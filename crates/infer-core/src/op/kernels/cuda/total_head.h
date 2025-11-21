@@ -1,0 +1,7 @@
+#include "./rmsnorm/rmsnorm.h"
+#include "./matmul/matmul.h"
+#include "./add/add.h"
+#include "./swiglu/swiglu.h"
+#include "./embedding/emb.h"
+#include "./rope/rope.h"
+#include "./flash_attn_gqa/flash_attn_gqa.h"
