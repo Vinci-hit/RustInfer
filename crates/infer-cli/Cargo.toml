@@ -1,0 +1,10 @@
+[package]
+name = "infer-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[features]
+# 默认情况下，kuiper-cli 也是纯 CPU 的
+default = []
