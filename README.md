@@ -61,6 +61,13 @@ RustInfer/
 
 ### 安装步骤
 
+0. **安装依赖**
+```bash
+sudo apt-get update
+sudo apt-get install clang libclang-dev pkg-config libssl-dev openblas-src conda-forge clang
+或 conda install conda-forge::libclang anaconda::openssl
+```
+
 1. **克隆代码仓库**
 
 ```bash
@@ -71,13 +78,32 @@ cd RustInfer
 2. **构建CPU版本**
 
 ```bash
-cargo build --release
+cargo build --release  # 其实默认开启了cuda feature
 ```
 
 3. **构建CUDA加速版本**
 
 ```bash
 cargo build --release --features cuda
+```
+
+4. **运行前**
+```
+先运行 cargo test 来保证所有测试正常通过
+接着再测试性能
+cargo test --release test_llama3_cuda_vs_cpu_performance -- --ignored
+```
+
+5. **常见错误**
+```
+ndarray-linalg有许多后端，如果openblas用不了，可以尝试其它的，如intel-mkl-static
+```
+
+6、**改进选项**
+```
+现在的mha是用固定32x32block的GQA flashattention实现，对decoder阶段的性能很差。
+修改build.rs 里面的计算能力flag 以适配不同的显卡。
+cuda feature 未完全拆分
 ```
 
 ## 使用方法
