@@ -34,6 +34,19 @@ void flash_attn_gqa_cu(
     cudaStream_t stream
 );
 
+void flash_decoding_cu(
+    const float* q_ptr,
+    const float* k_ptr,
+    const float* v_ptr,
+    float* o_ptr,
+    int32_t q_seq_len,
+    int32_t kv_seq_len,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,18 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+    pub fn flash_decoding_cu(
+        q_ptr: *const f32,
+        k_ptr: *const f32,
+        v_ptr: *const f32,
+        o_ptr: *mut f32,
+        q_seq_len: i32,
+        kv_seq_len: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Flash Attention GQA 的 CUDA 内核包装函数 (Prefill/Decode 模式)。
@@ -70,22 +82,36 @@ pub fn flash_attn_gqa(
     if let Some(config) = cuda_config {
         stream = config.stream; 
     }
-
-    // --- 4. 调用 FFI 函数 ---
-    unsafe {
-        flash_attn_gqa_cu(
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            o_ptr,
-            q_seq_len_i32,
-            kv_seq_len_i32,
-            num_q_heads_i32,
-            num_kv_heads_i32,
-            head_dim_i32,
-            stream,
-        );
+    if q_seq_len == 1 {
+        unsafe {
+            flash_decoding_cu(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                o_ptr,
+                q_seq_len_i32,
+                kv_seq_len_i32,
+                num_q_heads_i32,
+                num_kv_heads_i32,
+                head_dim_i32,
+                stream,
+            );
+        }
+    }else{
+        unsafe {
+            flash_attn_gqa_cu(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                o_ptr,
+                q_seq_len_i32,
+                kv_seq_len_i32,
+                num_q_heads_i32,
+                num_kv_heads_i32,
+                head_dim_i32,
+                stream,
+            );
+        }
     }
-    
     Ok(())
 }
