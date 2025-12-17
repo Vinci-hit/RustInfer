@@ -107,10 +107,10 @@ impl ModelLoader {
             // 临时映射文件以读取其内部的张量名称
             let mmap = safetensor_loader::load_and_mmap(&single_file_path)?;
             let reader = SafetensorReader::new(&mmap)?;
-            println!("[DEBUG] Available tensors in the model file:");
+            // println!("[DEBUG] Available tensors in the model file:");
             // 为这个文件中的所有张量构建 weight_map
             for tensor_name in reader.get_tensor_names() {
-                println!("- {}", tensor_name);
+                // println!("- {}", tensor_name);
                 weight_map.insert(tensor_name, "model.safetensors".to_string());
             }
         }

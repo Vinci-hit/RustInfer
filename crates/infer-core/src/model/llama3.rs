@@ -374,11 +374,11 @@ impl Llama3 {
         // 6. FFN (SwiGLU) 的输入缓冲区 (批处理形状)
         buffers.insert(
             BufferType::W1Output,
-            Tensor::new(&[max_seq_len, config.hidden_dim], float_dtype, *device)?,
+            Tensor::new(&[max_seq_len, config.intermediate_size], float_dtype, *device)?,
         );
         buffers.insert(
             BufferType::W3Output,
-            Tensor::new(&[max_seq_len, config.hidden_dim], float_dtype, *device)?,
+            Tensor::new(&[max_seq_len, config.intermediate_size], float_dtype, *device)?,
         );
         
         // 7. Attention scores (QK^T) 的缓冲区 (批处理形状)
@@ -421,18 +421,15 @@ impl Llama3 {
 
     // --- 创建一系列辅助加载函数，提高代码可读性 ---
     fn load_matmul(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Matmul> {
-        println!("Loading Matmul weight: {}", name);
+        // println!("Loading Matmul weight: {}", name);
         let tensor_view = loader.get_tensor(name)?;
-        
         // 1. 在 CPU 上从 TensorView 加载，保留原始 dtype (通常是 bf16)
         let mut weight = Tensor::from_view_on_cpu(&tensor_view)?;
-
         // 2. 如果目标设备是 CPU，则将权重转换为 F32
         if  weight.dtype() == DataType::BF16 { // device == DeviceType::Cpu &&
-            println!("  -> Converting weight '{}' to F32 for CPU execution.", name);
+            // println!("  -> Converting weight '{}' to F32.", name);
             weight = weight.to_dtype(DataType::F32)?;
         }
-        
         // 3. 将最终确定类型的权重移动到目标设备
         let weight_on_device = weight.to_device(device)?;
 
@@ -451,7 +448,7 @@ impl Llama3 {
         //    RMSNorm 的权重总是需要 f32，无论是在 CPU 还是 GPU (为了精度)
         //    这是一个可以简化的假设，但现在我们先保持一致
         if weight.dtype() == DataType::BF16 { // device == DeviceType::Cpu &&
-            println!("  -> Converting RMSNorm weight '{}' to F32 for CPU execution.", name);
+            // println!("  -> Converting RMSNorm weight '{}' to F32 for CPU execution.", name);
             weight = weight.to_dtype(DataType::F32)?;
         }
         
@@ -468,12 +465,11 @@ impl Llama3 {
 
         // 1. 在 CPU 上加载 bf16 权重
         let mut weight = Tensor::from_view_on_cpu(&tensor_view)?;
-
         // 2. **重要**: Embedding 层本身不进行计算，只是查表（内存拷贝）。
         //    所以，如果整个流水线是 bf16 (在 CUDA 上)，它的权重也应该是 bf16。
         //    只有当 CPU 流水线被确定为 f32 时，我们才转换它。
         if weight.dtype() == DataType::BF16 { // device == DeviceType::Cpu &&
-            println!("  -> Converting Embedding weight '{}' to F32 for CPU execution.", name);
+            // println!("  -> Converting Embedding weight '{}' to F32 for CPU execution.", name);
             weight = weight.to_dtype(DataType::F32)?;
         }
         
@@ -527,18 +523,16 @@ impl Llama3 {
     /// # 返回
     /// - `Result<String>`: 成功时返回完整的生成文本（不包括提示）。
     /// 使用当前模型生成文本，支持对长提示进行批处理优化。
-    pub fn generate(&mut self, prompt: &str, max_tokens: usize, print_output: bool) -> Result<String> {
+    pub fn generate(&mut self, prompt: &str, max_tokens: usize, print_output: bool) -> Result<(String,u32)> {
+        if print_output {
+            println!("----------------------------------------");
+            println!("Prompt: {}", prompt);
+            io::stdout().flush()?;
+        }
         // --- 1. Tokenize 输入提示 ---
         let prompt_tokens = self.tokenizer.encode(prompt)?;
-
         if prompt_tokens.is_empty() {
             return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
-        }
-        
-        // --- 2. 提示处理阶段 (使用批处理) ---
-        if print_output {
-            print!("{}", self.tokenizer.decode(prompt_tokens.as_slice())?);
-            io::stdout().flush()?;
         }
         // 这个方法会填充 KV 缓存，并返回整个序列的最后一个。
         let mut current_token = self.forward_batch(&prompt_tokens,0)?;
@@ -572,9 +566,9 @@ impl Llama3 {
         if print_output {
             println!();
         }
-
         // --- 4. 解码并返回完整结果 ---
-        self.tokenizer.decode(&generated_tokens)
+        let some_string = self.tokenizer.decode(&generated_tokens)?;
+        Ok((some_string, generated_tokens.len() as u32))
     }
 
     /// 从 KV 缓存中获取指定层和位置的 Key 和 Value 的零拷贝视图。
@@ -670,6 +664,7 @@ impl Llama3 {
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
+        
         // a. 准备一个 pos 张量，值为 0，表示批处理从位置 0 开始
         let mut pos_tensor = self.workspace.remove(&BufferType::InputPos).unwrap();
         pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = pos as i32; // 表示起始位置
@@ -693,13 +688,19 @@ impl Llama3 {
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
             self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
-            
+            // println!("q shape{:?}",q.shape());
+            // println!("q{:?}",&q.as_f32()?.as_slice()?[0..5]);
+            // println!("q{:?}",&q.as_f32()?.as_slice()?[2048..2053]);
+            // println!("q{:?}",&q.as_f32()?.as_slice()?[2048 * 20..2048 * 20 + 5]);
+            // panic!("");
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&pos_tensor, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
+            
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out; // 复用缓冲区
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history,&pos_tensor], &mut [&mut attn_out], cuda_config_ref))?;
+            
             let mut wo_out = q; // 复用缓冲区
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
             
@@ -711,19 +712,16 @@ impl Llama3 {
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&residual], &mut [&mut ffn_norm_out], cuda_config_ref))?;
             
             let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
-            let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.hidden_dim])?;
+            let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
             let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
-            let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, self.config.hidden_dim])?;
+            let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
 
             self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
             self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
-            
             let mut w2_out = ffn_norm_out; // 复用缓冲区
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
-
             self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &w2_out], &mut [&mut x], cuda_config_ref))?;
-            
             
         }
         self.workspace.insert(BufferType::InputPos, pos_tensor); // 还回去供下次使用
@@ -811,29 +809,14 @@ mod tests {
         prompt: &str,
         max_tokens: usize,
         verbose: bool
-    ) -> Result<(String, u64, usize)> {
-        // 如果需要捕获输出以计算Token数，这里可以进行设置
-        // 假设 model.generate 有一个变体或者可以通过其他方式获取生成的文本
-        // 为了简化，我们先专注于计时
+    ) -> Result<(String, u64, u32)> {
         
         let start_time = Instant::now();
         
         // 执行生成，verbose设为false以减少IO干扰
-        let generated_text = model.generate(prompt, max_tokens, false)?;
-        
+        let (generated_text, num_generated_tokens) = model.generate(prompt, max_tokens, verbose)?;
         let duration = start_time.elapsed();
         let duration_ms = duration.as_millis() as u64;
-        
-        // 简单估算生成的Token数（这取决于你的Tokenizer实现）
-        // 这里用一个简单的split_whitespace来估算，实际应用中应该用真实的Tokenizer
-        let num_generated_tokens = generated_text.split_whitespace().count();
-
-        if verbose {
-            println!("----------------------------------------");
-            println!("Prompt: {}", prompt);
-            println!("Generated Text: {}", generated_text);
-            println!("----------------------------------------");
-        }
         
         Ok((generated_text, duration_ms, num_generated_tokens))
     }
@@ -854,7 +837,14 @@ mod tests {
         println!("Model loaded.");
 
         // --- 2. Act (执行) ---
-        let prompt = "Write a short email to a colleague declining a meeting invitation next Monday, giving a polite reason and suggesting an alternative time.";
+        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 14 Dec 2025
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+你好。<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
         let max_tokens = 50;
         
         println!("Starting CPU generation...");
@@ -877,52 +867,6 @@ mod tests {
         
         Ok(())
     }
-    
-    #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_llama3_cuda_vs_cpu_performance() -> Result<()> {
-        // 这个测试现在同时验证一致性和性能
-        
-        let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Dummy model directory not found.");
-
-        let prompt = "Write a short email to a colleague declining a meeting invitation next Monday, giving a polite reason and suggesting an alternative time.";
-        let max_tokens = 50;
-
-        // --- 1. 在 CPU 上运行并获取黄金结果和性能 ---
-        println!("=== Step 1: Running on CPU ===");
-        let mut model_cpu = Llama3::new(model_path, DeviceType::Cpu, false)?;
-        let (cpu_generated_text, cpu_duration_ms, cpu_num_tokens) = generate_and_measure(&mut model_cpu, prompt, max_tokens, false)?;
-        
-        let cpu_tps = if cpu_duration_ms > 0 {
-            (cpu_num_tokens as f64) / (cpu_duration_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        // --- 2. 在 CUDA 上运行并获取结果和性能 ---
-        println!("\n=== Step 2: Running on CUDA ===");
-        let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (cuda_generated_text, cuda_duration_ms, cuda_num_tokens) = generate_and_measure(&mut model_cuda, prompt, max_tokens, false)?;
-
-        let cuda_tps = if cuda_duration_ms > 0 {
-            (cuda_num_tokens as f64) / (cuda_duration_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        // --- 4. 报告性能 ---
-        println!("\n================ PERFORMANCE COMPARISON ================");
-        println!("CPU - Total Time: {} ms, Tokens: {}, TPS: {:.2}", cpu_duration_ms, cpu_num_tokens, cpu_tps);
-        println!("CUDA - Total Time: {} ms, Tokens: {}, TPS: {:.2}", cuda_duration_ms, cuda_num_tokens, cuda_tps);
-        if cpu_duration_ms > 0 {
-             println!("CUDA is {:.2}x faster than CPU", cpu_duration_ms as f64 / cuda_duration_ms as f64);
-        }
-        println!("=========================================================\n");
-        
-        Ok(())
-    }
     #[test]
     #[ignore = "该测试花费时间较长，请单独测试运行。"]
     #[cfg(feature = "cuda")]
@@ -932,13 +876,20 @@ mod tests {
         let model_path = get_dummy_model_path();
         assert!(model_path.exists(), "Dummy model directory not found.");
 
-        let prompt = "Write a short email to a colleague declining a meeting invitation next Monday, giving a polite reason and suggesting an alternative time.";
-        let max_tokens = 50;
+        let prompt = "<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 14 Dec 2025
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+你好,你是ai infra 来面试实习的，请自我介绍一下。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+        let max_tokens = 500;
 
         // --- 2. 在 CUDA 上运行并获取结果和性能 ---
         println!("\n=== Step 2: Running on CUDA ===");
         let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (cuda_generated_text, cuda_duration_ms, cuda_num_tokens) = generate_and_measure(&mut model_cuda, prompt, max_tokens, false)?;
+        let (cuda_generated_text, cuda_duration_ms, cuda_num_tokens) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
 
         let cuda_tps = if cuda_duration_ms > 0 {
             (cuda_num_tokens as f64) / (cuda_duration_ms as f64 / 1000.0)
@@ -950,32 +901,11 @@ mod tests {
         println!("\n================ PERFORMANCE COMPARISON ================");
         println!("CUDA - Total Time: {} ms, Tokens: {}, TPS: {:.2}", cuda_duration_ms, cuda_num_tokens, cuda_tps);
         println!("=========================================================\n");
-        panic!("!");
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_llama3_cuda_only() -> Result<()> {
-        // 这个测试的核心是确保 CPU 和 GPU 的输出完全一致
-        
-        let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Dummy model directory not found.");
-
-        // --- 1. 在 CPU 上运行并获取黄金结果 ---
-        let prompt = "Write a short email to a colleague declining a meeting invitation next Monday, giving a polite reason and suggesting an alternative time.";
-        let max_tokens = 50;
-
-        // --- 2. 在 CUDA 上运行 ---
-        let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        model_cuda.generate(prompt, max_tokens, true)?;
-
         Ok(())
     }
 
     // 辅助函数，获取虚拟模型的路径
     fn get_dummy_model_path() -> &'static Path {
-        Path::new("/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct")
+        Path::new("/mnt/md1/lwq/Llama-3.2-1B-Instruct")
     }
 }

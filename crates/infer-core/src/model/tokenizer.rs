@@ -35,7 +35,6 @@ pub trait Tokenizer {
     }
 
     fn is_eos(&self, token_id: i32) -> bool;
-    fn get_eos_id(&self) -> i32;
 }
 
 
@@ -44,7 +43,7 @@ pub trait Tokenizer {
 pub struct GenericHfTokenizer {
     // 核心：内部持有一个来自 Hugging Face 库的 Tokenizer 实例
     hf_tokenizer: HfTokenizer,
-    eos_token_id: i32,
+    eos_token_id: Vec<u32>,
 }
 
 impl GenericHfTokenizer {
@@ -56,19 +55,22 @@ impl GenericHfTokenizer {
             .map_err(|e| Error::InternalError(format!("Failed to load tokenizer: {}", e)))?;
         
         // 调用我们新的、健壮的查找函数
-        let eos_token_id = Self::find_eos_token_id(&hf_tokenizer)?  as i32;
+        let eos_token_id = Self::find_eos_token_id(&hf_tokenizer)?; 
         Ok(Self { hf_tokenizer , eos_token_id})
     }
-    fn find_eos_token_id(tokenizer: &HfTokenizer) -> Result<u32> {
+    fn find_eos_token_id(tokenizer: &HfTokenizer) -> Result<Vec<u32>> {
         // --- 方法 C: 尝试通过已知的 token 字符串直接查找 ID ---
         // 这是最后的、针对特定模型的后备方案
+        let mut eos_token_id = Vec::new();
         for token_str in ["<|end_of_text|>", "</s>", "<|eot_id|>"] {
             if let Some(id) = tokenizer.token_to_id(token_str) {
                 println!("[DEBUG] Found EOS token ID {} using token string '{}'", id, token_str);
-                return Ok(id); // 找到了！
+                eos_token_id.push(id); // 找到了！
             }
         }
-
+        if !eos_token_id.is_empty() {
+            return Ok(eos_token_id);
+        }
         // 如果所有方法都失败了，返回一个清晰的错误
         Err(Error::InternalError("EOS token ID could not be found in the tokenizer file using any known method.".to_string()).into())
     }
@@ -82,9 +84,7 @@ impl Tokenizer for GenericHfTokenizer {
     fn is_eos(&self, token_id: i32) -> bool {
         // 我们将输入的 i32 token ID 转换为 u32，
         // 然后与我们存储的 u32 类型的 eos_token_id 进行比较。
-        token_id == self.eos_token_id
-    }
-    fn get_eos_id(&self) -> i32 {
-        self.eos_token_id
+        let token_id_u32 = token_id as u32;
+        self.eos_token_id.contains(&token_id_u32)
     }
 }
