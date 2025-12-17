@@ -42,7 +42,7 @@ pub fn sgemv(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config:O
     let k = a_shape[0];
     let m = a_shape[1];
 
-    if m % 4 != 0 {
+    if !m.is_multiple_of(4) {
         return Err(Error::InvalidArgument("SGEMV float4 kernel requires the inner dimension (N) to be a multiple of 4.".into()).into());
     }
 

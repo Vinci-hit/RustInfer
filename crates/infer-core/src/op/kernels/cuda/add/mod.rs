@@ -28,7 +28,7 @@ pub fn add(
     input_a: &Tensor,
     input_b: &Tensor,
     output_c: &mut Tensor,
-    cuda_config: Option<&CudaConfig>,
+    _cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     // 1. 获取 TypedTensor 并进行类型校验
     let input_a_typed = input_a.as_f32()?;
@@ -45,7 +45,7 @@ pub fn add(
         return Err(Error::InvalidArgument(format!(
             "Tensor shapes must match for addition. A: {:?}, B: {:?}, C: {:?}",
             dims_a, dims_b, dims_c
-        ).into()).into());
+        )).into());
     }
 
     // 长度校验
@@ -98,7 +98,7 @@ pub fn add_inplace(
         return Err(Error::InvalidArgument(format!(
             "Tensor shapes must match for in-place addition. A: {:?}, B: {:?}",
             dims_a, dims_b
-        ).into()).into());
+        )).into());
     }
     
     let num_elements = input_output_a_typed.num_elements();

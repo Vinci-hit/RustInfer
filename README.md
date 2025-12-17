@@ -91,11 +91,11 @@ cargo build --release --features cuda
 ```
 先运行 cargo test 来保证所有测试正常通过
 接着再测试性能
-cargo test test_llama3_cuda_performance -- --show-output --ignored
-cargo test test_llama3_cpu_loading_and_generation -- --show-output --ignored
+cargo test test_llama3_cuda_performance --release -- --show-output --ignored
+cargo test test_llama3_cpu_loading_and_generation --release -- --show-output --ignored
 ```
 
-下图展示了运行cargo test test_llama3_cuda_performance -- --show-output --ignored在H200上运行的结果：
+下图展示了运行cargo test test_llama3_cuda_performance --release -- --show-output --ignored在H200上运行的结果：
 
 ![性能测试图](test_images/image1.png)
 
@@ -211,8 +211,8 @@ pub trait Op {
 
 ```bash
 cargo test
-cargo test test_llama3_cuda_performance -- --show-output --ignored
-cargo test test_llama3_cpu_loading_and_generation -- --show-output --ignored
+cargo test test_llama3_cuda_performance --release -- --show-output --ignored
+cargo test test_llama3_cpu_loading_and_generation --release -- --show-output --ignored
 ```
 
 ## 许可证

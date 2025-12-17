@@ -2,7 +2,7 @@
 
 use crate::base::error::{Result, Error};
 use crate::base::DataType; // 需要引入 DataType
-use crate::cuda::{self, CudaConfig};
+use crate::cuda::CudaConfig;
 use crate::tensor::Tensor;
 
 // ============================================================================
@@ -34,7 +34,7 @@ pub fn swiglu(
     // --- 2. 检查前置条件 ---
     let num_elements = input_output_x.num_elements();
     // a) 元素数量必须是 4 的倍数 (对于 fp32x4 内核)
-    if num_elements % 4 != 0 {
+    if !num_elements.is_multiple_of(4) {
         return Err(Error::InvalidArgument(
             "CUDA SwiGLU kernel (fp32x4) requires element count to be a multiple of 4.".to_string()
         ).into());

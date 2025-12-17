@@ -425,7 +425,7 @@ impl Tensor {
     /// # Safety
     /// 调用者必须保证 `view` (以及其底层的 mmap) 的生命周期
     /// 比返回的 Tensor 更长。
-    pub unsafe fn from_view_borrowed<'a>(view: &'a TensorView) -> Result<Self> {
+    pub unsafe fn from_view_borrowed(view: &TensorView) -> Result<Self> {
         let shape = view.shape();
         let safetensor_dtype = view.dtype();
         let data_bytes = view.data();

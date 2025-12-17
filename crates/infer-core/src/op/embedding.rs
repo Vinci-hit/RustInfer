@@ -62,7 +62,7 @@ impl Op for Embedding {
         }
         // 输入的 token ID 可以在 CPU 上，而权重和输出在 GPU 上
         if input_tokens.dtype() != DataType::I32 {
-            return Err(Error::InvalidArgument(format!("Input tokens for Embedding must be of type I32")).into());
+            return Err(Error::InvalidArgument("Input tokens for Embedding must be of type I32".to_string()).into());
         }
         if output.dtype() != weight.dtype() {
             return Err(Error::InvalidArgument(format!("Output and weight must have the same data type, Output:{:?}, weight{:?}",output.dtype(),weight.dtype())).into());
@@ -175,9 +175,8 @@ mod tests {
         // b) 创建输入 token ID 张量。Token ID 通常在 CPU 上。
         let mut input_tokens = Tensor::new(&[token_len], dtype_tokens, cpu_device)?;
         input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&tokens_data);
-        match device{
-            DeviceType::Cuda(id) => input_tokens = input_tokens.to_cuda(id)?,
-            _ => ()
+        if let DeviceType::Cuda(id) = device {
+            input_tokens = input_tokens.to_cuda(id)?;
         }
         // c) 创建输出张量，它必须和算子在同一个设备上
         let mut output = Tensor::new(&[token_len, dim], dtype_weights, device)?;

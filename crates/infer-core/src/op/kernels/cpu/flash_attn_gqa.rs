@@ -1,6 +1,6 @@
 use crate::base::error::{Error, Result};
 use crate::tensor::Tensor;
-use ndarray::{s, ArrayView2, ArrayViewMut2, ArrayViewMut3, Axis}; 
+use ndarray::{s, ArrayView2, ArrayViewMut3, Axis}; 
 use rayon::prelude::*; 
 use std::f32;
 
@@ -44,20 +44,20 @@ pub fn flash_attn_gqa(
     // Q: [Seq, Num_Q_Heads * Head_Dim] -> 逻辑上看作 [Seq, Num_Q_Heads, Head_Dim]
     // 为了方便切片，我们保持 2D 视图，在循环中手动切分列
     let q_view = ArrayView2::from_shape((q_seq_len, q_hidden_dim), q_slice.as_slice()?)
-        .map_err(|e| Error::InvalidArgument(format!("Q view failed: {}", e).into()))?;
+        .map_err(|e| Error::InvalidArgument(format!("Q view failed: {}", e)))?;
 
     // K, V: [Max_Seq, Num_KV_Heads * Head_Dim]
     let k_full_view = ArrayView2::from_shape((max_kv_seq_len, kv_hidden_dim), k_slice.as_slice()?)
-        .map_err(|e| Error::InvalidArgument(format!("K view failed: {}", e).into()))?;
+        .map_err(|e| Error::InvalidArgument(format!("K view failed: {}", e)))?;
     let v_full_view = ArrayView2::from_shape((max_kv_seq_len, kv_hidden_dim), v_slice.as_slice()?)
-        .map_err(|e| Error::InvalidArgument(format!("V view failed: {}", e).into()))?;
+        .map_err(|e| Error::InvalidArgument(format!("V view failed: {}", e)))?;
 
     // Output: 为了安全并行，我们将视图重塑为 3D [Seq, Num_Heads, Head_Dim]
     // 这样我们可以沿着 Axis(1) (Heads) 进行可变迭代，Rayon 就能安全地分发任务
     let mut o_view_3d = ArrayViewMut3::from_shape(
         (q_seq_len, num_q_heads, head_dim),
         o_slice_mut.as_slice_mut()?,
-    ).map_err(|e| Error::InvalidArgument(format!("O view failed: {}", e).into()))?;
+    ).map_err(|e| Error::InvalidArgument(format!("O view failed: {}", e)))?;
 
     // --- 3. 并行计算 (按 Query Head 维度) ---
 

@@ -44,7 +44,6 @@ __global__ void rope_rotate_kernel(
     // 每个线程处理一个head_size的元素
     // 每个block处理一个dim，y轴为seq_len
     int start_head_id = blockIdx.x * head_size;
-    int start_thread_id = threadIdx.x;
     int seq_pos = blockIdx.y;
 
     // 旋转操作的维度索引 i = 2 * thread_idx

@@ -128,6 +128,9 @@ void flash_decoding_cu(
     int32_t head_dim,
     cudaStream_t stream)
 {
+    // 显式忽略未使用的参数
+    (void)q_seq_len;
+    
     dim3 grid(num_q_heads); 
     
     // 确保线程数足够 (向上取整到 32 倍数)
