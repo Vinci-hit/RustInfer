@@ -884,7 +884,7 @@ Today Date: 14 Dec 2025
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
 你好,你是ai infra 来面试实习的，精通高性能计算，请自我介绍一下。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let max_tokens = 200;
+        let max_tokens = 2000;
 
         // --- 2. 在 CUDA 上运行并获取结果和性能 ---
         println!("\n=== Step 2: Running on CUDA ===");
