@@ -34,7 +34,7 @@ impl Matmul {
         device: DeviceType,
     ) -> Result<Self> {
         // 创建权重张量 W，形状为 [out_features, in_features]
-        let weight = Tensor::new(&[out_features, in_features], dtype, device.clone())?;
+        let weight = Tensor::new(&[out_features, in_features], dtype, device)?;
         
         // 如果需要，创建偏置张量 B
         let bias = if has_bias {
@@ -79,10 +79,10 @@ impl Op for Matmul {
         if output.dtype() != dtype || weight.dtype() != dtype {
             return Err(Error::InvalidArgument("All tensors must have the same data type".into()).into());
         }
-        if let Some(bias) = &self.bias {
-            if bias.device() != device || bias.dtype() != dtype {
-                return Err(Error::InvalidArgument("Bias tensor has mismatched device or dtype".into()).into());
-            }
+        if let Some(bias) = &self.bias
+            && (bias.device() != device || bias.dtype() != dtype)
+        {
+            return Err(Error::InvalidArgument("Bias tensor has mismatched device or dtype".into()).into());
         }
         
         let weight_shape = weight.shape();

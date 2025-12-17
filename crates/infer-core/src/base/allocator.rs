@@ -77,6 +77,13 @@ impl CachingCudaAllocator {
 }
 /// DeviceAllocator Trait 定义了内存分配器的通用行为.
 pub trait DeviceAllocator: Debug {
+    /// Allocate memory according to the given layout.
+    /// 
+    /// # Safety
+    /// This function is unsafe because it allocates raw memory. The caller must ensure that:
+    /// 1. The layout is valid (size >= 0, alignment is a power of two, etc.)
+    /// 2. The returned pointer is properly aligned for the requested layout
+    /// 3. The memory is deallocated using the corresponding deallocate method
     unsafe fn allocate(&self, layout: Layout) -> Result<NonNull<u8>>;
 
     /// 释放之前申请的内存.

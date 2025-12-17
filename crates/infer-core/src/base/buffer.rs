@@ -45,7 +45,7 @@ impl Buffer {
         let inner = Arc::new(BufferInner {
             ptr,
             len_bytes,
-            allocator : allocator,
+            allocator,
         });
 
         Ok(Buffer {

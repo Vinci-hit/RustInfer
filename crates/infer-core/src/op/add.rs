@@ -1,4 +1,4 @@
-use crate::base::error::{Error, Result};
+use crate::base::error::Result;
 use crate::base::DeviceType; // 引入 DeviceType
 use crate::op::{kernels, Op, OpContext};
 
@@ -11,6 +11,12 @@ impl Add {
     /// 创建一个新的 Add 算子实例。
     pub fn new() -> Self {
         Add
+    }
+}
+
+impl Default for Add {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

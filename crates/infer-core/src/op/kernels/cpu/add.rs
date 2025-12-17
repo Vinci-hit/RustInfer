@@ -18,13 +18,13 @@ pub fn add(input_a: &Tensor, input_b: &Tensor, output: &mut Tensor) -> Result<()
     // --- 2. 创建 ndarray 视图 ---
     // 使用 ArrayViewD (D for Dynamic) 来处理任意维度的张量
     let a_view: ArrayViewD<f32> = ArrayViewD::from_shape(input_a.shape(), a_slice)
-        .map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
         
     let b_view: ArrayViewD<f32> = ArrayViewD::from_shape(input_b.shape(), b_slice)
-        .map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
         
     let mut c_view: ArrayViewMutD<f32> = ArrayViewMutD::from_shape(output_shape, c_slice)
-        .map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
 
     // --- 3. 执行计算 ---
     // ndarray 重载了 `+` 运算符用于按元素相加
@@ -48,9 +48,9 @@ pub fn add_inplace(tensor_a: &mut Tensor, tensor_b: &Tensor) -> Result<()> {
 
     // --- 创建 ndarray 视图 ---
     let mut a_view = ArrayViewMutD::from_shape(a_shape, a_slice)
-        .map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
     let b_view = ArrayViewD::from_shape(b_shape, b_slice)
-        .map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
 
     // --- 执行原地加法 ---
     // `a_view += &b_view` 会执行按元素原地加法，支持广播

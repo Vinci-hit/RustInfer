@@ -16,21 +16,19 @@ impl DeviceType {
     /// # Returns
     /// 如果设备是 DeviceType::Cpu，则返回 true；否则返回 false。
     pub fn is_cpu(&self) -> bool {
-        // 使用模式匹配来检查变体
-        match self {
-            DeviceType::Cpu => true,
-            _ => false,
-        }
+        matches!(self, DeviceType::Cpu)
     }
     
     /// 检查设备类型是否是 CUDA GPU。
     pub fn is_cuda(&self) -> bool {
-        match self {
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => true,
-            _ => false,
+        #[cfg(feature = "cuda")]
+        {
+            matches!(self, DeviceType::Cuda(_))
         }
-
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
     }
 }
 

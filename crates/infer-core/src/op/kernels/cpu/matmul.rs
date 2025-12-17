@@ -29,7 +29,7 @@ pub fn matmul(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()
     let weight_view: ArrayView2<f32> = ArrayView2::from_shape(
         (out_features, in_features),
         weight_slice
-    ).map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+    ).map_err(|e| Error::InvalidArgument(e.to_string()))?;
 
     // 输入可能是多维的 (e.g., [B, S, K])，我们需要处理 batch 维度
     // 我们将输入 reshape 成一个 2D 矩阵 [M, K]，其中 M 是所有前缀维度的乘积
@@ -39,13 +39,13 @@ pub fn matmul(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()
     let input_view: ArrayView2<f32> = ArrayView2::from_shape(
         (m_dim, in_features),
         input_slice
-    ).map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+    ).map_err(|e| Error::InvalidArgument(e.to_string()))?;
 
     // 创建输出的 2D 可变视图 [M, N]
     let mut output_view: ArrayViewMut2<f32> = ArrayViewMut2::from_shape(
         (m_dim, out_features),
         output_slice
-    ).map_err(|e| Error::InvalidArgument(e.to_string().into()))?;
+    ).map_err(|e| Error::InvalidArgument(e.to_string()))?;
     
     // --- 3. 执行高性能矩阵乘法 ---
     // 计算 C = A * B^T。 ndarray 的 .dot() 会自动调用 BLAS GEMM。

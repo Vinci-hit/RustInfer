@@ -186,7 +186,7 @@ impl ModelLoader {
 
         // 更新 vocab_size 的逻辑保持不变
         let tokenizer_vocab_size = boxed_tokenizer.vocab_size();
-        if tokenizer_vocab_size <= 0 {
+        if tokenizer_vocab_size == 0 {
             return Err(Error::InvalidArgument("Tokenizer vocabulary size must be positive".to_string()).into());
         }
         

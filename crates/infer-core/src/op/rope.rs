@@ -67,8 +67,8 @@ impl Op for RoPEOp {
         let (q_slice, k_slice) = q_k_tensor_slice.split_at_mut(1);
         
         // 安全地获取 Q 和 K 的可变引用
-        let input_q: &mut Tensor = &mut q_slice[0];
-        let input_k: &mut Tensor = &mut k_slice[0]; 
+        let input_q: &mut Tensor = q_slice[0];
+        let input_k: &mut Tensor = k_slice[0]; 
         let seq_len  = input_q.shape()[0];
         // --- c. 检查设备和数据类型 (使用 input_q/k 而非 inputs[0]/1) ---
         let device = input_q.device();

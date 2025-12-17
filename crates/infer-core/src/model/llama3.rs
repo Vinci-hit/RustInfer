@@ -514,34 +514,25 @@ impl Llama3 {
         Ok(kv_cache)
     }
 
-    /// 使用当前模型生成文本。
-    ///
-    /// # 参数
-    /// - `prompt`: 输入的提示字符串。
-    /// - `max_tokens`: 要生成的最大 token 数量。
-    /// - `print_output`: 是否在生成时将 token 流式打印到控制台。
-    ///
-    /// # 返回
-    /// - `Result<String>`: 成功时返回完整的生成文本（不包括提示）。
-    /// 使用当前模型生成文本，支持对长提示进行批处理优化。
+
     pub fn generate(&mut self, prompt: &str, max_tokens: usize, print_output: bool) -> Result<(String,u32, u64, u64, usize)> {
         if print_output {
             println!("----------------------------------------");
             println!("Prompt: {}", prompt);
             io::stdout().flush()?;
         }
-        // --- 1. Tokenize 输入提示 ---
         let prompt_tokens = self.tokenizer.encode(prompt)?;
         if prompt_tokens.is_empty() {
             return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
         }
-        // --- 2. Prefill 阶段 (填充 KV 缓存) ---
+        
+        // Prefill stage - fill KV cache
         let prefill_start = Instant::now();
-        let mut current_token = self.forward_batch(&prompt_tokens,0)?;
+        let mut current_token = self.forward_batch(&prompt_tokens, 0)?;
         let prefill_duration = prefill_start.elapsed();
         let prefill_ms = prefill_duration.as_millis() as u64;
 
-        // --- 3. 生成阶段 ---
+        // Generation stage
         let mut generated_tokens = vec![current_token];
         if print_output {
             let decoded = self.tokenizer.decode(&[current_token])?;
@@ -549,11 +540,10 @@ impl Llama3 {
             io::stdout().flush()?;
         }
 
-        // 生成循环从提示的末尾开始
+        // Generate tokens starting from the end of the prompt
         let decode_start = Instant::now();
         let mut decode_iterations = 0;
         for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
-            // 后续的 token 生成仍然是逐个进行的
             let next_token = self.forward_batch(&[current_token], pos)?;
 
             if self.tokenizer.is_eos(next_token) {
@@ -572,29 +562,16 @@ impl Llama3 {
         }
         let decode_duration = decode_start.elapsed();
         let decode_ms = decode_duration.as_millis() as u64;
+        
         if print_output {
             println!();
         }
-        // --- 4. 解码并返回完整结果 ---
-        let some_string = self.tokenizer.decode(&generated_tokens)?;
-        Ok((some_string, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
+        
+        let generated_text = self.tokenizer.decode(&generated_tokens)?;
+        Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
 
-    /// 从 KV 缓存中获取指定层和位置的 Key 和 Value 的零拷贝视图。
-    ///
-    /// 这个函数在自回归生成时（`forward_one_token` 中）被调用，
-    /// 用于定位当前 token 应该写入的 KV 缓存位置。
-    ///
-    /// # 参数
-    /// - `layer_idx`: 目标 Transformer 层的索引。
-    /// - `token_pos`: 序列中的令牌位置（通常是当前生成的 token 的索引）。
-    ///
-    /// # 返回
-    /// - `Result<(Tensor, Tensor)>`: 成功时返回一个元组，包含 Key 和 Value 的张量视图。
-    ///                              这些视图是可变的，因为它们将被写入。
-    ///
-    /// 注意：这个方法返回的是拥有的 Tensor 视图，而不是引用，
-    /// 这使得调用方的生命周期管理更简单。
+
     pub fn slice_kv_cache(
         &mut self, 
         layer_idx: usize, 
@@ -638,86 +615,69 @@ impl Llama3 {
     ///
     /// # 参数
     /// - `tokens`: 输入的 token ID 切片 `&[i32]`。
+    /// - `pos`: 输入序列在 KV 缓存中的起始位置。
     ///
     /// # 返回
-    /// - `Result<&Tensor>`: 成功时返回一个对工作区中最终 logits 张量的不可变引用。
-    /// 对一个 token 序列进行批处理前向传播。
-    ///
-    /// 这个方法用于高效处理输入提示。它会并行计算所有 token，
-    /// 填充 KV 缓存，并返回序列中**最后一个 token**对应的 logits。
-    ///
-    /// # 参数
-    /// - `tokens`: 输入的 token ID 切片 `&[i32]`。
-    ///
-    /// # 返回
-    /// - `Result<&Tensor>`: 成功时返回一个对工作区中最终 logits 张量的不可变引用。
+    /// - `Result<i32>`: 成功时返回生成的 token ID。
     fn forward_batch(&mut self, tokens: &[i32], pos: usize) -> Result<i32> {
         let seq_len = tokens.len();
         
         let cuda_config = if self.device_type.is_cuda() { Some(CudaConfig::new()?) } else { None };
         let cuda_config_ref = cuda_config.as_ref();
 
-        // --- 1. 准备批处理输入张量 ---
-        // a. 获取工作区中的输入 token 缓冲区，并切出所需长度的视图
+        // Prepare batch input tokens
         let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
-        // b. 在 CPU 上创建临时 token 数据，并拷贝到最终的设备视图中
         let mut input_tokens_cpu = Tensor::new(&[seq_len], DataType::I32, DeviceType::Cpu)?;
         input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(tokens);
         input_tokens_view.copy_from(&input_tokens_cpu.to_device(self.device_type)?)?;
 
-        // --- 2. 词嵌入 ---
-        // `x` 是当前计算流中的隐藏状态，形状为 [seq_len, dim]
+        // Token embedding
         let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
         
-        // a. 准备一个 pos 张量，值为 0，表示批处理从位置 0 开始
+        // Prepare position tensor
         let mut pos_tensor = self.workspace.remove(&BufferType::InputPos).unwrap();
-        pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = pos as i32; // 表示起始位置
-        // --- 3. 遍历所有 Transformer 层 ---
+        pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
+        // Process all transformer layers
         for i in 0..self.config.layer_num {
-            // 残差连接：将当前的 x 拷贝一份作为残差输入
+            // Residual connection
             let residual_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
             let mut residual = residual_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             residual.copy_from(&x)?;
-            
 
-            // ==================== a. Attention Block ====================
+            // Attention Block
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&residual], &mut [&mut attn_norm_out], cuda_config_ref))?;
             
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            let (mut k,mut v) = self.slice_kv_cache(i, pos as i32, seq_len)?;
+            let (mut k, mut v) = self.slice_kv_cache(i, pos as i32, seq_len)?;
             
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
             self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
-            // println!("q shape{:?}",q.shape());
-            // println!("q{:?}",&q.as_f32()?.as_slice()?[0..5]);
-            // println!("q{:?}",&q.as_f32()?.as_slice()?[2048..2053]);
-            // println!("q{:?}",&q.as_f32()?.as_slice()?[2048 * 20..2048 * 20 + 5]);
-            // panic!("");
+            
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&pos_tensor, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
             
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out; // 复用缓冲区
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history,&pos_tensor], &mut [&mut attn_out], cuda_config_ref))?;
+            let mut attn_out = attn_norm_out; // Reuse buffer
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &pos_tensor], &mut [&mut attn_out], cuda_config_ref))?;
             
-            let mut wo_out = q; // 复用缓冲区
+            let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
             
             self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &wo_out], &mut [&mut x], cuda_config_ref))?;
             
-            // ==================== b. FFN Block ====================
-            residual.copy_from(&x)?; // 更新残差
-            let mut ffn_norm_out = attn_out; // 复用缓冲区
+            // FFN Block
+            residual.copy_from(&x)?; // Update residual
+            let mut ffn_norm_out = attn_out; // Reuse buffer
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&residual], &mut [&mut ffn_norm_out], cuda_config_ref))?;
             
             let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
@@ -728,23 +688,23 @@ impl Llama3 {
             self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
             self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
-            let mut w2_out = ffn_norm_out; // 复用缓冲区
+            let mut w2_out = ffn_norm_out; // Reuse buffer
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &w2_out], &mut [&mut x], cuda_config_ref))?;
-            
         }
-        self.workspace.insert(BufferType::InputPos, pos_tensor); // 还回去供下次使用
+        self.workspace.insert(BufferType::InputPos, pos_tensor); // Return for next use
 
-        // --- 4. 提取最后一个 token 的隐藏状态 ---
+        // Extract last token's hidden state
         let last_hidden_state_view = x.slice(&[seq_len - 1, 0], &[1, self.config.dim])?;
-        // 我们需要一个单 token 形状的缓冲区来执行 final norm 和 classifier
+        
+        // Prepare for final norm and classifier
         let final_norm_input_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-        let mut final_norm_input = final_norm_input_buffer.slice(&[0,0], &[1,self.config.dim])?;
+        let mut final_norm_input = final_norm_input_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         final_norm_input.copy_from(&last_hidden_state_view)?;
         
-        // --- 5. Final Norm 和分类器 (只对最后一个 token) ---
+        // Final Norm and classifier
         let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-        let mut final_norm_out = final_norm_out_buffer.slice(&[0,0], &[1,self.config.dim])?;
+        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         
         self.layers.rmsnorm_final_layer.forward(
             &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
@@ -760,20 +720,7 @@ impl Llama3 {
         Ok(next_token)
     }
 
-    /// 从工作区中检索一个对张量的不可变引用。
-    ///
-    /// 这是在前向传播中为算子获取输入张量的主要方式。
-    /// 如果请求的缓冲区不存在，将返回一个错误。
-    ///
-    /// # 参数
-    /// - `buffer_type`: 需要检索的缓冲区的 `BufferType` 枚举键。
-    ///
-    /// # 返回
-    /// - `Result<&Tensor>`: 成功时返回对张量的引用，失败时返回错误。
     pub fn get_buffer(&self, buffer_type: BufferType) -> Result<&Tensor> {
-        // HashMap::get 返回一个 Option<&Tensor>
-        // 我们使用 ok_or_else 将 None 的情况转换为一个具体的错误。
-        // 这种方式比 .unwrap() 或 .expect() 更健壮，因为它允许错误被优雅地传播。
         self.workspace.get(&buffer_type).ok_or_else(|| {
             Error::InternalError(format!(
                 "Buffer {:?} not found in workspace.",
@@ -782,18 +729,7 @@ impl Llama3 {
         })
     }
 
-    /// 从工作区中检索一个对张量的可变引用。
-    ///
-    /// 这主要用于为算子获取输出缓冲区，以便将计算结果写入其中。
-    /// 如果请求的缓冲区不存在，将返回一个错误。
-    ///
-    /// # 参数
-    /// - `buffer_type`: 需要检索的缓冲区的 `BufferType` 枚举键。
-    ///
-    /// # 返回
-    /// - `Result<&mut Tensor>`: 成功时返回对张量的可变引用，失败时返回错误。
     pub fn get_buffer_mut(&mut self, buffer_type: BufferType) -> Result<&mut Tensor> {
-        // HashMap::get_mut 返回一个 Option<&mut Tensor>
         self.workspace.get_mut(&buffer_type).ok_or_else(|| {
             Error::InternalError(format!(
                 "Mutable buffer {:?} not found in workspace.",
@@ -857,7 +793,7 @@ Today Date: 14 Dec 2025
         let max_tokens = 50;
         
         println!("Starting CPU generation...");
-        let (_, duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
+        let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
         
         // --- 3. Assert & Report (断言 & 报告) ---
         assert!(num_generated_tokens > 0, "No tokens were generated.");
@@ -927,7 +863,7 @@ Today Date: 14 Dec 2025
         // --- 2. 在 CUDA 上运行并获取结果和性能 ---
         println!("\n=== Step 2: Running on CUDA ===");
         let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (_cuda_generated_text, cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
+        let (_cuda_generated_text, _cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
 
         // 计算更详细的性能指标
         let prompt_tokens = model_cuda.tokenizer.encode(prompt)?;

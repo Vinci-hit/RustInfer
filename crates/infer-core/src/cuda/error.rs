@@ -30,7 +30,7 @@ macro_rules! cuda_check {
         {
             let result = $expr;
             if result != $crate::cuda::ffi::cudaError_cudaSuccess {
-                Err($crate::base::error::Error::CudaError(crate::cuda::error::CudaError(result)))
+                Err($crate::base::error::Error::CudaError($crate::cuda::error::CudaError(result)))
             } else {
                 // 成功时返回 Ok(())
                 Ok(())
