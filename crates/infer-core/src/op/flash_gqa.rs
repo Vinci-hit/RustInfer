@@ -19,7 +19,7 @@ impl FlashAttnGQA {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
-        if num_q_heads % num_kv_heads != 0 {
+        if !num_q_heads.is_multiple_of(num_kv_heads) {
             return Err(Error::InvalidArgument(format!(
                 "FlashAttnGQA requires num_q_heads ({}) to be a multiple of num_kv_heads ({}).",
                 num_q_heads, num_kv_heads
@@ -204,7 +204,7 @@ mod tests {
         ];
         // 校验维度（可选，避免粘贴错误）
         assert_eq!(input_q_data.len(), q_s * q_d, "Q数组长度不匹配 q_s*q_d");
-        let mut input_q = Tensor::new(&[q_s, q_d], dtype, device.clone())?;
+        let mut input_q = Tensor::new(&[q_s, q_d], dtype, device)?;
         input_q.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&input_q_data);
 
         // --------------------------
@@ -217,7 +217,7 @@ mod tests {
         ];
         // 校验维度（可选）
         assert_eq!(input_k_cache_data.len(), k_s_max * kv_d, "K_cache数组长度不匹配 k_s_max*kv_d");
-        let mut input_k_cache = Tensor::new(&[k_s_max, kv_d], dtype, device.clone())?;
+        let mut input_k_cache = Tensor::new(&[k_s_max, kv_d], dtype, device)?;
         input_k_cache.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&input_k_cache_data);
 
         // --------------------------
@@ -231,13 +231,13 @@ mod tests {
         ];
         // 校验维度（可选）
         assert_eq!(input_v_cache_data.len(), k_s_max * kv_d, "V_cache数组长度不匹配 k_s_max*kv_d");
-        let mut input_v_cache = Tensor::new(&[k_s_max, kv_d], dtype, device.clone())?;
+        let mut input_v_cache = Tensor::new(&[k_s_max, kv_d], dtype, device)?;
         input_v_cache.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&input_v_cache_data);
 
         // --------------------------
         // 4. 初始化 O: [Q_S, Q_D]（保持零初始化，原逻辑正确）
         // --------------------------
-        let mut output_o = Tensor::new(&[q_s, q_d], dtype, device.clone())?;
+        let mut output_o = Tensor::new(&[q_s, q_d], dtype, device)?;
         output_o.as_f32_mut()?.buffer_mut().zero_out()?;
 
         Ok((input_q, input_k_cache, input_v_cache, output_o))

@@ -94,13 +94,13 @@ pub struct RuntimeModelConfig {
 impl RuntimeModelConfig {
     pub fn new(file_config: &ModelFileConfig) -> Result<Self> {
         // 进行参数有效性检查
-        if file_config.hidden_size % file_config.num_attention_heads != 0 {
+        if !file_config.hidden_size.is_multiple_of(file_config.num_attention_heads) {
             return Err(Error::InvalidArgument(format!(
                 "hidden_size ({}) must be divisible by num_attention_heads ({})",
                 file_config.hidden_size, file_config.num_attention_heads
             )).into());
         }
-        if file_config.num_attention_heads % file_config.num_key_value_heads != 0 {
+        if !file_config.num_attention_heads.is_multiple_of(file_config.num_key_value_heads) {
             return Err(Error::InvalidArgument(format!(
                 "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
                 file_config.num_attention_heads, file_config.num_key_value_heads
@@ -120,7 +120,7 @@ impl RuntimeModelConfig {
         let kv_mul = head_num / kv_head_num;
 
         let is_shared_weight = file_config.vocab_size > 0;
-        let vocab_size = file_config.vocab_size.abs() as usize;
+        let vocab_size = file_config.vocab_size.unsigned_abs() as usize;
 
         let immediate_dim = file_config.immediate_dim;
 

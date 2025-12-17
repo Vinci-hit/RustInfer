@@ -14,6 +14,12 @@ impl SwiGLU {
     }
 }
 
+impl Default for SwiGLU {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Op for SwiGLU {
     fn name(&self) -> &'static str {
         "SwiGLU"
@@ -69,7 +75,7 @@ impl Op for SwiGLU {
                 if dtype == DataType::F32 {
                     kernels::cpu::swiglu(input_y, input_output_x)
                 } else {
-                    return Err(Error::InvalidArgument("Unsupported dtype for CPU SwiGLU.".into()).into());
+                    Err(Error::InvalidArgument("Unsupported dtype for CPU SwiGLU.".into()).into())
                 }
             }
             

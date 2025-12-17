@@ -32,7 +32,7 @@ pub fn embedding(
 
     // --- 2. 检查前置条件 (对齐) ---
     let dim = weight.shape()[1];
-    if dim % 4 != 0 {
+    if !dim.is_multiple_of(4) {
         return Err(Error::InvalidArgument(
             "CUDA Embedding kernel (fp32x4) requires the embedding dimension to be a multiple of 4.".into()
         ).into());

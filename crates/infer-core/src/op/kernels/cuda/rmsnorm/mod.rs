@@ -23,7 +23,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
     let dim = weight_typed.shape()[0];
     let rows = input_typed.num_elements() / dim;
     if dim % 16 != 0 {
-        return Err(Error::InvalidArgument(format!("rmsnrom input last dim must 对齐16字节！未实现无对齐的版本！")).into());
+        return Err(Error::InvalidArgument("rmsnrom input last dim must 对齐16字节！未实现无对齐的版本！".to_string()).into());
     }
     let input_ptr = input_typed.buffer().as_ptr() as *const f32;
     let weight_ptr = weight_typed.buffer().as_ptr() as *const f32;
