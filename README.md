@@ -203,12 +203,8 @@ pub trait Op {
 
 ```bash
 cargo test
-```
-
-运行CUDA相关测试：
-
-```bash
-cargo test --features cuda
+cargo test test_llama3_cuda_performance -- --show-output --ignored
+cargo test test_llama3_cpu_loading_and_generation -- --show-output --ignored
 ```
 
 ## 许可证
@@ -228,3 +224,6 @@ cargo test --features cuda
 ## 文档说明
 
 *本文档由AI生成，仅供参考。具体实现细节和功能请以代码为准，实际使用中可能需要根据具体情况进行调整和分析。*
+
+## 本项目主要灵感源于课程KuiperLLama
+- KuiperLLama代码: [https://github.com/zjhellofss/KuiperLLama](https://github.com/zjhellofss/KuiperLLama)

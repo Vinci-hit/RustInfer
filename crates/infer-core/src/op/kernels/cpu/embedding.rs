@@ -4,6 +4,8 @@ use rayon::prelude::*; // 引入 rayon 的并行迭代器 trait
 
 /// Embedding 的 CPU 高性能内核实现 (并行化)
 pub fn embedding(input_tokens: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()> {
+    println!("Weight shape: {:?}", weight.shape());
+    println!("Expected: [128256, 4096]");
     // --- 1. 获取数据 slice (与之前版本相同) ---
     let tokens_typed = input_tokens.as_i32()?;
     let weight_typed = weight.as_f32()?;
@@ -12,7 +14,6 @@ pub fn embedding(input_tokens: &Tensor, weight: &Tensor, output: &mut Tensor) ->
     let tokens_slice = tokens_typed.as_slice()?;
     let weight_slice = weight_typed.as_slice()?;
     let output_slice = output_typed.as_slice_mut()?;
-
     let vocab_size = weight.shape()[0];
     let dim = weight.shape()[1];
 
@@ -46,6 +47,5 @@ pub fn embedding(input_tokens: &Tensor, weight: &Tensor, output: &mut Tensor) ->
             // 将权重行拷贝到输出行的 chunk 中
             output_row.copy_from_slice(weight_row);
         });
-
     Ok(())
 }

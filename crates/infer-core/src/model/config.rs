@@ -71,7 +71,7 @@ pub struct ModelFileConfig {
 pub struct RuntimeModelConfig {
     // === 直接参数 ===
     pub dim: usize,
-    pub hidden_dim: usize,
+    pub intermediate_size: usize,
     pub layer_num: usize,
     pub head_num: usize,
     pub kv_head_num: usize,
@@ -108,7 +108,7 @@ impl RuntimeModelConfig {
         }
         
         let dim = file_config.hidden_size;
-        let hidden_dim = file_config.intermediate_size;
+        let intermediate_size = file_config.intermediate_size;
         let layer_num = file_config.num_hidden_layers;
         let head_num = file_config.num_attention_heads;
         let kv_head_num = file_config.num_key_value_heads;
@@ -127,7 +127,7 @@ impl RuntimeModelConfig {
 
         Ok(Self {
             dim,
-            hidden_dim,
+            intermediate_size,
             layer_num,
             head_num,
             kv_head_num,
