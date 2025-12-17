@@ -91,8 +91,13 @@ cargo build --release --features cuda
 ```
 先运行 cargo test 来保证所有测试正常通过
 接着再测试性能
-cargo test --release test_llama3_cuda_vs_cpu_performance -- --ignored
+cargo test test_llama3_cuda_performance -- --show-output --ignored
+cargo test test_llama3_cpu_loading_and_generation -- --show-output --ignored
 ```
+
+下图展示了运行cargo test test_llama3_cuda_performance -- --show-output --ignored在H200上运行的结果：
+
+![性能测试图](test_images/image1.png)
 
 5. **常见错误**
 ```
@@ -101,9 +106,12 @@ ndarray-linalg有许多后端，如果openblas用不了，可以尝试其它的�
 
 6、**改进选项**
 ```
-现在的mha是用固定32x32block的GQA flashattention实现，对decoder阶段的性能很差。
+大部分算子无优化。
 修改build.rs 里面的计算能力flag 以适配不同的显卡。
-cuda feature 未完全拆分
+cuda feature 未完全拆分。
+尚未支持计算图。
+尚未支持bf16原生计算，现在是通过转为f32到内存保存。
+未支持量化。
 ```
 
 ## 使用方法

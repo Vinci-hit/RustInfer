@@ -27,6 +27,8 @@ impl Dtype for bf16 { const DTYPE: DataType = DataType::BF16; }
 pub struct TypedTensor<T: Dtype> {
     /// 形状 (dimensions)
     dims: Arc<[usize]>,
+    /// 元素总数，缓存起来避免重复计算
+    num_elements: usize,
     /// 底层存储的 Buffer，Arc 实现了共享所有权
     buffer: Buffer,
     /// 占位符，告诉编译器我们“拥有”类型 T 的数据
@@ -49,6 +51,7 @@ impl<T: Dtype> TypedTensor<T> {
 
         Ok(Self {
             dims: Arc::from(shape),
+            num_elements,
             buffer,
             _phantom: std::marker::PhantomData,
         })
@@ -67,6 +70,7 @@ impl<T: Dtype> TypedTensor<T> {
         
         Ok(Self {
             dims: Arc::from(shape),
+            num_elements,
             buffer,
             _phantom: std::marker::PhantomData,
         })
@@ -107,7 +111,7 @@ impl<T: Dtype> TypedTensor<T> {
     }
 
     pub fn num_elements(&self) -> usize {
-        self.shape().iter().product()
+        self.num_elements
     }
 }
 
@@ -182,7 +186,7 @@ impl Tensor {
 
     /// 返回元素的总数
     pub fn num_elements(&self) -> usize {
-        self.shape().iter().product()
+        dispatch_on_tensor!(self, num_elements())
     }
 
     /// 创建一个新的 Tensor 视图，具有不同的形状 (零拷贝)。
@@ -198,21 +202,25 @@ impl Tensor {
         match self {
             Tensor::F32(t) => Ok(Tensor::F32(TypedTensor {
                 dims: new_dims,
+                num_elements: self.num_elements(), // 新形状的元素数量与原形状相同
                 buffer: t.buffer().clone(), // 廉价的 Arc clone
                 _phantom: std::marker::PhantomData,
             })),
             Tensor::I32(t) => Ok(Tensor::I32(TypedTensor {
                 dims: new_dims,
+                num_elements: self.num_elements(),
                 buffer: t.buffer().clone(),
                 _phantom: std::marker::PhantomData,
             })),
             Tensor::I8(t) => Ok(Tensor::I8(TypedTensor {
                 dims: new_dims,
+                num_elements: self.num_elements(),
                 buffer: t.buffer().clone(),
                 _phantom: std::marker::PhantomData,
             })),
             Tensor::BF16(t) => Ok(Tensor::BF16(TypedTensor {
                 dims: new_dims,
+                num_elements: self.num_elements(),
                 buffer: t.buffer().clone(),
                 _phantom: std::marker::PhantomData,
             })),
@@ -296,21 +304,25 @@ impl Tensor {
         let new_typed_tensor = match self {
             Tensor::F32(t) => Tensor::F32(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: cpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::I32(t) => Tensor::I32(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: cpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::I8(t) => Tensor::I8(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: cpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::BF16(t) => Tensor::BF16(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: cpu_buffer,
                 _phantom: std::marker::PhantomData,
             })
@@ -338,21 +350,25 @@ impl Tensor {
         let new_typed_tensor = match self {
             Tensor::F32(t) => Tensor::F32(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: gpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::I32(t) => Tensor::I32(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: gpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::I8(t) => Tensor::I8(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: gpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::BF16(t) => Tensor::BF16(TypedTensor {
                 dims: t.shape().clone(),
+                num_elements: t.num_elements(),
                 buffer: gpu_buffer,
                 _phantom: std::marker::PhantomData,
             })
