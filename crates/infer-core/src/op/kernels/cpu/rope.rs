@@ -161,104 +161,6 @@ pub fn sin_cos_cache_calc(
 
     Ok(())
 }
-// ndarray 在这里没有直接用到视图，因为操作是逐元素的，但我们保留了风格和 Result 的使用。
-
-/// 应用 Rotary Positional Embedding (RoPE) 旋转核。
-/// 这是一个就地 (in-place) 操作，会修改 input_q 和 input_k 的内容。
-/// 
-/// # Arguments
-/// * `dim`: Q 和 K 向量的总旋转维度 (通常是模型维度)。
-/// * `kv_dim`: K 向量旋转的维度。如果 `dim > kv_dim`，则 Q 在剩余维度上单独旋转。
-/// * `head_size`: Attention Head 的大小，用于 RoPE 缓存的索引计算。
-/// * `input_q`: Query 张量，将被就地修改。
-/// * `input_k`: Key 张量，将被就地修改 (直到 kv_dim)。
-/// * `input_pos`: 包含当前位置索引的张量 (通常是 [1] 形状的 i32 张量)。
-/// * `sin_cache`: 正弦缓存张量。
-/// * `cos_cache`: 余弦缓存张量。
-pub fn rope_kernel(
-    dim: usize,
-    kv_dim: usize,
-    head_size: usize,
-    input_q: &mut Tensor,
-    input_k: &mut Tensor,
-    input_pos: &Tensor,
-    sin_cache: &Tensor,
-    cos_cache: &Tensor,
-) -> Result<()> {
-    // --- 1. 获取类型化的数据切片 ---
-    // Q 和 K 需要可变切片
-    let q_slice = input_q.as_f32_mut()?.as_slice_mut()?;
-    let k_slice = input_k.as_f32_mut()?.as_slice_mut()?;
-
-    // Cache 需要不可变切片
-    let sin_slice = sin_cache.as_f32()?.as_slice()?;
-    let cos_slice = cos_cache.as_f32()?.as_slice()?;
-    
-    // Position 需要 i32 切片
-    let pos_slice = input_pos.as_i32()?.as_slice()?;
-
-    // --- 2. 获取当前位置 `pos` 并进行基本检查 ---
-    if pos_slice.is_empty() {
-        return Err(Error::InvalidArgument("input_pos tensor is empty".to_string()).into());
-    }
-    
-    let pos = pos_slice[0] as usize;
-
-    // --- 3. 维度检查 (保障后续索引安全) ---
-
-    if kv_dim > dim {
-         return Err(Error::InvalidArgument(
-            format!("kv_dim ({}) cannot be greater than dim ({}).", kv_dim, dim)
-        ).into());
-    }
-    // 缓存索引 pos * head_size + head_size - 1 必须小于缓存长度
-    // 假设缓存是 [max_seq_len, head_size]
-    let max_cache_index = (pos + 1) * head_size;
-    if max_cache_index > sin_slice.len() || max_cache_index > cos_slice.len() {
-        return Err(Error::IndexOutOfBounds(
-            format!("RoPE cache index out of bounds. pos={}, head_size={}, cache_len={}",
-                    pos, head_size, sin_slice.len())
-        ).into());
-    }
-    
-
-    // --- 4. 核心 RoPE 旋转计算 ---
-    // 循环从 0 到 dim，步长为 2 (处理 (i, i+1) 对)
-    for i in (0..dim).step_by(2) {
-        // 计算缓存的索引
-        let head_dim = i % head_size;
-        let cache_idx = pos * head_size + head_dim;
-
-        // 加载 sin 和 cos 值
-        // 由于我们在 3 中已经检查了边界，这里可以直接使用 [cache_idx]
-        let fci = sin_slice[cache_idx]; // sin(val)
-        let fcr = cos_slice[cache_idx]; // cos(val)
-
-        // **旋转 Query (Q) 向量**
-        // 获取 Q 的 (v0, v1)
-        let v0_q = q_slice[i];
-        let v1_q = q_slice[i + 1];
-        
-        // 应用旋转: v0' = v0 * cos - v1 * sin, v1' = v0 * sin + v1 * cos
-        q_slice[i]     = v0_q * fcr - v1_q * fci;
-        q_slice[i + 1] = v0_q * fci + v1_q * fcr;
-        
-        // **旋转 Key (K) 向量**
-
-        if i < kv_dim {
-            // 获取 K 的 (v0, v1)
-            let v0_k = k_slice[i];
-            let v1_k = k_slice[i + 1];
-
-            // 应用旋转
-            k_slice[i]     = v0_k * fcr - v1_k * fci;
-            k_slice[i + 1] = v0_k * fci + v1_k * fcr;
-        }
-    }
-
-    Ok(())
-}
-
 pub fn rope_kernel_batch(
     // dim, kv_dim, head_size: 这些通常是 RoPEOp 算子的成员，可以从那里获取
     kv_dim: usize,
@@ -271,9 +173,6 @@ pub fn rope_kernel_batch(
     sin_cache: &Tensor,
     cos_cache: &Tensor,
 ) -> Result<()> {
-    // --- 1. 获取类型化的数据切片 ---
-    // (与之前类似，但现在我们将它们包装成二维 ndarray 视图)
-    // --- 2. 获取维度和起始位置 ---
     if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
         return Err(Error::InvalidArgument("Input Q and K for batch RoPE must be 2D.".to_string()).into());
     }
@@ -297,53 +196,38 @@ pub fn rope_kernel_batch(
                     max_pos, head_size, sin_slice.len())
         ).into());
     }
-    
     // --- 4. 将切片包装成二维 ndarray 视图以方便按行迭代 ---
     
-    let mut q_view: ArrayViewMut2<f32> = ArrayViewMut2::from_shape((seq_len, dim), q_slice).map_err(|e| 
-        Error::InvalidArgument(format!("Q view creation failed: {}", e))
-    )?;
-    let mut k_view: ArrayViewMut2<f32> = ArrayViewMut2::from_shape((seq_len, kv_dim), k_slice).map_err(|e| 
-        Error::InvalidArgument(format!("K view creation failed: {}", e))
-    )?;
-    
-    // --- 5. 核心 RoPE 旋转计算 (并行化) ---
-    // a) 并行地迭代 q_view 和 k_view 的每一行
-    q_view.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(k_view.axis_iter_mut(Axis(0)).into_par_iter())
-        // b) 使用 .enumerate() 来获取当前行在批次中的相对索引 `i`
-        .enumerate()
-        .for_each(|(i, (mut q_row, mut k_row))| {
-            // c) 计算当前 token 在整个序列中的绝对位置 `pos`
-            let pos = start_pos + i;
+    let head_dim = head_size; // 每个头的维度（64）
 
-            // d) 迭代当前行的每个维度对 (j, j+1)
-            for j in (0..dim).step_by(2) {
-                // 计算在 sin/cos 缓存中查找的索引
-                let head_dim = j % head_size;
-                let cache_idx = pos * head_size + head_dim;
-
-                // 加载 sin 和 cos 值 (边界已检查，这里是安全的)
-                let fci = sin_slice[cache_idx];
-                let fcr = cos_slice[cache_idx];
-
-                // **旋转 Query (Q) 行向量**
-                let v0_q = q_row[j];
-                let v1_q = q_row[j + 1];
-                q_row[j]     = v0_q * fcr - v1_q * fci;
-                q_row[j + 1] = v0_q * fci + v1_q * fcr;
-
-                // **旋转 Key (K) 行向量**
-                // 只有当维度 j 在 kv_dim 范围内时才旋转
+    // ========== 核心顺序逻辑：遍历每个token（行） ==========
+    for i in 0..seq_len {
+        // 计算当前token的绝对位置
+        let pos = start_pos + i;
+        // ========== 处理Q的旋转：逐token+逐成对维度 ==========
+        // Q当前行的起始索引：i * dim
+        let q_row_start = i * dim;
+        let k_row_start = i * kv_dim;
+        for j in (0..dim).step_by(head_dim) {
+            for k in 0..head_dim/2 {
+                let sin_val = sin_slice[pos * head_dim + k*2];
+                let cos_val = cos_slice[pos * head_dim + k*2];
+                let q_idx_j = q_row_start + j + k;
+                let q_idx_j1 = q_row_start + j + k + head_dim / 2;
+                let v0_q = q_slice[q_idx_j];
+                let v1_q = q_slice[q_idx_j1];
+                q_slice[q_idx_j] = v0_q * cos_val - v1_q * sin_val;
+                q_slice[q_idx_j1] = v0_q * sin_val + v1_q * cos_val;
                 if j < kv_dim {
-                    let v0_k = k_row[j];
-                    let v1_k = k_row[j + 1];
-                    k_row[j]     = v0_k * fcr - v1_k * fci;
-                    k_row[j + 1] = v0_k * fci + v1_k * fcr;
+                    let k_idx_j = k_row_start + j + k;
+                    let k_idx_j1 = k_row_start + j + k + head_dim / 2;
+                    let v0_k = k_slice[k_idx_j];
+                    let v1_k = k_slice[k_idx_j1];
+                    k_slice[k_idx_j] = v0_k * cos_val - v1_k * sin_val;
+                    k_slice[k_idx_j1] = v0_k * sin_val + v1_k * cos_val;
                 }
             }
-        });
-    
+        }
+    }
     Ok(())
 }

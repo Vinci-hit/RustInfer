@@ -41,40 +41,33 @@ __global__ void rope_rotate_kernel(
     const float* __restrict__ sin_cache,
     const float* __restrict__ cos_cache)
 {
-    // 每个线程处理一个维度对 (i, i+1)
-    // 线程索引 i 从 0 到 dim/2 - 1
-    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // 每个线程处理一个head_size的元素
+    // 每个block处理一个dim，y轴为seq_len
+    int start_head_id = blockIdx.x * head_size;
+    int start_thread_id = threadIdx.x;
     int seq_pos = blockIdx.y;
-    // 我们只需要 dim/2 个线程，因为每个线程处理两个元素 (i 和 i+1)
-    if (thread_idx * 2 >= dim) {
-        return;
-    }
 
     // 旋转操作的维度索引 i = 2 * thread_idx
-    int i = thread_idx * 2;
-    
-    // --- 1. 计算缓存索引和加载 sin/cos ---
-    // Caching index: pos * head_size + head_dim
-    int head_dim = i % head_size;
-    int cache_idx = (pos + seq_pos) * head_size + head_dim;
-    // 加载 sin 和 cos 值
-    float fci = sin_cache[cache_idx]; // sin(val)
-    float fcr = cos_cache[cache_idx]; // cos(val)
-    // --- 2. 旋转 Query (Q) 向量 ---
-    auto some_ptr = reinterpret_cast<float2*>(input_q + (seq_pos * dim) + i);
-    
-    // 应用旋转: v0' = v0 * cos - v1 * sin, v1' = v0 * sin + v1 * cos
-    float2 some = *some_ptr;
-    (*some_ptr).x    = some.x * fcr - some.y * fci;
-    (*some_ptr).y    = some.x * fci + some.y * fcr;
-    
-    // --- 3. 旋转 Key (K) 向量 ---
-    // 只有当 i < kv_dim 时才旋转 K
-    if (i < kv_dim) {
-        auto some_ptr = reinterpret_cast<float2*>(input_k + (seq_pos * kv_dim) + i);
-        float2 some = *some_ptr;
-        (*some_ptr).x    = some.x * fcr - some.y * fci;
-        (*some_ptr).y    = some.x * fci + some.y * fcr;
+    int abs_pos = pos + seq_pos;
+    int q_start = seq_pos * dim;
+    int k_start = seq_pos * kv_dim;
+    for (int i = 0; i < head_size / 2; i ++) {
+        float sin_val = sin_cache[abs_pos * head_size + i*2]; // sin(val)
+        float cos_val = cos_cache[abs_pos * head_size + i*2]; // cos(val)
+        int q_idx_j = q_start + start_head_id + i;
+        int q_idx_j1 = q_start + start_head_id + i + head_size / 2;
+        float v0_q = input_q[q_idx_j];
+        float v1_q = input_q[q_idx_j1];
+        input_q[q_idx_j] = v0_q * cos_val - v1_q * sin_val;
+        input_q[q_idx_j1] = v0_q * sin_val + v1_q * cos_val;
+        if (start_head_id < kv_dim) {
+            int k_idx_j = k_start + start_head_id + i;
+            int k_idx_j1 = k_start + start_head_id + i + head_size / 2;
+            float v0_k = input_k[k_idx_j];
+            float v1_k = input_k[k_idx_j1];
+            input_k[k_idx_j] = v0_k * cos_val - v1_k * sin_val;
+            input_k[k_idx_j1] = v0_k * sin_val + v1_k * cos_val;
+        }
     }
 }
 
@@ -92,12 +85,12 @@ extern "C" void rope_kernel_cu(
     const float* cos_cache,
     cudaStream_t stream)
 {
-    const int THREADS_PER_BLOCK = 256;
-    int num_rotations = dim / 2;
-    int num_blocks = (num_rotations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    int threads_per_block = head_size/2;
+    int num_blocks = dim / head_size; // 必定能整除
+    // 每个thread处理一个head_size，每个block处理一个dim，y轴为seq_len
     dim3 grid(num_blocks, seq_len);
     // 3. 启动核函数
-    rope_rotate_kernel<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
+    rope_rotate_kernel<<<grid, threads_per_block, 0, stream>>>(
         dim,
         kv_dim,
         head_size,
