@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
+use std::time::Instant;
 use crate::cuda::CudaConfig;
 use crate::op::{Op, OpContext};
 use super::config::RuntimeModelConfig;
@@ -523,7 +524,7 @@ impl Llama3 {
     /// # 返回
     /// - `Result<String>`: 成功时返回完整的生成文本（不包括提示）。
     /// 使用当前模型生成文本，支持对长提示进行批处理优化。
-    pub fn generate(&mut self, prompt: &str, max_tokens: usize, print_output: bool) -> Result<(String,u32)> {
+    pub fn generate(&mut self, prompt: &str, max_tokens: usize, print_output: bool) -> Result<(String,u32, u64, u64, usize)> {
         if print_output {
             println!("----------------------------------------");
             println!("Prompt: {}", prompt);
@@ -534,8 +535,11 @@ impl Llama3 {
         if prompt_tokens.is_empty() {
             return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
         }
-        // 这个方法会填充 KV 缓存，并返回整个序列的最后一个。
+        // --- 2. Prefill 阶段 (填充 KV 缓存) ---
+        let prefill_start = Instant::now();
         let mut current_token = self.forward_batch(&prompt_tokens,0)?;
+        let prefill_duration = prefill_start.elapsed();
+        let prefill_ms = prefill_duration.as_millis() as u64;
 
         // --- 3. 生成阶段 ---
         let mut generated_tokens = vec![current_token];
@@ -546,6 +550,8 @@ impl Llama3 {
         }
 
         // 生成循环从提示的末尾开始
+        let decode_start = Instant::now();
+        let mut decode_iterations = 0;
         for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
             // 后续的 token 生成仍然是逐个进行的
             let next_token = self.forward_batch(&[current_token], pos)?;
@@ -556,6 +562,7 @@ impl Llama3 {
 
             generated_tokens.push(next_token);
             current_token = next_token;
+            decode_iterations += 1;
 
             if print_output {
                 let decoded = self.tokenizer.decode(&[current_token])?;
@@ -563,12 +570,14 @@ impl Llama3 {
                 io::stdout().flush()?;
             }
         }
+        let decode_duration = decode_start.elapsed();
+        let decode_ms = decode_duration.as_millis() as u64;
         if print_output {
             println!();
         }
         // --- 4. 解码并返回完整结果 ---
         let some_string = self.tokenizer.decode(&generated_tokens)?;
-        Ok((some_string, generated_tokens.len() as u32))
+        Ok((some_string, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
 
     /// 从 KV 缓存中获取指定层和位置的 Key 和 Value 的零拷贝视图。
@@ -809,16 +818,16 @@ mod tests {
         prompt: &str,
         max_tokens: usize,
         verbose: bool
-    ) -> Result<(String, u64, u32)> {
+    ) -> Result<(String, u64, u32, u64, u64, usize)> {
         
         let start_time = Instant::now();
         
         // 执行生成，verbose设为false以减少IO干扰
-        let (generated_text, num_generated_tokens) = model.generate(prompt, max_tokens, verbose)?;
+        let (generated_text, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = model.generate(prompt, max_tokens, verbose)?;
         let duration = start_time.elapsed();
         let duration_ms = duration.as_millis() as u64;
         
-        Ok((generated_text, duration_ms, num_generated_tokens))
+        Ok((generated_text, duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations))
     }
 
     #[test]
@@ -848,21 +857,50 @@ Today Date: 14 Dec 2025
         let max_tokens = 50;
         
         println!("Starting CPU generation...");
-        let (_, duration_ms, num_generated_tokens) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
+        let (_, duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
         
         // --- 3. Assert & Report (断言 & 报告) ---
         assert!(num_generated_tokens > 0, "No tokens were generated.");
         
-        let tps = if duration_ms > 0 {
-            (num_generated_tokens as f64) / (duration_ms as f64 / 1000.0)
+        // 计算更详细的性能指标
+        let prompt_tokens = model.tokenizer.encode(prompt)?;
+        let prompt_tokens_len = prompt_tokens.len() as f64;
+        let generated_tokens_len = num_generated_tokens as f64;
+        let total_tokens = prompt_tokens_len + generated_tokens_len;
+        
+        // 使用generate内部测量的纯计算时间作为总时间，而不是generate_and_measure的外部时间
+        let total_compute_ms = (prefill_ms + decode_ms) as f64;
+        
+        let tps = if total_compute_ms > 0.0 {
+            total_tokens / (total_compute_ms / 1000.0)
+        } else {
+            0.0
+        };
+        
+        let prefill_throughput = if prefill_ms > 0 {
+            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        
+        let decode_avg_itl = if decode_iterations > 0 {
+            decode_ms as f64 / decode_iterations as f64
+        } else {
+            0.0
+        };
+        
+        let decode_throughput = if decode_ms > 0 {
+            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
         } else {
             0.0
         };
 
         println!("\n================ CPU PERFORMANCE ================");
-        println!("Total Generation Time: {} ms", duration_ms);
-        println!("Generated Tokens: {}", num_generated_tokens);
-        println!("Tokens Per Second (TPS): {:.2}", tps);
+        println!("Total Generation Time (compute only): {} ms", total_compute_ms as u64);
+        println!("Generated Tokens: {}, Prompt Tokens: {}", num_generated_tokens, prompt_tokens_len as usize);
+        println!("Total Tokens: {}, Tokens Per Second (TPS): {:.2}", total_tokens as usize, tps);
+        println!("Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, prefill_throughput);
+        println!("Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
         println!("==================================================\n");
         
         Ok(())
@@ -889,17 +927,46 @@ Today Date: 14 Dec 2025
         // --- 2. 在 CUDA 上运行并获取结果和性能 ---
         println!("\n=== Step 2: Running on CUDA ===");
         let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (cuda_generated_text, cuda_duration_ms, cuda_num_tokens) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
+        let (_cuda_generated_text, cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
 
-        let cuda_tps = if cuda_duration_ms > 0 {
-            (cuda_num_tokens as f64) / (cuda_duration_ms as f64 / 1000.0)
+        // 计算更详细的性能指标
+        let prompt_tokens = model_cuda.tokenizer.encode(prompt)?;
+        let prompt_tokens_len = prompt_tokens.len() as f64;
+        let generated_tokens_len = cuda_num_tokens as f64;
+        let total_tokens = prompt_tokens_len + generated_tokens_len;
+        
+        // 使用generate内部测量的纯计算时间作为总时间，而不是generate_and_measure的外部时间
+        let total_compute_ms = (prefill_ms + decode_ms) as f64;
+        
+        let cuda_tps = if total_compute_ms > 0.0 {
+            total_tokens / (total_compute_ms / 1000.0)
+        } else {
+            0.0
+        };
+        
+        let prefill_throughput = if prefill_ms > 0 {
+            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        
+        let decode_avg_itl = if decode_iterations > 0 {
+            decode_ms as f64 / decode_iterations as f64
+        } else {
+            0.0
+        };
+        
+        let decode_throughput = if decode_ms > 0 {
+            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
         } else {
             0.0
         };
 
-        // --- 4. 报告性能 ---
         println!("\n================ PERFORMANCE COMPARISON ================");
-        println!("CUDA - Total Time: {} ms, Tokens: {}, TPS: {:.2}", cuda_duration_ms, cuda_num_tokens, cuda_tps);
+        println!("CUDA - Total Time (compute only): {} ms, Total Tokens: {}, TPS: {:.2}", total_compute_ms as u64, total_tokens as usize, cuda_tps);
+        println!("CUDA - Generated Tokens: {}, Prompt Tokens: {}", cuda_num_tokens, prompt_tokens_len as usize);
+        println!("CUDA - Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, prefill_throughput);
+        println!("CUDA - Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
         println!("=========================================================\n");
         Ok(())
     }
