@@ -38,7 +38,7 @@ pub fn sin_cos_cache_calc_bf16(
     // --- 2. 预先计算频率 freqs (总是使用 f32 计算) ---
     let freqs: Vec<f32> = (0..head_size).map(|head_dim| {
         let exponent = head_dim as f32 / head_size as f32;
-        1.0f32 / 10000.0f32.powf(exponent)
+        1.0f32 / 500000.0f32.powf(exponent)
     }).collect();
     
     // --- 3. 核心多线程并行计算并填充 BF16 缓存 ---
@@ -70,10 +70,107 @@ pub fn sin_cos_cache_calc_bf16(
     Ok(())
 }
 
+/// BF16版本的rope_kernel_batch实现
+/// 支持自动解析为f32进行计算，计算完再转为bf16塞回去
+pub fn rope_kernel_batch_bf16(
+    kv_dim: usize,
+    head_size: usize,
+    input_q: &mut Tensor,
+    input_k: &mut Tensor,
+    start_pos_tensor: &Tensor,
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+) -> Result<()> {
+    if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
+        return Err(Error::InvalidArgument("Input Q and K for batch RoPE must be 2D.".to_string()).into());
+    }
+    
+    let seq_len = input_q.shape()[0];
+    let dim = input_q.shape()[1];
+    
+    // 获取BF16切片
+    let q_slice_bf16 = input_q.as_bf16_mut()?.as_slice_mut()?;
+    let k_slice_bf16 = input_k.as_bf16_mut()?.as_slice_mut()?;
+    // 对于BF16计算，sin/cos缓存仍然是F32类型（为了数值稳定性）
+    let sin_slice = sin_cache.as_bf16()?.as_slice()?;
+    let cos_slice = cos_cache.as_bf16()?.as_slice()?;
+    let start_pos_slice = start_pos_tensor.as_i32()?.as_slice()?;
+    
+    if start_pos_slice.is_empty() {
+        return Err(Error::InvalidArgument("start_pos_tensor is empty".to_string()).into());
+    }
+    
+    let start_pos = start_pos_slice[0] as usize;
+    
+    // --- 3. 维度和边界检查 ---
+    let max_pos = start_pos + seq_len-1;
+    let max_cache_index = max_pos * head_size;
+    if max_cache_index > sin_slice.len() || max_cache_index > cos_slice.len() {
+        return Err(Error::IndexOutOfBounds(
+            format!("RoPE cache index out of bounds. Max pos={}, head_size={}, cache_len={}",
+                    max_pos, head_size, sin_slice.len())
+        ).into());
+    }
+    
+    let head_dim = head_size; // 每个头的维度（64）
+
+    // ========== 核心逻辑：遍历每个token（行） ==========
+    for i in 0..seq_len {
+        // 计算当前token的绝对位置
+        let pos = start_pos + i;
+        // ========== 处理Q的旋转：逐token+逐成对维度 ==========
+        // Q当前行的起始索引：i * dim
+        let q_row_start = i * dim;
+        let k_row_start = i * kv_dim;
+        
+        for j in (0..dim).step_by(head_dim) {
+            for k in 0..head_dim/2 {
+                // sin/cos缓存已经是F32类型（为了数值稳定性）
+                let sin_val = sin_slice[pos * head_dim + k*2];
+                let cos_val = cos_slice[pos * head_dim + k*2];
+                
+                let q_idx_j = q_row_start + j + k;
+                let q_idx_j1 = q_row_start + j + k + head_dim / 2;
+                
+                // 从BF16转换为F32进行计算
+                let v0_q = q_slice_bf16[q_idx_j];
+                let v1_q = q_slice_bf16[q_idx_j1];
+                
+                // F32计算
+                let result0 = v0_q * cos_val - v1_q * sin_val;
+                let result1 = v0_q * sin_val + v1_q * cos_val;
+                
+                // 将结果转换回BF16并存储
+                q_slice_bf16[q_idx_j] = result0;
+                q_slice_bf16[q_idx_j1] = result1;
+                
+                if j < kv_dim {
+                    let k_idx_j = k_row_start + j + k;
+                    let k_idx_j1 = k_row_start + j + k + head_dim / 2;
+                    
+                    // 从BF16转换为F32进行计算
+                    let v0_k = k_slice_bf16[k_idx_j];
+                    let v1_k = k_slice_bf16[k_idx_j1];
+                    
+                    // F32计算
+                    let result0 = v0_k * cos_val - v1_k * sin_val;
+                    let result1 = v0_k * sin_val + v1_k * cos_val;
+                    
+                    // 将结果转换回BF16并存储
+                    k_slice_bf16[k_idx_j] = result0;
+                    k_slice_bf16[k_idx_j1] = result1;
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 /// 计算并填充正弦和余弦旋转嵌入 (RoPE) 的缓存。
 /// 
-/// 该函数使用 `rayon` 库进行多线程并行计算，极大地加速了缓存的生成。
-/// 缓存的形状为 `[max_seq_len, head_size]`。
+/// 该函数根据输入张量的数据类型自动分发到对应的实现，并使用 `rayon` 库进行多线程并行计算，
+/// 极大地加速了缓存的生成。缓存的形状为 `[max_seq_len, head_size]`。
 /// 
 /// # Arguments
 /// * `head_size`: 旋转维度的大小 (K)。
@@ -81,6 +178,29 @@ pub fn sin_cos_cache_calc_bf16(
 /// * `sin_cache`: 正弦值输出张量, 形状 [max_seq_len, head_size]。
 /// * `cos_cache`: 余弦值输出张量, 形状 [max_seq_len, head_size]。
 pub fn sin_cos_cache_calc(
+    head_size: usize,
+    max_seq_len: usize,
+    sin_cache: &mut Tensor,
+    cos_cache: &mut Tensor,
+) -> Result<()> {
+    // 根据数据类型自动分发到对应的实现
+    match sin_cache.dtype() {
+        crate::base::DataType::F32 => {
+            sin_cos_cache_calc_f32(head_size, max_seq_len, sin_cache, cos_cache)
+        }
+        crate::base::DataType::BF16 => {
+            sin_cos_cache_calc_bf16(head_size, max_seq_len, sin_cache, cos_cache)
+        }
+        _ => {
+            Err(Error::InvalidArgument(format!(
+                "Unsupported data type for sin_cos_cache_calc: {:?}", sin_cache.dtype()
+            )).into())
+        }
+    }
+}
+
+/// F32版本的sin_cos_cache_calc实现
+fn sin_cos_cache_calc_f32(
     head_size: usize,
     max_seq_len: usize,
     sin_cache: &mut Tensor,
@@ -162,6 +282,34 @@ pub fn sin_cos_cache_calc(
     Ok(())
 }
 pub fn rope_kernel_batch(
+    // dim, kv_dim, head_size: 这些通常是 RoPEOp 算子的成员，可以从那里获取
+    kv_dim: usize,
+    head_size: usize,
+    // 输入张量
+    input_q: &mut Tensor,
+    input_k: &mut Tensor,
+    // pos 张量现在告诉我们这个批次的起始位置
+    start_pos_tensor: &Tensor,
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+) -> Result<()> {
+    // 根据数据类型自动分发到对应的实现
+    match input_q.dtype() {
+        crate::base::DataType::F32 => {
+            rope_kernel_batch_f32(kv_dim, head_size, input_q, input_k, start_pos_tensor, sin_cache, cos_cache)
+        }
+        crate::base::DataType::BF16 => {
+            rope_kernel_batch_bf16(kv_dim, head_size, input_q, input_k, start_pos_tensor, sin_cache, cos_cache)
+        }
+        _ => {
+            Err(Error::InvalidArgument(format!(
+                "Unsupported data type for rope_kernel_batch: {:?}", input_q.dtype()
+            )).into())
+        }
+    }
+}
+
+fn rope_kernel_batch_f32(
     // dim, kv_dim, head_size: 这些通常是 RoPEOp 算子的成员，可以从那里获取
     kv_dim: usize,
     head_size: usize,

@@ -79,13 +79,8 @@ impl Op for RoPEOp {
             return Err(Error::InvalidArgument(format!("RoPE: All tensors must be on the same device,input_q:{:?}, input_k:{:?}, sin_cache:{:?}, cos_cache:{:?}",device,input_k.device(),sin_cache.device(),cos_cache.device())).into());
         }
         
-        // Q, K, Sin, Cos 必须是 f32
-        if dtype != DataType::F32 
-            || input_k.dtype() != DataType::F32 
-            || sin_cache.dtype() != DataType::F32 
-            || cos_cache.dtype() != DataType::F32 
-        {
-            return Err(Error::InvalidArgument("Q, K, Sin, Cos tensors must be F32 type".into()).into());
+        if input_k.dtype() != dtype || sin_cache.dtype() != dtype || cos_cache.dtype() != dtype {
+                return Err(Error::InvalidArgument(format!("RoPE: All tensors must have the same data type. input_q:{:?}, input_k:{:?}, sin_cache:{:?}, cos_cache:{:?}", dtype, input_k.dtype(), sin_cache.dtype(), cos_cache.dtype())).into());
         }
 
         // Pos 必须是 i32
@@ -126,8 +121,7 @@ impl Op for RoPEOp {
         
         match device {
             DeviceType::Cpu => {
-                // 调用 CPU 内核函数
-                // if input_q_mut.shape()[0] > 1{
+                // 调用 CPU 内核函数 (F32版本)
                 kernels::cpu::rope_kernel_batch(
                     self.kv_dim,
                     self.head_size,
@@ -137,19 +131,6 @@ impl Op for RoPEOp {
                     sin_cache,
                     cos_cache,
                 )?;
-                // }else{
-                //     kernels::cpu::rope_kernel(
-                //         self.dim,
-                //         self.kv_dim,
-                //         self.head_size,
-                //         input_q_mut, // 可变
-                //         input_k_mut, // 可变
-                //         input_pos,
-                //         sin_cache,
-                //         cos_cache,
-                //     )?;
-                // }
-                
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
@@ -166,8 +147,12 @@ impl Op for RoPEOp {
                     ctx.cuda_config
                 )?;
             }
+            // _ => {
+            //     return Err(Error::InvalidArgument(format!(
+            //         "Unsupported device/data type combination: {:?}/{:?}", device, dtype
+            //     )).into());
+            // }
         }
-
         Ok(())
     }
 }
@@ -187,12 +172,10 @@ mod tests {
     use crate::base::{DataType, DeviceType};
     use crate::op::{Op, OpContext};
     use crate::base::error::Result;
-    use crate::cuda::CudaConfig;
     
     // 引入 rand 相关的 trait
     use rand::Rng;
-    use rand::distr::Uniform;
-
+    
     // ------------------------------------------------------------------------
     // 辅助函数: 断言两个 float slice 是否足够接近
     // ------------------------------------------------------------------------
@@ -208,15 +191,100 @@ mod tests {
     }
     
     // ------------------------------------------------------------------------
+    // TEST 2: test_rope_bf16_equivalence
+    // 验证 BF16 和 F32 计算结果的等价性
+    // ------------------------------------------------------------------------
+    #[test]
+    fn test_rope_bf16_equivalence() -> Result<()> {
+        let dim = 256;
+        let head_size = 64;
+        let kv_dim = 128;
+        let pos = 3;
+        let seq_len = 4;
+        
+        // --- 1. 准备 F32 数据 ---
+        let dtype_f32 = DataType::F32;
+        let pos_dtype = DataType::I32;
+        let max_seq_len = pos as usize + 512;
+        
+        let mut rng = rand::rng();
+        
+        // F32 输入张量
+        let mut input_q_f32 = Tensor::new(&[seq_len, dim], dtype_f32, DeviceType::Cpu)?;
+        input_q_f32.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.random_range(0.0f32..1.0f32));
+        let mut input_k_f32 = Tensor::new(&[seq_len, kv_dim], dtype_f32, DeviceType::Cpu)?;
+        input_k_f32.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.random_range(0.0f32..1.0f32));
+        
+        // Pos 张量
+        let mut input_pos = Tensor::new(&[1], pos_dtype, DeviceType::Cpu)?;
+        input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos;
+        
+        // Sin/Cos 缓存 (F32)
+        let mut sin_cache_f32 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
+        let mut cos_cache_f32 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
+        kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, &mut sin_cache_f32, &mut cos_cache_f32)?;
+        
+        // --- 2. 准备 BF16 数据 (从 F32 转换) ---
+        let dtype_bf16 = DataType::BF16;
+        
+        // BF16 输入张量 (从 F32 转换)
+        let mut input_q_bf16 = Tensor::new(&[seq_len, dim], dtype_bf16, DeviceType::Cpu)?;
+        let mut input_k_bf16 = Tensor::new(&[seq_len, kv_dim], dtype_bf16, DeviceType::Cpu)?;
+        
+        // 将 F32 数据转换为 BF16
+        for i in 0..(seq_len * dim) {
+            let val = input_q_f32.as_f32()?.as_slice()?[i];
+            input_q_bf16.as_bf16_mut()?.as_slice_mut()?[i] = half::bf16::from_f32(val);
+        }
+        for i in 0..(seq_len * kv_dim) {
+            let val = input_k_f32.as_f32()?.as_slice()?[i];
+            input_k_bf16.as_bf16_mut()?.as_slice_mut()?[i] = half::bf16::from_f32(val);
+        }
+        
+        // Sin/Cos 缓存 (BF16 版本使用 F32 缓存，因为计算是在 F32 中进行的)
+        let mut sin_cache_bf16 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
+        let mut cos_cache_bf16 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
+        kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, &mut sin_cache_bf16, &mut cos_cache_bf16)?;
+        
+        // --- 3. F32 计算 ---
+        let op_f32 = RoPEOp::new(dim, kv_dim, head_size)?;
+        let mut ctx_f32 = OpContext {
+            inputs: &[&input_pos, &sin_cache_f32, &cos_cache_f32],
+            outputs: &mut [&mut input_q_f32, &mut input_k_f32],
+            cuda_config: None,
+        };
+        op_f32.forward(&mut ctx_f32)?;
+        let q_result_f32 = ctx_f32.outputs[0].as_f32()?.as_slice()?.to_vec();
+        let k_result_f32 = ctx_f32.outputs[1].as_f32()?.as_slice()?.to_vec();
+        
+        // --- 4. BF16 计算 ---
+        let op_bf16 = RoPEOp::new(dim, kv_dim, head_size)?;
+        let mut ctx_bf16 = OpContext {
+            inputs: &[&input_pos, &sin_cache_bf16, &cos_cache_bf16],
+            outputs: &mut [&mut input_q_bf16, &mut input_k_bf16],
+            cuda_config: None,
+        };
+        op_bf16.forward(&mut ctx_bf16)?;
+        
+        // 将 BF16 结果转换为 F32 用于比较
+        let q_result_bf16: Vec<f32> = ctx_bf16.outputs[0].as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
+        let k_result_bf16: Vec<f32> = ctx_bf16.outputs[1].as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
+        
+        // --- 5. 对比结果 (容忍 BF16 精度损失) ---
+        assert_close(&q_result_f32, &q_result_bf16, 1e-2); // BF16 精度约为 3-4 位小数
+        assert_close(&k_result_f32, &k_result_bf16, 1e-2);
+        
+        Ok(())
+    }
+    
+    // ------------------------------------------------------------------------
     // 辅助函数: 设置所有输入张量
     // ------------------------------------------------------------------------
     fn setup_tensors(
         dim: usize, 
         head_size: usize, 
         pos: i32, 
-        device: DeviceType,
-        #[cfg(feature = "cuda")]
-        some_config: Option<&CudaConfig>
+        device: DeviceType
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let dtype = DataType::F32;
         let pos_dtype = DataType::I32;
@@ -224,11 +292,10 @@ mod tests {
         
         // --- 1. Q, K 张量 (用随机数填充) ---
         let mut rng = rand::rng();
-        let dist = Uniform::new(0.0f32, 1.0).unwrap();
         let mut input_q = Tensor::new(&[4,dim], dtype, DeviceType::Cpu)?; // as slice方法暂时只支持在cpu上
-        input_q.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.sample(dist));
+        input_q.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.random_range(0.0f32..1.0f32));
         let mut input_k = Tensor::new(&[4,dim/2], dtype, DeviceType::Cpu)?;
-        input_k.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.sample(dist));
+        input_k.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.random_range(0.0f32..1.0f32));
 
         // --- 2. Pos 张量 (设置 pos 值) ---
         let mut input_pos = Tensor::new(&[1], pos_dtype, DeviceType::Cpu)?;
@@ -245,7 +312,7 @@ mod tests {
             DeviceType::Cuda(device_id) => {
                 input_q = input_q.to_cuda(device_id)?;
                 input_k = input_k.to_cuda(device_id)?;
-                kernels::cuda::rope_sin_cos_cache_calc_cuda(head_size, max_seq_len, &mut sin_cache, &mut cos_cache,some_config)?
+                kernels::cuda::rope_sin_cos_cache_calc_cuda(head_size, max_seq_len, &mut sin_cache, &mut cos_cache,None)?
             }
         }
 
@@ -265,8 +332,8 @@ mod tests {
         
         // --- 1. CPU (Golden) 计算 ---
         // Q 和 K 是被就地修改的，所以需要克隆一份作为输入
-        let (mut q_cpu_in, mut k_cpu_in, pos_cpu, sin_cpu, cos_cpu) = setup_tensors(dim, head_size, pos, DeviceType::Cpu, None)?;
-        let (mut q_gpu_result, mut k_gpu_result, pos_gpu, sin_gpu, cos_gpu) = setup_tensors(dim, head_size, pos, DeviceType::Cuda(0),None)?;
+        let (mut q_cpu_in, mut k_cpu_in, pos_cpu, sin_cpu, cos_cpu) = setup_tensors(dim, head_size, pos, DeviceType::Cpu)?;
+        let (mut q_gpu_result, mut k_gpu_result, pos_gpu, sin_gpu, cos_gpu) = setup_tensors(dim, head_size, pos, DeviceType::Cuda(0))?;
         assert_close(sin_cpu.as_f32()?.as_slice()?,sin_gpu.to_cpu()?.as_f32()?.as_slice()?,1e-3);
         assert_close(cos_cpu.as_f32()?.as_slice()?,cos_gpu.to_cpu()?.as_f32()?.as_slice()?,1e-3);
         q_gpu_result.as_f32_mut()?.buffer_mut().copy_from_host(q_cpu_in.as_f32()?.as_slice()?)?; // Q 的 GPU 结果，将被修改
@@ -306,4 +373,5 @@ mod tests {
         
         Ok(())
     }
+    
 }

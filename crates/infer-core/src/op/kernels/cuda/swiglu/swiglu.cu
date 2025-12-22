@@ -1,5 +1,52 @@
 #include "swiglu.h"
+// --- CUDA Kernel (BF16版本) ---
+__global__ void swiglu_inplace_kernel_bf16x8(
+    float4* __restrict__ input_output_x,
+    const float4* __restrict__ input_y,
+    int num_float4_elements
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    __nv_bfloat162 one = {1.0, 1.0};
+    for (; i < num_float4_elements; i += stride) {
+        // a. 读取 x 的原始值
+        auto x_bf162_vec4 = reinterpret_cast<__nv_bfloat162*>(&input_output_x[i]);
+        // b. 读取 y 的值
+        auto y_bf162_vec4 = reinterpret_cast<const __nv_bfloat162*>(&input_y[i]);
+        for (int j =0;j<4;j++)
+        {
+            x_bf162_vec4[j] = x_bf162_vec4[j] * y_bf162_vec4[j] / (one + h2exp(-x_bf162_vec4[j]));
+        }
+        
+    }
+}
 
+
+// ======================= 主机端 FFI 函数修改 =======================
+// 函数名和签名被修改以反映其原地操作的特性
+// 这是将要从 Rust 调用的 FFI 函数
+void swiglu_inplace_cu_bf16x8(
+    const __nv_bfloat16* input_y,      // <--- 只读的 y
+    __nv_bfloat16* input_output_x, // <--- 可读写的 x
+    int num_elements,
+    cudaStream_t stream
+) {
+    int num_float4_elements = num_elements / 8;
+    const int threads_per_block = 256;
+    int num_sm = 0;
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
+    const int blocks_per_grid = num_sm * 8;
+    // --- 类型转换 (指针调整) ---
+    float4* in_out_x_f4 = reinterpret_cast<float4*>(input_output_x);
+    const float4* in_y_f4 = reinterpret_cast<const float4*>(input_y);
+
+    // --- 启动原地内核 ---
+    swiglu_inplace_kernel_bf16x8<<<blocks_per_grid, threads_per_block, 0, stream>>>(
+        in_out_x_f4, in_y_f4, num_float4_elements
+    );
+}
 // ============================================================================
 //  在这里填写您的 CUDA C++ 内核实现
 // ============================================================================

@@ -4,8 +4,6 @@ use std::path::PathBuf;
 fn main() {
     // 检查 "cuda" feature 是否被启用
     #[cfg(feature = "cuda")]{
-        println!("cargo:rerun-if-changed=src/kernels/cuda/add_kernel.cu");
-        println!("cargo:rerun-if-changed=src/kernels/cuda/add_kernel.cuh");
         let kernel_paths = find_files("src/op/kernels/cuda", "cu");
         if kernel_paths.is_empty() {
             // 如果没有找到任何 .cu 文件，可能是一个配置错误，可以选择性地警告或 panic
@@ -42,6 +40,7 @@ fn main() {
             .allowlist_function("cudaMalloc")
             .allowlist_function("cudaFree")
             .allowlist_function("cudaMemcpy")
+            .allowlist_function("cudaMemcpyAsync")
             .allowlist_function("cudaMemset")
             .allowlist_function("cudaGetErrorString")
             .allowlist_function("cudaGetErrorName")
@@ -53,11 +52,14 @@ fn main() {
             .allowlist_type("cudaError_t")
             .allowlist_type("cudaMemcpyKind")
             .allowlist_type("cudaStream_t")
-            .allowlist_function("cudaMemcpy")
-            .allowlist_function("cudaMemset")
+            .allowlist_type("cublasLtHandle_t")
+            .allowlist_type("cublasHandle_t")
+            .allowlist_function("cublasLtCreate")
+            .allowlist_function("cublasLtDestroy")
+            .allowlist_function("cublasCreate_v2")
+            .allowlist_function("cublasDestroy_v2")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .rustified_enum("cudaError_t")
-        
             .rustified_enum("cudaMemcpyKind")
             .generate()
             .expect("Unable to generate bindings");

@@ -70,13 +70,7 @@ impl Op for SwiGLU {
         // ==================== 2. 分派到原地内核 ====================
         match device {
             DeviceType::Cpu => {
-                // **核心修改**: 调用我们之前实现的原地 CPU 内核
-                // (这里的 bf16 适配逻辑也遵循原地模式)
-                if dtype == DataType::F32 {
-                    kernels::cpu::swiglu(input_y, input_output_x)
-                } else {
-                    Err(Error::InvalidArgument("Unsupported dtype for CPU SwiGLU.".into()).into())
-                }
+                kernels::cpu::swiglu(input_y, input_output_x)
             }
             
             #[cfg(feature = "cuda")]

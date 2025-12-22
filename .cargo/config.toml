@@ -1,0 +1,13 @@
+# .cargo/config.toml
+[target.x86_64-unknown-linux-gnu]
+# 替换为你第一步查到的 cc 绝对路径
+linker = "/usr/bin/cc"
+rustflags = [
+    "-C", "linker=/usr/bin/cc",  # 强制指定链接器
+]
+
+# 额外指定 CUDA 相关工具路径（避免 nvcc 找错）
+[env]
+CC = "/usr/bin/cc"    # 全局指定 C 编译器
+CXX = "/usr/bin/c++"  # C++ 编译器
+NVCC = "/usr/local/cuda/bin/nvcc"                   # nvcc 绝对路径

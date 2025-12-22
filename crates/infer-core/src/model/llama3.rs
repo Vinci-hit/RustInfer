@@ -92,15 +92,111 @@ pub struct Llama3 {
     config: RuntimeModelConfig,
     device_type: DeviceType,
     tokenizer: Box<dyn Tokenizer>,
-    
     /// 核心算子和权重容器
     layers: LlamaLayers,
 
     /// KV Cache
-    kv_cache: Vec<(Tensor, Tensor)>,
+    kv_cache: KvCache,
     /// 工作空间，用于存放中间计算结果，避免频繁分配和释放内存
     workspace: Workspace,
     sampler: Box<dyn Sampler>,
+    cuda_config: Option<CudaConfig>,
+}
+
+struct KvCache {
+    cache: Vec<(Tensor, Tensor)>,
+}
+impl KvCache {
+    pub fn slice_kv_cache(
+        &mut self, 
+        layer_idx: usize, 
+        start_pos: i32, 
+        len: usize,
+        kv_dim: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // 1. 安全地获取指定层的 (Key, Value) 缓存张量的可变引用
+        let (k_cache_full, v_cache_full) = self.get_mut(layer_idx)?;
+
+        // 2. 确定 KV 缓存的形状和要切片的维度
+        // 假设您的 KV 缓存形状是 `[max_seq_len, num_heads, head_size]` 或 `[max_seq_len, hidden_dim]`
+        // 我们总是在第一个维度 (seq_len) 上进行切片。
+        let seq_len_dim_idx = 0;
+        let max_seq_len = k_cache_full.shape()[seq_len_dim_idx];
+
+        // 3. 边界检查，确保切片范围 `[start_pos, start_pos + len)` 不会越界
+        if start_pos as usize + len > max_seq_len {
+            return Err(anyhow::anyhow!(
+                "KV cache slice is out of bounds. Attempted to slice from pos {} with length {}, but max_seq_len is {}.",
+                start_pos, len, max_seq_len
+            ));
+        }
+
+
+        // 5. 调用 Tensor::slice 方法来创建零拷贝视图
+        let k_slice = k_cache_full.slice(&[start_pos as usize,0], &[len,kv_dim])?;
+        let v_slice = v_cache_full.slice(&[start_pos as usize,0], &[len,kv_dim])?;
+
+        // 6. 返回包含两个视图的元组
+        Ok((k_slice, v_slice))
+    }
+
+    fn get(&self, layer_id: usize) -> Result<(&Tensor, &Tensor)> {
+        let (k_cache, v_cache) = self.cache.get(layer_id)
+            .ok_or_else(|| anyhow::anyhow!("Layer index {} is out of bounds for KV cache with layers.", layer_id))?;
+        Ok((k_cache, v_cache))
+    }
+    fn get_mut(&mut self, layer_id: usize) -> Result<(&mut Tensor, &mut Tensor)> {
+        let (k_cache, v_cache) = self.cache.get_mut(layer_id)
+            .ok_or_else(|| anyhow::anyhow!("Layer index {} is out of bounds for KV cache with layers.", layer_id))?;
+        Ok((k_cache, v_cache))
+    }
+
+    pub fn init_kv_cache(
+        config: &RuntimeModelConfig,
+        device: &DeviceType
+    ) -> Result<Self> {
+        let cache_shape = vec![
+            config.seq_len,
+            config.kv_head_num*config.head_size
+        ];
+
+        // 如果设备是CPU，则使用F32以获得更好的精度和兼容性
+        let float_type = if device.is_cpu() {
+            println!("  -> Initializing F32 KV Cache for CPU device.");
+            DataType::F32
+        } else {
+            match config.torch_dtype.as_str() {
+                "float32" => {
+                    println!("  -> torch_dtype is float32.");
+                    DataType::F32
+                },
+                "bfloat16" => {
+                    println!("  -> torch_dtype is bfloat16.");
+                    DataType::BF16
+                },
+                _ => {
+                    return Err(Error::InvalidArgument(format!(
+                        "Unsupported torch_dtype: {}", config.torch_dtype
+                    )).into());
+                }
+            }
+        };
+        
+        println!(
+            "Initializing KV Cache for {} layers with shape {:?}...",
+            config.layer_num, cache_shape
+        );
+        let mut kv_cache = Vec::with_capacity(config.layer_num);
+        for _ in 0..config.layer_num {
+            // **核心变化**: 创建 bf16 类型的空张量
+            let k_cache = Tensor::new(&cache_shape, float_type, *device)?;
+            let v_cache = Tensor::new(&cache_shape, float_type, *device)?;
+
+            kv_cache.push((k_cache, v_cache));
+        }
+
+        Ok(KvCache { cache: kv_cache })
+    }
 }
 
 // 在 impl Llama3 中
@@ -111,11 +207,13 @@ impl Llama3 {
         device_type: DeviceType,
         is_quant_model: bool
     ) -> Result<Self> {
-        println!("Loading model from directory: {:?}", model_dir.as_ref());
+        let start_time = Instant::now();
+        println!("Start calculate time, Loading model from directory: {:?}", model_dir.as_ref());
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
         let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
+        let cuda_config = CudaConfig::new()?;
 
         println!("Creating model layers...");
         
@@ -253,15 +351,16 @@ impl Llama3 {
             swiglu_layers,
         };
         
-        let kv_cache = Self::init_kv_cache(&config, &device_type)?;
+        let kv_cache = KvCache::init_kv_cache(&config, &device_type)?;
         
         // --- 初始化工作区 (这是新添加的部分) ---
         let workspace = Self::init_workspace(&config, &device_type)?;
         let sampler = Box::new(ArgmaxSampler::new(device_type));
-        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler };
+        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config) };
         println!("Calculating RoPE sin/cos cache...");
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
-        println!("Model successfully initialized.");
+        let duration = start_time.elapsed();
+        println!("Model successfully initialized. Loading time: {:.2} seconds", duration.as_secs_f64());
         Ok(model)
     }
 
@@ -318,12 +417,26 @@ impl Llama3 {
         let mut buffers = HashMap::new();
 
         // 遵循您的代码风格，大部分浮点运算使用 BF16
-        let float_dtype = if *device == DeviceType::Cpu {
-            println!("  -> Using F32 for CPU workspace buffers.");
+        // 但如果设备是CPU，则使用F32以获得更好的精度和兼容性
+        let float_dtype = if device.is_cpu() {
+            println!("  -> Using F32 for CPU device.");
             DataType::F32
         } else {
-            println!("  -> Using BF16 for CUDA workspace buffers.");
-            DataType::F32
+            match config.torch_dtype.as_str() {
+                "float32" => {
+                    println!("  -> torch_dtype is float32.");
+                    DataType::F32
+                },
+                "bfloat16" => {
+                    println!("  -> torch_dtype is bfloat16.");
+                    DataType::BF16
+                },
+                _ => {
+                    return Err(Error::InvalidArgument(format!(
+                        "Unsupported torch_dtype: {}", config.torch_dtype
+                    )).into());
+                }
+            }
         };
         let int_dtype = DataType::I32;
         
@@ -422,96 +535,64 @@ impl Llama3 {
 
     // --- 创建一系列辅助加载函数，提高代码可读性 ---
     fn load_matmul(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Matmul> {
-        // println!("Loading Matmul weight: {}", name);
         let tensor_view = loader.get_tensor(name)?;
-        // 1. 在 CPU 上从 TensorView 加载，保留原始 dtype (通常是 bf16)
-        let mut weight = Tensor::from_view_on_cpu(&tensor_view)?;
-        // 2. 如果目标设备是 CPU，则将权重转换为 F32
-        if  weight.dtype() == DataType::BF16 { // device == DeviceType::Cpu &&
-            // println!("  -> Converting weight '{}' to F32.", name);
-            weight = weight.to_dtype(DataType::F32)?;
-        }
-        // 3. 将最终确定类型的权重移动到目标设备
-        let weight_on_device = weight.to_device(device)?;
+        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
+        
+        // 如果目标设备是CPU，则将权重转换为F32
+        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
+            // println!("Converting {} weight to F32 for CPU device", name);
+            weight.to_dtype(DataType::F32)?
+        } else {
+            weight
+        };
+        
+        let weight_on_device = weight_converted.to_device(device)?;
 
         Ok(Matmul::from(weight_on_device, None))
     }
 
     // ======================= 已修改的函数 =======================
     fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<RMSNorm> {
-        println!("Loading RMSNorm weight: {}", name);
         let tensor_view = loader.get_tensor(name)?;
         
         // 1. 在 CPU 上加载 bf16/f32 权重
-        let mut weight = Tensor::from_view_on_cpu(&tensor_view)?;
+        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
 
-        // 2. 如果目标是 CPU，确保权重是 F32
-        //    RMSNorm 的权重总是需要 f32，无论是在 CPU 还是 GPU (为了精度)
-        //    这是一个可以简化的假设，但现在我们先保持一致
-        if weight.dtype() == DataType::BF16 { // device == DeviceType::Cpu &&
-            // println!("  -> Converting RMSNorm weight '{}' to F32 for CPU execution.", name);
-            weight = weight.to_dtype(DataType::F32)?;
-        }
-        
-        // 3. 将权重移动到目标设备
-        let weight_on_device = weight.to_device(device)?;
+        // 如果目标设备是CPU，则将权重转换为F32
+        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
+            // println!("Converting {} weight to F32 for CPU device", name);
+            weight.to_dtype(DataType::F32)?
+        } else {
+            weight
+        };
+
+        // 2. 直接将权重移动到目标设备，不进行类型转换
+        let weight_on_device = weight_converted.to_device(device)?;
 
         // RMSNorm::from 接收一个最终的、位于正确设备和类型的权重
         Ok(RMSNorm::from(weight_on_device))
     }
 
     fn load_embedding(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Embedding> {
-        println!("Loading Embedding weight: {}", name);
         let tensor_view = loader.get_tensor(name)?;
 
         // 1. 在 CPU 上加载 bf16 权重
-        let mut weight = Tensor::from_view_on_cpu(&tensor_view)?;
-        // 2. **重要**: Embedding 层本身不进行计算，只是查表（内存拷贝）。
-        //    所以，如果整个流水线是 bf16 (在 CUDA 上)，它的权重也应该是 bf16。
-        //    只有当 CPU 流水线被确定为 f32 时，我们才转换它。
-        if weight.dtype() == DataType::BF16 { // device == DeviceType::Cpu &&
-            // println!("  -> Converting Embedding weight '{}' to F32 for CPU execution.", name);
-            weight = weight.to_dtype(DataType::F32)?;
-        }
+        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
+        
+        // 如果目标设备是CPU，则将权重转换为F32
+        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
+            // println!("Converting {} weight to F32 for CPU device", name);
+            weight.to_dtype(DataType::F32)?
+        } else {
+            weight
+        };
+
+        // 2. 直接将BF16权重移动到目标设备，不进行类型转换
         
         // 3. 将权重移动到目标设备
-        let weight_on_device = weight.to_device(device)?;
+        let weight_on_device = weight_converted.to_device(device)?;
         
         Ok(Embedding::from(weight_on_device))
-    }
-
-    /// 根据运行时配置，初始化 KV Cache。
-    /// KV Cache 通常也使用半精度来节省显存。
-    fn init_kv_cache(
-        config: &RuntimeModelConfig,
-        device: &DeviceType
-    ) -> Result<Vec<(Tensor, Tensor)>> {
-        let cache_shape = vec![
-            config.seq_len,
-            config.kv_head_num*config.head_size
-        ];
-
-        println!(
-            "Initializing F16 KV Cache for {} layers with shape {:?}...",
-            config.layer_num, cache_shape
-        );
-        let float_type = if *device == DeviceType::Cpu {
-            println!("  -> Using F32 for CPU KV Cache.");
-            DataType::F32
-        } else {
-            println!("  -> Using BF16 for CUDA KV Cache.");
-            DataType::F32
-        };
-        let mut kv_cache = Vec::with_capacity(config.layer_num);
-        for _ in 0..config.layer_num {
-            // **核心变化**: 创建 bf16 类型的空张量
-            let k_cache = Tensor::new(&cache_shape, float_type, *device)?;
-            let v_cache = Tensor::new(&cache_shape, float_type, *device)?;
-
-            kv_cache.push((k_cache, v_cache));
-        }
-
-        Ok(kv_cache)
     }
 
 
@@ -570,44 +651,6 @@ impl Llama3 {
         let generated_text = self.tokenizer.decode(&generated_tokens)?;
         Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
-
-
-    pub fn slice_kv_cache(
-        &mut self, 
-        layer_idx: usize, 
-        start_pos: i32, 
-        len: usize
-    ) -> Result<(Tensor, Tensor)> {
-        // 1. 安全地获取指定层的 (Key, Value) 缓存张量的可变引用
-        let (k_cache_full, v_cache_full) = self.kv_cache.get_mut(layer_idx).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Layer index {} is out of bounds for KV cache with {} layers.",
-                layer_idx, self.config.layer_num
-            )
-        })?;
-
-        // 2. 确定 KV 缓存的形状和要切片的维度
-        // 假设您的 KV 缓存形状是 `[max_seq_len, num_heads, head_size]` 或 `[max_seq_len, hidden_dim]`
-        // 我们总是在第一个维度 (seq_len) 上进行切片。
-        let seq_len_dim_idx = 0;
-        let max_seq_len = k_cache_full.shape()[seq_len_dim_idx];
-
-        // 3. 边界检查，确保切片范围 `[start_pos, start_pos + len)` 不会越界
-        if start_pos as usize + len > max_seq_len {
-            return Err(anyhow::anyhow!(
-                "KV cache slice is out of bounds. Attempted to slice from pos {} with length {}, but max_seq_len is {}.",
-                start_pos, len, max_seq_len
-            ));
-        }
-
-
-        // 5. 调用 Tensor::slice 方法来创建零拷贝视图
-        let k_slice = k_cache_full.slice(&[start_pos as usize,0], &[len,self.config.kv_dim])?;
-        let v_slice = v_cache_full.slice(&[start_pos as usize,0], &[len,self.config.kv_dim])?;
-
-        // 6. 返回包含两个视图的元组
-        Ok((k_slice, v_slice))
-    }
     /// 对一个 token 序列进行批处理前向传播。
     ///
     /// 这个方法用于高效处理输入提示。它会填充 KV 缓存，并返回
@@ -622,8 +665,7 @@ impl Llama3 {
     fn forward_batch(&mut self, tokens: &[i32], pos: usize) -> Result<i32> {
         let seq_len = tokens.len();
         
-        let cuda_config = if self.device_type.is_cuda() { Some(CudaConfig::new()?) } else { None };
-        let cuda_config_ref = cuda_config.as_ref();
+        let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
 
         // Prepare batch input tokens
         let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
@@ -656,7 +698,7 @@ impl Llama3 {
             
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            let (mut k, mut v) = self.slice_kv_cache(i, pos as i32, seq_len)?;
+            let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
             
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
@@ -757,8 +799,6 @@ mod tests {
     ) -> Result<(String, u64, u32, u64, u64, usize)> {
         
         let start_time = Instant::now();
-        
-        // 执行生成，verbose设为false以减少IO干扰
         let (generated_text, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = model.generate(prompt, max_tokens, verbose)?;
         let duration = start_time.elapsed();
         let duration_ms = duration.as_millis() as u64;
@@ -789,8 +829,8 @@ Today Date: 14 Dec 2025
 
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
-你好。<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-        let max_tokens = 50;
+你是算法糕手，写一段C++代码，实现一个简单的MaxPooling函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+        let max_tokens = 150;
         
         println!("Starting CPU generation...");
         let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;

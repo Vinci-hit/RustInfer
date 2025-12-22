@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <cuda_runtime.h> // 包含 cudaStream_t 定义
-
+#include <cuda_bf16.h>
+#include <cublasLt.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,6 +47,17 @@ void flash_decoding_cu(
     int32_t head_dim,
     cudaStream_t stream
 );
+
+void flash_decoding_cu_bf16(
+    const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* k_ptr,
+    const __nv_bfloat16* v_ptr,
+    __nv_bfloat16* o_ptr,
+    int32_t kv_seq_len,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    cudaStream_t stream);
 
 #ifdef __cplusplus
 }
