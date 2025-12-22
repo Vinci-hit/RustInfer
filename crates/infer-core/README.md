@@ -6,3 +6,4 @@
 
 # 注意事项
 1、flashattention采用异步读取实现，使用了cp.async指令，要求Ampere以上的架构。
+2、cublas采用了v2后缀，要求新版本cuda

@@ -6,11 +6,12 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 dashmap = "6.1.0"
-half = "2.7.1"
+half = { version = "2.7.1", features = ["std","num-traits"] }
 libc = "0.2.177"
 memmap2 = "0.9.9"
 ndarray = { version = "0.16.1", features = ["rayon"] }
 ndarray-linalg = { version = "0.17.0", features = ["openblas-system"] }
+num-traits = "0.2.19"
 once_cell = "1.21.3"
 rayon = "1.11.0"
 safetensors = "0.6.2"
