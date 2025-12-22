@@ -92,19 +92,7 @@ impl Op for Embedding {
         // Embedding 的内核通常需要在与权重相同的设备上执行
         match weight.device() {
             DeviceType::Cpu => {
-                // --- CPU 路径 ---
-                // 在 CPU 路径内部，我们再根据 dtype 调用不同的内核
-                match weight.dtype() {
-                    DataType::F32 => {
-                        // 调用 f32 版本的 CPU 内核
-                        kernels::cpu::embedding(input_tokens, weight, output)?
-                    }
-                    unsupported_dtype => {
-                        return Err(Error::InvalidArgument(format!(
-                            "Unsupported weight dtype '{:?}' for CPU embedding.", unsupported_dtype
-                        )).into());
-                    }
-                }
+                    kernels::cpu::embedding(input_tokens, weight, output)?
             }
             
             #[cfg(feature = "cuda")]

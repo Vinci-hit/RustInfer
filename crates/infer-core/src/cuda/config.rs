@@ -1,3 +1,5 @@
+use std::os::raw::c_void;
+
 use crate::base::error::Result;
 
 use super::ffi;
@@ -9,8 +11,10 @@ use super::ffi;
 pub struct CudaConfig {
     /// CUDA stream for asynchronous execution.
     pub stream: ffi::cudaStream_t,
-    
-    // pub cublas_handle: cublasHandle_t, // (未来)
+    pub cublaslt_handle: ffi::cublasLtHandle_t,
+    pub cublas_handle_v2: ffi::cublasHandle_t,
+    pub workspace: *mut c_void,
+    pub workspace_size: usize,
     // pub cudnn_handle: cudnnHandle_t,   // (未来)
 }
 
@@ -21,8 +25,20 @@ impl CudaConfig {
         
         // 创建一个新的 CUDA stream
         unsafe { crate::cuda_check!(ffi::cudaStreamCreate(&mut stream))? };
-
-        Ok(Self { stream })
+        
+        // 创建 cuBLAS handle
+        let mut cublaslt_handle: ffi::cublasLtHandle_t = std::ptr::null_mut();
+        unsafe { crate::cuda_check!(ffi::cublasLtCreate(&mut cublaslt_handle))? };
+        // 创建 cuBLAS handle v2
+        let mut cublas_handle_v2: ffi::cublasHandle_t = std::ptr::null_mut();
+        unsafe { crate::cuda_check!(ffi::cublasCreate_v2(&mut cublas_handle_v2))? };
+        
+        // 创建 workspace
+        let mut workspace: *mut c_void = std::ptr::null_mut();
+        let workspace_size = 32 * 1024 * 1024; // 32MB
+        unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut workspace, workspace_size))? };
+        
+        Ok(Self { stream, cublaslt_handle, cublas_handle_v2, workspace, workspace_size })
     }
 }
 
@@ -33,6 +49,24 @@ impl Drop for CudaConfig {
             unsafe {
                 // 在 drop 中忽略错误，或添加日志
                 let _ = ffi::cudaStreamDestroy(self.stream);
+            }
+        }
+        if !self.cublaslt_handle.is_null() {
+            unsafe {
+                // 在 drop 中忽略错误，或添加日志
+                let _ = ffi::cublasLtDestroy(self.cublaslt_handle);
+            }
+        }
+        if !self.cublas_handle_v2.is_null() {
+            unsafe {
+                // 在 drop 中忽略错误，或添加日志
+                let _ = ffi::cublasDestroy_v2(self.cublas_handle_v2);
+            }
+        }
+        if !self.workspace.is_null() {
+            unsafe {
+                // 在 drop 中忽略错误，或添加日志
+                let _ = ffi::cudaFree(self.workspace);
             }
         }
     }

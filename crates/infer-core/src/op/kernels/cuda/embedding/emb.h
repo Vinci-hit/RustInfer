@@ -1,8 +1,19 @@
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+void embedding_kernel_cu_bf16x8(
+    __nv_bfloat16* output,
+    const int* input_token_ids,
+    const __nv_bfloat16* weight,
+    int token_len,
+    int dim,
+    int vocab_size,
+    cudaStream_t stream
+);
 
 /// @brief 执行 Embedding 查找，采用 float4 向量化访存优化。
 ///        要求 embedding_dim 必须是 4 的倍数。

@@ -30,6 +30,17 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+    pub fn flash_decoding_cu_bf16(
+        q_ptr: *const half::bf16,
+        k_ptr: *const half::bf16,
+        v_ptr: *const half::bf16,
+        o_ptr: *mut half::bf16,
+        kv_seq_len: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Flash Attention GQA 的 CUDA 内核包装函数 (Prefill/Decode 模式)。

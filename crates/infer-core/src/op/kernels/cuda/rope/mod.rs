@@ -17,6 +17,20 @@ unsafe extern "C" {
         cos_cache: *const f32,
         stream: cuda::ffi::cudaStream_t,
     );
+    
+    // BF16版本的ROPE CUDA kernel
+    pub fn rope_kernel_cu_bf16(
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        input_q: *mut half::bf16,
+        input_k: *mut half::bf16,
+        input_pos: i32,
+        seq_len:i32,
+        sin_cache: *const half::bf16,
+        cos_cache: *const half::bf16,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Rotary Positional Embedding (RoPE) 的 CUDA 内核包装函数
@@ -45,19 +59,11 @@ pub fn rope(
     cos_cache: &Tensor,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
-    // --- 1. 获取具体类型和指针 ---
+    // --- 1. 根据数据类型获取具体类型和指针 ---
+    let dtype = input_q.dtype();
     
-    // Q 和 K 需要可变指针
-    let q_ptr = input_q.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-    let k_ptr = input_k.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-
     // Pos 是 i32，需要不可变指针
     let pos = input_pos.as_i32()?.as_slice()?[0];
-
-    // Cache 是 f32，需要不可变指针
-    let sin_ptr = sin_cache.as_f32()?.buffer().as_ptr() as *const f32;
-    let cos_ptr = cos_cache.as_f32()?.buffer().as_ptr() as *const f32;
-
 
     // --- 2. 维度检查和转换 ---
     
@@ -76,20 +82,61 @@ pub fn rope(
         stream = config.stream; 
     }
 
-    // --- 4. 调用 FFI 函数 ---
-    unsafe {
-        rope_kernel_cu(
-            dim_i32,
-            kv_dim_i32,
-            head_size_i32,
-            q_ptr,       // *mut f32
-            k_ptr,       // *mut f32
-            pos,     // i32
-            seq_len,
-            sin_ptr,     // *const f32
-            cos_ptr,     // *const f32
-            stream,
-        );
+    // --- 4. 根据数据类型调用相应的 FFI 函数 ---
+    match dtype {
+        crate::base::DataType::F32 => {
+            // Q 和 K 需要可变指针
+            let q_ptr = input_q.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let k_ptr = input_k.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+
+            // Cache 是 f32，需要不可变指针
+            let sin_ptr = sin_cache.as_f32()?.buffer().as_ptr() as *const f32;
+            let cos_ptr = cos_cache.as_f32()?.buffer().as_ptr() as *const f32;
+
+            unsafe {
+                rope_kernel_cu(
+                    dim_i32,
+                    kv_dim_i32,
+                    head_size_i32,
+                    q_ptr,       // *mut f32
+                    k_ptr,       // *mut f32
+                    pos,     // i32
+                    seq_len,
+                    sin_ptr,     // *const f32
+                    cos_ptr,     // *const f32
+                    stream,
+                );
+            }
+        }
+        crate::base::DataType::BF16 => {
+            // Q 和 K 需要可变指针
+            let q_ptr = input_q.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let k_ptr = input_k.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+
+            // Cache 是 bf16，需要不可变指针
+            let sin_ptr = sin_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let cos_ptr = cos_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+
+            unsafe {
+                rope_kernel_cu_bf16(
+                    dim_i32,
+                    kv_dim_i32,
+                    head_size_i32,
+                    q_ptr,       // *mut bf16
+                    k_ptr,       // *mut bf16
+                    pos,     // i32
+                    seq_len,
+                    sin_ptr,     // *const bf16
+                    cos_ptr,     // *const bf16
+                    stream,
+                );
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported data type for ROPE CUDA kernel: {:?}", dtype
+            )).into());
+        }
     }
     
     Ok(())
@@ -101,6 +148,15 @@ unsafe extern "C" {
         max_seq_len: i32,
         sin_cache: *mut f32,
         cos_cache: *mut f32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+    
+    // BF16版本的sin_cos_cache_calc CUDA kernel
+    pub fn sin_cos_cache_calc_cu_bf16(
+        head_size: i32,
+        max_seq_len: i32,
+        sin_cache: *mut half::bf16,
+        cos_cache: *mut half::bf16,
         stream: cuda::ffi::cudaStream_t,
     );
 }
@@ -120,11 +176,8 @@ pub fn sin_cos_cache_calc_cuda(
     cos_cache: &mut Tensor,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
+    let dtype = sin_cache.dtype();
    
-    // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut f32)
-    let sin_ptr = sin_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-    let cos_ptr = cos_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-
     // --- 2. 维度转换 ---
     
     // 维度转换为 i32
@@ -142,18 +195,43 @@ pub fn sin_cos_cache_calc_cuda(
         stream = config.stream; 
     }
 
-    // --- 4. 调用 FFI 函数 ---
-    // 注意：你提供的 C++ 代码中，stream 为 NULL 时调用了一个不带 stream 的版本。
-    // 在 C++ 包装函数中通常将 stream 设为默认值来简化。
-    // 我们假设 C++ FFI 接收 stream=null_mut() 时，它会调用不带 stream 的版本或使用默认 stream。
-    unsafe {
-        sin_cos_cache_calc_cu(
-            head_size_i32,
-            max_seq_len_i32,
-            sin_ptr,
-            cos_ptr,
-            stream,
-        );
+    // --- 4. 根据数据类型调用相应的 FFI 函数 ---
+    match dtype {
+        crate::base::DataType::F32 => {
+            // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut f32)
+            let sin_ptr = sin_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let cos_ptr = cos_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+
+            unsafe {
+                sin_cos_cache_calc_cu(
+                    head_size_i32,
+                    max_seq_len_i32,
+                    sin_ptr,
+                    cos_ptr,
+                    stream,
+                );
+            }
+        }
+        crate::base::DataType::BF16 => {
+            // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut bf16)
+            let sin_ptr = sin_cache.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let cos_ptr = cos_cache.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+
+            unsafe {
+                sin_cos_cache_calc_cu_bf16(
+                    head_size_i32,
+                    max_seq_len_i32,
+                    sin_ptr,
+                    cos_ptr,
+                    stream,
+                );
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported data type for sin_cos_cache_calc CUDA kernel: {:?}", dtype
+            )).into());
+        }
     }
     
     Ok(())

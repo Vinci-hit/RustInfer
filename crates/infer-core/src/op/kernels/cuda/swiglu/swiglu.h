@@ -1,5 +1,5 @@
 #include <cuda_runtime.h>
-
+#include <cuda_bf16.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,6 +14,13 @@ extern "C" {
 void swiglu_inplace_kernel_cu_fp32x4(
     const float* input_y,      // <--- 只读的 y
     float* input_output_x, // <--- 可读写的 x
+    int num_elements,
+    cudaStream_t stream
+);
+
+void swiglu_inplace_cu_bf16x8(
+    const __nv_bfloat16* input_y,      // <--- 只读的 y
+    __nv_bfloat16* input_output_x, // <--- 可读写的 x
     int num_elements,
     cudaStream_t stream
 );
