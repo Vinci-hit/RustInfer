@@ -65,7 +65,6 @@ impl Op for FlashAttnGQA {
         // --- b. 检查设备和数据类型 ---
         // ... (设备和数据类型检查保持不变，但要检查 input_kv_len 是 I32) ...
         let device = input_q.device();
-        let dtype = input_q.dtype();
 
         // --- c. 检查形状 ---
         let q_shape = input_q.shape();

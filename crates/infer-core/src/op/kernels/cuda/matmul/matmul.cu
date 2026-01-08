@@ -1,6 +1,15 @@
 #include <cub/block/block_reduce.cuh>
 #include "matmul.h"
-
+#include <cublasLt.h>
+#include <cublas_v2.h>
+#define CHECK_CUBLAS(func) { \
+    cublasStatus_t status = (func); \
+    if (status != CUBLAS_STATUS_SUCCESS) { \
+        printf("cuBLAS API failed at line %d with error: %d\n", \
+               __LINE__, status); \
+        exit(EXIT_FAILURE); \
+    } \
+}
 template <int THREAD_PER_BLOCK>
 __global__ void sgemv_kernel_cu_fp32x4(
     const float* input,
@@ -116,75 +125,86 @@ extern "C" void sgemm_naive_f32_cu(
         a, b, c, M, N, K
     );
 }
-void fast_bf16_gemm_atbt(
+void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtHandle_t ltHandle,
-    int m, int n, int k,
-    const __nv_bfloat16 *A, // M x K
-    const __nv_bfloat16 *B, // N x K
-    __nv_bfloat16 *C,       // M x N
-    void *workspace, size_t workspaceSize)
+    int M, int N, int K,
+    const __nv_bfloat16 *d_A, // shape: [M, K]
+    const __nv_bfloat16 *d_B, // shape: [N, K]
+    __nv_bfloat16 *d_C,       // shape: [M, N] output
+    void *workspace,
+    size_t workspaceSize,
+    cudaStream_t stream)
 {
-    float alpha = 1.0f;
-    float beta = 0.0f;
+    int m_gemm = N;
+    int n_gemm = M;
+    int k_gemm = K;
 
-    // 1. 创建描述符
+    cublasOperation_t transA = CUBLAS_OP_T;
+    cublasOperation_t transB = CUBLAS_OP_N;
+
     cublasLtMatmulDesc_t operationDesc = NULL;
-    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_16BF);
-
-    // 设置转置：A 为 N (M*K)，B 为 T (N*K)
-    cublasOperation_t transA = CUBLAS_OP_N;
-    cublasOperation_t transB = CUBLAS_OP_T;
+    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
     cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
 
-    // 2. 矩阵布局描述符 (假设是 Row-Major)
-    // 注意：cuBLASLt 默认是 Column-Major，处理 Row-Major 时通常通过交换 A,B 并调整转置实现
-    // 或者简单理解为：C(M,N) = A(M,K) * B^T(K,N)
-    cublasLtMatrixLayout_t adesc = NULL, bdesc = NULL, cdesc = NULL;
-    cublasLtMatrixLayoutCreate(&adesc, CUDA_R_16BF, m, k, k); // M x K, LDA=K
-    cublasLtMatrixLayoutCreate(&bdesc, CUDA_R_16BF, n, k, k); // N x K, LDB=K
-    cublasLtMatrixLayoutCreate(&cdesc, CUDA_R_16BF, m, n, n); // M x N, LDC=N
+    // Matrix Layouts
+    // Arg1 (B): 物理内存看作 ColMajor [K, N], leading dim = K
+    cublasLtMatrixLayout_t Adesc = NULL;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16BF, k_gemm, m_gemm, k_gemm));
 
-    // 3. 设置启发式搜索偏好
+    // Arg2 (A): 物理内存看作 ColMajor [K, M], leading dim = K
+    cublasLtMatrixLayout_t Bdesc = NULL;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16BF, k_gemm, n_gemm, k_gemm));
+
+    // Result (C): 物理内存看作 ColMajor [N, M], leading dim = N
+    cublasLtMatrixLayout_t Cdesc = NULL;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, m_gemm, n_gemm, m_gemm));
+
+    // Preference
     cublasLtMatmulPreference_t preference = NULL;
-    cublasLtMatmulPreferenceCreate(&preference);
-    cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize));
+    CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
+    CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
 
-    // 4. 获取最优算法
+    // Heuristic
     cublasLtMatmulHeuristicResult_t heuristicResult = {};
     int returnedResults = 0;
-    cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, adesc, bdesc, cdesc, cdesc, preference, 1, &heuristicResult, &returnedResults);
+    // 参数顺序：Handle, Desc, Mat1(Left), Mat2(Right), C, D, Pref, Count, Result, ResultCount
+    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
 
     if (returnedResults == 0) {
-        // 处理错误：未找到合适算法
-        return;
+        printf("cuBLASLt: No algorithm found!\n");
+        exit(1);
     }
 
-    // 5. 执行矩阵乘法
-    cublasLtMatmul(ltHandle,
-                   operationDesc,
-                   &alpha,
-                   A, adesc,
-                   B, bdesc,
-                   &beta,
-                   C, cdesc,
-                   C, cdesc,
-                   &heuristicResult.algo,
-                   workspace,
-                   workspaceSize,
-                   0);
+    float alpha = 1.0f;
+    float beta = 0.0f;
 
-    // 释放资源
+    // Execute
+    // Inputs swapped: A_param = d_B, B_param = d_A
+    CHECK_CUBLAS(cublasLtMatmul(ltHandle,
+                                operationDesc,
+                                &alpha,
+                                d_B, Adesc,
+                                d_A, Bdesc,
+                                &beta,
+                                d_C, Cdesc,
+                                d_C, Cdesc,
+                                &heuristicResult.algo,
+                                workspace,
+                                workspaceSize,
+                                stream));
+
+    // Cleanup
     cublasLtMatmulPreferenceDestroy(preference);
-    cublasLtMatrixLayoutDestroy(adesc);
-    cublasLtMatrixLayoutDestroy(bdesc);
-    cublasLtMatrixLayoutDestroy(cdesc);
+    cublasLtMatrixLayoutDestroy(Adesc);
+    cublasLtMatrixLayoutDestroy(Bdesc);
+    cublasLtMatrixLayoutDestroy(Cdesc);
     cublasLtMatmulDescDestroy(operationDesc);
 }
 void gemm_cublaslt_bf16(
-    const __nv_bfloat16* a,
-    const __nv_bfloat16* b,
-    __nv_bfloat16* c,
+    const __nv_bfloat16* A,
+    const __nv_bfloat16* B,
+    __nv_bfloat16* C,
     int M,
     int N,
     int K,
@@ -192,5 +212,5 @@ void gemm_cublaslt_bf16(
     cublasLtHandle_t handle,
     void* workspace, size_t workspaceSize
 ) {
-    fast_bf16_gemm_atbt(handle, M, N, K, a, b, c, workspace, workspaceSize);
+    gemm_cublasLt_AxBT_RowMajor_bf16(handle, M, N, K, A, B, C, workspace, workspaceSize,stream);
 }

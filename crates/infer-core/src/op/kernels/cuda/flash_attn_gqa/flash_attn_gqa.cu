@@ -2,16 +2,6 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cstdio>
-// 宏定义：用于处理 CUDA 核函数中的错误检查
-#define CUDA_CHECK(call)                                                          \
-    do {                                                                          \
-        cudaError_t err = call;                                                   \
-        if (err != cudaSuccess) {                                                 \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            /* 在生产代码中可能需要更复杂的错误处理机制 */                           \
-        }                                                                         \
-    } while (0)
-
 
 __device__ __forceinline__ float warp_reduce_max(float val) {
 #pragma unroll

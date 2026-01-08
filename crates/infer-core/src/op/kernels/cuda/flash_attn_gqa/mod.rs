@@ -41,6 +41,17 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+    pub fn launch_flash_attn_cute_128x64x64_tile(
+        q_ptr: *const half::bf16,
+        k_ptr: *const half::bf16,
+        v_ptr: *const half::bf16,
+        o_ptr: *mut half::bf16,
+        q_seq_len: i32,
+        kv_seq_len: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Flash Attention GQA 的 CUDA 内核包装函数 (Prefill/Decode 模式)。
@@ -67,13 +78,15 @@ pub fn flash_attn_gqa(
     head_dim: usize,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
-    // --- 1. 获取具体类型和指针 ---
+    // --- 1. 数据类型校验 ---
+    let dtype = input_q.dtype();
     
-    let q_ptr = input_q.as_f32()?.buffer().as_ptr() as *const f32;
-    let k_ptr = input_k_cache.as_f32()?.buffer().as_ptr() as *const f32;
-    let v_ptr = input_v_cache.as_f32()?.buffer().as_ptr() as *const f32;
-    // O 是输出，需要可变指针
-    let o_ptr = output_o.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+    if input_q.dtype() != input_k_cache.dtype() || input_q.dtype() != input_v_cache.dtype() || input_q.dtype() != output_o.dtype() {
+        return Err(Error::InvalidArgument(format!(
+            "All tensors must have the same data type for flash_attn_gqa. Q: {:?}, K: {:?}, V: {:?}, O: {:?}",
+            input_q.dtype(), input_k_cache.dtype(), input_v_cache.dtype(), output_o.dtype()
+        )).into());
+    }
 
     // --- 2. 维度检查和转换 ---
     
@@ -89,40 +102,84 @@ pub fn flash_attn_gqa(
     }
 
     // --- 3. 获取 CUDA stream ---
-    let mut stream: cuda::ffi::cudaStream_t = std::ptr::null_mut();
-    if let Some(config) = cuda_config {
-        stream = config.stream; 
-    }
-    if q_seq_len == 1 {
-        unsafe {
-            flash_decoding_cu(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                o_ptr,
-                q_seq_len_i32,
-                kv_seq_len_i32,
-                num_q_heads_i32,
-                num_kv_heads_i32,
-                head_dim_i32,
-                stream,
-            );
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+
+    // --- 4. 根据数据类型分发 ---
+    match dtype {
+        crate::base::DataType::F32 => {
+            let q_ptr = input_q.as_f32()?.buffer().as_ptr() as *const f32;
+            let k_ptr = input_k_cache.as_f32()?.buffer().as_ptr() as *const f32;
+            let v_ptr = input_v_cache.as_f32()?.buffer().as_ptr() as *const f32;
+            let o_ptr = output_o.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+
+            unsafe {
+                if q_seq_len == 1 {
+                    flash_decoding_cu(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        o_ptr,
+                        q_seq_len_i32,
+                        kv_seq_len_i32,
+                        num_q_heads_i32,
+                        num_kv_heads_i32,
+                        head_dim_i32,
+                        stream,
+                    );
+                } else {
+                    flash_attn_gqa_cu(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        o_ptr,
+                        q_seq_len_i32,
+                        kv_seq_len_i32,
+                        num_q_heads_i32,
+                        num_kv_heads_i32,
+                        head_dim_i32,
+                        stream,
+                    );
+                }
+            }
         }
-    }else{
-        unsafe {
-            flash_attn_gqa_cu(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                o_ptr,
-                q_seq_len_i32,
-                kv_seq_len_i32,
-                num_q_heads_i32,
-                num_kv_heads_i32,
-                head_dim_i32,
-                stream,
-            );
+        crate::base::DataType::BF16 => {
+            let q_ptr = input_q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let k_ptr = input_k_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let v_ptr = input_v_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let o_ptr = output_o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+
+            unsafe {
+                if q_seq_len == 1 {
+                    flash_decoding_cu_bf16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        o_ptr,
+                        kv_seq_len_i32,
+                        num_q_heads_i32,
+                        num_kv_heads_i32,
+                        head_dim_i32,
+                        stream,
+                    );
+                } else {
+                    launch_flash_attn_cute_128x64x64_tile(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        o_ptr,
+                        q_seq_len_i32,
+                        kv_seq_len_i32 + q_seq_len_i32,
+                        num_q_heads_i32,
+                        num_kv_heads_i32,
+                        stream,
+                    );
+                }
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!("Unsupported dtype {:?} for flash_attn_gqa", dtype)).into());
         }
     }
+    
     Ok(())
 }

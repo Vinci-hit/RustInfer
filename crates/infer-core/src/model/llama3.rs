@@ -664,9 +664,8 @@ impl Llama3 {
     /// - `Result<i32>`: 成功时返回生成的 token ID。
     fn forward_batch(&mut self, tokens: &[i32], pos: usize) -> Result<i32> {
         let seq_len = tokens.len();
-        
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
-
+        
         // Prepare batch input tokens
         let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
@@ -680,7 +679,6 @@ impl Llama3 {
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
-        
         // Prepare position tensor
         let mut pos_tensor = self.workspace.remove(&BufferType::InputPos).unwrap();
         pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
@@ -699,40 +697,36 @@ impl Llama3 {
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
-            
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
+            // println!("attn_out: {:?}", &attn_norm_out.to_cpu()?.as_bf16()?.as_slice()?[0]);
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
             self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
-            
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&pos_tensor, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
-            
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out; // Reuse buffer
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &pos_tensor], &mut [&mut attn_out], cuda_config_ref))?;
-            
             let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
-            
             self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &wo_out], &mut [&mut x], cuda_config_ref))?;
-            
             // FFN Block
             residual.copy_from(&x)?; // Update residual
             let mut ffn_norm_out = attn_out; // Reuse buffer
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&residual], &mut [&mut ffn_norm_out], cuda_config_ref))?;
-            
+
             let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
             let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
             let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
             let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
-
             self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
             self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
+
             let mut w2_out = ffn_norm_out; // Reuse buffer
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &w2_out], &mut [&mut x], cuda_config_ref))?;
+            
         }
         self.workspace.insert(BufferType::InputPos, pos_tensor); // Return for next use
 
@@ -747,18 +741,18 @@ impl Llama3 {
         // Final Norm and classifier
         let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        
+
         self.layers.rmsnorm_final_layer.forward(
             &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
         )?;
-        
+
         let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
+
         self.layers.cls_layer.forward(
             &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
         )?;
-        
         let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
-        let next_token = self.sampler.sample(logits_ref)?;
+        let next_token = self.sampler.sample(logits_ref, cuda_config_ref)?;
         Ok(next_token)
     }
 
@@ -829,7 +823,7 @@ Today Date: 14 Dec 2025
 
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
-你是算法糕手，写一段C++代码，实现一个简单的MaxPooling函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         let max_tokens = 150;
         
         println!("Starting CPU generation...");
@@ -890,14 +884,14 @@ Today Date: 14 Dec 2025
         let model_path = get_dummy_model_path();
         assert!(model_path.exists(), "Dummy model directory not found.");
 
-        let prompt = "<|start_header_id|>system<|end_header_id|>
+        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Cutting Knowledge Date: December 2023
 Today Date: 14 Dec 2025
 
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
-你好,你是ai infra 来面试实习的，精通高性能计算，请自我介绍一下。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         let max_tokens = 2000;
 
         // --- 2. 在 CUDA 上运行并获取结果和性能 ---

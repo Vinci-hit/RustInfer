@@ -5,14 +5,32 @@ fn main() {
     // 检查 "cuda" feature 是否被启用
     #[cfg(feature = "cuda")]{
         let kernel_paths = find_files("src/op/kernels/cuda", "cu");
+        
         if kernel_paths.is_empty() {
             // 如果没有找到任何 .cu 文件，可能是一个配置错误，可以选择性地警告或 panic
             println!("cargo:warning=No CUDA kernel files (.cu) found in src/op/kernels/cuda/");
             // return; // 如果你希望在这种情况下停止构建
         }
+        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+        println!("cargo:rustc-link-lib=cublas");
+        // 对应 cublasLt.h
+        println!("cargo:rustc-link-lib=cublasLt");
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = PathBuf::from(manifest_dir);
+        let cutlass_include = root.join("src/op/kernels/cuda/third_party");
+        if !cutlass_include.exists() {
+            panic!(
+                "Cutlass include directory not found at: {:?}\n\
+                 Hint: Did you run 'git submodule update --init --recursive'?", 
+                cutlass_include
+            );
+        }
         // 1. 使用 cc crate 编译 CUDA 代码 (这部分保持不变)
         let mut build = cc::Build::new();
         build.cuda(true)
+        .flag("-w") 
+        .include(&cutlass_include)
+        .flag("-std=c++17")
         .flag("-arch=sm_89");// 请根据你的 GPU 架构修改       // 禁用优化（避免变量被优化掉，调试时能看到真实值）
 
         for path in &kernel_paths {
@@ -32,6 +50,7 @@ fn main() {
             .clang_arg(format!("-I{}/include", env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into())))
             // 明确告诉 bindgen 本次编译的目标架构
             .clang_arg(format!("--target={}", target))
+            .clang_arg(format!("-I{}", cutlass_include.to_string_lossy()))
             // ==================== 关键的新增代码在这里 ====================
             // 强制 libclang 使用 C++ 模式解析头文件
             .clang_arg("-x")

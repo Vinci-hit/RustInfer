@@ -5,7 +5,7 @@ use std::io::{Cursor, Read};
 use serde::Deserialize;
 use crate::base::error::{Error, Result};
 
-const MAX_SEQ_LEN: usize = 512; // 根据调整此值
+const MAX_SEQ_LEN: usize = 2048; // 根据调整此值
 
 // ======================= 新增的顶层结构体 =======================
 /// 这个结构体匹配 config.json 的顶层结构。

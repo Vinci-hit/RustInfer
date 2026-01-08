@@ -2,16 +2,16 @@
 #include <cuda_bf16.h>
 __global__ void bf16_vec8_add_kernel(
     float4*  __restrict__ c,
-    float4*  __restrict__ a,
-    float4*  __restrict__ b,
+    const float4*  __restrict__ a,
+    const float4*  __restrict__ b,
     int N
 )
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
     for (int i = idx; i < N; i += stride) {
-        auto val_a = reinterpret_cast<__nv_bfloat162*>(&a[i]);
-        auto val_b = reinterpret_cast<__nv_bfloat162*>(&b[i]);
+        auto val_a = reinterpret_cast<const __nv_bfloat162*>(&a[i]);
+        auto val_b = reinterpret_cast<const __nv_bfloat162*>(&b[i]);
         auto val_c = reinterpret_cast<__nv_bfloat162*>(&c[i]);
         val_c[0] = __hadd2(val_a[0], val_b[0]);
         val_c[1] = __hadd2(val_a[1], val_b[1]);
@@ -21,8 +21,8 @@ __global__ void bf16_vec8_add_kernel(
 }
 void add_kernel_bf16x8(
     __nv_bfloat16* c,
-    __nv_bfloat16* a,
-    __nv_bfloat16* b,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
     int num_elements,
     cudaStream_t stream
 )
@@ -34,13 +34,13 @@ void add_kernel_bf16x8(
     cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     auto* c_f4 = reinterpret_cast<float4*>(c);
-    auto* a_f4 = reinterpret_cast<float4*>(a);
-    auto* b_f4 = reinterpret_cast<float4*>(b);
+    auto* a_f4 = reinterpret_cast<const float4*>(a);
+    auto* b_f4 = reinterpret_cast<const float4*>(b);
     bf16_vec8_add_kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(c_f4, a_f4, b_f4, num_elements / 8);
 }
 __global__ void bf16_inplace_vec8_add_kernel(
     float4* a_and_c,
-    float4* b,
+    const float4* b,
     int N
 )
 {
@@ -48,7 +48,7 @@ __global__ void bf16_inplace_vec8_add_kernel(
     int stride = gridDim.x * blockDim.x;
     for (int i = idx; i < N; i += stride) {
         auto val_a = reinterpret_cast<__nv_bfloat162*>(&a_and_c[i]);
-        auto val_b = reinterpret_cast<__nv_bfloat162*>(&b[i]);
+        auto val_b = reinterpret_cast<const __nv_bfloat162*>(&b[i]);
         val_a[0] = __hadd2(val_a[0], val_b[0]);
         val_a[1] = __hadd2(val_a[1], val_b[1]);
         val_a[2] = __hadd2(val_a[2], val_b[2]);
@@ -57,7 +57,7 @@ __global__ void bf16_inplace_vec8_add_kernel(
 }
 void add_inplace_kernel_bf16x8(
     __nv_bfloat16* a_and_c,
-    __nv_bfloat16* b,
+    const __nv_bfloat16* b,
     int num_elements,
     cudaStream_t stream
 )
@@ -69,7 +69,7 @@ void add_inplace_kernel_bf16x8(
     cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     auto* a_and_c_f4 = reinterpret_cast<float4*>(a_and_c);
-    auto* b_f4 = reinterpret_cast<float4*>(b);
+    auto* b_f4 = reinterpret_cast<const float4*>(b);
     bf16_inplace_vec8_add_kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(a_and_c_f4, b_f4, num_elements / 8);
 }
 
