@@ -1,0 +1,40 @@
+   Compiling infer-core v0.1.0 (/mnt/md1/lwq/RustInfer/crates/infer-core)
+warning: unused import: `DataType`
+ --> crates/infer-core/src/op/swiglu.rs:2:30
+  |
+2 | use crate::base::{DeviceType,DataType};
+  |                              ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `DataType`
+ --> crates/infer-core/src/op/flash_gqa.rs:2:19
+  |
+2 | use crate::base::{DataType, DeviceType};
+  |                   ^^^^^^^^
+
+warning: unused variable: `dtype`
+  --> crates/infer-core/src/op/flash_gqa.rs:68:13
+   |
+68 |         let dtype = input_q.dtype();
+   |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_dtype`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `flash_decoding_cu_bf16` is never used
+  --> crates/infer-core/src/op/kernels/cuda/flash_attn_gqa/mod.rs:33:12
+   |
+33 |     pub fn flash_decoding_cu_bf16(
+   |            ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `infer-core` (lib test) generated 4 warnings (run `cargo fix --lib -p infer-core --tests` to apply 3 suggestions)
+    Finished `release` profile [optimized] target(s) in 46.13s
+     Running unittests src/lib.rs (/mnt/md1/lwq/RustInfer/target/release/deps/infer_core-a5abf2ba925c51fd)
+
+running 1 test
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `/mnt/md1/lwq/RustInfer/target/release/deps/infer_core-a5abf2ba925c51fd test_llama3_cuda_performance --show-output --ignored` (signal: 11, SIGSEGV: invalid memory reference)

@@ -44,9 +44,9 @@ pub fn hgemm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let a_shape = input.shape();
     let b_shape = weight.shape();
 
-    let m = b_shape[0];
-    let k = b_shape[1];
-    let n = a_shape[0];
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[0];
     
     // (这里可以添加形状检查)
 
@@ -61,6 +61,7 @@ pub fn hgemm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let cublaslt_handle = cuda_config.map_or(std::ptr::null_mut(), |config| config.cublaslt_handle);
     let workspace = cuda_config.map_or(std::ptr::null_mut(), |config| config.workspace);
     let workspace_size = cuda_config.map_or(0, |config| config.workspace_size);
+    
     unsafe {
         gemm_cublaslt_bf16(
             a_ptr,
@@ -139,10 +140,6 @@ pub fn sgemm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config: 
     // (这里可以添加形状检查)
 
     let a_ptr = input.as_f32()?.buffer().as_ptr() as *const f32;
-    // **注意**: 我们的 sgemm 内核不支持转置，所以 B 必须已经是 W^T
-    // 在实践中，我们会使用 cuBLAS，它支持转置。
-    // 为了使用您的 naive_kernel，我们需要一个已经转置好的 weight。
-    // 这里我们假设 weight 就是 B，而不是 W。
     let b_ptr = weight.as_f32()?.buffer().as_ptr() as *const f32;
     let c_ptr = output.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
 

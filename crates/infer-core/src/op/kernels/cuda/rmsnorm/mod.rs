@@ -20,7 +20,7 @@ unsafe extern "C" {
         weight: *const half::bf16,
         rows: i32,
         cols: i32,
-        eps: half::bf16,
+        eps: f32,
         stream:crate::cuda::ffi::cudaStream_t,
     );
 }
@@ -32,7 +32,6 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
     
     // 获取 CUDA stream
     let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
-
     // 根据输出数据类型进行分发
     let dtype = output.dtype();
     match dtype {
@@ -66,7 +65,6 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
             let input_typed = input.as_bf16()?;
             let weight_typed = weight.as_bf16()?;
             let output_typed:&mut TypedTensor<half::bf16> = output.as_bf16_mut()?;
-            
             // 检查对齐要求
             if dim % 16 != 0 {
                 return Err(Error::InvalidArgument("RMSNorm bf16 kernel requires dimension to be multiple of 16".to_string()).into());
@@ -83,7 +81,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
                     weight_ptr,
                     rows as i32,
                     dim as i32,
-                    bf16::from_f32(1e-6), // epsilon
+                    1e-6, // epsilon
                     stream
                 );
             }
