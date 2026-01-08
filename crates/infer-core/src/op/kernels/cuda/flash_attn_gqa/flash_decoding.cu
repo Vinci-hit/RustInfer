@@ -3,15 +3,6 @@
 #include <stdio.h>
 #include "flash_attn_gqa.h"
 
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(1); \
-        } \
-    } while (0)
-
 // Warp 内求和
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll

@@ -18,7 +18,7 @@ extern "C" {
  * @param stream          执行此操作的 CUDA stream。
  * @return cudaError_t    返回最后一个 CUDA API 调用的错误码。
  */
-cudaError_t argmax_cu_f32_ffi(
+void argmax_cu_f32_ffi(
     const float* logits_ptr,
     int vocab_size,
     int* result_ptr_gpu,
@@ -34,7 +34,7 @@ cudaError_t argmax_cu_f32_ffi(
  * @param stream          执行此操作的 CUDA stream。
  * @return cudaError_t    返回最后一个 CUDA API 调用的错误码。
  */
-cudaError_t argmax_cu_bf16_ffi(
+void argmax_cu_bf16_ffi(
     const __nv_bfloat16* logits_ptr,
     int vocab_size,
     int* result_ptr_gpu,

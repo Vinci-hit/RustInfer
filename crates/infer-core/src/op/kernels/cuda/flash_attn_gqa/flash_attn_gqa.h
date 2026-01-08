@@ -2,6 +2,14 @@
 #include <cuda_runtime.h> // 包含 cudaStream_t 定义
 #include <cuda_bf16.h>
 #include <cublasLt.h>
+#define CUDA_CHECK(call)                                                          \
+    do {                                                                          \
+        cudaError_t err = call;                                                   \
+        if (err != cudaSuccess) {                                                 \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            /* 在生产代码中可能需要更复杂的错误处理机制 */                           \
+        }                                                                         \
+    } while (0)
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -57,6 +65,11 @@ void flash_decoding_cu_bf16(
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
+    cudaStream_t stream);
+
+void launch_flash_attn_cute_128x64x64_tile(
+    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+    int seq_len, int kv_len, int q_heads, int kv_heads,
     cudaStream_t stream);
 
 #ifdef __cplusplus

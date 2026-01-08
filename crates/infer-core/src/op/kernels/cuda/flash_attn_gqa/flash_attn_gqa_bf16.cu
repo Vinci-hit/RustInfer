@@ -1,322 +1,525 @@
+#include <iostream>
+#include <vector>
+#include <random>
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
 #include "flash_attn_gqa.h"
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
-#include <cstdio>
-// 宏定义：用于处理 CUDA 核函数中的错误检查
-#define CUDA_CHECK(call)                                                          \
-    do {                                                                          \
-        cudaError_t err = call;                                                   \
-        if (err != cudaSuccess) {                                                 \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            /* 在生产代码中可能需要更复杂的错误处理机制 */                           \
-        }                                                                         \
-    } while (0)
+#include <cuda_bf16.h>
+#include <cute/tensor.hpp>
+#include <cutlass/numeric_conversion.h>
+template <class ElementType, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV>
+struct SharedStorage {
+    cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutK>> smem_k;
+    cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutV>> smem_v;
+};
 
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
+using namespace cute;
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
+__device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
 #pragma unroll
-    for (int mask = 32 >> 1; mask >= 1; mask >>= 1) {
-        val = max(val, __shfl_xor_sync(0xffffffff, val, mask, 32));
-    }
-    return val;
-}
-__device__ __forceinline__ float warp_reduce_sum(float val, unsigned mask = 0xffffffff) {
+    for (int mi = 0; mi < size<0>(tensor); mi++) {
+        summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));
 #pragma unroll
-    for (int mask = 32 >> 1; mask >= 1; mask >>= 1) {
-        val += __shfl_xor_sync(0xffffffff, val, mask, 32);
+        for (int ni = 1; ni < size<1>(tensor); ni++) {
+            summary(mi) = op(summary(mi), tensor(mi, ni));
+        }
     }
-    return val;
+}
+template<int THREADS>
+struct Allreduce {
+    static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
+    template<typename T, typename Operator>
+    static __device__ __forceinline__ T run(T x, Operator &op) {
+        constexpr int OFFSET = THREADS / 2;
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+        return Allreduce<OFFSET>::run(x, op);
+    }
+};
+template<>
+struct Allreduce<2> {
+    template<typename T, typename Operator>
+    static __device__ __forceinline__ T run(T x, Operator &op) {
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+        return x;
+    }
+};
+template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
+__device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Engine1, Layout1> &src, Operator &op) {
+    CUTE_STATIC_ASSERT_V(size(dst) == size(src));
+#pragma unroll
+    for (int i = 0; i < size(dst); i++){
+        dst(i) = Allreduce<4>::run(src(i), op);
+    }
+}
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
+__device__ __forceinline__ void reduce_(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
+    thread_reduce_<zero_init>(tensor, summary, op);
+    quad_allreduce_(summary, summary, op);
 }
 
-#define CP_ASYNC_CG(dst, src, bytes)                                           \
-asm volatile(                                                                \
-"cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"l"(dst),       \
-"l"(src), "n"(bytes))
+template<typename T>
+struct MaxOp {
+    __device__ __forceinline__ T operator()(T const & x, T const & y) { return x > y ? x : y; }
+};
 
-#define CP_ASYNC_CG_ca(dst, src, bytes)                                           \
-asm volatile(                                                                \
-"cp.async.ca.shared.global [%0], [%1], %2;\n" ::"l"(dst),       \
-"l"(src), "n"(bytes))
+template <>
+struct MaxOp<float> {
+    // This is slightly faster
+    __device__ __forceinline__ float operator()(float const &x, float const &y) { return max(x, y); }
+};
 
-#define CP_ASYNC_COMMIT_GROUP() asm volatile("cp.async.commit_group;\n" ::)
-#define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)
-#define CP_ASYNC_WAIT_GROUP(n)                                                 \
-asm volatile("cp.async.wait_group %0;\n" ::"n"(n))
-template<const int THREADS_PER_BLOCK = 128,const int Br = 16>
-__global__ void flash_attn_gqa_kernel(
-    const float* __restrict__ q_ptr,
-    const float* __restrict__ k_ptr,
-    const float* __restrict__ v_ptr,
-    float* __restrict__ o_ptr,
-    int Tc,
-    const int tile_offset,//每个tile的大小，q_ptr[q_tile_id*Br:q_tile_id*(Br+1)][head_idx][head_dim]
-    const int tile_size_inhead,
-    const int kv_total_len, // 历史大小加上当前q输入新的qlen
-    const float scale,
-    int q_seq_len,
-    int kv_seq_len,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename T>
+struct SumOp {
+    __device__ __forceinline__ T operator()(T const & x, T const & y) { return x + y; }
+};
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
+    MaxOp<float> max_op;
+    reduce_<zero_init>(tensor, max, max_op);
+}
+
+template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
+    SumOp<float> sum_op;
+    thread_reduce_<zero_init>(tensor, sum, sum_op);
+}
+template<typename Layout>
+__forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
+    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+};
+template <typename To_type, typename Engine, typename Layout>
+__forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
+    using From_type = typename Engine::value_type;
+    constexpr int numel = decltype(size(tensor))::value;
+    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+    // HACK: this requires tensor to be "contiguous"
+    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+}
+template <typename Engine, typename Layout>
+__forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
+                                           const int col_idx_offset_,
+                                           const int row_idx_offset,
+                                           const int warp_row_stride,const int causal_shift) {
+    // 检查 Tensor 格式是否符合 MMA 累加器的布局要求
+    static_assert(Layout::rank == 3, "Only support 3D Tensor");
+    static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+    Tensor tensor = make_tensor(tensor_.data(), convert_layout_acc_rowcol(tensor_.layout()));
+    const int lane_id = threadIdx.x % 32;
+    // 计算当前线程处理的列索引基础偏移
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+
+    // 遍历 MMA 布局的行维度 (外层)
+#pragma unroll
+    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+        const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+#pragma unroll
+        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+            const int row_idx = row_idx_base + i * 8;
+
+            // [核心修改]
+            // 允许查看的最大列号 = 当前行号 + 历史长度偏移
+            // 比如 row=0, shift=99 -> limit=100 (可以看 col 0~99)
+            const int col_idx_limit = row_idx + 1 + causal_shift;
+
+#pragma unroll
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const int col_idx_base = col_idx_offset + nj * 8;
+#pragma unroll
+                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    const int col_idx = col_idx_base + j;
+
+                    // Causal Mask 判断
+                    if (col_idx >= col_idx_limit) {
+                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    }
+                }
+            }
+        }
+    }
+}
+template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
+#pragma unroll
+    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+        // If max is -inf, then all elements must have been -inf (possibly due to masking).
+        // We don't want (-inf - (-inf)) since that would give NaN.
+        // If we don't have float around M_LOG2E the multiplication is done in fp64.
+        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * (Scale_max ? scale : float(M_LOG2E));
+#pragma unroll
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
+            // max * log_2(e)) This allows the compiler to use the ffma
+            // instruction instead of fadd and fmul separately.
+            // The following macro will disable the use of fma.
+            // See: https://github.com/pytorch/pytorch/issues/121558 for more details
+            // This macro is set in PyTorch and not FlashAttention
+#ifdef UNFUSE_FMA
+            tensor(mi, ni) = exp2f(__fmul_rn(tensor(mi, ni), scale) - max_scaled);
+#else
+            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+#endif
+        }
+    }
+}
+template<typename MMA_traits, typename Layout>
+__forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
+    using X = Underscore;
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
+    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
+    if constexpr (mma_shape_K == 8) {
+        return acc_layout;
+    } else {
+        auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
+        return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
+    }
+};
+template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+         typename TiledMma, typename TiledCopy, typename ThrCopy>
+__forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
+                               TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+                               ThrCopy smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+#pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+const int kNWarps = 4;
+template <class QShape, class KVShape,
+          class QStride, class QSmemLayout, class TiledCopyQ, class S2RAtom,
+          class KStride, class KVSmemLayout, class TiledCopyK, class S2RAtomTrans, class SmemVTransNoSwi, class SmemVTrans,
+          class VStride,
+          class OStride, class OSmemLayout, class TiledCopyO, class TiledMma>
+__global__ void flash_attn_gqa_kernel_bf16_test(
+    QShape q_shape, KVShape kv_shape,
+    const __nv_bfloat16* __restrict__ q_ptr, QStride dQ, QSmemLayout sQ_layout, TiledCopyQ copy_q, S2RAtom s2r_atom,
+    const __nv_bfloat16* __restrict__ k_ptr, KStride dK, KVSmemLayout sKV_layout, TiledCopyK copy_kv, S2RAtomTrans s2r_atom_trans, SmemVTransNoSwi V_layout_trans_no_swi,SmemVTrans V_layout_trans,
+    const __nv_bfloat16* __restrict__ v_ptr, VStride dV,
+    __nv_bfloat16* __restrict__ o_ptr,OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma)
 {
-    const unsigned Q_tile_id = blockIdx.x; // 处理某个Q的块。
-    const unsigned q_head_idx = blockIdx.y; //第几个头，索引形式为q_ptr[seq_len][head_idx][head_dim]
-    const unsigned kv_head_idx = blockIdx.y / (num_q_heads / num_kv_heads);
-    const int kLoadNumElementsPerThread = Br * head_dim / THREADS_PER_BLOCK; //一个block128个线程，将tile内的元素平均分给每个线程。只管head内
-    extern __shared__ float Q_tile_smem[];
-    float *K_tile_smem = Q_tile_smem + tile_size_inhead;
-    float *V_tile_smem = Q_tile_smem + 2 * tile_size_inhead;
-    const int headdim_warp = head_dim / 32;
-    uint32_t smem_Q_base_ptr = __cvta_generic_to_shared(Q_tile_smem);// 将通用指针转为共享内存专用指针。也许不转也行？
-    uint32_t smem_K_base_ptr = __cvta_generic_to_shared(K_tile_smem);
-    uint32_t smem_V_base_ptr = __cvta_generic_to_shared(V_tile_smem);
-    const unsigned tid = threadIdx.x;
-    {
-        const unsigned q_row_id = (tid / 4) + Q_tile_id * Br; //128个线程处理32行，也就是4个线程处理一行，也就是说tid/4 == tile内行id, 加上Q偏移，等于全局q行id
-        //q_ptr[q_row_id][head_id][(tid % 4) * kLoadNumElementsPerThread]
-        int gmem_start_idx = q_row_id * num_q_heads * head_dim + q_head_idx * head_dim + (tid % 4) * kLoadNumElementsPerThread; // 此时不同的线程的这个值处于各自的起始位置。
-        //Q_smem[(tid / 4)][(tid % 4) * kLoadNumElementsPerThread]
-        uint32_t q_load_smem_ptr = smem_Q_base_ptr + ((tid / 4) * head_dim + (tid % 4) * kLoadNumElementsPerThread)  * sizeof(float);//每个指针应该在的共享内存内的地址。
-        if (q_row_id < q_seq_len)
+    unsigned int q_head_idx = blockIdx.y;
+    unsigned int block_m = blockIdx.x;
+    constexpr float softmax_scale_log2 = M_LOG2E / 8.0f;
+    unsigned int kv_head_idx = q_head_idx / (size<1>(q_shape) / size<1>(kv_shape)); // 简单的映射
+    Tensor Q = make_tensor(make_gmem_ptr(q_ptr), q_shape, dQ);// (seq,head_num,head_dim)
+    Tensor K = make_tensor(make_gmem_ptr(k_ptr), kv_shape, dK);
+    Tensor V = make_tensor(make_gmem_ptr(v_ptr), kv_shape, dV);
+    Tensor O = make_tensor(make_gmem_ptr(o_ptr), q_shape, dO);// (seq,head_num,head_dim)
+    Tensor gQ = local_tile(Q(_,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0)); //每个blockx处理一块q
+    Tensor gK = local_tile(K(_,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0)); // 把第0个维度堆叠起来，变成（64,64，N/64）
+    Tensor gV = local_tile(V(_,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0));
+    Tensor gO = local_tile(O(_,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0));
+    extern __shared__ __nv_bfloat16 shared_memory[];
+    using SharedStorage = SharedStorage<__nv_bfloat16, QSmemLayout, KVSmemLayout,KVSmemLayout>;
+    SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+    Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.begin()), sQ_layout);
+    Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.begin()), sKV_layout);
+    Tensor sV = make_tensor(make_smem_ptr(smem.smem_v.begin()), sKV_layout);
+    Tensor sVt = make_tensor(sV.data(), V_layout_trans);
+    Tensor sVtNoSwizzle = make_tensor(sV.data(), V_layout_trans_no_swi);
+    int q_len = size<0>(q_shape);
+    int kv_len = size<0>(kv_shape);
+    // 创建一个假的 Tensor 用于分配寄存器
+    ThrCopy thr_copy_q  = copy_q.get_slice(threadIdx.x);
+    ThrCopy thr_copy_kv = copy_kv.get_slice(threadIdx.x);
+    Tensor tQgQ = thr_copy_q.partition_S(gQ);
+    Tensor tQsQ = thr_copy_q.partition_D(sQ);
+    copy(copy_q, tQgQ, tQsQ);
+    Tensor tKgK = thr_copy_kv.partition_S(gK);
+    Tensor tKsK = thr_copy_kv.partition_D(sK);
+    Tensor tVgV = thr_copy_kv.partition_S(gV);
+    Tensor tVsV = thr_copy_kv.partition_D(sV);
+
+    copy(copy_kv, tKgK(_,_,_,0), tKsK); //把k的第0分片从全局读到共享
+    auto thr_mma = mma.get_slice(threadIdx.x);
+    // 用于计算 S = Q * K^T
+    Tensor rQ = thr_mma.partition_fragment_A(sQ); // (MMA, MMA_M, MMA_K)
+    // 想办法把sQ里面的值塞进rQ，但是要重排列
+    TiledCopy s2r_copy_q = make_tiled_copy_A(s2r_atom, mma);
+    ThrCopy   s2r_thr_copy_q = s2r_copy_q.get_slice(threadIdx.x);
+    Tensor tXsQ = s2r_thr_copy_q.partition_S(sQ);
+    Tensor tXrQ = s2r_thr_copy_q.retile_D(rQ);
+    CUTE_STATIC_ASSERT_V(size<1>(tXsQ) == size<1>(tXrQ));
+
+    Tensor rK = thr_mma.partition_fragment_B(sK); // (MMA, MMA_N, MMA_K)
+
+    Tensor rS = partition_fragment_C(mma, Shape<Int<128>, Int<64>>{});  // (MMA=4, MMA_M, MMA_N)
+    Tensor acc_o = partition_fragment_C(mma, Shape<Int<128>, Int<64>>{});  // MMA, MMA_M, MMA_K
+    clear(rS);
+    clear(acc_o);
+    TiledCopy s2r_copy_k = make_tiled_copy_B(s2r_atom, mma);
+    ThrCopy   s2r_thr_copy_k = s2r_copy_k.get_slice(threadIdx.x);
+    Tensor tXsK = s2r_thr_copy_k.partition_S(sK); // (CPY, MMA_N, MMA_K)
+    Tensor tXrK = s2r_thr_copy_k.retile_D(rK);    // (CPY, MMA_N, MMA_K)
+
+    Tensor rVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);
+    TiledCopy s2r_copy_v = make_tiled_copy_B(s2r_atom_trans, mma);
+    ThrCopy   s2r_thr_copy_v = s2r_copy_v.get_slice(threadIdx.x);
+    Tensor tOsVt = s2r_thr_copy_v.partition_S(sVt); // (CPY, MMA_N, MMA_K, PIPE)
+
+    cp_async_fence(); // 提交
+
+    //用于存储每个线程持有的最终结果
+    auto rAccOut = partition_fragment_C(mma, Shape<Int<128>, Int<64>>{});
+    clear(rAccOut);
+    auto ol = logical_divide(rAccOut.layout(), Shape<Int<2>>{});
+    auto rAccOut_new_layout =
+        make_layout(make_layout(get<1>(get<0>(ol)), get<1>(ol)),
+                    make_layout(get<0>(get<0>(ol)), get<2>(ol)));
+    auto rAccOut_new = make_tensor(rAccOut.data(), rAccOut_new_layout);
+    Tensor row_max = make_tensor<float>(Shape<Int<size<0>(rAccOut_new)>>{});
+    Tensor row_sum = make_tensor<float>(Shape<Int<size<0>(rAccOut_new)>>{});
+    CUTE_UNROLL
+    for (int ii = 0; ii < size(row_max); ii++) {
+        row_max(ii) = float(-5e4);
+        row_sum(ii) = 0;
+    }
+    cp_async_wait<0>();
+    __syncthreads();//进入循环前，等Q和KV读入共享内存
+
+    copy(s2r_copy_q, tXsQ, tXrQ); // 把Q从共享内存读入寄存器
+    int max_k_col = (block_m + 1) * 128 + (size<0>(kv_shape) - size<0>(q_shape));
+    int n_block_max = (max_k_col + 64 - 1) / 64;
+    n_block_max = min(n_block_max, (size<0>(kv_shape) + 64 - 1) / 64);
+     for (int n_tile = 0; n_tile < n_block_max; ++n_tile)
+     {
+
+         copy(copy_kv, tVgV(_,_,_,n_tile), tVsV);
+
+         cp_async_wait<1>();
+         __syncthreads();//进入循环前，等上一轮的K存入共享内存完毕
+         clear(rS);
+         copy(s2r_copy_k, tXsK, tXrK);
+
+         gemm(mma, rQ, rK, rS); //用完了rK，可以读下一轮的了
+
+         copy(copy_kv, tKgK(_,_,_,(n_tile + 1 ) % n_block_max), tKsK);
+         cp_async_fence();
+         apply_mask(
+             rS, 64 *n_tile, block_m * 128 + (threadIdx.x / 32) * 16 + (threadIdx.x % 32) / 4,16*kNWarps, kv_len - q_len
+         );
+
+        //softmax
+         Tensor scores = make_tensor(rS.data(), convert_layout_acc_rowcol(rS.layout()));//把tensorcore计算完后的乱序结果视为有序
+
+        if (n_tile == 0)
         {
-#pragma unroll
-            for (int i =0;i<kLoadNumElementsPerThread;i+=4) //载入Q，边界判断
-            {
-                CP_ASYNC_CG(q_load_smem_ptr + i * sizeof(float), &q_ptr[gmem_start_idx + i], 4 * sizeof(float));
-            }
-        }
-        CP_ASYNC_COMMIT_GROUP();//提交异步流
-    }
-    float m_old[8]; // 8 个 Br 行的局部最大值
-    float l_old[8]; // 8 个 Br 行的局部指数和
-    for (int i = 0; i < 8; ++i) {
-        m_old[i] = -INFINITY;
-        l_old[i] = 0.0f;
-    }
-    const int output_elements_per_thread = Br * head_dim / THREADS_PER_BLOCK;
-    // 动态分配线程本地内存（堆上，64位CUDA支持）
-    float* Output = (float*)malloc(output_elements_per_thread * sizeof(float));
-    if (Output == nullptr) {  // 检查分配失败（避免内存不足）
-        return;
-    }
-    for (int i =0 ; i< output_elements_per_thread;++i)
-    {
-        Output[i] = 0.0f;
-    }
-    
-    //在循环外首次加载
-    unsigned k_load_row_id = (tid / 4) + 0 * Br;
-    //k_ptr[k_load_row_id][kv_head_id][tid%4 * kperthread]
-    int kv_gmem_start_idx = k_load_row_id * num_kv_heads * head_dim + kv_head_idx * head_dim + (tid % 4) * kLoadNumElementsPerThread; // 此时不同的线程的这个值处于各自的起始位置。
-    //k_smem[tid/4][tid%4 * kperthead] // 即每行由四个线程填充，转置存储只需改为k_smem[tid%4 * kperthead][tid/4]
-    uint32_t k_load_smem_ptr = smem_K_base_ptr + ((tid % 4) * kLoadNumElementsPerThread * 32 + (tid / 4))  * sizeof(float);//每个指针应该在的共享内存内的地址。
-    uint32_t v_load_smem_ptr = smem_V_base_ptr + ((tid / 4) * head_dim + (tid % 4) * kLoadNumElementsPerThread)  * sizeof(float);
-
-#pragma unroll
-    for (int i =0;i<kLoadNumElementsPerThread;i++)
-    {
-        CP_ASYNC_CG_ca(k_load_smem_ptr + (i * 32) * sizeof(float), &k_ptr[kv_gmem_start_idx + i], sizeof(float));
-    }
-    CP_ASYNC_COMMIT_GROUP();//提交异步流
-    //开始主循环
-    for (int K_tile_id = 0; K_tile_id < Tc; K_tile_id++)
-    {
-        
-        k_load_row_id = (tid / 4) + K_tile_id * Br;
-        kv_gmem_start_idx = k_load_row_id * num_kv_heads * head_dim + kv_head_idx * head_dim + (tid % 4) * kLoadNumElementsPerThread;
-
-        if (k_load_row_id < kv_total_len)
+            reduce_max</*zero_init=*/true>(scores, row_max);
+            scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            reduce_sum</*zero_init=*/true>(scores, row_sum);
+        }else
         {
-            //此时在载入qk中，还算不了矩阵，先发布一下载入v的命令
+            Tensor scores_max_prev = make_fragment_like(row_max);
+            cute::copy(row_max, scores_max_prev);
+            reduce_max</*zero_init=*/false>(scores, row_max);
+            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+            Tensor acc_o_rowcol = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
 #pragma unroll
-            for (int i =0;i<kLoadNumElementsPerThread;i+=4) //载入Q，边界判断
-            {
-                CP_ASYNC_CG(v_load_smem_ptr + i * sizeof(float), &v_ptr[kv_gmem_start_idx + i], 4 * sizeof(float));
-            }
-            CP_ASYNC_COMMIT_GROUP();//提交异步流
-            CP_ASYNC_WAIT_GROUP(1);//等待qk加载完毕，允许最新的1组未完成
-        }
-        __syncthreads(); //等待块内所有线程加载数据完毕
-        const unsigned k_row_id = (tid % Br) + K_tile_id * Br;
-        //开始计算矩阵乘法，此时已保证k_row不会超过所需要的行
-        float R_S[8]; //每个线程持有的block内的结果数量，为32*32 / 128 = 8
-        for (int i = 0; i < 8; ++i) {
-            R_S[i] = 0.0f;
-        }
-        const int q_row = Q_tile_id * Br + tid / 32 * 8;
-        const int valid_row_id = q_seq_len - q_row > 8 ? 8 : q_seq_len - q_row;
-        #ifndef HEAD_DIM_DIV_4
-        #define HEAD_DIM_DIV_4 (head_dim / 4)
-        #endif
-        if (k_row_id < kv_total_len)
-        {
-        #pragma unroll
-            for (int i = 0; i < 8; i++) 
-            {
-                const unsigned s_row_id = tid / Br * 8 + i; 
-                
-                // 1. 获取 Q 的 float4 指针 (假设 Q 的行是 16 字节对齐的)
-                // Q_smem[s_row_id * head_dim] 是 Q 行的起始 float 地址
-                const float4* Q_row_ptr_f4 = (const float4*)&Q_tile_smem[s_row_id * head_dim];
-
-                // 2. K 的列索引 (转置 K 的行索引)
-                const unsigned k_col_idx = k_row_id % 32; 
-
-                // 3. 循环步长改为 4
-        #pragma unroll
-                for (int j_f4 = 0; j_f4 < HEAD_DIM_DIV_4; j_f4++)
-                {
-                    // --- 读取 Q 的 float4 ---
-                    // 每次读取 4 个 float，减少 4 倍 SMem Load 指令数量
-                    const float4 q_f4 = Q_row_ptr_f4[j_f4];
-                    
-                    // --- 读取 K 的 4 个 float ---
-                    // K 的访问仍然是 4 个单独的 float 访问，以保持转置索引的正确性。
-                    // 尽管是 4 次 SMem 访问，但它们依赖于前一个指令（Q Load）完成。
-
-                    // K 的行索引 j 是 j_f4 * 4, j_f4 * 4 + 1, ...
-                    const int j_base = j_f4 * 4;
-
-                    float k_vals[4];
-                    k_vals[0] = K_tile_smem[j_base * 32 + k_col_idx]; 
-                    k_vals[1] = K_tile_smem[(j_base + 1) * 32 + k_col_idx];
-                    k_vals[2] = K_tile_smem[(j_base + 2) * 32 + k_col_idx];
-                    k_vals[3] = K_tile_smem[(j_base + 3) * 32 + k_col_idx];
-                    
-                    // 4. 点积累加 (手动展开 4 次浮点乘法)
-                    R_S[i] += q_f4.x * k_vals[0];
-                    R_S[i] += q_f4.y * k_vals[1];
-                    R_S[i] += q_f4.z * k_vals[2];
-                    R_S[i] += q_f4.w * k_vals[3];
-                }
-            }
-        }
-        
-
-        k_load_row_id = (tid / 4) + (K_tile_id + 1) * Br;
-        kv_gmem_start_idx = k_load_row_id * num_kv_heads * head_dim + kv_head_idx * head_dim + (tid % 4) * kLoadNumElementsPerThread;
-        if (k_load_row_id < kv_total_len)
-        {
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float scores_max_cur = row_max(mi) == -INFINITY ? 0.0f : row_max(mi);
+                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale;
 #pragma unroll
-            for (int i =0;i<kLoadNumElementsPerThread;i++)
-            {
-                CP_ASYNC_CG_ca(k_load_smem_ptr + (i * 32) * sizeof(float), &k_ptr[kv_gmem_start_idx + i], sizeof(float));
+                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
             }
-            CP_ASYNC_COMMIT_GROUP();//提交异步流
+            scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            // We don't do the reduce across threads here since we don't need to use the row_sum.
+            // We do that reduce at the end when we need to normalize the softmax.
+            reduce_sum</*zero_init=*/false>(scores, row_sum);
         }
 
-        float m_new;
-        m_new = -INFINITY;
+         Tensor rP = convert_type<__nv_bfloat16>(rS);
+         Tensor tOrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMma>(rP.layout()));
+         gemm_rs(acc_o, tOrP, rVt, tOsVt, mma, s2r_copy_v, s2r_thr_copy_v);
+     }
+
+    SumOp<float> sum_op;
+    quad_allreduce_(row_sum, row_sum, sum_op);
+    Tensor acc_o_rowcol = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
 #pragma unroll
-        for (int i = 0; i < valid_row_id; ++i) {
-            const unsigned q_abs_pos = kv_seq_len + Q_tile_id * Br + i + tid / 32 * 8;
-            // Causal Mask
-            if (k_row_id > q_abs_pos) {
-                R_S[i] = -INFINITY; // 掩盖 (设为极小负数)
-            } else {
-                R_S[i] *= scale;
-            }
-            m_new = warp_reduce_max(R_S[i]);
-            m_new = m_new > m_old[i]?m_new:m_old[i];
-            R_S[i] = __expf(R_S[i] - m_new);
-            float e_factor = __expf(m_old[i] - m_new);
-            l_old[i] = __expf(m_old[i] - m_new) * l_old[i] + warp_reduce_sum(R_S[i]);
-            CP_ASYNC_WAIT_GROUP(1);//等待v加载完毕，允许最新的1组未完成
-            __syncthreads(); //等待块内所有线程加载数据完毕
-            int valid_col = kv_total_len - K_tile_id * Br;//计算现在p矩阵的有效列
-            valid_col = valid_col < 32?valid_col :32;
-            // P @ V 乘法，（32,32) @ (32,head_dim)
-            for (int col = 0;col < head_dim;col+=32)//32个线程沿着headdim维度处理，无bank conflict,一个线程是一个col
-            {
-                float temp = 0;
-                for (int row = 0;row < valid_col;row++)
-                {
-                    float val = __shfl_sync(0xffffffff,R_S[i],row,32);
-                    
-                    temp += V_tile_smem[row * head_dim + col + (tid % 32)] * val;
-                    
-                }
-                
-                const int local_col_block = col / 32; // 0, 1, 2, 3
-                const int local_idx = i * headdim_warp + local_col_block; // [0, 31]
-                // 现在只与 Q 有关，应该与 Q 的行数 q_seq_len 比较。
-                if (Q_tile_id * Br + (tid / 32 * 8) + i < q_seq_len)
-                    Output[local_idx] = temp + Output[local_idx] * e_factor;
-                
-            }
-            
-            m_old[i] = m_new;
-        }
-        
-    }// 结束K循环
-    
-    int valid_rows_in_tile = q_seq_len - Q_tile_id * Br;
-    valid_rows_in_tile = valid_rows_in_tile < Br ? valid_rows_in_tile : Br;
-    const int q_row_idx = tid / 32 *8; 
-    valid_rows_in_tile = valid_rows_in_tile - q_row_idx;
-    valid_rows_in_tile = valid_rows_in_tile > 8 ? 8 : valid_rows_in_tile;
-    for (int i = 0; i < valid_rows_in_tile; i++) // 遍历 i 循环
-    {
-        for (int col = 0; col < head_dim; col += 32) // 遍历 col 循环
-        {
-            const int local_col_block = col / 32;
-            const int local_idx = i * headdim_warp + local_col_block;
+    for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+        float sum = row_sum(mi);
+        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
 
-            // 第一步：除以 l_old (e_factor 已经被并入了 l_old 的累加)
-            // l_old[i] 存储了 e_factor * l_old[i] + sum(exp(S'))
-            Output[local_idx] *= (1.0f / l_old[i]);
-            // 第二步：写入全局 O 矩阵
-            // O[global_row][q_head_idx][global_col]
-            size_t o_gmem_idx = (size_t)(Q_tile_id * Br + q_row_idx + i) * num_q_heads * head_dim +
-                                q_head_idx * head_dim +
-                                col + (tid % 32);
-            
-            if (Q_tile_id * Br + (tid / 32 * 8) + i < q_seq_len)
-                o_ptr[o_gmem_idx] = Output[local_idx];
+        float scale = inv_sum; // 推理通常没有 dropout
+
+#pragma unroll
+        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+            acc_o_rowcol(mi, ni) *= scale; // 只做归一化
         }
-        
     }
-    free(Output);
+
+    // Convert acc_o from fp32 to fp16/bf16
+    Tensor rO = convert_type<__nv_bfloat16>(acc_o);
+    // sO 复用 sQ 的 Shared Memory 空间 (节省显存)
+    Tensor sO = make_tensor(sQ.data(), sO_layout);
+
+    // 定义 Smem -> Reg 的拷贝策略 (用于 Output)
+    // 这里的 Atom 必须支持向量化写入，且要配合 MMA 的布局
+    using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, __nv_bfloat16>;
+    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(threadIdx.x);
+
+    // retile_S: 将 MMA 布局的 rO 重排为 Copy 布局
+    Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
+    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
+
+    // 执行拷贝: Reg -> Smem
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    __syncthreads(); // 必须同步，等待所有线程写完 Smem
+
+    // ----------------------------------------------------------------
+    // 2. Global Memory 写回 (Smem -> Gmem)
+    // ----------------------------------------------------------------
+
+    // 获取 Gmem Copy 的线程切片
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(threadIdx.x);
+
+    // 切分 Source (Smem) 和 Dest (Gmem)
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+
+    // 创建寄存器中转站 (用于谓词 Masking 拷贝)
+    Tensor tOrO = make_tensor<__nv_bfloat16>(shape(tOgO));
+
+    // 从 Smem 读到寄存器
+    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+
+    // ----------------------------------------------------------------
+    // 3. 边界检查与最终写入
+    // ----------------------------------------------------------------
+
+    // 构造 Identity Tensor 用于计算逻辑坐标 (Row, Col)
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO))); // (BLK_M, BLK_K)
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO); // 切分坐标
+
+    // 构造谓词 Mask (Predicate Tensor)
+    // 用于处理 HeadDim (K维度) 不对齐的情况
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+
+    #pragma unroll
+    for (int i = 0; i < size(tOrO); ++i) {
+        // 获取当前元素的逻辑坐标 (m, n)
+        // 注意：tOcO 的布局和 tOrO 是一一对应的
+        // get<0> 是 M 坐标 (Row)，get<1> 是 N 坐标 (Col/HeadDim)
+        int m_coord = get<0>(tOcO(i));
+
+        // 判断是否越界 (M 维度)
+        // size<0>(q_shape) 是 seq_len
+        // block_m * 128 是当前 Block 的起始行
+        if (block_m * 128 + m_coord < size<0>(q_shape)) {
+            tOgO(i) = tOrO(i);
+        }
+    }
 }
 
-void flash_attn_gqa_cu(
-    const float* q_ptr,
-    const float* k_ptr,
-    const float* v_ptr,
-    float* o_ptr,
-    int32_t q_seq_len,
-    int32_t kv_seq_len,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
+void launch_flash_attn_cute_128x64x64_tile(
+    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+    int seq_len, int kv_len, int q_heads, int kv_heads,
     cudaStream_t stream)
 {
-    // 1. 确定启动参数
-    constexpr int Br = 32;
-    constexpr int THREADS_PER_BLOCK = 128; //4个warp来处理一个block
-    const int N_blocks = (q_seq_len + Br - 1) / Br; // 按q的输入长度分竖着x方向的块。
-    const int Tc = (kv_seq_len + q_seq_len+ Br - 1) / Br;
-    const int tile_offset = Br * head_dim * num_q_heads;
-    dim3 grid(N_blocks, num_q_heads); // 因为没有batch，因此按head并行。
-    dim3 block(THREADS_PER_BLOCK);
-    const unsigned smem_size = Br * head_dim * 3 * sizeof(float);
-    // 3. 启动核函数
-    flash_attn_gqa_kernel<THREADS_PER_BLOCK,Br><<<grid, block, smem_size, stream>>>(
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        o_ptr,
-        Tc,
-        tile_offset,
-        Br * head_dim,
-        kv_seq_len + q_seq_len,
-        1.0f / sqrtf((float)head_dim),
-        q_seq_len,
-        kv_seq_len,
-        num_q_heads,
-        num_kv_heads,
-        head_dim
+    using namespace cute; // 确保使用 cute 命名空间
+    
+    // 配置 Block 大小
+    constexpr int kBlockM = 128;
+    constexpr int kBlockN = 64;
+    constexpr int kHeadDim = 64; // 已确认 HeadDim = 64
+    // 1. 定义 Shapes (使用 Int<kHeadDim> 确保静态编译)
+    auto q_shape = make_shape(seq_len, q_heads, Int<kHeadDim>{});
+    auto kv_shape = make_shape(kv_len,kv_heads, Int<kHeadDim>{});
+
+    // 2. 定义 Strides
+    auto stride_Q = make_stride(q_heads * kHeadDim, kHeadDim, _1{});
+    auto stride_K = make_stride(kv_heads * kHeadDim, kHeadDim, _1{});
+    auto stride_V = make_stride(kv_heads * kHeadDim, kHeadDim, _1{});
+    auto stride_O = make_stride(q_heads * kHeadDim, kHeadDim, _1{});
+
+    using SmemLayoutAtomQ = decltype(composition(Swizzle<3,3,3>{},
+                                  Layout<Shape <_8,_64>,
+                                         Stride<_64,_1>>{}));
+
+    using SmemLayoutKV = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+    using SmemLayoutVtransposed = decltype(
+            composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+    using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
+    auto sQ = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
+    auto sKV = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockN>{}, Int<kHeadDim>{}));
+
+    auto sO = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
+    using AtomGMEM = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, __nv_bfloat16>;
+
+    auto copy_q = make_tiled_copy(
+        AtomGMEM{},
+        Layout<Shape<_16,_8>,Stride<_8,_1>>{},
+        Layout<Shape< _1,_8>>{});
+
+    auto copy_kv = make_tiled_copy(
+        AtomGMEM{},
+        Layout<Shape<_16,_8>,Stride<_8,_1>>{},
+        Layout<Shape< _1,_8>>{});
+
+    using AtomGMEM_Out = Copy_Atom<UniversalCopy<cute::uint128_t>, __nv_bfloat16>;
+    auto copy_o = make_tiled_copy(
+        AtomGMEM_Out{},
+        make_layout(Shape<Int<128>, Int<1>>{}),
+        make_layout(Shape<Int<1>, Int<8>>{}));
+
+
+    auto warp_layout = make_layout(make_shape(Int<kNWarps>{}, Int<1>{}, Int<1>{}));
+
+    // 定义总 Tile 大小
+    // M=128, N=64, K=64
+    auto tile_shape = make_tile(Int<16 * kNWarps>{}, Int<64>{}, Int<64>{});
+
+    // 生成 MMA
+    auto mma = make_tiled_mma(
+        SM80_16x8x16_F32BF16BF16F32_TN{}, // Atom
+        warp_layout,                      // Warp Layout (4x1x1)
+        tile_shape                        // Tile Shape
     );
-    // 4. 检查是否有核函数启动错误
+    using S2RAtom = Copy_Atom<SM75_U32x4_LDSM_N, __nv_bfloat16>;
+    using S2RAtom_trans = Copy_Atom<SM75_U16x8_LDSM_T, __nv_bfloat16>;
+    // 6. Launch Config
+    dim3 dimGrid(size(ceil_div(seq_len, Int<kBlockM>{})),
+               size(q_heads));
+    dim3 block(size(mma));
+
+    int smem_size = int(sizeof(SharedStorage<__nv_bfloat16, decltype(sQ), decltype(sKV), decltype(sKV)>));
+    
+    // 8. 启动 Kernel
+    flash_attn_gqa_kernel_bf16_test<<<dimGrid, block, smem_size, stream>>>(
+        q_shape, kv_shape,
+        d_Q, stride_Q, sQ, copy_q, S2RAtom{},
+        d_K, stride_K, sKV, copy_kv, S2RAtom_trans{},SmemLayoutVtransposedNoSwizzle{},SmemLayoutVtransposed{},
+        d_V, stride_V,
+        d_O, stride_O, sO, copy_o, mma
+    );
     CUDA_CHECK(cudaGetLastError());
 }

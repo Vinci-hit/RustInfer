@@ -3,12 +3,13 @@
 use crate::tensor::Tensor;
 use crate::base::error::{Result, Error};
 use crate::base::DeviceType;
-use crate::op::{kernels, Op, OpContext}; // 引入内核模块
+use crate::op::{kernels, Op, OpContext}; // 引入内核模块和 OpContext
+use crate::cuda::CudaConfig; // 引入 CudaConfig
 
 /// Sampler trait 定义了所有采样策略的通用接口。
 pub trait Sampler: Send + Sync {
     /// 接收 logits 张量并分发到合适的内核来执行采样。
-    fn sample(&self, logits: &Tensor) -> Result<i32>;
+    fn sample(&self, logits: &Tensor, cuda_config: Option<&CudaConfig>) -> Result<i32>;
 }
 
 // ------------------- Argmax Sampler (分发器) -------------------
@@ -25,7 +26,7 @@ impl ArgmaxSampler {
 
 impl Sampler for ArgmaxSampler {
     /// `sample` 方法现在是一个分发器。
-    fn sample(&self, logits: &Tensor) -> Result<i32> {
+    fn sample(&self, logits: &Tensor, cuda_config: Option<&CudaConfig>) -> Result<i32> {
         // ---- 1. 执行前置检查 ----
         if logits.shape().len() != 1 {
             return Err(Error::InvalidArgument(format!(
@@ -50,7 +51,7 @@ impl Sampler for ArgmaxSampler {
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
                 // 调用 CUDA 内核函数
-                kernels::cuda::argmax(logits, None)
+                kernels::cuda::argmax(logits, cuda_config)
             }
         }
     }
@@ -121,7 +122,7 @@ impl Op for SamplerOp {
 
         // ==================== 2. 分派到具体的 Sampler 实现 ====================
         
-        let sampled_id = self.sampler.sample(logits)?;
+        let sampled_id = self.sampler.sample(logits, ctx.cuda_config)?;
 
         // ==================== 3. 将结果写入输出张量 ====================
         

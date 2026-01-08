@@ -68,7 +68,6 @@ impl Op for Matmul {
         let input = &ctx.inputs[0];
         let output = &mut ctx.outputs[0];
         let weight = &self.weight;
-
         // --- b. 检查设备和数据类型 ---
         let device = input.device();
         let dtype = input.dtype();
@@ -94,13 +93,7 @@ impl Op for Matmul {
                 weight_shape
             )).into());
         }
-        // if i == 0{
-        //         let last_hidden_state_view = weight.slice(&[seq_len - 24, 0], &[1, self.config.dim])?;
-        //         println!("{:?} ",&last_hidden_state_view.to_cpu()?.as_f32()?.as_slice()?[..10]);
-        //         panic!("");
-        //     }
-        // }
-
+        
         // ==================== 2. 分派到内核 (对应 C++ 的 forward() 主体) ====================
         match device {
             DeviceType::Cpu => {
@@ -109,13 +102,15 @@ impl Op for Matmul {
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                // 调用 CUDA 内核函数Y = W@X^T + B
-                if input.shape()[0] == 1{
-                    kernels::cuda::sgemv(input, weight, output, None)?;
+                if input.dtype() == DataType::BF16{
+                    kernels::cuda::hgemm_bf16(input, weight, output, ctx.cuda_config)?;
                 }else{
-                    kernels::cuda::sgemm(input, weight, output, None)?;
+                    if input.shape()[0] == 1{
+                        kernels::cuda::sgemv(input, weight, output, ctx.cuda_config)?;
+                    }else{
+                        kernels::cuda::sgemm(input, weight, output, ctx.cuda_config)?;
+                    }
                 }
-                
             }
         }
 
