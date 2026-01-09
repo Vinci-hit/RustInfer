@@ -1,4 +1,4 @@
-use crate::base::error::Result;
+use crate::base::error::{Result, Error};
 use crate::tensor::Tensor;
 use half::bf16;
 use ndarray::{ArrayView1, ArrayViewMut1};
@@ -18,8 +18,10 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<(
         }
         _ => {
             // 如果输入和输出的数据类型不匹配，则返回错误
-            panic!("Unsupported data type combination for rmsnorm: input={:?}, weight={:?}, output={:?}", 
-                   input.dtype(), weight.dtype(), output.dtype());
+            Err(Error::InvalidArgument(format!(
+                "Unsupported data type combination for rmsnorm: input={:?}, weight={:?}, output={:?}",
+                input.dtype(), weight.dtype(), output.dtype()
+            )).into())
         }
     }
 }

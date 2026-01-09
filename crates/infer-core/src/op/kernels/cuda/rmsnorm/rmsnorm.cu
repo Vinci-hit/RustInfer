@@ -1,96 +1,72 @@
 #include <cub/block/block_reduce.cuh>
 #include "rmsnorm.h"
 #include <cuda_bf16.h>
-// 定义一个转换器 Union，自动处理对齐
-union Bfloat16Pack {
-    float4 f4;
-    __nv_bfloat162 bf162[4];
-};
-
-__global__ void rmsnorm_bf16x8(
+__global__ void rmsnorm_bf16_optimized(
     __nv_bfloat16* __restrict__ output, 
     const __nv_bfloat16* __restrict__ input, 
     const __nv_bfloat16* __restrict__ weight, 
     int dim, 
-    float eps // 注意：这里保持 float，精度更好
+    float eps
 ) {
-    const int bid = blockIdx.x;
+    // 使用外部传入的 block_sum 或在内部做
+    const int offset = blockIdx.x * dim;
     const int tid = threadIdx.x;
-    const int offset = bid * dim;
 
-    // 强制转为 float4 指针读取 (要求 input/output 首地址 16 字节对齐)
-    const float4* input_pack = reinterpret_cast<const float4*>(input + offset);
-    float4* output_pack = reinterpret_cast<float4*>(output + offset);
-    const float4* weight_pack = reinterpret_cast<const float4*>(weight);
+    // 假设 dim 是 8 的倍数，直接使用 reinterpret_cast 提升访存效率
+    const float4* in_ptr = reinterpret_cast<const float4*>(input + offset);
+    const float4* weight_ptr = reinterpret_cast<const float4*>(weight);
+    float4* out_ptr = reinterpret_cast<float4*>(output + offset);
 
-    const int pack_num = dim / 8;
     float sum = 0.0f;
+    const int loops = dim / (blockDim.x * 8); 
 
-    // --- Phase 1: 平方和 ---
-    for (int i = tid; i < pack_num; i += blockDim.x) {
-        // 1. 读取 128 bit 数据
-        float4 load_val = input_pack[i];
+    // 1. 计算平方和 (利用 bf162 指令提升吞吐)
+    for (int i = tid; i < dim / 8; i += blockDim.x) {
+        float4 tmp_in = in_ptr[i];
+        __nv_bfloat162* b162_vals = reinterpret_cast<__nv_bfloat162*>(&tmp_in);
         
-        // 2. [修复] 使用 union 进行安全的类型转换
-        Bfloat16Pack pack;
-        pack.f4 = load_val;
-
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            // pack.bf162[j] 直接访问寄存器
-            __nv_bfloat162 res = __hmul2(pack.bf162[j], pack.bf162[j]);
-            sum += __low2float(res) + __high2float(res);
+            // __hmul2 在较新 GPU 上有专用硬件指令
+            __nv_bfloat162 squared = __hmul2(b162_vals[j], b162_vals[j]);
+            sum += (__bfloat162float(squared.x) + __bfloat162float(squared.y));
         }
     }
 
-    // --- Phase 2: Reduce ---
-    using BlockReduce = cub::BlockReduce<float, 128>;
-    __shared__ typename BlockReduce::TempStorage temp;
-    
-    // BlockReduce 只在 Thread 0 返回有效 Sum，其他线程可能是未定义的
-    float block_sum = BlockReduce(temp).Sum(sum);
+    // 2. Block Reduce
+    typedef cub::BlockReduce<float, 128> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    float total_sum = BlockReduce(temp_storage).Sum(sum);
 
-    __shared__ float shared_inv_scale;
-    if (threadIdx.x == 0) {
-        // RMSNorm 公式: 1 / sqrt(mean(x^2) + eps)
-        shared_inv_scale = rsqrtf(block_sum / float(dim) + eps);
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrtf(total_sum / float(dim) + eps);
     }
     __syncthreads();
 
-    const __nv_bfloat16 inv_scale_bf16 = __float2bfloat16(shared_inv_scale);
-    const __nv_bfloat162 scale_2 = {inv_scale_bf16, inv_scale_bf16};
-
-    // --- Phase 3: 应用 Norm 和 Weight ---
-    for (int i = tid; i < pack_num; i += blockDim.x) {
-        float4 in_val = input_pack[i];
-        float4 wei_val = weight_pack[i];
-
-        // [修复] 使用 union
-        Bfloat16Pack in_pack_u, wei_pack_u, out_pack_u;
-        in_pack_u.f4 = in_val;
-        wei_pack_u.f4 = wei_val;
-
+    // 3. 应用缩放并写回
+    float f_inv_rms = inv_rms;
+    for (int i = tid; i < dim / 8; i += blockDim.x) {
+        float4 tmp_in = in_ptr[i];
+        float4 tmp_weight = weight_ptr[i];
+        
+        __nv_bfloat162* in_b162 = reinterpret_cast<__nv_bfloat162*>(&tmp_in);
+        __nv_bfloat162* weight_b162 = reinterpret_cast<__nv_bfloat162*>(&tmp_weight);
+        
+        __nv_bfloat162 scale_bf162 = __floats2bfloat162_rn(f_inv_rms, f_inv_rms);
+        
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            // Norm: x * scale
-            __nv_bfloat162 norm = __hmul2(in_pack_u.bf162[j], scale_2);
-            // Output: norm * weight
-            out_pack_u.bf162[j] = __hmul2(norm, wei_pack_u.bf162[j]);
+            // x = (x * inv_rms) * weight
+            in_b162[j] = __hmul2(__hmul2(in_b162[j], scale_bf162), weight_b162[j]);
         }
-
-        // 写回
-        output_pack[i] = out_pack_u.f4;
+        out_ptr[i] = tmp_in;
     }
 }
 
 void rmsnorm_kernel_cu_bf16x8(__nv_bfloat16* output, __nv_bfloat16* input, __nv_bfloat16* weight, int row, int dim, float eps, cudaStream_t stream) {
-    // 安全检查：dim 必须是 8 的倍数，否则 pack_num 会截断导致计算错误
-    if (dim % 8 != 0) {
-        printf("Error: dim must be multiple of 8\n");
-        return;
-    }
     constexpr int threads_num = 128;
-    rmsnorm_bf16x8<<<row, threads_num, 0, stream>>>(output, input, weight, dim, eps);
+    rmsnorm_bf16_optimized<<<row, threads_num, 0, stream>>>(output, input, weight, dim, eps);
 }
 __global__ void row_rmsnorm_f32_dim(float* output, float* input, float* weight, int row, int dim, float eps){
     const int bid = blockIdx.x;
