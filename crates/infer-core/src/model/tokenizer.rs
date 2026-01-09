@@ -30,7 +30,7 @@ pub trait Tokenizer: Send + Sync {
     /// 将 Token ID 序列解码为文本。
     fn decode(&self, ids: &[i32]) -> Result<String> {
         let u32_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-        self.as_hf_tokenizer().decode(&u32_ids, true)
+        self.as_hf_tokenizer().decode(&u32_ids, false)
             .map_err(|e| Error::InternalError(format!("Tokenizer decode error: {}", e)).into())
     }
 

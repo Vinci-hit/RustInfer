@@ -9,7 +9,7 @@ title = "RustInfer - Interactive Chat"
 watch_path = ["src", "assets"]
 
 [web.resource.dev]
-style = ["assets/output.css"]
+style = []
 
 [web.resource.release]
-style = ["assets/output.css"]
+style = []
