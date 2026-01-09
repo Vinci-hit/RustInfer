@@ -20,7 +20,7 @@ RustInfer是一个用Rust语言实现的高性能大语言模型(LLM)推理引�
 | **模型加载时间** | ~15 秒 | ~5 秒 | **3.0x** ⬆️ |
 | **显存占用** | ~12GB (FP32) | ~6GB (BF16) | **50%** ⬇️ |
 
-> 测试环境: NVIDIA RTX 4070Ti Super, Llama-3.2-1B-Instruct, Batch Size=1
+> 测试环境: H200, Llama-3.2-1B-Instruct, Batch Size=1
 
 #### 技术细节
 - **内存池化**: 实现 CUDA 内存池，将分配开销从 800µs 降低到 1µs
