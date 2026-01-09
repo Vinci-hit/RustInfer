@@ -3,3 +3,6 @@
 /.cargo
 /.claude
 /crates/infer-frontend/node_modules
+/crates/infer-frontend/assets/output.css
+/crates/infer-frontend/dist
+/crates/infer-frontend/package-lock.json

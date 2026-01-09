@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+#[component]
 pub fn StreamingIndicator() -> Element {
     rsx! {
         div {
