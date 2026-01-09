@@ -2,3 +2,4 @@
 /.history
 /.cargo
 /.claude
+/crates/infer-frontend/node_modules
