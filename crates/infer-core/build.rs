@@ -20,8 +20,7 @@ fn main() {
         let cutlass_include = root.join("src/op/kernels/cuda/third_party");
         if !cutlass_include.exists() {
             panic!(
-                "Cutlass include directory not found at: {:?}\n\
-                 Hint: Did you run 'git submodule update --init --recursive'?", 
+                "Cutlass include directory not found at: {:?}", 
                 cutlass_include
             );
         }
@@ -73,10 +72,18 @@ fn main() {
             .allowlist_type("cudaStream_t")
             .allowlist_type("cublasLtHandle_t")
             .allowlist_type("cublasHandle_t")
+            .allowlist_type("cudaGraph_t")
+            .allowlist_type("cudaGraphExec_t")
             .allowlist_function("cublasLtCreate")
             .allowlist_function("cublasLtDestroy")
             .allowlist_function("cublasCreate_v2")
             .allowlist_function("cublasDestroy_v2")
+            .allowlist_function("cudaStreamBeginCapture")
+            .allowlist_function("cudaStreamEndCapture")
+            .allowlist_function("cudaGraphInstantiate")
+            .allowlist_function("cudaGraphDestroy")
+            .allowlist_function("cudaGraphLaunch")
+            .allowlist_function("cudaGraphExecDestroy")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .rustified_enum("cudaError_t")
             .rustified_enum("cudaMemcpyKind")

@@ -4,7 +4,7 @@ use crate::base::error::{Error, Result};
 use std::path::Path;
 use tokenizers::tokenizer::Tokenizer as HfTokenizer;
 
-pub trait Tokenizer {
+pub trait Tokenizer: Send + Sync {
     /// 获取内部的 Hugging Face Tokenizer 实例的引用。
     /// 这样可以在需要时访问更底层的 API。
     fn as_hf_tokenizer(&self) -> &HfTokenizer;

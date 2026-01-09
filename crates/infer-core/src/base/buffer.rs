@@ -311,6 +311,13 @@ impl Drop for BufferInner {
 }
 // =================================================================
 
+// Buffer's raw pointers are safe to send across threads because:
+// 1. The actual memory is owned by Arc<BufferInner> which is Send+Sync
+// 2. CUDA memory is thread-safe (CUDA runtime handles synchronization)
+// 3. NonNull<u8> is just a pointer, the actual safety comes from the allocator
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
+
 #[cfg(test)]
 mod tests {
     use super::*; // 导入父模块（也就是 buffer.rs）的所有公共项

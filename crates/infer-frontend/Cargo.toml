@@ -1,0 +1,35 @@
+[package]
+name = "infer-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustinfer-frontend"
+path = "src/main.rs"
+
+[dependencies]
+# Dioxus web
+dioxus = { version = "0.6", features = ["web"] }
+dioxus-web = "0.6"
+
+# HTTP client (WASM-compatible)
+reqwest = { version = "0.12", features = ["json"] }
+gloo-net = { version = "0.5", features = ["eventsource"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-wasm = "0.2"
+
+# Time
+chrono = "0.4"
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "serde", "js"] }
