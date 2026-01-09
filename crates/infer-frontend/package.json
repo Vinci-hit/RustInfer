@@ -1,0 +1,10 @@
+{
+  "name": "infer-frontend",
+  "version": "0.1.0",
+  "scripts": {
+    "tailwind": "tailwindcss -i ./assets/main.css -o ./assets/output.css --watch"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.0"
+  }
+}

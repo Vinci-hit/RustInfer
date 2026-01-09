@@ -9,7 +9,7 @@ use crate::cuda::CudaConfig; // 引入 CudaConfig
 /// Sampler trait 定义了所有采样策略的通用接口。
 pub trait Sampler: Send + Sync {
     /// 接收 logits 张量并分发到合适的内核来执行采样。
-    fn sample(&self, logits: &Tensor, cuda_config: Option<&CudaConfig>) -> Result<i32>;
+    fn sample(&self, logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()>;
 }
 
 // ------------------- Argmax Sampler (分发器) -------------------
@@ -26,7 +26,7 @@ impl ArgmaxSampler {
 
 impl Sampler for ArgmaxSampler {
     /// `sample` 方法现在是一个分发器。
-    fn sample(&self, logits: &Tensor, cuda_config: Option<&CudaConfig>) -> Result<i32> {
+    fn sample(&self, logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
         // ---- 1. 执行前置检查 ----
         if logits.shape().len() != 1 {
             return Err(Error::InvalidArgument(format!(
@@ -46,14 +46,15 @@ impl Sampler for ArgmaxSampler {
         match self.device_type {
             DeviceType::Cpu => {
                 // 调用 CPU 内核函数
-                kernels::cpu::argmax(logits)
+                kernels::cpu::argmax(logits, output_token);
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                // 调用 CUDA 内核函数
-                kernels::cuda::argmax(logits, cuda_config)
+                // 调用 CUDA 内核函数 (使用 CudaConfig 中的预分配 buffer)
+                kernels::cuda::argmax(logits, output_token,cuda_config);
             }
         }
+        Ok(())
     }
 }
 
@@ -122,12 +123,7 @@ impl Op for SamplerOp {
 
         // ==================== 2. 分派到具体的 Sampler 实现 ====================
         
-        let sampled_id = self.sampler.sample(logits, ctx.cuda_config)?;
-
-        // ==================== 3. 将结果写入输出张量 ====================
-        
-        let output_slice = output_token_id.as_i32_mut()?.as_slice_mut()?;
-        output_slice[0] = sampled_id;
+        self.sampler.sample(logits, output_token_id, ctx.cuda_config)?;
 
         Ok(())
     }

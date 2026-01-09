@@ -1,0 +1,47 @@
+[package]
+name = "infer-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustinfer-server"
+path = "src/main.rs"
+
+[dependencies]
+# Core inference
+infer-core = { path = "../infer-core", features = ["cuda"] }
+
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI & config
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+chrono = "0.4"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# System metrics
+sysinfo = "0.30"
+nvml-wrapper = { version = "0.10", optional = true }
+
+[features]
+default = ["cuda"]
+cuda = ["infer-core/cuda", "nvml-wrapper"]

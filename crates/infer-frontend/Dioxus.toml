@@ -1,0 +1,15 @@
+[application]
+name = "RustInfer Frontend"
+default_platform = "web"
+
+[web.app]
+title = "RustInfer - Interactive Chat"
+
+[web.watcher]
+watch_path = ["src", "assets"]
+
+[web.resource.dev]
+style = ["assets/output.css"]
+
+[web.resource.release]
+style = ["assets/output.css"]

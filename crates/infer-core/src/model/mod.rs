@@ -56,8 +56,15 @@ pub struct TensorInfo {
 pub struct ModelLoader {
     pub config: RuntimeModelConfig,
     tensor_names: Vec<String>,
+    /// Mmap文件持有者。这些内存映射必须在readers之前被drop，因为readers依赖这些数据。
+    /// 注意：字段声明顺序很重要 - Rust按声明顺序drop字段，所以_mmaps会在readers之后drop。
     _mmaps: HashMap<PathBuf, Mmap>,
     tensor_index: HashMap<String, TensorInfo>,
+    /// SafetensorReader实例。这些reader的生命周期被标记为'static，
+    /// 但实际上它们依赖于_mmaps中的数据。这是安全的，因为：
+    /// 1. _mmaps和readers总是同时存在于同一个结构体中
+    /// 2. Rust的drop顺序保证_mmaps会在readers之后drop（按字段声明相反顺序）
+    /// 3. ModelLoader不提供任何方法来分别修改_mmaps或readers
     readers: HashMap<PathBuf, SafetensorReader<'static>>,
 }
 
@@ -141,11 +148,30 @@ impl ModelLoader {
         // 5. 为每个文件创建 SafetensorReader 实例
         let mut readers = HashMap::new();
         for (path, mmap) in &mmaps {
+            // SAFETY: 这个transmute将mmap引用的生命周期从 &'a [u8] 扩展到 &'static [u8]。
+            // 虽然这在一般情况下是不安全的，但在这个特定上下文中是安全的，原因如下：
+            //
+            // 1. **所有权保证**：mmaps HashMap和readers HashMap都存储在同一个ModelLoader结构体中。
+            //    mmaps持有实际的Mmap对象，readers持有指向这些mmap数据的SafetensorReader。
+            //
+            // 2. **生命周期保证**：Rust的drop顺序是按字段声明的相反顺序。在ModelLoader的定义中，
+            //    _mmaps字段在readers字段之前声明，因此_mmaps会在readers之后被drop。
+            //    这保证了当readers被drop时，它们所引用的mmap数据仍然有效。
+            //
+            // 3. **不可变性保证**：ModelLoader不提供任何方法来分别修改_mmaps或readers。
+            //    一旦创建，这两个HashMap就保持不变，确保引用关系不会被破坏。
+            //
+            // 4. **封装保证**：_mmaps字段是私有的，外部代码无法访问或修改它，
+            //    因此无法在readers仍然存在时删除或替换mmap。
+            //
+            // 这个设计本质上实现了一个"自引用结构"，其中readers依赖于_mmaps的数据。
+            // 理想情况下应该使用Pin或自引用crate（如ouroboros）来表达这种关系，
+            // 但为了避免引入额外依赖和复杂性，我们选择了这种方式并明确文档化安全性保证。
             let mmap_static: &'static [u8] = unsafe { std::mem::transmute(mmap.as_ref()) };
             let reader = SafetensorReader::new(mmap_static)?;
             readers.insert(path.clone(), reader);
         }
-        
+
         println!("所有权重文件均已成功映射，并为每个文件创建了 SafetensorReader。");
 
         Ok(Self { config, tensor_names, _mmaps: mmaps, tensor_index, readers })

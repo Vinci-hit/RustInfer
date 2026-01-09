@@ -1,4 +1,4 @@
-use crate::base::error::Result;
+use crate::base::error::{Result, Error};
 use crate::tensor::Tensor;
 use rayon::prelude::*; // 引入 rayon 的并行迭代器 trait
 
@@ -14,7 +14,10 @@ pub fn embedding(input_tokens: &Tensor, weight: &Tensor, output: &mut Tensor) ->
         }
         _ => {
             // 如果输入和输出的数据类型不匹配，则返回错误
-            panic!("Unsupported data type combination for embedding: weight={:?}, output={:?}", weight.dtype(), output.dtype());
+            Err(Error::InvalidArgument(format!(
+                "Unsupported data type combination for embedding: weight={:?}, output={:?}",
+                weight.dtype(), output.dtype()
+            )).into())
         }
     }
 }
