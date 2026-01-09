@@ -4,6 +4,7 @@ pub mod rmsnorm;
 pub mod kernels;
 pub mod matmul;
 pub mod add;
+pub mod add_inplace;
 pub mod swiglu;
 pub mod embedding;
 pub mod flash_gqa;
@@ -50,13 +51,4 @@ pub trait Op {
     fn to_cuda_(&self, _cuda_config: i32) -> Result<()> {
         unimplemented!("未实现！");
     }
-}
-
-/// `QuantizationParams` 结构体，用于封装量化所需的所有参数。
-/// 对应 C++ `LayerParam` 中的 is_quant, scales, group_size.
-#[derive(Clone, Debug)] // 使用 Clone 以便在需要时复制
-pub struct QuantizationParams {
-    pub scales: Tensor,
-    pub group_size: Option<i32>,
-    
 }

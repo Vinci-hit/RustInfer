@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
+use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
 use crate::cuda::CudaConfig;
 use crate::op::{Op, OpContext};
@@ -39,7 +40,7 @@ pub struct LlamaLayers {
     pub wo_layers: Vec<Matmul>,
     pub mha_layers: Vec<FlashAttnGQA>,
     pub rope_layers: Vec<RoPEOp>,
-    pub add_layers: Add,
+    pub add_layers: AddInplace,
     
     // FFN layers
     pub w1_layers: Vec<Matmul>, // gate_proj
@@ -308,7 +309,7 @@ impl Llama3 {
             .map(|_| RoPEOp::new(config.dim, config.kv_dim, config.head_size))
             .collect();
         let rope_layers = rope_layers?;
-        let add_layers:Add = Add::new(); 
+        let add_layers = AddInplace::new(); 
         let swiglu_layers:Vec<SwiGLU> = (0..layer_num).map(|_| SwiGLU::new()).collect();
 
         // 在 Rust 中，许多检查是隐式的。`load_*` 函数返回 Result，如果失败 `?` 会立即返回错误。
@@ -695,15 +696,11 @@ impl Llama3 {
         
         // Process all transformer layers
         for i in 0..self.config.layer_num {
-            // Residual connection
-            let residual_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-            let mut residual = residual_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            residual.copy_from(&x)?;
 
             // Attention Block
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&residual], &mut [&mut attn_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
             
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
@@ -720,12 +717,10 @@ impl Llama3 {
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
             let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &wo_out], &mut [&mut x], cuda_config_ref))?;
+            self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
             // FFN Block
-            residual.copy_from(&x)?; // Update residual
             let mut ffn_norm_out = attn_out; // Reuse buffer
-            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&residual], &mut [&mut ffn_norm_out], cuda_config_ref))?;
-
+            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
             let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
             let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
             let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
@@ -736,7 +731,7 @@ impl Llama3 {
 
             let mut w2_out = ffn_norm_out; // Reuse buffer
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&residual, &w2_out], &mut [&mut x], cuda_config_ref))?;
+            self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
             
         }
         // Extract last token's hidden state
