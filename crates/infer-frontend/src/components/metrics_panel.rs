@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use crate::api::client::ApiClient;
 use crate::state::metrics::SystemMetrics;
 
+#[component]
 pub fn MetricsPanel() -> Element {
     let mut metrics = use_signal(|| None::<SystemMetrics>);
     let api_client = use_signal(|| ApiClient::new());

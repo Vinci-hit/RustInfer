@@ -4,12 +4,16 @@ mod api;
 mod components;
 mod state;
 
+const CSS: Asset = asset!("/assets/output.css");
+
 fn main() {
     dioxus::launch(App);
 }
 
+#[component]
 fn App() -> Element {
     rsx! {
+        document::Stylesheet { href: CSS }
         div {
             class: "min-h-screen bg-gray-900 text-white",
 
