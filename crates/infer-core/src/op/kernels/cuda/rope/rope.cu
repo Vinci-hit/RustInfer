@@ -36,7 +36,7 @@ __global__ void rope_rotate_kernel(
     const int head_size,
     float* __restrict__ input_q,
     float* __restrict__ input_k,
-    const int pos,
+    const int* pos,
     const float* __restrict__ sin_cache,
     const float* __restrict__ cos_cache)
 {
@@ -46,7 +46,8 @@ __global__ void rope_rotate_kernel(
     int seq_pos = blockIdx.y;
 
     // 旋转操作的维度索引 i = 2 * thread_idx
-    int abs_pos = pos + seq_pos;
+    int abs_pos = *pos + seq_pos;
+    
     int q_start = seq_pos * dim;
     int k_start = seq_pos * kv_dim;
     for (int i = 0; i < head_size / 2; i ++) {
@@ -95,7 +96,7 @@ __global__ void rope_rotate_kernel_llama3_bf16(
     const int num_heads,
     const int num_kv_heads,
     const int head_size,
-    const int pos_offset,                     // 当前 batch 的起始位置偏移
+    const int* pos_offset,                     // 当前 batch 的起始位置偏移
     const int seq_len                         // 当前处理的序列长度
 ) {
     // 1. 维度计算
@@ -111,7 +112,7 @@ __global__ void rope_rotate_kernel_llama3_bf16(
 
     // 2. 计算 RoPE Cache 的绝对位置索引
     // Llama 3 通常预计算好了 sin/cos，形状为 [max_seq, half_head]
-    int abs_pos = pos_offset + seq_idx;
+    int abs_pos = *pos_offset + seq_idx;
     float sin_val = __bfloat162float(sin_cache[abs_pos * half_head + tid]);
     float cos_val = __bfloat162float(cos_cache[abs_pos * half_head + tid]);
 
@@ -152,7 +153,7 @@ void rope_kernel_cu_bf16(
     int32_t head_size,
     __nv_bfloat16* input_q,
     __nv_bfloat16* input_k,
-    int32_t input_pos,
+    int32_t* input_pos,
     int32_t seq_len,
     __nv_bfloat16* sin_cache,
     __nv_bfloat16* cos_cache,
@@ -192,7 +193,7 @@ void rope_kernel_cu(
     int32_t head_size,
     float* input_q,
     float* input_k,
-    int32_t input_pos,
+    int32_t* input_pos,
     int32_t seq_len,
     const float* sin_cache,
     const float* cos_cache,

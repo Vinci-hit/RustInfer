@@ -440,11 +440,11 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
 
 void launch_flash_attn_cute_128x64x64_tile(
     const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
-    int seq_len, int kv_len, int q_heads, int kv_heads,
+    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
     cudaStream_t stream)
 {
     using namespace cute; // 确保使用 cute 命名空间
-    
+    int kv_len = *kv_len_ptr + seq_len;//prefill阶段可以在cpu里面用
     // 配置 Block 大小
     constexpr int kBlockM = 128;
     constexpr int kBlockN = 64;

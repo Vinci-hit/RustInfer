@@ -48,14 +48,14 @@ __global__ void simple_gqa_decoding_native_layout_kernel(
     const float* __restrict__ K_cache, 
     const float* __restrict__ V_cache, 
     float* __restrict__ Output,        
-    int kv_seq_len,
+    int* kv_seq_len_ptr,
     int head_dim,
     int num_kv_heads,                  
     int group_size,                    
     float sm_scale
 ) {
     extern __shared__ float smem[]; 
-
+    int kv_seq_len = *kv_seq_len_ptr + 1;
     int q_head_idx = blockIdx.x; 
     int tid = threadIdx.x;
     
@@ -113,7 +113,7 @@ void flash_decoding_cu(
     const float* v_ptr,
     float* o_ptr,
     int32_t q_seq_len,   
-    int32_t kv_seq_len,
+    int32_t* kv_seq_len,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
@@ -143,7 +143,7 @@ void flash_decoding_cu(
         k_ptr,
         v_ptr,
         o_ptr,
-        kv_seq_len + 1,
+        kv_seq_len,
         head_dim,
         num_kv_heads,
         group_size,

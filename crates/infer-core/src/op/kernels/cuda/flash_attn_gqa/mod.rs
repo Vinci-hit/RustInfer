@@ -12,7 +12,7 @@ unsafe extern "C" {
         v_ptr: *const f32,
         o_ptr: *mut f32,
         q_seq_len: i32,
-        kv_seq_len: i32,
+        kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -24,7 +24,7 @@ unsafe extern "C" {
         v_ptr: *const f32,
         o_ptr: *mut f32,
         q_seq_len: i32,
-        kv_seq_len: i32,
+        kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -35,7 +35,7 @@ unsafe extern "C" {
         k_ptr: *const half::bf16,
         v_ptr: *const half::bf16,
         o_ptr: *mut half::bf16,
-        kv_seq_len: i32,
+        kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -47,7 +47,7 @@ unsafe extern "C" {
         v_ptr: *const half::bf16,
         o_ptr: *mut half::bf16,
         q_seq_len: i32,
-        kv_seq_len: i32,
+        kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         stream: cuda::ffi::cudaStream_t,
@@ -72,7 +72,7 @@ pub fn flash_attn_gqa(
     input_v_cache: &Tensor,
     output_o: &mut Tensor,
     q_seq_len: usize,
-    current_kv_len: usize,
+    current_kv_len_gpu: *const i32,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -92,7 +92,6 @@ pub fn flash_attn_gqa(
     
     // 维度转换为 i32 (假设所有维度都不超过 i32 的范围，这是 LLM 中的标准假设)
     let q_seq_len_i32 = q_seq_len as i32;
-    let kv_seq_len_i32 = current_kv_len as i32;
     let num_q_heads_i32 = num_q_heads as i32;
     let num_kv_heads_i32 = num_kv_heads as i32;
     let head_dim_i32 = head_dim as i32;
@@ -111,7 +110,6 @@ pub fn flash_attn_gqa(
             let k_ptr = input_k_cache.as_f32()?.buffer().as_ptr() as *const f32;
             let v_ptr = input_v_cache.as_f32()?.buffer().as_ptr() as *const f32;
             let o_ptr = output_o.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-
             unsafe {
                 if q_seq_len == 1 {
                     flash_decoding_cu(
@@ -120,7 +118,7 @@ pub fn flash_attn_gqa(
                         v_ptr,
                         o_ptr,
                         q_seq_len_i32,
-                        kv_seq_len_i32,
+                        current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
                         head_dim_i32,
@@ -133,7 +131,7 @@ pub fn flash_attn_gqa(
                         v_ptr,
                         o_ptr,
                         q_seq_len_i32,
-                        kv_seq_len_i32,
+                        current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
                         head_dim_i32,
@@ -155,7 +153,7 @@ pub fn flash_attn_gqa(
                         k_ptr,
                         v_ptr,
                         o_ptr,
-                        kv_seq_len_i32,
+                        current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
                         head_dim_i32,
@@ -168,7 +166,7 @@ pub fn flash_attn_gqa(
                         v_ptr,
                         o_ptr,
                         q_seq_len_i32,
-                        kv_seq_len_i32 + q_seq_len_i32,
+                        current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
                         stream,
