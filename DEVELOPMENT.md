@@ -763,16 +763,6 @@ impl CachingCudaAllocator {
   - 缺点：慢（O(n)）
   - 适用场景：大块内存（>=1MB），碎片影响大
 
-### 性能提升
-
-**实测数据**（Llama-3-8B，batch=1）：
-```
-无内存池：    120 tokens/s（每个 token ~800µs 用于分配）
-有内存池：    180 tokens/s（首次分配后，后续 ~1µs）
-提升：       50%
-```
-
----
 
 ## KV Cache 管理：零拷贝视图
 

@@ -124,4 +124,11 @@ impl CudaConfig {
             Err(crate::base::error::Error::InvalidArgument("CUDA graph not captured".to_string()).into())
         }
     }
+
+    pub fn sync_stream(&self) -> Result<()> {
+        unsafe {
+            crate::cuda_check!(ffi::cudaStreamSynchronize(self.stream))?;
+        }
+        Ok(())
+    }
 }

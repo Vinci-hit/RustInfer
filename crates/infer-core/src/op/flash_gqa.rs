@@ -99,23 +99,18 @@ impl Op for FlashAttnGQA {
         let max_kv_seq_len = k_shape[0]; // K/V 缓存的最大容量
         
         // --- 从 KV_Len 张量中获取当前有效长度 ---
-        let current_kv_len: usize = input_kv_len.as_i32()?.as_slice()?[0] as usize;
+        
         
         // 4. 检查序列长度的一致性和有效性
         if output_o.shape()[0] != q_seq_len {
             return Err(Error::InvalidArgument("O SeqLen must match Q SeqLen.".into()).into());
-        }
-        if q_seq_len + current_kv_len > max_kv_seq_len {
-            return Err(Error::IndexOutOfBounds(format!(
-                "Prefill/Decode exceeds max cache size. Q_S {} + KV_S {} > Max_S {}",
-                q_seq_len, current_kv_len, max_kv_seq_len
-            )).into());
         }
 
         // ==================== 2. 分派到内核 ====================
         match device {
             DeviceType::Cpu => {
                 // 调用 CPU 黄金标准 (需要支持 Prefill 和 Decode 逻辑)
+                let current_kv_len = input_kv_len.as_i32()?.as_slice()?[0] as usize;
                 kernels::cpu::flash_attn_gqa(
                     input_q, 
                     input_k_cache, // K/V 缓存的全部内存
@@ -130,6 +125,7 @@ impl Op for FlashAttnGQA {
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
+                let current_kv_len_ptr = input_kv_len.as_i32()?.buffer().as_ptr() as *const i32; // 只有decoding阶段是指向GPU
                 // 假设有一个统一的 CUDA KV Cache Kernel
                 kernels::cuda::flash_attn_gqa(
                     input_q, 
@@ -137,7 +133,7 @@ impl Op for FlashAttnGQA {
                     input_v_cache, 
                     output_o,
                     q_seq_len,      // Q 的长度
-                    current_kv_len, // KV Cache 的当前有效长度 (S_KV)
+                    current_kv_len_ptr, // KV Cache 的当前有效长度 (S_KV)
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,

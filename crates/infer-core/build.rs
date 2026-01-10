@@ -67,6 +67,7 @@ fn main() {
             .allowlist_function("cudaStreamCreate")
             .allowlist_function("cudaStreamDestroy")
             .allowlist_function("cudaDeviceSynchronize")
+            .allowlist_function("cudaStreamSynchronize")
             .allowlist_type("cudaError_t")
             .allowlist_type("cudaMemcpyKind")
             .allowlist_type("cudaStream_t")

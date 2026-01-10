@@ -23,3 +23,6 @@ pub use flash_attn_gqa::*;
 
 mod sampler;
 pub use sampler::*;
+
+mod scatter;
+pub use scatter::*;

@@ -275,13 +275,14 @@ void flash_attn_gqa_cu(
     const float* v_ptr,
     float* o_ptr,
     int32_t q_seq_len,
-    int32_t kv_seq_len,
+    int32_t* kv_seq_len_ptr,//prefill阶段，是cpu内存可以用
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
     cudaStream_t stream)
 {
     // 1. 确定启动参数
+    int kv_seq_len = *kv_seq_len_ptr;
     constexpr int Br = 32;
     constexpr int THREADS_PER_BLOCK = 128; //4个warp来处理一个block
     const int N_blocks = (q_seq_len + Br - 1) / Br; // 按q的输入长度分竖着x方向的块。
