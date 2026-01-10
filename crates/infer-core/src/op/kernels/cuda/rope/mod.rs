@@ -11,7 +11,7 @@ unsafe extern "C" {
         head_size: i32,
         input_q: *mut f32,
         input_k: *mut f32,
-        input_pos: i32,
+        input_pos: *const i32,
         seq_len:i32,
         sin_cache: *const f32,
         cos_cache: *const f32,
@@ -25,8 +25,8 @@ unsafe extern "C" {
         head_size: i32,
         input_q: *mut half::bf16,
         input_k: *mut half::bf16,
-        input_pos: i32,
-        seq_len:i32,
+        input_pos: *const i32,
+        seq_len: i32,
         sin_cache: *const half::bf16,
         cos_cache: *const half::bf16,
         stream: cuda::ffi::cudaStream_t,
@@ -63,7 +63,7 @@ pub fn rope(
     let dtype = input_q.dtype();
     
     // Pos 是 i32，需要不可变指针
-    let pos = input_pos.as_i32()?.as_slice()?[0];
+    let pos = input_pos.as_i32()?.buffer().as_ptr() as *const i32;
 
     // --- 2. 维度检查和转换 ---
     
@@ -77,10 +77,7 @@ pub fn rope(
     }
 
     // --- 3. 获取 CUDA stream ---
-    let mut stream: cuda::ffi::cudaStream_t = std::ptr::null_mut();
-    if let Some(config) = cuda_config {
-        stream = config.stream; 
-    }
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
 
     // --- 4. 根据数据类型调用相应的 FFI 函数 ---
     match dtype {
@@ -100,7 +97,7 @@ pub fn rope(
                     head_size_i32,
                     q_ptr,       // *mut f32
                     k_ptr,       // *mut f32
-                    pos,     // i32
+                    pos,     // *const i32
                     seq_len,
                     sin_ptr,     // *const f32
                     cos_ptr,     // *const f32
@@ -124,7 +121,7 @@ pub fn rope(
                     head_size_i32,
                     q_ptr,       // *mut bf16
                     k_ptr,       // *mut bf16
-                    pos,     // i32
+                    pos,     // const  * i32
                     seq_len,
                     sin_ptr,     // *const bf16
                     cos_ptr,     // *const bf16

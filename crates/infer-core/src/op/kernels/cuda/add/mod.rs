@@ -177,10 +177,7 @@ pub fn add_inplace(
     }
 
     // 4. 获取 CUDA stream
-    let mut stream: crate::cuda::ffi::cudaStream_t = std::ptr::null_mut();
-    if cuda_config.is_some() {
-        stream = cuda_config.ok_or(Error::InvalidArgument("CudaConfig not provided".into()))?.stream;
-    }
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
 
     // 5. 根据数据类型调用相应的 FFI 函数
     match dtype {

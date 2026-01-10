@@ -11,6 +11,7 @@ pub mod flash_gqa;
 pub mod rope;
 pub mod encode;
 pub mod sampler;
+pub mod scatter;
 
 /// OpContext 用于向 forward 方法传递可变数量的输入和输出。
 pub struct OpContext<'a> {

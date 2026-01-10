@@ -23,11 +23,12 @@ __global__ void llama3_1B_decode_kernel_optimized(
     const __nv_bfloat16* __restrict__ K,  // [Seq_Len, num_kv_heads, D]
     const __nv_bfloat16* __restrict__ V,  // [Seq_Len, num_kv_heads, D]
     __nv_bfloat16* __restrict__ O,        // [num_q_heads, D]
-    int seq_len,
+    int32_t* seq_len_ptr,
     int num_kv_heads,
     int group_size,
     float sm_scale
 ) {
+    int32_t seq_len = *seq_len_ptr + 1;
     int q_head_idx = blockIdx.x;
     int kv_head_idx = q_head_idx / group_size;
 
@@ -180,7 +181,7 @@ void flash_decoding_cu_bf16(
     const __nv_bfloat16* k_ptr,
     const __nv_bfloat16* v_ptr,
     __nv_bfloat16* o_ptr,
-    int32_t kv_seq_len,
+    int32_t* kv_seq_len,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,

@@ -23,6 +23,7 @@ use crate::op::rope::RoPEOp;
 use crate::op::swiglu::SwiGLU;
 use crate::model::{BufferType, Workspace};
 use crate::op::sampler::{Sampler, ArgmaxSampler};
+use crate::op::scatter::Scatter;
 
 /// LlamaLayers 结构体，用于持有模型的所有算子。
 pub struct LlamaLayers {
@@ -41,6 +42,7 @@ pub struct LlamaLayers {
     pub mha_layers: Vec<FlashAttnGQA>,
     pub rope_layers: Vec<RoPEOp>,
     pub add_layers: AddInplace,
+    pub scatter_layer: Scatter,
     
     // FFN layers
     pub w1_layers: Vec<Matmul>, // gate_proj
@@ -98,6 +100,8 @@ pub struct Llama3 {
 
     /// KV Cache
     kv_cache: KvCache,
+    kcache: Tensor,
+    vcache: Tensor,
     /// 工作空间，用于存放中间计算结果，避免频繁分配和释放内存
     workspace: Workspace,
     output_token: Tensor,
@@ -348,6 +352,7 @@ impl Llama3 {
             mha_layers,
             rope_layers,
             add_layers,
+            scatter_layer: Scatter::new(),
             w1_layers,
             w2_layers,
             w3_layers,
@@ -360,8 +365,10 @@ impl Llama3 {
         let workspace = Self::init_workspace(&config, &device_type)?;
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
-        let input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos };
+        let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
+        let kcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        let vcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos, kcache, vcache };
         println!("Calculating RoPE sin/cos cache...");
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
         let duration = start_time.elapsed();
@@ -618,7 +625,7 @@ impl Llama3 {
         input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
         // Prefill stage - fill KV cache
         let prefill_start = Instant::now();
-        let mut current_token = self.forward_batch(&input_tokens_cpu, &input_pos, prompt_tokens.len())?;
+        let mut current_token = self.forward_prefill(&input_tokens_cpu, &input_pos, prompt_tokens.len())?;
         let prefill_duration = prefill_start.elapsed();
         let prefill_ms = prefill_duration.as_millis() as u64;
 
@@ -627,7 +634,7 @@ impl Llama3 {
         
         if print_output {
             let decoded = self.tokenizer.decode(&[current_token])?;
-            write!(stdout,"{}", decoded);
+            let _ = write!(stdout,"{}", decoded);
             io::stdout().flush().expect("Failed to flush stdout");
         }
 
@@ -638,7 +645,7 @@ impl Llama3 {
         for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
             input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
             input_tokens_cpu.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = self.forward_batch(&input_tokens_cpu, &input_pos,1)?;
+            let next_token = self.forward_decoding(&input_tokens_cpu, &input_pos)?;
 
             if self.tokenizer.is_eos(next_token) {
                 break;
@@ -650,7 +657,7 @@ impl Llama3 {
             
             if print_output {
                 let decoded = self.tokenizer.decode(&[current_token])?;
-                write!(stdout,"{}", decoded);
+                let _ = write!(stdout,"{}", decoded);
                 stdout.flush()?;
             }
         }
@@ -665,21 +672,96 @@ impl Llama3 {
         let generated_text = self.tokenizer.decode(&generated_tokens)?;
         Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
-    /// 对一个 token 序列进行批处理前向传播。
-    ///
-    /// 这个方法用于高效处理输入提示。它会填充 KV 缓存，并返回
-    /// **序列中最后一个 token** 对应的 logits。
-    ///
-    /// # 参数
-    /// - `tokens`: 输入的 token ID 切片 `&[i32]`。
-    /// - `pos`: 输入序列在 KV 缓存中的起始位置。
-    ///
-    /// # 返回
-    /// - `Result<i32>`: 成功时返回生成的 token ID。
-    fn forward_batch(&mut self, tokens: &Tensor, pos_cpu: &Tensor, seq_len:usize) -> Result<i32> {
+    fn forward_decoding(&mut self, tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
+        self.input_pos.copy_from(&pos_cpu)?;
+        let mut input_tokens_view = &self.output_token;
+        let mut config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
+        if config.cuda_graph.is_none(){
+            config.capture_graph_begin()?;
+        }else{
+            config.launch_graph()?;
+            config.sync_stream()?;
+            let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+            return Ok(next_token);
+        }
         
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
+        // Token embedding
+        let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+        let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+        self.layers.embedding_layer.forward(
+            &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
+        )?;
+        // Process all transformer layers
+        for i in 0..self.config.layer_num {
+            let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+            
+            let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+            self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
+            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.kcache], cuda_config_ref))?;
+            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.vcache], cuda_config_ref))?;
+            let (k_cache_full, v_cache_full) = self.kv_cache.get_mut(i)?;
+            
+            let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
+            let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
+            
+            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut self.kcache], cuda_config_ref))?;
+            self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.kcache, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
+            self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.vcache, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
+            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
+            let mut attn_out = attn_norm_out; // Reuse buffer
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
+            let mut wo_out = q; // Reuse buffer
+            self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
+            self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
+            // FFN Block
+            let mut ffn_norm_out = attn_out; // Reuse buffer
+            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
+            let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
+            let mut w1_out = w1_buffer.slice(&[0, 0], &[1, self.config.intermediate_size])?;
+            let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
+            let mut w3_out = w3_buffer.slice(&[0, 0], &[1, self.config.intermediate_size])?;
+            self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
+            self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
+            self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
+
+            let mut w2_out = ffn_norm_out; // Reuse buffer
+            self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
+            self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+            
+        }
+        // Extract last token's hidden state
+        let last_hidden_state_view = x.slice(&[0, 0], &[1, self.config.dim])?;
         
+        // Final Norm and classifier
+        let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+
+        self.layers.rmsnorm_final_layer.forward(
+            &mut OpContext::new(&[&last_hidden_state_view], &mut [&mut final_norm_out], cuda_config_ref)
+        )?;
+
+        let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
+
+        self.layers.cls_layer.forward(
+            &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
+        )?;
+        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+        let mut config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
+        if config.cuda_graph.is_none(){
+            config.capture_graph_end()?;
+        }
+        let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+        Ok(next_token)
+    }
+    fn forward_prefill(&mut self, tokens: &Tensor, pos_cpu: &Tensor, seq_len:usize) -> Result<i32> {
+        let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
+        let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
+        self.input_pos.copy_from(&pos_cpu)?;
         // Prepare batch input tokens
         let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
@@ -691,12 +773,8 @@ impl Llama3 {
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
-        self.input_pos.copy_from(&pos_cpu)?;
-        let pos = self.input_pos.as_i32()?.as_slice()?[0] as usize;
-        
         // Process all transformer layers
         for i in 0..self.config.layer_num {
-
             // Attention Block
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
@@ -706,7 +784,6 @@ impl Llama3 {
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
-            // println!("attn_out: {:?}", &attn_norm_out.to_cpu()?.as_bf16()?.as_slice()?[0]);
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
             self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
@@ -714,7 +791,8 @@ impl Llama3 {
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out; // Reuse buffer
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
+            
             let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
