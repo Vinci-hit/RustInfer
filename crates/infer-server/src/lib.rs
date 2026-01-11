@@ -2,10 +2,10 @@
 
 pub mod api;
 pub mod chat;
-pub mod config;
-pub mod inference;
+pub mod zmq_client;  // ZMQ客户端（分离式架构）
 
 // Re-export commonly used types
-pub use config::ServerConfig;
-pub use inference::InferenceEngine;
-pub use chat::{ChatTemplate, Llama3Template, get_template};
+pub use chat::get_template;
+pub use zmq_client::ZmqClient;
+
+

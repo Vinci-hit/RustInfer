@@ -66,7 +66,16 @@ unsafe extern "C" {
 /// * `current_kv_len`: K/V Cache 的有效历史长度 (S_KV_history)
 /// * `num_q_heads`, `num_kv_heads`, `head_dim`: Attention 结构参数
 /// * `cuda_config`: 可选的 CUDA stream 配置。
-pub fn flash_attn_gqa(
+///
+/// # Safety
+/// This function is unsafe because it accepts a raw pointer (`current_kv_len_gpu`)
+/// which must be a valid pointer to device memory containing the KV cache length.
+/// The caller must ensure that:
+/// - The pointer points to valid, initialized device memory
+/// - The memory remains valid for the duration of the function call
+/// - The pointer is properly aligned for i32 access
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_gqa(
     input_q: &Tensor,
     input_k_cache: &Tensor,
     input_v_cache: &Tensor,

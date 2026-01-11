@@ -32,4 +32,4 @@ tracing-wasm = "0.2"
 chrono = "0.4"
 
 # UUID
-uuid = { version = "1.6", features = ["v4", "serde", "js"] }
+uuid = { version = "1.19", features = ["v4", "serde", "js"] }

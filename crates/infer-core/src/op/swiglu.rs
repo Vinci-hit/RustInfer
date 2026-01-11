@@ -1,5 +1,5 @@
 use crate::base::error::{Error, Result};
-use crate::base::{DeviceType,DataType};
+use crate::base::DeviceType;
 use crate::op::{kernels, Op, OpContext};
 
 /// SwiGLU 算子，执行 Output = (Input1 * sigmoid(Input1)) ⊙ Input2 (按元素)
@@ -183,5 +183,219 @@ mod tests {
     #[cfg(feature = "cuda")]
     fn test_swiglu_compare_cpu_vs_gpu_with_stream() -> Result<()> {
         run_swiglu_cpu_vs_gpu_test(true)
+    }
+
+    // ========================================================================
+    // BF16 Comprehensive Batch Tests
+    // ========================================================================
+
+    /// Helper to assert BF16 results are close
+    fn assert_bf16_close(a: &[half::bf16], b: &[half::bf16], tol: f32) {
+        assert_eq!(a.len(), b.len(), "BF16 slices have different lengths");
+        for (i, (&val_a, &val_b)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (val_a.to_f32() - val_b.to_f32()).abs();
+            assert!(
+                diff < tol,
+                "BF16 mismatch at index {}: a = {}, b = {}, diff = {}",
+                i, val_a.to_f32(), val_b.to_f32(), diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_swiglu_bf16_cpu_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        // Test multiple batch sizes
+        for batch in [1, 2, 4, 8] {
+            let seq_len = 16;
+            let dim = 256;
+            let shape = &[batch, seq_len, dim];
+
+            // Create tensors (x and y)
+            let mut input_x = Tensor::new(shape, dtype, device)?;
+            let mut input_y = Tensor::new(shape, dtype, device)?;
+
+            // Initialize with test data
+            let x_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 100) as f32) * 0.01))
+                .collect();
+            let y_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 50) as f32) * 0.02))
+                .collect();
+
+            input_x.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&x_data);
+            input_y.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&y_data);
+
+            // Compute: x = silu(x) * x * y
+            let swiglu_op = SwiGLU::new();
+            swiglu_op.forward(&mut OpContext::new(&[&input_y], &mut [&mut input_x], None))?;
+
+            // Verify result is finite
+            let result = input_x.as_bf16()?.as_slice()?;
+            for &val in result {
+                assert!(val.to_f32().is_finite(), "Output contains non-finite value");
+            }
+
+            // Verify basic properties (output magnitude should be reasonable)
+            let mean_abs: f32 = result.iter()
+                .map(|&x| x.to_f32().abs())
+                .sum::<f32>() / result.len() as f32;
+            assert!(mean_abs < 10.0, "Output values too large: mean_abs = {}", mean_abs);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_swiglu_bf16_cuda_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
+
+        // Test multiple batch sizes
+        for batch in [1, 2, 4, 8, 16] {
+            let seq_len = 32;
+            let dim = 512;
+            let shape = &[batch, seq_len, dim];
+
+            // Create tensors on GPU
+            let mut input_x = Tensor::new(shape, dtype, device)?;
+            let mut input_y = Tensor::new(shape, dtype, device)?;
+
+            // Prepare data
+            let x_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 200) as f32) * 0.005 + 0.5))
+                .collect();
+            let y_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 150) as f32) * 0.01))
+                .collect();
+
+            // Copy to GPU
+            input_x.as_bf16_mut()?.buffer_mut().copy_from_host(&x_data)?;
+            input_y.as_bf16_mut()?.buffer_mut().copy_from_host(&y_data)?;
+
+            // Compute
+            let swiglu_op = SwiGLU::new();
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            swiglu_op.forward(&mut OpContext::new(&[&input_y], &mut [&mut input_x], Some(&cuda_config)))?;
+
+            // Copy result back
+            let result_tensor = input_x.to_cpu()?;
+            let result = result_tensor.as_bf16()?.as_slice()?;
+
+            // Verify result is finite
+            for &val in result {
+                assert!(val.to_f32().is_finite(), "Output contains non-finite value");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_swiglu_bf16_cpu_vs_cuda() -> Result<()> {
+        use half::bf16;
+        let dtype = DataType::BF16;
+
+        // Test CPU vs CUDA for various batch sizes
+        for batch in [1, 4, 8] {
+            let seq_len = 20;
+            let dim = 256;
+            let shape = &[batch, seq_len, dim];
+
+            // Prepare data
+            let x_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i * 7) % 100) as f32 * 0.01))
+                .collect();
+            let y_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i * 11) % 80) as f32 * 0.01))
+                .collect();
+
+            // CPU computation
+            let mut input_x_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+            let mut input_y_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+
+            input_x_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&x_data);
+            input_y_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&y_data);
+
+            let swiglu_op = SwiGLU::new();
+            swiglu_op.forward(&mut OpContext::new(&[&input_y_cpu], &mut [&mut input_x_cpu], None))?;
+            let cpu_result = input_x_cpu.as_bf16()?.as_slice()?.to_vec();
+
+            // GPU computation
+            let mut input_x_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+            let mut input_y_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+
+            input_x_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&x_data)?;
+            input_y_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&y_data)?;
+
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            swiglu_op.forward(&mut OpContext::new(&[&input_y_gpu], &mut [&mut input_x_gpu], Some(&cuda_config)))?;
+
+            let gpu_result_tensor = input_x_gpu.to_cpu()?;
+            let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
+
+            // CPU and GPU results should match
+            assert_bf16_close(&cpu_result, gpu_result, 1e-2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_swiglu_bf16_numerical_correctness() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        // Test with known values to verify correctness
+        let size = 4;
+        let shape = &[1, size];
+
+        let mut input_x = Tensor::new(shape, dtype, device)?;
+        let mut input_y = Tensor::new(shape, dtype, device)?;
+
+        // Use simple values for verification
+        let x_data = vec![bf16::from_f32(1.0), bf16::from_f32(2.0), bf16::from_f32(-1.0), bf16::from_f32(0.5)];
+        let y_data = vec![bf16::from_f32(2.0), bf16::from_f32(1.0), bf16::from_f32(3.0), bf16::from_f32(4.0)];
+
+        input_x.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&x_data);
+        input_y.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&y_data);
+
+        // Compute SwiGLU
+        let swiglu_op = SwiGLU::new();
+        swiglu_op.forward(&mut OpContext::new(&[&input_y], &mut [&mut input_x], None))?;
+
+        let result = input_x.as_bf16()?.as_slice()?;
+
+        // Verify results are reasonable
+        // SwiGLU(x, y) = silu(x) * y where silu(x) = x / (1 + exp(-x))
+        // Note: The operation is inplace, so we compute silu(x) * y
+        for (i, &val) in result.iter().enumerate() {
+            let x = x_data[i].to_f32();
+            let y = y_data[i].to_f32();
+            let silu_x = x / (1.0 + (-x).exp());
+            let expected = silu_x * y;
+            let actual = val.to_f32();
+
+            // Allow generous tolerance for BF16
+            let rel_error = if expected.abs() > 1e-6 {
+                (expected - actual).abs() / expected.abs()
+            } else {
+                (expected - actual).abs()
+            };
+
+            assert!(
+                (expected - actual).abs() < 0.1 || rel_error < 0.15,
+                "Index {}: expected ~{}, got {}, rel_error={}", i, expected, actual, rel_error
+            );
+        }
+
+        Ok(())
     }
 }

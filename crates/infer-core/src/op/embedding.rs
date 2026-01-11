@@ -209,4 +209,215 @@ mod tests {
     fn test_embedding_cuda_with_stream() -> Result<()> {
         run_embedding_test(DeviceType::Cuda(0), true)
     }
+
+    // ========================================================================
+    // BF16 Comprehensive Batch Tests
+    // ========================================================================
+
+    /// Helper to assert BF16 results are close
+    fn assert_bf16_close(a: &[half::bf16], b: &[half::bf16], tol: f32) {
+        assert_eq!(a.len(), b.len(), "BF16 slices have different lengths");
+        for (i, (&val_a, &val_b)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (val_a.to_f32() - val_b.to_f32()).abs();
+            assert!(
+                diff < tol,
+                "BF16 mismatch at index {}: a = {}, b = {}, diff = {}",
+                i, val_a.to_f32(), val_b.to_f32(), diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedding_bf16_cpu_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        let vocab_size = 128;
+        let dim = 256;
+
+        // Test multiple batch sizes (number of tokens)
+        for token_len in [1, 4, 8, 16] {
+            // Create embedding operator
+            let mut embedding_op = Embedding::new(vocab_size, dim, dtype, device)?;
+
+            // Initialize weight with known pattern
+            let weight_data: Vec<bf16> = (0..(vocab_size * dim))
+                .map(|i| bf16::from_f32((i as f32) * 0.001))
+                .collect();
+            embedding_op.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
+
+            // Create input tokens (various IDs)
+            let mut input_tokens = Tensor::new(&[token_len], DataType::I32, device)?;
+            let token_ids: Vec<i32> = (0..token_len)
+                .map(|i| ((i * 7) % vocab_size) as i32) // Varied token IDs
+                .collect();
+            input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&token_ids);
+
+            // Create output tensor
+            let mut output = Tensor::new(&[token_len, dim], dtype, device)?;
+
+            // Compute embedding
+            embedding_op.forward(&mut OpContext::new(&[&input_tokens], &mut [&mut output], None))?;
+
+            // Verify results
+            let result = output.as_bf16()?.as_slice()?;
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                let start = (token_id as usize) * dim;
+                let end = start + dim;
+                let expected = &weight_data[start..end];
+                let actual = &result[(i * dim)..((i + 1) * dim)];
+                assert_bf16_close(actual, expected, 1e-3);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_embedding_bf16_cuda_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
+
+        let vocab_size = 256;
+        let dim = 512;
+
+        // Test multiple batch sizes
+        for token_len in [1, 8, 16, 32] {
+            // Create embedding operator
+            let mut embedding_op = Embedding::new(vocab_size, dim, dtype, device)?;
+
+            // Initialize weight
+            let weight_data: Vec<bf16> = (0..(vocab_size * dim))
+                .map(|i| bf16::from_f32(((i % 1000) as f32) * 0.01))
+                .collect();
+            embedding_op.weight.as_bf16_mut()?.buffer_mut().copy_from_host(&weight_data)?;
+
+            // Create input tokens on CPU first
+            let mut input_tokens = Tensor::new(&[token_len], DataType::I32, DeviceType::Cpu)?;
+            let token_ids: Vec<i32> = (0..token_len)
+                .map(|i| ((i * 11) % vocab_size) as i32)
+                .collect();
+            input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&token_ids);
+
+            // Move to GPU
+            let input_tokens_gpu = input_tokens.to_cuda(0)?;
+
+            // Create output tensor on GPU
+            let mut output = Tensor::new(&[token_len, dim], dtype, device)?;
+
+            // Compute embedding with CUDA
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            embedding_op.forward(&mut OpContext::new(&[&input_tokens_gpu], &mut [&mut output], Some(&cuda_config)))?;
+
+            // Copy result back and verify
+            let result_tensor = output.to_cpu()?;
+            let result = result_tensor.as_bf16()?.as_slice()?;
+
+            for (i, &token_id) in token_ids.iter().enumerate() {
+                let start = (token_id as usize) * dim;
+                let end = start + dim;
+                let expected = &weight_data[start..end];
+                let actual = &result[(i * dim)..((i + 1) * dim)];
+                assert_bf16_close(actual, expected, 1e-2);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_embedding_bf16_cpu_vs_cuda() -> Result<()> {
+        use half::bf16;
+        let dtype = DataType::BF16;
+
+        let vocab_size = 200;
+        let dim = 384;
+
+        // Test CPU vs CUDA for various token lengths
+        for token_len in [1, 4, 16] {
+            // Prepare weight data
+            let weight_data: Vec<bf16> = (0..(vocab_size * dim))
+                .map(|i| bf16::from_f32(((i * 3) % 500) as f32 * 0.01))
+                .collect();
+
+            // CPU computation
+            let mut embedding_op_cpu = Embedding::new(vocab_size, dim, dtype, DeviceType::Cpu)?;
+            embedding_op_cpu.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
+
+            let mut input_tokens_cpu = Tensor::new(&[token_len], DataType::I32, DeviceType::Cpu)?;
+            let token_ids: Vec<i32> = (0..token_len)
+                .map(|i| ((i * 13) % vocab_size) as i32)
+                .collect();
+            input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&token_ids);
+
+            let mut output_cpu = Tensor::new(&[token_len, dim], dtype, DeviceType::Cpu)?;
+            embedding_op_cpu.forward(&mut OpContext::new(&[&input_tokens_cpu], &mut [&mut output_cpu], None))?;
+            let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
+
+            // GPU computation
+            let mut embedding_op_gpu = Embedding::new(vocab_size, dim, dtype, DeviceType::Cuda(0))?;
+            embedding_op_gpu.weight.as_bf16_mut()?.buffer_mut().copy_from_host(&weight_data)?;
+
+            let input_tokens_gpu = input_tokens_cpu.to_cuda(0)?;
+            let mut output_gpu = Tensor::new(&[token_len, dim], dtype, DeviceType::Cuda(0))?;
+
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            embedding_op_gpu.forward(&mut OpContext::new(&[&input_tokens_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+
+            let gpu_result_tensor = output_gpu.to_cpu()?;
+            let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
+
+            // CPU and GPU results should match
+            assert_bf16_close(&cpu_result, gpu_result, 1e-2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_embedding_bf16_large_vocab() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        // Test with realistic large vocabulary (like LLaMA)
+        let vocab_size = 32000;
+        let dim = 512;
+        let token_len = 8;
+
+        let mut embedding_op = Embedding::new(vocab_size, dim, dtype, device)?;
+
+        // Initialize weight (use modulo to avoid huge data)
+        let weight_data: Vec<bf16> = (0..(vocab_size * dim))
+            .map(|i| bf16::from_f32(((i % 10000) as f32) * 0.0001))
+            .collect();
+        embedding_op.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
+
+        // Create tokens spanning the vocabulary
+        let mut input_tokens = Tensor::new(&[token_len], DataType::I32, device)?;
+        let token_ids: Vec<i32> = vec![0, 100, 1000, 10000, 20000, 30000, 31999, 15000];
+        input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&token_ids);
+
+        let mut output = Tensor::new(&[token_len, dim], dtype, device)?;
+
+        embedding_op.forward(&mut OpContext::new(&[&input_tokens], &mut [&mut output], None))?;
+
+        // Verify some specific tokens
+        let result = output.as_bf16()?.as_slice()?;
+        for (i, &token_id) in token_ids.iter().enumerate() {
+            let start = (token_id as usize) * dim;
+            let expected_first = weight_data[start];
+            let actual_first = result[i * dim];
+            assert!(
+                (expected_first.to_f32() - actual_first.to_f32()).abs() < 1e-3,
+                "Mismatch for token {} at position {}", token_id, i
+            );
+        }
+
+        Ok(())
+    }
 }

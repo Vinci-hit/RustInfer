@@ -1,8 +1,5 @@
-use axum::{extract::State, Json};
+use axum::Json;
 use serde::Serialize;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use crate::inference::InferenceEngine;
 
 #[derive(Debug, Serialize)]
 pub struct SystemMetrics {
@@ -34,16 +31,18 @@ pub struct GpuMetrics {
     pub temperature_celsius: Option<f32>,
 }
 
-pub async fn get_system_metrics(
-    State(_engine): State<Arc<Mutex<InferenceEngine>>>,
-) -> Json<SystemMetrics> {
+pub async fn get_system_metrics() -> Json<SystemMetrics> {
     use sysinfo::System;
 
     let mut sys = System::new_all();
     sys.refresh_all();
 
+    // sysinfo 0.32 API: 使用cpus()获取所有CPU信息
+    let cpu_usage: f32 = sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
+        / sys.cpus().len() as f32;
+
     let cpu = CpuMetrics {
-        utilization_percent: sys.global_cpu_info().cpu_usage(),
+        utilization_percent: cpu_usage,
         core_count: sys.cpus().len(),
     };
 
@@ -88,3 +87,4 @@ fn get_gpu_metrics() -> Option<GpuMetrics> {
         temperature_celsius: temp.map(|t| t as f32),
     })
 }
+

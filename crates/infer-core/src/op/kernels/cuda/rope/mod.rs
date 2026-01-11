@@ -47,6 +47,7 @@ unsafe extern "C" {
 /// * `sin_cache`: 正弦缓存张量。
 /// * `cos_cache`: 余弦缓存张量。
 /// * `stream`: 可选的 CUDA stream。
+#[allow(clippy::too_many_arguments)]
 pub fn rope(
     dim: usize,
     kv_dim: usize,

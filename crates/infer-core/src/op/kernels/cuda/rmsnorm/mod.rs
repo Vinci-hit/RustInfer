@@ -1,7 +1,6 @@
 use crate::base::error::{Error, Result};
 use crate::cuda::config::CudaConfig;
 use crate::tensor::{Tensor, TypedTensor};
-use half::bf16;
 
 // 假设我们会在 build.rs 中为 `rmsnorm_kernel_forward` 函数生成 FFI 绑定
 unsafe extern "C" {
@@ -39,9 +38,9 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
             let input_typed = input.as_f32()?;
             let weight_typed = weight.as_f32()?;
             let output_typed:&mut TypedTensor<f32> = output.as_f32_mut()?;
-            
+
             // 检查对齐要求
-            if dim % 16 != 0 {
+            if !dim.is_multiple_of(16) {
                 return Err(Error::InvalidArgument("RMSNorm f32 kernel requires dimension to be multiple of 16".to_string()).into());
             }
             
@@ -66,7 +65,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
             let weight_typed = weight.as_bf16()?;
             let output_typed:&mut TypedTensor<half::bf16> = output.as_bf16_mut()?;
             // 检查对齐要求
-            if dim % 16 != 0 {
+            if !dim.is_multiple_of(16) {
                 return Err(Error::InvalidArgument("RMSNorm bf16 kernel requires dimension to be multiple of 16".to_string()).into());
             }
             

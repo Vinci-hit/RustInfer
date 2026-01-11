@@ -15,6 +15,7 @@ use std::f32;
 /// * `output_o`: 输出张量，形状为 [Q_SeqLen, Q_HiddenDim]
 /// * `q_seq_len`: Query 的序列长度 (S_Q)。
 /// * `current_kv_len`: K/V Cache 的有效历史长度 (S_KV_history)。
+#[allow(clippy::too_many_arguments)]
 pub fn flash_attn_gqa(
     input_q: &Tensor,
     input_k_cache: &Tensor,
@@ -71,6 +72,7 @@ pub fn flash_attn_gqa(
 }
 
 /// F32版本的Flash Attention GQA实现
+#[allow(clippy::too_many_arguments)]
 fn flash_attn_gqa_f32(
     input_q: &Tensor,
     input_k_cache: &Tensor,
@@ -182,6 +184,7 @@ fn flash_attn_gqa_f32(
 
 /// BF16版本的Flash Attention GQA实现
 /// 为了数值稳定性，内部计算仍然使用F32，输入输出使用BF16
+#[allow(clippy::too_many_arguments)]
 fn flash_attn_gqa_bf16(
     input_q: &Tensor,
     input_k_cache: &Tensor,

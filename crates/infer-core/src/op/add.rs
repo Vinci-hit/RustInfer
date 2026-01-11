@@ -189,7 +189,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     fn test_add_cuda_with_stream() -> Result<()> {
         use crate::cuda::CudaConfig;
-        
+
         let device = DeviceType::Cuda(0);
         let size = 32 * 151;
 
@@ -204,15 +204,10 @@ mod tests {
 
         // 2. 创建一个自定义的 CudaConfig (包含一个新的 stream)
         let cuda_config = CudaConfig::new()?;
-        
+
         // 3. 创建算子和上下文，这次传入 cuda_config
         let add_op = Add::new();
         add_op.forward(&mut OpContext::new(&[&t1, &t2], &mut [&mut output], Some(&cuda_config)))?;
-
-        // 4. 显式同步设备以确保计算完成
-        //    在实际应用中，你可能会同步 stream，但同步整个设备对于测试来说更简单可靠
-        unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
-        
         // 5. 将结果拷贝回 CPU 并验证
         let result_tensor = output.to_cpu()?;
         let result_slice = result_tensor.as_f32()?.as_slice()?;
@@ -221,6 +216,221 @@ mod tests {
         assert_close(result_slice, &expected_result, 1e-6);
 
         // `cuda_config` 离开作用域时，其 Drop impl 会自动调用 cudaStreamDestroy
+        Ok(())
+    }
+
+    // ========================================================================
+    // BF16 Comprehensive Batch Tests
+    // ========================================================================
+
+    /// Helper to assert BF16 results are close (with BF16 precision tolerance)
+    fn assert_bf16_close(a: &[half::bf16], b: &[half::bf16], tol: f32) {
+        assert_eq!(a.len(), b.len(), "BF16 slices have different lengths");
+        for (i, (&val_a, &val_b)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (val_a.to_f32() - val_b.to_f32()).abs();
+            assert!(
+                diff < tol,
+                "BF16 mismatch at index {}: a = {}, b = {}, diff = {}",
+                i, val_a.to_f32(), val_b.to_f32(), diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_bf16_cpu_batch() -> Result<()> {
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        // Test multiple batch sizes
+        for batch in [1, 2, 4, 8] {
+            let seq_len = 32;
+            let dim = 64;
+            let shape = &[batch, seq_len, dim];
+
+            // Create inputs
+            let mut input_a = Tensor::new(shape, dtype, device)?;
+            let mut input_b = Tensor::new(shape, dtype, device)?;
+            let mut output = Tensor::new(shape, dtype, device)?;
+
+            // Fill with test data
+            use half::bf16;
+            let a_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32((i as f32) * 0.01))
+                .collect();
+            let b_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32((i as f32) * 0.02))
+                .collect();
+
+            input_a.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&a_data);
+            input_b.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&b_data);
+
+            // Compute
+            let add_op = Add::new();
+            add_op.forward(&mut OpContext::new(&[&input_a, &input_b], &mut [&mut output], None))?;
+
+            // Verify
+            let result = output.as_bf16()?.as_slice()?;
+            let expected: Vec<bf16> = a_data.iter()
+                .zip(b_data.iter())
+                .map(|(&a, &b)| bf16::from_f32(a.to_f32() + b.to_f32()))
+                .collect();
+
+            assert_bf16_close(result, &expected, 1e-2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_add_bf16_cuda_batch() -> Result<()> {
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
+
+        // Test multiple batch sizes
+        for batch in [1, 2, 4, 8] {
+            let seq_len = 32;
+            let dim = 128; // Test larger dimension
+            let shape = &[batch, seq_len, dim];
+
+            // Create inputs on GPU
+            let mut input_a = Tensor::new(shape, dtype, device)?;
+            let mut input_b = Tensor::new(shape, dtype, device)?;
+            let mut output = Tensor::new(shape, dtype, device)?;
+
+            // Prepare data on CPU
+            use half::bf16;
+            let a_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 100) as f32) * 0.1))
+                .collect();
+            let b_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 50) as f32) * 0.2))
+                .collect();
+
+            // Copy to GPU
+            input_a.as_bf16_mut()?.buffer_mut().copy_from_host(&a_data)?;
+            input_b.as_bf16_mut()?.buffer_mut().copy_from_host(&b_data)?;
+
+            // Compute
+            let add_op = Add::new();
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            add_op.forward(&mut OpContext::new(&[&input_a, &input_b], &mut [&mut output], Some(&cuda_config)))?;
+
+            // Copy result back
+            let result_tensor = output.to_cpu()?;
+            let result = result_tensor.as_bf16()?.as_slice()?;
+
+            // Verify
+            let expected: Vec<bf16> = a_data.iter()
+                .zip(b_data.iter())
+                .map(|(&a, &b)| bf16::from_f32(a.to_f32() + b.to_f32()))
+                .collect();
+
+            assert_bf16_close(result, &expected, 1e-2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_add_inplace_bf16_cuda_batch() -> Result<()> {
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
+
+        // Test inplace add with multiple batch sizes
+        for batch in [1, 2, 4, 8] {
+            let seq_len = 16;
+            let dim = 256;
+            let shape = &[batch, seq_len, dim];
+
+            // Create tensors
+            let mut input_a = Tensor::new(shape, dtype, device)?;
+            let mut output = Tensor::new(shape, dtype, device)?;
+
+            // Prepare data
+            use half::bf16;
+            let a_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32((i as f32) * 0.005))
+                .collect();
+            let output_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32((i as f32) * 0.003))
+                .collect();
+
+            // Copy to GPU
+            input_a.as_bf16_mut()?.buffer_mut().copy_from_host(&a_data)?;
+            output.as_bf16_mut()?.buffer_mut().copy_from_host(&output_data)?;
+
+            // Inplace add: output = output + input_a
+            let add_op = Add::new();
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            add_op.forward(&mut OpContext::new(&[&input_a], &mut [&mut output], Some(&cuda_config)))?;
+
+            // Verify
+            let result_tensor = output.to_cpu()?;
+            let result = result_tensor.as_bf16()?.as_slice()?;
+
+            let expected: Vec<bf16> = a_data.iter()
+                .zip(output_data.iter())
+                .map(|(&a, &b)| bf16::from_f32(a.to_f32() + b.to_f32()))
+                .collect();
+
+            assert_bf16_close(result, &expected, 1e-2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_add_bf16_cpu_vs_cuda() -> Result<()> {
+        let dtype = DataType::BF16;
+
+        // Test CPU vs CUDA for various batch sizes
+        for batch in [1, 4, 8] {
+            let seq_len = 20;
+            let dim = 128;
+            let shape = &[batch, seq_len, dim];
+
+            // Prepare input data on CPU
+            use half::bf16;
+            let mut input_a_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+            let mut input_b_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+            let mut output_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+
+            let a_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i * 7) % 100) as f32 * 0.1))
+                .collect();
+            let b_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i * 13) % 100) as f32 * 0.1))
+                .collect();
+
+            input_a_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&a_data);
+            input_b_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&b_data);
+
+            // CPU computation
+            let add_op = Add::new();
+            add_op.forward(&mut OpContext::new(&[&input_a_cpu, &input_b_cpu], &mut [&mut output_cpu], None))?;
+            let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
+
+            // GPU computation
+            let mut input_a_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+            let mut input_b_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+            let mut output_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+
+            input_a_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&a_data)?;
+            input_b_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&b_data)?;
+
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            add_op.forward(&mut OpContext::new(&[&input_a_gpu, &input_b_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+
+            let gpu_result_tensor = output_gpu.to_cpu()?;
+            let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
+
+            // CPU and GPU results should match
+            assert_bf16_close(&cpu_result, gpu_result, 1e-3);
+        }
+
         Ok(())
     }
 }
