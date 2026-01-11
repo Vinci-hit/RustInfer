@@ -3,26 +3,19 @@ use axum::{Router, routing::{get, post}};
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::cors::{CorsLayer, Any};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api;
 mod chat;
-mod config;
-mod inference;
+mod zmq_client;
 
-use config::ServerConfig;
-use inference::InferenceEngine;
+use zmq_client::ZmqClient;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-server")]
-#[command(about = "RustInfer HTTP inference server with OpenAI-compatible API", long_about = None)]
+#[command(about = "RustInfer API Server - Connects to rustinfer-engine via ZMQ", long_about = None)]
 struct Args {
-    /// Path to model directory
-    #[arg(short, long, env = "MODEL_PATH")]
-    model: String,
-
     /// Server host
     #[arg(long, default_value = "0.0.0.0", env = "HOST")]
     host: String,
@@ -31,15 +24,11 @@ struct Args {
     #[arg(short, long, default_value = "8000", env = "PORT")]
     port: u16,
 
-    /// Device: cpu or cuda:0, cuda:1, etc.
-    #[arg(short, long, default_value = "cuda:0", env = "DEVICE")]
-    device: String,
+    /// Engine endpoint (ZMQ地址)
+    #[arg(short, long, default_value = "ipc:///tmp/rustinfer.ipc", env = "ENGINE_ENDPOINT")]
+    engine_endpoint: String,
 
-    /// Maximum tokens to generate
-    #[arg(long, default_value = "512", env = "MAX_TOKENS")]
-    max_tokens: usize,
-
-    /// Log level: trace, debug, info, warn, error
+    /// Log level: trace, debug, info, warn, errorf
     #[arg(long, default_value = "info", env = "RUST_LOG")]
     log_level: String,
 }
@@ -57,46 +46,39 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Parse device
-    let device = parse_device(&args.device)?;
+    tracing::info!("🚀 RustInfer API Server starting...");
+    tracing::info!("  Connecting to engine: {}", args.engine_endpoint);
 
-    // Load model
-    tracing::info!("Loading model from {}...", args.model);
-    let config = ServerConfig {
-        model_path: args.model.clone(),
-        device,
-        max_tokens: args.max_tokens,
-    };
+    // 连接到Engine
+    let zmq_client = Arc::new(ZmqClient::new(&args.engine_endpoint).await?);
 
-    let engine = InferenceEngine::new(config).await?;
-    let engine = Arc::new(Mutex::new(engine));
+    tracing::info!("✅ Connected to engine successfully!");
 
-    tracing::info!("Model loaded successfully!");
-
-    // Build router
-    let app = Router::new()
-        // OpenAI-compatible endpoints
+    // 构建Router (先创建需要state的部分)
+    let stateful_router = Router::new()
         .route("/v1/chat/completions", post(api::openai::chat_completions))
         .route("/v1/models", get(api::openai::list_models))
-
-        // System metrics
-        .route("/v1/metrics", get(api::metrics::get_system_metrics))
-
-        // Health & status
         .route("/health", get(api::health::health_check))
         .route("/ready", get(api::health::ready_check))
+        .with_state(zmq_client);
 
-        // Share state
-        .with_state(engine)
-
-        // Middleware
+    // 合并不需要state的路由
+    let app = stateful_router
+        .merge(
+            Router::new()
+                .route("/v1/metrics", get(api::metrics::get_system_metrics))
+        )
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    tracing::info!("🚀 RustInfer server listening on http://{}:{}", args.host, args.port);
-    tracing::info!("📚 API docs: http://{}:{}/health", args.host, args.port);
+    tracing::info!("🚀 API Server listening on http://{}:{}", args.host, args.port);
+    tracing::info!("📚 Endpoints:");
+    tracing::info!("   - POST /v1/chat/completions");
+    tracing::info!("   - GET  /v1/models");
+    tracing::info!("   - GET  /health");
+    tracing::info!("   - GET  /ready");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
@@ -104,19 +86,6 @@ async fn main() -> Result<()> {
         .await?;
 
     Ok(())
-}
-
-fn parse_device(s: &str) -> Result<infer_core::base::DeviceType> {
-    use infer_core::base::DeviceType;
-
-    match s.to_lowercase().as_str() {
-        "cpu" => Ok(DeviceType::Cpu),
-        s if s.starts_with("cuda:") => {
-            let device_id: i32 = s[5..].parse()?;
-            Ok(DeviceType::Cuda(device_id))
-        }
-        _ => Err(anyhow::anyhow!("Invalid device: {}. Use 'cpu' or 'cuda:0'", s)),
-    }
 }
 
 async fn shutdown_signal() {

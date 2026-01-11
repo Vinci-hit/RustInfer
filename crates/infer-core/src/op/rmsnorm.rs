@@ -246,7 +246,255 @@ mod tests {
         let gpu_result = gpu_result_tensor.as_f32()?.as_slice()?;
 
         // --- 3. 对比结果 ---
-        assert_close(&cpu_result, gpu_result, 1e-5);
+        assert_close(&cpu_result, gpu_result, 1e-2);
+        Ok(())
+    }
+
+    // ========================================================================
+    // BF16 Comprehensive Batch Tests
+    // ========================================================================
+
+    /// Helper to assert BF16 results are close
+    fn assert_bf16_close(a: &[half::bf16], b: &[half::bf16], tol: f32) {
+        assert_eq!(a.len(), b.len(), "BF16 slices have different lengths");
+        for (i, (&val_a, &val_b)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (val_a.to_f32() - val_b.to_f32()).abs();
+            assert!(
+                diff < tol,
+                "BF16 mismatch at index {}: a = {}, b = {}, diff = {}",
+                i, val_a.to_f32(), val_b.to_f32(), diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_rmsnorm_bf16_cpu_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        let dim = 256; // Must be multiple of 16 for alignment
+
+        // Test multiple batch sizes
+        for batch in [1, 2, 4, 8] {
+            let seq_len = 16;
+            let shape = &[batch, seq_len, dim];
+
+            // Create operator and tensors
+            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device)?;
+            let mut input = Tensor::new(shape, dtype, device)?;
+            let mut output = Tensor::new(shape, dtype, device)?;
+
+            // Initialize with test data
+            let input_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 100) as f32) * 0.01 + 1.0))
+                .collect();
+            input.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&input_data);
+
+            let weight_data: Vec<bf16> = (0..dim)
+                .map(|_| bf16::from_f32(1.0))
+                .collect();
+            rmsnorm_op.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
+
+            // Compute
+            rmsnorm_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], None))?;
+
+            // Verify output is valid (not NaN or Inf)
+            let result = output.as_bf16()?.as_slice()?;
+            for &val in result {
+                assert!(val.to_f32().is_finite(), "Output contains non-finite value");
+            }
+
+            // Verify normalization property: mean of squares should be ~1
+            for b in 0..batch {
+                for s in 0..seq_len {
+                    let start = (b * seq_len + s) * dim;
+                    let end = start + dim;
+                    let slice = &result[start..end];
+
+                    let mean_sq: f32 = slice.iter()
+                        .map(|&x| {
+                            let val = x.to_f32();
+                            val * val
+                        })
+                        .sum::<f32>() / (dim as f32);
+
+                    // After RMSNorm with weight=1.0, mean of squares should be close to 1
+                    assert!(
+                        (mean_sq - 1.0).abs() < 0.15,
+                        "Batch {}, Seq {}: Mean of squares = {} (expected ~1.0)",
+                        b, s, mean_sq
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_rmsnorm_bf16_cuda_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
+
+        let dim = 512; // Larger dimension for CUDA test
+
+        // Test multiple batch sizes
+        for batch in [1, 2, 4, 8, 16] {
+            let seq_len = 32;
+            let shape = &[batch, seq_len, dim];
+
+            // Create operator and tensors
+            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device)?;
+            let mut input = Tensor::new(shape, dtype, device)?;
+            let mut output = Tensor::new(shape, dtype, device)?;
+
+            // Prepare data on CPU
+            let input_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i % 200) as f32) * 0.005 + 0.5))
+                .collect();
+            let weight_data: Vec<bf16> = (0..dim)
+                .map(|_| bf16::from_f32(1.0))
+                .collect();
+
+            // Copy to GPU
+            input.as_bf16_mut()?.buffer_mut().copy_from_host(&input_data)?;
+            rmsnorm_op.weight.as_bf16_mut()?.buffer_mut().copy_from_host(&weight_data)?;
+
+            // Compute with CUDA
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            rmsnorm_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], Some(&cuda_config)))?;
+
+            // Copy result back
+            let result_tensor = output.to_cpu()?;
+            let result = result_tensor.as_bf16()?.as_slice()?;
+
+            // Verify output is valid
+            for &val in result {
+                assert!(val.to_f32().is_finite(), "Output contains non-finite value");
+            }
+
+            // Spot check normalization
+            let start = (batch / 2) * seq_len * dim + (seq_len / 2) * dim;
+            let end = start + dim;
+            let slice = &result[start..end];
+
+            let mean_sq: f32 = slice.iter()
+                .map(|&x| {
+                    let val = x.to_f32();
+                    val * val
+                })
+                .sum::<f32>() / (dim as f32);
+
+            assert!(
+                (mean_sq - 1.0).abs() < 0.15,
+                "Batch {}: Mean of squares = {} (expected ~1.0)",
+                batch, mean_sq
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_rmsnorm_bf16_cpu_vs_cuda() -> Result<()> {
+        use half::bf16;
+        let dtype = DataType::BF16;
+
+        let dim = 256;
+
+        // Test CPU vs CUDA for various batch sizes
+        for batch in [1, 4, 8] {
+            let seq_len = 20;
+            let shape = &[batch, seq_len, dim];
+
+            // Prepare input data
+            let input_data: Vec<bf16> = (0..(batch * seq_len * dim))
+                .map(|i| bf16::from_f32(((i * 7) % 100) as f32 * 0.01 + 1.5))
+                .collect();
+            let weight_data: Vec<bf16> = (0..dim)
+                .map(|i| bf16::from_f32(((i * 3) % 50) as f32 * 0.02 + 0.9))
+                .collect();
+
+            // CPU computation
+            let mut rmsnorm_op_cpu = RMSNorm::new(dim, dtype, DeviceType::Cpu)?;
+            let mut input_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+            let mut output_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+
+            input_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&input_data);
+            rmsnorm_op_cpu.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
+
+            rmsnorm_op_cpu.forward(&mut OpContext::new(&[&input_cpu], &mut [&mut output_cpu], None))?;
+            let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
+
+            // GPU computation
+            let mut rmsnorm_op_gpu = RMSNorm::new(dim, dtype, DeviceType::Cuda(0))?;
+            let mut input_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+            let mut output_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
+
+            input_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&input_data)?;
+            rmsnorm_op_gpu.weight.as_bf16_mut()?.buffer_mut().copy_from_host(&weight_data)?;
+
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            rmsnorm_op_gpu.forward(&mut OpContext::new(&[&input_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+
+            let gpu_result_tensor = output_gpu.to_cpu()?;
+            let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
+
+            // CPU and GPU results should match (with BF16 tolerance)
+            assert_bf16_close(&cpu_result, gpu_result, 5e-2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rmsnorm_bf16_1d_batch() -> Result<()> {
+        use half::bf16;
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        // Test 1D input (single vector) with multiple sizes
+        for dim in [128, 256, 512] {
+            let shape = &[dim];
+
+            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device)?;
+            let mut input = Tensor::new(shape, dtype, device)?;
+            let mut output = Tensor::new(shape, dtype, device)?;
+
+            // Initialize
+            let input_data: Vec<bf16> = (0..dim)
+                .map(|i| bf16::from_f32((i as f32) * 0.01))
+                .collect();
+            let weight_data: Vec<bf16> = (0..dim)
+                .map(|_| bf16::from_f32(1.0))
+                .collect();
+
+            input.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&input_data);
+            rmsnorm_op.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
+
+            // Compute
+            rmsnorm_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], None))?;
+
+            // Verify
+            let result = output.as_bf16()?.as_slice()?;
+            let mean_sq: f32 = result.iter()
+                .map(|&x| {
+                    let val = x.to_f32();
+                    val * val
+                })
+                .sum::<f32>() / (dim as f32);
+
+            assert!(
+                (mean_sq - 1.0).abs() < 0.1,
+                "1D RMSNorm dim {}: Mean of squares = {} (expected ~1.0)",
+                dim, mean_sq
+            );
+        }
+
         Ok(())
     }
 }

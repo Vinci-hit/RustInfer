@@ -4,6 +4,13 @@ use std::path::PathBuf;
 fn main() {
     // 检查 "cuda" feature 是否被启用
     #[cfg(feature = "cuda")]{
+        // --- 新增代码：如果是 cargo check，直接退出，不跑编译器 ---
+        let _profile = std::env::var("PROFILE").unwrap_or_default();
+        // 或者检查是否由 cargo check 触发 (有些环境下可以用 RUST_CHECK)
+        // 一个更通用的办法是检查具体的指令，但最快的是自定义一个环境变量
+        if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
+             return;
+        }
         let kernel_paths = find_files("src/op/kernels/cuda", "cu");
         
         if kernel_paths.is_empty() {
@@ -27,6 +34,9 @@ fn main() {
         // 1. 使用 cc crate 编译 CUDA 代码 (这部分保持不变)
         let mut build = cc::Build::new();
         build.cuda(true)
+        .opt_level(3)
+        .debug(false)
+        .flag("-O3")
         .flag("-w") 
         .include(&cutlass_include)
         .flag("-std=c++17")
@@ -101,13 +111,21 @@ fn main() {
 #[cfg(feature = "cuda")]
 fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    for entry in walkdir::WalkDir::new(dir) {
+    let walker = walkdir::WalkDir::new(dir).into_iter();
+
+    // 使用 filter_entry 可以高效跳过整个文件夹，不进入其内部扫描
+    let iter = walker.filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        name != "third_party" // <--- 关键：如果文件夹名叫 third_party，直接跳过
+    });
+
+    for entry in iter {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
         let path = entry.path();
-        if path.is_file() && let Some(ext) = path.extension() && ext == extension {
+        if path.is_file() && path.extension().is_some_and(|ext| ext == extension) {
             paths.push(path.to_path_buf());
         }
     }

@@ -1,7 +1,7 @@
 [package]
 name = "infer-server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "rustinfer-server"
@@ -10,23 +10,24 @@ path = "src/main.rs"
 [dependencies]
 # Core inference
 infer-core = { path = "../infer-core", features = ["cuda"] }
+infer-protocol = { path = "../infer-protocol" }  # 新增：分离式通信协议
 
 # Web framework
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+axum = { version = "0.8.8", features = ["macros"] }
+tokio = { version = "1.49", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # CLI & config
-clap = { version = "4.4", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
@@ -34,12 +35,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utils
 chrono = "0.4"
-uuid = { version = "1.6", features = ["v4", "serde"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
+# ZMQ (新增：进程间通信)
+zmq = "0.10"
+rmp-serde = "1.3"
+
 # System metrics
-sysinfo = "0.30"
+sysinfo = "0.32"
 nvml-wrapper = { version = "0.10", optional = true }
 
 [features]

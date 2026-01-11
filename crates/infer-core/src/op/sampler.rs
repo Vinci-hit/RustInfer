@@ -46,12 +46,12 @@ impl Sampler for ArgmaxSampler {
         match self.device_type {
             DeviceType::Cpu => {
                 // 调用 CPU 内核函数
-                kernels::cpu::argmax(logits, output_token);
+                kernels::cpu::argmax(logits, output_token)?;
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
                 // 调用 CUDA 内核函数 (使用 CudaConfig 中的预分配 buffer)
-                kernels::cuda::argmax(logits, output_token,cuda_config);
+                kernels::cuda::argmax(logits, output_token,cuda_config)?;
             }
         }
         Ok(())
@@ -112,12 +112,6 @@ impl Op for SamplerOp {
              return Err(Error::InvalidArgument(format!(
                 "Output tensor must have dtype I32, but got {:?}",
                 output_token_id.dtype()
-            )).into());
-        }
-        if output_token_id.device() != crate::base::DeviceType::Cpu {
-             return Err(Error::InvalidArgument(format!(
-                "Output tensor for token_id must be on the CPU, but got {:?}",
-                output_token_id.device()
             )).into());
         }
 
@@ -187,54 +181,152 @@ mod tests {
         // --- 3. 验证结果 ---
         let result_slice = ctx.outputs[0].as_i32()?.as_slice()?;
         assert_eq!(result_slice, &[max_index as i32]);
-        
+
         Ok(())
     }
 
-    // ------------------------------------------------------------------------
-    // 测试 SamplerOp + ArgmaxSampler 在 CUDA 上的行为
-    // ------------------------------------------------------------------------
+    // ========================================================================
+    // BF16 Comprehensive Batch Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sampler_bf16_cpu_batch() -> Result<()> {
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+
+        // Test multiple vocab sizes
+        for (vocab_size, max_index) in [(128, 50), (1024, 512), (4096, 2048), (32000, 15000)] {
+            // Create logits tensor with known maximum
+            let mut logits = Tensor::new(&[vocab_size], dtype, device)?;
+            let logits_data: Vec<bf16> = (0..vocab_size)
+                .map(|i| {
+                    if i == max_index {
+                        bf16::from_f32(100.0) // Maximum value
+                    } else {
+                        bf16::from_f32(((i * 7) % 100) as f32 * 0.1) // Values range 0.0 to 9.9
+                    }
+                })
+                .collect();
+            logits.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&logits_data);
+
+            // Create sampler and operator
+            let argmax_sampler = Box::new(ArgmaxSampler::new(device));
+            let sampler_op = SamplerOp::new(argmax_sampler);
+
+            // Execute sampling
+            let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+            sampler_op.forward(&mut OpContext::new(&[&logits], &mut [&mut output], None))?;
+
+            // Verify result
+            let result = output.as_i32()?.as_slice()?;
+            assert_eq!(
+                result[0], max_index as i32,
+                "Vocab size {}: Expected max_index {}, got {}",
+                vocab_size, max_index, result[0]
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     #[cfg(feature = "cuda")]
-    fn test_sampler_op_with_argmax_cuda() -> Result<()> {
-        use crate::cuda::CudaConfig;
+    fn test_sampler_bf16_cuda_batch() -> Result<()> {
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
 
-        let cpu_device = DeviceType::Cpu;
-        let gpu_device = DeviceType::Cuda(0);
-        let dtype = DataType::F32;
-        let vocab_size = 50000;
-        let max_index = 43210;
+        // Test multiple vocab sizes
+        for (vocab_size, max_index) in [(256, 100), (2048, 1024), (8192, 4096), (32000, 20000)] {
+            // Prepare logits data on CPU
+            let logits_data: Vec<bf16> = (0..vocab_size)
+                .map(|i| {
+                    if i == max_index {
+                        bf16::from_f32(100.0)
+                    } else {
+                        bf16::from_f32(((i * 13) % 100) as f32 * 0.1) // Values range 0.0 to 9.9
+                    }
+                })
+                .collect();
 
-        // --- 1. 在 CPU 上准备数据 ---
-        let mut logits_cpu = Tensor::new(&[vocab_size], dtype, cpu_device)?;
-        let mut logits_data_cpu = vec![0.0f32; vocab_size];
-        // 设置一个独特的最大值
-        logits_data_cpu[max_index] = 999.9;
-        logits_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&logits_data_cpu);
-        
-        // --- 2. 将输入移动到 GPU ---
-        let logits_gpu = logits_cpu.to_cuda(0)?;
+            // Create logits tensor on GPU
+            let mut logits = Tensor::new(&[vocab_size], dtype, device)?;
+            logits.as_bf16_mut()?.buffer_mut().copy_from_host(&logits_data)?;
 
-        // --- 3. 准备算子，注意 Sampler 需要知道它在 GPU 上工作 ---
-        let argmax_sampler = Box::new(ArgmaxSampler::new(gpu_device));
-        let sampler_op = SamplerOp::new(argmax_sampler);
+            // Create sampler and operator
+            let argmax_sampler = Box::new(ArgmaxSampler::new(device));
+            let sampler_op = SamplerOp::new(argmax_sampler);
 
-        // --- 4. 准备输出张量 (必须在 CPU) 并执行 forward ---
-        let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        let cuda_config = CudaConfig::new()?;
-        let mut ctx = OpContext {
-            inputs: &[&logits_gpu],
-            outputs: &mut [&mut output],
-            cuda_config: Some(&cuda_config),
-        };
-        sampler_op.forward(&mut ctx)?;
+            // Execute sampling
+            let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cuda(0))?;
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            sampler_op.forward(&mut OpContext::new(&[&logits], &mut [&mut output], Some(&cuda_config)))?;
 
-        // --- 5. 验证结果 ---
-        // 因为输出张量已经在 CPU 上，并且我们的内核是隐式同步的，
-        // 所以 forward 返回后，结果就已经可用了。
-        let result_slice = ctx.outputs[0].as_i32()?.as_slice()?;
-        assert_eq!(result_slice, &[max_index as i32]);
-        
+
+            assert_eq!(
+                output.to_cpu()?.as_i32()?.as_slice()?[0], max_index as i32,
+                "CUDA vocab size {}: Expected max_index {}, got {}",
+                vocab_size, max_index, output.to_cpu()?.as_i32()?.as_slice()?[0]
+            );
+        }
+
         Ok(())
     }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_sampler_bf16_cpu_vs_cuda() -> Result<()> {
+        let dtype = DataType::BF16;
+
+        // Test CPU vs CUDA for various vocab sizes
+        for (vocab_size, max_index) in [(512, 256), (4096, 2048), (16000, 8000)] {
+            // Prepare logits data
+            let logits_data: Vec<bf16> = (0..vocab_size)
+                .map(|i| {
+                    if i == max_index {
+                        bf16::from_f32(50.0)
+                    } else {
+                        bf16::from_f32(((i * 7) % 100) as f32 * 0.1)
+                    }
+                })
+                .collect();
+
+            // CPU computation
+            let mut logits_cpu = Tensor::new(&[vocab_size], dtype, DeviceType::Cpu)?;
+            logits_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&logits_data);
+
+            let argmax_sampler_cpu = Box::new(ArgmaxSampler::new(DeviceType::Cpu));
+            let sampler_op_cpu = SamplerOp::new(argmax_sampler_cpu);
+
+            let mut output_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+            sampler_op_cpu.forward(&mut OpContext::new(&[&logits_cpu], &mut [&mut output_cpu], None))?;
+            let cpu_result = output_cpu.as_i32()?.as_slice()?[0];
+
+            // GPU computation
+            let mut logits_gpu = Tensor::new(&[vocab_size], dtype, DeviceType::Cuda(0))?;
+            logits_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&logits_data)?;
+
+            let argmax_sampler_gpu = Box::new(ArgmaxSampler::new(DeviceType::Cuda(0)));
+            let sampler_op_gpu = SamplerOp::new(argmax_sampler_gpu);
+
+            let mut output_gpu = Tensor::new(&[1], DataType::I32, DeviceType::Cuda(0))?;
+            let cuda_config = crate::cuda::CudaConfig::new()?;
+            sampler_op_gpu.forward(&mut OpContext::new(&[&logits_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+            let gpu_result = output_gpu.to_cpu()?.as_i32()?.as_slice()?[0];
+
+            // CPU and GPU results should match
+            assert_eq!(
+                cpu_result, gpu_result,
+                "Vocab size {}: CPU result {} != GPU result {}",
+                vocab_size, cpu_result, gpu_result
+            );
+            assert_eq!(
+                cpu_result, max_index as i32,
+                "Vocab size {}: Both should find max_index {}",
+                vocab_size, max_index
+            );
+        }
+
+        Ok(())
+    }
+
 }

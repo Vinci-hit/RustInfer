@@ -2,7 +2,6 @@
 
 use crate::base::error::{Result, Error};
 use crate::base::DataType;
-use crate::cuda::error::CudaError;
 use crate::tensor::Tensor;
 use crate::cuda::{self, CudaConfig};
 use half::bf16; // 确保引入 bf16 类型
@@ -27,17 +26,16 @@ unsafe extern "C" {
 
 /// 在 GPU 上执行 argmax，并通过 D2H 拷贝隐式同步返回结果。
 /// 使用 CudaConfig 中的预分配 result buffer 以支持 CUDA graphs。
-pub fn argmax(logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
+pub fn argmax(logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
     // --- 1. 形状检查 ---
     let vocab_size = logits.shape()[0];
 
-    // --- 2. 获取 CUDA stream 和 result buffer ---
+    // --- 2. 获取 CUDA stream ---
     let cuda_cfg = cuda_config
         .ok_or_else(|| Error::InvalidArgument("CudaConfig required for CUDA argmax".to_string()))?;
-    let stream = cuda_cfg.stream;
-    let result_ptr_gpu = output_token.buffer_mut().as_mut_ptr() as *mut i32;
 
-    // --- 3. 根据 logits 的类型，调用不同的 FFI 函数 ---
+    let stream = cuda_cfg.stream;
+    // --- 4. 根据 logits 的类型，调用不同的 FFI 函数 ---
     match logits.dtype() {
         DataType::F32 => {
             // 提取类型化指针
@@ -48,7 +46,7 @@ pub fn argmax(logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&Cu
                 argmax_cu_f32_ffi(
                     logits_ptr,
                     vocab_size as i32,
-                    result_ptr_gpu,
+                    output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
                     stream,
                 )
             }
@@ -62,7 +60,7 @@ pub fn argmax(logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&Cu
                 argmax_cu_bf16_ffi(
                     logits_ptr,
                     vocab_size as i32,
-                    result_ptr_gpu,
+                    output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
                     stream,
                 )
             }
@@ -73,5 +71,6 @@ pub fn argmax(logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&Cu
             )).into());
         }
     };
+
     Ok(())
 }

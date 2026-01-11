@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-pub trait ChatTemplate {
+pub trait ChatTemplate: Send + Sync {
     fn apply(&self, messages: &[crate::api::openai::ChatMessage]) -> Result<String>;
 }
 
@@ -38,7 +38,7 @@ impl ChatTemplate for Llama3Template {
     }
 }
 
-pub fn get_template(_model_name: &str) -> Box<dyn ChatTemplate> {
+pub fn get_template(_model_name: &str) -> Box<dyn ChatTemplate + Send + Sync> {
     // Future: detect from config.json
     Box::new(Llama3Template)
 }

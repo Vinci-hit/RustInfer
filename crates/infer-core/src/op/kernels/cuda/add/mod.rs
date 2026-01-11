@@ -75,11 +75,10 @@ pub fn add(
     }
 
     // 3. 对齐校验 (仅对F32版本需要)
-    if let Some(last_dim) = dims_a.last() {
-        if dtype == crate::base::DataType::F32 {
+    if let Some(last_dim) = dims_a.last()
+        && dtype == crate::base::DataType::F32 {
             assert!(last_dim % 2 == 0, "add_kernel_float2_forward requires last dim to be divisible by 2 (for float2 packing).");
         }
-    }
     
     // 4. 获取 CUDA stream
     let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
@@ -170,11 +169,10 @@ pub fn add_inplace(
     }
 
     // 3. 对齐校验 (仅对F32版本需要)
-    if let Some(last_dim) = dims_a.last() {
-        if dtype == crate::base::DataType::F32 {
+    if let Some(last_dim) = dims_a.last()
+        && dtype == crate::base::DataType::F32 {
             assert!(last_dim % 2 == 0, "add_inplace_kernel_float2_forward requires last dim to be divisible by 2.");
         }
-    }
 
     // 4. 获取 CUDA stream
     let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
