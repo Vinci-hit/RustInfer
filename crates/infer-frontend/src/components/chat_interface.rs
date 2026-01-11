@@ -34,7 +34,7 @@ pub fn ChatInterface() -> Element {
         let request = ChatRequest {
             model: "llama3".to_string(),
             messages: api_messages,
-            max_tokens: Some(150),
+            max_tokens: Some(512),
             stream: false,
         };
 

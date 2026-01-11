@@ -9,10 +9,17 @@ use super::DeviceType;
 // Arc 指向的就是这个结构体。
 #[derive(Debug)]
 struct BufferInner {
-    ptr: NonNull<u8>,             // “地契”上记录的地址
-    len_bytes: usize,             // “地契”上记录的面积
-    allocator: Arc<dyn DeviceAllocator + Send + Sync>,// “地契”上记录了是哪个“开发商”分配的
+    ptr: NonNull<u8>,             // "地契"上记录的地址
+    len_bytes: usize,             // "地契"上记录的面积
+    allocator: Arc<dyn DeviceAllocator + Send + Sync>,// "地契"上记录了是哪个"开发商"分配的
 }
+
+// SAFETY: BufferInner can be safely sent between threads because:
+// 1. The allocator is already Send + Sync
+// 2. The pointer is managed by the allocator which handles thread safety
+// 3. Access to the buffer is controlled through the Buffer type
+unsafe impl Send for BufferInner {}
+unsafe impl Sync for BufferInner {}
 
 /// Buffer 是一个线程安全的、引用计数的内存缓冲区.
 /// 它是内存的“所有者”。
