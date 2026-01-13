@@ -4,7 +4,6 @@ use std::path::Path;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
-use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
 use crate::cuda::CudaConfig;
 use crate::op::{Op, OpContext};
@@ -12,90 +11,18 @@ use super::config::RuntimeModelConfig;
 use super::ModelLoader;
 use crate::tensor::Tensor;
 use super::tokenizer::Tokenizer;
-use crate::base::error::Error::InternalError;
 use std::boxed::Box;
-use crate::op::embedding::Embedding;
-use crate::op::flash_gqa::FlashAttnGQA;
-use crate::op::matmul::Matmul;
-use crate::op::rmsnorm::RMSNorm;
-use crate::op::rope::RoPEOp;
-use crate::op::swiglu::SwiGLU;
 use crate::model::{BufferType, Workspace};
 use crate::op::sampler::{Sampler, ArgmaxSampler};
-use crate::op::scatter::Scatter;
-
-/// LlamaLayers 结构体，用于持有模型的所有算子。
-pub struct LlamaLayers {
-    // ---- Token Embedding ----
-    pub embedding_layer: Embedding,
-    pub rmsnorm_final_layer: RMSNorm, // 对应 model.norm.weight
-    pub cls_layer: Matmul, // 对应 lm_head.weight
-
-    // ---- Transformer Blocks (按类型组织) ----
-    pub rmsnorm_attn_layers: Vec<RMSNorm>,
-    pub rmsnorm_ffn_layers: Vec<RMSNorm>,
-    pub wq_layers: Vec<Matmul>,
-    pub wk_layers: Vec<Matmul>,
-    pub wv_layers: Vec<Matmul>,
-    pub wo_layers: Vec<Matmul>,
-    pub mha_layers: Vec<FlashAttnGQA>,
-    pub rope_layers: Vec<RoPEOp>,
-    pub add_layers: AddInplace,
-    pub scatter_layer: Scatter,
-    
-    // FFN layers
-    pub w1_layers: Vec<Matmul>, // gate_proj
-    pub w2_layers: Vec<Matmul>, // down_proj
-    pub w3_layers: Vec<Matmul>, // up_proj
-    pub swiglu_layers: Vec<SwiGLU>,
-}
-
-impl LlamaLayers {
-    /// 将所有层和它们的权重移动到指定的 CUDA 设备。
-    #[cfg(feature = "cuda")]
-    pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        // ---- Token Embedding, Final Norm, and Classifier ----
-        self.embedding_layer.to_cuda(device_id)?;
-        self.rmsnorm_final_layer.to_cuda(device_id)?;
-        self.cls_layer.to_cuda(device_id)?;
-
-        // ---- Transformer Blocks (按类型遍历) ----
-        
-        // --- RMSNorm Layers ---
-        // 为了提高可读性，我们可以用 for_each 结合闭包
-        self.rmsnorm_attn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.rmsnorm_ffn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
-        // --- Attention Matmul Layers ---
-        self.wq_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wk_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wv_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wo_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
-        // --- FFN Matmul Layers ---
-        self.w1_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.w2_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.w3_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
-        // --- Non-parameterized Layers (如果它们有 to_cuda 实现) ---
-        // 这种写法等同于您参考代码中的 for 循环，但更符合 Rust 风格
-        self.mha_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.rope_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.add_layers.to_cuda(device_id)?;
-        self.swiglu_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        
-        println!("All layers successfully moved to CUDA device {}.", device_id);
-        Ok(())
-    }
-}
+use super::layers::{DecoderLayers, WeightMapping};
 
 
 pub struct Llama3 {
     config: RuntimeModelConfig,
     device_type: DeviceType,
     tokenizer: Box<dyn Tokenizer>,
-    /// 核心算子和权重容器
-    layers: LlamaLayers,
+    /// Core decoder layers (shared abstraction with Qwen2)
+    layers: DecoderLayers,
 
     /// KV Cache
     kv_cache: KvCache,
@@ -214,150 +141,24 @@ impl Llama3 {
         is_quant_model: bool
     ) -> Result<Self> {
         let start_time = Instant::now();
-        println!("Start calculate time, Loading model from directory: {:?}", model_dir.as_ref());
+        println!("Start calculate time, Loading Llama3 model from directory: {:?}", model_dir.as_ref());
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
-        let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
         let cuda_config = CudaConfig::new()?;
 
-        println!("Creating model layers...");
-        
-        let (
-            embedding_layer,
-            rmsnorm_final_layer,
-            cls_layer,
-            rmsnorm_attn_layers,
-            rmsnorm_ffn_layers,
-            wq_layers,
-            wk_layers,
-            wv_layers,
-            wo_layers,
-            w1_layers,
-            w2_layers,
-            w3_layers,
-        ) = if !is_quant_model {
-            // === 非量化路径 (Normal Path) ===
-            let layer_num = config.layer_num;
-            let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
-            let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
-            let mut wq_layers = Vec::with_capacity(layer_num);
-            let mut wk_layers = Vec::with_capacity(layer_num);
-            let mut wv_layers = Vec::with_capacity(layer_num);
-            let mut wo_layers = Vec::with_capacity(layer_num);
-            let mut w1_layers = Vec::with_capacity(layer_num);
-            let mut w2_layers = Vec::with_capacity(layer_num);
-            let mut w3_layers = Vec::with_capacity(layer_num);
-            
-            for i in 0..layer_num {
-                wq_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.q_proj.weight", i), &loader, device_type)?);
-                wk_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.k_proj.weight", i), &loader, device_type)?);
-                wv_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.v_proj.weight", i), &loader, device_type)?);
-                wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
-                w1_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.gate_proj.weight", i), &loader, device_type)?);
-                w3_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.up_proj.weight", i), &loader, device_type)?);
-                w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
-                rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type)?);
-                rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type)?);
-            }
+        println!("Creating Llama3 decoder layers...");
 
-            let embedding_layer = Self::load_embedding("model.embed_tokens.weight", &loader, device_type)?;
-            let rmsnorm_final_layer = Self::load_rmsnorm("model.norm.weight", &loader, device_type)?;
-            // 通常是通过检查 `lm_head.weight` 是否存在来隐式判断的。
-            let cls_layer = if tensor_names.contains("lm_head.weight") {
-                // --- 情况 B：权重是独立的 ---
-                // 如果 `lm_head.weight` 存在，我们就加载它。
-                println!("Found independent 'lm_head.weight'. Loading it.");
-                Self::load_matmul("lm_head.weight", &loader, device_type)?
+        // Use DecoderLayers with Llama weight mapping
+        let layers = DecoderLayers::from_loader(
+            &loader,
+            &config,
+            &WeightMapping::LLAMA,
+            device_type,
+            is_quant_model,
+        )?;
 
-            } else {
-                // --- 情况 A：权重是共享/绑定的 (Tied Weights) ---
-                // 如果 `lm_head.weight` 不存在，我们就复用词嵌入层的权重。
-                println!("'lm_head.weight' not found. Reusing token embedding weights (tied weights).");
-                
-                // `Matmul::from` 接收一个拥有的 Tensor 和一个可选的 bias。
-                // `embedding_layer.weight` 是一个 Tensor，它的 `clone()` 是廉价的 Arc clone，
-                // 这实现了权重的共享，而不是数据的复制。
-                Matmul::from(embedding_layer.weight.clone(), None)
-            };
-
-            (
-                embedding_layer,
-                rmsnorm_final_layer,
-                cls_layer,
-                rmsnorm_attn_layers,
-                rmsnorm_ffn_layers,
-                wq_layers,
-                wk_layers,
-                wv_layers,
-                wo_layers,
-                w1_layers,
-                w2_layers,
-                w3_layers,
-            )
-        } else {
-            // === 量化路径 (Quantized Path) ===
-            return Err(Error::InvalidArgument("Quantized models are not yet supported.".to_string()).into());
-        };
-
-
-        let layer_num = config.layer_num;
-        let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
-            .map(|_| {
-                FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size)
-            })
-            .collect();
-        let mha_layers = mha_layers?; 
-        let rope_layers: Result<Vec<RoPEOp>> = (0..layer_num)
-            .map(|_| RoPEOp::new(config.dim, config.kv_dim, config.head_size))
-            .collect();
-        let rope_layers = rope_layers?;
-        let add_layers = AddInplace::new(); 
-        let swiglu_layers:Vec<SwiGLU> = (0..layer_num).map(|_| SwiGLU::new()).collect();
-
-        // 在 Rust 中，许多检查是隐式的。`load_*` 函数返回 Result，如果失败 `?` 会立即返回错误。
-        // 但我们可以添加对集合长度的显式检查，这是一种很好的防御性编程。
-        if rmsnorm_attn_layers.len() != layer_num || rmsnorm_ffn_layers.len() != layer_num {
-             return Err(InternalError("Incorrect number of RMSNorm layers created.".to_string()).into());
-        }
-
-        if wq_layers.len() != layer_num || wk_layers.len() != layer_num || 
-           wv_layers.len() != layer_num || wo_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of attention Matmul layers created.".to_string()).into());
-        }
-        
-        if w1_layers.len() != layer_num || w2_layers.len() != layer_num || w3_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of FFN Matmul layers created.".to_string()).into());
-        }
-        // 对于无参数算子，`.collect()` 保证了长度，但检查一下也无妨。
-        if mha_layers.len() != layer_num || rope_layers.len() != layer_num ||
-           swiglu_layers.len() != layer_num{
-            return Err(InternalError("Incorrect number of non-parameterized layers created.".to_string()).into());
-        }
-        
-        println!("All layers created and checked successfully.");
-        
-        // --- 组装 LlamaLayers ---
-        let layers = LlamaLayers {
-            embedding_layer,
-            rmsnorm_final_layer,
-            cls_layer,
-            rmsnorm_attn_layers,
-            rmsnorm_ffn_layers,
-            wq_layers,
-            wk_layers,
-            wv_layers,
-            wo_layers,
-            mha_layers,
-            rope_layers,
-            add_layers,
-            scatter_layer: Scatter::new(),
-            w1_layers,
-            w2_layers,
-            w3_layers,
-            swiglu_layers,
-        };
-        
+        // Initialize KV cache
         let kv_cache = KvCache::init_kv_cache(&config, &device_type)?;
         
         // --- 初始化工作区 (这是新添加的部分) ---
@@ -365,8 +166,12 @@ impl Llama3 {
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
         let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
-        let kcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
-        let vcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        let mut kcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        let mut vcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        if device_type.is_cpu(){
+            kcache = kcache.to_dtype(DataType::F32)?;
+            vcache = vcache.to_dtype(DataType::F32)?;
+        }
         let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos, kcache, vcache };
         println!("Calculating RoPE sin/cos cache...");
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
@@ -396,6 +201,7 @@ impl Llama3 {
                     crate::op::kernels::cpu::rope_sin_cos_cache_calc(
                         config.head_size,
                         config.seq_len,
+                        500000.0, // Llama3 rope_base
                         sin_cache, // 直接传递 &mut Tensor
                         cos_cache, // 直接传递 &mut Tensor
                     )?;
@@ -406,6 +212,7 @@ impl Llama3 {
                     crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
                         config.head_size,
                         config.seq_len,
+                        500000.0, // Llama3 rope_base
                         sin_cache, // 直接传递 &mut Tensor
                         cos_cache, // 直接传递 &mut Tensor
                         Some(&stream),
@@ -538,69 +345,6 @@ impl Llama3 {
         Ok(buffers)
     }
 
-    // --- 创建一系列辅助加载函数，提高代码可读性 ---
-    fn load_matmul(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Matmul> {
-        let tensor_view = loader.get_tensor(name)?;
-        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
-        
-        // 如果目标设备是CPU，则将权重转换为F32
-        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            // println!("Converting {} weight to F32 for CPU device", name);
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-        
-        let weight_on_device = weight_converted.to_device(device)?;
-
-        Ok(Matmul::from(weight_on_device, None))
-    }
-
-    // ======================= 已修改的函数 =======================
-    fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<RMSNorm> {
-        let tensor_view = loader.get_tensor(name)?;
-        
-        // 1. 在 CPU 上加载 bf16/f32 权重
-        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
-
-        // 如果目标设备是CPU，则将权重转换为F32
-        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            // println!("Converting {} weight to F32 for CPU device", name);
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-
-        // 2. 直接将权重移动到目标设备，不进行类型转换
-        let weight_on_device = weight_converted.to_device(device)?;
-
-        // RMSNorm::from 接收一个最终的、位于正确设备和类型的权重
-        Ok(RMSNorm::from(weight_on_device))
-    }
-
-    fn load_embedding(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Embedding> {
-        let tensor_view = loader.get_tensor(name)?;
-
-        // 1. 在 CPU 上加载 bf16 权重
-        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
-        
-        // 如果目标设备是CPU，则将权重转换为F32
-        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            // println!("Converting {} weight to F32 for CPU device", name);
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-
-        // 2. 直接将BF16权重移动到目标设备，不进行类型转换
-        
-        // 3. 将权重移动到目标设备
-        let weight_on_device = weight_converted.to_device(device)?;
-        
-        Ok(Embedding::from(weight_on_device))
-    }
-
-
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -675,14 +419,17 @@ impl Llama3 {
         self.input_pos.copy_from(pos_cpu)?;
         let input_tokens_view = &self.output_token;
         let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-        if config.cuda_graph.is_none(){
-            config.capture_graph_begin()?;
-        }else{
-            config.launch_graph()?;
-            config.sync_stream()?;
-            let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-            return Ok(next_token);
+        if self.device_type.is_cuda(){
+            if config.cuda_graph.is_none(){
+                config.capture_graph_begin()?;
+            }else{
+                config.launch_graph()?;
+                config.sync_stream()?;
+                let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+                return Ok(next_token);
+            }
         }
+        
         
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
         // Token embedding
@@ -691,14 +438,15 @@ impl Llama3 {
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
+        
         // Process all transformer layers
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
-            
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+            
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.kcache], cuda_config_ref))?;
             self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.vcache], cuda_config_ref))?;
@@ -708,6 +456,7 @@ impl Llama3 {
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
             
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut self.kcache], cuda_config_ref))?;
+            
             self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.kcache, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
             self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.vcache, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
@@ -732,6 +481,7 @@ impl Llama3 {
             self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
             
         }
+        
         // Extract last token's hidden state
         let last_hidden_state_view = x.slice(&[0, 0], &[1, self.config.dim])?;
         
@@ -750,8 +500,9 @@ impl Llama3 {
         )?;
         let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
         self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+        
         let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-        if config.cuda_graph.is_none(){
+        if self.device_type.is_cuda() && config.cuda_graph.is_none(){
             config.capture_graph_end()?;
         }
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
@@ -772,21 +523,18 @@ impl Llama3 {
         let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
         self.input_pos.copy_from(pos_cpu)?;
-
         let total_tokens = batch_size * seq_len;
 
         // Prepare batch input tokens [batch_size * seq_len]
         let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[total_tokens])?;
         input_tokens_view.copy_from(tokens)?;
-
         // Token embedding: [batch_size * seq_len] -> [batch_size * seq_len, dim]
         let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[total_tokens, self.config.dim])?;
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
-
         // Process all transformer layers with batched input
         for i in 0..self.config.layer_num {
             // Attention Block
@@ -944,7 +692,6 @@ impl Llama3 {
         self.layers.rmsnorm_final_layer.forward(
             &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
         )?;
-        
         let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
         
         self.layers.cls_layer.forward(
@@ -953,7 +700,7 @@ impl Llama3 {
         let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
         self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-        
+
         Ok(next_token)
     }
 
@@ -974,6 +721,356 @@ impl Llama3 {
             )).into()
         })
     }
+
+    /// Get reference to the tokenizer
+    pub fn tokenizer(&self) -> &dyn Tokenizer {
+        self.tokenizer.as_ref()
+    }
+}
+
+// ============================================================================
+//  CacheAwareModel Implementation for Engine-Worker Integration
+// ============================================================================
+use super::cache_interface::{CacheAwareModel, CacheInstruction, KVCachePool};
+
+impl CacheAwareModel for Llama3 {
+    /// Forward pass with cache instructions from Engine
+    ///
+    /// This method uses the cache instruction to:
+    /// 1. Skip KV computation for cached tokens (reuse from kv_pool)
+    /// 2. Compute KV only for new tokens
+    /// 3. Write new KV to the specified indices in kv_pool
+    fn forward_with_cache(
+        &mut self,
+        tokens: &Tensor,
+        instruction: &CacheInstruction,
+        kv_pool: &mut KVCachePool,
+    ) -> Result<i32> {
+        if instruction.is_full_cache_hit() {
+            // Decode phase: single new token
+            self.decode_with_cache(
+                tokens.as_i32()?.as_slice()?[0],
+                instruction,
+                kv_pool,
+            )
+        } else {
+            // Prefill phase: multiple tokens
+            self.prefill_with_cache(tokens, instruction, kv_pool)
+        }
+    }
+
+    /// Prefill with cache instructions
+    ///
+    /// Engine tells us:
+    /// - cached_indices: KV already computed, just read from kv_pool
+    /// - new_indices: Need to compute KV, write to kv_pool
+    fn prefill_with_cache(
+        &mut self,
+        tokens: &Tensor,
+        instruction: &CacheInstruction,
+        kv_pool: &mut KVCachePool,
+    ) -> Result<i32> {
+        let cuda_config_ref = if self.device_type.is_cuda() {
+            self.cuda_config.as_ref()
+        } else {
+            None
+        };
+
+        let cached_len = instruction.cached_len();
+        let new_len = instruction.new_len();
+        let total_len = instruction.total_seq_len;
+
+        // Set up position tensor for RoPE
+        let mut pos_tensor = Tensor::new(&[1], crate::base::DataType::I32, crate::base::DeviceType::Cpu)?;
+        pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = instruction.seq_start_pos as i32;
+        self.input_pos.copy_from(&pos_tensor)?;
+
+        // Token embedding for ALL tokens (we need embeddings even for cached tokens for attention)
+        let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
+        let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[total_len])?;
+        input_tokens_view.copy_from(tokens)?;
+
+        let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+        let mut x = x_buffer.slice(&[0, 0], &[total_len, self.config.dim])?;
+        self.layers.embedding_layer.forward(
+            &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
+        )?;
+
+        // Process all transformer layers
+        for layer_idx in 0..self.config.layer_num {
+            // === Attention Block ===
+            let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[total_len, self.config.dim])?;
+            self.layers.rmsnorm_attn_layers[layer_idx].forward(
+                &mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref)
+            )?;
+
+            // Q projection for all tokens (needed for attention)
+            let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buffer.slice(&[0, 0], &[total_len, self.config.dim])?;
+            self.layers.wq_layers[layer_idx].forward(
+                &mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref)
+            )?;
+
+            // Get KV slices from pool
+            // For cached tokens: read existing KV
+            // For new tokens: compute and write KV
+            let all_indices = instruction.all_indices();
+            let (mut k_slice, mut v_slice) = kv_pool.get_kv_slice_mut(layer_idx, &all_indices)?;
+
+            if cached_len > 0 {
+                // Only compute K,V for NEW tokens (skip cached prefix)
+                let new_attn_norm = attn_norm_out.slice(&[cached_len, 0], &[new_len, self.config.dim])?;
+                let mut new_k = k_slice.slice(&[cached_len, 0], &[new_len, self.config.kv_dim])?;
+                let mut new_v = v_slice.slice(&[cached_len, 0], &[new_len, self.config.kv_dim])?;
+
+                self.layers.wk_layers[layer_idx].forward(
+                    &mut OpContext::new(&[&new_attn_norm], &mut [&mut new_k], cuda_config_ref)
+                )?;
+                self.layers.wv_layers[layer_idx].forward(
+                    &mut OpContext::new(&[&new_attn_norm], &mut [&mut new_v], cuda_config_ref)
+                )?;
+            } else {
+                // Cache miss: compute K,V for all tokens
+                self.layers.wk_layers[layer_idx].forward(
+                    &mut OpContext::new(&[&attn_norm_out], &mut [&mut k_slice], cuda_config_ref)
+                )?;
+                self.layers.wv_layers[layer_idx].forward(
+                    &mut OpContext::new(&[&attn_norm_out], &mut [&mut v_slice], cuda_config_ref)
+                )?;
+            }
+
+            // Apply RoPE to Q and K
+            let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
+            let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
+
+            if cached_len > 0 {
+                // Only apply RoPE to new tokens' K (cached K already has RoPE applied)
+                let mut new_q = q.slice(&[cached_len, 0], &[new_len, self.config.dim])?;
+                let mut new_k = k_slice.slice(&[cached_len, 0], &[new_len, self.config.kv_dim])?;
+
+                // Adjust position for new tokens
+                let mut new_pos = Tensor::new(&[1], crate::base::DataType::I32, crate::base::DeviceType::Cpu)?;
+                new_pos.as_i32_mut()?.as_slice_mut()?[0] = cached_len as i32;
+                self.input_pos.copy_from(&new_pos)?;
+
+                self.layers.rope_layers[layer_idx].forward(
+                    &mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut new_q, &mut new_k], cuda_config_ref)
+                )?;
+            } else {
+                self.layers.rope_layers[layer_idx].forward(
+                    &mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k_slice], cuda_config_ref)
+                )?;
+            }
+
+            // Multi-head attention using full KV cache
+            let mut attn_out = attn_norm_out;
+            self.layers.mha_layers[layer_idx].forward(
+                &mut OpContext::new(&[&q, &k_slice, &v_slice, &pos_tensor], &mut [&mut attn_out], cuda_config_ref)
+            )?;
+
+            // Output projection and residual
+            let mut wo_out = q;
+            self.layers.wo_layers[layer_idx].forward(
+                &mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref)
+            )?;
+            self.layers.add_layers.forward(
+                &mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref)
+            )?;
+
+            // === FFN Block ===
+            let mut ffn_norm_out = attn_out;
+            self.layers.rmsnorm_ffn_layers[layer_idx].forward(
+                &mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref)
+            )?;
+
+            let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
+            let mut w1_out = w1_buffer.slice(&[0, 0], &[total_len, self.config.intermediate_size])?;
+            let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
+            let mut w3_out = w3_buffer.slice(&[0, 0], &[total_len, self.config.intermediate_size])?;
+
+            self.layers.w1_layers[layer_idx].forward(
+                &mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref)
+            )?;
+            self.layers.w3_layers[layer_idx].forward(
+                &mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref)
+            )?;
+            self.layers.swiglu_layers[layer_idx].forward(
+                &mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref)
+            )?;
+
+            let mut w2_out = ffn_norm_out;
+            self.layers.w2_layers[layer_idx].forward(
+                &mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref)
+            )?;
+            self.layers.add_layers.forward(
+                &mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref)
+            )?;
+        }
+
+        // Extract last token's hidden state and generate
+        let last_hidden = x.slice(&[total_len - 1, 0], &[1, self.config.dim])?;
+
+        let final_norm_input_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
+        let mut final_norm_input = final_norm_input_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+        final_norm_input.copy_from(&last_hidden)?;
+
+        let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+        self.layers.rmsnorm_final_layer.forward(
+            &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
+        )?;
+
+        let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
+        self.layers.cls_layer.forward(
+            &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
+        )?;
+
+        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+        let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+
+        Ok(next_token)
+    }
+
+    /// Decode single token with cache
+    ///
+    /// All previous tokens are cached, only compute for 1 new token
+    fn decode_with_cache(
+        &mut self,
+        token: i32,
+        instruction: &CacheInstruction,
+        kv_pool: &mut KVCachePool,
+    ) -> Result<i32> {
+        let cuda_config_ref = if self.device_type.is_cuda() {
+            self.cuda_config.as_ref()
+        } else {
+            None
+        };
+
+        let current_pos = instruction.seq_start_pos;
+
+        // Set up position tensor
+        let mut pos_tensor = Tensor::new(&[1], crate::base::DataType::I32, crate::base::DeviceType::Cpu)?;
+        pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = current_pos as i32;
+        self.input_pos.copy_from(&pos_tensor)?;
+
+        // Single token embedding
+        self.output_token.as_i32_mut()?.as_slice_mut()?[0] = token;
+
+        let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+        let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+        self.layers.embedding_layer.forward(
+            &mut OpContext::new(&[&self.output_token], &mut [&mut x], cuda_config_ref)
+        )?;
+
+        // Process all layers
+        for layer_idx in 0..self.config.layer_num {
+            // Attention block
+            let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+            self.layers.rmsnorm_attn_layers[layer_idx].forward(
+                &mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref)
+            )?;
+
+            // Q projection
+            let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+            self.layers.wq_layers[layer_idx].forward(
+                &mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref)
+            )?;
+
+            // K, V projection for new token only
+            self.layers.wk_layers[layer_idx].forward(
+                &mut OpContext::new(&[&attn_norm_out], &mut [&mut self.kcache], cuda_config_ref)
+            )?;
+            self.layers.wv_layers[layer_idx].forward(
+                &mut OpContext::new(&[&attn_norm_out], &mut [&mut self.vcache], cuda_config_ref)
+            )?;
+
+            // Apply RoPE
+            let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
+            let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
+            self.layers.rope_layers[layer_idx].forward(
+                &mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut self.kcache], cuda_config_ref)
+            )?;
+
+            // Write new KV to pool at the specified index
+            if !instruction.new_indices.is_empty() {
+                let new_idx = instruction.new_indices[0];
+                let (mut k_slot, mut v_slot) = kv_pool.get_kv_slice_mut(layer_idx, &[new_idx])?;
+                k_slot.copy_from(&self.kcache)?;
+                v_slot.copy_from(&self.vcache)?;
+            }
+
+            // Get full KV cache for attention (all cached + new)
+            let all_indices = instruction.all_indices();
+            let (k_cache_full, v_cache_full) = kv_pool.get_kv_slice_mut(layer_idx, &all_indices)?;
+
+            // Multi-head attention
+            let mut attn_out = attn_norm_out;
+            self.layers.mha_layers[layer_idx].forward(
+                &mut OpContext::new(&[&q, &k_cache_full, &v_cache_full, &self.input_pos], &mut [&mut attn_out], cuda_config_ref)
+            )?;
+
+            // Output projection and residual
+            let mut wo_out = q;
+            self.layers.wo_layers[layer_idx].forward(
+                &mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref)
+            )?;
+            self.layers.add_layers.forward(
+                &mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref)
+            )?;
+
+            // FFN block
+            let mut ffn_norm_out = attn_out;
+            self.layers.rmsnorm_ffn_layers[layer_idx].forward(
+                &mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref)
+            )?;
+
+            let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
+            let mut w1_out = w1_buffer.slice(&[0, 0], &[1, self.config.intermediate_size])?;
+            let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
+            let mut w3_out = w3_buffer.slice(&[0, 0], &[1, self.config.intermediate_size])?;
+
+            self.layers.w1_layers[layer_idx].forward(
+                &mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref)
+            )?;
+            self.layers.w3_layers[layer_idx].forward(
+                &mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref)
+            )?;
+            self.layers.swiglu_layers[layer_idx].forward(
+                &mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref)
+            )?;
+
+            let mut w2_out = ffn_norm_out;
+            self.layers.w2_layers[layer_idx].forward(
+                &mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref)
+            )?;
+            self.layers.add_layers.forward(
+                &mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref)
+            )?;
+        }
+
+        // Final norm and classifier
+        let last_hidden = x.slice(&[0, 0], &[1, self.config.dim])?;
+        let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+        self.layers.rmsnorm_final_layer.forward(
+            &mut OpContext::new(&[&last_hidden], &mut [&mut final_norm_out], cuda_config_ref)
+        )?;
+
+        let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
+        self.layers.cls_layer.forward(
+            &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
+        )?;
+
+        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+        let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+
+        Ok(next_token)
+    }
 }
 
 // ============================================================================
@@ -985,6 +1082,64 @@ mod tests {
     use std::time::Instant;
     use crate::base::error::Result;
 
+    /// Helper struct for performance metrics
+    #[derive(Debug, Clone)]
+    struct PerformanceMetrics {
+        pub total_compute_ms: f64,
+        pub cuda_tps: f64,
+        pub prefill_throughput: f64,
+        pub decode_avg_itl: f64,
+        pub decode_throughput: f64,
+        pub prompt_tokens_len: f64,
+        pub generated_tokens_len: f64,
+    }
+
+    /// Calculate performance metrics from generation results
+    fn calculate_performance_metrics(
+        prompt_tokens_len: f64,
+        generated_tokens_len: f64,
+        prefill_ms: u64,
+        decode_ms: u64,
+        decode_iterations: usize,
+    ) -> PerformanceMetrics {
+        let total_tokens = prompt_tokens_len + generated_tokens_len;
+        let total_compute_ms = (prefill_ms + decode_ms) as f64;
+
+        let cuda_tps = if total_compute_ms > 0.0 {
+            total_tokens / (total_compute_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        let prefill_throughput = if prefill_ms > 0 {
+            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        let decode_avg_itl = if decode_iterations > 0 {
+            decode_ms as f64 / decode_iterations as f64
+        } else {
+            0.0
+        };
+
+        let decode_throughput = if decode_ms > 0 {
+            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        PerformanceMetrics {
+            total_compute_ms,
+            cuda_tps,
+            prefill_throughput,
+            decode_avg_itl,
+            decode_throughput,
+            prompt_tokens_len,
+            generated_tokens_len,
+        }
+    }
+
     /// 辅助函数：执行生成并返回 (生成的文本, 耗时(毫秒), 生成的Token数)
     fn generate_and_measure(
         model: &mut Llama3,
@@ -992,12 +1147,12 @@ mod tests {
         max_tokens: usize,
         verbose: bool
     ) -> Result<(String, u64, u32, u64, u64, usize)> {
-        
+
         let start_time = Instant::now();
         let (generated_text, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = model.generate(prompt, max_tokens, verbose)?;
         let duration = start_time.elapsed();
         let duration_ms = duration.as_millis() as u64;
-        
+
         Ok((generated_text, duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations))
     }
 
@@ -1026,346 +1181,323 @@ Today Date: 14 Dec 2025
 
 你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         let max_tokens = 150;
-        
+
         println!("Starting CPU generation...");
         let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
-        
+
         // --- 3. Assert & Report (断言 & 报告) ---
         assert!(num_generated_tokens > 0, "No tokens were generated.");
-        
-        // 计算更详细的性能指标
+
+        // 计算性能指标
         let prompt_tokens = model.tokenizer.encode(prompt)?;
         let prompt_tokens_len = prompt_tokens.len() as f64;
         let generated_tokens_len = num_generated_tokens as f64;
-        let total_tokens = prompt_tokens_len + generated_tokens_len;
-        
-        // 使用generate内部测量的纯计算时间作为总时间，而不是generate_and_measure的外部时间
-        let total_compute_ms = (prefill_ms + decode_ms) as f64;
-        
-        let tps = if total_compute_ms > 0.0 {
-            total_tokens / (total_compute_ms / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let prefill_throughput = if prefill_ms > 0 {
-            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let decode_avg_itl = if decode_iterations > 0 {
-            decode_ms as f64 / decode_iterations as f64
-        } else {
-            0.0
-        };
-        
-        let decode_throughput = if decode_ms > 0 {
-            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
+
+        let metrics = calculate_performance_metrics(
+            prompt_tokens_len,
+            generated_tokens_len,
+            prefill_ms,
+            decode_ms,
+            decode_iterations,
+        );
 
         println!("\n================ CPU PERFORMANCE ================");
-        println!("Total Generation Time (compute only): {} ms", total_compute_ms as u64);
-        println!("Generated Tokens: {}, Prompt Tokens: {}", num_generated_tokens, prompt_tokens_len as usize);
-        println!("Total Tokens: {}, Tokens Per Second (TPS): {:.2}", total_tokens as usize, tps);
-        println!("Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, prefill_throughput);
-        println!("Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
+        println!("Total Generation Time (compute only): {:.0} ms", metrics.total_compute_ms);
+        println!("Generated Tokens: {}, Prompt Tokens: {}", num_generated_tokens, metrics.prompt_tokens_len as usize);
+        println!("Total Tokens: {}, Tokens Per Second (TPS): {:.2}",
+            (metrics.prompt_tokens_len + metrics.generated_tokens_len) as usize,
+            metrics.cuda_tps);
+        println!("Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, metrics.prefill_throughput);
+        println!("Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", metrics.decode_avg_itl, metrics.decode_throughput);
         println!("==================================================\n");
-        
+
         Ok(())
     }
+
     #[test]
     #[ignore = "该测试花费时间较长，请单独测试运行。"]
     #[cfg(feature = "cuda")]
     fn test_llama3_cuda_performance() -> Result<()> {
-        // 这个测试现在同时验证一致性和性能
-        
+        // --- 1. Setup (准备) ---
         let model_path = get_dummy_model_path();
         assert!(model_path.exists(), "Dummy model directory not found.");
 
-        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        let shared_prefix = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Cutting Knowledge Date: December 2023
 Today Date: 14 Dec 2025
 
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
-你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let max_tokens = 2000;
+你是算法糕手，写一段C++代码，";
 
-        // --- 2. 在 CUDA 上运行并获取结果和性能 ---
-        println!("\n=== Step 2: Running on CUDA ===");
+        let prompt_suffix_1 = "实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+        let prompt_suffix_2 = "实现一个简单的快速排序函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+
+        let max_tokens = 100;
+
+        // --- 2. First request: Cache miss (缓存未命中) ---
+        println!("\n=== Request 1: Cache MISS (Computing Full Prompt) ===");
         let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (_cuda_generated_text, _cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
 
-        // 计算更详细的性能指标
-        let prompt_tokens = model_cuda.tokenizer.encode(prompt)?;
-        let prompt_tokens_len = prompt_tokens.len() as f64;
-        let generated_tokens_len = cuda_num_tokens as f64;
-        let total_tokens = prompt_tokens_len + generated_tokens_len;
-        
-        // 使用generate内部测量的纯计算时间作为总时间，而不是generate_and_measure的外部时间
-        let total_compute_ms = (prefill_ms + decode_ms) as f64;
-        
-        let cuda_tps = if total_compute_ms > 0.0 {
-            total_tokens / (total_compute_ms / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let prefill_throughput = if prefill_ms > 0 {
-            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let decode_avg_itl = if decode_iterations > 0 {
-            decode_ms as f64 / decode_iterations as f64
-        } else {
-            0.0
-        };
-        
-        let decode_throughput = if decode_ms > 0 {
-            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
+        let prompt_1 = format!("{}{}", shared_prefix, prompt_suffix_1);
+        let (text_1, _, tokens_1, prefill_ms_1, decode_ms_1, _) =
+            generate_and_measure(&mut model_cuda, &prompt_1, max_tokens, false)?;
 
-        println!("\n================ PERFORMANCE COMPARISON ================");
-        println!("CUDA - Total Time (compute only): {} ms, Total Tokens: {}, TPS: {:.2}", total_compute_ms as u64, total_tokens as usize, cuda_tps);
-        println!("CUDA - Generated Tokens: {}, Prompt Tokens: {}", cuda_num_tokens, prompt_tokens_len as usize);
-        println!("CUDA - Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, prefill_throughput);
-        println!("CUDA - Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
-        println!("=========================================================\n");
+        println!("Request 1 Results:");
+        println!("  Generated Tokens: {}", tokens_1);
+        println!("  Prefill Time: {:.2} ms (computing full prompt)", prefill_ms_1);
+        println!("  Decode Time: {:.2} ms", decode_ms_1);
+        println!("  Total: {:.2} ms", (prefill_ms_1 + decode_ms_1) as f64);
+
+        // --- 3. Second request: Cache hit simulation (缓存命中模拟) ---
+        println!("\n=== Request 2: Simulating Cache HIT (Shared Prefix) ===");
+        println!("Note: In production, RadixCache would skip recomputing the shared prefix");
+        println!("      and provide cached KV indices via CacheInstruction");
+
+        let prompt_2 = format!("{}{}", shared_prefix, prompt_suffix_2);
+
+        // Tokenize both prompts to show prefix sharing
+        let tokens_full_1 = model_cuda.tokenizer.encode(&prompt_1)?;
+        let tokens_full_2 = model_cuda.tokenizer.encode(&prompt_2)?;
+        let tokens_prefix = model_cuda.tokenizer.encode(shared_prefix)?;
+
+        println!("\nToken Analysis:");
+        println!("  Prefix tokens: {} tokens", tokens_prefix.len());
+        println!("  Request 1 total: {} tokens", tokens_full_1.len());
+        println!("  Request 2 total: {} tokens", tokens_full_2.len());
+
+        // In a real implementation, RadixCache would have cached the prefix
+        // and returned the cached_indices for reuse. Here we show the potential savings:
+        let prefix_tokens = tokens_prefix.len();
+        let new_tokens_per_request = tokens_full_2.len() - prefix_tokens;
+
+        // Estimate savings: prefix computation would be skipped
+        let estimated_prefix_time = (prefill_ms_1 as f64) * (prefix_tokens as f64 / tokens_full_1.len() as f64);
+        println!("\nEstimated Savings with RadixCache:");
+        println!("  Shared prefix: {} tokens", prefix_tokens);
+        println!("  Estimated time to recompute prefix: {:.2} ms", estimated_prefix_time);
+        println!("  Unique tokens in Request 2: {} tokens", new_tokens_per_request);
+
+        // Run second request (currently without cache, but would benefit from it)
+        let (text_2, _, tokens_2, prefill_ms_2, decode_ms_2, _) =
+            generate_and_measure(&mut model_cuda, &prompt_2, max_tokens, false)?;
+
+        println!("\nRequest 2 Results (without RadixCache optimization):");
+        println!("  Generated Tokens: {}", tokens_2);
+        println!("  Prefill Time: {:.2} ms (recomputing shared prefix)", prefill_ms_2);
+        println!("  Decode Time: {:.2} ms", decode_ms_2);
+        println!("  Total: {:.2} ms", (prefill_ms_2 + decode_ms_2) as f64);
+
+        // --- 4. Performance comparison ---
+        println!("\n================ RADIXCACHE POTENTIAL IMPACT ================");
+        println!("Combined metrics (2 requests):");
+        let total_prefill = (prefill_ms_1 + prefill_ms_2) as f64;
+        let with_cache_prefill = total_prefill - estimated_prefix_time;
+        println!("  Current (no cache): {:.2} ms total prefill", total_prefill);
+        println!("  With RadixCache:    {:.2} ms (estimated, skipping prefix recompute)", with_cache_prefill);
+        println!("  Potential speedup:  {:.2}x", total_prefill / with_cache_prefill);
+
+        println!("\n=== How forward_with_cache() Works ===");
+        println!("1. Request 1 arrives (no cached prefix):");
+        println!("   - CacheInstruction::with_cache_miss(id, [0..{}])", tokens_full_1.len());
+        println!("   - forward_with_cache() computes all {} token KVs", tokens_full_1.len());
+        println!("   - Stores KV results in KVCachePool at indices [0..{}]", tokens_full_1.len());
+
+        println!("\n2. Request 2 arrives (with shared prefix):");
+        println!("   - RadixCache finds cached prefix (len={})", prefix_tokens);
+        println!("   - CacheInstruction::with_cache_hit(id, cached=[0..{}], new=[{}..{}], pos={})",
+            prefix_tokens, prefix_tokens, tokens_full_2.len(), prefix_tokens);
+        println!("   - forward_with_cache() SKIPS KV computation for cached tokens");
+        println!("   - forward_with_cache() ONLY computes KV for new {} tokens", new_tokens_per_request);
+        println!("   - Stores new KV results in KVCachePool at indices [{}..{}]",
+            prefix_tokens, tokens_full_2.len());
+
+        println!("\n3. Speedup from forward_with_cache():");
+        let full_compute_time = prefill_ms_2 as f64;
+        let partial_compute_time = full_compute_time * (new_tokens_per_request as f64 / tokens_full_2.len() as f64);
+        println!("   - Full computation (no cache): {:.2} ms", full_compute_time);
+        println!("   - Partial (forward_with_cache): {:.2} ms", partial_compute_time);
+        println!("   - Speedup: {:.2}x", full_compute_time / partial_compute_time);
+
+        println!("==========================================================\n");
+
+        // Verify both requests completed
+        assert!(!text_1.is_empty(), "Request 1 generated empty text");
+        assert!(!text_2.is_empty(), "Request 2 generated empty text");
+
+        Ok(())
+    }
+
+
+    /// Test that actually uses forward_with_cache() with KVCachePool
+    /// This is the authentic test demonstrating cache-aware model behavior
+    #[test]
+    #[ignore = "该测试花费时间较长，请单独测试运行。"]
+    #[cfg(feature = "cuda")]
+    fn test_llama3_forward_with_cache() -> Result<()> {
+        use crate::model::cache_interface::{CacheInstruction, KVCachePool};
+
+        let model_path = get_dummy_model_path();
+        assert!(model_path.exists(), "Dummy model directory not found.");
+
+        let mut model = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
+
+        // Initialize KV Cache Pool with pre-allocated space
+        let max_tokens = 1024;
+        let mut kv_pool = KVCachePool::new(
+            max_tokens,
+            model.config.layer_num,
+            model.config.kv_dim,
+            if model.device_type.is_cpu() { DataType::F32 } else { DataType::BF16 },
+            model.device_type,
+        )?;
+
+        println!("\n=== Test: forward_with_cache() with KVCachePool ===");
+
+        // Request 1: Full cache miss - compute all tokens
+        println!("\n1. Request 1: Full Cache MISS");
+        let prompt_1 = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+Cutting Knowledge Date: December 2023
+Today Date: 14 Dec 2025
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+写一个C++排序函数<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+
+        let tokens_1 = model.tokenizer().encode(prompt_1)?;
+        println!("  Prompt tokens: {}", tokens_1.len());
+
+        // Pre-allocate indices for Request 1
+        let indices_1: Vec<usize> = (0..tokens_1.len()).collect();
+        println!("  Allocated KV indices: [0..{})", tokens_1.len());
+
+        // Create cache miss instruction
+        let instruction_1 = CacheInstruction::with_cache_miss(
+            "req1".to_string(),
+            indices_1.clone(),
+        );
+
+        // Create token tensor
+        let mut tokens_tensor = Tensor::new(&[tokens_1.len()], DataType::I32, model.device_type)?;
+        tokens_tensor.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&tokens_1);
+
+        // Call forward_with_cache - should compute all token KVs
+        let start = Instant::now();
+        let token_1 = model.forward_with_cache(
+            &tokens_tensor,
+            &instruction_1,
+            &mut kv_pool,
+        )?;
+        let prefill_ms_1 = start.elapsed().as_millis() as u64;
+        println!("  First generated token: {}", token_1);
+        println!("  Prefill time: {:.2} ms (full computation)", prefill_ms_1);
+
+        // Request 2: Partial cache hit - only compute new tokens
+        println!("\n2. Request 2: Partial Cache HIT (shared prefix)");
+        let prompt_2 = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+Cutting Knowledge Date: December 2023
+Today Date: 14 Dec 2025
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+写一个C++搜索函数<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+
+        let tokens_2 = model.tokenizer().encode(prompt_2)?;
+        let tokens_prefix = model.tokenizer().encode("<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+Cutting Knowledge Date: December 2023
+Today Date: 14 Dec 2025
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+写一个C++")?;
+
+        println!("  Request 1 tokens: {}", tokens_1.len());
+        println!("  Request 2 tokens: {}", tokens_2.len());
+        println!("  Shared prefix: {} tokens", tokens_prefix.len());
+        let new_tokens = tokens_2.len() - tokens_prefix.len();
+        println!("  New unique tokens: {} tokens", new_tokens);
+
+        // Create indices: reuse cached prefix + new slots
+        let mut indices_2: Vec<usize> = (0..tokens_prefix.len()).collect();
+        indices_2.extend(tokens_1.len()..tokens_1.len() + new_tokens);
+
+        // Create cache hit instruction: prefix is already cached
+        let cached_indices: Vec<usize> = (0..tokens_prefix.len()).collect();
+        let new_indices: Vec<usize> = (tokens_1.len()..tokens_1.len() + new_tokens).collect();
+
+        let instruction_2 = CacheInstruction::with_cache_hit(
+            "req2".to_string(),
+            cached_indices.clone(),
+            new_indices.clone(),
+            0,
+        );
+
+        println!("  Cache HIT: {} cached indices + {} new indices",
+            cached_indices.len(), new_indices.len());
+
+        // Create token tensor for request 2
+        let mut tokens_tensor_2 = Tensor::new(&[tokens_2.len()], DataType::I32, model.device_type)?;
+        tokens_tensor_2.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&tokens_2);
+
+        // Call forward_with_cache - should SKIP cached tokens, only compute new ones
+        let start = Instant::now();
+        let token_2 = model.forward_with_cache(
+            &tokens_tensor_2,
+            &instruction_2,
+            &mut kv_pool,
+        )?;
+        let prefill_ms_2 = start.elapsed().as_millis() as u64;
+        println!("  First generated token: {}", token_2);
+        println!("  Prefill time: {:.2} ms (partial computation)", prefill_ms_2);
+
+        // Verify speedup
+        println!("\n3. Cache Speedup Analysis");
+        println!("  Request 1 (full):   {:.2} ms", prefill_ms_1);
+        println!("  Request 2 (cached): {:.2} ms", prefill_ms_2);
+        let speedup = prefill_ms_1 as f64 / prefill_ms_2 as f64;
+        println!("  Speedup: {:.2}x (computed {:.1}% fewer tokens)",
+            speedup,
+            (new_tokens as f64 / tokens_2.len() as f64) * 100.0);
+
+        // Decode phase: both should use decode_with_cache
+        println!("\n4. Decode with Cache");
+
+        // Request 1 decode - add 2 more tokens
+        let mut all_indices_1 = indices_1.clone();
+        for i in 0..2 {
+            let new_idx = tokens_1.len() + new_tokens + i;
+            all_indices_1.push(new_idx);
+
+            let decode_instr = CacheInstruction::for_decode(
+                "req1".to_string(),
+                all_indices_1.clone(),
+                new_idx,
+                tokens_1.len() + i,
+            );
+
+            let _next_token = model.decode_with_cache(token_1, &decode_instr, &mut kv_pool)?;
+        }
+        println!("  Request 1: Generated 2 additional tokens");
+
+        // Request 2 decode - add 2 more tokens
+        let mut all_indices_2 = indices_2.clone();
+        for i in 0..2 {
+            let new_idx = tokens_1.len() + new_tokens + 2 + i;
+            all_indices_2.push(new_idx);
+
+            let decode_instr = CacheInstruction::for_decode(
+                "req2".to_string(),
+                all_indices_2.clone(),
+                new_idx,
+                tokens_2.len() + i,
+            );
+
+            let _next_token = model.decode_with_cache(token_2, &decode_instr, &mut kv_pool)?;
+        }
+        println!("  Request 2: Generated 2 additional tokens");
+
+        println!("\n=== Test Completed: forward_with_cache() works correctly ===\n");
+
         Ok(())
     }
 
     // 辅助函数，获取虚拟模型的路径
     fn get_dummy_model_path() -> &'static Path {
         Path::new("/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct")
-    }
-
-    /// Test TRUE batch processing with 8 users sending "How are you" simultaneously
-    /// This test demonstrates real batch inference where all 8 users are processed in parallel
-    /// within a single forward pass, maximizing GPU utilization
-    #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_llama3_concurrent_batch_users() -> Result<()> {
-        println!("\n========== TRUE BATCH PROCESSING TEST ==========");
-        println!("Processing 8 users in a SINGLE batch (parallel inference)");
-
-        let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Model directory not found at {:?}", model_path);
-
-        // Create model on CUDA device
-        println!("\n[1/5] Loading model on CUDA...");
-        let mut model = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        println!("✓ Model loaded successfully");
-
-        // Define the prompt that all 8 users are sending
-        let base_prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-Cutting Knowledge Date: December 2023
-Today Date: 14 Dec 2025
-
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-How are you<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-
-        let batch_size = 8;
-        let max_tokens_per_user = 50;
-
-        println!("\n[2/5] Preparing batch input for {} users...", batch_size);
-
-        // Tokenize the prompt (same for all users)
-        let prompt_tokens = model.tokenizer.encode(base_prompt)?;
-        let prompt_len = prompt_tokens.len();
-        println!("  Prompt length: {} tokens", prompt_len);
-        println!("  Prompt: {:?}", &prompt_tokens[..prompt_len.min(10)]);
-
-        // Create batch tensor: [batch_size, seq_len]
-        let batch_token_data: Vec<i32> = (0..batch_size)
-            .flat_map(|_| prompt_tokens.iter().copied())
-            .collect();
-
-        let mut batch_tokens = Tensor::new(&[batch_size * prompt_len], DataType::I32, DeviceType::Cpu)?;
-        batch_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&batch_token_data);
-
-        println!("  Created batch tensor: [{}, {}]", batch_size, prompt_len);
-
-        println!("\n[3/5] Running BATCH prefill (all {} users in parallel)...", batch_size);
-        let prefill_start = Instant::now();
-
-        // Process all users in a SINGLE batch prefill - TRUE PARALLEL PROCESSING
-        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
-
-        let batch_first_tokens = model.forward_prefill_batch(&batch_tokens, &input_pos, batch_size, prompt_len)?;
-
-        let prefill_duration = prefill_start.elapsed();
-        let prefill_ms = prefill_duration.as_millis() as u64;
-
-        println!("  ✓ Batch prefill completed in {:.2}ms", prefill_ms);
-        println!("  First tokens generated for all users: {:?}", batch_first_tokens);
-        println!("  TRUE PARALLEL: {} users processed in a SINGLE forward pass!", batch_size);
-
-        println!("\n[4/5] Running sequential decode for each user...");
-        println!("  (Note: Decode is sequential because users may have different generation lengths)");
-
-        let decode_start = Instant::now();
-        let mut results = Vec::new();
-
-        // For decode phase, we process each user sequentially
-        // (In production, you'd implement batched decode with dynamic batching)
-        for user_id in 0..batch_size {
-            let user_decode_start = Instant::now();
-            let first_token = batch_first_tokens[user_id];
-
-            let mut generated_tokens = vec![first_token];
-            let mut current_token = first_token;
-
-            // Generate remaining tokens for this user
-            for pos in prompt_len..(prompt_len + max_tokens_per_user - 1) {
-                let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-
-                let mut input_tokens = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                input_tokens.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-
-                let next_token = model.forward_decoding(&input_tokens, &input_pos)?;
-
-                if model.tokenizer.is_eos(next_token) {
-                    break;
-                }
-
-                generated_tokens.push(next_token);
-                current_token = next_token;
-            }
-
-            let user_decode_time = user_decode_start.elapsed().as_millis() as u64;
-            let generated_text = model.tokenizer.decode(&generated_tokens)?;
-
-            results.push(UserResult {
-                user_id,
-                generated_text,
-                num_tokens: generated_tokens.len() as u32,
-                prefill_ms: prefill_ms / batch_size as u64, // Amortized prefill time
-                decode_ms: user_decode_time,
-                decode_iterations: generated_tokens.len() - 1,
-                total_duration_ms: prefill_ms / batch_size as u64 + user_decode_time,
-                success: true,
-                error: None,
-            });
-
-            println!("  [User {}] Generated {} tokens in {:.2}ms", user_id, generated_tokens.len(), user_decode_time);
-        }
-
-        let total_decode_time = decode_start.elapsed().as_millis() as u64;
-        let total_time = prefill_duration.as_millis() as u64 + total_decode_time;
-
-        println!("\n[5/5] Analyzing batch processing results...");
-
-        println!("\n================ BATCH PROCESSING RESULTS ================");
-        println!("Batch Size: {} users", batch_size);
-        println!("Processing Mode: TRUE PARALLEL BATCH (single forward pass)");
-        println!("----------------------------------------------------------");
-        println!("Timing Breakdown:");
-        println!("  Batch Prefill (parallel): {:.2}ms", prefill_ms);
-        println!("  Per-user prefill (amortized): {:.2}ms", prefill_ms as f64 / batch_size as f64);
-        println!("  Sequential Decode (all users): {:.2}ms", total_decode_time);
-        println!("  Total Time: {:.2}ms", total_time);
-        println!("----------------------------------------------------------");
-
-        let mut total_tokens = 0;
-        let mut total_decode_ms = 0u64;
-
-        // Print individual user results
-        for result in &results {
-            total_tokens += result.num_tokens;
-            total_decode_ms += result.decode_ms;
-
-            let tps = if result.decode_ms > 0 {
-                (result.num_tokens as f64 - 1.0) / (result.decode_ms as f64 / 1000.0)
-            } else {
-                0.0
-            };
-
-            println!("[User {}] Tokens: {}, Decode: {}ms, TPS: {:.2}",
-                result.user_id,
-                result.num_tokens,
-                result.decode_ms,
-                tps
-            );
-
-            // Print response preview
-            let preview = if result.generated_text.len() > 80 {
-                format!("{}...", &result.generated_text[..80])
-            } else {
-                result.generated_text.clone()
-            };
-            println!("         Response: {}", preview);
-        }
-
-        println!("----------------------------------------------------------");
-
-        // Calculate batch metrics
-        let avg_tokens_per_user = total_tokens as f64 / batch_size as f64;
-        let avg_decode_time = total_decode_ms as f64 / batch_size as f64;
-
-        // Batch prefill throughput
-        let batch_prefill_throughput = (batch_size * prompt_len) as f64 / (prefill_ms as f64 / 1000.0);
-
-        // Overall throughput
-        let overall_throughput = total_tokens as f64 / (total_time as f64 / 1000.0);
-
-        println!("\nBatch Performance Metrics:");
-        println!("  Average tokens/user: {:.1}", avg_tokens_per_user);
-        println!("  Average decode time/user: {:.2}ms", avg_decode_time);
-        println!("  Batch prefill throughput: {:.2} tokens/sec", batch_prefill_throughput);
-        println!("  Overall throughput: {:.2} tokens/sec", overall_throughput);
-        println!("  Total tokens processed: {}", total_tokens);
-
-        // Calculate speedup vs sequential processing
-        let sequential_prefill_time = prefill_ms * batch_size as u64;
-        let speedup = sequential_prefill_time as f64 / prefill_ms as f64;
-        println!("\nBatch Efficiency:");
-        println!("  Prefill speedup vs sequential: {:.2}x", speedup);
-        println!("  Time saved in prefill: {:.2}ms ({:.1}%)",
-            sequential_prefill_time as f64 - prefill_ms as f64,
-            ((sequential_prefill_time as f64 - prefill_ms as f64) / sequential_prefill_time as f64) * 100.0
-        );
-
-        println!("==========================================================\n");
-
-        // Assertions
-        assert_eq!(results.len(), batch_size, "Not all users were processed");
-
-        for result in &results {
-            assert!(result.success, "User {} failed", result.user_id);
-            assert!(result.num_tokens > 0, "User {} generated 0 tokens", result.user_id);
-            assert!(!result.generated_text.is_empty(), "User {} has empty response", result.user_id);
-        }
-
-        println!("✓ All assertions passed!");
-        println!("✓ Batch processing successfully handled {} users in parallel", batch_size);
-
-        Ok(())
-    }
-
-    /// Helper struct to store results from each concurrent user
-    #[derive(Debug, Clone)]
-    struct UserResult {
-        user_id: usize,
-        generated_text: String,
-        num_tokens: u32,
-        prefill_ms: u64,
-        decode_ms: u64,
-        decode_iterations: usize,
-        total_duration_ms: u64,
-        success: bool,
-        error: Option<String>,
     }
 }
