@@ -95,7 +95,7 @@ RustInfer uses a **separated process architecture** with ZeroMQ for inter-proces
               │ ZeroMQ IPC + MessagePack
               │
 ┌─────────────▼───────────────────────────────────────────┐
-│                     infer-engine                         │
+│                     infer-scheduler                         │
 │  • Model inference execution                             │
 │  • Request queue & scheduling                            │
 │  • ZMQ Server (ROUTER socket)                           │
@@ -103,7 +103,7 @@ RustInfer uses a **separated process architecture** with ZeroMQ for inter-proces
               │ FFI
               │
 ┌─────────────▼───────────────────────────────────────────┐
-│                     infer-core                           │
+│                     infer-worker                           │
 │  • Tensor system                                         │
 │  • Operator implementations                              │
 │  • Memory management                                     │
@@ -113,7 +113,7 @@ RustInfer uses a **separated process architecture** with ZeroMQ for inter-proces
 
 **Key File Locations:**
 - Protocol: `/crates/infer-protocol/src/lib.rs`
-- Engine ZMQ: `/crates/infer-engine/src/zmq_server.rs`
+- Engine ZMQ: `/crates/infer-scheduler/src/zmq_server.rs`
 - Server ZMQ: `/crates/infer-server/src/zmq_client.rs`
 
 ### Design Rationale
@@ -139,11 +139,11 @@ RustInfer uses a **separated process architecture** with ZeroMQ for inter-proces
 
 ## Core Components Deep Dive
 
-### 1. Memory Management (`infer-core/src/base/`)
+### 1. Memory Management (`infer-worker/src/base/`)
 
 #### Buffer System
 
-**Location**: `/crates/infer-core/src/base/buffer.rs`
+**Location**: `/crates/infer-worker/src/base/buffer.rs`
 
 The `Buffer` type is the foundation of RustInfer's memory system:
 
@@ -194,7 +194,7 @@ Automatically determines the correct transfer type.
 
 #### CUDA Memory Allocator
 
-**Location**: `/crates/infer-core/src/base/allocator.rs`
+**Location**: `/crates/infer-worker/src/base/allocator.rs`
 
 The `CachingCudaAllocator` is a critical performance optimization:
 
@@ -227,9 +227,9 @@ struct CudaMemoryChunk {
 **Thread Safety:**
 Uses `DashMap` for lock-free concurrent access across threads.
 
-### 2. Tensor System (`infer-core/src/tensor/`)
+### 2. Tensor System (`infer-worker/src/tensor/`)
 
-**Location**: `/crates/infer-core/src/tensor/mod.rs`
+**Location**: `/crates/infer-worker/src/tensor/mod.rs`
 
 #### Design Pattern: Type-Erased with Internal Typed Variants
 
@@ -295,9 +295,9 @@ pub fn slice(&self, ranges: &[Range<usize>]) -> Tensor {
 }
 ```
 
-### 3. Operator System (`infer-core/src/op/`)
+### 3. Operator System (`infer-worker/src/op/`)
 
-**Location**: `/crates/infer-core/src/op/mod.rs`
+**Location**: `/crates/infer-worker/src/op/mod.rs`
 
 #### Trait-Based Abstraction
 
@@ -330,7 +330,7 @@ impl Op for RMSNorm {
 
 #### Implemented Operators
 
-**Location**: `/crates/infer-core/src/op/`
+**Location**: `/crates/infer-worker/src/op/`
 
 | Operator | File | Description |
 |----------|------|-------------|
@@ -344,9 +344,9 @@ impl Op for RMSNorm {
 | Scatter | `scatter.rs` | KV cache update |
 | Sampler | `sampler.rs` | Token sampling (argmax) |
 
-### 4. Model Implementation (`infer-core/src/model/llama3.rs`)
+### 4. Model Implementation (`infer-worker/src/model/llama3.rs`)
 
-**Location**: `/crates/infer-core/src/model/llama3.rs` (~1000 lines)
+**Location**: `/crates/infer-worker/src/model/llama3.rs` (~1000 lines)
 
 #### Workspace Pattern
 
@@ -427,7 +427,7 @@ fn forward_decoding(&mut self, token: u32, pos: usize) -> Result<u32> {
 
 #### Engine Side: ZMQ Server
 
-**Location**: `/crates/infer-engine/src/zmq_server.rs`
+**Location**: `/crates/infer-scheduler/src/zmq_server.rs`
 
 ```rust
 pub struct ZmqServer {
@@ -493,7 +493,7 @@ Llama3 Model (borrows weight tensors)
 
 ### Zero-Copy Model Loading
 
-**Location**: `/crates/infer-core/src/model/loader.rs`
+**Location**: `/crates/infer-worker/src/model/loader.rs`
 
 **Technique**: mmap + unsafe lifetime extension
 
@@ -596,7 +596,7 @@ impl OperatorName {
 
 ### Flash Attention Implementation
 
-**Location**: `/crates/infer-core/src/op/kernels/cuda/flash_attn_gqa/`
+**Location**: `/crates/infer-worker/src/op/kernels/cuda/flash_attn_gqa/`
 
 Flash Attention is the most complex operator (~1200 lines of CUDA code):
 
@@ -618,11 +618,11 @@ Flash Attention is the most complex operator (~1200 lines of CUDA code):
    - Parallelizes over cache sequence length
    - Split-K reduction for load balancing
 
-**File**: `/crates/infer-core/src/op/kernels/cuda/flash_attn_gqa/flash_attn_kernel.cu`
+**File**: `/crates/infer-worker/src/op/kernels/cuda/flash_attn_gqa/flash_attn_kernel.cu`
 
 ### Matrix Multiplication
 
-**Location**: `/crates/infer-core/src/op/kernels/cuda/matmul/`
+**Location**: `/crates/infer-worker/src/op/kernels/cuda/matmul/`
 
 **Backend Selection:**
 - **CPU**: Uses OpenBLAS via ndarray-linalg
@@ -670,7 +670,7 @@ pub fn matmul_cuda(
 
 ### 1. CUDA Graph Capture
 
-**Location**: `/crates/infer-core/src/cuda/config.rs`
+**Location**: `/crates/infer-worker/src/cuda/config.rs`
 
 CUDA graphs eliminate kernel launch overhead by recording and replaying sequences of operations:
 
@@ -766,7 +766,7 @@ fn get_workspace(&mut self, buffer_type: BufferType, shape: &[usize]) -> &mut Te
 
 **Examples:**
 
-1. **SwiGLU Fusion** (`/crates/infer-core/src/op/swiglu.rs`)
+1. **SwiGLU Fusion** (`/crates/infer-worker/src/op/swiglu.rs`)
 ```cuda
 __global__ void swiglu_kernel(
     const T* gate,    // gate projection
@@ -863,29 +863,29 @@ impl CachingCudaAllocator {
 
 **Start here if you're new:**
 
-1. **Read the tensor system** (`/crates/infer-core/src/tensor/mod.rs`)
+1. **Read the tensor system** (`/crates/infer-worker/src/tensor/mod.rs`)
    - Understand Buffer, TypedTensor, and Tensor enum
    - See how zero-copy operations work
 
-2. **Read a simple operator** (`/crates/infer-core/src/op/add.rs`)
+2. **Read a simple operator** (`/crates/infer-worker/src/op/add.rs`)
    - Understand Op trait and OpContext
    - See dual backend pattern
 
-3. **Read RMSNorm** (`/crates/infer-core/src/op/rmsnorm.rs`)
+3. **Read RMSNorm** (`/crates/infer-worker/src/op/rmsnorm.rs`)
    - More complex operator with normalization logic
    - Good example of CPU vs CUDA implementations
 
-4. **Read Llama3 model** (`/crates/infer-core/src/model/llama3.rs`)
+4. **Read Llama3 model** (`/crates/infer-worker/src/model/llama3.rs`)
    - Understand workspace pattern
    - See how operators compose into a model
 
-5. **Explore ZMQ communication** (`/crates/infer-engine/src/zmq_server.rs`)
+5. **Explore ZMQ communication** (`/crates/infer-scheduler/src/zmq_server.rs`)
    - Understand process separation
    - See message passing patterns
 
 ### Adding a New Operator
 
-**Template** (save as `/crates/infer-core/src/op/your_op.rs`):
+**Template** (save as `/crates/infer-worker/src/op/your_op.rs`):
 
 ```rust
 use crate::base::{DeviceType, Result};
@@ -1001,7 +1001,7 @@ mod tests {
 }
 ```
 
-**CUDA Kernel** (save as `/crates/infer-core/src/op/kernels/cuda/your_op/kernel.cu`):
+**CUDA Kernel** (save as `/crates/infer-worker/src/op/kernels/cuda/your_op/kernel.cu`):
 
 ```cuda
 #include "cuda_runtime.h"
@@ -1041,7 +1041,7 @@ extern "C" int your_kernel_launch(
 
 **Update build.rs** to compile new CUDA file:
 ```rust
-// In /crates/infer-core/build.rs
+// In /crates/infer-worker/build.rs
 println!("cargo:rerun-if-changed=src/op/kernels/cuda/your_op/kernel.cu");
 
 cc::Build::new()
@@ -1052,7 +1052,7 @@ cc::Build::new()
 
 ### Adding a New Model
 
-**Template** (save as `/crates/infer-core/src/model/your_model.rs`):
+**Template** (save as `/crates/infer-worker/src/model/your_model.rs`):
 
 ```rust
 use crate::base::{DeviceType, Result};
@@ -1397,25 +1397,25 @@ This eliminates serialization overhead for multi-GB tensors.
 ### How to Contribute to Each
 
 **1. Continuous Batching**:
-- Modify `/crates/infer-engine/src/engine.rs`
+- Modify `/crates/infer-scheduler/src/engine.rs`
 - Implement request queue with priority scheduling
 - Batch multiple requests in single forward pass
 - Handle variable sequence lengths with padding/attention masking
 
 **2. Advanced Sampling**:
-- Modify `/crates/infer-core/src/op/sampler.rs`
+- Modify `/crates/infer-worker/src/op/sampler.rs`
 - Add temperature scaling, top-p, top-k algorithms
 - Implement nucleus sampling
 - Add support for multiple samples per request
 
 **3. New Model Architectures**:
-- Create new file in `/crates/infer-core/src/model/`
+- Create new file in `/crates/infer-worker/src/model/`
 - Implement required operators
 - Follow Llama3 as reference implementation
 - Add configuration parsing from HuggingFace format
 
 **4. PagedAttention**:
-- Modify KV cache management in `/crates/infer-core/src/model/llama3.rs`
+- Modify KV cache management in `/crates/infer-worker/src/model/llama3.rs`
 - Implement block-based allocation
 - Add copy-on-write for shared prefixes
 - Requires custom attention kernel

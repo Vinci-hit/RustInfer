@@ -1,0 +1,147 @@
+   0.145016505s  INFO prepare_target{force=false package_id=infer-frontend v0.1.0 (/home/vinci/RustInfer/crates/infer-frontend) target="rustinfer-frontend"}: cargo::core::compiler::fingerprint: fingerprint error for infer-frontend v0.1.0 (/home/vinci/RustInfer/crates/infer-frontend)/Check { test: false }/TargetInner { name: "rustinfer-frontend", doc: true, ..: with_path("/home/vinci/RustInfer/crates/infer-frontend/src/main.rs", Edition2024) }
+   0.145052194s  INFO prepare_target{force=false package_id=infer-frontend v0.1.0 (/home/vinci/RustInfer/crates/infer-frontend) target="rustinfer-frontend"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/vinci/RustInfer/target/debug/.fingerprint/infer-frontend-0117469711a58130/bin-rustinfer-frontend`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: cargo_util::paths::read_bytes
+   1: cargo_util::paths::read
+   2: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   3: cargo::core::compiler::fingerprint::prepare_target
+   4: cargo::core::compiler::compile
+   5: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   6: cargo::ops::cargo_compile::compile_ws
+   7: cargo::ops::cargo_compile::compile_with_exec
+   8: cargo::ops::cargo_compile::compile
+   9: cargo::commands::check::exec
+  10: <cargo::cli::Exec>::exec
+  11: cargo::main
+  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  13: std::rt::lang_start::<()>::{closure#0}
+  14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/core/src/ops/function.rs:287:21
+  15: std::panicking::catch_unwind::do_call
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:590:40
+  16: std::panicking::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:553:19
+  17: std::panic::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panic.rs:359:14
+  18: std::rt::lang_start_internal::{{closure}}
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/rt.rs:175:24
+  19: std::panicking::catch_unwind::do_call
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:590:40
+  20: std::panicking::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:553:19
+  21: std::panic::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panic.rs:359:14
+  22: std::rt::lang_start_internal
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/rt.rs:171:5
+  23: main
+  24: __libc_start_call_main
+             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+  25: __libc_start_main_impl
+             at ./csu/../csu/libc-start.c:360:3
+  26: <unknown>
+   0.199052303s  INFO prepare_target{force=false package_id=katex v0.4.6 target="katex"}: cargo::core::compiler::fingerprint: fingerprint error for katex v0.4.6/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("katex", ["lib"], "/home/vinci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/katex-0.4.6/src/lib.rs", Edition2021) }
+   0.199077790s  INFO prepare_target{force=false package_id=katex v0.4.6 target="katex"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/vinci/RustInfer/target/debug/.fingerprint/katex-b917710a66118d4c/lib-katex`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: cargo_util::paths::read_bytes
+   1: cargo_util::paths::read
+   2: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   3: cargo::core::compiler::fingerprint::prepare_target
+   4: cargo::core::compiler::compile
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/core/src/ops/function.rs:287:21
+  16: std::panicking::catch_unwind::do_call
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:590:40
+  17: std::panicking::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:553:19
+  18: std::panic::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panic.rs:359:14
+  19: std::rt::lang_start_internal::{{closure}}
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/rt.rs:175:24
+  20: std::panicking::catch_unwind::do_call
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:590:40
+  21: std::panicking::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:553:19
+  22: std::panic::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panic.rs:359:14
+  23: std::rt::lang_start_internal
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/rt.rs:171:5
+  24: main
+  25: __libc_start_call_main
+             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+  26: __libc_start_main_impl
+             at ./csu/../csu/libc-start.c:360:3
+  27: <unknown>
+   0.202072768s  INFO prepare_target{force=false package_id=infer-frontend v0.1.0 (/home/vinci/RustInfer/crates/infer-frontend) target="rustinfer-frontend"}: cargo::core::compiler::fingerprint: fingerprint error for infer-frontend v0.1.0 (/home/vinci/RustInfer/crates/infer-frontend)/Check { test: true }/TargetInner { name: "rustinfer-frontend", doc: true, ..: with_path("/home/vinci/RustInfer/crates/infer-frontend/src/main.rs", Edition2024) }
+   0.202093546s  INFO prepare_target{force=false package_id=infer-frontend v0.1.0 (/home/vinci/RustInfer/crates/infer-frontend) target="rustinfer-frontend"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/vinci/RustInfer/target/debug/.fingerprint/infer-frontend-3ac6b266bb24552b/test-bin-rustinfer-frontend`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: cargo_util::paths::read_bytes
+   1: cargo_util::paths::read
+   2: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   3: cargo::core::compiler::fingerprint::prepare_target
+   4: cargo::core::compiler::compile
+   5: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   6: cargo::ops::cargo_compile::compile_ws
+   7: cargo::ops::cargo_compile::compile_with_exec
+   8: cargo::ops::cargo_compile::compile
+   9: cargo::commands::check::exec
+  10: <cargo::cli::Exec>::exec
+  11: cargo::main
+  12: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  13: std::rt::lang_start::<()>::{closure#0}
+  14: core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/core/src/ops/function.rs:287:21
+  15: std::panicking::catch_unwind::do_call
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:590:40
+  16: std::panicking::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:553:19
+  17: std::panic::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panic.rs:359:14
+  18: std::rt::lang_start_internal::{{closure}}
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/rt.rs:175:24
+  19: std::panicking::catch_unwind::do_call
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:590:40
+  20: std::panicking::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panicking.rs:553:19
+  21: std::panic::catch_unwind
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/panic.rs:359:14
+  22: std::rt::lang_start_internal
+             at /rustc/ded5c06cf21d2b93bffd5d884aa6e96934ee4234/library/std/src/rt.rs:171:5
+  23: main
+  24: __libc_start_call_main
+             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+  25: __libc_start_main_impl
+             at ./csu/../csu/libc-start.c:360:3
+  26: <unknown>
+   0.203076992s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="infer_server"}: cargo::core::compiler::fingerprint: dependency on `infer_core` is newer than we are 1768316600.429978934s > 1768146734.964423927s "/home/vinci/RustInfer/crates/infer-server"
+   0.203131100s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="infer_server"}: cargo::core::compiler::fingerprint: fingerprint dirty for infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("infer_server", ["lib"], "/home/vinci/RustInfer/crates/infer-server/src/lib.rs", Edition2024) }
+   0.203146251s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="infer_server"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDependency { name: "infer_core", dep_mtime: FileTime { seconds: 1768316600, nanos: 429978934 }, max_mtime: FileTime { seconds: 1768146734, nanos: 964423927 } })
+   0.204435504s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="rustinfer-server"}: cargo::core::compiler::fingerprint: fingerprint dirty for infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server)/Check { test: false }/TargetInner { name: "rustinfer-server", doc: true, ..: with_path("/home/vinci/RustInfer/crates/infer-server/src/main.rs", Edition2024) }
+   0.204455222s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="rustinfer-server"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "infer_server" })
+   0.205172274s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="rustinfer-server"}: cargo::core::compiler::fingerprint: fingerprint dirty for infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server)/Check { test: true }/TargetInner { name: "rustinfer-server", doc: true, ..: with_path("/home/vinci/RustInfer/crates/infer-server/src/main.rs", Edition2024) }
+   0.205190702s  INFO prepare_target{force=false package_id=infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server) target="rustinfer-server"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "infer_server" })
+    Checking infer-server v0.1.0 (/home/vinci/RustInfer/crates/infer-server)
+    Checking katex v0.4.6
+error: could not compile `katex` (lib) due to 4 previous errors
+warning: build failed, waiting for other jobs to finish...

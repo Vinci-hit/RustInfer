@@ -1,52 +1,57 @@
 [package]
 name = "infer-server"
 version = "0.1.0"
-edition = "2024"
-
-[[bin]]
-name = "rustinfer-server"
-path = "src/main.rs"
+edition = "2021"
 
 [dependencies]
-# Core inference
-infer-core = { path = "../infer-core", features = ["cuda"] }
-infer-protocol = { path = "../infer-protocol" }  # 新增：分离式通信协议
+# 协议定义
+infer-protocol = { path = "../infer-protocol" }
 
-# Web framework
-axum = { version = "0.8.8", features = ["macros"] }
-tokio = { version = "1.49", features = ["full"] }
+# 异步运行时
+tokio = { version = "1.40", features = ["full"] }
+
+# HTTP 服务器
+axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
-# Serialization
+# 序列化
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# CLI & config
-clap = { version = "4.5", features = ["derive", "env"] }
+# ZeroMQ
+zeromq = "0.4"
 
-# Error handling
-anyhow = "1.0"
-thiserror = "2.0"
+# Tokenizer
+tokenizers = "0.20"
 
-# Logging
+# UUID
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Utils
-chrono = "0.4"
-uuid = { version = "1.19", features = ["v4", "serde"] }
+# 异步流
+async-stream = "0.3"
 futures = "0.3"
-tokio-stream = { version = "0.1", features = ["sync"] }
 
-# ZMQ (新增：进程间通信)
-zmq = "0.10"
+# 配置
+toml = "0.8"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Time handling
+chrono = "0.4"
+
+# MessagePack serialization
 rmp-serde = "1.3"
 
-# System metrics
-sysinfo = "0.32"
-nvml-wrapper = { version = "0.10", optional = true }
+# ZeroMQ (synchronous)
+zmq = "0.10"
 
-[features]
-default = ["cuda"]
-cuda = ["infer-core/cuda", "nvml-wrapper"]
+[[bin]]
+name = "infer-server"
+path = "src/main.rs"

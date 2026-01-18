@@ -24,7 +24,6 @@ pub struct ChatMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
-    pub id: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
 }

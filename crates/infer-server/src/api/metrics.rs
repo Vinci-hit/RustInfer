@@ -1,11 +1,15 @@
-use axum::Json;
+use axum::{Json, Extension};
 use serde::Serialize;
+use std::sync::Arc;
+use crate::zmq_client::ZmqClient;
 
 #[derive(Debug, Serialize)]
 pub struct SystemMetrics {
     pub cpu: CpuMetrics,
     pub memory: MemoryMetrics,
     pub gpu: Option<GpuMetrics>,
+    pub cache: Option<CacheMetrics>,
+    pub engine: Option<EngineMetrics>,
     pub timestamp: i64,
 }
 
@@ -31,7 +35,36 @@ pub struct GpuMetrics {
     pub temperature_celsius: Option<f32>,
 }
 
-pub async fn get_system_metrics() -> Json<SystemMetrics> {
+#[derive(Debug, Serialize)]
+pub struct CacheMetrics {
+    pub hit_rate: f64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictable_size: usize,
+    pub protected_size: usize,
+    pub total_cached: usize,
+    pub total_capacity: usize,
+    pub evictions: u64,
+    pub node_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EngineMetrics {
+    pub total_requests: u64,
+    pub completed_requests: u64,
+    pub failed_requests: u64,
+    pub total_tokens_generated: u64,
+    pub avg_queue_time_ms: f64,
+    pub avg_prefill_time_ms: f64,
+    pub avg_decode_time_ms: f64,
+    pub queue_size: usize,
+    pub queue_capacity: usize,
+    pub concurrent_requests: usize,
+}
+
+pub async fn get_system_metrics(
+    Extension(zmq_client): Extension<Arc<ZmqClient>>,
+) -> Json<SystemMetrics> {
     use sysinfo::System;
 
     let mut sys = System::new_all();
@@ -58,10 +91,47 @@ pub async fn get_system_metrics() -> Json<SystemMetrics> {
     #[cfg(not(feature = "cuda"))]
     let gpu = None;
 
+    // Try to get engine/cache metrics from the engine
+    let (cache, engine) = match zmq_client.get_metrics().await {
+        Ok(engine_metrics) => {
+            (
+                Some(CacheMetrics {
+                    hit_rate: engine_metrics.hit_rate,
+                    hits: engine_metrics.hits,
+                    misses: engine_metrics.misses,
+                    evictable_size: engine_metrics.evictable_size,
+                    protected_size: engine_metrics.protected_size,
+                    total_cached: engine_metrics.total_cached,
+                    total_capacity: engine_metrics.total_capacity,
+                    evictions: engine_metrics.evictions,
+                    node_count: engine_metrics.node_count,
+                }),
+                Some(EngineMetrics {
+                    total_requests: engine_metrics.total_requests,
+                    completed_requests: engine_metrics.completed_requests,
+                    failed_requests: engine_metrics.failed_requests,
+                    total_tokens_generated: engine_metrics.total_tokens_generated,
+                    avg_queue_time_ms: engine_metrics.avg_queue_time_ms,
+                    avg_prefill_time_ms: engine_metrics.avg_prefill_time_ms,
+                    avg_decode_time_ms: engine_metrics.avg_decode_time_ms,
+                    queue_size: engine_metrics.queue_size,
+                    queue_capacity: engine_metrics.queue_capacity,
+                    concurrent_requests: engine_metrics.concurrent_requests,
+                })
+            )
+        }
+        Err(e) => {
+            tracing::warn!("Failed to get engine metrics: {:?}", e);
+            (None, None)
+        }
+    };
+
     Json(SystemMetrics {
         cpu,
         memory,
         gpu,
+        cache,
+        engine,
         timestamp: chrono::Utc::now().timestamp(),
     })
 }
@@ -87,4 +157,3 @@ fn get_gpu_metrics() -> Option<GpuMetrics> {
         temperature_celsius: temp.map(|t| t as f32),
     })
 }
-

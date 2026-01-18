@@ -1,11 +1,15 @@
 use dioxus::prelude::*;
 use crate::state::conversation::Message;
+use crate::utils::markdown::render_markdown;
 
 #[component]
 pub fn MessageBubble(message: Message) -> Element {
     let is_user = message.role == "user";
     let bg_class = if is_user { "bg-blue-600" } else { "bg-gray-700" };
     let align_class = if is_user { "ml-auto" } else { "mr-auto" };
+
+    // Render markdown to HTML
+    let html_content = render_markdown(&message.content);
 
     rsx! {
         div {
@@ -20,8 +24,8 @@ pub fn MessageBubble(message: Message) -> Element {
                 }
 
                 div {
-                    class: "whitespace-pre-wrap leading-relaxed",
-                    "{message.content}"
+                    class: "markdown-content leading-relaxed",
+                    dangerous_inner_html: "{html_content}"
                 }
 
                 // Performance metrics (only for assistant)

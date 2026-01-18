@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/infer-core",
+    "crates/infer-worker",
     "crates/infer-server",
     "crates/infer-frontend",
     "crates/infer-protocol",  # 新增: 通信协议
-    "crates/infer-engine"     # 新增: 推理引擎进程
+    "crates/infer-scheduler"     # 新增: 推理引擎进程
 ]
 resolver = "3"
 

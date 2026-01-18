@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Rust Test",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--package", "infer-worker",
+                    "--features", "cuda"
+                ],
+                "filter": {
+                    "name": "infer-worker",
+                    "kind": "test" // <--- 重点：测试通常被标记为 "test"
+                }
+            },
+            "args": [
+                "test_qwen2_cpu_loading_and_generation",
+                "--ignored",
+                "--nocapture"
+            ],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
