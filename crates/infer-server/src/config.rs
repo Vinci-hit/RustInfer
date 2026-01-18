@@ -88,8 +88,8 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            model_name: "llama3-8b".to_string(),
-            tokenizer_path: PathBuf::from("./models/tokenizer.json"),
+            model_name: "llama3-1b".to_string(),
+            tokenizer_path: PathBuf::from("/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct/tokenizer.json"),
         }
     }
 }
@@ -128,10 +128,10 @@ impl ServerConfig {
             },
             model: ModelConfig {
                 model_name: std::env::var("MODEL_NAME")
-                    .unwrap_or_else(|_| "llama3-8b".to_string()),
+                    .unwrap_or_else(|_| "llama3-1b".to_string()),
                 tokenizer_path: PathBuf::from(
                     std::env::var("TOKENIZER_PATH")
-                        .unwrap_or_else(|_| "./models/tokenizer.json".to_string())
+                        .unwrap_or_else(|_| "/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct/tokenizer.json".to_string())
                 ),
             },
             log: LogConfig {
