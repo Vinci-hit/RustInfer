@@ -36,15 +36,23 @@
 //!         0,                                    // rank
 //!         1,                                    // world_size
 //!         "ipc:///tmp/rustinfer-scheduler.ipc", // scheduler_url
-//!         "/path/to/model",                     // model_path
 //!     ).await?;
 //!
 //!     server.run_loop().await?;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Architecture Flow
+//!
+//! 1. Worker starts with just rank/device info
+//! 2. Worker connects to Scheduler
+//! 3. Worker sends Register message
+//! 4. Scheduler sends LoadModel command (with model path)
+//! 5. Worker loads model from specified path
+//! 6. Scheduler sends InitKVCache command
+//! 7. Worker is ready for inference
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -104,9 +112,6 @@ pub struct WorkerServer {
     /// Total world size
     world_size: usize,
 
-    /// Model path (stored for reload capability)
-    model_path: PathBuf,
-
     /// Whether server is running
     running: bool,
 }
@@ -118,26 +123,26 @@ impl WorkerServer {
     /// * `rank` - Worker rank (0-indexed), maps to GPU device
     /// * `world_size` - Total number of workers
     /// * `scheduler_url` - ZeroMQ endpoint for Scheduler (e.g., "ipc:///tmp/scheduler.ipc")
-    /// * `model_path` - Path to model directory
     ///
     /// # Returns
     /// A new WorkerServer ready to run
+    ///
+    /// # Note
+    /// The model path is NOT provided here. The Scheduler will send
+    /// a LoadModel command with the model path to load.
     pub async fn new(
         rank: usize,
         world_size: usize,
         scheduler_url: &str,
-        model_path: impl Into<PathBuf>,
     ) -> Result<Self> {
-        let model_path = model_path.into();
-
         // Create Worker with appropriate device type
         #[cfg(feature = "cuda")]
-        let worker_config = WorkerConfig::cuda(rank as u32, &model_path)
+        let worker_config = WorkerConfig::cuda(rank as u32)
             .with_id(format!("worker-{}", rank))
             .with_tp(rank as u32, world_size as u32);
 
         #[cfg(not(feature = "cuda"))]
-        let worker_config = WorkerConfig::cpu(&model_path)
+        let worker_config = WorkerConfig::cpu()
             .with_id(format!("worker-{}", rank))
             .with_tp(rank as u32, world_size as u32);
 
@@ -156,7 +161,6 @@ impl WorkerServer {
             socket,
             rank,
             world_size,
-            model_path,
             running: false,
         })
     }
@@ -191,17 +195,20 @@ impl WorkerServer {
                 }
             };
 
-            // 2. Extract payload (last frame for Dealer socket)
-            let payload = match msg.into_vec().pop() {
-                Some(p) => p,
-                None => {
-                    eprintln!("[Worker-{}] Empty message received", self.rank);
-                    continue;
-                }
-            };
+            // 2. Extract frames from DealerSocket message
+            // DealerSocket 格式：[empty_delimiter_frame, payload_frame]
+            let frames = msg.into_vec();
+            if frames.len() < 2 {
+                eprintln!("[Worker-{}] Invalid message format: expected 2 frames, got {}", self.rank, frames.len());
+                continue;
+            }
+
+            // frames[0] 是空的分隔符帧（来自 Scheduler）
+            // frames[1] 是实际的命令载荷
+            let payload = &frames[1];
 
             // 3. Deserialize command
-            let command: WorkerCommand = match bincode::deserialize(&payload) {
+            let command: WorkerCommand = match bincode::deserialize(payload) {
                 Ok(cmd) => cmd,
                 Err(e) => {
                     eprintln!("[Worker-{}] Deserialize error: {}", self.rank, e);
@@ -217,8 +224,11 @@ impl WorkerServer {
             // 4. Handle command (synchronous - GPU is exclusive resource)
             let response = self.handle_command(command).await;
 
-            // 5. Send response back
-            self.send_response(response).await?;
+            // 5. Send response back (with error handling - don't exit on send failure)
+            if let Err(e) = self.send_response(response).await {
+                eprintln!("[Worker-{}] Failed to send response: {}", self.rank, e);
+                // Continue running even if send fails
+            }
         }
 
         println!("[Worker-{}] Main loop exited", self.rank);
@@ -267,7 +277,12 @@ impl WorkerServer {
         // 发送注册请求
         let register_cmd = WorkerCommand::Register(registration.clone());
         let payload = bincode::serialize(&register_cmd)?;
-        self.socket.send(payload.into()).await?;
+
+        // DealerSocket 发送格式：[empty_frame, payload]
+        // RouterSocket 接收格式：[address, empty_frame, payload]
+        let mut msg = ZmqMessage::try_from(Vec::<u8>::new())?; // empty delimiter frame
+        msg.push_back(payload.into());
+        self.socket.send(msg).await?;
         println!(
             "[Worker-{}] Sent registration: worker_id={}, rank={}, device={}:{}",
             self.rank,
@@ -415,12 +430,17 @@ impl WorkerServer {
         let _ = self.worker.refresh_memory_stats();
         let memory_stats = self.worker.memory_stats();
 
+        // Get model parameters count
+        let num_parameters = self.worker.model()
+            .map(|m| m.config().estimate_num_parameters())
+            .unwrap_or(0);
+
         WorkerResponse::ModelLoaded(ModelLoadedInfo {
             worker_id: self.worker.worker_id().to_string(),
             device_id: params.device_id,
             model_name: "llama3".to_string(), // TODO: Get from model config
-            num_parameters: 0, // TODO: Calculate from model
-            memory_used: memory_stats.model_memory,
+            num_parameters,
+            memory_used: memory_stats.used, // Total used memory after model loading
             tp_rank: params.tp_rank,
             tp_world_size: params.tp_world_size,
             load_time_ms,
@@ -683,7 +703,18 @@ impl WorkerServer {
     /// Send response back to Scheduler
     async fn send_response(&mut self, response: WorkerResponse) -> Result<()> {
         let payload = bincode::serialize(&response)?;
-        self.socket.send(payload.into()).await?;
+
+        // Safety check: ensure payload is not empty
+        if payload.is_empty() {
+            eprintln!("[Worker-{}] WARNING: Attempting to send empty payload!", self.rank);
+            return Err(anyhow::anyhow!("Cannot send empty response payload"));
+        }
+
+        // DealerSocket 发送格式：[empty_frame, payload]
+        // RouterSocket 接收格式：[address, empty_frame, payload]
+        let mut msg = ZmqMessage::try_from(Vec::<u8>::new())?; // empty delimiter frame
+        msg.push_back(payload.into());
+        self.socket.send(msg).await?;
         Ok(())
     }
 

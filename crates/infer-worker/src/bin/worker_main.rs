@@ -10,16 +10,24 @@
 //! cargo run --bin infer-worker --features server -- \
 //!     --rank 0 \
 //!     --world-size 1 \
-//!     --scheduler-url "ipc:///tmp/rustinfer-scheduler.ipc" \
-//!     --model-path "/path/to/model"
+//!     --scheduler-url "ipc:///tmp/rustinfer-scheduler.ipc"
 //!
 //! # Start worker for tensor parallelism (GPU 1 of 2)
 //! cargo run --bin infer-worker --features server -- \
 //!     --rank 1 \
 //!     --world-size 2 \
-//!     --scheduler-url "tcp://localhost:5555" \
-//!     --model-path "/path/to/model"
+//!     --scheduler-url "tcp://localhost:5555"
 //! ```
+//!
+//! # Architecture
+//!
+//! 1. Worker starts with rank/device info
+//! 2. Worker connects to Scheduler
+//! 3. Worker sends Register message
+//! 4. Scheduler sends LoadModel command (with model path)
+//! 5. Worker loads model from specified path
+//! 6. Scheduler sends InitKVCache command
+//! 7. Worker is ready for inference
 
 use clap::Parser;
 use infer_worker::worker::WorkerServer;
@@ -49,12 +57,6 @@ struct Args {
     #[arg(long, default_value = "ipc:///tmp/rustinfer-scheduler.ipc")]
     scheduler_url: String,
 
-    /// Path to model directory
-    ///
-    /// Should contain config.json and model weights (safetensors)
-    #[arg(long)]
-    model_path: String,
-
     /// Enable verbose logging
     #[arg(long, short, default_value_t = false)]
     verbose: bool,
@@ -70,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     println!("╠════════════════════════════════════════════════════════════╣");
     println!("║  Rank:        {:>4} / {:<4}                                 ║", args.rank, args.world_size);
     println!("║  Scheduler:   {:<43} ║", truncate_str(&args.scheduler_url, 43));
-    println!("║  Model:       {:<43} ║", truncate_str(&args.model_path, 43));
+    println!("║  Model:       <Waiting for Scheduler>                        ║");
     println!("╚════════════════════════════════════════════════════════════╝");
 
     // Validate arguments
@@ -89,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
         args.rank,
         args.world_size,
         &args.scheduler_url,
-        &args.model_path,
     )
     .await?;
 

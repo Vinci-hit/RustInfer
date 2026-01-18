@@ -107,7 +107,7 @@ impl RuntimeModelConfig {
                 file_config.num_attention_heads, file_config.num_key_value_heads
             )).into());
         }
-        
+
         let dim = file_config.hidden_size;
         let intermediate_size = file_config.intermediate_size;
         let layer_num = file_config.num_hidden_layers;
@@ -115,7 +115,7 @@ impl RuntimeModelConfig {
         let kv_head_num = file_config.num_key_value_heads;
         let seq_len = MAX_SEQ_LEN;
         println!("模型最大序列长度 (max_position_embeddings) 设置为默认值 {}, 忽略 config.json 中的值 {}, 在model/config.rs中修改",MAX_SEQ_LEN, file_config.max_position_embeddings);
-        
+
         let head_size = dim / head_num;
         let kv_dim = (dim * kv_head_num) / head_num;
         let kv_mul = head_num / kv_head_num;
@@ -141,5 +141,46 @@ impl RuntimeModelConfig {
             torch_dtype: file_config.torch_dtype.clone(),
             immediate_dim,
         })
+    }
+
+    /// 计算模型参数总数
+    ///
+    /// 基于模型配置估算参数数量，包括：
+    /// - Token embedding
+    /// - Transformer layers (attention + FFN + layernorm)
+    /// - Output projection (如果不共享权重)
+    pub fn estimate_num_parameters(&self) -> u64 {
+        let mut params: u64 = 0;
+
+        // 1. Token embedding: vocab_size × dim
+        params += (self.vocab_size * self.dim) as u64;
+
+        // 2. Each transformer layer
+        let per_layer_params =
+            // Attention projections
+            (self.dim * self.dim) +           // Q projection
+            (self.dim * self.kv_dim) +        // K projection
+            (self.dim * self.kv_dim) +        // V projection
+            (self.dim * self.dim) +           // O projection
+            // FFN projections
+            (self.dim * self.intermediate_size) +  // Gate projection
+            (self.dim * self.intermediate_size) +  // Up projection
+            (self.intermediate_size * self.dim) +  // Down projection
+            // LayerNorms (RMSNorm has only scale parameters, no bias)
+            self.dim +                        // Input layernorm
+            self.dim;                         // Post-attention layernorm
+
+        params += (per_layer_params * self.layer_num) as u64;
+
+        // 3. Final layernorm
+        params += self.dim as u64;
+
+        // 4. Output projection (LM head): dim × vocab_size
+        // If weights are shared with embedding, don't count again
+        if !self.is_shared_weight {
+            params += (self.dim * self.vocab_size) as u64;
+        }
+
+        params
     }
 }

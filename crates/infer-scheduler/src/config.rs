@@ -70,6 +70,16 @@ pub struct SchedulerConfig {
 /// 网络配置
 #[derive(Debug, Clone, Serialize, Deserialize, Parser)]
 pub struct NetworkConfig {
+    /// ZeroMQ endpoint for Server/Frontend communication
+    ///
+    /// Server connects via DEALER, Scheduler binds via ROUTER.
+    ///
+    /// Examples:
+    /// - IPC: "ipc:///tmp/rustinfer.ipc"
+    /// - TCP: "tcp://*:5556"
+    #[arg(long, default_value = "ipc:///tmp/rustinfer.ipc")]
+    pub frontend_endpoint: String,
+
     /// ZeroMQ endpoint for Worker communication
     ///
     /// Examples:
@@ -124,7 +134,7 @@ pub struct MemoryConfig {
 
     /// Total number of GPU blocks
     ///
-    /// 如果设置为 0，将根据 gpu_memory_utilization 自动计算
+    /// 由Scheduler确定KVCache的参数，为了防止不同显卡之间的木桶效应。
     #[arg(long, default_value_t = 0)]
     pub total_blocks: usize,
 
@@ -425,6 +435,7 @@ impl SchedulerConfig {
     pub fn print_summary(&self) {
         println!("📋 Scheduler Configuration:");
         println!("  Network:");
+        println!("    Frontend endpoint: {}", self.network.frontend_endpoint);
         println!("    Worker endpoint: {}", self.network.worker_endpoint);
         println!("    Num workers: {}", self.network.num_workers);
         println!("  Model:");
@@ -432,7 +443,12 @@ impl SchedulerConfig {
         println!("    Dtype: {}", self.model.dtype);
         println!("  Memory:");
         println!("    Block size: {}", self.memory.block_size);
-        println!("    Total blocks: {}", self.memory.total_blocks);
+        // 对 total_blocks=0 做特殊显示，因为它会在 profile 后自动计算
+        if self.memory.total_blocks == 0 {
+            println!("    Total blocks: auto (will be determined after profiling)");
+        } else {
+            println!("    Total blocks: {}", self.memory.total_blocks);
+        }
         println!("    Prefix cache: {}", self.memory.enable_prefix_cache);
         println!("  Scheduling:");
         println!("    Policy: {}", self.scheduling.policy);
@@ -474,6 +490,7 @@ impl Default for SchedulerConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
+            frontend_endpoint: "ipc:///tmp/rustinfer.ipc".to_string(),
             worker_endpoint: "ipc:///tmp/rustinfer-scheduler.ipc".to_string(),
             worker_timeout_ms: 30000,
             num_workers: 1,

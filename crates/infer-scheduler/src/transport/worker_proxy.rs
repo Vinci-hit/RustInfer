@@ -34,6 +34,7 @@ use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
 use std::collections::HashMap;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn, error};
+use std::path::Path;
 
 /// Worker 连接状态
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,17 @@ impl WorkerProxy {
     /// * `endpoint` - ZeroMQ endpoint (e.g., "ipc:///tmp/scheduler.ipc" 或 "tcp://*:5555")
     /// * `timeout_ms` - RPC 超时时间
     pub async fn new(endpoint: String, timeout_ms: u64) -> Result<Self> {
+        // IPC 地址需要清理旧文件，否则 bind 会失败
+        if endpoint.starts_with("ipc://") {
+            let ipc_path = endpoint.strip_prefix("ipc://")
+                .ok_or_else(|| anyhow::anyhow!("Invalid IPC endpoint"))?;
+            if Path::new(ipc_path).exists() {
+                info!("Cleaning up existing IPC file: {}", ipc_path);
+                std::fs::remove_file(ipc_path)
+                    .context("Failed to remove existing IPC file")?;
+            }
+        }
+
         let mut socket = zeromq::RouterSocket::new();
 
         info!("WorkerProxy binding to {}", endpoint);
@@ -204,7 +216,11 @@ impl WorkerProxy {
                 if let Some(w) = self.workers.get_mut(worker_id) {
                     w.state = WorkerConnectionState::ModelLoaded;
                 }
-                info!("Model loaded on Worker {}: {} MB", worker_id, info.memory_used / 1024 / 1024);
+                info!(
+                    "Model loaded on Worker {}: {:.2} GB",
+                    worker_id,
+                    info.memory_used as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
                 Ok(info)
             }
             WorkerResponse::Error(err) => {
@@ -232,10 +248,10 @@ impl WorkerProxy {
 
         match response {
             WorkerResponse::ProfileCompleted(result) => {
-                info!(
-                    "Profile completed on Worker {}: {} MB available for KV Cache",
+                debug!(
+                    "Profile completed on Worker {}: {:.2} GB available for KV Cache",
                     worker_id,
-                    result.available_kv_cache_memory / 1024 / 1024
+                    result.available_kv_cache_memory as f64 / (1024.0 * 1024.0 * 1024.0)
                 );
                 Ok(result)
             }
@@ -348,20 +364,23 @@ impl WorkerProxy {
 
         // 发送到 Worker (RouterSocket格式：[address, empty_frame, payload])
         // 构建多帧消息
-        let mut msg = ZmqMessage::try_from(worker_address.to_vec())?;
-        msg.push_back(vec![].into()); // empty delimiter frame
-        msg.push_back(payload.into());
+        let mut send_msg = ZmqMessage::try_from(worker_address.to_vec())?;
+        send_msg.push_back(vec![].into()); // empty delimiter frame
+        send_msg.push_back(payload.into());
 
-        self.socket.send(msg).await
+        self.socket.send(send_msg).await
             .context("Failed to send command")?;
 
         // 等待响应（带超时）
         let timeout_duration = Duration::from_millis(self.timeout_ms);
         let recv_future = self.socket.recv();
 
-        let msg = timeout(timeout_duration, recv_future)
-            .await
-            .context("Worker response timeout")?
+        let msg = timeout(timeout_duration, recv_future).await
+            .map_err(|_| {
+                // Timeout - log warning but don't crash
+                warn!("Worker response timeout after {}ms", self.timeout_ms);
+                anyhow::anyhow!("Worker response timeout")
+            })?
             .context("Failed to receive response")?;
 
         // 解析响应
@@ -387,11 +406,11 @@ impl WorkerProxy {
             .context("Failed to serialize response")?;
 
         // RouterSocket 发送格式：[address, empty_frame, payload]
-        let mut msg = ZmqMessage::try_from(worker_address.to_vec())?;
-        msg.push_back(vec![].into()); // empty delimiter frame
-        msg.push_back(payload.into());
+        let mut send_msg = ZmqMessage::try_from(worker_address.to_vec())?;
+        send_msg.push_back(vec![].into()); // empty delimiter frame
+        send_msg.push_back(payload.into());
 
-        self.socket.send(msg).await
+        self.socket.send(send_msg).await
             .context("Failed to send response")?;
 
         Ok(())

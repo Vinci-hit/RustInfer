@@ -2,13 +2,12 @@
 //!
 //! Configuration structures for initializing and managing Worker instances.
 
-use std::path::PathBuf;
-
 use crate::base::DeviceType;
 
 /// Worker configuration
 ///
 /// Contains all the settings needed to initialize a Worker instance.
+/// Note: model_path is NOT stored here - it comes from Scheduler via ModelLoadParams.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     /// Worker unique identifier
@@ -17,8 +16,6 @@ pub struct WorkerConfig {
     pub device_id: u32,
     /// Device type (CPU or CUDA)
     pub device_type: DeviceType,
-    /// Model path
-    pub model_path: PathBuf,
     /// Data type for inference ("bf16", "fp16", "fp32")
     pub dtype: String,
     /// Whether to use quantized model
@@ -39,12 +36,14 @@ pub struct WorkerConfig {
 
 impl WorkerConfig {
     /// Create a new WorkerConfig for a CUDA device
-    pub fn cuda(device_id: u32, model_path: impl Into<PathBuf>) -> Self {
+    ///
+    /// Note: model_path is NOT required here. The Scheduler will send LoadModel
+    /// command with the model path to load.
+    pub fn cuda(device_id: u32) -> Self {
         Self {
             worker_id: format!("worker-cuda-{}", device_id),
             device_id,
             device_type: DeviceType::Cuda(device_id as i32),
-            model_path: model_path.into(),
             dtype: "bf16".to_string(),
             is_quant_model: false,
             max_seq_len: 4096,
@@ -57,12 +56,14 @@ impl WorkerConfig {
     }
 
     /// Create a new WorkerConfig for CPU
-    pub fn cpu(model_path: impl Into<PathBuf>) -> Self {
+    ///
+    /// Note: model_path is NOT required here. The Scheduler will send LoadModel
+    /// command with the model path to load.
+    pub fn cpu() -> Self {
         Self {
             worker_id: "worker-cpu-0".to_string(),
             device_id: 0,
             device_type: DeviceType::Cpu,
-            model_path: model_path.into(),
             dtype: "fp32".to_string(),
             is_quant_model: false,
             max_seq_len: 2048,
@@ -75,6 +76,8 @@ impl WorkerConfig {
     }
 
     /// Create WorkerConfig from protocol ModelLoadParams
+    ///
+    /// This is the correct way to create config after receiving LoadModel command.
     #[cfg(feature = "protocol")]
     pub fn from_protocol_params(params: &infer_protocol::ModelLoadParams) -> Self {
         let device_type = if params.dtype.contains("cuda") || params.device_id > 0 {
@@ -87,7 +90,6 @@ impl WorkerConfig {
             worker_id: format!("worker-{}", params.device_id),
             device_id: params.device_id,
             device_type,
-            model_path: PathBuf::from(&params.model_path),
             dtype: params.dtype.clone(),
             is_quant_model: params.dtype.contains("int"),
             max_seq_len: 4096, // Default, will be overridden by model config

@@ -32,7 +32,9 @@ use crate::memory::{MemoryManager, MemoryConfig};
 use crate::policy::{ScheduleContext, SchedulingPolicy};
 use crate::state::GlobalState;
 use crate::transport::{FrontendReceiver, WorkerProxy};
-use infer_protocol::{StepOutput, FinishOutput};
+use infer_protocol::{StepOutput, FinishOutput, SchedulerOutput};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -95,6 +97,10 @@ pub struct Coordinator {
 
     /// 默认 Worker ID (支持单Worker模式)
     default_worker_id: Option<String>,
+
+    /// 输出路由表 (request_id -> output_channel)
+    /// 用于将输出发送回 Server
+    output_router: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<SchedulerOutput>>>>,
 }
 
 impl Coordinator {
@@ -104,6 +110,7 @@ impl Coordinator {
         worker: WorkerProxy,
         frontend: FrontendReceiver,
         config: CoordinatorConfig,
+        output_router: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<SchedulerOutput>>>>,
     ) -> Self {
         // 创建 MemoryManager 配置
         let memory_config = MemoryConfig {
@@ -125,6 +132,7 @@ impl Coordinator {
             frontend,
             config,
             default_worker_id: None, // 将在首次注册时设置
+            output_router,
         }
     }
 
@@ -248,8 +256,11 @@ impl Coordinator {
             let (output_tx, _output_rx) = mpsc::unbounded_channel::<StepOutput>();
             let (finish_tx, _finish_rx) = mpsc::unbounded_channel::<FinishOutput>();
 
-            // TODO: 将 output_rx 和 finish_rx 发送回 HTTP Server
-            // 这里需要一个 Response channel mapping: request_id -> (output_rx, finish_rx)
+            // 将输出 channel 包装为 SchedulerOutput channel并注册到 output_router
+            // 这样 Coordinator 可以通过 output_router 发送输出
+            // 注意：这里我们暂时不使用 output_tx 和 finish_tx，
+            // 而是依赖 Sequence 内部的发送机制
+            // TODO: 重构 Sequence 使用 SchedulerOutput 统一输出
 
             self.state.add_request(
                 req,
@@ -298,9 +309,13 @@ impl Coordinator {
                 }
             } else {
                 // 理论上 Schedule 阶段已经检查过显存足够
-                // 如果这里 panic 说明 Policy 的计算逻辑有 Bug
+                // 如果这里发生说明 Policy 的计算逻辑有 Bug
                 error!("Scheduler Logic Bug: OOM during decode allocation for {}", request_id);
-                panic!("Scheduler Logic Bug: OOM during decode allocation!");
+                // Gracefully reject the request instead of panicking
+                self.reject_request(
+                    request_id,
+                    anyhow::anyhow!("OOM during decode allocation - scheduler logic bug")
+                );
             }
         }
     }
@@ -344,9 +359,9 @@ impl Coordinator {
                 // 2. 检查是否结束
                 let (finished, reason) = seq.check_finished();
 
-                // 3. 发送流式输出
+                // 3. 发送流式输出 (通过 output_router)
                 if !finished {
-                    seq.send_token_stream(new_token);
+                    self.send_step_output(request_id, new_token as u32);
                 }
 
                 (finished, reason)
@@ -359,10 +374,8 @@ impl Coordinator {
                 // A. 更新 RadixTree（缓存这条完整的路径供未来复用）
                 self.state.free_sequence_memory(request_id, &mut self.memory);
 
-                // B. 通知前端结束
-                if let Some(seq) = self.state.get_sequence(request_id) {
-                    seq.send_finish_stream(finish_reason);
-                }
+                // B. 通知前端结束 (通过 output_router)
+                self.send_finish_output(request_id, finish_reason);
 
                 // C. 从队列移除
                 self.state.remove_request(request_id);
@@ -371,6 +384,49 @@ impl Coordinator {
                 // 状态保持在 Running，等待下一轮 Schedule
                 debug!("Request continuing: {} (token: {})", request_id, new_token);
             }
+        }
+    }
+
+    /// 通过 output_router 发送 StepOutput
+    fn send_step_output(&self, request_id: &str, token_id: u32) {
+        let router = self.output_router.read().unwrap();
+        if let Some(tx) = router.get(request_id) {
+            let step_output = StepOutput {
+                request_id: request_id.to_string(),
+                new_token_id: token_id,
+                logprob: None,
+            };
+
+            let output = SchedulerOutput::Step(step_output);
+
+            if let Err(e) = tx.send(output) {
+                warn!("Failed to send step output for {}: {:?}", request_id, e);
+            } else {
+                debug!("Sent step output for {}: token {}", request_id, token_id);
+            }
+        } else {
+            warn!("No output channel found for request: {}", request_id);
+        }
+    }
+
+    /// 通过 output_router 发送 FinishOutput
+    fn send_finish_output(&self, request_id: &str, finish_reason: infer_protocol::FinishReason) {
+        let router = self.output_router.read().unwrap();
+        if let Some(tx) = router.get(request_id) {
+            let finish_output = FinishOutput {
+                request_id: request_id.to_string(),
+                reason: finish_reason.clone(),
+            };
+
+            let output = SchedulerOutput::Finish(finish_output);
+
+            if let Err(e) = tx.send(output) {
+                warn!("Failed to send finish output for {}: {:?}", request_id, e);
+            } else {
+                debug!("Sent finish output for {}: {:?}", request_id, finish_reason);
+            }
+        } else {
+            warn!("No output channel found for request: {}", request_id);
         }
     }
 
@@ -392,6 +448,24 @@ impl Coordinator {
     /// 获取 Worker Proxy
     pub fn worker_proxy(&mut self) -> &mut WorkerProxy {
         &mut self.worker
+    }
+
+    /// 拒绝请求（错误处理）
+    ///
+    /// 在发生错误时，通知前端并清理资源
+    fn reject_request(&mut self, request_id: &str, error: anyhow::Error) {
+        error!("Rejecting request {}: {}", request_id, error);
+
+        // 1. 通知前端结束（发送错误）
+        if let Some(seq) = self.state.get_sequence(request_id) {
+            seq.send_finish_stream(infer_protocol::FinishReason::Abort);
+        }
+
+        // 2. 释放显存
+        self.state.free_sequence_memory(request_id, &mut self.memory);
+
+        // 3. 从队列移除
+        self.state.remove_request(request_id);
     }
 }
 
@@ -430,8 +504,9 @@ mod tests {
         let worker = WorkerProxy::new(endpoint, 5000).await.unwrap();
         let (_tx, frontend) = create_frontend_channel();
         let config = CoordinatorConfig::default();
+        let output_router = Arc::new(RwLock::new(HashMap::new()));
 
-        let coordinator = Coordinator::new(policy, worker, frontend, config);
+        let coordinator = Coordinator::new(policy, worker, frontend, config, output_router);
 
         let (waiting, running, swapped) = coordinator.queue_stats();
         assert_eq!(waiting, 0);
@@ -446,8 +521,9 @@ mod tests {
         let worker = WorkerProxy::new(endpoint, 5000).await.unwrap();
         let (tx, frontend) = create_frontend_channel();
         let config = CoordinatorConfig::default();
+        let output_router = Arc::new(RwLock::new(HashMap::new()));
 
-        let mut coordinator = Coordinator::new(policy, worker, frontend, config);
+        let mut coordinator = Coordinator::new(policy, worker, frontend, config, output_router);
 
         // 发送请求
         let req = create_test_request("req1", vec![1, 2, 3, 4, 5]);

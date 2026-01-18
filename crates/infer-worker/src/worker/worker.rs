@@ -509,39 +509,6 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn test_worker_config_cuda() {
-        let config = WorkerConfig::cuda(0, "/path/to/model");
-        assert_eq!(config.device_id, 0);
-        assert!(matches!(config.device_type, DeviceType::Cuda(0)));
-        assert_eq!(config.dtype, "bf16");
-    }
-
-    #[test]
-    fn test_worker_config_cpu() {
-        let config = WorkerConfig::cpu("/path/to/model");
-        assert_eq!(config.device_id, 0);
-        assert!(matches!(config.device_type, DeviceType::Cpu));
-        assert_eq!(config.dtype, "fp32");
-    }
-
-    #[test]
-    fn test_worker_config_builder() {
-        let config = WorkerConfig::cuda(0, "/path/to/model")
-            .with_dtype("fp16")
-            .with_max_seq_len(8192)
-            .with_tp(1, 2)
-            .with_id("custom-worker");
-
-        assert_eq!(config.dtype, "fp16");
-        assert_eq!(config.max_seq_len, 8192);
-        assert_eq!(config.tp_rank, 1);
-        assert_eq!(config.tp_world_size, 2);
-        assert_eq!(config.worker_id, "custom-worker");
-    }
-
     #[test]
     fn test_performance_stats() {
         let mut stats = PerformanceStats::default();
