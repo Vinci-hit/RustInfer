@@ -1,3 +1,5 @@
+> 🚧 **radix_tree 分支重构中**: 正在实现 RadixTree + 分布式架构的新技术路线，详见 `radix_tree` 分支。
+
 # RustInfer: Rust实现的高性能LLM推理引擎
 
 RustInfer是一个用Rust语言实现的高性能大语言模型(LLM)推理引擎，专注于提供高效、稳定、易于扩展的模型推理能力。
