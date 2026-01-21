@@ -18,7 +18,7 @@ pub mod registry;
 pub use factory::{ModelFactory, ModelType};
 pub use registry::{ModelRegistry, ModelId};
 pub use layers::{DecoderLayers, WeightMapping};
-pub use kvcache::{KvCache, KVCachePool, KVCacheConfig};
+pub use kvcache::{KVCachePool, KVCacheConfig};
 
 // Internal imports for ModelLoader
 use tokenizer::{GenericHfTokenizer, Tokenizer};
@@ -390,6 +390,8 @@ pub enum BufferType {
     ValueCache,
 
     IntermediateBuffer1,
+    BlockTable,
+    CurrentKVLen,
 }
 
 pub type Workspace = HashMap<BufferType, Tensor>;

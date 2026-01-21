@@ -64,6 +64,25 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+    // PagedAttention kernels
+    pub fn flash_attn_gqa_paged_bf16_cu(
+        q_ptr: *const half::bf16,
+        k_ptr: *const half::bf16,
+        v_ptr: *const half::bf16,
+        o_ptr: *mut half::bf16,
+        block_table: *const i32,
+        q_seq_len: i32,
+        kv_seq_len: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        num_total_blocks: i32,
+        max_num_blocks_per_seq: i32,
+        block_table_batch_stride: i32,
+        kv_block_stride: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Flash Attention GQA 的 CUDA 内核包装函数 (Prefill/Decode 模式)。
@@ -202,5 +221,110 @@ pub unsafe fn flash_attn_gqa(
         }
     }
     
+    Ok(())
+}
+
+/// Flash Attention GQA with PagedAttention support
+///
+/// This function supports non-contiguous KV cache blocks through the block table.
+///
+/// # Arguments
+/// * `input_q`: Query tensor, [Q_SeqLen, Q_HiddenDim]
+/// * `input_k_cache`: KV Cache base tensor, [num_blocks, block_size, KV_HiddenDim]
+/// * `input_v_cache`: V Cache base tensor, [num_blocks, block_size, KV_HiddenDim]
+/// * `output_o`: Output tensor, [Q_SeqLen, Q_HiddenDim]
+/// * `block_table_gpu`: Device pointer to block indices for this sequence
+/// * `q_seq_len`: Query sequence length
+/// * `current_kv_len`: KV sequence length (history length)
+/// * `num_q_heads`, `num_kv_heads`, `head_dim`: Attention structure parameters
+/// * `block_size`: Number of tokens per block
+/// * `num_total_blocks`: Total number of blocks in the cache
+/// * `cuda_config`: Optional CUDA stream configuration
+///
+/// # Safety
+/// This function is unsafe because it accepts raw pointers to device memory.
+/// The caller must ensure all pointers are valid and remain valid for the duration of the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_gqa_paged(
+    input_q: &Tensor,
+    input_k_cache: &Tensor,
+    input_v_cache: &Tensor,
+    output_o: &mut Tensor,
+    block_table_gpu: *const i32,
+    q_seq_len: usize,
+    current_kv_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    num_total_blocks: usize,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    // --- 1. 数据类型校验 ---
+    let dtype = input_q.dtype();
+
+    if input_q.dtype() != input_k_cache.dtype() || input_q.dtype() != input_v_cache.dtype() || input_q.dtype() != output_o.dtype() {
+        return Err(Error::InvalidArgument(format!(
+            "All tensors must have the same data type for flash_attn_gqa_paged. Q: {:?}, K: {:?}, V: {:?}, O: {:?}",
+            input_q.dtype(), input_k_cache.dtype(), input_v_cache.dtype(), output_o.dtype()
+        )).into());
+    }
+
+    // --- 2. 维度检查和转换 ---
+    let q_seq_len_i32 = q_seq_len as i32;
+    let kv_seq_len_i32 = current_kv_len as i32;
+    let num_q_heads_i32 = num_q_heads as i32;
+    let num_kv_heads_i32 = num_kv_heads as i32;
+    let head_dim_i32 = head_dim as i32;
+    let block_size_i32 = block_size as i32;
+    let num_total_blocks_i32 = num_total_blocks as i32;
+
+    if head_dim_i32 % 4 != 0 {
+        return Err(Error::InvalidArgument("FlashAttention requires head dimension to be a multiple of 4.".into()).into());
+    }
+
+    // --- 3. 获取 CUDA stream ---
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+
+    // --- 4. 根据数据类型分发 ---
+    match dtype {
+        crate::base::DataType::BF16 => {
+            let q_ptr = input_q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let k_ptr = input_k_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let v_ptr = input_v_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let o_ptr = output_o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+
+            // PagedAttention需要额外的block_table参数
+            // 这里使用默认值，实际调用时需要由调用者提供
+            let max_num_blocks_per_seq = (current_kv_len + block_size - 1) / block_size + 1;
+            let block_table_batch_stride = max_num_blocks_per_seq;
+            let kv_block_stride = block_size;
+
+            unsafe {
+                flash_attn_gqa_paged_bf16_cu(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    o_ptr,
+                    block_table_gpu,
+                    q_seq_len_i32,
+                    kv_seq_len_i32,
+                    num_q_heads_i32,
+                    num_kv_heads_i32,
+                    head_dim_i32,
+                    block_size_i32,
+                    num_total_blocks_i32,
+                    max_num_blocks_per_seq as i32,
+                    block_table_batch_stride as i32,
+                    kv_block_stride as i32,
+                    stream,
+                );
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!("Unsupported dtype {:?} for flash_attn_gqa_paged, only BF16 is supported", dtype)).into());
+        }
+    }
+
     Ok(())
 }

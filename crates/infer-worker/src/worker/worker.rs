@@ -4,8 +4,9 @@
 //! - Device resources (GPU/CPU)
 //! - Model instance (any implementation of the Model trait)
 //! - KV Cache memory pool
-//! - Sampler for token generation
 //! - CUDA configuration (streams, handles, etc.)
+//!
+//! Note: Sampler is managed internally by the Model, not by the Worker.
 //!
 //! # Architecture
 //!
@@ -19,14 +20,15 @@
 //! │  │ - device_id  │  │              │  │ - data       │                   │
 //! │  │ - memory     │  │ - layers     │  │ - config     │                   │
 //! │  └──────────────┘  │ - workspace  │  └──────────────┘                   │
+//! │                    │ - sampler    │                                      │
 //! │                    └──────────────┘                                      │
 //! │                                                                          │
-//! │  ┌──────────────┐  ┌──────────────┐                                     │
-//! │  │   Sampler    │  │  CudaConfig  │                                     │
-//! │  │              │  │              │                                     │
-//! │  │ - argmax     │  │ - stream     │                                     │
-//! │  │ - top_p      │  │ - handles    │                                     │
-//! │  └──────────────┘  └──────────────┘                                     │
+//! │  ┌──────────────┐                                                        │
+//! │  │  CudaConfig  │                                                        │
+//! │  │              │                                                        │
+//! │  │ - stream     │                                                        │
+//! │  │ - handles    │                                                        │
+//! │  └──────────────┘                                                        │
 //! │                                                                          │
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
@@ -45,7 +47,6 @@ use crate::base::error::{Error, Result};
 use crate::base::DeviceType;
 use crate::model::kvcache::{KVCacheConfig, KVCachePool};
 use crate::model::Model;
-use crate::op::sampler::{ArgmaxSampler, Sampler};
 use crate::tensor::Tensor;
 
 #[cfg(feature = "cuda")]
@@ -156,8 +157,6 @@ pub struct Worker {
     model: Option<Box<dyn Model>>,
     /// KV Cache pool (optional, initialized after model load)
     kv_cache: Option<KVCachePool>,
-    /// Sampler for token generation
-    sampler: Option<Box<dyn Sampler>>,
     /// CUDA configuration (streams, handles, etc.)
     #[cfg(feature = "cuda")]
     cuda_config: Option<CudaConfig>,
@@ -189,7 +188,6 @@ impl Worker {
             device_info,
             model: None,
             kv_cache: None,
-            sampler: None,
             #[cfg(feature = "cuda")]
             cuda_config: None,
             memory_stats: MemoryStats::default(),
@@ -234,9 +232,6 @@ impl Worker {
 
         self.model_load_time_ms = start_time.elapsed().as_millis() as u64;
 
-        // Initialize sampler
-        let sampler: Box<dyn Sampler> = Box::new(ArgmaxSampler::new(self.config.device_type));
-
         // Initialize CUDA config if needed
         #[cfg(feature = "cuda")]
         if self.config.device_type.is_cuda() {
@@ -244,7 +239,6 @@ impl Worker {
         }
 
         self.model = Some(model);
-        self.sampler = Some(sampler);
         self.state = WorkerState::Ready;
 
         // Update memory stats
@@ -337,27 +331,6 @@ impl Worker {
 
         self.state = WorkerState::Ready;
         result
-    }
-
-    /// Sample next token from logits
-    ///
-    /// Uses the configured sampler to select the next token.
-    ///
-    /// # Arguments
-    /// * `logits` - Logits tensor from model forward pass
-    /// * `output_token` - Mutable tensor to store the sampled token
-    pub fn sample(&self, logits: &Tensor, output_token: &mut Tensor) -> Result<()> {
-        let sampler = self.sampler.as_ref()
-            .ok_or_else(|| Error::InvalidArgument("Sampler not initialized".to_string()))?;
-
-        #[cfg(feature = "cuda")]
-        {
-            sampler.sample(logits, output_token, self.cuda_config.as_ref())
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            sampler.sample(logits, output_token, None)
-        }
     }
 
     /// Reset KV cache state

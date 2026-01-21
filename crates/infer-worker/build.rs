@@ -73,6 +73,9 @@ fn main() {
             .allowlist_function("cudaGetErrorString")
             .allowlist_function("cudaGetErrorName")
             .allowlist_function("cudaGetDevice")
+            .allowlist_function("cudaGetDeviceCount")
+            .allowlist_function("cudaGetDeviceName")
+            .allowlist_function("cudaDeviceGetAttribute")
             .allowlist_function("cudaSetDevice")
             .allowlist_function("cudaStreamCreate")
             .allowlist_function("cudaStreamDestroy")
@@ -81,6 +84,7 @@ fn main() {
             .allowlist_type("cudaError_t")
             .allowlist_type("cudaMemcpyKind")
             .allowlist_type("cudaStream_t")
+            .allowlist_type("cudaDeviceAttr")
             .allowlist_type("cublasLtHandle_t")
             .allowlist_type("cublasHandle_t")
             .allowlist_type("cudaGraph_t")
@@ -99,8 +103,10 @@ fn main() {
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .rustified_enum("cudaError_t")
             .rustified_enum("cudaMemcpyKind")
+            .rustified_enum("cudaDeviceAttr")
             .generate()
             .expect("Unable to generate bindings");
+
         let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
         bindings
             .write_to_file(out_path.join("bindings.rs"))

@@ -584,9 +584,9 @@ impl WorkerServer {
             }
         };
 
-        // Execute forward pass
-        let logits = match self.worker.forward(&input_tokens, &positions) {
-            Ok(l) => l,
+        // Execute forward pass - returns sampled token_id directly (sampling is done inside model)
+        let output_token = match self.worker.forward(&input_tokens, &positions) {
+            Ok(t) => t,
             Err(e) => {
                 return self.make_error(
                     ErrorCode::ForwardFailed,
@@ -595,36 +595,9 @@ impl WorkerServer {
             }
         };
 
-        // Sample next token
-        let mut output_token = match Tensor::new(&[1], crate::base::DataType::I32, device_type) {
-            Ok(t) => t,
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Failed to create output tensor: {}", e),
-                );
-            }
-        };
-
-        if let Err(e) = self.worker.sample(&logits, &mut output_token) {
-            return self.make_error(
-                ErrorCode::ForwardFailed,
-                format!("Sampling failed: {}", e),
-            );
-        }
-
-        // Get sampled token ID
-        // First move tensor to CPU if needed, then extract data
-        let cpu_output = match output_token.to_cpu() {
-            Ok(t) => t,
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Failed to move output to CPU: {}", e),
-                );
-            }
-        };
-        let next_token_id = match cpu_output.as_i32().and_then(|t| t.as_slice()) {
+        // Get sampled token ID from the forward output
+        // The model's forward() already includes sampling, returning token_id as I32 tensor
+        let next_token_id = match output_token.as_i32().and_then(|t| t.as_slice()) {
             Ok(v) => v[0],
             Err(e) => {
                 return self.make_error(

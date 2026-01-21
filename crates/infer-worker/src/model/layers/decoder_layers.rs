@@ -69,6 +69,8 @@ impl DecoderLayers {
         weight_mapping: &WeightMapping,
         device_type: DeviceType,
         is_quant_model: bool,
+        block_size: usize,
+        num_total_blocks: usize,
     ) -> Result<Self> {
         if is_quant_model {
             return Err(Error::InvalidArgument(
@@ -297,7 +299,7 @@ impl DecoderLayers {
         // Create parameterless operators
         let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
             .map(|_| {
-                FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size)
+                FlashAttnGQA::new_paged(config.head_num, config.kv_head_num, config.head_size, block_size, num_total_blocks)
             })
             .collect();
         let mha_layers = mha_layers?;

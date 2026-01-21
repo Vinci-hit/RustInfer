@@ -2,10 +2,11 @@
 //!
 //! This module provides the core inference worker that manages:
 //! - Device resources (GPU/CPU)
-//! - Model instance
+//! - Model instance (with internal Sampler)
 //! - KV Cache memory pool
-//! - Sampler for token generation
 //! - CUDA configuration (streams, handles, etc.)
+//!
+//! Note: Sampler is managed internally by the Model, not by the Worker.
 //!
 //! # Architecture
 //!
@@ -17,7 +18,8 @@
 //!    +-----+-----+-----+-----+
 //!    |     |     |     |     |
 //!    v     v     v     v     v
-//! Device Model KVCache Sampler CudaConfig
+//! Device Model KVCache CudaConfig
+//!        (sampler inside)
 //! ```
 //!
 //! # Usage

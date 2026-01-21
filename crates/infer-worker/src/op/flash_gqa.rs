@@ -3,6 +3,7 @@ use crate::base::DeviceType;
 use crate::op::{kernels, Op, OpContext};
 
 /// Flash Attention (高性能注意力机制) 的 GQA (Grouped-Query Attention) 算子。
+/// 使用 PagedAttention 模式，KV cache 以 block 形式存储。
 pub struct FlashAttnGQA {
     /// Query 头数量
     pub num_q_heads: usize,
@@ -10,14 +11,27 @@ pub struct FlashAttnGQA {
     pub num_kv_heads: usize,
     /// 单个 Attention Head 的维度
     pub head_dim: usize,
+    /// Paged 模式下的 block_size
+    pub block_size: usize,
+    /// Paged 模式下的总 block 数量
+    pub num_total_blocks: usize,
 }
 
 impl FlashAttnGQA {
-    /// 创建一个新的 FlashAttnGQA 算子。
-    pub fn new(
+    /// 创建一个新的 FlashAttnGQA 算子（Paged 模式）。
+    ///
+    /// # Arguments
+    /// * `num_q_heads` - Query 头数量
+    /// * `num_kv_heads` - Key/Value 头数量
+    /// * `head_dim` - 单个 Attention Head 的维度
+    /// * `block_size` - 每个 block 的 token 数量
+    /// * `num_total_blocks` - 总 block 数量
+    pub fn new_paged(
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        block_size: usize,
+        num_total_blocks: usize,
     ) -> Result<Self> {
         if !num_q_heads.is_multiple_of(num_kv_heads) {
             return Err(Error::InvalidArgument(format!(
@@ -29,7 +43,18 @@ impl FlashAttnGQA {
             num_q_heads,
             num_kv_heads,
             head_dim,
+            block_size,
+            num_total_blocks,
         })
+    }
+
+    /// 保持旧方法用于向后兼容
+    pub fn new(
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        Self::new_paged(num_q_heads, num_kv_heads, head_dim, 16, 1000)
     }
 }
 
@@ -39,31 +64,32 @@ impl Op for FlashAttnGQA {
         "FlashAttnGQA"
     }
 
-    /// 执行 Flash Attention GQA 的前向计算： 要求输入维度是2D：[seq_len,hidden_dim]
-    /// 
-    /// **新的输入约定 (4个输入):**
+    /// 执行 Flash Attention GQA 的前向计算（Paged 模式）
+    ///
+    /// **Paged 输入约定 (5个输入):**
     /// 0. Q_tensor: [Q_SeqLen, Q_HiddenDim]
-    /// 1. K_cache: [Max_SeqLen, KV_HiddenDim] (K Cache 的全部内存)
-    /// 2. V_cache: [Max_SeqLen, KV_HiddenDim] (V Cache 的全部内存)
-    /// 3. KV_Len_tensor: [1] I32 存着当前 K/V Cache 的有效长度 (S_KV_len)
+    /// 1. K_cache: [num_blocks, block_size, num_kv_heads, head_dim] (KV Cache 全部内存)
+    /// 2. V_cache: [num_blocks, block_size, num_kv_heads, head_dim] (V Cache 全部内存)
+    /// 3. block_table: [max_blocks_per_seq] I32 存储物理 block 索引
+    /// 4. KV_Len_tensor: [1] I32 存储当前 KV 长度
     fn forward(&self, ctx: &mut OpContext) -> Result<()> {
         // ==================== 1. 检查逻辑 ====================
 
-        // --- a. 检查输入输出数量 (4 输入，1 输出) ---
-        if ctx.inputs.len() != 4 || ctx.outputs.len() != 1 {
+        // --- a. 检查输入输出数量 (5 输入，1 输出) ---
+        if ctx.inputs.len() != 5 || ctx.outputs.len() != 1 {
             return Err(Error::InvalidArgument(
-                "FlashAttnGQA expects 4 inputs (Q, K_Cache, V_Cache, KV_Len) and 1 output (O)".into()
+                "FlashAttnGQA (paged) expects 5 inputs (Q, K_Cache, V_Cache, block_table, KV_Len) and 1 output (O)".into()
             ).into());
         }
 
         let input_q = &ctx.inputs[0];
         let input_k_cache = &ctx.inputs[1];
         let input_v_cache = &ctx.inputs[2];
-        let input_kv_len = &ctx.inputs[3]; // KV Cache 的当前有效长度 S_KV_len
+        let input_block_table = &ctx.inputs[3];
+        let input_kv_len = &ctx.inputs[4];
         let output_o = &mut ctx.outputs[0];
 
         // --- b. 检查设备和数据类型 ---
-        // ... (设备和数据类型检查保持不变，但要检查 input_kv_len 是 I32) ...
         let device = input_q.device();
 
         // --- c. 检查形状 ---
@@ -72,9 +98,12 @@ impl Op for FlashAttnGQA {
         let v_shape = input_v_cache.shape();
         let o_shape = output_o.shape();
 
-        // 1. 检查维度数量是 2D [SeqLen, Dim]
-        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2 || o_shape.len() != 2 {
-            return Err(Error::InvalidArgument("FlashAttnGQA inputs/output must be 2D [SeqLen, Dim].".into()).into());
+        // 1. 检查维度数量
+        if q_shape.len() != 2 || o_shape.len() != 2 {
+            return Err(Error::InvalidArgument("Q/O must be 2D [SeqLen, Dim].".into()).into());
+        }
+        if k_shape.len() != 4 || v_shape.len() != 4 {
+            return Err(Error::InvalidArgument("K/V Cache must be 4D [num_blocks, block_size, num_kv_heads, head_dim].".into()).into());
         }
 
         // 2. 检查隐藏层维度
@@ -87,20 +116,19 @@ impl Op for FlashAttnGQA {
                 expected_q_dim, q_shape[1], o_shape[1]
             )).into());
         }
-        if k_shape[1] != expected_kv_dim || v_shape[1] != expected_kv_dim {
+        if k_shape[3] != self.head_dim || v_shape[3] != self.head_dim {
             return Err(Error::InvalidArgument(format!(
-                "K/V Cache last dimension mismatch. Expected {} (NKV*DH), got K {} and V {}.",
-                expected_kv_dim, k_shape[1], v_shape[1]
+                "K/V Cache head_dim mismatch. Expected {}, got K {} and V {}.",
+                self.head_dim, k_shape[3], v_shape[3]
             )).into());
         }
 
-        // 3. 提取 SeqLen 和判断模式
+        // 3. 提取 SeqLen
         let q_seq_len = q_shape[0];
-        let _max_kv_seq_len = k_shape[0]; // K/V 缓存的最大容量
 
         // --- 从 KV_Len 张量中获取当前有效长度 ---
-        
-        
+        let current_kv_len = input_kv_len.as_i32()?.as_slice()?[0] as usize;
+
         // 4. 检查序列长度的一致性和有效性
         if output_o.shape()[0] != q_seq_len {
             return Err(Error::InvalidArgument("O SeqLen must match Q SeqLen.".into()).into());
@@ -109,15 +137,14 @@ impl Op for FlashAttnGQA {
         // ==================== 2. 分派到内核 ====================
         match device {
             DeviceType::Cpu => {
-                // 调用 CPU 黄金标准 (需要支持 Prefill 和 Decode 逻辑)
-                let current_kv_len = input_kv_len.as_i32()?.as_slice()?[0] as usize;
+                // CPU 回退：使用标准 kernel（不支持 paged）
                 kernels::cpu::flash_attn_gqa(
-                    input_q, 
-                    input_k_cache, // K/V 缓存的全部内存
-                    input_v_cache, 
+                    input_q,
+                    input_k_cache, // 将 4D 展平为 2D 使用
+                    input_v_cache,
                     output_o,
-                    q_seq_len,      // Q 的长度
-                    current_kv_len, // KV Cache 的当前有效长度 (S_KV)
+                    q_seq_len,
+                    current_kv_len,
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,
@@ -125,19 +152,23 @@ impl Op for FlashAttnGQA {
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                let current_kv_len_ptr = input_kv_len.as_i32()?.buffer().as_ptr() as *const i32; // 只有decoding阶段是指向GPU
-                // 假设有一个统一的 CUDA KV Cache Kernel
+                // 使用 PagedAttention kernel
+                let block_table_ptr = input_block_table.as_i32()?.buffer().as_ptr() as *const i32;
+
                 unsafe {
-                    kernels::cuda::flash_attn_gqa(
+                    kernels::cuda::flash_attn_gqa_paged(
                         input_q,
-                        input_k_cache, // K/V 缓存的全部内存
+                        input_k_cache,
                         input_v_cache,
                         output_o,
-                        q_seq_len,      // Q 的长度
-                        current_kv_len_ptr, // KV Cache 的当前有效长度 (S_KV)
+                        block_table_ptr,
+                        q_seq_len,
+                        current_kv_len,
                         self.num_q_heads,
                         self.num_kv_heads,
                         self.head_dim,
+                        self.block_size,
+                        self.num_total_blocks,
                         ctx.cuda_config,
                     )?;
                 }

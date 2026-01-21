@@ -9,6 +9,20 @@
 #include <cuda_bf16.h>
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_conversion.h>
+#define CP_ASYNC_CG(dst, src, bytes)                                           \
+asm volatile(                                                                \
+"cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"l"(dst),       \
+"l"(src), "n"(bytes))
+
+#define CP_ASYNC_CG_ca(dst, src, bytes)                                           \
+asm volatile(                                                                \
+"cp.async.ca.shared.global [%0], [%1], %2;\n" ::"l"(dst),       \
+"l"(src), "n"(bytes))
+
+#define CP_ASYNC_COMMIT_GROUP() asm volatile("cp.async.commit_group;\n" ::)
+#define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)
+#define CP_ASYNC_WAIT_GROUP(n)                                                 \
+asm volatile("cp.async.wait_group %0;\n" ::"n"(n))
 template <class ElementType, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV>
 struct SharedStorage {
     cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutQ>> smem_q;
@@ -220,7 +234,13 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     const __nv_bfloat16* __restrict__ q_ptr, QStride dQ, QSmemLayout sQ_layout, TiledCopyQ copy_q, S2RAtom s2r_atom,
     const __nv_bfloat16* __restrict__ k_ptr, KStride dK, KVSmemLayout sKV_layout, TiledCopyK copy_kv, S2RAtomTrans s2r_atom_trans, SmemVTransNoSwi V_layout_trans_no_swi,SmemVTrans V_layout_trans,
     const __nv_bfloat16* __restrict__ v_ptr, VStride dV,
-    __nv_bfloat16* __restrict__ o_ptr,OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma)
+    __nv_bfloat16* __restrict__ o_ptr,OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma,
+    const int32_t* __restrict__ block_table,
+    int32_t block_size,
+    int32_t num_total_blocks,
+    int max_num_blocks_per_seq,
+    int block_table_batch_stride,
+    int kv_block_stride)
 {
     unsigned int batch_idx = blockIdx.z;
     unsigned int q_head_idx = blockIdx.y;
@@ -232,8 +252,18 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     Tensor V = make_tensor(make_gmem_ptr(v_ptr), kv_shape, dV);
     Tensor O = make_tensor(make_gmem_ptr(o_ptr), q_shape, dO);// (batch,seq,head_num,head_dim)
     Tensor gQ = local_tile(Q(batch_idx, _,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0)); //每个blockx处理一块q
-    Tensor gK = local_tile(K(batch_idx, _,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0)); // 把第0个维度堆叠起来，变成（64,64，N/64）
-    Tensor gV = local_tile(V(batch_idx, _,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0));
+
+    // 获取当前batch对应的block_table起始位置
+    const int32_t* batch_block_table = block_table + batch_idx * block_table_batch_stride;
+    // 创建基于block_table的KV tensor视图
+    // KV数据存储在离散的block中，需要通过block_table访问
+    Tensor KV_blocks = make_tensor(make_gmem_ptr(k_ptr), kv_shape, dK);
+    Tensor V_blocks = make_tensor(make_gmem_ptr(v_ptr), kv_shape, dV);
+
+    // 在循环中，我们需要根据block_table动态计算KV数据的地址
+    // 这里暂时保持原来的结构，后续会在循环中修改
+    Tensor gK = local_tile(KV_blocks(batch_idx, _,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0)); // 把第0个维度堆叠起来，变成（64,64，N/64）
+    Tensor gV = local_tile(V_blocks(batch_idx, _,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0));
     Tensor gO = local_tile(O(batch_idx, _,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0));
     extern __shared__ __nv_bfloat16 shared_memory[];
     using SharedStorage = SharedStorage<__nv_bfloat16, QSmemLayout, KVSmemLayout,KVSmemLayout>;
@@ -256,7 +286,28 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     Tensor tVgV = thr_copy_kv.partition_S(gV);
     Tensor tVsV = thr_copy_kv.partition_D(sV);
 
-    copy(copy_kv, tKgK(_,_,_,0), tKsK); //把k的第0分片从全局读到共享
+    // 第一轮K数据加载（n_tile=0），使用block_table和异步cp
+    int first_block_idx_in_seq = 0;
+    int32_t first_physical_block_idx = batch_block_table[first_block_idx_in_seq];
+    int32_t first_block_offset = first_physical_block_idx * block_size * size<2>(kv_shape) * size<3>(kv_shape);
+    int32_t first_head_offset = kv_head_idx * size<3>(kv_shape);
+
+    const __nv_bfloat16* k_global_ptr = k_ptr + first_block_offset + first_head_offset;
+    __nv_bfloat16* k_smem_ptr = reinterpret_cast<__nv_bfloat16*>(cute::raw_pointer_cast(sK.data()));
+
+    // 使用异步cp加载K数据（第一个tile，offset=0）
+    for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+         int k_token = i / 64;
+         int k_dim = i % 64;
+         if (k_token < block_size) {
+             int global_idx = k_token * size<2>(kv_shape) * size<3>(kv_shape) + k_dim;
+             CP_ASYNC_CG_ca(k_smem_ptr + i, k_global_ptr + global_idx, 16);
+         } else {
+             k_smem_ptr[i] = __nv_bfloat16(0);
+         }
+     }
+    CP_ASYNC_COMMIT_GROUP();
+
     auto thr_mma = mma.get_slice(threadIdx.x);
     // 用于计算 S = Q * K^T
     Tensor rQ = thr_mma.partition_fragment_A(sQ); // (MMA, MMA_M, MMA_K)
@@ -309,17 +360,73 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     n_block_max = min(n_block_max, (size<0>(kv_shape) + 64 - 1) / 64);
      for (int n_tile = 0; n_tile < n_block_max; ++n_tile)
      {
+         // 计算当前KV tile的物理block信息
+         int kv_token_start = n_tile * 64;
+         int block_idx_in_seq = kv_token_start / block_size;
+         int token_offset_in_block = kv_token_start % block_size;
 
-         copy(copy_kv, tVgV(_,_,_,n_tile), tVsV);
+         // 从block_table获取实际的物理block索引_idx_in_se
+         int32_t physical_block_idx = batch_block_table[block_idx_in_seq];
+
+         // 计算物理block的数据指针
+         // KV数据布局：[num_blocks, block_size, num_kv_heads, head_dim]
+         int32_t block_offset = physical_block_idx * block_size * size<2>(kv_shape) * size<3>(kv_shape);
+
+         // 计算token在物理block内的偏移量
+         int32_t token_in_block_offset = token_offset_in_block * size<2>(kv_shape) * size<3>(kv_shape);
+         int32_t head_offset = kv_head_idx * size<3>(kv_shape);
+
+         // 从全局内存异步加载V数据到共享内存
+         const __nv_bfloat16* v_global_ptr = v_ptr + block_offset + token_in_block_offset + head_offset;
+         __nv_bfloat16* v_smem_ptr = reinterpret_cast<__nv_bfloat16*>(cute::raw_pointer_cast(sV.data()));
+
+         // V数据：[64个token, head_dim=64] - 使用异步cp
+         for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+             int v_token = i / 64;
+             int v_dim = i % 64;
+             // 只加载有效的token数量
+             if (v_token + token_offset_in_block < block_size) {
+                 int global_idx = v_token * size<2>(kv_shape) * size<3>(kv_shape) + v_dim;
+                 CP_ASYNC_CG_ca(v_smem_ptr + i, v_global_ptr + global_idx, 16); // 每个元素2字节
+             } else {
+                 // 填充0
+                 v_smem_ptr[i] = __nv_bfloat16(0);
+             }
+         }
+         CP_ASYNC_COMMIT_GROUP();
 
          cp_async_wait<1>();
          __syncthreads();//进入循环前，等上一轮的K存入共享内存完毕
          clear(rS);
-         copy(s2r_copy_k, tXsK, tXrK);
-
          gemm(mma, rQ, rK, rS); //用完了rK，可以读下一轮的了
 
-         copy(copy_kv, tKgK(_,_,_,(n_tile + 1 ) % n_block_max), tKsK);
+         // 下一轮K的预加载，需要使用block_table
+         int next_tile = n_tile + 1;
+         if (next_tile < n_block_max) {
+             int next_kv_token_start = next_tile * 64;
+             int next_block_idx_in_seq = next_kv_token_start / block_size;
+             int next_token_offset_in_block = next_kv_token_start % block_size;
+             int32_t next_physical_block_idx = batch_block_table[next_block_idx_in_seq];
+             int32_t next_block_offset = next_physical_block_idx * block_size * size<2>(kv_shape) * size<3>(kv_shape);
+             int32_t next_token_in_block_offset = next_token_offset_in_block * size<2>(kv_shape) * size<3>(kv_shape);
+             int32_t next_head_offset = kv_head_idx * size<3>(kv_shape);
+
+             const __nv_bfloat16* k_global_ptr = k_ptr + next_block_offset + next_token_in_block_offset + next_head_offset;
+             __nv_bfloat16* k_smem_ptr = reinterpret_cast<__nv_bfloat16*>(cute::raw_pointer_cast(sK.data()));
+
+             // 使用异步cp加载K数据
+             for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+                 int k_token = i / 64;
+                 int k_dim = i % 64;
+                 if (k_token + next_token_offset_in_block < block_size) {
+                     int global_idx = k_token * size<2>(kv_shape) * size<3>(kv_shape) + k_dim;
+                     CP_ASYNC_CG_ca(k_smem_ptr + i, k_global_ptr + global_idx, 16);
+                 } else {
+                     k_smem_ptr[i] = __nv_bfloat16(0);
+                 }
+             }
+         }
+         CP_ASYNC_COMMIT_GROUP();
          cp_async_fence();
          apply_mask(
              rS, 64 *n_tile, block_m * 128 + (threadIdx.x / 32) * 16 + (threadIdx.x % 32) / 4,16*kNWarps, kv_len - q_len
@@ -438,29 +545,49 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
         }
     }
 }
+// ============================================================================
+// PagedAttention Kernel Wrapper Function
+// ============================================================================
 
-void launch_flash_attn_cute_128x64x64_tile(
-    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
-    int batch_size,
-    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
-    cudaStream_t stream)
-{
-    using namespace cute; // 确保使用 cute 命名空间
-    int kv_len = *kv_len_ptr + seq_len;//prefill阶段可以在cpu里面用
+void flash_attn_gqa_paged_cu(
+    const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* k_ptr,
+    const __nv_bfloat16* v_ptr,
+    __nv_bfloat16* o_ptr,
+    const int32_t* block_table,
+    int32_t q_seq_len,
+    int32_t kv_seq_len,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t block_size,
+    int32_t num_total_blocks,
+    int max_num_blocks_per_seq,
+    int block_table_batch_stride,
+    int kv_block_stride,
+    cudaStream_t stream
+) {
+    using namespace cute;
+
+    int batch_size = 1; // paged kernel当前只支持单batch
+    int kv_len = kv_seq_len;
+
     // 配置 Block 大小
     constexpr int kBlockM = 128;
     constexpr int kBlockN = 64;
-    constexpr int kHeadDim = 64; // 已确认 HeadDim = 64
-    // 1. 定义 Shapes (使用 Int<kHeadDim> 确保静态编译)
-    auto q_shape = make_shape(batch_size, seq_len, q_heads, Int<kHeadDim>{});
-    auto kv_shape = make_shape(batch_size, kv_len,kv_heads, Int<kHeadDim>{});
+    constexpr int kHeadDim = 64;
 
-    // 2. 定义 Strides
-    auto stride_Q = make_stride(seq_len * q_heads * kHeadDim, q_heads * kHeadDim, kHeadDim, _1{});
-    auto stride_K = make_stride(kv_len * kv_heads * kHeadDim, kv_heads * kHeadDim, kHeadDim, _1{});
-    auto stride_V = make_stride(kv_len * kv_heads * kHeadDim, kv_heads * kHeadDim, kHeadDim, _1{});
-    auto stride_O = make_stride(seq_len * q_heads * kHeadDim, q_heads * kHeadDim, kHeadDim, _1{});
+    // 定义 Shapes
+    auto q_shape = make_shape(batch_size, q_seq_len, num_q_heads, Int<kHeadDim>{});
+    auto kv_shape = make_shape(num_total_blocks, block_size, num_kv_heads, Int<kHeadDim>{});
 
+    // 定义 Strides
+    auto stride_Q = make_stride(q_seq_len * num_q_heads * kHeadDim, num_q_heads * kHeadDim, kHeadDim, _1{});
+    auto stride_K = make_stride(block_size * num_kv_heads * kHeadDim, num_kv_heads * kHeadDim, kHeadDim, _1{});
+    auto stride_V = make_stride(block_size * num_kv_heads * kHeadDim, num_kv_heads * kHeadDim, kHeadDim, _1{});
+    auto stride_O = make_stride(q_seq_len * num_q_heads * kHeadDim, num_q_heads * kHeadDim, kHeadDim, _1{});
+
+    // Shared Memory Layouts
     using SmemLayoutAtomQ = decltype(composition(Swizzle<3,3,3>{},
                                   Layout<Shape <_8,_64>,
                                          Stride<_64,_1>>{}));
@@ -471,10 +598,12 @@ void launch_flash_attn_cute_128x64x64_tile(
     using SmemLayoutVtransposed = decltype(
             composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
     using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
+
     auto sQ = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
     auto sKV = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockN>{}, Int<kHeadDim>{}));
-
     auto sO = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
+
+    // Copy Atoms
     using AtomGMEM = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, __nv_bfloat16>;
 
     auto copy_q = make_tiled_copy(
@@ -493,67 +622,43 @@ void launch_flash_attn_cute_128x64x64_tile(
         make_layout(Shape<Int<128>, Int<1>>{}),
         make_layout(Shape<Int<1>, Int<8>>{}));
 
-
     auto warp_layout = make_layout(make_shape(Int<kNWarps>{}, Int<1>{}, Int<1>{}));
 
-    // 定义总 Tile 大小
-    // M=128, N=64, K=64
+    // 定义 Tile 大小
     auto tile_shape = make_tile(Int<16 * kNWarps>{}, Int<64>{}, Int<64>{});
 
     // 生成 MMA
     auto mma = make_tiled_mma(
-        SM80_16x8x16_F32BF16BF16F32_TN{}, // Atom
-        warp_layout,                      // Warp Layout (4x1x1)
-        tile_shape                        // Tile Shape
+        SM80_16x8x16_F32BF16BF16F32_TN{},
+        warp_layout,
+        tile_shape
     );
+
     using S2RAtom = Copy_Atom<SM75_U32x4_LDSM_N, __nv_bfloat16>;
     using S2RAtom_trans = Copy_Atom<SM75_U16x8_LDSM_T, __nv_bfloat16>;
-    // 6. Launch Config
-    dim3 dimGrid(size(ceil_div(seq_len, Int<kBlockM>{})),
-               size(q_heads),
+
+    // Launch Config
+    dim3 dimGrid(size(ceil_div(q_seq_len, Int<kBlockM>{})),
+               size(num_q_heads),
                batch_size);
     dim3 block(size(mma));
 
     int smem_size = int(sizeof(SharedStorage<__nv_bfloat16, decltype(sQ), decltype(sKV), decltype(sKV)>));
-    
-    // 8. 启动 Kernel
+
+    // 启动 Paged Kernel
     flash_attn_gqa_kernel_bf16_test<<<dimGrid, block, smem_size, stream>>>(
         q_shape, kv_shape,
-        d_Q, stride_Q, sQ, copy_q, S2RAtom{},
-        d_K, stride_K, sKV, copy_kv, S2RAtom_trans{},SmemLayoutVtransposedNoSwizzle{},SmemLayoutVtransposed{},
-        d_V, stride_V,
-        d_O, stride_O, sO, copy_o, mma
+        q_ptr, stride_Q, sQ, copy_q, S2RAtom{},
+        k_ptr, stride_K, sKV, copy_kv, S2RAtom_trans{},SmemLayoutVtransposedNoSwizzle{},SmemLayoutVtransposed{},
+        v_ptr, stride_V,
+        o_ptr, stride_O, sO, copy_o, mma,
+        block_table,
+        block_size,
+        num_total_blocks,
+        max_num_blocks_per_seq,
+        block_table_batch_stride,
+        kv_block_stride
     );
+
     CUDA_CHECK(cudaGetLastError());
-}
-
-// ============================================================================
-// Generic Dispatcher Function
-// ============================================================================
-
-void launch_flash_attn_cute_dispatch(
-    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
-    int batch_size,
-    int seq_len, int* kv_len, int q_heads, int kv_heads, int head_dim,
-    cudaStream_t stream)
-{
-    // Dispatch based on head_dim
-    switch (head_dim) {
-        case 64:
-            launch_flash_attn_cute_128x64x64_tile(
-                d_Q, d_K, d_V, d_O,
-                batch_size,
-                seq_len, kv_len, q_heads, kv_heads,
-                stream
-            );
-            break;
-        case 128:
-            // TODO: Implement 128 head_dim kernel
-            // launch_flash_attn_cute_128x128x128_tile(...);
-            fprintf(stderr, "head_dim=128 kernel not yet implemented. Please implement launch_flash_attn_cute_128x128x128_tile().\n");
-            break;
-        default:
-            fprintf(stderr, "Unsupported head_dim: %d. Only 64 and 128 are supported.\n", head_dim);
-            break;
-    }
 }

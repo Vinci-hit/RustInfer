@@ -67,22 +67,42 @@ void flash_decoding_cu_bf16(
     int32_t head_dim,
     cudaStream_t stream);
 
+void flash_attn_gqa_paged_cu(
+    const __nv_bfloat16* q_ptr,
+    const __nv_bfloat16* k_ptr,
+    const __nv_bfloat16* v_ptr,
+    __nv_bfloat16* o_ptr,
+    const int32_t* block_table,
+    int32_t q_seq_len,
+    int32_t kv_seq_len,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t block_size,
+    int32_t num_total_blocks,
+    int max_num_blocks_per_seq,
+    int block_table_batch_stride,
+    int kv_block_stride,
+    cudaStream_t stream
+);
 void launch_flash_attn_cute_128x64x64_tile(
     const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+    int batch_size,
     int seq_len, int* kv_len, int q_heads, int kv_heads,
     cudaStream_t stream);
 
 void launch_flash_attn_cute_128x128x128_tile(
     const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+    int batch_size,
     int seq_len, int* kv_len, int q_heads, int kv_heads,
     cudaStream_t stream);
 
 // Generic dispatcher that selects the appropriate kernel based on head_dim
 void launch_flash_attn_cute_dispatch(
     const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+    int batch_size,
     int seq_len, int* kv_len, int q_heads, int kv_heads, int head_dim,
     cudaStream_t stream);
-
 #ifdef __cplusplus
 }
 #endif

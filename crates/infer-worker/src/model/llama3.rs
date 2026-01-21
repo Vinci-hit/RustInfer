@@ -16,7 +16,7 @@ use crate::model::{BufferType, Workspace, Model};
 use crate::op::sampler::{Sampler, ArgmaxSampler};
 use super::layers::{DecoderLayers, WeightMapping};
 // Import KvCache from the kvcache module
-use super::kvcache::KvCache;
+use super::kvcache::{KvCache, KVCachePool, KVCacheConfig};
 
 
 pub struct Llama3 {
@@ -26,10 +26,16 @@ pub struct Llama3 {
     /// Core decoder layers (shared abstraction with Qwen2)
     layers: DecoderLayers,
 
-    /// KV Cache
-    kv_cache: KvCache,
-    kcache: Tensor,
-    vcache: Tensor,
+    /// KV Cache Pool (Paged 模式）
+    kv_cache_pool: KVCachePool,
+    /// 当前 KV 长度
+    current_kv_len: usize,
+    /// Block table (GPU) 用于 paged attention
+    block_table: Tensor,
+    /// Block size for paged KV cache
+    block_size: usize,
+    /// Total number of blocks
+    num_total_blocks: usize,
     /// 工作空间，用于存放中间计算结果，避免频繁分配和释放内存
     workspace: Workspace,
     output_token: Tensor,
@@ -64,25 +70,53 @@ impl Llama3 {
             &WeightMapping::LLAMA,
             device_type,
             is_quant_model,
+            block_size,
+            num_total_blocks,
         )?;
 
-        // Initialize KV cache
-        let kv_cache = KvCache::init_kv_cache(&config, &device_type)?;
-        
-        // --- 初始化工作区 (这是新添加的部分) ---
-        let workspace = Self::init_workspace(&config, &device_type)?;
+        // Initialize KV Cache Pool (Paged 模式）
+        let block_size = 16;  // 每个 block 16 个 token
+        let num_total_blocks = (config.seq_len + block_size - 1) / block_size;
+        let kv_cache_config = KVCacheConfig::new(
+            config.layer_num,
+            config.kv_head_num,
+            config.head_size,
+            if device_type.is_cpu() { DataType::F32 } else { DataType::BF16 },
+            block_size,
+            num_total_blocks,
+        );
+        let kv_cache_pool = KVCachePool::new(kv_cache_config, device_type)?;
+
+        // --- 初始化工作区 ---
+        let workspace = Self::init_workspace(&config, &device_type, num_total_blocks)?;
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
         let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
-        let mut kcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
-        let mut vcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
-        // On CPU, convert KV cache to F32 for better precision and compatibility
-        
-        if device_type.is_cpu() {
-            kcache = kcache.to_dtype(DataType::F32)?;
-            vcache = vcache.to_dtype(DataType::F32)?;
+
+        // 初始化 block table（连续分配，顺序使用）
+        let max_blocks_per_seq = (config.seq_len + block_size - 1) / block_size;
+        let mut block_table = Tensor::new(&[max_blocks_per_seq], DataType::I32, device_type)?;
+        // 初始化 block table 为顺序索引 [0, 1, 2, ...]
+        for i in 0..max_blocks_per_seq {
+            block_table.as_i32_mut()?.as_slice_mut()?[i] = i as i32;
         }
-        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos, kcache, vcache };
+
+        let mut model = Self {
+            config,
+            device_type,
+            tokenizer,
+            layers,
+            kv_cache_pool,
+            current_kv_len: 0,
+            block_table,
+            block_size,
+            num_total_blocks,
+            workspace,
+            sampler,
+            cuda_config: Some(cuda_config),
+            output_token,
+            input_pos,
+        };
         println!("Calculating RoPE sin/cos cache...");
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
         let duration = start_time.elapsed();
@@ -139,7 +173,8 @@ impl Llama3 {
     /// 预分配前向传播所需的所有中间张量。
     fn init_workspace(
         config: &RuntimeModelConfig,
-        device: &DeviceType
+        device: &DeviceType,
+        num_total_blocks: usize,
     ) -> Result<Workspace> {
         println!("Initializing inference workspace for device {:?}...", device);
         let mut buffers = HashMap::new();
@@ -245,8 +280,22 @@ impl Llama3 {
             BufferType::IntermediateBuffer1,
             Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
         );
+
+        // Block table buffer
+        let max_blocks_per_seq = (max_seq_len + 16 - 1) / 16;  // block_size=16
+        buffers.insert(
+            BufferType::BlockTable,
+            Tensor::new(&[max_blocks_per_seq], DataType::I32, *device)?
+        );
+
+        // Current KV length buffer
+        buffers.insert(
+            BufferType::CurrentKVLen,
+            Tensor::new(&[1], DataType::I32, *device)?
+        );
+
         // ==========================================================
-        
+
         // 10. 模型的最终 logits 输出 (用于单 token)
         let forward_output = Tensor::new(&[config.vocab_size], float_dtype, *device)?;
         buffers.insert(BufferType::ForwardOutput, forward_output);
@@ -328,53 +377,74 @@ impl Llama3 {
     fn forward_decoding(&mut self, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
         self.input_pos.copy_from(pos_cpu)?;
         let input_tokens_view = &self.output_token;
-        let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-        if self.device_type.is_cuda(){
-            if config.cuda_graph.is_none(){
-                config.capture_graph_begin()?;
-            }else{
-                config.launch_graph()?;
-                config.sync_stream()?;
-                let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-                return Ok(next_token);
-            }
-        }
-        
-        
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
+
         // Token embedding
         let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
-        
+
+        // Get current position and update current_kv_len
+        let pos = self.input_pos.as_i32()?.as_slice()?[0] as usize;
+
         // Process all transformer layers
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            
+
+            // Q projection
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
-            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.kcache], cuda_config_ref))?;
-            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.vcache], cuda_config_ref))?;
-            let (k_cache_full, v_cache_full) = self.kv_cache.get_mut(i)?;
-            
+
+            // K, V projections to temporary buffers
+            let k_buffer = self.workspace.get_mut(&BufferType::KeyCache).unwrap();
+            let mut k_temp = k_buffer.slice(&[0, 0], &[1, self.config.kv_dim])?;
+            let v_buffer = self.workspace.get_mut(&BufferType::ValueCache).unwrap();
+            let mut v_temp = v_buffer.slice(&[0, 0], &[1, self.config.kv_dim])?;
+
+            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k_temp], cuda_config_ref))?;
+            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v_temp], cuda_config_ref))?;
+
+            // RoPE on K only (Q doesn't need RoPE in decode mode since pos is just new token)
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
-            
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut self.kcache], cuda_config_ref))?;
-            
-            self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.kcache, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.vcache, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
-            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
+            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut k_temp], cuda_config_ref))?;
+
+            // Write K, V to KV cache pool at current position
+            let block_idx = pos / self.block_size;
+            let slot_idx = pos % self.block_size;
+
+            // Get K, V tensors from pool
+            let (k_pool_base, v_pool_base) = self.kv_cache_pool.get(i)?;
+
+            // Write K to pool
+            let k_write_view = k_temp.slice(&[0, 0], &[1, self.config.kv_dim])?;
+            self.kv_cache_pool.write_kv_to_slot(i, block_idx, slot_idx, &k_write_view, &v_temp)?;
+
+            // Get current KV length buffer
+            let kv_len_buffer = self.workspace.get_mut(&BufferType::CurrentKVLen).unwrap();
+            kv_len_buffer.as_i32_mut()?.as_slice_mut()?[0] = self.current_kv_len as i32;
+
+            // Paged Attention using 4D KV cache
             let mut attn_out = attn_norm_out; // Reuse buffer
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[
+                &q,
+                k_pool_base,  // 4D: [num_blocks, block_size, num_kv_heads, head_dim]
+                v_pool_base,
+                &self.block_table,
+                kv_len_buffer,
+            ], &mut [&mut attn_out], cuda_config_ref))?;
+
+            // Wo projection
             let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
+
             // FFN Block
             let mut ffn_norm_out = attn_out; // Reuse buffer
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
@@ -389,12 +459,11 @@ impl Llama3 {
             let mut w2_out = ffn_norm_out; // Reuse buffer
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
-            
         }
-        
+
         // Extract last token's hidden state
         let last_hidden_state_view = x.slice(&[0, 0], &[1, self.config.dim])?;
-        
+
         // Final Norm and classifier
         let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
@@ -410,11 +479,10 @@ impl Llama3 {
         )?;
         let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
         self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
-        
-        let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-        if self.device_type.is_cuda() && config.cuda_graph.is_none(){
-            config.capture_graph_end()?;
-        }
+
+        // Update KV length after processing all layers
+        self.current_kv_len += 1;
+
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
         Ok(next_token)
     }
