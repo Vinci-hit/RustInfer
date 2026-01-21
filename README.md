@@ -1,9 +1,6 @@
 # RustInfer: Rust实现的高性能LLM推理引擎
 
 RustInfer是一个用Rust语言实现的高性能大语言模型(LLM)推理引擎，专注于提供高效、稳定、易于扩展的模型推理能力。
-
-> **测试环境**: H200, Llama-3.2-1B-Instruct, Batch Size=1
-
 ---
 
 ## ✨ 核心特性
