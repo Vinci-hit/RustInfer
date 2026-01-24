@@ -1,5 +1,16 @@
 ## 更新说明
 
+### 20260124
+重构了ModelRegistry注册逻辑：
+
+    ModelRegistry：作为注册中心，承担调度中心和标准制定者的角色，目标是将模型架构名称（字符串）映射到模型构建逻辑（函数），实现解耦。本体是一个全局的线程安全的Map，在程序启动时，各个模型将自己的名字和构建函数挂号在这里。在使用的时候，接受config.json里面的架构名，找到对应的构建函数，传入Loader，返回构建好的模型对象。
+
+    ModelTrait：作为Registry的输出产品，定义了一个模型应该有的方法，如forward、reset_kv_cache等。
+
+    ModelBuilderFn：模型构建函数，作为Registry的value，也就是通过输入名称，会自动调用到不同的构建函数。输入是ModelLoader和运行时参数（包含设备信息，TP Rank等），输出是ModelTrait。
+
+    Weight Mapping Adapter：模型权重映射器，模型自己构建函数知道自己要载入哪些权重，每个模型管理自己的命名规则。
+
 ### 20260121
 1、修改Attention算子为pagedAttention，支持分块载入共享内存。
 2、分离Model使得为无状态，只存储静态权重和计算方法，输入由ForwardInput 结构体持有，使得支持在初次启动时，可以构造dummy input进行profile操作。
