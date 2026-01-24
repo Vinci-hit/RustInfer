@@ -14,8 +14,8 @@ use crate::op::rope::RoPEOp;
 use crate::op::swiglu::SwiGLU;
 use crate::op::scatter::Scatter;
 use crate::tensor::Tensor;
-use super::super::{ModelLoader, config::RuntimeModelConfig};
-use super::weight_mapping::WeightMapping;
+use super::super::{config::RuntimeModelConfig,ModelLoader};
+use super::weight_mapping::WeightMappingAdapter;
 
 /// Generic decoder layers for decoder-only transformer models
 ///
@@ -57,7 +57,7 @@ impl DecoderLayers {
     /// # Arguments
     /// * `loader` - ModelLoader containing the safetensor weights
     /// * `config` - Runtime model configuration
-    /// * `weight_mapping` - Weight naming mapping for this model type
+    /// * `weight_mapping` - Weight mapping adapter for this model architecture
     /// * `device_type` - Target device (CPU or CUDA)
     /// * `is_quant_model` - Whether this is a quantized model
     ///
@@ -66,7 +66,7 @@ impl DecoderLayers {
     pub fn from_loader(
         loader: &ModelLoader,
         config: &RuntimeModelConfig,
-        weight_mapping: &WeightMapping,
+        weight_mapping: &dyn WeightMappingAdapter,
         device_type: DeviceType,
         is_quant_model: bool,
         block_size: usize,
@@ -113,125 +113,69 @@ impl DecoderLayers {
 
         // Load per-layer weights
         for i in 0..layer_num {
-            // Attention weights
-            #[cfg(feature = "cuda")]
-            {
-                wq_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_q),
-                    loader,
-                    device_type,
-                    stream
-                )?);
-                wk_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_k),
-                    loader,
-                    device_type,
-                    stream
-                )?);
-                wv_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_v),
-                    loader,
-                    device_type,
-                    stream
-                )?);
-                wo_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_o),
-                    loader,
-                    device_type,
-                    stream
-                )?);
+            wq_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_q),
+                loader,
+                device_type,
+                stream
+            )?);
+            wk_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_k),
+                loader,
+                device_type,
+                stream
+            )?);
+            wv_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_v),
+                loader,
+                device_type,
+                stream
+            )?);
+            wo_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_o),
+                loader,
+                device_type,
+                stream
+            )?);
 
-                // FFN weights
-                w1_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.ffn_gate),
-                    loader,
-                    device_type,
-                    stream
-                )?);
-                w3_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.ffn_up),
-                    loader,
-                    device_type,
-                    stream
-                )?);
-                w2_layers.push(Self::load_matmul_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.ffn_down),
-                    loader,
-                    device_type,
-                    stream
-                )?);
+            // FFN weights
+            w1_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_gate),
+                loader,
+                device_type,
+                stream
+            )?);
+            w3_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_up),
+                loader,
+                device_type,
+                stream
+            )?);
+            w2_layers.push(Self::load_matmul_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_down),
+                loader,
+                device_type,
+                stream
+            )?);
 
-                // Normalization layers
-                rmsnorm_attn_layers.push(Self::load_rmsnorm_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_attn),
-                    loader,
-                    device_type,
-                    stream,
-                    config.rms_norm_eps,
-                )?);
-                rmsnorm_ffn_layers.push(Self::load_rmsnorm_async(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_ffn),
-                    loader,
-                    device_type,
-                    stream,
-                    config.rms_norm_eps,
-                )?);
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                // CPU fallback - use synchronous loading
-                wq_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_q),
-                    loader,
-                    device_type
-                )?);
-                wk_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_k),
-                    loader,
-                    device_type
-                )?);
-                wv_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_v),
-                    loader,
-                    device_type
-                )?);
-                wo_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.attn_o),
-                    loader,
-                    device_type
-                )?);
-
-                w1_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.ffn_gate),
-                    loader,
-                    device_type
-                )?);
-                w3_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.ffn_up),
-                    loader,
-                    device_type
-                )?);
-                w2_layers.push(Self::load_matmul(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.ffn_down),
-                    loader,
-                    device_type
-                )?);
-
-                rmsnorm_attn_layers.push(Self::load_rmsnorm(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_attn),
-                    loader,
-                    device_type
-                )?);
-                rmsnorm_ffn_layers.push(Self::load_rmsnorm(
-                    &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_ffn),
-                    loader,
-                    device_type
-                )?);
-            }
+            // Normalization layers
+            rmsnorm_attn_layers.push(Self::load_rmsnorm_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_attn),
+                loader,
+                device_type,
+                stream,
+                config.rms_norm_eps,
+            )?);
+            rmsnorm_ffn_layers.push(Self::load_rmsnorm_async(
+                &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_ffn),
+                loader,
+                device_type,
+                stream,
+                config.rms_norm_eps,
+            )?);
         }
-
         // Load global layers
-        #[cfg(feature = "cuda")]
+        
         let (embedding_layer, rmsnorm_final_layer, cls_layer) = {
             let embedding_layer = Self::load_embedding_async(
                 weight_mapping.embedding,
@@ -267,31 +211,6 @@ impl DecoderLayers {
                 }
                 println!("  -> All async transfers completed!");
             }
-
-            (embedding_layer, rmsnorm_final_layer, cls_layer)
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let (embedding_layer, rmsnorm_final_layer, cls_layer) = {
-            let embedding_layer = Self::load_embedding(
-                weight_mapping.embedding,
-                loader,
-                device_type
-            )?;
-            let rmsnorm_final_layer = Self::load_rmsnorm(
-                weight_mapping.rmsnorm_final,
-                loader,
-                device_type
-            )?;
-
-            let cls_layer = if tensor_names.contains(weight_mapping.cls) {
-                println!("Found independent '{}'. Loading it.", weight_mapping.cls);
-                Self::load_matmul(weight_mapping.cls, loader, device_type)?
-            } else {
-                println!("'{}' not found. Reusing token embedding weights (tied weights).",
-                    weight_mapping.cls);
-                Matmul::from(embedding_layer.weight.clone(), None)
-            };
 
             (embedding_layer, rmsnorm_final_layer, cls_layer)
         };

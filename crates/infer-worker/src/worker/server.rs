@@ -73,7 +73,7 @@ use infer_protocol::{
 
 use crate::base::DeviceType;
 use crate::base::DataType;
-use crate::model::ModelFactory;
+use crate::model::architectures::llama3;
 use crate::tensor::Tensor;
 
 use super::{Worker, WorkerConfig};
@@ -401,13 +401,13 @@ impl WorkerServer {
         #[cfg(not(feature = "cuda"))]
         let device_type = DeviceType::Cpu;
 
-        // Create model using factory (for now, only Llama3 is supported)
-        let model = match ModelFactory::create_llama3(
+        // Create model using builder function (for now, only Llama3 is supported)
+        let model = match llama3::builder(
             std::path::Path::new(&params.model_path),
             device_type,
             false, // is_quant - TODO: detect from dtype
         ) {
-            Ok(m) => Box::new(m) as Box<dyn crate::model::Model>,
+            Ok(m) => m,
             Err(e) => {
                 return self.make_error(
                     ErrorCode::ModelLoadFailed,

@@ -1,42 +1,35 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
 use std::time::Instant;
 use crate::cuda::CudaConfig;
 use crate::op::{Op, OpContext};
-use super::config::RuntimeModelConfig;
-use super::ModelLoader;
+use crate::model::config::RuntimeModelConfig;
+use crate::model::ModelLoader;
 use crate::tensor::Tensor;
-use super::tokenizer::Tokenizer;
+// use super::tokenizer::Tokenizer; // TODO: Tokenizer module was removed
 use std::boxed::Box;
 use crate::model::{BufferType, Workspace, Model};
 use crate::op::sampler::{Sampler, ArgmaxSampler};
-use super::layers::{DecoderLayers, WeightMapping};
+use crate::model::layers::DecoderLayers;
+// Weight mapping is managed internally by this module
+use crate::model::WeightMappingAdapter;
 // Import KvCache from the kvcache module
-use super::kvcache::{KvCache, KVCachePool, KVCacheConfig};
-
+use crate::model::kvcache::{KVCachePool, KVCacheConfig};
 
 pub struct Llama3 {
-    config: RuntimeModelConfig,
+    config: Arc<RuntimeModelConfig>,
     device_type: DeviceType,
-    tokenizer: Box<dyn Tokenizer>,
-    /// Core decoder layers (shared abstraction with Qwen2)
     layers: DecoderLayers,
-
-    /// KV Cache Pool (Paged 模式）
     kv_cache_pool: KVCachePool,
-    /// 当前 KV 长度
     current_kv_len: usize,
-    /// Block table (GPU) 用于 paged attention
     block_table: Tensor,
-    /// Block size for paged KV cache
     block_size: usize,
-    /// Total number of blocks
     num_total_blocks: usize,
-    /// 工作空间，用于存放中间计算结果，避免频繁分配和释放内存
     workspace: Workspace,
     output_token: Tensor,
     input_pos: Tensor,
@@ -44,7 +37,75 @@ pub struct Llama3 {
     cuda_config: Option<CudaConfig>,
 }
 
-// KvCache is now imported from super::kvcache::KvCache
+// ======================= Llama3 Weight Mapping =======================
+
+/// Llama3 model's weight mapping implementation
+///
+/// Defines how Llama3 maps safetensor weight names to internal layers.
+/// Llama3 uses the following naming convention:
+/// - model.embed_tokens.weight
+/// - model.layers.{layer}.self_attn.q_proj.weight
+/// - model.layers.{layer}.mlp.gate_proj.weight
+/// - model.norm.weight
+/// - lm_head.weight
+#[derive(Debug, Clone)]
+struct Llama3WeightMapping;
+
+impl WeightMappingAdapter for Llama3WeightMapping {
+    fn embedding(&self) -> &'static str {
+        "model.embed_tokens.weight"
+    }
+
+    fn rmsnorm_final(&self) -> &'static str {
+        "model.norm.weight"
+    }
+
+    fn cls(&self) -> &'static str {
+        "lm_head.weight"
+    }
+
+    fn format_layer_weight(&self, layer_idx: usize, weight_name: &str) -> String {
+        format!("model.layers.{}.{}", layer_idx, weight_name)
+    }
+
+    fn attn_q(&self) -> &'static str {
+        "self_attn.q_proj.weight"
+    }
+
+    fn attn_k(&self) -> &'static str {
+        "self_attn.k_proj.weight"
+    }
+
+    fn attn_v(&self) -> &'static str {
+        "self_attn.v_proj.weight"
+    }
+
+    fn attn_o(&self) -> &'static str {
+        "self_attn.o_proj.weight"
+    }
+
+    fn ffn_gate(&self) -> &'static str {
+        "mlp.gate_proj.weight"
+    }
+
+    fn ffn_up(&self) -> &'static str {
+        "mlp.up_proj.weight"
+    }
+
+    fn ffn_down(&self) -> &'static str {
+        "mlp.down_proj.weight"
+    }
+
+    fn rmsnorm_attn(&self) -> &'static str {
+        "input_layernorm.weight"
+    }
+
+    fn rmsnorm_ffn(&self) -> &'static str {
+        "post_attention_layernorm.weight"
+    }
+}
+
+// ======================= Llama3 Implementation =======================
 
 // Llama3 implementation
 
@@ -57,26 +118,26 @@ impl Llama3 {
         let start_time = Instant::now();
         println!("Start calculate time, Loading Llama3 model from directory: {:?}", model_dir.as_ref());
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
-        let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
         let cuda_config = CudaConfig::new()?;
 
+        // Initialize KV Cache Pool (Paged 模式）
+        let block_size = 16;  // 每个 block 16 个 token
+        let num_total_blocks = (config.seq_len + block_size - 1) / block_size;
+
         println!("Creating Llama3 decoder layers...");
 
-        // Use DecoderLayers with Llama weight mapping
+        // Use DecoderLayers with Llama3 weight mapping
+        let weight_mapping = Llama3WeightMapping;
         let layers = DecoderLayers::from_loader(
             &loader,
             &config,
-            &WeightMapping::LLAMA,
+            &weight_mapping,
             device_type,
             is_quant_model,
             block_size,
             num_total_blocks,
         )?;
-
-        // Initialize KV Cache Pool (Paged 模式）
-        let block_size = 16;  // 每个 block 16 个 token
-        let num_total_blocks = (config.seq_len + block_size - 1) / block_size;
         let kv_cache_config = KVCacheConfig::new(
             config.layer_num,
             config.kv_head_num,
@@ -102,9 +163,8 @@ impl Llama3 {
         }
 
         let mut model = Self {
-            config,
+            config: config.into(),
             device_type,
-            tokenizer,
             layers,
             kv_cache_pool,
             current_kv_len: 0,
@@ -304,76 +364,6 @@ impl Llama3 {
         Ok(buffers)
     }
 
-    pub fn generate(
-        &mut self,
-        prompt: &str,
-        max_tokens: usize,
-        print_output: bool,
-    ) -> Result<(String, u32, u64, u64, usize)> {
-        let mut stdout = io::stdout();
-        if print_output {
-            println!("----------------------------------------");
-            println!("Prompt: {}", prompt);
-            stdout.flush()?;
-        }
-        
-        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
-        let prompt_tokens = self.tokenizer.encode(prompt)?;
-        if prompt_tokens.is_empty() {
-            return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
-        }
-        let mut input_tokens_cpu = Tensor::new(&[prompt_tokens.len()], DataType::I32, DeviceType::Cpu)?;
-        input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
-        // Prefill stage - fill KV cache
-        let prefill_start = Instant::now();
-        let mut current_token = self.forward_prefill(&input_tokens_cpu, &input_pos, prompt_tokens.len())?;
-        let prefill_duration = prefill_start.elapsed();
-        let prefill_ms = prefill_duration.as_millis() as u64;
-
-        // Generation stage
-        let mut generated_tokens = vec![current_token];
-        
-        if print_output {
-            let decoded = self.tokenizer.decode(&[current_token])?;
-            let _ = write!(stdout,"{}", decoded);
-            io::stdout().flush().expect("Failed to flush stdout");
-        }
-
-        // Generate tokens starting from the end of the prompt
-        let decode_start = Instant::now();
-        let mut decode_iterations = 0;
-        let mut input_tokens_cpu = input_tokens_cpu.slice(&[0], &[1])?;
-        for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-            input_tokens_cpu.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = self.forward_decoding(&input_tokens_cpu, &input_pos)?;
-
-            if self.tokenizer.is_eos(next_token) {
-                break;
-            }
-
-            generated_tokens.push(next_token);
-            current_token = next_token;
-            decode_iterations += 1;
-            
-            if print_output {
-                let decoded = self.tokenizer.decode(&[current_token])?;
-                let _ = write!(stdout,"{}", decoded);
-                stdout.flush()?;
-            }
-        }
-        let decode_duration = decode_start.elapsed();
-        let decode_ms = decode_duration.as_millis() as u64;
-
-        // 最后输出换行并刷新（可选，让终端提示符回到新行）
-        if print_output {
-            println!();
-        }
-
-        let generated_text = self.tokenizer.decode(&generated_tokens)?;
-        Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
-    }
     fn forward_decoding(&mut self, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
         self.input_pos.copy_from(pos_cpu)?;
         let input_tokens_view = &self.output_token;
@@ -421,10 +411,16 @@ impl Llama3 {
 
             // Get K, V tensors from pool
             let (k_pool_base, v_pool_base) = self.kv_cache_pool.get(i)?;
+            let k_pool_shape = k_pool_base.shape().to_vec();
+            let v_pool_shape = v_pool_base.shape().to_vec();
 
-            // Write K to pool
+            // Write K, V to pool
             let k_write_view = k_temp.slice(&[0, 0], &[1, self.config.kv_dim])?;
-            self.kv_cache_pool.write_kv_to_slot(i, block_idx, slot_idx, &k_write_view, &v_temp)?;
+            let v_write_view = v_temp.slice(&[0, 0], &[1, self.config.kv_dim])?;
+            self.kv_cache_pool.write_kv_to_slot(i, block_idx, slot_idx, &k_write_view, &v_write_view)?;
+
+            // Get K, V references after write
+            let (k_pool_base, v_pool_base) = self.kv_cache_pool.get(i)?;
 
             // Get current KV length buffer
             let kv_len_buffer = self.workspace.get_mut(&BufferType::CurrentKVLen).unwrap();
@@ -525,7 +521,10 @@ impl Llama3 {
 
             // For batch processing, we need to handle KV cache for each sequence separately
             // For now, process each user's KV cache sequentially within the batch
-            let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, total_tokens, self.config.kv_dim)?;
+            // Temporary: K, V cache slicing not yet implemented
+            let (k_cache, v_cache) = self.kv_cache_pool.get_mut(i)?;
+            let mut k = k_cache.slice(&[0, 0], &[total_tokens, self.config.kv_dim])?;
+            let mut v = v_cache.slice(&[0, 0], &[total_tokens, self.config.kv_dim])?;
 
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
             self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
@@ -535,7 +534,7 @@ impl Llama3 {
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
 
-            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
+            let (k_cache_history, v_cache_history) = self.kv_cache_pool.get(i).unwrap();
             let mut attn_out = attn_norm_out; // Reuse buffer
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
 
@@ -603,7 +602,7 @@ impl Llama3 {
         Ok(first_tokens)
     }
 
-    fn forward_prefill(&mut self, tokens: &Tensor, pos_cpu: &Tensor, seq_len:usize) -> Result<i32> {
+    fn forward_prefill(&mut self, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
         let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
         self.input_pos.copy_from(pos_cpu)?;
@@ -618,28 +617,70 @@ impl Llama3 {
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
         )?;
+
         // Process all transformer layers
         for i in 0..self.config.layer_num {
             // Attention Block
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
-            
+
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
+
+            // Compute Q, K, V for all prompt tokens
             self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
-            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
-            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
+
+            // K, V projections to temporary buffers
+            let k_buffer = self.workspace.get_mut(&BufferType::KeyCache).unwrap();
+            let mut k_temp = k_buffer.slice(&[0, 0], &[seq_len, self.config.kv_dim])?;
+            let v_buffer = self.workspace.get_mut(&BufferType::ValueCache).unwrap();
+            let mut v_temp = v_buffer.slice(&[0, 0], &[seq_len, self.config.kv_dim])?;
+
+            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k_temp], cuda_config_ref))?;
+            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v_temp], cuda_config_ref))?;
+
+            // Apply RoPE to K (Q uses full position range for prefill)
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
-            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
+            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut k_temp], cuda_config_ref))?;
+
+            // Write K, V values to KV cache pool for each position
+            // For paged KV cache, we write each token to its slot
+            for token_pos in pos..(pos + seq_len) {
+                let block_idx = token_pos / self.block_size;
+                let slot_idx = token_pos % self.block_size;
+
+                // Get K, V for this specific token position
+                // K, V shape: [seq_len, kv_dim], need to get token_pos-pos row
+                let k_single = k_temp.slice(&[token_pos - pos, 0], &[1, self.config.kv_dim])?;
+                let v_single = v_temp.slice(&[token_pos - pos, 0], &[1, self.config.kv_dim])?;
+
+                // Write to pool
+                self.kv_cache_pool.write_kv_to_slot(i, block_idx, slot_idx, &k_single, &v_single)?;
+            }
+
+            // Get KV cache for paged attention
+            let (k_pool_base, v_pool_base) = self.kv_cache_pool.get(i)?;
+
+            // Get current KV length buffer
+            let kv_len_buffer = self.workspace.get_mut(&BufferType::CurrentKVLen).unwrap();
+            kv_len_buffer.as_i32_mut()?.as_slice_mut()?[0] = (pos + seq_len) as i32;
+
+            // Paged Attention using 4D KV cache
             let mut attn_out = attn_norm_out; // Reuse buffer
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[
+                &q,
+                k_pool_base,  // 4D: [num_blocks, block_size, num_kv_heads, head_dim]
+                v_pool_base,
+                &self.block_table,
+                kv_len_buffer,
+            ], &mut [&mut attn_out], cuda_config_ref))?;
+
             let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
+
             // FFN Block
             let mut ffn_norm_out = attn_out; // Reuse buffer
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
@@ -655,14 +696,18 @@ impl Llama3 {
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
         }
+
+        // Update KV length after prefill
+        self.current_kv_len = pos + seq_len;
+
         // Extract last token's hidden state
         let last_hidden_state_view = x.slice(&[seq_len - 1, 0], &[1, self.config.dim])?;
-        
+
         // Prepare for final norm and classifier
         let final_norm_input_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
         let mut final_norm_input = final_norm_input_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         final_norm_input.copy_from(&last_hidden_state_view)?;
-        
+
         // Final Norm and classifier
         let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
@@ -671,7 +716,7 @@ impl Llama3 {
             &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
         )?;
         let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        
+
         self.layers.cls_layer.forward(
             &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
         )?;
@@ -700,67 +745,50 @@ impl Llama3 {
         })
     }
 
-    /// Get reference to the tokenizer
-    pub fn tokenizer(&self) -> &dyn Tokenizer {
-        self.tokenizer.as_ref()
-    }
-
     /// Get the device type used by this model
     pub fn device(&self) -> DeviceType {
         self.device_type
     }
 }
 
-// ============================================================================
-//  Model Trait Implementation
-// ============================================================================
+/// Builder function for Llama3 models
+/// 
+/// This function creates a new Llama3 model instance and returns it as a Box<dyn Model>
+/// which can be used with the ModelRegistry.
+/// 
+/// # Arguments
+/// * `model_dir` - Path to the model directory containing config.json and weights
+/// * `device_type` - Device to run the model on (CPU or CUDA)
+/// * `is_quant_model` - Whether the model is quantized
+/// 
+/// # Returns
+/// A Box containing the model instance implementing the Model trait
+pub fn builder(
+    model_dir: &Path,
+    device_type: DeviceType,
+    is_quant_model: bool,
+) -> Result<Box<dyn Model>> {
+    let model = Llama3::new(model_dir, device_type, is_quant_model)?;
+    Ok(Box::new(model))
+}
+
+// ============================================================================ //  Model Trait Implementation // ============================================================================
 
 impl Model for Llama3 {
     fn config(&self) -> &RuntimeModelConfig {
         &self.config
     }
 
-    fn forward(&mut self, input: &Tensor, pos: &Tensor) -> Result<Tensor> {
-        // Determine if this is a single token (decoding) or multiple tokens (prefill)
-        let seq_len = input.shape()[0];
-
-        if seq_len == 1 {
-            // Single token - decoding mode
-            let token_id = self.forward_decoding(input, pos)?;
-            // Return the token ID as a tensor
-            let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            output.as_i32_mut()?.as_slice_mut()?[0] = token_id;
-            Ok(output)
-        } else {
-            // Multiple tokens - prefill mode
-            let token_id = self.forward_prefill(input, pos, seq_len)?;
-            let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            output.as_i32_mut()?.as_slice_mut()?[0] = token_id;
-            Ok(output)
-        }
-    }
-
-    fn forward_with_cache(
-        &mut self,
-        input: &Tensor,
-        start_pos: usize,
-        seq_len: usize,
-    ) -> Result<Tensor> {
-        // Create position tensor from start_pos
-        let mut pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        pos.as_i32_mut()?.as_slice_mut()?[0] = start_pos as i32;
-
-        if seq_len == 1 {
-            let token_id = self.forward_decoding(input, &pos)?;
-            let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            output.as_i32_mut()?.as_slice_mut()?[0] = token_id;
-            Ok(output)
-        } else {
-            let token_id = self.forward_prefill(input, &pos, seq_len)?;
-            let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            output.as_i32_mut()?.as_slice_mut()?[0] = token_id;
-            Ok(output)
-        }
+    fn forward_paged(
+            &mut self,
+            input_tokens: &Tensor,
+            positions: &Tensor,
+            block_tables: &[Vec<u32>],
+            slot_mapping: &Tensor,
+            context_lens: &[usize],
+            is_prefill: bool,
+        ) -> Result<Tensor> {
+        unimplemented!("Paged forward not yet implemented for Llama3.");
     }
 
     fn reset_kv_cache(&mut self) -> Result<()> {
@@ -770,235 +798,7 @@ impl Model for Llama3 {
         Ok(())
     }
 
-    fn slice_kv_cache(
-        &mut self,
-        layer_idx: usize,
-        start_pos: usize,
-        len: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        self.kv_cache.slice_kv_cache(layer_idx, start_pos as i32, len, self.config.kv_dim)
-    }
-
     fn device_type(&self) -> DeviceType {
         self.device_type
-    }
-}
-
-// ============================================================================
-//  集成测试 (Integration Tests)
-// ============================================================================
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-    use crate::base::error::Result;
-
-    /// Helper struct for performance metrics
-    #[derive(Debug, Clone)]
-    struct PerformanceMetrics {
-        pub total_compute_ms: f64,
-        pub cuda_tps: f64,
-        pub prefill_throughput: f64,
-        pub decode_avg_itl: f64,
-        pub decode_throughput: f64,
-        pub prompt_tokens_len: f64,
-        pub generated_tokens_len: f64,
-    }
-
-    /// Calculate performance metrics from generation results
-    fn calculate_performance_metrics(
-        prompt_tokens_len: f64,
-        generated_tokens_len: f64,
-        prefill_ms: u64,
-        decode_ms: u64,
-        decode_iterations: usize,
-    ) -> PerformanceMetrics {
-        let total_tokens = prompt_tokens_len + generated_tokens_len;
-        let total_compute_ms = (prefill_ms + decode_ms) as f64;
-
-        let cuda_tps = if total_compute_ms > 0.0 {
-            total_tokens / (total_compute_ms / 1000.0)
-        } else {
-            0.0
-        };
-
-        let prefill_throughput = if prefill_ms > 0 {
-            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        let decode_avg_itl = if decode_iterations > 0 {
-            decode_ms as f64 / decode_iterations as f64
-        } else {
-            0.0
-        };
-
-        let decode_throughput = if decode_ms > 0 {
-            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        PerformanceMetrics {
-            total_compute_ms,
-            cuda_tps,
-            prefill_throughput,
-            decode_avg_itl,
-            decode_throughput,
-            prompt_tokens_len,
-            generated_tokens_len,
-        }
-    }
-
-    /// 辅助函数：执行生成并返回 (生成的文本, 耗时(毫秒), 生成的Token数)
-    fn generate_and_measure(
-        model: &mut Llama3,
-        prompt: &str,
-        max_tokens: usize,
-        verbose: bool
-    ) -> Result<(String, u64, u32, u64, u64, usize)> {
-
-        let start_time = Instant::now();
-        let (generated_text, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = model.generate(prompt, max_tokens, verbose)?;
-        let duration = start_time.elapsed();
-        let duration_ms = duration.as_millis() as u64;
-
-        Ok((generated_text, duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations))
-    }
-
-    #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
-    fn test_llama3_cpu_loading_and_generation() -> Result<()> {
-        // --- 1. Arrange (准备) ---
-        let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Dummy model directory not found.");
-
-        println!("Loading model on CPU...");
-        let mut model = Llama3::new(
-            model_path,
-            DeviceType::Cpu,
-            false // is_quant_model
-        )?;
-        println!("Model loaded.");
-
-        // --- 2. Act (执行) ---
-        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-Cutting Knowledge Date: December 2023
-Today Date: 14 Dec 2025
-
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let max_tokens = 150;
-
-        println!("Starting CPU generation...");
-        let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
-
-        // --- 3. Assert & Report (断言 & 报告) ---
-        assert!(num_generated_tokens > 0, "No tokens were generated.");
-
-        // 计算性能指标
-        let prompt_tokens = model.tokenizer.encode(prompt)?;
-        let prompt_tokens_len = prompt_tokens.len() as f64;
-        let generated_tokens_len = num_generated_tokens as f64;
-
-        let metrics = calculate_performance_metrics(
-            prompt_tokens_len,
-            generated_tokens_len,
-            prefill_ms,
-            decode_ms,
-            decode_iterations,
-        );
-
-        println!("\n================ CPU PERFORMANCE ================");
-        println!("Total Generation Time (compute only): {:.0} ms", metrics.total_compute_ms);
-        println!("Generated Tokens: {}, Prompt Tokens: {}", num_generated_tokens, metrics.prompt_tokens_len as usize);
-        println!("Total Tokens: {}, Tokens Per Second (TPS): {:.2}",
-            (metrics.prompt_tokens_len + metrics.generated_tokens_len) as usize,
-            metrics.cuda_tps);
-        println!("Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, metrics.prefill_throughput);
-        println!("Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", metrics.decode_avg_itl, metrics.decode_throughput);
-        println!("==================================================\n");
-
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_llama3_cuda_performance() -> Result<()> {
-    // 1. 准备工作
-    let model_path = get_dummy_model_path();
-    assert!(model_path.exists(), "Dummy model directory not found.");
-
-    let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-    let max_tokens = 2000;
-
-    // 2. 仅初始化一次模型
-    println!("\n=== Initializing Model on CUDA (Only Once) ===");
-    let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-
-    // 预计算 Prompt Tokens
-    let prompt_tokens = model_cuda.tokenizer.encode(prompt)?;
-    let prompt_tokens_len = prompt_tokens.len() as f64;
-
-    // 3. 循环运行三次测试
-    for i in 1..=3 {
-        println!("\n>>> Running Test Round {}/3", i);
-
-        // 执行推理并测量
-        // 假设 prefill_ms 和 decode_ms 返回的是 u64
-        let (_cuda_generated_text, _cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = 
-            generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
-
-        // --- 修正后的计算逻辑：显式转换类型 ---
-        let generated_tokens_len = cuda_num_tokens as f64;
-        let total_tokens = prompt_tokens_len + generated_tokens_len;
-        
-        // 将 u64 转换为 f64 进行计算
-        let prefill_ms_f = prefill_ms as f64;
-        let decode_ms_f = decode_ms as f64;
-        let total_compute_ms_f = prefill_ms_f + decode_ms_f;
-        
-        let cuda_tps = if total_compute_ms_f > 0.0 {
-            total_tokens / (total_compute_ms_f / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let prefill_throughput = if prefill_ms > 0 { // u64 比较用 0
-            prompt_tokens_len / (prefill_ms_f / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let decode_avg_itl = if decode_iterations > 0 {
-            decode_ms_f / (decode_iterations as f64)
-        } else {
-            0.0
-        };
-        
-        let decode_throughput = if decode_ms > 0 { // u64 比较用 0
-            (decode_iterations as f64) / (decode_ms_f / 1000.0)
-        } else {
-            0.0
-        };
-
-        // 4. 输出单次成绩
-        println!("================ PERFORMANCE ROUND {} ================", i);
-        println!("CUDA - Total Time (compute): {} ms, Total Tokens: {}, TPS: {:.2}", total_compute_ms_f as u64, total_tokens as usize, cuda_tps);
-        println!("CUDA - Generated Tokens: {}, Prompt Tokens: {}", cuda_num_tokens, prompt_tokens_len as usize);
-        println!("CUDA - Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms_f, prefill_throughput);
-        println!("CUDA - Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
-        println!("======================================================\n");
-    }
-
-    Ok(())
-}
-    // 辅助函数，获取虚拟模型的路径
-    fn get_dummy_model_path() -> &'static Path {
-        Path::new("/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct")
     }
 }

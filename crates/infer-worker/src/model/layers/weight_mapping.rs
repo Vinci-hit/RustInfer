@@ -1,110 +1,33 @@
-// src/model/layers/weight_mapping.rs
+// Weight mapping abstraction for different model architectures
 //
-// Weight mapping for different model architectures
-// Maps generic layer names to model-specific safetensor keys
+// Each model architecture is responsible for implementing its own weight mapping
+// strategy to handle differences in naming conventions across model families.
 
-/// Maps generic layer names to model-specific weight names in safetensors
+use crate::model::ModelLoader;
+use crate::base::error::Result;
+
+/// Abstract weight mapping interface for model architectures
 ///
 /// Different model families use different naming conventions for their weights.
 /// For example:
-/// - Llama: "model.layers.{layer}.self_attn.q_proj.weight"
-/// - Qwen2: "model.layers.{layer}.self_attn.q_proj.weight" (same as Llama)
+/// - Llama/Mistral: "model.layers.{layer}.self_attn.q_proj.weight"
+/// - Qwen: Similar to Llama
+/// - Phi: Different naming conventions
 ///
-/// This struct provides a centralized mapping to handle these variations.
-#[derive(Debug, Clone)]
-pub struct WeightMapping {
-    /// Token embedding layer weight name
+/// Each model architecture should implement this trait to define how to map
+/// generic layer names to model-specific safetensor keys.
+pub trait WeightMappingAdapter: Send + Sync {
+    /// Get the embedding layer weight name
     /// e.g., "model.embed_tokens.weight"
-    pub embedding: &'static str,
+    fn embedding(&self) -> &'static str;
 
-    /// Final RMSNorm layer weight name
+    /// Get the final RMSNorm layer weight name
     /// e.g., "model.norm.weight"
-    pub rmsnorm_final: &'static str,
+    fn rmsnorm_final(&self) -> &'static str;
 
-    /// Classification/language model head weight name
+    /// Get the classification/language model head weight name
     /// e.g., "lm_head.weight"
-    pub cls: &'static str,
-
-    /// Prefix for transformer layers
-    /// e.g., "model.layers" (will be formatted as "model.layers.{layer}")
-    pub layer_prefix: &'static str,
-
-    // Per-layer weight names (use {layer} placeholder for layer index)
-
-    /// Query projection weight name
-    /// e.g., "self_attn.q_proj.weight"
-    pub attn_q: &'static str,
-
-    /// Key projection weight name
-    /// e.g., "self_attn.k_proj.weight"
-    pub attn_k: &'static str,
-
-    /// Value projection weight name
-    /// e.g., "self_attn.v_proj.weight"
-    pub attn_v: &'static str,
-
-    /// Output projection weight name
-    /// e.g., "self_attn.o_proj.weight"
-    pub attn_o: &'static str,
-
-    /// FFN gate projection weight name (w1)
-    /// e.g., "mlp.gate_proj.weight"
-    pub ffn_gate: &'static str,
-
-    /// FFN up projection weight name (w3)
-    /// e.g., "mlp.up_proj.weight"
-    pub ffn_up: &'static str,
-
-    /// FFN down projection weight name (w2)
-    /// e.g., "mlp.down_proj.weight"
-    pub ffn_down: &'static str,
-
-    /// Attention RMSNorm weight name
-    /// e.g., "input_layernorm.weight"
-    pub rmsnorm_attn: &'static str,
-
-    /// FFN RMSNorm weight name
-    /// e.g., "post_attention_layernorm.weight"
-    pub rmsnorm_ffn: &'static str,
-}
-
-impl WeightMapping {
-    /// Llama3 weight mapping (standard Llama family)
-    pub const LLAMA: WeightMapping = WeightMapping {
-        embedding: "model.embed_tokens.weight",
-        rmsnorm_final: "model.norm.weight",
-        cls: "lm_head.weight",
-        layer_prefix: "model.layers",
-        attn_q: "self_attn.q_proj.weight",
-        attn_k: "self_attn.k_proj.weight",
-        attn_v: "self_attn.v_proj.weight",
-        attn_o: "self_attn.o_proj.weight",
-        ffn_gate: "mlp.gate_proj.weight",
-        ffn_up: "mlp.up_proj.weight",
-        ffn_down: "mlp.down_proj.weight",
-        rmsnorm_attn: "input_layernorm.weight",
-        rmsnorm_ffn: "post_attention_layernorm.weight",
-    };
-
-    /// Qwen2 weight mapping (uses same naming as Llama)
-    pub const QWEN2: WeightMapping = WeightMapping {
-        embedding: "model.embed_tokens.weight",
-        rmsnorm_final: "model.norm.weight",
-        cls: "lm_head.weight",
-        layer_prefix: "model.layers",
-        attn_q: "self_attn.q_proj.weight",
-        attn_k: "self_attn.k_proj.weight",
-        attn_v: "self_attn.v_proj.weight",
-        attn_o: "self_attn.o_proj.weight",
-        ffn_gate: "mlp.gate_proj.weight",
-        ffn_up: "mlp.up_proj.weight",
-        ffn_down: "mlp.down_proj.weight",
-        rmsnorm_attn: "input_layernorm.weight",
-        rmsnorm_ffn: "post_attention_layernorm.weight",
-    };
-
-    /// Mistral weight mapping (same as Llama)
-    pub const MISTRAL: WeightMapping = Self::LLAMA;
+    fn cls(&self) -> &'static str;
 
     /// Format a layer-specific weight name
     ///
@@ -114,7 +37,49 @@ impl WeightMapping {
     ///
     /// # Returns
     /// Formatted weight name (e.g., "model.layers.0.self_attn.q_proj.weight")
-    pub fn format_layer_weight(&self, layer_idx: usize, weight_name: &str) -> String {
-        format!("{}.{}.{}", self.layer_prefix, layer_idx, weight_name)
+    fn format_layer_weight(&self, layer_idx: usize, weight_name: &str) -> String;
+
+    /// Query projection weight name
+    /// e.g., "self_attn.q_proj.weight"
+    fn attn_q(&self) -> &'static str;
+
+    /// Key projection weight name
+    /// e.g., "self_attn.k_proj.weight"
+    fn attn_k(&self) -> &'static str;
+
+    /// Value projection weight name
+    /// e.g., "self_attn.v_proj.weight"
+    fn attn_v(&self) -> &'static str;
+
+    /// Output projection weight name
+    /// e.g., "self_attn.o_proj.weight"
+    fn attn_o(&self) -> &'static str;
+
+    /// FFN gate projection weight name (w1)
+    /// e.g., "mlp.gate_proj.weight"
+    fn ffn_gate(&self) -> &'static str;
+
+    /// FFN up projection weight name (w3)
+    /// e.g., "mlp.up_proj.weight"
+    fn ffn_up(&self) -> &'static str;
+
+    /// FFN down projection weight name (w2)
+    /// e.g., "mlp.down_proj.weight"
+    fn ffn_down(&self) -> &'static str;
+
+    /// Attention RMSNorm weight name
+    /// e.g., "input_layernorm.weight"
+    fn rmsnorm_attn(&self) -> &'static str;
+
+    /// FFN RMSNorm weight name
+    /// e.g., "post_attention_layernorm.weight"
+    fn rmsnorm_ffn(&self) -> &'static str;
+
+    /// Verify that all required weights are present in the loader
+    ///
+    /// Optional method for stricter validation.
+    /// Implement if the model needs to validate weight presence.
+    fn verify_weights(&self, _loader: &ModelLoader) -> Result<()> {
+        Ok(())
     }
 }

@@ -65,7 +65,7 @@ unsafe extern "C" {
         stream: cuda::ffi::cudaStream_t,
     );
     // PagedAttention kernels
-    pub fn flash_attn_gqa_paged_bf16_cu(
+    pub fn flash_attn_gqa_paged_cu(
         q_ptr: *const half::bf16,
         k_ptr: *const half::bf16,
         v_ptr: *const half::bf16,
@@ -301,7 +301,7 @@ pub unsafe fn flash_attn_gqa_paged(
             let kv_block_stride = block_size;
 
             unsafe {
-                flash_attn_gqa_paged_bf16_cu(
+                flash_attn_gqa_paged_cu(
                     q_ptr,
                     k_ptr,
                     v_ptr,
