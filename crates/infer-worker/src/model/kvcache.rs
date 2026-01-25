@@ -36,6 +36,7 @@
 //! ```ignore
 //! use infer_protocol::InitKVCacheParams;
 //!
+//! // Scheduler creates and sends these parameters to the Worker
 //! let params = InitKVCacheParams {
 //!     num_blocks: 1000,
 //!     block_size: 16,
@@ -46,6 +47,7 @@
 //!     use_unified_memory_pool: true,
 //! };
 //!
+//! // Worker receives params and creates KV cache with them
 //! let kv_cache = KVCachePool::from_protocol_params(&params, DeviceType::Cuda(0))?;
 //! ```
 
@@ -66,10 +68,16 @@ fn parse_dtype(dtype_str: &str) -> DataType {
 
 /// Configuration for KV Cache initialization
 ///
-/// This can be created from:
-/// - Direct construction with `KVCacheConfig::new()`
-/// - From model config with `KVCacheConfig::from_model_config()`
-/// - From protocol params with `KVCacheConfig::from_protocol_params()`
+/// Created from Protocol parameters received from the Scheduler, which is the
+/// source of truth for all KV cache configuration in the system.
+///
+/// The Scheduler determines:
+/// - num_layers, num_heads, head_size - from model metadata
+/// - dtype - from model config
+/// - num_blocks, block_size - from memory allocation strategy and configuration
+///
+/// The Worker receives these values via InitKVCacheParams and uses them to
+/// create the appropriate KVCacheConfig for memory allocation.
 #[derive(Debug, Clone)]
 pub struct KVCacheConfig {
     /// Number of transformer layers
@@ -106,31 +114,10 @@ impl KVCacheConfig {
         }
     }
 
-    /// Create KVCacheConfig from RuntimeModelConfig with custom block settings
-    pub fn from_model_config(
-        model_config: &crate::model::config::RuntimeModelConfig,
-        block_size: usize,
-        num_blocks: usize,
-    ) -> Self {
-        let dtype = match model_config.torch_dtype.as_str() {
-            "bfloat16" => DataType::BF16,
-            "float16" => DataType::F16,
-            _ => DataType::F32,
-        };
-
-        Self {
-            num_layers: model_config.layer_num,
-            num_kv_heads: model_config.kv_head_num,
-            head_size: model_config.head_size,
-            dtype,
-            block_size,
-            num_blocks,
-        }
-    }
-
     /// Create KVCacheConfig from infer_protocol::InitKVCacheParams
     ///
-    /// This is the preferred method when initializing from Scheduler commands.
+    /// This is the standard way to create KVCacheConfig. The Scheduler is the source of truth
+    /// for these parameters and sends them to the Worker for each inference session.
     #[cfg(feature = "protocol")]
     pub fn from_protocol_params(params: &infer_protocol::InitKVCacheParams) -> Self {
         Self {

@@ -489,8 +489,8 @@ impl WorkerServer {
     /// Handle InitKVCache command
     fn handle_init_kv_cache(&mut self, params: InitKVCacheParams) -> WorkerResponse {
         println!(
-            "[Worker-{}] Initializing KV Cache: {} blocks x {} size",
-            self.rank, params.num_blocks, params.block_size
+            "[Worker-{}] Initializing KV Cache: {} blocks x {} size (dtype: {})",
+            self.rank, params.num_blocks, params.block_size, params.dtype
         );
         let start_time = Instant::now();
 
@@ -502,8 +502,8 @@ impl WorkerServer {
             );
         }
 
-        // Initialize KV cache
-        if let Err(e) = self.worker.init_kv_cache(params.num_blocks, params.block_size) {
+        // Initialize KV cache with scheduler parameters
+        if let Err(e) = self.worker.init_kv_cache(&params) {
             return self.make_error(
                 ErrorCode::KVCacheInitFailed,
                 format!("Failed to init KV cache: {}", e),
@@ -584,8 +584,29 @@ impl WorkerServer {
             }
         };
 
-        // Execute forward pass - returns sampled token_id directly (sampling is done inside model)
-        let output_token = match self.worker.forward(&input_tokens, &positions) {
+        // Execute forward pass with PagedAttention
+        // TODO: Integrate with Scheduler's block_tables and slot_mapping
+        // For now, construct minimal paged attention parameters
+        let block_tables = vec![]; // Placeholder
+        let slot_mapping = match create_i32_tensor(&[], self.worker.device_type()) {
+            Ok(t) => t,
+            Err(e) => {
+                return self.make_error(
+                    ErrorCode::ForwardFailed,
+                    format!("Failed to create slot mapping: {}", e),
+                );
+            }
+        };
+        let context_lens = vec![];
+
+        let output_token = match self.worker.forward(
+            &input_tokens,
+            &positions,
+            &block_tables,
+            &slot_mapping,
+            &context_lens,
+            params.is_prefill,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 return self.make_error(

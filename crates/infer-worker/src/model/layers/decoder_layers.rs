@@ -114,25 +114,25 @@ impl DecoderLayers {
         // Load per-layer weights
         for i in 0..layer_num {
             wq_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.attn_q),
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_q()),
                 loader,
                 device_type,
                 stream
             )?);
             wk_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.attn_k),
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_k()),
                 loader,
                 device_type,
                 stream
             )?);
             wv_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.attn_v),
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_v()),
                 loader,
                 device_type,
                 stream
             )?);
             wo_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.attn_o),
+                &weight_mapping.format_layer_weight(i, weight_mapping.attn_o()),
                 loader,
                 device_type,
                 stream
@@ -140,19 +140,19 @@ impl DecoderLayers {
 
             // FFN weights
             w1_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_gate),
+                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_gate()),
                 loader,
                 device_type,
                 stream
             )?);
             w3_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_up),
+                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_up()),
                 loader,
                 device_type,
                 stream
             )?);
             w2_layers.push(Self::load_matmul_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_down),
+                &weight_mapping.format_layer_weight(i, weight_mapping.ffn_down()),
                 loader,
                 device_type,
                 stream
@@ -160,14 +160,14 @@ impl DecoderLayers {
 
             // Normalization layers
             rmsnorm_attn_layers.push(Self::load_rmsnorm_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_attn),
+                &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_attn()),
                 loader,
                 device_type,
                 stream,
                 config.rms_norm_eps,
             )?);
             rmsnorm_ffn_layers.push(Self::load_rmsnorm_async(
-                &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_ffn),
+                &weight_mapping.format_layer_weight(i, weight_mapping.rmsnorm_ffn()),
                 loader,
                 device_type,
                 stream,
@@ -178,13 +178,13 @@ impl DecoderLayers {
         
         let (embedding_layer, rmsnorm_final_layer, cls_layer) = {
             let embedding_layer = Self::load_embedding_async(
-                weight_mapping.embedding,
+                weight_mapping.embedding(),
                 loader,
                 device_type,
                 stream
             )?;
             let rmsnorm_final_layer = Self::load_rmsnorm_async(
-                weight_mapping.rmsnorm_final,
+                weight_mapping.rmsnorm_final(),
                 loader,
                 device_type,
                 stream,
@@ -192,12 +192,12 @@ impl DecoderLayers {
             )?;
 
             // Load or tie classification layer
-            let cls_layer = if tensor_names.contains(weight_mapping.cls) {
-                println!("Found independent '{}'. Loading it.", weight_mapping.cls);
-                Self::load_matmul_async(weight_mapping.cls, loader, device_type, stream)?
+            let cls_layer = if tensor_names.contains(weight_mapping.cls()) {
+                println!("Found independent '{}'. Loading it.", weight_mapping.cls());
+                Self::load_matmul_async(weight_mapping.cls(), loader, device_type, stream)?
             } else {
                 println!("'{}' not found. Reusing token embedding weights (tied weights).",
-                    weight_mapping.cls);
+                    weight_mapping.cls());
                 Matmul::from(embedding_layer.weight.clone(), None)
             };
 

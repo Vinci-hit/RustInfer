@@ -743,9 +743,6 @@ pub struct InitKVCacheParams {
 
     /// KVCache的数据类型: "bf16", "fp16", "fp32", "int8"
     pub dtype: String,
-
-    /// 是否使用统一的显存池 (true: 预分配一大块, false: 按需分配)
-    pub use_unified_memory_pool: bool,
 }
 
 /// KVCache初始化完成信息

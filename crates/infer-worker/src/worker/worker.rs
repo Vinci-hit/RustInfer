@@ -254,22 +254,22 @@ impl Worker {
         Ok(())
     }
 
-    /// Initialize the KV cache pool
+    /// Initialize the KV cache pool from Scheduler parameters
     ///
-    /// This should be called after model loading and profiling to determine
-    /// the optimal cache size.
-    pub fn init_kv_cache(&mut self, num_blocks: usize, block_size: usize) -> Result<()> {
-        let model = self.model.as_ref()
+    /// The Scheduler provides all necessary KV cache configuration parameters.
+    /// This should be called after model loading.
+    #[cfg(feature = "protocol")]
+    pub fn init_kv_cache(&mut self, params: &infer_protocol::InitKVCacheParams) -> Result<()> {
+        let _ = self.model.as_ref()
             .ok_or_else(|| Error::InvalidArgument("Model not loaded".to_string()))?;
 
-        // Get configuration from model
-        let model_config = model.config();
-        let kv_config = KVCacheConfig::from_model_config(model_config, block_size, num_blocks);
+        // Create KV cache config from scheduler parameters (source of truth)
+        let kv_config = KVCacheConfig::from_protocol_params(params);
 
         println!(
             "Initializing KV Cache: {} blocks x {} = {} max tokens, {:.2} GB",
-            num_blocks,
-            block_size,
+            params.num_blocks,
+            params.block_size,
             kv_config.max_seq_len(),
             kv_config.total_memory_gb()
         );
@@ -289,48 +289,26 @@ impl Worker {
         Ok(())
     }
 
-    /// Execute a forward pass on input tokens
-    ///
-    /// This is the core inference method for the Worker. Tokenization should
-    /// be done by the Server layer before calling this.
-    ///
-    /// # Arguments
-    /// * `input_tokens` - Token IDs tensor
-    /// * `positions` - Position tensor for each token
-    ///
-    /// # Returns
-    /// Logits tensor for the output
-    pub fn forward(&mut self, input_tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
-        self.state = WorkerState::Processing;
-
-        let model = self.model.as_mut()
-            .ok_or_else(|| Error::InvalidArgument("Model not loaded".to_string()))?;
-
-        let result = model.forward(input_tokens, positions);
-
-        self.state = WorkerState::Ready;
-        result
-    }
-
-    /// Execute a forward pass with explicit cache management
-    ///
-    /// This is used for continuous batching where KV cache positions
-    /// are managed externally by the Scheduler.
-    pub fn forward_with_cache(
+    pub fn forward(
         &mut self,
         input_tokens: &Tensor,
-        start_pos: usize,
-        seq_len: usize,
+        positions: &Tensor,
+        block_tables: &[Vec<u32>],
+        slot_mapping: &Tensor,
+        context_lens: &[usize],
+        is_prefill: bool,
     ) -> Result<Tensor> {
-        self.state = WorkerState::Processing;
-
         let model = self.model.as_mut()
             .ok_or_else(|| Error::InvalidArgument("Model not loaded".to_string()))?;
 
-        let result = model.forward_with_cache(input_tokens, start_pos, seq_len);
-
-        self.state = WorkerState::Ready;
-        result
+        model.forward_paged(
+            input_tokens,
+            positions,
+            block_tables,
+            slot_mapping,
+            context_lens,
+            is_prefill,
+        )
     }
 
     /// Reset KV cache state
@@ -350,15 +328,6 @@ impl Worker {
         self.memory_stats.free = self.device_info.free_memory;
         self.memory_stats.used = self.device_info.used_memory;
 
-        Ok(())
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    pub fn refresh_memory_stats(&mut self) -> Result<()> {
-        // For CPU, just update from device info
-        self.memory_stats.total = self.device_info.total_memory;
-        self.memory_stats.free = self.device_info.free_memory;
-        self.memory_stats.used = self.device_info.used_memory;
         Ok(())
     }
 
