@@ -1278,7 +1278,7 @@ How are you<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         println!("  Sequential Decode (all users): {:.2}ms", total_decode_time);
         println!("  Total Time: {:.2}ms", total_time);
         println!("----------------------------------------------------------");
-
+        
         let mut total_tokens = 0;
         let mut total_decode_ms = 0u64;
 
