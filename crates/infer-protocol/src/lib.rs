@@ -519,6 +519,22 @@ pub struct FinishOutput {
     // 注意: 不包含 num_tokens，因为 Server 可以自己统计
 }
 
+/// 采样输出 (Sampler 输出)
+///
+/// Model forward_paged 返回 logits，Sampler 基于 SamplingParams 生成此结果。
+/// 包含一个批次内所有请求的采样结果。
+#[derive(Debug, Clone)]
+pub struct SamplingOutput {
+    /// 采样得到的 token ID，形状 [batch_size]
+    pub next_token_ids: Vec<i32>,
+
+    /// 每个请求是否已停止，形状 [batch_size]
+    pub is_stopped: Vec<bool>,
+
+    /// 停止原因，形状 [batch_size]
+    pub finish_reasons: Vec<FinishReason>,
+}
+
 /// 结束原因
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FinishReason {
@@ -769,45 +785,66 @@ pub struct KVCacheInfo {
 /// Forward推理参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardParams {
-    /// Batch中的请求ID列表
-    pub request_ids: Vec<String>,
+    // ==================== 基础数据 (Flattened) ====================
+    
+    /// 所有请求的 token 拼成的一维数组。
+    /// 形状: [total_batch_tokens]
+    pub input_ids: Vec<i32>,
 
-    /// 输入token IDs [batch_size, seq_len]
-    pub token_ids: Vec<Vec<i32>>,
+    /// 对应的位置索引，用于 RoPE。
+    /// 形状: [total_batch_tokens]
+    /// 必须显式传入，因为 Continuous Batching 下位置是不连续的。
+    pub position_ids: Vec<i32>,
 
-    /// 每个请求的位置IDs [batch_size, seq_len]
-    pub position_ids: Vec<Vec<i32>>,
+    // ==================== 调度元数据 (Metadata) ====================
 
-    /// 分配的KVCache block IDs [batch_size, num_blocks_per_seq]
-    pub kv_cache_block_ids: Vec<Vec<u32>>,
+    /// 告诉 Kernel 这一批里有多少个是 Decoding，多少个是 Prefill
+    /// 这决定了 input_ids 的切分点：input_ids[0..num_decode_tokens] 是 Decode 的
+    pub num_decode_tokens: usize,
+    pub num_prefill_tokens: usize,
 
-    /// 是否为prefill阶段
-    pub is_prefill: bool,
+    // ==================== PagedAttention 核心 (读) ====================
 
-    /// Sampling参数
-    pub sampling_params: SamplingParams,
+    /// 块表 (Block Table)。拍扁的一维数组。
+    /// 形状: [batch_size, max_num_blocks_per_seq]
+    /// 用于 Kernel 读取历史 KV。
+    pub block_tables: Vec<u32>, 
 
-    /// 是否返回logits (调试用)
-    pub return_logits: bool,
+    /// 每个请求的 Block Table 有效长度 (或者 max_blocks stride)
+    /// 用于在 block_tables 中寻址: row_offset = req_idx * max_blocks_per_req
+    pub max_blocks_per_req: usize,
+
+    /// 每个请求的历史上下文长度 (Context Length)。
+    /// 形状: [batch_size]
+    /// 用于 Attention Mask 和判断循环边界。
+    pub context_lens: Vec<u32>,
+
+    // ==================== PagedAttention 核心 (写) ====================
+    
+    /// 槽位映射 (Slot Mapping)。
+    /// 形状: [total_batch_tokens]
+    /// 含义：当前的 input_ids[i] 计算出的 KV 应该写入到哪个物理位置？
+    /// 格式通常是: physical_block_idx * block_size + offset_in_block
+    pub slot_mapping: Vec<i32>,
+
+    // ==================== 采样参数 ====================
+    
+    /// 采样只需要针对每个 Request 的最后一个 Token
+    /// 这里只传索引：input_ids 中的哪些下标是 Request 的末尾？
+    pub selected_token_indices: Vec<u32>,
+    
+    /// 具体的采样参数 (Temperature, TopP 等)，按 Request 顺序排列
+    pub sampling_params: Vec<SamplingParams>,
 }
 
 /// Forward推理结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardResult {
-    /// 采样得到的下一个token IDs [batch_size]
+    // 形状: [batch_size]
     pub next_token_ids: Vec<i32>,
-
-    /// 每个请求是否已完成
-    pub finished: Vec<bool>,
-
-    /// Logits (可选) [batch_size, vocab_size]
-    pub logits: Option<Vec<Vec<f32>>>,
-
-    /// 推理耗时 (ms)
-    pub inference_time_ms: u64,
-
-    /// 使用的KVCache blocks数量
-    pub num_kv_blocks_used: usize,
+    
+    // 形状: [batch_size]
+    pub is_stopped: Vec<bool>,
 }
 
 // ==================== Worker Status ====================

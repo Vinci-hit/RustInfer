@@ -532,111 +532,67 @@ impl WorkerServer {
 
     /// Handle Forward command
     fn handle_forward(&mut self, params: ForwardParams) -> WorkerResponse {
-        let start_time = Instant::now();
-        let batch_size = params.token_ids.len();
-
-        // Ensure model and KV cache are ready
+        // 1. 基础检查
         if !self.worker.is_model_loaded() {
-            return self.make_error(
-                ErrorCode::InvalidState,
-                "Model not loaded".to_string(),
-            );
-        }
-        if !self.worker.is_kv_cache_initialized() {
-            return self.make_error(
-                ErrorCode::InvalidState,
-                "KV cache not initialized".to_string(),
-            );
+            return self.make_error(ErrorCode::InvalidState, "Model not loaded".to_string());
         }
 
-        // For now, handle single sequence (batch_size = 1)
-        // TODO: Support batched inference
-        if batch_size != 1 {
-            return self.make_error(
-                ErrorCode::InvalidParams,
-                format!("Batch size {} not supported yet, use 1", batch_size),
-            );
-        }
+        // 2. 准备 Device 上下文
+        let device = self.worker.device_type();
 
-        let token_ids = &params.token_ids[0];
-        let position_ids = &params.position_ids[0];
-        let device_type = self.worker.device_type();
+        // 计算 Batch Size (请求数量)
+        // 注意：在 Continuous Batching 下，Batch Size = context_lens.len()，而不是 input_ids.len()
+        let batch_size = params.context_lens.len();
 
-        // Create input tensor from token_ids
-        let input_tokens = match create_i32_tensor(token_ids, device_type) {
+        // ==================== Step 1: 核心 Tensor 构建 ====================
+
+        // Input IDs [total_tokens] -> GPU
+        let input_tokens = match Tensor::from_slice(&params.input_ids, device) {
             Ok(t) => t,
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Failed to create input tensor: {}", e),
-                );
-            }
+            Err(e) => return self.make_error(ErrorCode::ForwardFailed, format!("Input tensor error: {}", e)),
         };
 
-        // Create position tensor from position_ids
-        let positions = match create_i32_tensor(position_ids, device_type) {
+        // Position IDs [total_tokens] -> GPU
+        let positions = match Tensor::from_slice(&params.position_ids, device) {
             Ok(t) => t,
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Failed to create position tensor: {}", e),
-                );
-            }
+            Err(e) => return self.make_error(ErrorCode::ForwardFailed, format!("Pos tensor error: {}", e)),
         };
 
-        // Execute forward pass with PagedAttention
-        // TODO: Integrate with Scheduler's block_tables and slot_mapping
-        // For now, construct minimal paged attention parameters
-        let block_tables = vec![]; // Placeholder
-        let slot_mapping = match create_i32_tensor(&[], self.worker.device_type()) {
-            Ok(t) => t,
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Failed to create slot mapping: {}", e),
-                );
-            }
-        };
-        let context_lens = vec![];
+        // ==================== Step 2: Attention Metadata 构建 ====================
 
-        let output_token = match self.worker.forward(
+        // Context Lens [batch_size] - already u32 in ForwardParams
+        let context_lens = &params.context_lens;
+
+        // Block Tables - pass as-is (flattened), no allocation/conversion
+        let block_tables = &params.block_tables;
+
+        // Slot Mapping [total_tokens] -> GPU
+        let slot_mapping = match Tensor::from_slice(&params.slot_mapping, device) {
+            Ok(t) => t,
+            Err(e) => return self.make_error(ErrorCode::ForwardFailed, format!("SlotMap error: {}", e)),
+        };
+
+        // ==================== Step 3: 执行 Model Forward ====================
+
+        // 执行 forward 调用
+        // Model forward returns logits tensor [vocab_size] for this batch
+        let logits_result = self.worker.forward(
             &input_tokens,
             &positions,
-            &block_tables,
+            // Paged Attention 参数 (zero-copy, no allocation)
+            block_tables,
+            params.max_blocks_per_req,
             &slot_mapping,
-            &context_lens,
-            params.is_prefill,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Forward pass failed: {}", e),
-                );
-            }
+            context_lens,
+            // 标记是否 Prefill
+            params.num_prefill_tokens > 0,
+        );
+
+        let logits = match logits_result {
+            Ok(t) => return t,
+            Err(e) => return self.make_error(ErrorCode::ForwardFailed, format!("Forward execution failed: {}", e)),
         };
 
-        // Get sampled token ID from the forward output
-        // The model's forward() already includes sampling, returning token_id as I32 tensor
-        let next_token_id = match output_token.as_i32().and_then(|t| t.as_slice()) {
-            Ok(v) => v[0],
-            Err(e) => {
-                return self.make_error(
-                    ErrorCode::ForwardFailed,
-                    format!("Failed to get output token: {}", e),
-                );
-            }
-        };
-
-        let inference_time_ms = start_time.elapsed().as_millis() as u64;
-
-        WorkerResponse::ForwardCompleted(ForwardResult {
-            next_token_ids: vec![next_token_id],
-            finished: vec![false], // TODO: Check for EOS
-            logits: None, // TODO: Support return_logits
-            inference_time_ms,
-            num_kv_blocks_used: params.kv_cache_block_ids[0].len(),
-        })
     }
 
     /// Handle GetStatus command

@@ -160,6 +160,30 @@ impl Tensor {
         }
     }
 
+    /// Create a Tensor from an external slice without taking ownership
+    ///
+    /// This method uses `Buffer::from_external_slice()` internally, which means
+    /// the returned Tensor holds a reference to the original slice data.
+    /// The slice must remain valid for as long as the Tensor is used.
+    ///
+    /// # Arguments
+    /// * `slice` - The data slice to wrap
+    /// * `device` - Target device (currently only CPU is supported for external slices)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let data = vec![1.0f32, 2.0f32, 3.0f32];
+    /// let tensor = Tensor::from_slice(&data, DeviceType::Cpu)?;
+    /// assert_eq!(tensor.shape(), &[3]);
+    /// ```
+    pub fn from_slice<T: Dtype>(slice: &[T], _device: DeviceType) -> Result<Self> {
+        // Create a Buffer from the external slice (doesn't take ownership)
+        let buffer = unsafe { Buffer::from_external_slice(slice) };
+        let shape = &[slice.len()];
+        // Reuse the existing from_buffer implementation with the dtype from T
+        Self::from_buffer(buffer, shape, T::DTYPE)
+    }
+
     /// 返回张量的形状
     pub fn shape(&self) -> &[usize] {
         dispatch_on_tensor!(self, shape())

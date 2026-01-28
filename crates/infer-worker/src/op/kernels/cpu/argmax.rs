@@ -35,3 +35,69 @@ pub fn argmax(logits: &Tensor,output_token:&mut Tensor) -> Result<()> {
     output_slice[0] = max_idx as i32;
     Ok(())
 }
+
+/// Batch argmax on CPU
+///
+/// Input: logits [batch_size, vocab_size]
+/// Output: token_ids [batch_size], each element is the argmax of corresponding row
+pub fn argmax_batch(logits: &Tensor, output_tokens: &mut Tensor) -> Result<()> {
+    let shape = logits.shape();
+    if shape.len() != 2 {
+        return Err(Error::InvalidArgument(
+            format!("Expected 2D logits [batch_size, vocab_size], got shape {:?}", shape)
+        ).into());
+    }
+
+    let batch_size = shape[0];
+    let vocab_size = shape[1];
+
+    let output_slice = output_tokens.as_i32_mut()?.as_slice_mut()?;
+    if output_slice.len() != batch_size {
+        return Err(Error::InvalidArgument(
+            format!("Output size {} != batch_size {}", output_slice.len(), batch_size)
+        ).into());
+    }
+
+    match logits.dtype() {
+        DataType::BF16 => {
+            let logits_data = logits.as_bf16()?.as_slice()?;
+            for batch_idx in 0..batch_size {
+                let row_start = batch_idx * vocab_size;
+                let row_end = row_start + vocab_size;
+                let row = &logits_data[row_start..row_end];
+
+                let max_idx = row.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+
+                output_slice[batch_idx] = max_idx as i32;
+            }
+        }
+        DataType::F32 => {
+            let logits_data = logits.as_f32()?.as_slice()?;
+            for batch_idx in 0..batch_size {
+                let row_start = batch_idx * vocab_size;
+                let row_end = row_start + vocab_size;
+                let row = &logits_data[row_start..row_end];
+
+                let max_idx = row.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+
+                output_slice[batch_idx] = max_idx as i32;
+            }
+        }
+        unsupported_dtype => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported dtype {:?} for CPU argmax_batch kernel.",
+                unsupported_dtype
+            )).into());
+        }
+    }
+
+    Ok(())
+}

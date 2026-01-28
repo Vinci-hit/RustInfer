@@ -2,6 +2,9 @@
 
 ## 更新说明
 
+### 20260127
+1、为Tensor新增from_slice方法
+
 ### 20260125
 改善了Profile和InitKVCache逻辑，为后续工作做好准备。
 

@@ -74,7 +74,8 @@ pub trait Model: Send + Sync {
     /// # Arguments
     /// * `input_tokens` - Input token IDs tensor, shape [num_tokens]
     /// * `positions` - Position tensor for each token
-    /// * `block_tables` - Block table for each sequence, shape [num_seqs, max_blocks]
+    /// * `block_tables` - Flattened block table [batch_size * max_blocks_per_req]
+    /// * `max_blocks_per_req` - Stride for block table access (blocks per request)
     /// * `slot_mapping` - Mapping from token positions to physical slots
     /// * `context_lens` - Context length for each sequence
     /// * `is_prefill` - True if this is prefill phase, false for decode
@@ -85,9 +86,10 @@ pub trait Model: Send + Sync {
         &mut self,
         input_tokens: &Tensor,
         positions: &Tensor,
-        block_tables: &[Vec<u32>],
+        block_tables: &[u32],
+        max_blocks_per_req: usize,
         slot_mapping: &Tensor,
-        context_lens: &[usize],
+        context_lens: &[u32],
         is_prefill: bool,
     ) -> Result<Tensor>;
 

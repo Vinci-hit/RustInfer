@@ -783,9 +783,10 @@ impl Model for Llama3 {
             &mut self,
             input_tokens: &Tensor,
             positions: &Tensor,
-            block_tables: &[Vec<u32>],
+            block_tables: &[u32],
+            max_blocks_per_req: usize,
             slot_mapping: &Tensor,
-            context_lens: &[usize],
+            context_lens: &[u32],
             is_prefill: bool,
         ) -> Result<Tensor> {
         unimplemented!("Paged forward not yet implemented for Llama3.");
