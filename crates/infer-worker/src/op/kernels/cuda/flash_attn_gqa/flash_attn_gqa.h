@@ -72,17 +72,14 @@ void flash_attn_gqa_paged_cu(
     const __nv_bfloat16* k_ptr,
     const __nv_bfloat16* v_ptr,
     __nv_bfloat16* o_ptr,
-    const int32_t* block_table,
+    const int32_t* slot_mapping,
+    const int32_t* kv_indptr,
+    int32_t batch_size,
     int32_t q_seq_len,
-    int32_t kv_seq_len,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
-    int32_t block_size,
-    int32_t num_total_blocks,
-    int max_num_blocks_per_seq,
-    int block_table_batch_stride,
-    int kv_block_stride,
+    float sm_scale,
     cudaStream_t stream
 );
 void launch_flash_attn_cute_128x64x64_tile(

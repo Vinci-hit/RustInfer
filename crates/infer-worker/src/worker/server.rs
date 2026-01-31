@@ -63,7 +63,7 @@ use infer_protocol::{
     ModelLoadParams, ModelLoadedInfo,
     ProfileParams, ProfileResult,
     InitKVCacheParams, KVCacheInfo,
-    ForwardParams, ForwardResult,
+    ForwardParams,
     WorkerStatus,
     WorkerState as ProtocolWorkerState,
     MemoryStats as ProtocolMemoryStats,
@@ -73,7 +73,7 @@ use infer_protocol::{
 
 use crate::base::DeviceType;
 use crate::base::DataType;
-use crate::model::architectures::llama3;
+use crate::model::architectures::llama3::Llama3;
 use crate::tensor::Tensor;
 
 use super::{Worker, WorkerConfig};
@@ -401,13 +401,14 @@ impl WorkerServer {
         #[cfg(not(feature = "cuda"))]
         let device_type = DeviceType::Cpu;
 
-        // Create model using builder function (for now, only Llama3 is supported)
-        let model = match llama3::builder(
+        // Create model using Llama3::new directly
+        let model: Box<dyn crate::model::Model> = match Llama3::new(
             std::path::Path::new(&params.model_path),
             device_type,
-            false, // is_quant - TODO: detect from dtype
+            128,  // max_batch_size - TODO: from config
+            16,   // block_size - TODO: from config
         ) {
-            Ok(m) => m,
+            Ok(m) => Box::new(m),
             Err(e) => {
                 return self.make_error(
                     ErrorCode::ModelLoadFailed,
@@ -540,10 +541,6 @@ impl WorkerServer {
         // 2. 准备 Device 上下文
         let device = self.worker.device_type();
 
-        // 计算 Batch Size (请求数量)
-        // 注意：在 Continuous Batching 下，Batch Size = context_lens.len()，而不是 input_ids.len()
-        let batch_size = params.context_lens.len();
-
         // ==================== Step 1: 核心 Tensor 构建 ====================
 
         // Input IDs [total_tokens] -> GPU
@@ -584,15 +581,16 @@ impl WorkerServer {
             params.max_blocks_per_req,
             &slot_mapping,
             context_lens,
-            // 标记是否 Prefill
-            params.num_prefill_tokens > 0,
+            params.num_decode_tokens
         );
 
-        let logits = match logits_result {
-            Ok(t) => return t,
+        let sampling_output = match logits_result {
+            Ok(output) => output,
             Err(e) => return self.make_error(ErrorCode::ForwardFailed, format!("Forward execution failed: {}", e)),
         };
 
+        // ==================== Step 4: 返回采样结果 ====================
+        WorkerResponse::ForwardCompleted(sampling_output)
     }
 
     /// Handle GetStatus command

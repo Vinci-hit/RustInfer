@@ -47,7 +47,7 @@ use crate::base::error::{Error, Result};
 use crate::base::DeviceType;
 use crate::model::kvcache::{KVCacheConfig, KVCachePool};
 use crate::model::Model;
-use crate::op::Op;
+use crate::op::sampler::Sampler;
 use crate::tensor::Tensor;
 use infer_protocol::SamplingOutput;
 
@@ -162,9 +162,12 @@ pub struct Worker {
     /// CUDA configuration (streams, handles, etc.)
     #[cfg(feature = "cuda")]
     cuda_config: Option<CudaConfig>,
-    /// Pre-allocated output tensor for sampling [max_batch_size] (I32)
-    /// Initialized during init_kv_cache, reused on every forward call
-    output_token_ids: Option<Tensor>,
+    /// Pre-allocated output tensor for sampling [16] (I32)
+    /// Fixed batch size of 16, reused on every forward call
+    output_token_ids: Tensor,
+    /// Argmax sampler (initialized during new)
+    /// Reused on every forward call (zero allocation)
+    argmax_sampler: crate::op::sampler::ArgmaxSampler,
     /// Memory statistics
     memory_stats: MemoryStats,
     /// Performance statistics
@@ -187,6 +190,16 @@ impl Worker {
 
         println!("Worker {} initialized on device: {}", config.worker_id, device_info);
 
+        // Pre-allocate output tensor for batch sampling [16] (I32)
+        let output_token_ids = Tensor::new(
+            &[16],
+            crate::base::DataType::I32,
+            config.device_type,
+        )?;
+
+        // Create argmax sampler (only one type for now)
+        let argmax_sampler = crate::op::sampler::ArgmaxSampler::new(config.device_type);
+
         Ok(Self {
             config,
             state: WorkerState::Uninitialized,
@@ -195,7 +208,8 @@ impl Worker {
             kv_cache: None,
             #[cfg(feature = "cuda")]
             cuda_config: None,
-            output_token_ids: None,
+            output_token_ids,
+            argmax_sampler,
             memory_stats: MemoryStats::default(),
             perf_stats: PerformanceStats::default(),
             model_load_time_ms: 0,
@@ -268,7 +282,6 @@ impl Worker {
     ///
     /// The Scheduler provides all necessary KV cache configuration parameters.
     /// This should be called after model loading.
-    /// Also pre-allocates the output tensor for batch sampling (reused on every forward call).
     #[cfg(feature = "protocol")]
     pub fn init_kv_cache(&mut self, params: &infer_protocol::InitKVCacheParams) -> Result<()> {
         let _ = self.model.as_ref()
@@ -293,20 +306,10 @@ impl Worker {
         self.memory_stats.kv_cache_memory = kv_cache.memory_bytes() as u64;
         self.kv_cache = Some(kv_cache);
 
-        // Pre-allocate output tensor for batch sampling [max_batch_size] (I32)
-        // Max batch size = num_blocks (each request occupies at least 1 block)
-        let max_batch_size = params.num_blocks;
-        self.output_token_ids = Some(Tensor::new(
-            &[max_batch_size],
-            crate::base::DataType::I32,
-            self.config.device_type,
-        )?);
-
         // Update memory stats
         self.refresh_memory_stats()?;
 
-        println!("KV Cache initialized in {} ms, output tensor pre-allocated for batch_size={}",
-            init_time_ms, max_batch_size);
+        println!("KV Cache initialized in {} ms", init_time_ms);
 
         Ok(())
     }
@@ -319,7 +322,7 @@ impl Worker {
         max_blocks_per_req: usize,
         slot_mapping: &Tensor,
         context_lens: &[u32],
-        is_prefill: bool,
+        decode_tokens: usize,
     ) -> Result<SamplingOutput> {
         let model = self.model.as_mut()
             .ok_or_else(|| Error::InvalidArgument("Model not loaded".to_string()))?;
@@ -332,30 +335,17 @@ impl Worker {
             max_blocks_per_req,
             slot_mapping,
             context_lens,
-            is_prefill,
+            decode_tokens,
         )?;
 
         // Step 2: Extract batch size from logits
         let batch_size = logits.shape()[0];
 
-        // Step 3: Get pre-allocated output tensor
-        let output_token_ids = self.output_token_ids.as_mut()
-            .ok_or_else(|| Error::InvalidArgument(
-                "Output tensor not initialized. Call init_kv_cache() first.".to_string()
-            ))?;
+        // Step 3: Execute argmax sampling on GPU/CPU
+        self.argmax_sampler.sample(&logits, &mut self.output_token_ids, None)?;
 
-        // Step 4: Create sampler (using default ArgmaxSampler for now)
-        let sampler = Box::new(crate::op::sampler::ArgmaxSampler::new(self.config.device_type));
-        let sampler_op = crate::op::sampler::SamplerOp::new(sampler);
-
-        // Step 5: Execute sampling on GPU/CPU
-        let inputs = [&logits];
-        let mut outputs = [output_token_ids];
-        let mut ctx = crate::op::OpContext::new(&inputs, &mut outputs, None);
-        sampler_op.forward(&mut ctx)?;
-
-        // Step 6: Copy sampled token IDs from device to CPU (only first batch_size elements)
-        let next_token_ids = match output_token_ids.as_i32() {
+        // Step 4: Copy sampled token IDs from device to CPU (only first batch_size elements)
+        let next_token_ids = match self.output_token_ids.as_i32() {
             Ok(token_tensor) => {
                 let all_tokens = token_tensor.as_slice()?;
                 all_tokens[..batch_size].to_vec()
@@ -365,7 +355,7 @@ impl Worker {
             ).into()),
         };
 
-        // Step 7: Return SamplingOutput
+        // Step 5: Return SamplingOutput
         // TODO: Determine finish_reasons based on token IDs and sampling parameters
         Ok(SamplingOutput {
             next_token_ids,

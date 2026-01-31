@@ -523,7 +523,7 @@ pub struct FinishOutput {
 ///
 /// Model forward_paged 返回 logits，Sampler 基于 SamplingParams 生成此结果。
 /// 包含一个批次内所有请求的采样结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingOutput {
     /// 采样得到的 token ID，形状 [batch_size]
     pub next_token_ids: Vec<i32>,
@@ -611,7 +611,7 @@ pub enum WorkerResponse {
     KVCacheInitialized(KVCacheInfo),
 
     /// Forward执行完成
-    ForwardCompleted(ForwardResult),
+    ForwardCompleted(SamplingOutput),
 
     /// Worker状态
     Status(WorkerStatus),
@@ -799,9 +799,8 @@ pub struct ForwardParams {
     // ==================== 调度元数据 (Metadata) ====================
 
     /// 告诉 Kernel 这一批里有多少个是 Decoding，多少个是 Prefill
-    /// 这决定了 input_ids 的切分点：input_ids[0..num_decode_tokens] 是 Decode 的
+    /// 这决定了 input_ids 的切分点：input_ids[0..num_decode_tokens] 是 Decode 的，然后len - num_decode_tokens 是 Prefill 的
     pub num_decode_tokens: usize,
-    pub num_prefill_tokens: usize,
 
     // ==================== PagedAttention 核心 (读) ====================
 

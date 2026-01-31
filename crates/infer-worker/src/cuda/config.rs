@@ -15,7 +15,6 @@ pub struct CudaConfig {
     pub cublas_handle_v2: ffi::cublasHandle_t,
     pub workspace: *mut c_void,
     pub workspace_size: usize,
-    pub cuda_graph: Option<CudaGraph>,
     // pub cudnn_handle: cudnnHandle_t,   // (未来)
 }
 #[derive(Debug)]
@@ -29,6 +28,18 @@ impl Drop for CudaGraph {
             ffi::cudaGraphExecDestroy(self.exec);
             ffi::cudaGraphDestroy(self.graph);
         }
+    }
+}
+
+// CudaGraph contains raw pointers but CUDA graphs are internally thread-safe
+unsafe impl Send for CudaGraph {}
+unsafe impl Sync for CudaGraph {}
+impl CudaGraph{
+    pub fn launch(&self,stream: ffi::cudaStream_t) -> Result<()> {
+        unsafe {
+            crate::cuda_check!(ffi::cudaGraphLaunch(self.exec, stream))?;
+        }
+        Ok(())
     }
 }
 
@@ -52,9 +63,7 @@ impl CudaConfig {
         let workspace_size = 32 * 1024 * 1024; // 32MB
         unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut workspace, workspace_size))? };
 
-        let cuda_graph = None;
-
-        Ok(Self { stream, cublaslt_handle, cublas_handle_v2, workspace, workspace_size, cuda_graph })
+        Ok(Self { stream, cublaslt_handle, cublas_handle_v2, workspace, workspace_size})
     }
 }
 
@@ -101,27 +110,14 @@ impl CudaConfig {
         Ok(())
     }
 
-    pub fn capture_graph_end(&mut self) -> Result<()> {
+    pub fn capture_graph_end(&mut self) -> Result<CudaGraph> {
         unsafe {
             let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
             crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
 
             let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
             crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
-
-            self.cuda_graph = Some(CudaGraph { graph, exec });
-        }
-        Ok(())
-    }
-
-    pub fn launch_graph(&self) -> Result<()> {
-        if let Some(cuda_graph) = &self.cuda_graph {
-            unsafe {
-                crate::cuda_check!(ffi::cudaGraphLaunch(cuda_graph.exec, self.stream))?;
-            }
-            Ok(())
-        } else {
-            Err(crate::base::error::Error::InvalidArgument("CUDA graph not captured".to_string()).into())
+            Ok(CudaGraph { graph, exec })
         }
     }
 

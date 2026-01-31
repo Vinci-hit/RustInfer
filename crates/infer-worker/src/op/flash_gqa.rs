@@ -3,7 +3,7 @@ use crate::base::DeviceType;
 use crate::op::{kernels, Op, OpContext};
 
 /// Flash Attention (高性能注意力机制) 的 GQA (Grouped-Query Attention) 算子。
-/// 使用 PagedAttention 模式，KV cache 以 block 形式存储。
+/// 使用 PagedAttention 模式，KV cache 以 slot_mapping 形式访问。
 pub struct FlashAttnGQA {
     /// Query 头数量
     pub num_q_heads: usize,
@@ -11,27 +11,19 @@ pub struct FlashAttnGQA {
     pub num_kv_heads: usize,
     /// 单个 Attention Head 的维度
     pub head_dim: usize,
-    /// Paged 模式下的 block_size
-    pub block_size: usize,
-    /// Paged 模式下的总 block 数量
-    pub num_total_blocks: usize,
 }
 
 impl FlashAttnGQA {
-    /// 创建一个新的 FlashAttnGQA 算子（Paged 模式）。
+    /// 创建一个新的 FlashAttnGQA 算子。
     ///
     /// # Arguments
     /// * `num_q_heads` - Query 头数量
     /// * `num_kv_heads` - Key/Value 头数量
     /// * `head_dim` - 单个 Attention Head 的维度
-    /// * `block_size` - 每个 block 的 token 数量
-    /// * `num_total_blocks` - 总 block 数量
-    pub fn new_paged(
+    pub fn new(
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-        block_size: usize,
-        num_total_blocks: usize,
     ) -> Result<Self> {
         if !num_q_heads.is_multiple_of(num_kv_heads) {
             return Err(Error::InvalidArgument(format!(
@@ -43,18 +35,7 @@ impl FlashAttnGQA {
             num_q_heads,
             num_kv_heads,
             head_dim,
-            block_size,
-            num_total_blocks,
         })
-    }
-
-    /// 保持旧方法用于向后兼容
-    pub fn new(
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) -> Result<Self> {
-        Self::new_paged(num_q_heads, num_kv_heads, head_dim, 16, 1000)
     }
 }
 
@@ -64,29 +45,29 @@ impl Op for FlashAttnGQA {
         "FlashAttnGQA"
     }
 
-    /// 执行 Flash Attention GQA 的前向计算（Paged 模式）
+    /// 执行 Flash Attention GQA 的前向计算（使用 slot_mapping 模式）
     ///
-    /// **Paged 输入约定 (5个输入):**
-    /// 0. Q_tensor: [Q_SeqLen, Q_HiddenDim]
-    /// 1. K_cache: [num_blocks, block_size, num_kv_heads, head_dim] (KV Cache 全部内存)
-    /// 2. V_cache: [num_blocks, block_size, num_kv_heads, head_dim] (V Cache 全部内存)
-    /// 3. block_table: [max_blocks_per_seq] I32 存储物理 block 索引
-    /// 4. KV_Len_tensor: [1] I32 存储当前 KV 长度
+    /// **输入约定 (5个输入):**
+    /// 0. Q_tensor: [batch_size, q_seq_len, num_q_heads * head_dim] 或 [q_seq_len, num_q_heads * head_dim]
+    /// 1. K_cache: [total_slots, num_kv_heads, head_dim]
+    /// 2. V_cache: [total_slots, num_kv_heads, head_dim]
+    /// 3. slot_mapping: [total_tokens] I32 物理 slot 索引
+    /// 4. kv_indptr: [batch_size + 1] I32 CSR-style 索引
     fn forward(&self, ctx: &mut OpContext) -> Result<()> {
         // ==================== 1. 检查逻辑 ====================
 
         // --- a. 检查输入输出数量 (5 输入，1 输出) ---
         if ctx.inputs.len() != 5 || ctx.outputs.len() != 1 {
             return Err(Error::InvalidArgument(
-                "FlashAttnGQA (paged) expects 5 inputs (Q, K_Cache, V_Cache, block_table, KV_Len) and 1 output (O)".into()
+                "FlashAttnGQA expects 5 inputs (Q, K_Cache, V_Cache, slot_mapping, kv_indptr) and 1 output (O)".into()
             ).into());
         }
 
         let input_q = &ctx.inputs[0];
         let input_k_cache = &ctx.inputs[1];
         let input_v_cache = &ctx.inputs[2];
-        let input_block_table = &ctx.inputs[3];
-        let input_kv_len = &ctx.inputs[4];
+        let input_slot_mapping = &ctx.inputs[3];
+        let input_kv_indptr = &ctx.inputs[4];
         let output_o = &mut ctx.outputs[0];
 
         // --- b. 检查设备和数据类型 ---
@@ -98,62 +79,44 @@ impl Op for FlashAttnGQA {
         let v_shape = input_v_cache.shape();
         let o_shape = output_o.shape();
 
-        // 1. 检查维度数量
-        if q_shape.len() != 2 || o_shape.len() != 2 {
-            return Err(Error::InvalidArgument("Q/O must be 2D [SeqLen, Dim].".into()).into());
-        }
-        if k_shape.len() != 4 || v_shape.len() != 4 {
-            return Err(Error::InvalidArgument("K/V Cache must be 4D [num_blocks, block_size, num_kv_heads, head_dim].".into()).into());
+        // 推断 batch_size 和 q_seq_len
+        let (batch_size, q_seq_len) = if q_shape.len() == 3 {
+            (q_shape[0], q_shape[1])
+        } else if q_shape.len() == 2 {
+            (1, q_shape[0])
+        } else {
+            return Err(Error::InvalidArgument("Q must be 2D [SeqLen, Dim] or 3D [Batch, SeqLen, Dim].".into()).into());
+        };
+
+        // KV cache: [total_slots, num_kv_heads, head_dim]
+        if k_shape.len() != 3 || v_shape.len() != 3 {
+            return Err(Error::InvalidArgument("K/V Cache must be 3D [total_slots, num_kv_heads, head_dim].".into()).into());
         }
 
-        // 2. 检查隐藏层维度
+        // 检查隐藏层维度
         let expected_q_dim = self.num_q_heads * self.head_dim;
-        let expected_kv_dim = self.num_kv_heads * self.head_dim;
+        let q_last_dim = q_shape[q_shape.len() - 1];
+        let o_last_dim = o_shape[o_shape.len() - 1];
 
-        if q_shape[1] != expected_q_dim || o_shape[1] != expected_q_dim {
+        if q_last_dim != expected_q_dim || o_last_dim != expected_q_dim {
             return Err(Error::InvalidArgument(format!(
                 "Q/O last dimension mismatch. Expected {} (NQ*DH), got Q {} and O {}.",
-                expected_q_dim, q_shape[1], o_shape[1]
+                expected_q_dim, q_last_dim, o_last_dim
             )).into());
         }
-        if k_shape[3] != self.head_dim || v_shape[3] != self.head_dim {
+        if k_shape[2] != self.head_dim || v_shape[2] != self.head_dim {
             return Err(Error::InvalidArgument(format!(
                 "K/V Cache head_dim mismatch. Expected {}, got K {} and V {}.",
-                self.head_dim, k_shape[3], v_shape[3]
+                self.head_dim, k_shape[2], v_shape[2]
             )).into());
-        }
-
-        // 3. 提取 SeqLen
-        let q_seq_len = q_shape[0];
-
-        // --- 从 KV_Len 张量中获取当前有效长度 ---
-        let current_kv_len = input_kv_len.as_i32()?.as_slice()?[0] as usize;
-
-        // 4. 检查序列长度的一致性和有效性
-        if output_o.shape()[0] != q_seq_len {
-            return Err(Error::InvalidArgument("O SeqLen must match Q SeqLen.".into()).into());
         }
 
         // ==================== 2. 分派到内核 ====================
         match device {
-            DeviceType::Cpu => {
-                // CPU 回退：使用标准 kernel（不支持 paged）
-                kernels::cpu::flash_attn_gqa(
-                    input_q,
-                    input_k_cache, // 将 4D 展平为 2D 使用
-                    input_v_cache,
-                    output_o,
-                    q_seq_len,
-                    current_kv_len,
-                    self.num_q_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-            }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                // 使用 PagedAttention kernel
-                let block_table_ptr = input_block_table.as_i32()?.buffer().as_ptr() as *const i32;
+                let slot_mapping_ptr = input_slot_mapping.as_i32()?.buffer().as_ptr() as *const i32;
+                let kv_indptr_ptr = input_kv_indptr.as_i32()?.buffer().as_ptr() as *const i32;
 
                 unsafe {
                     kernels::cuda::flash_attn_gqa_paged(
@@ -161,20 +124,18 @@ impl Op for FlashAttnGQA {
                         input_k_cache,
                         input_v_cache,
                         output_o,
-                        block_table_ptr,
+                        slot_mapping_ptr,
+                        kv_indptr_ptr,
+                        batch_size,
                         q_seq_len,
-                        current_kv_len,
                         self.num_q_heads,
                         self.num_kv_heads,
                         self.head_dim,
-                        self.block_size,
-                        self.num_total_blocks,
                         ctx.cuda_config,
                     )?;
                 }
             }
-            #[cfg(not(feature = "cuda"))]
-            _ => Err(Error::Unimplemented("Device type not supported.".into())),
+            _ => return Err(Error::Unimplemented("Device type not supported.".into()).into()),
         }
 
         Ok(())

@@ -15,87 +15,22 @@ pub use layers::{DecoderLayers, WeightMappingAdapter};
 pub use kvcache::{KVCachePool, KVCacheConfig};
 pub use loader::model_loader::{ModelLoader, TensorLocation, DType};
 
-
-
-
+use crate::cuda::config::CudaGraph;
 use crate::{base::DeviceType, tensor::Tensor};
 use crate::base::error::Result;
 
-/// Model trait for inference execution in Worker
-///
-/// This trait defines the core interface for running model inference with PagedAttention.
-/// All inference MUST use forward_paged() for continuous batching support.
-///
-/// # Design Philosophy
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────────┐
-/// │                     Server (infer-server)                       │
-/// │  - Text encoding/decoding (Tokenizer)                          │
-/// │  - Request handling and response formatting                    │
-/// │  - EOS token detection                                         │
-/// └────────────────────────┬────────────────────────────────────────┘
-///                          │ token_ids: Vec<i32>
-///                          ▼
-/// ┌─────────────────────────────────────────────────────────────────┐
-/// │                     Scheduler (infer-scheduler)                 │
-/// │  - Request batching and scheduling                             │
-/// │  - Block allocation via RadixCache                             │
-/// │  - Token pool management                                        │
-/// └────────────────────────┬────────────────────────────────────────┘
-///                          │ ForwardRequest with block_table
-///                          ▼
-/// ┌─────────────────────────────────────────────────────────────────┐
-/// │                     Worker (infer-worker)                       │
-/// │  - Model forward pass: forward_paged() ONLY (this trait)       │
-/// │  - KV cache management via KVCachePool                         │
-/// │  - Block-based attention (PagedAttention)                      │
-/// └─────────────────────────────────────────────────────────────────┘
-/// ```
-///
-/// # PagedAttention Architecture
-///
-/// For continuous batching with PagedAttention:
-/// - `block_table`: List of physical block indices for each sequence
-/// - `slot_mapping`: Mapping from logical positions to physical slots
-/// - `context_lens`: Context length for each sequence in the batch
-///
-/// The model uses these to access the correct KV cache blocks.
 pub trait Model: Send + Sync {
     /// Get the model configuration
     fn config(&self) -> &config::RuntimeModelConfig;
 
-    /// Execute a forward pass with PagedAttention (the ONLY forward method)
-    ///
-    /// This is the exclusive entry point for inference with continuous batching.
-    /// The Scheduler provides block tables that map logical positions to
-    /// physical blocks in the KVCachePool.
-    ///
-    /// # Arguments
-    /// * `input_tokens` - Input token IDs tensor, shape [num_tokens]
-    /// * `positions` - Position tensor for each token
-    /// * `block_tables` - Flattened block table [batch_size * max_blocks_per_req]
-    /// * `max_blocks_per_req` - Stride for block table access (blocks per request)
-    /// * `slot_mapping` - Mapping from token positions to physical slots
-    /// * `context_lens` - Context length for each sequence
-    /// * `is_prefill` - True if this is prefill phase, false for decode
-    ///
-    /// # Returns
-    /// Logits tensor for sampled positions
     fn forward_paged(
         &mut self,
         input_tokens: &Tensor,
         positions: &Tensor,
-        block_tables: &[u32],
-        max_blocks_per_req: usize,
         slot_mapping: &Tensor,
         context_lens: &[u32],
-        is_prefill: bool,
+        decode_tokens: usize,
     ) -> Result<Tensor>;
-
-    /// Reset KV cache state (e.g., for new sequence)
-    fn reset_kv_cache(&mut self) -> Result<()>;
-
     /// Get the device type this model is running on
     fn device_type(&self) -> DeviceType;
 
@@ -117,41 +52,183 @@ pub trait Model: Send + Sync {
     }
 }
 
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BufferType {
-    // Input and Embedding
-    InputTokens,      // (CPU)
-    InputEmbeddings,
-    InputPos,         // (CPU)
-
-    // Caches for RoPE
-    SinCache,
-    CosCache,
-
-    // Buffers for Attention block
-    Query,
-    AttnScores,       // Storage for QK^T scores
-    AttnOutput,       // Output of the attention mechanism (can reuse Query buffer)
-
-    // Buffers for FFN block
-    W1Output,
-    W3Output,
-
-    // Reusable general-purpose buffers of specific shapes
-    RmsOutput,        // General buffer for RMSNorm outputs, shape [dim]
+#[derive(Debug)]
+pub struct Workspace {
+    // 必需 buffer（推理核心路径）
+    pub query: Tensor,
+    pub key_cache: Tensor,
+    pub value_cache: Tensor,
+    pub attn_output: Tensor,
     
-    // Final model output
-    ForwardOutput,
-    ForwardOutputCpu, // (CPU, only for CUDA execution)
+    // 可选 buffer（按需分配，避免浪费）
+    pub sin_cache: Tensor,
+    pub cos_cache: Tensor,
+    pub rms_output: Tensor,
 
-    KeyCache,
-    ValueCache,
+    // 预定义的桶大小，例如 [1, 2, 4, 8, ..., 128]，当请求到来时进行二分查找，寻找最接近的桶
+    ordered_buckets: Vec<usize>,
+    
+    // 静态分配的显存（Static Workspace）
+    // 所有的 Graph 都绑定到这些内存地址上
+    // [max_bs]
+    static_input_ids: Tensor,
+    // [max_bs]
+    static_positions: Tensor,
+    // [max_bs, max_blocks_per_req]
+    static_block_tables: Tensor,
+    // [max_bs]
+    static_slot_mapping: Tensor,
+    // [max_bs,vocab_size]
+    static_output: Tensor,
 
-    IntermediateBuffer1,
-    BlockTable,
-    CurrentKVLen,
+    graphs: Option<HashMap<usize, CudaGraph>>,
 }
 
-pub type Workspace = HashMap<BufferType, Tensor>;
+impl Workspace {
+    /// 创建并初始化 Decode 专属推理工作区
+    ///
+    /// 专为 decoding 阶段设计，每个请求处理 1 个 token。
+    ///
+    /// # Arguments
+    /// * `config` - 模型运行时配置
+    /// * `device` - 目标设备 (CPU/CUDA)
+    /// * `max_batch_size` - 最大批处理大小（决定 static buffer 和桶上限）
+    /// * `max_blocks_per_req` - 每个请求最大块数（用于 block_tables 形状）
+    pub fn new(
+        config: &config::RuntimeModelConfig,
+        device: DeviceType,
+        max_batch_size: usize,
+        max_blocks_per_req: usize,
+    ) -> Result<Self> {
+        use crate::base::DataType;
+
+        println!("Initializing Decode Workspace: max_bs={}, max_blocks_per_req={}, device={:?}",
+            max_batch_size, max_blocks_per_req, device);
+
+        // 根据设备和模型配置选择浮点精度
+        let float_dtype = if device.is_cpu() {
+            DataType::F32
+        } else {
+            match config.torch_dtype.as_str() {
+                "float32" => DataType::F32,
+                "bfloat16" => DataType::BF16,
+                _ => DataType::BF16, // 默认 BF16
+            }
+        };
+
+        // Decode 专属: 每个请求只有 1 个 token
+        // Buffer 形状: [max_batch_size, hidden_dim]
+
+        // ---- 必需 buffer（推理核心路径）----
+        // query: [max_bs, dim] - 每个请求 1 个 token
+        let query = Tensor::new(&[max_batch_size, config.dim], float_dtype, device)?;
+        // key_cache/value_cache: 临时 K/V 投影缓冲区 [max_bs, kv_dim]
+        let key_cache = Tensor::new(&[max_batch_size, config.kv_dim], float_dtype, device)?;
+        let value_cache = Tensor::new(&[max_batch_size, config.kv_dim], float_dtype, device)?;
+        // attn_output: [max_bs, dim]
+        let attn_output = Tensor::new(&[max_batch_size, config.dim], float_dtype, device)?;
+
+        // ---- 可选 buffer ----
+        // RoPE sin/cos cache: [max_seq_len, head_size] - 仍然需要完整序列长度用于 RoPE 计算
+        let sin_cache = Tensor::new(&[config.seq_len, config.head_size], float_dtype, device)?;
+        let cos_cache = Tensor::new(&[config.seq_len, config.head_size], float_dtype, device)?;
+        // rms_output: [max_bs, dim]
+        let rms_output = Tensor::new(&[max_batch_size, config.dim], float_dtype, device)?;
+
+        // ---- 预定义桶大小 (powers of 2 up to max_batch_size) ----
+        let ordered_buckets = Self::generate_buckets(max_batch_size);
+        println!("  CudaGraph buckets: {:?}", ordered_buckets);
+
+        // ---- 静态显存（CudaGraph 绑定地址）----
+        // 使用最大桶大小作为静态 buffer 大小
+        let max_bs = *ordered_buckets.last().unwrap_or(&max_batch_size);
+
+        let static_input_ids = Tensor::new(&[max_bs], DataType::I32, device)?;
+        let static_positions = Tensor::new(&[max_bs], DataType::I32, device)?;
+        let static_block_tables = Tensor::new(&[max_bs, max_blocks_per_req], DataType::I32, device)?;
+        let static_slot_mapping = Tensor::new(&[max_bs], DataType::I32, device)?;
+        let static_output = Tensor::new(&[max_bs, config.vocab_size], float_dtype, device)?;
+
+        println!("Decode Workspace initialized successfully.");
+
+        Ok(Self {
+            query,
+            key_cache,
+            value_cache,
+            attn_output,
+            sin_cache,
+            cos_cache,
+            rms_output,
+            ordered_buckets,
+            static_input_ids,
+            static_positions,
+            static_block_tables,
+            static_slot_mapping,
+            static_output,
+            graphs: None,
+        })
+    }
+
+    /// 生成 2 的幂次桶大小序列: [1, 2, 4, 8, ..., max_batch_size 向上取整到 2 的幂]
+    fn generate_buckets(max_batch_size: usize) -> Vec<usize> {
+        let mut buckets = Vec::new();
+        let mut size = 1;
+        while size <= max_batch_size {
+            buckets.push(size);
+            size *= 2;
+        }
+        // 如果 max_batch_size 不是 2 的幂，把它也加上
+        if let Some(&last) = buckets.last() {
+            if last < max_batch_size {
+                buckets.push(max_batch_size);
+            }
+        }
+        buckets
+    }
+
+    /// 根据实际 batch_size 查找最接近的桶大小（>= batch_size 的最小桶）
+    pub fn find_bucket(&self, batch_size: usize) -> Option<usize> {
+        match self.ordered_buckets.binary_search(&batch_size) {
+            Ok(idx) => Some(self.ordered_buckets[idx]),
+            Err(idx) => self.ordered_buckets.get(idx).copied(),
+        }
+    }
+
+    /// 获取对应桶大小的 CudaGraph（如果已捕获）
+    pub fn get_graph(&self, bucket_size: usize) -> Option<&CudaGraph> {
+        self.graphs.as_ref()?.get(&bucket_size)
+    }
+
+    /// 插入已捕获的 CudaGraph
+    pub fn insert_graph(&mut self, bucket_size: usize, graph: CudaGraph) {
+        self.graphs
+            .get_or_insert_with(HashMap::new)
+            .insert(bucket_size, graph);
+    }
+
+    /// 获取静态 input_ids buffer（用于 CudaGraph 的地址绑定）
+    pub fn static_input_ids(&self) -> &Tensor { &self.static_input_ids }
+    pub fn static_positions(&self) -> &Tensor { &self.static_positions }
+    pub fn static_block_tables(&self) -> &Tensor { &self.static_block_tables }
+    pub fn static_slot_mapping(&self) -> &Tensor { &self.static_slot_mapping }
+    pub fn static_output(&self) -> &Tensor { &self.static_output }
+    pub fn static_output_mut(&mut self) -> &mut Tensor { &mut self.static_output }
+
+    /// 将运行时数据拷贝到静态 buffer（CudaGraph 执行前调用）
+    pub fn copy_to_static(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        slot_mapping: &Tensor,
+    ) -> Result<()> {
+        self.static_input_ids.copy_from(input_ids)?;
+        self.static_positions.copy_from(positions)?;
+        self.static_slot_mapping.copy_from(slot_mapping)?;
+        Ok(())
+    }
+
+    /// 返回所有桶大小
+    pub fn buckets(&self) -> &[usize] {
+        &self.ordered_buckets
+    }
+}

@@ -37,6 +37,9 @@ pub enum Error {
 
     #[error("Serialization/Deserialization error: {0}")]
     SerdeError(#[from] serde_json::Error),
+
+    #[error("Unimplemented feature: {0}")]
+    Unimplemented(String),
 }
 
 // pub type Result<T> = std::result::Result<T, Error>;

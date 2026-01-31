@@ -68,16 +68,7 @@ impl DecoderLayers {
         config: &RuntimeModelConfig,
         weight_mapping: &dyn WeightMappingAdapter,
         device_type: DeviceType,
-        is_quant_model: bool,
-        block_size: usize,
-        num_total_blocks: usize,
     ) -> Result<Self> {
-        if is_quant_model {
-            return Err(Error::InvalidArgument(
-                "Quantized models are not yet supported.".to_string()
-            ).into());
-        }
-
         println!("Creating decoder layers using weight mapping...");
 
         let layer_num = config.layer_num;
@@ -218,7 +209,7 @@ impl DecoderLayers {
         // Create parameterless operators
         let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
             .map(|_| {
-                FlashAttnGQA::new_paged(config.head_num, config.kv_head_num, config.head_size, block_size, num_total_blocks)
+                FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size)
             })
             .collect();
         let mha_layers = mha_layers?;
