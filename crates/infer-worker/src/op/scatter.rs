@@ -2,16 +2,17 @@ use crate::base::error::Result;
 use crate::base::DeviceType;
 use crate::op::{kernels, Op, OpContext};
 
-/// Scatter operator: copies src[0, :] to dst[pos, :]
+/// Scatter operator: writes K,V to paged KV cache based on slot_mapping
 ///
-/// This is used for KV cache updates in the decoding phase where seq_len == 1.
-/// The source tensor has shape [1, kvdim] and needs to be written to a specific
-/// position in the destination tensor which has shape [max_seq_len, kvdim].
+/// This is used for KV cache updates in the decoding phase using paged attention.
+/// The operator handles both Key and Value tensors simultaneously.
 ///
 /// # Context
-/// * `ctx.inputs[0]` (src): Source tensor with shape [1, kvdim]
-/// * `ctx.inputs[1]` (pos): Position tensor (I32 scalar) indicating where to write in dst
-/// * `ctx.outputs[0]` (dst): Destination tensor with shape [max_seq_len, kvdim]
+/// * `ctx.inputs[0]` (key): Key tensor with shape [batch_size, kv_dim]
+/// * `ctx.inputs[1]` (value): Value tensor with shape [batch_size, kv_dim]
+/// * `ctx.inputs[2]` (slot_mapping): Slot mapping tensor [batch_size] with target positions
+/// * `ctx.outputs[0]` (k_cache): Key cache tensor [num_blocks, block_size, kv_dim]
+/// * `ctx.outputs[1]` (v_cache): Value cache tensor [num_blocks, block_size, kv_dim]
 #[derive(Debug, Clone, Copy)]
 pub struct Scatter;
 
@@ -34,20 +35,30 @@ impl Op for Scatter {
     }
 
     fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        if ctx.inputs.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Scatter requires exactly 2 inputs (src, pos), got {}",
-                ctx.inputs.len()
-            ));
-        }
+        // 支持两种模式：
+        // 模式1（遗留）: 2输入, 1输出 - 单个张量scatter
+        // 模式2（新）: 3输入, 2输出 - KV一起scatter到paged cache
 
-        if ctx.outputs.len() != 1 {
-            return Err(anyhow::anyhow!(
-                "Scatter requires exactly 1 output (dst), got {}",
-                ctx.outputs.len()
-            ));
+        match (ctx.inputs.len(), ctx.outputs.len()) {
+            (2, 1) => {
+                // 旧模式：用于单个张量scatter（后向兼容）
+                self.scatter_single(ctx)
+            }
+            (3, 2) => {
+                // 新模式：用于KV cache写入
+                self.scatter_kv(ctx)
+            }
+            _ => Err(anyhow::anyhow!(
+                "Scatter requires either (2 inputs, 1 output) or (3 inputs, 2 outputs), got ({}, {})",
+                ctx.inputs.len(), ctx.outputs.len()
+            )),
         }
+    }
+}
 
+impl Scatter {
+    /// 旧模式：scatter单个张量
+    fn scatter_single(&self, ctx: &mut OpContext) -> Result<()> {
         let src = ctx.inputs[0];
         let pos = ctx.inputs[1];
         let dst = &mut ctx.outputs[0];
@@ -70,6 +81,72 @@ impl Op for Scatter {
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
                 kernels::cuda::scatter(dst, src, pos, ctx.cuda_config)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 新模式：将K,V分别写入到paged KV cache
+    fn scatter_kv(&self, ctx: &mut OpContext) -> Result<()> {
+        let key = ctx.inputs[0];
+        let value = ctx.inputs[1];
+        let slot_mapping = ctx.inputs[2];
+
+        // Check device compatibility
+        if key.device() != value.device() || key.device() != slot_mapping.device() {
+            return Err(anyhow::anyhow!(
+                "Device mismatch for Scatter KV: key={:?}, value={:?}, slot_mapping={:?}",
+                key.device(), value.device(), slot_mapping.device()
+            ));
+        }
+
+        // Validate shapes
+        if key.shape()[0] != value.shape()[0] || key.shape()[1] != value.shape()[1] {
+            return Err(anyhow::anyhow!(
+                "Key and Value shapes must match: key={:?}, value={:?}",
+                key.shape(), value.shape()
+            ));
+        }
+
+        if slot_mapping.shape()[0] != key.shape()[0] {
+            return Err(anyhow::anyhow!(
+                "Slot mapping length must match batch size: slot_mapping={:?}, batch_size={}",
+                slot_mapping.shape(), key.shape()[0]
+            ));
+        }
+
+        // Validate output count
+        if ctx.outputs.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "Scatter KV requires exactly 2 outputs (k_cache, v_cache), got {}",
+                ctx.outputs.len()
+            ));
+        }
+
+        // Split outputs to get mutable references
+        let (k_cache_ref, v_cache_ref) = ctx.outputs.split_at_mut(1);
+        let k_cache = &mut k_cache_ref[0];
+        let v_cache = &mut v_cache_ref[0];
+
+        // Check cache device compatibility
+        if key.device() != k_cache.device() || key.device() != v_cache.device() {
+            return Err(anyhow::anyhow!(
+                "Device mismatch for caches: key={:?}, k_cache={:?}, v_cache={:?}",
+                key.device(), k_cache.device(), v_cache.device()
+            ));
+        }
+
+        // Dispatch to kernel based on device
+        match key.device() {
+            DeviceType::Cpu => {
+                return Err(anyhow::anyhow!(
+                    "Scatter KV operator is only supported on CUDA devices"
+                ));
+            }
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(_) => {
+                kernels::cuda::scatter_kv(key, value, slot_mapping, k_cache, v_cache, ctx.cuda_config)?;
             }
         }
 

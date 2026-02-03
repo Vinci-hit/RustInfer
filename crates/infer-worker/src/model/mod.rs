@@ -27,9 +27,11 @@ pub trait Model: Send + Sync {
         &mut self,
         input_tokens: &Tensor,
         positions: &Tensor,
-        slot_mapping: &Tensor,
-        context_lens: &[u32],
+        kv_indices: &Tensor,         // [nnz_tokens] CSR-style slot indices for attention
+        kv_indptr: &Tensor,          // [batch_size + 1] CSR row pointers
+        new_slots: &Tensor,          // [total_tokens] slots for new K/V writes
         decode_tokens: usize,
+        kv_cache: &mut KVCachePool,
     ) -> Result<Tensor>;
     /// Get the device type this model is running on
     fn device_type(&self) -> DeviceType;
@@ -55,11 +57,11 @@ pub trait Model: Send + Sync {
 #[derive(Debug)]
 pub struct Workspace {
     // 必需 buffer（推理核心路径）
-    pub query: Tensor,
-    pub key_cache: Tensor,
-    pub value_cache: Tensor,
     pub attn_output: Tensor,
-    
+
+    // QKV融合输出buffer
+    pub qkv_output: Tensor,
+
     // 可选 buffer（按需分配，避免浪费）
     pub sin_cache: Tensor,
     pub cos_cache: Tensor,
@@ -67,7 +69,7 @@ pub struct Workspace {
 
     // 预定义的桶大小，例如 [1, 2, 4, 8, ..., 128]，当请求到来时进行二分查找，寻找最接近的桶
     ordered_buckets: Vec<usize>,
-    
+
     // 静态分配的显存（Static Workspace）
     // 所有的 Graph 都绑定到这些内存地址上
     // [max_bs]
@@ -120,11 +122,10 @@ impl Workspace {
         // Buffer 形状: [max_batch_size, hidden_dim]
 
         // ---- 必需 buffer（推理核心路径）----
-        // query: [max_bs, dim] - 每个请求 1 个 token
-        let query = Tensor::new(&[max_batch_size, config.dim], float_dtype, device)?;
-        // key_cache/value_cache: 临时 K/V 投影缓冲区 [max_bs, kv_dim]
-        let key_cache = Tensor::new(&[max_batch_size, config.kv_dim], float_dtype, device)?;
-        let value_cache = Tensor::new(&[max_batch_size, config.kv_dim], float_dtype, device)?;
+        // qkv_output: 融合QKV输出 [max_bs, dim + 2*kv_dim]
+        let qkv_dim = config.dim + 2 * config.kv_dim;
+        let qkv_output = Tensor::new(&[max_batch_size, qkv_dim], float_dtype, device)?;
+
         // attn_output: [max_bs, dim]
         let attn_output = Tensor::new(&[max_batch_size, config.dim], float_dtype, device)?;
 
@@ -152,9 +153,7 @@ impl Workspace {
         println!("Decode Workspace initialized successfully.");
 
         Ok(Self {
-            query,
-            key_cache,
-            value_cache,
+            qkv_output,
             attn_output,
             sin_cache,
             cos_cache,

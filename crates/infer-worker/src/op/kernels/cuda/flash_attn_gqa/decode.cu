@@ -267,7 +267,7 @@ template <typename Traits, typename Params>
 __global__ void flash_attn_gqa_kernel_bf16(Params params)
 {
     using DType = __nv_bfloat16;
-    using IdType = int32_t;
+    using IdType = typename Params::IdType;
 
     const unsigned int batch_idx = blockIdx.z;
     const unsigned int q_head_idx = blockIdx.y;
@@ -277,7 +277,9 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
     const unsigned int kv_head_idx = q_head_idx / params.get_gqa_group_size();
 
     // Get sequence lengths
-    const int q_seq_len = params.q_seq_len;
+    // For decode: q_seq_len = 1 (get_qo_len returns 1)
+    // For prefill: q_seq_len comes from padded_batch_size or we need to track it separately
+    const int q_seq_len = params.get_qo_len(batch_idx);
     const int kv_seq_len = params.get_kv_len(batch_idx);
 
     // Softmax scale (precomputed log2 version for efficiency)
@@ -304,20 +306,21 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
     Tensor sVtNoSwizzle = make_tensor(sV.data(), sVt_no_swi_layout);
 
     // ========== Setup Global Memory Tensors ==========
-    // Q: [batch, q_seq, num_qo_heads, head_dim]
-    auto q_shape = make_shape(params.batch_size, q_seq_len, params.num_qo_heads, Int<Traits::kHeadDim>{});
-    auto q_stride = make_stride(params.q_stride_batch, params.q_stride_seq, params.q_stride_head, _1{});
+    // Q layout: [batch_size, num_qo_heads, head_dim] for decode (q_seq_len=1)
+    // Using stride_n (between batches) and stride_h (between heads)
+    auto q_shape = make_shape(params.batch_size, params.num_qo_heads, Int<Traits::kHeadDim>{});
+    auto q_stride = make_stride(params.q_stride_n, params.q_stride_h, _1{});
     Tensor Q = make_tensor(make_gmem_ptr(params.q), q_shape, q_stride);
-    Tensor gQ = local_tile(Q(batch_idx, _, q_head_idx, _),
+    Tensor gQ = local_tile(Q(batch_idx, q_head_idx, _),
                            Shape<Int<Traits::kBlockM>, Int<Traits::kHeadDim>>{},
-                           make_coord(block_m, 0));
+                           make_coord(0, 0));
 
-    // O: [batch, q_seq, num_qo_heads, head_dim]
-    auto o_stride = make_stride(params.o_stride_batch, params.o_stride_seq, params.o_stride_head, _1{});
+    // O layout: [batch_size, num_qo_heads, head_dim] for decode
+    auto o_stride = make_stride(params.o_stride_n, params.o_stride_h, _1{});
     Tensor O = make_tensor(make_gmem_ptr(params.o), q_shape, o_stride);
-    Tensor gO = local_tile(O(batch_idx, _, q_head_idx, _),
+    Tensor gO = local_tile(O(batch_idx, q_head_idx, _),
                            Shape<Int<Traits::kBlockM>, Int<Traits::kHeadDim>>{},
-                           make_coord(block_m, 0));
+                           make_coord(0, 0));
 
     // ========== Setup Copy Operations ==========
     auto copy_q = make_tiled_copy(
@@ -386,7 +389,7 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
         row_sum(ii) = 0;
     }
 
-    // ========== Paged KV cache access via slot_mapping ==========
+    // ========== Paged KV cache access via CSR-style kv_indices ==========
     const auto& paged_kv = params.paged_kv;
     const IdType kv_start = paged_kv.kv_indptr[batch_idx];
 
@@ -399,7 +402,7 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
     constexpr int kVecsPerToken = Traits::kHeadDim / kCopyVec;  // 64/8 = 8
     constexpr int kTotalVecs = Traits::kBlockN * kVecsPerToken;  // 64*8 = 512
 
-    // First tile K load using slot_mapping
+    // First tile K load using kv_indices (CSR-style)
     for (int idx = threadIdx.x; idx < kTotalVecs; idx += blockDim.x) {
         int token_in_tile = idx / kVecsPerToken;
         int vec_idx = idx % kVecsPerToken;
@@ -407,10 +410,9 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
         int smem_offset = token_in_tile * Traits::kHeadDim + dim_offset;
 
         if (token_in_tile < kv_seq_len) {
-            IdType slot = paged_kv.slot_mapping[kv_start + token_in_tile];
-            const DType* k_src = paged_kv.k_ptr
-                               + slot * paged_kv.num_kv_heads * paged_kv.head_dim
-                               + kv_head_idx * paged_kv.head_dim + dim_offset;
+            IdType slot = paged_kv.kv_indices[kv_start + token_in_tile];
+            const DType* k_src = paged_kv.k_data
+                               + paged_kv.get_elem_offset(slot, kv_head_idx, dim_offset);
             CP_ASYNC_CG_ca(k_smem_ptr + smem_offset, k_src, 16);
         } else {
             #pragma unroll
@@ -447,10 +449,9 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
             int global_token = kv_tile_start + token_in_tile;
 
             if (global_token < kv_seq_len) {
-                IdType slot = paged_kv.slot_mapping[kv_start + global_token];
-                const DType* v_src = paged_kv.v_ptr
-                                   + slot * paged_kv.num_kv_heads * paged_kv.head_dim
-                                   + kv_head_idx * paged_kv.head_dim + dim_offset;
+                IdType slot = paged_kv.kv_indices[kv_start + global_token];
+                const DType* v_src = paged_kv.v_data
+                                   + paged_kv.get_elem_offset(slot, kv_head_idx, dim_offset);
                 CP_ASYNC_CG_ca(v_smem_ptr + smem_offset, v_src, 16);
             } else {
                 #pragma unroll
@@ -480,10 +481,9 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
                 int global_token = next_kv_start + token_in_tile;
 
                 if (global_token < kv_seq_len) {
-                    IdType slot = paged_kv.slot_mapping[kv_start + global_token];
-                    const DType* k_src = paged_kv.k_ptr
-                                       + slot * paged_kv.num_kv_heads * paged_kv.head_dim
-                                       + kv_head_idx * paged_kv.head_dim + dim_offset;
+                    IdType slot = paged_kv.kv_indices[kv_start + global_token];
+                    const DType* k_src = paged_kv.k_data
+                                       + paged_kv.get_elem_offset(slot, kv_head_idx, dim_offset);
                     CP_ASYNC_CG_ca(k_smem_ptr + smem_offset, k_src, 16);
                 } else {
                     #pragma unroll
@@ -570,7 +570,7 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
     auto gmem_thr_copy_O = copy_o.get_thread_slice(threadIdx.x);
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-    Tensor tOrO = make_tensor<DType>(shape(tOgO));
+    Tensor tOrO = make_fragment_like(tOgO);
     cute::copy(copy_o, tOsO, tOrO);
 
     // Boundary check and write
@@ -586,18 +586,17 @@ __global__ void flash_attn_gqa_kernel_bf16(Params params)
     }
 }
 // ============================================================================
-// PagedAttention Kernel Wrapper Function (using slot_mapping)
+// PagedAttention Kernel Wrapper Function (using CSR-style kv_indices)
 // ============================================================================
 
-void flash_attn_gqa_paged_cu(
+void paged_flash_decoding(
     const __nv_bfloat16* q_ptr,
     const __nv_bfloat16* k_ptr,
     const __nv_bfloat16* v_ptr,
     __nv_bfloat16* o_ptr,
-    const int32_t* slot_mapping,   // [total_tokens] -> physical slot
-    const int32_t* kv_indptr,      // [batch_size + 1] CSR-style
+    const int32_t* kv_indices,     // [nnz_tokens] physical slot indices
+    const int32_t* kv_indptr,      // [batch_size + 1] CSR row pointers
     int32_t batch_size,
-    int32_t q_seq_len,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
@@ -616,38 +615,33 @@ void flash_attn_gqa_paged_cu(
 
     using Traits = FlashAttnKernelTraits<kBlockM, kBlockN, kHeadDim, kNWarpsKernel>;
 
-    // Build PagedKV
-    PagedKV<DType, IdType> paged_kv(
+    // Build paged_kv_t with CSR-style indexing
+    paged_kv_t<DType, IdType> paged_kv(
         const_cast<DType*>(k_ptr),
         const_cast<DType*>(v_ptr),
-        slot_mapping,
+        kv_indices,
         kv_indptr,
         num_kv_heads,
-        head_dim
+        head_dim,
+        batch_size
     );
 
-    // Build BatchDecodeParams
-    // Q/O strides: [batch, seq, head, dim] -> batch-major
-    IdType q_stride_batch = q_seq_len * num_q_heads * head_dim;
-    IdType q_stride_seq = num_q_heads * head_dim;
-    IdType q_stride_head = head_dim;
-
+    // Build BatchDecodeParams (decode: q_seq_len = 1)
     BatchDecodeParams<DType, DType, DType, IdType> params(
-        const_cast<DType*>(q_ptr), q_stride_batch, q_stride_seq, q_stride_head,
+        const_cast<DType*>(q_ptr),
         paged_kv,
-        o_ptr, q_stride_batch, q_stride_seq, q_stride_head,  // O has same layout as Q
-        batch_size, q_seq_len,
-        num_q_heads, num_kv_heads, head_dim,
+        o_ptr,
+        batch_size,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
         sm_scale
     );
 
     // Launch configuration
+    // For decode: grid.x = 1 (q_seq_len = 1), grid.y = num_q_heads, grid.z = batch_size
     typename Traits::MMA mma;
-    dim3 grid(
-        (q_seq_len + kBlockM - 1) / kBlockM,
-        num_q_heads,
-        batch_size
-    );
+    dim3 grid(1, num_q_heads, batch_size);
     dim3 block(size(mma));
 
     int smem_size = sizeof(SharedStorage<DType,
@@ -659,46 +653,4 @@ void flash_attn_gqa_paged_cu(
     flash_attn_gqa_kernel_bf16<Traits><<<grid, block, smem_size, stream>>>(params);
 
     CUDA_CHECK(cudaGetLastError());
-}
-
-// ============================================================================
-// Legacy wrapper for backward compatibility (converts block_table to slot_mapping)
-// ============================================================================
-void flash_attn_gqa_paged_cu_legacy(
-    const __nv_bfloat16* q_ptr,
-    const __nv_bfloat16* k_ptr,
-    const __nv_bfloat16* v_ptr,
-    __nv_bfloat16* o_ptr,
-    const int32_t* block_table,
-    int32_t q_seq_len,
-    int32_t kv_seq_len,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    int32_t block_size,
-    int32_t num_total_blocks,
-    int max_num_blocks_per_seq,
-    int block_table_batch_stride,
-    int kv_block_stride,
-    cudaStream_t stream
-) {
-    // This is a placeholder - in production, you would:
-    // 1. Allocate device memory for slot_mapping and kv_indptr
-    // 2. Launch a kernel to convert block_table to slot_mapping
-    // 3. Call flash_attn_gqa_paged_cu with the converted data
-
-    // For now, this shows the expected conversion pattern on host:
-    // std::vector<int32_t> slot_mapping;
-    // std::vector<int32_t> kv_indptr = {0};
-    // for (int b = 0; b < batch_size; b++) {
-    //     for (int s = 0; s < kv_seq_len; s++) {
-    //         int logical_block = s / block_size;
-    //         int token_in_block = s % block_size;
-    //         int physical_block = block_table[b * block_table_batch_stride + logical_block];
-    //         slot_mapping.push_back(physical_block * block_size + token_in_block);
-    //     }
-    //     kv_indptr.push_back(slot_mapping.size());
-    // }
-
-    fprintf(stderr, "flash_attn_gqa_paged_cu_legacy: Please use flash_attn_gqa_paged_cu with slot_mapping instead\n");
 }

@@ -33,9 +33,7 @@ pub struct DecoderLayers {
     pub rmsnorm_ffn_layers: Vec<RMSNorm>,
 
     // Attention operators
-    pub wq_layers: Vec<Matmul>,
-    pub wk_layers: Vec<Matmul>,
-    pub wv_layers: Vec<Matmul>,
+    pub wqkv_layers: Vec<Matmul>, // Fused QKV: weight shape [dim_in, dim_q + dim_k + dim_v]
     pub wo_layers: Vec<Matmul>,
     pub mha_layers: Vec<FlashAttnGQA>,
     pub rope_layers: Vec<RoPEOp>,
@@ -92,9 +90,7 @@ impl DecoderLayers {
         // Pre-allocate vectors for all layers
         let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
         let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
-        let mut wq_layers = Vec::with_capacity(layer_num);
-        let mut wk_layers = Vec::with_capacity(layer_num);
-        let mut wv_layers = Vec::with_capacity(layer_num);
+        let mut wqkv_layers = Vec::with_capacity(layer_num);
         let mut wo_layers = Vec::with_capacity(layer_num);
         let mut w1_layers = Vec::with_capacity(layer_num);
         let mut w2_layers = Vec::with_capacity(layer_num);
@@ -104,24 +100,33 @@ impl DecoderLayers {
 
         // Load per-layer weights
         for i in 0..layer_num {
-            wq_layers.push(Self::load_matmul_async(
+            // Load and fuse Q, K, V weights
+            let wq = Self::load_matmul_async(
                 &weight_mapping.format_layer_weight(i, weight_mapping.attn_q()),
                 loader,
                 device_type,
                 stream
-            )?);
-            wk_layers.push(Self::load_matmul_async(
+            )?;
+            let wk = Self::load_matmul_async(
                 &weight_mapping.format_layer_weight(i, weight_mapping.attn_k()),
                 loader,
                 device_type,
                 stream
-            )?);
-            wv_layers.push(Self::load_matmul_async(
+            )?;
+            let wv = Self::load_matmul_async(
                 &weight_mapping.format_layer_weight(i, weight_mapping.attn_v()),
                 loader,
                 device_type,
                 stream
-            )?);
+            )?;
+
+            // Fuse weights: concatenate Q, K, V weights horizontally
+            // wq.weight shape: [dim, dim], wk.weight: [dim, kv_dim], wv.weight: [dim, kv_dim]
+            // Result shape: [dim, dim + kv_dim + kv_dim]
+            let fused_weight = Self::concatenate_weights(&[&wq.weight, &wk.weight, &wv.weight])?;
+            let wqkv = Matmul::from(fused_weight, wq.bias.clone());
+            wqkv_layers.push(wqkv);
+
             wo_layers.push(Self::load_matmul_async(
                 &weight_mapping.format_layer_weight(i, weight_mapping.attn_o()),
                 loader,
@@ -232,8 +237,7 @@ impl DecoderLayers {
             ).into());
         }
 
-        if wq_layers.len() != layer_num || wk_layers.len() != layer_num ||
-           wv_layers.len() != layer_num || wo_layers.len() != layer_num {
+        if wqkv_layers.len() != layer_num || wo_layers.len() != layer_num {
             return Err(Error::InternalError(
                 "Incorrect number of attention Matmul layers created.".to_string()
             ).into());
@@ -261,9 +265,7 @@ impl DecoderLayers {
             cls_layer,
             rmsnorm_attn_layers,
             rmsnorm_ffn_layers,
-            wq_layers,
-            wk_layers,
-            wv_layers,
+            wqkv_layers,
             wo_layers,
             mha_layers,
             rope_layers,
@@ -288,9 +290,7 @@ impl DecoderLayers {
         self.rmsnorm_attn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
         self.rmsnorm_ffn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
 
-        self.wq_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wk_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wv_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
+        self.wqkv_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
         self.wo_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
 
         self.w1_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
@@ -304,6 +304,89 @@ impl DecoderLayers {
         self.add_layers.to_cuda(device_id)?;
 
         println!("All decoder layers successfully moved to CUDA device {}.", device_id);
+        Ok(())
+    }
+
+    /// Concatenate weight tensors horizontally (along dimension 0)
+    /// Used for fusing Q, K, V weights into a single matrix
+    fn concatenate_weights(weights: &[&Tensor]) -> Result<Tensor> {
+        if weights.is_empty() {
+            return Err(Error::InvalidArgument("Cannot concatenate empty weight list".into()).into());
+        }
+
+        let first = weights[0];
+        let dtype = first.dtype();
+        let device = first.device();
+        let mut total_rows = 0usize;
+        let cols = first.shape()[1];
+
+        // Validate all weights have same dtype, device, and column count
+        for w in weights {
+            if w.dtype() != dtype || w.device() != device {
+                return Err(Error::InvalidArgument(
+                    "All weights must have same dtype and device".into()
+                ).into());
+            }
+            if w.shape().len() != 2 || w.shape()[1] != cols {
+                return Err(Error::InvalidArgument(
+                    format!("All weights must be 2D with same column count. Got {:?}", w.shape())
+                ).into());
+            }
+            total_rows += w.shape()[0];
+        }
+
+        // Create concatenated weight tensor
+        let mut result = Tensor::new(&[total_rows, cols], dtype, device)?;
+
+        // Copy data from each weight tensor into the result
+        let mut offset = 0;
+        for w in weights {
+            let w_rows = w.shape()[0];
+            // Copy this weight's data into the result at the appropriate offset
+            // This requires accessing the raw data, which depends on the Tensor implementation
+            // For now, we'll use a simple approach: copy row by row
+            for row in 0..w_rows {
+                // Get source row
+                let src_slice = w.slice(&[row, 0], &[row + 1, cols])?;
+                // Get dest row
+                let mut dst_slice = result.slice(&[offset + row, 0], &[offset + row + 1, cols])?;
+                // Copy data
+                Self::copy_tensor_data(&src_slice, &mut dst_slice)?;
+            }
+            offset += w_rows;
+        }
+
+        Ok(result)
+    }
+
+    /// Helper to copy data from source tensor to destination tensor
+    fn copy_tensor_data(src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        if src.shape() != dst.shape() || src.dtype() != dst.dtype() {
+            return Err(Error::InvalidArgument(
+                "Source and destination tensors must have same shape and dtype".into()
+            ).into());
+        }
+
+        let dtype = src.dtype();
+
+        match dtype {
+            DataType::F32 => {
+                let src_data = src.as_f32()?.as_slice()?;
+                let dst_data = dst.as_f32_mut()?.as_slice_mut()?;
+                dst_data.copy_from_slice(src_data);
+            }
+            DataType::BF16 => {
+                let src_data = src.as_bf16()?.as_slice()?;
+                let dst_data = dst.as_bf16_mut()?.as_slice_mut()?;
+                dst_data.copy_from_slice(src_data);
+            }
+            _ => {
+                return Err(Error::InvalidArgument(
+                    format!("Unsupported dtype for weight concatenation: {:?}", dtype)
+                ).into());
+            }
+        }
+
         Ok(())
     }
 

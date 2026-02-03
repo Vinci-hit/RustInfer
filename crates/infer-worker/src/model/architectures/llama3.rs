@@ -5,7 +5,7 @@ use crate::base::DeviceType;
 use crate::base::error::Result;
 use std::time::Instant;
 use crate::cuda::CudaConfig;
-use crate::op::OpContext;
+use crate::op::{Op, OpContext};
 use crate::model::config::RuntimeModelConfig;
 use crate::model::ModelLoader;
 use crate::tensor::Tensor;
@@ -189,20 +189,29 @@ impl Llama3 {
     /// # Arguments
     /// * `input_tokens` - [batch_size] token ids
     /// * `positions` - [batch_size] position ids
-    /// * `slot_mapping` - [batch_size] 写入 KV cache 的物理槽位
-    /// * `context_lens` - [batch_size] 每个请求的历史上下文长度
+    /// * `kv_indices` - [nnz_tokens] 历史 KV cache 的物理槽位索引 (CSR-style)
+    /// * `kv_indptr` - [batch_size + 1] CSR row pointers, kv_len[i] = kv_indptr[i+1] - kv_indptr[i]
+    /// * `new_slots` - [batch_size] 写入新 K/V 的物理槽位
+    /// * `kv_cache` - KVCachePool 用于存储K/V
     fn forward_decoding(
         &mut self,
         input_tokens: &Tensor,
         positions: &Tensor,
-        slot_mapping: &Tensor,
-        context_lens: &[u32],
+        kv_indices: &Tensor,
+        kv_indptr: &Tensor,
+        new_slots: &Tensor,
+        kv_cache: &mut crate::model::KVCachePool,
     ) -> Result<()> {
         let batch_size = input_tokens.shape()[0];
         let cuda_config = Some(&self.cuda_config);
 
         // Step 1: Token Embedding [batch_size] -> [batch_size, dim]
         let mut hidden = self.workspace.attn_output.slice(&[0, 0], &[batch_size, self.config.dim])?;
+        let mut qkv;
+        let q;
+        let k;
+        let v;
+
         self.layers.embedding_layer.forward(
             &mut OpContext::new(&[input_tokens], &mut [&mut hidden], cuda_config)
         )?;
@@ -210,44 +219,47 @@ impl Llama3 {
         // Step 2: Transformer Layers
         for i in 0..self.config.layer_num {
             // 2.1 Pre-Attention RMSNorm
-            let hidden_view = self.workspace.attn_output.slice(&[0, 0], &[batch_size, self.config.dim])?;
             let mut norm_out = self.workspace.rms_output.slice(&[0, 0], &[batch_size, self.config.dim])?;
             self.layers.rmsnorm_attn_layers[i].forward(
-                &mut OpContext::new(&[&hidden_view], &mut [&mut norm_out], cuda_config)
+                &mut OpContext::new(&[&hidden], &mut [&mut norm_out], cuda_config)
             )?;
 
-            // 2.2 QKV Projections
-            let norm_view = self.workspace.rms_output.slice(&[0, 0], &[batch_size, self.config.dim])?;
-
-            let mut q = self.workspace.query.slice(&[0, 0], &[batch_size, self.config.dim])?;
-            self.layers.wq_layers[i].forward(
-                &mut OpContext::new(&[&norm_view], &mut [&mut q], cuda_config)
+            // 2.2 Fused QKV Projection (single matmul produces Q, K, V concatenated)
+            // Output shape: [batch, dim + kv_dim + kv_dim]
+            qkv = self.workspace.qkv_output.slice(&[0, 0], &[batch_size, self.config.dim + 2 * self.config.kv_dim])?;
+            self.layers.wqkv_layers[i].forward(
+                &mut OpContext::new(&[&norm_out], &mut [&mut qkv], cuda_config)
             )?;
 
-            let mut k = self.workspace.key_cache.slice(&[0, 0], &[batch_size, self.config.kv_dim])?;
-            self.layers.wk_layers[i].forward(
-                &mut OpContext::new(&[&norm_view], &mut [&mut k], cuda_config)
-            )?;
-
-            let mut v = self.workspace.value_cache.slice(&[0, 0], &[batch_size, self.config.kv_dim])?;
-            self.layers.wv_layers[i].forward(
-                &mut OpContext::new(&[&norm_view], &mut [&mut v], cuda_config)
-            )?;
+            // Split fused output into Q, K, V
+            q = qkv.slice(&[0, 0], &[batch_size, self.config.dim])?;
+            k = qkv.slice(&[0, self.config.dim], &[batch_size, self.config.dim + self.config.kv_dim])?;
+            v = qkv.slice(&[0, self.config.dim + self.config.kv_dim], &[batch_size, self.config.dim + 2 * self.config.kv_dim])?;
 
             // 2.3 RoPE on Q and K
+            // 需要可变的Q和K切片来进行旋转变换
+            let mut qkv_mut = self.workspace.qkv_output.slice(&[0, 0], &[batch_size, self.config.dim + 2 * self.config.kv_dim])?;
+            let mut q_mut = qkv_mut.slice(&[0, 0], &[batch_size, self.config.dim])?;
+            let mut k_mut = qkv_mut.slice(&[0, self.config.dim], &[batch_size, self.config.dim + self.config.kv_dim])?;
+
             self.layers.rope_layers[i].forward(
                 &mut OpContext::new(
                     &[positions, &self.workspace.sin_cache, &self.workspace.cos_cache],
-                    &mut [&mut q, &mut k],
+                    &mut [&mut q_mut, &mut k_mut],
                     cuda_config
                 )
             )?;
 
-            // 2.4 Write K,V to paged KV cache via slot_mapping
-            // TODO: kv_cache_write_kernel(&k, &v, slot_mapping, layer_idx)
+            // 2.4 Write K,V to paged KV cache via new_slots
+            // 从qkv_output中重新提取K和V（已经过RoPE）
+            let k_updated = qkv_mut.slice(&[0, self.config.dim], &[batch_size, self.config.dim + self.config.kv_dim])?;
+            let v_updated = qkv_mut.slice(&[0, self.config.dim + self.config.kv_dim], &[batch_size, self.config.dim + 2 * self.config.kv_dim])?;
+
+            self.layers.scatter_layer.forward(&mut OpContext::new(&[&k_updated, &v_updated, &new_slots], &mut [&mut self.workspace.key, &mut self.workspace.value], cuda_config))?;
 
             // 2.5 Paged Attention: Q @ K^T -> softmax -> @ V
-            // TODO: flash_attn_gqa_paged(&q, kv_cache, slot_mapping, context_lens, &mut attn_out)
+            // 使用 CSR-style 的 kv_indices 和 kv_indptr 进行 attention 计算
+            // TODO: flash_attn_gqa_paged(&q, kv_cache, kv_indices, kv_indptr, &mut attn_out)
             let mut attn_out = self.workspace.rms_output.slice(&[0, 0], &[batch_size, self.config.dim])?;
 
             // 2.6 Output Projection
@@ -312,13 +324,16 @@ impl Model for Llama3 {
             &mut self,
             input_tokens_cpu: &Tensor,      // CPU Tensor [total_tokens]
             positions_cpu: &Tensor,          // CPU Tensor [total_tokens]
-            slot_mapping_cpu: &Tensor,       // CPU Tensor [total_tokens]
-            context_lens: &[u32],
+            kv_indices_cpu: &Tensor,         // CPU Tensor [nnz_tokens] CSR-style slot indices
+            kv_indptr_cpu: &Tensor,          // CPU Tensor [batch_size + 1] CSR row pointers
+            new_slots_cpu: &Tensor,          // CPU Tensor [total_tokens] slots for new K/V
             decode_tokens: usize,
+            kv_cache: &mut crate::model::KVCachePool,
         ) -> Result<Tensor> {
         let total_tokens = input_tokens_cpu.shape()[0];
         let prefill_tokens = total_tokens - decode_tokens;
-        let batch_size = context_lens.len();
+        let batch_size = kv_indptr_cpu.shape()[0] - 1;  // kv_indptr has batch_size + 1 elements
+        let nnz_tokens = kv_indices_cpu.shape()[0];
 
         // ======================= CPU -> Device Copy =======================
         // 拷贝到静态 buffer（CudaGraph 绑定地址）
@@ -332,30 +347,35 @@ impl Model for Llama3 {
         }
         {
             let mut slots_dst = self.workspace.static_slot_mapping().slice(&[0], &[total_tokens])?;
-            slots_dst.copy_from(slot_mapping_cpu)?;
+            slots_dst.copy_from(new_slots_cpu)?;
         }
 
         // 获取 device tensor 引用
         let input_tokens = self.workspace.static_input_ids().slice(&[0], &[total_tokens])?;
         let positions = self.workspace.static_positions().slice(&[0], &[total_tokens])?;
-        let slot_mapping = self.workspace.static_slot_mapping().slice(&[0], &[total_tokens])?;
+        let new_slots = self.workspace.static_slot_mapping().slice(&[0], &[total_tokens])?;
+
+        // TODO: 需要在 Workspace 中添加 kv_indices 和 kv_indptr 的静态 buffer
+        // 暂时直接使用 CPU tensor（需要后续优化）
+        let kv_indices = kv_indices_cpu;
+        let kv_indptr = kv_indptr_cpu;
 
         // ======================= Phase 1: Decode =======================
         if decode_tokens > 0 {
             let decode_input = input_tokens.slice(&[0], &[decode_tokens])?;
             let decode_pos = positions.slice(&[0], &[decode_tokens])?;
-            let decode_slots = slot_mapping.slice(&[0], &[decode_tokens])?;
+            let decode_new_slots = new_slots.slice(&[0], &[decode_tokens])?;
 
-            self.forward_decoding(&decode_input, &decode_pos, &decode_slots, context_lens)?;
+            self.forward_decoding(&decode_input, &decode_pos, kv_indices, kv_indptr, &decode_new_slots, kv_cache)?;
         }
 
         // ======================= Phase 2: Prefill =======================
         if prefill_tokens > 0 {
-            let prefill_input = input_tokens.slice(&[decode_tokens], &[prefill_tokens])?;
-            let prefill_pos = positions.slice(&[decode_tokens], &[prefill_tokens])?;
-            let prefill_slots = slot_mapping.slice(&[decode_tokens], &[prefill_tokens])?;
+            let prefill_input = input_tokens.slice(&[decode_tokens], &[total_tokens])?;
+            let prefill_pos = positions.slice(&[decode_tokens], &[total_tokens])?;
+            let prefill_new_slots = new_slots.slice(&[decode_tokens], &[total_tokens])?;
 
-            self.forward_prefill(&prefill_input, &prefill_pos, &prefill_slots)?;
+            self.forward_prefill(&prefill_input, &prefill_pos, &prefill_new_slots)?;
         }
 
         // 返回 logits [batch_size, vocab_size]

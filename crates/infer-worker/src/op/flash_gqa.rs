@@ -3,7 +3,8 @@ use crate::base::DeviceType;
 use crate::op::{kernels, Op, OpContext};
 
 /// Flash Attention (高性能注意力机制) 的 GQA (Grouped-Query Attention) 算子。
-/// 使用 PagedAttention 模式，KV cache 以 slot_mapping 形式访问。
+/// 使用 PagedAttention 模式，KV cache 以 CSR-style kv_indices 形式访问。
+/// 专用于 decode 阶段 (q_seq_len = 1)。
 pub struct FlashAttnGQA {
     /// Query 头数量
     pub num_q_heads: usize,
@@ -45,28 +46,28 @@ impl Op for FlashAttnGQA {
         "FlashAttnGQA"
     }
 
-    /// 执行 Flash Attention GQA 的前向计算（使用 slot_mapping 模式）
+    /// 执行 Flash Attention GQA 的前向计算（使用 CSR-style kv_indices 模式，decode 阶段）
     ///
     /// **输入约定 (5个输入):**
-    /// 0. Q_tensor: [batch_size, q_seq_len, num_q_heads * head_dim] 或 [q_seq_len, num_q_heads * head_dim]
+    /// 0. Q_tensor: [batch_size, num_q_heads * head_dim] (decode: q_seq_len=1)
     /// 1. K_cache: [total_slots, num_kv_heads, head_dim]
     /// 2. V_cache: [total_slots, num_kv_heads, head_dim]
-    /// 3. slot_mapping: [total_tokens] I32 物理 slot 索引
-    /// 4. kv_indptr: [batch_size + 1] I32 CSR-style 索引
+    /// 3. kv_indices: [nnz_tokens] I32 物理 slot 索引 (CSR-style)
+    /// 4. kv_indptr: [batch_size + 1] I32 CSR row pointers
     fn forward(&self, ctx: &mut OpContext) -> Result<()> {
         // ==================== 1. 检查逻辑 ====================
 
         // --- a. 检查输入输出数量 (5 输入，1 输出) ---
         if ctx.inputs.len() != 5 || ctx.outputs.len() != 1 {
             return Err(Error::InvalidArgument(
-                "FlashAttnGQA expects 5 inputs (Q, K_Cache, V_Cache, slot_mapping, kv_indptr) and 1 output (O)".into()
+                "FlashAttnGQA expects 5 inputs (Q, K_Cache, V_Cache, kv_indices, kv_indptr) and 1 output (O)".into()
             ).into());
         }
 
         let input_q = &ctx.inputs[0];
         let input_k_cache = &ctx.inputs[1];
         let input_v_cache = &ctx.inputs[2];
-        let input_slot_mapping = &ctx.inputs[3];
+        let input_kv_indices = &ctx.inputs[3];
         let input_kv_indptr = &ctx.inputs[4];
         let output_o = &mut ctx.outputs[0];
 
@@ -79,13 +80,16 @@ impl Op for FlashAttnGQA {
         let v_shape = input_v_cache.shape();
         let o_shape = output_o.shape();
 
-        // 推断 batch_size 和 q_seq_len
-        let (batch_size, q_seq_len) = if q_shape.len() == 3 {
-            (q_shape[0], q_shape[1])
-        } else if q_shape.len() == 2 {
-            (1, q_shape[0])
+        // 推断 batch_size (decode 模式: Q 形状为 [batch_size, num_q_heads * head_dim])
+        let batch_size = if q_shape.len() == 2 {
+            q_shape[0]
+        } else if q_shape.len() == 3 && q_shape[1] == 1 {
+            // 兼容 [batch_size, 1, dim] 格式
+            q_shape[0]
         } else {
-            return Err(Error::InvalidArgument("Q must be 2D [SeqLen, Dim] or 3D [Batch, SeqLen, Dim].".into()).into());
+            return Err(Error::InvalidArgument(
+                "FlashAttnGQA (decode) expects Q to be 2D [Batch, Dim] or 3D [Batch, 1, Dim].".into()
+            ).into());
         };
 
         // KV cache: [total_slots, num_kv_heads, head_dim]
@@ -115,7 +119,7 @@ impl Op for FlashAttnGQA {
         match device {
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                let slot_mapping_ptr = input_slot_mapping.as_i32()?.buffer().as_ptr() as *const i32;
+                let kv_indices_ptr = input_kv_indices.as_i32()?.buffer().as_ptr() as *const i32;
                 let kv_indptr_ptr = input_kv_indptr.as_i32()?.buffer().as_ptr() as *const i32;
 
                 unsafe {
@@ -124,10 +128,9 @@ impl Op for FlashAttnGQA {
                         input_k_cache,
                         input_v_cache,
                         output_o,
-                        slot_mapping_ptr,
+                        kv_indices_ptr,
                         kv_indptr_ptr,
                         batch_size,
-                        q_seq_len,
                         self.num_q_heads,
                         self.num_kv_heads,
                         self.head_dim,

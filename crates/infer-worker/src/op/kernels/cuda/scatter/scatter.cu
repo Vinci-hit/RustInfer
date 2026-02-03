@@ -85,3 +85,72 @@ void scatter_kernel_f32(
         dst_f4, src_f4, pos, kvdim, num_vec4
     );
 }
+
+// ============================================================================
+// Scatter KV到paged cache的kernel (仅BF16)
+// ============================================================================
+
+/// Scatter K,V到paged KV cache
+/// 输入K,V: [batch_size, kv_dim]
+/// 输出cache: [num_blocks, block_size, kv_dim]
+/// slot_mapping: [batch_size] - 每个K/V对应的slot索引
+__global__ void scatter_kv_bf16_kernel(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    const int* __restrict__ slot_mapping,
+    int kv_dim,
+    int block_size,
+    int batch_size)
+{
+    // 每个线程处理一个K/V对中的一个元素
+    int elem_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch_idx = blockIdx.y;
+
+    if (batch_idx >= batch_size || elem_idx >= kv_dim) {
+        return;
+    }
+
+    // 从slot_mapping获取该批次应该写入的slot
+    int slot = slot_mapping[batch_idx];
+
+    // 计算在paged cache中的位置
+    // cache shape: [num_blocks, block_size, kv_dim]
+    // slot对应的block和offset
+    int block_id = slot / block_size;
+    int offset_in_block = slot % block_size;
+    int cache_idx = (block_id * block_size + offset_in_block) * kv_dim + elem_idx;
+
+    // 从input中读取元素
+    int input_idx = batch_idx * kv_dim + elem_idx;
+
+    // 写入K和V到各自的cache
+    k_cache[cache_idx] = key[input_idx];
+    v_cache[cache_idx] = value[input_idx];
+}
+
+void scatter_kv_kernel_bf16(
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    const __nv_bfloat16* key,
+    const __nv_bfloat16* value,
+    const int* slot_mapping,
+    int kv_dim,
+    int block_size,
+    int batch_size,
+    cudaStream_t stream)
+{
+    // 总元素数 = batch_size * kv_dim
+    int total_elements = batch_size * kv_dim;
+    const int threads_per_block = 256;
+
+    // grid: (num_blocks_x, batch_size)
+    int grid_x = (kv_dim + threads_per_block - 1) / threads_per_block;
+    dim3 grid(grid_x, batch_size);
+    dim3 block(threads_per_block);
+
+    scatter_kv_bf16_kernel<<<grid, block, 0, stream>>>(
+        k_cache, v_cache, key, value, slot_mapping, kv_dim, block_size, batch_size
+    );
+}

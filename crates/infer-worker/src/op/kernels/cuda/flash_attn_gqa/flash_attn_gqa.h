@@ -72,10 +72,9 @@ void flash_attn_gqa_paged_cu(
     const __nv_bfloat16* k_ptr,
     const __nv_bfloat16* v_ptr,
     __nv_bfloat16* o_ptr,
-    const int32_t* slot_mapping,
-    const int32_t* kv_indptr,
+    const int32_t* kv_indices,     // [nnz_tokens] physical slot indices (CSR-style)
+    const int32_t* kv_indptr,      // [batch_size + 1] CSR row pointers
     int32_t batch_size,
-    int32_t q_seq_len,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,

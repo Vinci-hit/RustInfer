@@ -72,91 +72,80 @@ pub fn sin_cos_cache_calc_bf16(
 }
 
 /// BF16版本的rope_kernel_batch实现
-/// 支持自动解析为f32进行计算，计算完再转为bf16塞回去
+/// 支持位置数组（每个token一个位置）而不是单一起始位置
 pub fn rope_kernel_batch_bf16(
     kv_dim: usize,
     head_size: usize,
     input_q: &mut Tensor,
     input_k: &mut Tensor,
-    start_pos_tensor: &Tensor,
+    pos_array: &Tensor,  // 位置数组 [seq_len]，每个token一个位置
     sin_cache: &Tensor,
     cos_cache: &Tensor,
 ) -> Result<()> {
     if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
         return Err(Error::InvalidArgument("Input Q and K for batch RoPE must be 2D.".to_string()).into());
     }
-    
+
     let seq_len = input_q.shape()[0];
     let dim = input_q.shape()[1];
-    
+
     // 获取BF16切片
     let q_slice_bf16 = input_q.as_bf16_mut()?.as_slice_mut()?;
     let k_slice_bf16 = input_k.as_bf16_mut()?.as_slice_mut()?;
-    // 对于BF16计算，sin/cos缓存仍然是F32类型（为了数值稳定性）
     let sin_slice = sin_cache.as_bf16()?.as_slice()?;
     let cos_slice = cos_cache.as_bf16()?.as_slice()?;
-    let start_pos_slice = start_pos_tensor.as_i32()?.as_slice()?;
-    
-    if start_pos_slice.is_empty() {
-        return Err(Error::InvalidArgument("start_pos_tensor is empty".to_string()).into());
-    }
-    
-    let start_pos = start_pos_slice[0] as usize;
-    
-    // --- 3. 维度和边界检查 ---
-    let max_pos = start_pos + seq_len-1;
-    let max_cache_index = max_pos * head_size;
-    if max_cache_index > sin_slice.len() || max_cache_index > cos_slice.len() {
-        return Err(Error::IndexOutOfBounds(
-            format!("RoPE cache index out of bounds. Max pos={}, head_size={}, cache_len={}",
-                    max_pos, head_size, sin_slice.len())
+    let pos_slice = pos_array.as_i32()?.as_slice()?;
+
+    if pos_slice.len() != seq_len {
+        return Err(Error::InvalidArgument(
+            format!("Position array length ({}) must match sequence length ({})", pos_slice.len(), seq_len)
         ).into());
     }
-    
+
     let head_dim = head_size; // 每个头的维度（64）
 
     // ========== 核心逻辑：遍历每个token（行） ==========
     for i in 0..seq_len {
-        // 计算当前token的绝对位置
-        let pos = start_pos + i;
+        // 从位置数组获取当前token的位置
+        let pos = pos_slice[i] as usize;
+
         // ========== 处理Q的旋转：逐token+逐成对维度 ==========
-        // Q当前行的起始索引：i * dim
         let q_row_start = i * dim;
         let k_row_start = i * kv_dim;
-        
+
         for j in (0..dim).step_by(head_dim) {
             for k in 0..head_dim/2 {
-                // sin/cos缓存已经是F32类型（为了数值稳定性）
+                // 从sin/cos缓存获取当前位置和头维度的值
                 let sin_val = sin_slice[pos * head_dim + k*2];
                 let cos_val = cos_slice[pos * head_dim + k*2];
-                
+
                 let q_idx_j = q_row_start + j + k;
                 let q_idx_j1 = q_row_start + j + k + head_dim / 2;
-                
+
                 // 从BF16转换为F32进行计算
                 let v0_q = q_slice_bf16[q_idx_j];
                 let v1_q = q_slice_bf16[q_idx_j1];
-                
+
                 // F32计算
                 let result0 = v0_q * cos_val - v1_q * sin_val;
                 let result1 = v0_q * sin_val + v1_q * cos_val;
-                
+
                 // 将结果转换回BF16并存储
                 q_slice_bf16[q_idx_j] = result0;
                 q_slice_bf16[q_idx_j1] = result1;
-                
+
                 if j < kv_dim {
                     let k_idx_j = k_row_start + j + k;
                     let k_idx_j1 = k_row_start + j + k + head_dim / 2;
-                    
+
                     // 从BF16转换为F32进行计算
                     let v0_k = k_slice_bf16[k_idx_j];
                     let v1_k = k_slice_bf16[k_idx_j1];
-                    
+
                     // F32计算
                     let result0 = v0_k * cos_val - v1_k * sin_val;
                     let result1 = v0_k * sin_val + v1_k * cos_val;
-                    
+
                     // 将结果转换回BF16并存储
                     k_slice_bf16[k_idx_j] = result0;
                     k_slice_bf16[k_idx_j1] = result1;
@@ -164,7 +153,7 @@ pub fn rope_kernel_batch_bf16(
             }
         }
     }
-    
+
     Ok(())
 }
 

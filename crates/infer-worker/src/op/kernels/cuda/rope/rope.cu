@@ -96,7 +96,7 @@ __global__ void rope_rotate_kernel_llama3_bf16(
     const int num_heads,
     const int num_kv_heads,
     const int head_size,
-    const int* pos_offset,                     // 当前 batch 的起始位置偏移
+    const int* pos_array,                      // 位置数组 [seq_len]，每个token一个位置
     const int seq_len                         // 当前处理的序列长度
 ) {
     // 1. 维度计算
@@ -110,9 +110,9 @@ __global__ void rope_rotate_kernel_llama3_bf16(
         return;
     }
 
-    // 2. 计算 RoPE Cache 的绝对位置索引
-    // Llama 3 通常预计算好了 sin/cos，形状为 [max_seq, half_head]
-    int abs_pos = *pos_offset + seq_idx;
+    // 2. 从位置数组获取当前token的绝对位置索引
+    // sin/cos缓存形状为 [max_seq, half_head]
+    int abs_pos = pos_array[seq_idx];
     float sin_val = __bfloat162float(sin_cache[abs_pos * half_head + tid]);
     float cos_val = __bfloat162float(cos_cache[abs_pos * half_head + tid]);
 

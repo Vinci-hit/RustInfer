@@ -64,16 +64,15 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
-    // PagedAttention kernel with slot_mapping
+    // PagedAttention kernel with CSR-style kv_indices (FlashInfer design)
     pub fn flash_attn_gqa_paged_cu(
         q_ptr: *const half::bf16,
         k_ptr: *const half::bf16,
         v_ptr: *const half::bf16,
         o_ptr: *mut half::bf16,
-        slot_mapping: *const i32,    // [total_tokens] -> physical slot index
-        kv_indptr: *const i32,       // [batch_size + 1] CSR-style indices
+        kv_indices: *const i32,      // [nnz_tokens] physical slot indices (CSR-style)
+        kv_indptr: *const i32,       // [batch_size + 1] CSR row pointers
         batch_size: i32,
-        q_seq_len: i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
@@ -221,23 +220,27 @@ pub unsafe fn flash_attn_gqa(
     Ok(())
 }
 
-/// Flash Attention GQA with PagedAttention support (using slot_mapping)
+/// Flash Attention GQA with PagedAttention support (CSR-style, following FlashInfer design)
+///
+/// This function implements batch decode with paged KV cache using CSR (Compressed Sparse Row)
+/// indexing for efficient memory access. Each request's KV tokens are indexed via:
+/// - kv_indices: [nnz_tokens] physical slot indices for all tokens
+/// - kv_indptr: [batch_size + 1] CSR row pointers (kv_len[i] = kv_indptr[i+1] - kv_indptr[i])
 ///
 /// # Arguments
-/// * `input_q`: Query tensor, [batch_size, q_seq_len, num_q_heads, head_dim]
+/// * `input_q`: Query tensor, [batch_size, num_q_heads, head_dim] (decode mode: q_seq_len=1)
 /// * `input_k_cache`: K cache, [total_slots, num_kv_heads, head_dim]
 /// * `input_v_cache`: V cache, [total_slots, num_kv_heads, head_dim]
-/// * `output_o`: Output tensor, [batch_size, q_seq_len, num_q_heads, head_dim]
-/// * `slot_mapping_gpu`: Device pointer to slot_mapping [total_tokens] -> physical slot
-/// * `kv_indptr_gpu`: Device pointer to CSR-style indices [batch_size + 1]
+/// * `output_o`: Output tensor, [batch_size, num_q_heads, head_dim]
+/// * `kv_indices_gpu`: Device pointer to [nnz_tokens] physical slot indices
+/// * `kv_indptr_gpu`: Device pointer to [batch_size + 1] CSR row pointers
 /// * `batch_size`: Number of sequences in the batch
-/// * `q_seq_len`: Query sequence length (typically 1 for decode)
 /// * `num_q_heads`, `num_kv_heads`, `head_dim`: Attention parameters
 /// * `cuda_config`: Optional CUDA stream configuration
 ///
 /// # Safety
 /// The caller must ensure:
-/// - `slot_mapping_gpu` points to valid device memory of size [total_tokens]
+/// - `kv_indices_gpu` points to valid device memory of size [nnz_tokens]
 /// - `kv_indptr_gpu` points to valid device memory of size [batch_size + 1]
 /// - All tensor pointers are valid and properly aligned
 #[allow(clippy::too_many_arguments)]
@@ -246,10 +249,9 @@ pub unsafe fn flash_attn_gqa_paged(
     input_k_cache: &Tensor,
     input_v_cache: &Tensor,
     output_o: &mut Tensor,
-    slot_mapping_gpu: *const i32,
+    kv_indices_gpu: *const i32,
     kv_indptr_gpu: *const i32,
     batch_size: usize,
-    q_seq_len: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -267,7 +269,6 @@ pub unsafe fn flash_attn_gqa_paged(
 
     // --- 2. 维度检查和转换 ---
     let batch_size_i32 = batch_size as i32;
-    let q_seq_len_i32 = q_seq_len as i32;
     let num_q_heads_i32 = num_q_heads as i32;
     let num_kv_heads_i32 = num_kv_heads as i32;
     let head_dim_i32 = head_dim as i32;
@@ -296,10 +297,9 @@ pub unsafe fn flash_attn_gqa_paged(
                     k_ptr,
                     v_ptr,
                     o_ptr,
-                    slot_mapping_gpu,
+                    kv_indices_gpu,
                     kv_indptr_gpu,
                     batch_size_i32,
-                    q_seq_len_i32,
                     num_q_heads_i32,
                     num_kv_heads_i32,
                     head_dim_i32,

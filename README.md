@@ -1,6 +1,18 @@
 # RustInfer: Rust实现的高性能LLM推理引擎
 
 ## 更新说明
+### 20260204
+1、更新设计文档 /doc 
+2、正在设计forward流程
+
+### 20260201
+1、对QKV做权重融合，使得一次矩阵乘能同时计算QKV。
+2、重新设计forward参数，采用CSR的思想对页表进行压缩。
+
+### 20260131
+1、重构WorkSpace，Paged forward函数签名，为CUDAGraph分桶机制做准备。
+2、参考vllm 使用slot mapping，把索引偏移计算放在host端，减少kernel复杂度。
+3、参考sglang对decoding和prefill拆开计算，decoding默认实现Full Graph机制，而prefill作为计算密集型，先不使用Graph。
 
 ### 20260127
 1、为Tensor新增from_slice方法

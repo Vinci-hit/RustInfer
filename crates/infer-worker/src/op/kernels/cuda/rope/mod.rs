@@ -36,6 +36,7 @@ unsafe extern "C" {
 /// Rotary Positional Embedding (RoPE) 的 CUDA 内核包装函数
 ///
 /// 这是一个就地 (in-place) 操作，会修改 input_q 和 input_k 的内容。
+/// 现在使用位置数组而不是seq_len参数。
 ///
 /// # Arguments
 /// * `dim`: Q 和 K 向量的总旋转维度。
@@ -43,10 +44,10 @@ unsafe extern "C" {
 /// * `head_size`: Attention Head 的大小。
 /// * `input_q`: Query 张量, 被就地修改。
 /// * `input_k`: Key 张量, 被就地修改。
-/// * `input_pos`: 包含当前位置索引的张量。
+/// * `input_pos`: 位置数组张量 [seq_len]，每个token一个位置。
 /// * `sin_cache`: 正弦缓存张量。
 /// * `cos_cache`: 余弦缓存张量。
-/// * `stream`: 可选的 CUDA stream。
+/// * `cuda_config`: 可选的 CUDA stream。
 #[allow(clippy::too_many_arguments)]
 pub fn rope(
     dim: usize,
@@ -55,19 +56,21 @@ pub fn rope(
     input_q: &mut Tensor,
     input_k: &mut Tensor,
     input_pos: &Tensor,
-    seq_len:i32,
     sin_cache: &Tensor,
     cos_cache: &Tensor,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     // --- 1. 根据数据类型获取具体类型和指针 ---
     let dtype = input_q.dtype();
-    
+
     // Pos 是 i32，需要不可变指针
     let pos = input_pos.as_i32()?.buffer().as_ptr() as *const i32;
 
+    // 从位置数组推导seq_len
+    let seq_len = input_pos.shape()[0] as i32;
+
     // --- 2. 维度检查和转换 ---
-    
+
     // 维度转换为 i32。注意：这里我们信任上层 Op 已经做了充分的边界检查。
     let dim_i32 = dim as i32;
     let kv_dim_i32 = kv_dim as i32;
@@ -136,7 +139,7 @@ pub fn rope(
             )).into());
         }
     }
-    
+
     Ok(())
 }
 

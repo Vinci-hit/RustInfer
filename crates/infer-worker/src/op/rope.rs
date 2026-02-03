@@ -44,7 +44,8 @@ impl Op for RoPEOp {
     fn forward(&self, ctx: &mut OpContext) -> Result<()> {
         // ==================== 1. 检查逻辑 ====================
 
-        // 预期输入: [input_pos, sin_cache, cos_cache] (3个)
+        // 预期输入: [pos_array, sin_cache, cos_cache] (3个)
+        // pos_array 是位置数组 [seq_len]，每个token一个位置
         // 预期输出: [input_q, input_k] (2个，将被就地修改)
         if ctx.inputs.len() != 3 || ctx.outputs.len() != 2 {
             return Err(Error::InvalidArgument(
@@ -68,17 +69,16 @@ impl Op for RoPEOp {
         
         // 安全地获取 Q 和 K 的可变引用
         let input_q: &mut Tensor = q_slice[0];
-        let input_k: &mut Tensor = k_slice[0]; 
-        let seq_len  = input_q.shape()[0];
+        let input_k: &mut Tensor = k_slice[0];
         // --- c. 检查设备和数据类型 (使用 input_q/k 而非 inputs[0]/1) ---
         let device = input_q.device();
         let dtype = input_q.dtype();
-        
+
         // 所有张量必须在同一个设备上
         if input_k.device() != device || sin_cache.device() != device || cos_cache.device() != device {
             return Err(Error::InvalidArgument(format!("RoPE: All tensors must be on the same device,input_q:{:?}, input_k:{:?}, sin_cache:{:?}, cos_cache:{:?}",device,input_k.device(),sin_cache.device(),cos_cache.device())).into());
         }
-        
+
         if input_k.dtype() != dtype || sin_cache.dtype() != dtype || cos_cache.dtype() != dtype {
                 return Err(Error::InvalidArgument(format!("RoPE: All tensors must have the same data type. input_q:{:?}, input_k:{:?}, sin_cache:{:?}, cos_cache:{:?}", dtype, input_k.dtype(), sin_cache.dtype(), cos_cache.dtype())).into());
         }
@@ -100,10 +100,19 @@ impl Op for RoPEOp {
                 "Input K length ({}) must be at least RoPE kv_dim ({})", input_k.shape()[0], self.kv_dim
             )).into());
         }
-        
-        // Pos 必须是 [1] 形状或长度为 1
-        if input_pos.shape()[0] != 1 {
-            return Err(Error::InvalidArgument("Input Pos must be a single element tensor".into()).into());
+
+        // Pos 必须是 1D 张量，长度等于序列长度（每个 token 一个位置）
+        if input_pos.shape().len() != 1 {
+            return Err(Error::InvalidArgument("Input Pos must be a 1D tensor".into()).into());
+        }
+        let seq_len = input_q.shape()[0];
+        let pos_len = input_pos.shape()[0];
+
+        // 位置数组长度必须等于序列长度
+        if pos_len != seq_len {
+            return Err(Error::InvalidArgument(format!(
+                "Position array length ({}) must match sequence length ({})", pos_len, seq_len
+            )).into());
         }
 
 
@@ -126,7 +135,7 @@ impl Op for RoPEOp {
                     self.head_size,
                     input_q_mut, // 可变
                     input_k_mut, // 可变
-                    input_pos,
+                    input_pos,   // 位置数组
                     sin_cache,
                     cos_cache,
                 )?;
@@ -139,8 +148,7 @@ impl Op for RoPEOp {
                     self.head_size,
                     input_q_mut, // 可变
                     input_k_mut, // 可变
-                    input_pos,
-                    seq_len as i32,
+                    input_pos,   // 位置数组
                     sin_cache,
                     cos_cache,
                     ctx.cuda_config
