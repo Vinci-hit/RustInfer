@@ -4,6 +4,8 @@ pub use anyhow::Result;
 use thiserror::Error;
 #[cfg(feature = "cuda")]
 use crate::cuda;
+#[cfg(feature = "nccl")]
+use crate::comm;
 use super::DeviceType;
 #[derive(Error, Debug)]
 pub enum Error {
@@ -20,6 +22,10 @@ pub enum Error {
     #[cfg(feature = "cuda")]
     #[error("CUDA FFI call failed: {0}")]
     CudaError(#[from] cuda::error::CudaError),
+
+    #[cfg(feature = "nccl")]
+    #[error("NCCL call failed: {0}")]
+    NcclError(#[from] comm::NcclError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -40,6 +46,9 @@ pub enum Error {
 
     #[error("Unimplemented feature: {0}")]
     Unimplemented(String),
+
+    #[error("Architecture not found: {0}")]
+    ArchNotFound(String),
 }
 
 // pub type Result<T> = std::result::Result<T, Error>;

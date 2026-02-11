@@ -3,13 +3,15 @@
 //! Handles launching and managing multiple Worker processes.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use super::config::{RestartPolicy, SpawnerConfig, WorkerPlan};
 use super::device::{DeviceDiscovery, AvailableDevice};
+use super::process_manager::ProcessManager;
+use super::logger::AggregateLogger;
+use super::tui::{WorkerDisplayInfo, Tui, TuiApp};
 
 /// Worker process status
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +20,7 @@ pub enum WorkerStatus {
     Running,
     Stopping,
     Stopped,
+    WaitingForRestart { delay_ms: u64 },
     Failed(String),
 }
 
@@ -30,7 +33,8 @@ pub struct WorkerProcess {
     pub status: WorkerStatus,
     pub started_at: Instant,
     pub restart_count: u32,
-    child: Option<Child>,
+    pub last_restart_time: Instant,
+    process_manager: Option<ProcessManager>,
 }
 
 impl WorkerProcess {
@@ -44,33 +48,47 @@ impl WorkerProcess {
             status: WorkerStatus::Starting,
             started_at: Instant::now(),
             restart_count: 0,
-            child: None,
+            last_restart_time: Instant::now(),
+            process_manager: None,
         }
     }
 
     /// Check if the worker process is still running
     pub fn is_running(&self) -> bool {
-        matches!(self.status, WorkerStatus::Running) && self.child.is_some()
+        matches!(self.status, WorkerStatus::Running) && self.process_manager.is_some()
     }
 
     /// Try to wait for the process to complete
-    pub fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
-        if let Some(ref mut child) = self.child {
-            child.try_wait().ok().flatten()
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        if let Some(ref mut pm) = self.process_manager {
+            pm.try_wait()
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Kill the worker process
     pub fn kill(&mut self) -> Result<()> {
-        if let Some(ref mut child) = self.child {
-            child.kill().context("Failed to kill worker process")?;
+        if let Some(ref mut pm) = self.process_manager {
+            pm.kill().context("Failed to kill worker process")?;
             self.status = WorkerStatus::Stopped;
-            Ok(())
-        } else {
-            Ok(())
         }
+        Ok(())
+    }
+
+    /// Set the process manager
+    pub fn set_process_manager(&mut self, pm: ProcessManager) {
+        self.process_manager = Some(pm);
+    }
+
+    /// Get process ID
+    pub fn pid(&self) -> Option<u32> {
+        self.process_manager.as_ref().and_then(|pm| pm.id())
+    }
+
+    /// Get uptime
+    pub fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
     }
 }
 
@@ -78,15 +96,24 @@ impl WorkerProcess {
 pub struct WorkerSpawner {
     config: SpawnerConfig,
     workers: HashMap<String, WorkerProcess>,
+    plans: HashMap<String, WorkerPlan>,  // Store plans for restarts
+    logger: AggregateLogger,
+    tui: Tui,
 }
 
 impl WorkerSpawner {
     /// Create a new WorkerSpawner
-    pub fn new(config: SpawnerConfig) -> Self {
-        Self {
+    pub fn new(config: SpawnerConfig) -> Result<Self> {
+        let logger = AggregateLogger::new(config.log_dir.as_deref())?;
+        let tui = Tui::new();
+
+        Ok(Self {
             config,
             workers: HashMap::new(),
-        }
+            plans: HashMap::new(),
+            logger,
+            tui,
+        })
     }
 
     /// Discover available devices and generate worker plans
@@ -151,6 +178,11 @@ impl WorkerSpawner {
         println!("\n[Spawner] Starting worker processes...");
         println!("{}", "=".repeat(70));
 
+        // Store plans for future restarts
+        for plan in &plans {
+            self.plans.insert(plan.worker_id.clone(), plan.clone());
+        }
+
         for plan in &plans {
             self.spawn_worker(plan)?;
         }
@@ -173,15 +205,18 @@ impl WorkerSpawner {
     pub fn spawn_worker(&mut self, plan: &WorkerPlan) -> Result<()> {
         println!(
             "[Spawner] Starting {} on device {}...",
-            plan.worker_id,
-            plan.device_id
+            plan.worker_id, plan.device_id
         );
+
+        // Register worker in logger
+        self.logger
+            .register_worker(&plan.worker_id, plan.device_id as u32)?;
 
         // Build command
         let args = plan.build_command_args();
         let env = plan.build_env();
 
-        // Get infer-worker binary path (same directory as current binary)
+        // Get infer-worker binary path
         let current_exe = std::env::current_exe()
             .context("Failed to get current executable path")?;
         let exe_dir = current_exe
@@ -189,52 +224,47 @@ impl WorkerSpawner {
             .ok_or_else(|| anyhow::anyhow!("Failed to get executable directory"))?;
         let exe_path = exe_dir.join("infer-worker");
 
-        // Spawn the process
-        let mut child = Command::new(&exe_path)
-            .args(&args)
-            .envs(&env)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Failed to spawn worker {}: {:?} with env {:?}",
-                    plan.worker_id, args, env
-                )
-            })?;
+        // Create process manager with logging
+        let worker_id = plan.worker_id.clone();
+        let logger = self.logger.clone();
+        let worker_id_for_logging = worker_id.clone();
 
-        // Capture stdout/stderr for logging
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            let worker_id = plan.worker_id.clone();
-            std::thread::spawn(move || {
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        println!("[{}] {}", worker_id, line);
-                    }
-                }
-            });
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            let reader = BufReader::new(stderr);
-            let worker_id = plan.worker_id.clone();
-            std::thread::spawn(move || {
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        eprintln!("[{}] {}", worker_id, line);
-                    }
-                }
-            });
-        }
+        let process_manager = ProcessManager::spawn(
+            &worker_id,
+            &exe_path,
+            &args,
+            &env,
+            move |line: &str| {
+                let _ = logger.info(&worker_id_for_logging, line);
+            },
+        )?;
 
         // Create worker process record
         let mut worker = WorkerProcess::new(plan);
-        worker.child = Some(child);
+        worker.set_process_manager(process_manager);
         worker.status = WorkerStatus::Running;
         worker.started_at = Instant::now();
 
-        let pid = worker.child.as_ref().map(|c| c.id());
+        let pid = worker.pid();
+
+        // Update TUI
+        let app = self.tui.app();
+        let mut app = app.lock().unwrap();
+
+        // Check if worker already exists in TUI (e.g., from restart)
+        if app.workers.iter().any(|w| w.worker_id == plan.worker_id) {
+            app.update_worker(&plan.worker_id, "Running".to_string());
+        } else {
+            app.add_worker(WorkerDisplayInfo {
+                worker_id: worker.worker_id.clone(),
+                device_id: worker.device_id as u32,
+                status: "Running".to_string(),
+                restart_count: worker.restart_count,
+                uptime: Duration::from_secs(0),
+                memory_used: None,
+                memory_total: None,
+            });
+        }
 
         self.workers.insert(plan.worker_id.clone(), worker);
 
@@ -270,34 +300,55 @@ impl WorkerSpawner {
     fn check_workers(&mut self) -> Result<()> {
         let mut failed_workers = Vec::new();
         let mut restart_workers = Vec::new();
+        let mut ready_to_restart = Vec::new();
 
+        // Check for workers waiting to restart (delay expired)
         for (worker_id, worker) in self.workers.iter_mut() {
-            if let Some(exit_status) = worker.try_wait() {
-                println!("[Spawner] ⚠ Worker {} exited with status: {:?}", worker_id, exit_status);
+            if let WorkerStatus::WaitingForRestart { delay_ms } = &worker.status {
+                let elapsed_ms = worker.last_restart_time.elapsed().as_millis() as u64;
+                if elapsed_ms >= *delay_ms {
+                    ready_to_restart.push(worker_id.clone());
+                }
+            }
+        }
 
-                match &self.config.restart_policy {
-                    RestartPolicy::Never => {
-                        worker.status = WorkerStatus::Failed("exited".to_string());
-                        failed_workers.push(worker_id.clone());
-                    }
-                    RestartPolicy::Always => {
-                        restart_workers.push(worker_id.clone());
-                    }
-                    RestartPolicy::OnFailure { max_retries } => {
-                        if worker.restart_count < *max_retries {
-                            restart_workers.push(worker_id.clone());
-                        } else {
-                            worker.status = WorkerStatus::Failed(
-                                format!("exceeded max retries ({}),", max_retries)
-                            );
+        // Perform actual restart for workers with expired delay
+        for worker_id in ready_to_restart {
+            self.do_restart_worker(&worker_id)?;
+        }
+
+        // Check for exited workers
+        for (worker_id, worker) in self.workers.iter_mut() {
+            if let Ok(Some(exit_status)) = worker.try_wait() {
+                // Only handle if not already waiting for restart
+                if !matches!(worker.status, WorkerStatus::WaitingForRestart { .. }) {
+                    println!("[Spawner] ⚠ Worker {} exited with status: {:?}", worker_id, exit_status);
+                    let _ = self.logger.warn(worker_id, &format!("Exited with status: {:?}", exit_status));
+
+                    match &self.config.restart_policy {
+                        RestartPolicy::Never => {
+                            worker.status = WorkerStatus::Failed("exited".to_string());
                             failed_workers.push(worker_id.clone());
+                        }
+                        RestartPolicy::Always => {
+                            restart_workers.push(worker_id.clone());
+                        }
+                        RestartPolicy::OnFailure { max_retries } => {
+                            if worker.restart_count < *max_retries {
+                                restart_workers.push(worker_id.clone());
+                            } else {
+                                worker.status = WorkerStatus::Failed(
+                                    format!("exceeded max retries ({})", max_retries)
+                                );
+                                failed_workers.push(worker_id.clone());
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Restart workers
+        // Schedule restart for workers with delay
         for worker_id in &restart_workers {
             self.restart_worker(worker_id)?;
         }
@@ -313,20 +364,63 @@ impl WorkerSpawner {
         Ok(())
     }
 
-    /// Restart a failed worker
+    /// Restart a failed worker with exponential backoff
     fn restart_worker(&mut self, worker_id: &str) -> Result<()> {
         let worker = self.workers.get_mut(worker_id)
             .ok_or_else(|| anyhow::anyhow!("Worker {} not found", worker_id))?;
 
-        worker.restart_count += 1;
+        // Calculate exponential backoff delay
+        let delay_ms = {
+            let base_ms = 1000u64;
+            let max_ms = 60000u64;
+            let delay = base_ms * 2_u64.pow(worker.restart_count);
+            delay.min(max_ms)
+        };
+
         println!(
-            "[Spawner] Restarting {} (attempt {})...",
-            worker_id, worker.restart_count
+            "[Spawner] ↻ Restarting {} (attempt {}, waiting {}ms)...",
+            worker_id, worker.restart_count + 1,
+            delay_ms
         );
 
-        // TODO: Re-generate plan and spawn new worker
-        // For now, just mark as failed
-        worker.status = WorkerStatus::Failed("restart not implemented".to_string());
+        let _ = self.logger.info(
+            worker_id,
+            &format!("Scheduled restart (attempt {}, delay {}ms)",
+                worker.restart_count + 1, delay_ms)
+        );
+
+        worker.restart_count += 1;
+        worker.last_restart_time = Instant::now();
+        worker.status = WorkerStatus::WaitingForRestart { delay_ms };
+
+        // Update TUI
+        let app = self.tui.app();
+        let mut app = app.lock().unwrap();
+        app.update_worker(worker_id, format!("Waiting ({}/{}s)", delay_ms / 1000, 60));
+
+        Ok(())
+    }
+
+    /// Perform actual restart after delay has expired
+    fn do_restart_worker(&mut self, worker_id: &str) -> Result<()> {
+        println!("[Spawner] → Starting {} now...", worker_id);
+
+        let _ = self.logger.info(worker_id, "Restarting now");
+
+        // Get the plan for this worker
+        let plan = self.plans.get(worker_id)
+            .ok_or_else(|| anyhow::anyhow!("No plan found for worker {}", worker_id))?
+            .clone();
+
+        // Kill old process if still alive
+        if let Some(worker) = self.workers.get_mut(worker_id) {
+            let _ = worker.kill();
+        }
+
+        // Re-spawn the worker
+        self.spawn_worker(&plan)?;
+
+        println!("[Spawner] ✓ {} restarted", worker_id);
 
         Ok(())
     }

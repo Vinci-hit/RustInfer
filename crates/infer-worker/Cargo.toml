@@ -29,6 +29,13 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 # Protocol dependency
 infer-protocol = { path = "../infer-protocol", optional = true }
 
+# TUI and logging dependencies
+ratatui = "0.27"
+crossterm = "0.28"
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"
+
 [build-dependencies]
 cc = { version = "1.2.52", features = ["parallel"] , optional = true }
 bindgen = { version ="0.72.1", optional = true }
@@ -43,6 +50,7 @@ default = ["cuda","server"]
 protocol = ["dep:infer-protocol"]
 server = ["protocol", "dep:zeromq", "dep:bincode", "dep:clap"]
 cuda = ["dep:cc", "dep:bindgen", "dep:walkdir"]
+nccl = ["cuda"]
 
 [[bin]]
 name = "infer-worker"

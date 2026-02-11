@@ -271,6 +271,8 @@ mod tests {
             inputs: &[&input_pos, &sin_cache_f32, &cos_cache_f32],
             outputs: &mut [&mut input_q_f32, &mut input_k_f32],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         op_f32.forward(&mut ctx_f32)?;
         let q_result_f32 = ctx_f32.outputs[0].as_f32()?.as_slice()?.to_vec();
@@ -282,6 +284,8 @@ mod tests {
             inputs: &[&input_pos, &sin_cache_bf16, &cos_cache_bf16],
             outputs: &mut [&mut input_q_bf16, &mut input_k_bf16],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         op_bf16.forward(&mut ctx_bf16)?;
         

@@ -8,5 +8,9 @@ pub mod worker;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+// NCCL communication module (only available when nccl feature is enabled)
+#[cfg(feature = "nccl")]
+pub mod comm;
+
 // Spawner module for auto-launching multiple workers
 pub mod spawner;

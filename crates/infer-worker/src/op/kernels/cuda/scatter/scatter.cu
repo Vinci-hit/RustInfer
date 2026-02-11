@@ -130,6 +130,7 @@ __global__ void scatter_kv_bf16_kernel(
     v_cache[cache_idx] = value[input_idx];
 }
 
+extern "C"
 void scatter_kv_kernel_bf16(
     __nv_bfloat16* k_cache,
     __nv_bfloat16* v_cache,

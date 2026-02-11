@@ -1,0 +1,33 @@
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ╔════════════════════════════════════════════════════════════╗
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ║              RustInfer Worker v0.1.0                       ║
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ╠════════════════════════════════════════════════════════════╣
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ║  Rank:           0 / 1                                    ║
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ║  Scheduler:   ipc:///tmp/rustinfer-test.ipc               ║
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ║  Model:       <Waiting for Scheduler>                        ║
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] ╚════════════════════════════════════════════════════════════╝
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] 
+[2026-02-10 14:05:44.122] [INFO] [device:0] [worker-0] [Worker-0] Initializing...
+[2026-02-10 14:05:44.219] [INFO] [device:0] [worker-0] Worker worker-0 initialized on device: CUDA Device 0 (CUDA:0): 15.99 GB total, 14.73 GB free (7.9% used)
+[2026-02-10 14:05:44.219] [INFO] [device:0] [worker-0] [Worker-0] Connecting to scheduler at ipc:///tmp/rustinfer-test.ipc
+[2026-02-10 14:05:44.220] [INFO] [device:0] [worker-0] Worker worker-0 shutting down...
+[2026-02-10 14:05:44.221] [INFO] [device:0] [worker-0] [STDERR] Error: Network Error: No such file or directory (os error 2)
+[2026-02-10 14:05:44.221] [INFO] [device:0] [worker-0] [STDERR] 
+[2026-02-10 14:05:44.221] [INFO] [device:0] [worker-0] [STDERR] Caused by:
+[2026-02-10 14:05:44.221] [INFO] [device:0] [worker-0] [STDERR]     No such file or directory (os error 2)
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ╔════════════════════════════════════════════════════════════╗
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ║              RustInfer Worker v0.1.0                       ║
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ╠════════════════════════════════════════════════════════════╣
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ║  Rank:           0 / 1                                    ║
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ║  Scheduler:   ipc:///tmp/rustinfer-scheduler.ipc          ║
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ║  Model:       <Waiting for Scheduler>                        ║
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] ╚════════════════════════════════════════════════════════════╝
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] 
+[2026-02-10 16:08:16.403] [INFO] [device:0] [worker-0] [Worker-0] Initializing...
+[2026-02-10 16:08:16.501] [INFO] [device:0] [worker-0] Worker worker-0 initialized on device: CUDA Device 0 (CUDA:0): 15.99 GB total, 14.73 GB free (7.9% used)
+[2026-02-10 16:08:16.503] [INFO] [device:0] [worker-0] [Worker-0] Connecting to scheduler at ipc:///tmp/rustinfer-scheduler.ipc
+[2026-02-10 16:08:16.507] [INFO] [device:0] [worker-0] Worker worker-0 shutting down...
+[2026-02-10 16:08:16.508] [INFO] [device:0] [worker-0] [STDERR] Error: Network Error: No such file or directory (os error 2)
+[2026-02-10 16:08:16.508] [INFO] [device:0] [worker-0] [STDERR] 
+[2026-02-10 16:08:16.508] [INFO] [device:0] [worker-0] [STDERR] Caused by:
+[2026-02-10 16:08:16.508] [INFO] [device:0] [worker-0] [STDERR]     No such file or directory (os error 2)
+[2026-02-10 16:08:21.191] [WARN] [device:0] Exited with status: ExitStatus(unix_wait_status(256))

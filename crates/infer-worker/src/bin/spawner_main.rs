@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid configuration: {}", e))?;
 
     // Create spawner
-    let mut spawner = WorkerSpawner::new(config);
+    let mut spawner = WorkerSpawner::new(config)?;
 
     // Spawn all workers
     if let Err(e) = spawner.spawn_all().await {

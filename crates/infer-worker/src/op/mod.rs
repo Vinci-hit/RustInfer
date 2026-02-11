@@ -12,6 +12,7 @@ pub mod rope;
 pub mod encode;
 pub mod sampler;
 pub mod scatter;
+pub mod attn_backend;
 
 /// OpContext 用于向 forward 方法传递可变数量的输入和输出。
 pub struct OpContext<'a> {
@@ -19,18 +20,22 @@ pub struct OpContext<'a> {
     pub outputs: &'a mut [&'a mut Tensor],
     #[cfg(feature = "cuda")]
     pub cuda_config: Option<&'a CudaConfig>,
+    #[cfg(feature = "cuda")]
+    pub attn_backend: Option<&'a attn_backend::AttentionBackend>,
 }
 
 impl<'a> OpContext<'a> {
     pub fn new(
-        inputs: &'a [&'a Tensor], 
-        outputs: &'a mut [&'a mut Tensor], 
+        inputs: &'a [&'a Tensor],
+        outputs: &'a mut [&'a mut Tensor],
         cuda_config: Option<&'a CudaConfig>
     ) -> Self {
         Self {
             inputs,
             outputs,
             cuda_config,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         }
     }
     // 链式调用，用于添加 CudaConfig

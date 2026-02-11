@@ -652,12 +652,6 @@ pub struct ModelLoadParams {
     /// Pipeline Parallelism: 总共的world size (预留, 默认1)
     pub pp_world_size: u32,
 
-    /// Tokenizer路径 (可选，如果为None则使用model_path)
-    pub tokenizer_path: Option<String>,
-
-    /// 是否启用Flash Attention
-    pub enable_flash_attn: bool,
-
     /// 自定义配置项 (JSON格式，用于扩展)
     pub custom_config: Option<String>,
 }

@@ -179,6 +179,8 @@ mod tests {
             inputs: &[&cpu_input],
             outputs: &mut [&mut cpu_output],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         cpu_op.forward(&mut cpu_ctx)?;
         let cpu_result = cpu_ctx.outputs[0].as_f32()?.as_slice()?.to_vec();
@@ -193,6 +195,8 @@ mod tests {
             inputs: &[&gpu_input],
             outputs: &mut [&mut gpu_output],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         gpu_op.forward(&mut gpu_ctx)?;
         // 将结果拷贝回 CPU
@@ -226,10 +230,12 @@ mod tests {
             inputs: &[&cpu_input],
             outputs: &mut [&mut cpu_output],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         cpu_op.forward(&mut cpu_ctx)?;
         let cpu_result = cpu_ctx.outputs[0].as_f32()?.as_slice()?.to_vec();
-        
+
         let (mut gpu_op, mut gpu_input, mut gpu_output) = setup(shape, DeviceType::Cuda(0))?;
         // (拷贝数据到 GPU，同上)
         gpu_input.as_f32_mut()?.buffer_mut().copy_from_host(cpu_input.as_f32()?.as_slice()?)?;
@@ -239,6 +245,8 @@ mod tests {
             inputs: &[&gpu_input],
             outputs: &mut [&mut gpu_output],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         gpu_op.forward(&mut gpu_ctx)?;
         // 将结果拷贝回 CPU

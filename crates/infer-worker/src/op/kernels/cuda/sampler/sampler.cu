@@ -105,3 +105,25 @@ void argmax_cu_bf16_ffi(
     argmax_kernel_bf16<<<blocks, threads, 0, stream>>>(logits_ptr, vocab_size, result_ptr_gpu);
 
 }
+
+// ------------------- Batch BF16 版本 -------------------
+// 对 batch 中每一行独立做 argmax
+extern "C"
+void argmax_batch_cu_bf16_ffi(
+    const __nv_bfloat16* logits_ptr, // [batch_size, vocab_size]
+    int batch_size,
+    int vocab_size,
+    int* output_ptr_gpu,             // [batch_size]
+    cudaStream_t stream
+) {
+    const int threads = 256;
+    const int blocks = 1;
+
+    for (int i = 0; i < batch_size; i++) {
+        argmax_kernel_bf16<<<blocks, threads, 0, stream>>>(
+            logits_ptr + i * vocab_size,
+            vocab_size,
+            output_ptr_gpu + i
+        );
+    }
+}

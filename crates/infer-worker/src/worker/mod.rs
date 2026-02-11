@@ -33,13 +33,21 @@
 mod worker;
 mod device_info;
 mod config;
+pub mod state_machine;
 
+#[cfg(feature = "server")]
+pub mod handlers;
+#[cfg(feature = "server")]
+pub mod control_plane;
 #[cfg(feature = "server")]
 pub mod server;
 
-pub use worker::{Worker, WorkerState, MemoryStats, PerformanceStats};
+pub use worker::{Worker, MemoryStats, PerformanceStats};
 pub use device_info::DeviceInfo;
 pub use config::WorkerConfig;
+pub use state_machine::{WorkerState, WorkerEvent, StateTransitionError};
 
+#[cfg(feature = "server")]
+pub use control_plane::ControlPlaneClient;
 #[cfg(feature = "server")]
 pub use server::WorkerServer;

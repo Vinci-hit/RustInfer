@@ -3,6 +3,8 @@
 // Generic decoder-only transformer layers
 // Used by Llama3, Qwen2, Mistral, and other decoder-only models
 
+use core::panic;
+
 use crate::base::{DeviceType, DataType};
 use crate::base::error::{Error, Result};
 use crate::op::add_inplace::AddInplace;
@@ -119,7 +121,6 @@ impl DecoderLayers {
                 device_type,
                 stream
             )?;
-
             // Fuse weights: concatenate Q, K, V weights horizontally
             // wq.weight shape: [dim, dim], wk.weight: [dim, kv_dim], wv.weight: [dim, kv_dim]
             // Result shape: [dim, dim + kv_dim + kv_dim]
@@ -366,28 +367,7 @@ impl DecoderLayers {
                 "Source and destination tensors must have same shape and dtype".into()
             ).into());
         }
-
-        let dtype = src.dtype();
-
-        match dtype {
-            DataType::F32 => {
-                let src_data = src.as_f32()?.as_slice()?;
-                let dst_data = dst.as_f32_mut()?.as_slice_mut()?;
-                dst_data.copy_from_slice(src_data);
-            }
-            DataType::BF16 => {
-                let src_data = src.as_bf16()?.as_slice()?;
-                let dst_data = dst.as_bf16_mut()?.as_slice_mut()?;
-                dst_data.copy_from_slice(src_data);
-            }
-            _ => {
-                return Err(Error::InvalidArgument(
-                    format!("Unsupported dtype for weight concatenation: {:?}", dtype)
-                ).into());
-            }
-        }
-
-        Ok(())
+        dst.copy_from(src)
     }
 
     fn load_matmul_async(

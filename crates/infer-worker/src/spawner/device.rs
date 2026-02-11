@@ -2,7 +2,7 @@
 //!
 //! Provides functionality to discover and filter available computing devices (CPU/GPU).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fmt;
 
 /// CUDA device information

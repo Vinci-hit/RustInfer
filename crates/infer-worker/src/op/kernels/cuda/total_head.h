@@ -4,5 +4,4 @@
 #include "./swiglu/swiglu.h"
 #include "./embedding/emb.h"
 #include "./rope/rope.h"
-#include "./flash_attn_gqa/flash_attn_gqa.h"
 #include "./scatter/scatter.h"

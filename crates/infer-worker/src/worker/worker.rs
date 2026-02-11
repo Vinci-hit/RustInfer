@@ -56,19 +56,7 @@ use crate::cuda::CudaConfig;
 
 use super::config::WorkerConfig;
 use super::device_info::DeviceInfo;
-
-/// Worker state enumeration
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerState {
-    /// Initial state, not yet initialized
-    Uninitialized,
-    /// Model loaded, ready for inference
-    Ready,
-    /// Currently processing a request
-    Processing,
-    /// Error state
-    Error,
-}
+use super::state_machine::WorkerState;
 
 /// Memory statistics
 #[derive(Debug, Clone)]
@@ -202,7 +190,7 @@ impl Worker {
 
         Ok(Self {
             config,
-            state: WorkerState::Uninitialized,
+            state: WorkerState::Initializing,
             device_info,
             model: None,
             kv_cache: None,
@@ -259,7 +247,7 @@ impl Worker {
         }
 
         self.model = Some(model);
-        self.state = WorkerState::Ready;
+        // State transition is managed by the handler, not here.
 
         // Update memory stats
         self.refresh_memory_stats()?;
@@ -318,24 +306,26 @@ impl Worker {
         &mut self,
         input_tokens: &Tensor,
         positions: &Tensor,
-        block_tables: &[u32],
-        max_blocks_per_req: usize,
-        slot_mapping: &Tensor,
-        context_lens: &[u32],
+        kv_indices: &Tensor,
+        kv_indptr: &Tensor,
+        new_slots: &Tensor,
         decode_tokens: usize,
     ) -> Result<SamplingOutput> {
         let model = self.model.as_mut()
             .ok_or_else(|| Error::InvalidArgument("Model not loaded".to_string()))?;
 
+        let kv_cache = self.kv_cache.as_mut()
+            .ok_or_else(|| Error::InvalidArgument("KV cache not initialized".to_string()))?;
+
         // Step 1: Get logits from model [batch_size, vocab_size]
         let logits = model.forward_paged(
             input_tokens,
             positions,
-            block_tables,
-            max_blocks_per_req,
-            slot_mapping,
-            context_lens,
+            kv_indices,
+            kv_indptr,
+            new_slots,
             decode_tokens,
+            kv_cache,
         )?;
 
         // Step 2: Extract batch size from logits
@@ -366,10 +356,29 @@ impl Worker {
 
     /// Reset KV cache state
     pub fn reset_kv_cache(&mut self) -> Result<()> {
-        if let Some(model) = self.model.as_mut() {
-            model.reset_kv_cache()?;
-        }
+        // KV cache is managed by KVCachePool, no per-model reset needed
         Ok(())
+    }
+
+    /// Unload model and release KV cache.
+    ///
+    /// After this call, the worker is ready to load a new model.
+    pub fn unload_model(&mut self) {
+        if self.kv_cache.is_some() {
+            self.kv_cache = None;
+            self.memory_stats.kv_cache_memory = 0;
+        }
+        if self.model.is_some() {
+            self.model = None;
+            self.model_load_time_ms = 0;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_config = None;
+        }
+        self.memory_stats.model_memory = 0;
+        self.memory_stats.workspace_memory = 0;
+        println!("[Worker-{}] Model and KV cache unloaded", self.config.worker_id);
     }
 
     /// Refresh memory statistics
@@ -390,8 +399,26 @@ impl Worker {
     }
 
     /// Get current state
-    pub fn state(&self) -> WorkerState {
-        self.state
+    pub fn state(&self) -> &WorkerState {
+        &self.state
+    }
+
+    /// Get mutable reference to state (for handlers to transition).
+    pub fn state_mut(&mut self) -> &mut WorkerState {
+        &mut self.state
+    }
+
+    /// Attempt a state transition. Logs on success, returns Err on invalid.
+    pub fn transition_state(&mut self, target: WorkerState) -> Result<()> {
+        let from_label = self.state.to_string();
+        self.state.transition(target).map_err(|e| {
+            Error::InvalidArgument(e.to_string())
+        })?;
+        println!(
+            "[Worker-{}] State: {} -> {}",
+            self.config.worker_id, from_label, self.state,
+        );
+        Ok(())
     }
 
     /// Get device information
@@ -457,19 +484,13 @@ impl Worker {
     /// Build WorkerStatus for protocol response
     #[cfg(feature = "protocol")]
     pub fn to_worker_status(&self) -> infer_protocol::WorkerStatus {
-        use infer_protocol::WorkerState as ProtocolWorkerState;
         use infer_protocol::MemoryStats as ProtocolMemoryStats;
         use infer_protocol::PerformanceStats as ProtocolPerformanceStats;
 
         infer_protocol::WorkerStatus {
             worker_id: self.config.worker_id.clone(),
             device_id: self.config.device_id,
-            state: match self.state {
-                WorkerState::Uninitialized => ProtocolWorkerState::Initializing,
-                WorkerState::Ready => ProtocolWorkerState::Idle,
-                WorkerState::Processing => ProtocolWorkerState::Inferencing,
-                WorkerState::Error => ProtocolWorkerState::Error,
-            },
+            state: self.state.to_protocol(),
             model_loaded: self.model.is_some(),
             kv_cache_initialized: self.kv_cache.is_some(),
             memory_stats: ProtocolMemoryStats {

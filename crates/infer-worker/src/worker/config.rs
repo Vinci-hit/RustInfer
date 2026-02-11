@@ -30,8 +30,6 @@ pub struct WorkerConfig {
     pub pp_rank: u32,
     /// Pipeline Parallelism world size (reserved for future)
     pub pp_world_size: u32,
-    /// Whether to enable Flash Attention
-    pub enable_flash_attn: bool,
 }
 
 impl WorkerConfig {
@@ -51,7 +49,6 @@ impl WorkerConfig {
             tp_world_size: 1,
             pp_rank: 0,
             pp_world_size: 1,
-            enable_flash_attn: true,
         }
     }
 
@@ -71,7 +68,6 @@ impl WorkerConfig {
             tp_world_size: 1,
             pp_rank: 0,
             pp_world_size: 1,
-            enable_flash_attn: false,
         }
     }
 
@@ -97,7 +93,6 @@ impl WorkerConfig {
             tp_world_size: params.tp_world_size,
             pp_rank: params.pp_rank,
             pp_world_size: params.pp_world_size,
-            enable_flash_attn: params.enable_flash_attn,
         }
     }
 
@@ -129,12 +124,6 @@ impl WorkerConfig {
     /// Set worker ID
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.worker_id = id.into();
-        self
-    }
-
-    /// Set Flash Attention
-    pub fn with_flash_attn(mut self, enable: bool) -> Self {
-        self.enable_flash_attn = enable;
         self
     }
 }

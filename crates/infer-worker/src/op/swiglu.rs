@@ -139,6 +139,8 @@ mod tests {
             inputs: &[&input_y_cpu],
             outputs: &mut [&mut input_x_cpu],
             cuda_config:None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         swiglu_op.forward(&mut ctx_cpu)?;
         let cpu_result_slice = input_x_cpu.as_f32()?.as_slice()?;
@@ -155,6 +157,8 @@ mod tests {
             inputs: &[&input_y_gpu],
             outputs: &mut [&mut input_x_gpu],
             cuda_config: cuda_config_ref,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         swiglu_op.forward(&mut ctx_gpu)?;
 

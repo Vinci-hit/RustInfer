@@ -44,6 +44,12 @@ pub struct SpawnerConfig {
 
     /// Whether to enable verbose output
     pub verbose: bool,
+
+    /// Log directory for worker logs
+    pub log_dir: Option<std::path::PathBuf>,
+
+    /// Enable TUI monitoring dashboard
+    pub enable_tui: bool,
 }
 
 impl Default for SpawnerConfig {
@@ -59,6 +65,8 @@ impl Default for SpawnerConfig {
             wait_for_all: false,
             log_level: "info".to_string(),
             verbose: false,
+            log_dir: Some(std::path::PathBuf::from("./logs")),
+            enable_tui: true,
         }
     }
 }
@@ -108,6 +116,18 @@ impl SpawnerConfig {
     /// Set verbose flag
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// Set log directory
+    pub fn with_log_dir(mut self, log_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.log_dir = Some(log_dir.into());
+        self
+    }
+
+    /// Enable/disable TUI monitoring
+    pub fn with_tui(mut self, enable_tui: bool) -> Self {
+        self.enable_tui = enable_tui;
         self
     }
 }
@@ -397,6 +417,8 @@ impl TryFrom<SpawnerArgs> for SpawnerConfig {
             wait_for_all: args.wait_for_all,
             log_level: args.log_level,
             verbose: args.verbose,
+            log_dir: Some(std::path::PathBuf::from("./logs")),
+            enable_tui: true,
         })
     }
 }

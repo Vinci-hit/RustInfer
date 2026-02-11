@@ -100,6 +100,8 @@ fn main() {
             .allowlist_function("cudaGraphLaunch")
             .allowlist_function("cudaGraphExecDestroy")
             .allowlist_function("cudaMemGetInfo")
+            .allowlist_function("cudaMallocHost")
+            .allowlist_function("cudaFreeHost")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .rustified_enum("cudaError_t")
             .rustified_enum("cudaMemcpyKind")
@@ -112,6 +114,43 @@ fn main() {
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
+
+    // NCCL bindings generation (only when nccl feature is enabled)
+    #[cfg(feature = "nccl")]
+    {
+        // Link NCCL
+        println!("cargo:rustc-link-lib=nccl");
+
+        let cuda_home = env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into());
+        let target = env::var("TARGET").expect("TARGET environment variable not set");
+
+        // Generate NCCL bindings
+        let nccl_bindings = bindgen::Builder::default()
+            .header("src/comm/wrapper.h")
+            .clang_arg(format!("-I{}/include", cuda_home))
+            .clang_arg(format!("--target={}", target))
+            .allowlist_function("ncclGetUniqueId")
+            .allowlist_function("ncclCommInitRank")
+            .allowlist_function("ncclCommDestroy")
+            .allowlist_function("ncclAllReduce")
+            .allowlist_function("ncclGetErrorString")
+            .allowlist_type("ncclComm_t")
+            .allowlist_type("ncclUniqueId")
+            .allowlist_type("ncclResult_t")
+            .allowlist_type("ncclDataType_t")
+            .allowlist_type("ncclRedOp_t")
+            .rustified_enum("ncclResult_t")
+            .rustified_enum("ncclDataType_t")
+            .rustified_enum("ncclRedOp_t")
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .generate()
+            .expect("Unable to generate NCCL bindings");
+
+        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+        nccl_bindings
+            .write_to_file(out_path.join("nccl_bindings.rs"))
+            .expect("Couldn't write NCCL bindings!");
+    }
 }
 
 /// 辅助函数：递归地查找指定目录中具有特定扩展名的文件
@@ -123,7 +162,8 @@ fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
     // 使用 filter_entry 可以高效跳过整个文件夹，不进入其内部扫描
     let iter = walker.filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        name != "third_party" // <--- 关键：如果文件夹名叫 third_party，直接跳过
+        // 跳过 third_party 和 3rdparty 目录
+        name != "third_party" && name != "3rdparty"
     });
 
     for entry in iter {

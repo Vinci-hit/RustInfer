@@ -10,7 +10,7 @@ pub mod architectures;
 pub mod layers;
 
 // Re-exports
-pub use loader::registry::{ModelRegistry, ModelId, ModelBuilderFn, GLOBAL_REGISTRY};
+pub use loader::registry::ModelRegistry;
 pub use layers::{DecoderLayers, WeightMappingAdapter};
 pub use kvcache::{KVCachePool, KVCacheConfig};
 pub use loader::model_loader::{ModelLoader, TensorLocation, DType};
@@ -67,6 +67,13 @@ pub struct Workspace {
     pub cos_cache: Tensor,
     pub rms_output: Tensor,
 
+    // FFN intermediate buffers
+    pub w1_output: Tensor,        // [max_bs, intermediate_size] gate proj
+    pub w3_output: Tensor,        // [max_bs, intermediate_size] up proj
+
+    // Output buffer
+    pub forward_output: Tensor,   // [max_bs, vocab_size] logits
+
     // 预定义的桶大小，例如 [1, 2, 4, 8, ..., 128]，当请求到来时进行二分查找，寻找最接近的桶
     ordered_buckets: Vec<usize>,
 
@@ -82,6 +89,12 @@ pub struct Workspace {
     static_slot_mapping: Tensor,
     // [max_bs,vocab_size]
     static_output: Tensor,
+
+    // Static buffers for attention (CudaGraph 绑定地址)
+    // [max_nnz] I32 - kv_indices for CSR-style attention
+    static_kv_indices: Tensor,
+    // [max_bs + 1] I32 - kv_indptr for CSR row pointers
+    static_kv_indptr: Tensor,
 
     graphs: Option<HashMap<usize, CudaGraph>>,
 }
@@ -136,6 +149,16 @@ impl Workspace {
         // rms_output: [max_bs, dim]
         let rms_output = Tensor::new(&[max_batch_size, config.dim], float_dtype, device)?;
 
+        // ---- FFN intermediate buffers ----
+        // w1_output: [max_bs, intermediate_size] gate proj
+        let w1_output = Tensor::new(&[max_batch_size, config.intermediate_size], float_dtype, device)?;
+        // w3_output: [max_bs, intermediate_size] up proj
+        let w3_output = Tensor::new(&[max_batch_size, config.intermediate_size], float_dtype, device)?;
+
+        // ---- Output buffer ----
+        // forward_output: [max_bs, vocab_size] logits
+        let forward_output = Tensor::new(&[max_batch_size, config.vocab_size], float_dtype, device)?;
+
         // ---- 预定义桶大小 (powers of 2 up to max_batch_size) ----
         let ordered_buckets = Self::generate_buckets(max_batch_size);
         println!("  CudaGraph buckets: {:?}", ordered_buckets);
@@ -150,6 +173,13 @@ impl Workspace {
         let static_slot_mapping = Tensor::new(&[max_bs], DataType::I32, device)?;
         let static_output = Tensor::new(&[max_bs, config.vocab_size], float_dtype, device)?;
 
+        // static_kv_indices: [max_nnz] for CSR-style attention indices
+        // max_nnz = max_bs * seq_len (worst case: each request has full context)
+        let max_nnz = max_bs * config.seq_len;
+        let static_kv_indices = Tensor::new(&[max_nnz], DataType::I32, device)?;
+        // static_kv_indptr: [max_bs + 1] CSR row pointers
+        let static_kv_indptr = Tensor::new(&[max_bs + 1], DataType::I32, device)?;
+
         println!("Decode Workspace initialized successfully.");
 
         Ok(Self {
@@ -158,12 +188,17 @@ impl Workspace {
             sin_cache,
             cos_cache,
             rms_output,
+            w1_output,
+            w3_output,
+            forward_output,
             ordered_buckets,
             static_input_ids,
             static_positions,
             static_block_tables,
             static_slot_mapping,
             static_output,
+            static_kv_indices,
+            static_kv_indptr,
             graphs: None,
         })
     }
@@ -212,6 +247,8 @@ impl Workspace {
     pub fn static_slot_mapping(&self) -> &Tensor { &self.static_slot_mapping }
     pub fn static_output(&self) -> &Tensor { &self.static_output }
     pub fn static_output_mut(&mut self) -> &mut Tensor { &mut self.static_output }
+    pub fn static_kv_indices(&self) -> &Tensor { &self.static_kv_indices }
+    pub fn static_kv_indptr(&self) -> &Tensor { &self.static_kv_indptr }
 
     /// 将运行时数据拷贝到静态 buffer（CudaGraph 执行前调用）
     pub fn copy_to_static(

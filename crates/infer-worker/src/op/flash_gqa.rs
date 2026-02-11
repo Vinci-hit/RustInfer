@@ -1,6 +1,6 @@
 use crate::base::error::{Result, Error};
 use crate::base::DeviceType;
-use crate::op::{kernels, Op, OpContext};
+use crate::op::{Op, OpContext};
 
 /// Flash Attention (高性能注意力机制) 的 GQA (Grouped-Query Attention) 算子。
 /// 使用 PagedAttention 模式，KV cache 以 CSR-style kv_indices 形式访问。
@@ -68,7 +68,7 @@ impl Op for FlashAttnGQA {
         let input_k_cache = &ctx.inputs[1];
         let input_v_cache = &ctx.inputs[2];
         let input_kv_indices = &ctx.inputs[3];
-        let input_kv_indptr = &ctx.inputs[4];
+        let _input_kv_indptr = &ctx.inputs[4];
         let output_o = &mut ctx.outputs[0];
 
         // --- b. 检查设备和数据类型 ---
@@ -115,26 +115,27 @@ impl Op for FlashAttnGQA {
             )).into());
         }
 
-        // ==================== 2. 分派到内核 ====================
+        // ==================== 2. 分派到 FlashInfer Backend ====================
         match device {
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                let kv_indices_ptr = input_kv_indices.as_i32()?.buffer().as_ptr() as *const i32;
-                let kv_indptr_ptr = input_kv_indptr.as_i32()?.buffer().as_ptr() as *const i32;
+                // Use FlashInfer backend (required, no fallback)
+                let backend = ctx.attn_backend.ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "FlashAttnGQA requires AttentionBackend to be provided via OpContext".into()
+                    )
+                })?;
 
+                let stream = ctx.cuda_config.map_or(std::ptr::null_mut(), |c| c.stream);
                 unsafe {
-                    kernels::cuda::flash_attn_gqa_paged(
+                    backend.run_decode(
                         input_q,
                         input_k_cache,
                         input_v_cache,
                         output_o,
-                        kv_indices_ptr,
-                        kv_indptr_ptr,
-                        batch_size,
-                        self.num_q_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        ctx.cuda_config,
+                        input_kv_indices,
+                        batch_size as u32,
+                        stream,
                     )?;
                 }
             }
@@ -277,6 +278,8 @@ mod tests {
             inputs: &[&q_in, &k_cache_gold, &v_cache_gold, &input_kv_len],
             outputs: &mut [&mut o_out],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         op.forward(&mut ctx)?;
         let expected_o = [0.4141, 0.9579, 0.5411, 0.6051, 0.2205, 0.6257, 0.5716, 0.1848, 0.0596,
@@ -386,6 +389,8 @@ mod tests {
             inputs: &[&q_in_cpu.clone(), &k_cache_gold_cpu, &v_cache_gold_cpu, &input_kv_len_cpu.clone()],
             outputs: &mut [&mut output_cpu],
             cuda_config: None,
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         flash_attn_cpu.forward(&mut ctx_cpu)?;
         let cpu_result_slice = ctx_cpu.outputs[0].as_f32()?.as_slice()?;
@@ -410,6 +415,8 @@ mod tests {
             inputs: &[&q_in_gpu, &k_cache_gpu, &v_cache_gpu, &input_kv_len_gpu],
             outputs: &mut [&mut output_gpu],
             cuda_config: Some(&cuda_config),
+            #[cfg(feature = "cuda")]
+            attn_backend: None,
         };
         flash_attn_gpu.forward(&mut ctx_gpu)?;
 
