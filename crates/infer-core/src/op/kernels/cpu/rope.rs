@@ -7,6 +7,7 @@ use rayon::prelude::*; // 导入 rayon 的并行迭代器 trait
 pub fn sin_cos_cache_calc_bf16(
     head_size: usize,
     max_seq_len: usize,
+    rope_theta: f32,
     sin_cache: &mut Tensor,
     cos_cache: &mut Tensor,
 ) -> Result<()> {
@@ -38,7 +39,7 @@ pub fn sin_cos_cache_calc_bf16(
     // --- 2. 预先计算频率 freqs (总是使用 f32 计算) ---
     let freqs: Vec<f32> = (0..head_size).map(|head_dim| {
         let exponent = head_dim as f32 / head_size as f32;
-        1.0f32 / 500000.0f32.powf(exponent)
+        1.0f32 / rope_theta.powf(exponent)
     }).collect();
     
     // --- 3. 核心多线程并行计算并填充 BF16 缓存 ---
@@ -180,16 +181,17 @@ pub fn rope_kernel_batch_bf16(
 pub fn sin_cos_cache_calc(
     head_size: usize,
     max_seq_len: usize,
+    rope_theta: f32,
     sin_cache: &mut Tensor,
     cos_cache: &mut Tensor,
 ) -> Result<()> {
     // 根据数据类型自动分发到对应的实现
     match sin_cache.dtype() {
         crate::base::DataType::F32 => {
-            sin_cos_cache_calc_f32(head_size, max_seq_len, sin_cache, cos_cache)
+            sin_cos_cache_calc_f32(head_size, max_seq_len, rope_theta, sin_cache, cos_cache)
         }
         crate::base::DataType::BF16 => {
-            sin_cos_cache_calc_bf16(head_size, max_seq_len, sin_cache, cos_cache)
+            sin_cos_cache_calc_bf16(head_size, max_seq_len, rope_theta, sin_cache, cos_cache)
         }
         _ => {
             Err(Error::InvalidArgument(format!(
@@ -203,6 +205,7 @@ pub fn sin_cos_cache_calc(
 fn sin_cos_cache_calc_f32(
     head_size: usize,
     max_seq_len: usize,
+    rope_theta: f32,
     sin_cache: &mut Tensor,
     cos_cache: &mut Tensor,
 ) -> Result<()> {
@@ -234,7 +237,7 @@ fn sin_cos_cache_calc_f32(
     // ... (2. 预先计算频率 freqs - 保持不变)
     let mut freqs = Vec::with_capacity(head_size);
     let head_size_f = head_size as f32;
-    let base_f = 500000.0f32;
+    let base_f = rope_theta;
 
     for head_dim in 0..head_size {
         let head_dim_f = head_dim as f32;

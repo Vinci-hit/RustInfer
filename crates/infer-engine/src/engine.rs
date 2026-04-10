@@ -4,10 +4,31 @@ use tokio::sync::Mutex;
 use infer_protocol::{InferenceRequest, InferenceResponse, InferenceMetrics, ResponseStatus};
 use anyhow::Result;
 
+/// 模型实例枚举，支持多种模型类型
+pub enum ModelInstance {
+    Llama3(infer_core::model::llama3::Llama3),
+    Qwen3(infer_core::model::qwen3::Qwen3),
+}
+
+impl ModelInstance {
+    /// 统一的 generate 接口
+    pub fn generate(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        print_output: bool,
+    ) -> Result<(String, u32, u64, u64, usize)> {
+        match self {
+            ModelInstance::Llama3(model) => Ok(model.generate(prompt, max_tokens, print_output)?),
+            ModelInstance::Qwen3(model) => Ok(model.generate(prompt, max_tokens, print_output)?),
+        }
+    }
+}
+
 /// 推理引擎 - 负责批量调度和推理
 pub struct InferenceEngine {
-    /// Llama3模型实例
-    model: infer_core::model::llama3::Llama3,
+    /// 模型实例
+    model: ModelInstance,
 
     /// 请求队列
     request_queue: Arc<Mutex<VecDeque<QueuedRequest>>>,
@@ -32,7 +53,7 @@ pub struct EngineConfig {
 
 impl InferenceEngine {
     pub fn new(
-        model: infer_core::model::llama3::Llama3,
+        model: ModelInstance,
         max_batch_size: usize,
         max_queue_size: usize,
         schedule_interval_ms: u64,
@@ -128,7 +149,7 @@ impl InferenceEngine {
                             prefill_ms,
                             decode_ms,
                             queue_ms,
-                            batch_size: 1, // TODO: 真正batch后这里会>1
+                            batch_size: 1,
                             tokens_per_second,
                             decode_iterations,
                         },
