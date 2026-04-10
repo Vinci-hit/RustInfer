@@ -12,10 +12,7 @@ use crate::cuda::CudaConfig;
 use crate::model::{BufferType, Workspace};
 use crate::op::add_inplace::AddInplace;
 use crate::op::embedding::Embedding;
-#[cfg(not(feature = "flashinfer"))]
 use crate::op::flash_gqa::FlashAttnGQA;
-#[cfg(feature = "flashinfer")]
-use crate::op::flashinfer_attn::FlashInferAttn;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::rope::RoPEOp;
@@ -49,10 +46,7 @@ pub struct Qwen3Layers {
     pub wk_layers: Vec<Matmul>,
     pub wv_layers: Vec<Matmul>,
     pub wo_layers: Vec<Matmul>,
-    #[cfg(not(feature = "flashinfer"))]
     pub mha_layers: Vec<FlashAttnGQA>,
-    #[cfg(feature = "flashinfer")]
-    pub mha_layers: Vec<FlashInferAttn>,
     pub rope_layers: Vec<RoPEOp>,
     pub add_layers: AddInplace,
     pub scatter_layer: Scatter,
@@ -133,10 +127,6 @@ impl Qwen3Layers {
             .iter_mut()
             .try_for_each(|layer| layer.to_cuda(device_id))?;
 
-        println!(
-            "All Qwen3 layers successfully moved to CUDA device {}.",
-            device_id
-        );
         Ok(())
     }
 }
@@ -219,18 +209,11 @@ impl KvCache {
 
         // 根据设备类型选择数据类型
         let float_type = if device.is_cpu() {
-            println!("  -> Initializing F32 KV Cache for CPU device.");
             DataType::F32
         } else {
             match config.torch_dtype.as_str() {
-                "float32" => {
-                    println!("  -> torch_dtype is float32.");
-                    DataType::F32
-                }
-                "bfloat16" => {
-                    println!("  -> torch_dtype is bfloat16.");
-                    DataType::BF16
-                }
+                "float32" => DataType::F32,
+                "bfloat16" => DataType::BF16,
                 _ => {
                     return Err(Error::InvalidArgument(format!(
                         "Unsupported torch_dtype: {}",
@@ -241,10 +224,6 @@ impl KvCache {
             }
         };
 
-        println!(
-            "Initializing KV Cache for {} layers with shape {:?}...",
-            config.layer_num, cache_shape
-        );
         let mut kv_cache = Vec::with_capacity(config.layer_num);
         for _ in 0..config.layer_num {
             let k_cache = Tensor::new(&cache_shape, float_type, *device)?;
@@ -265,19 +244,12 @@ impl Qwen3 {
         device_type: DeviceType,
         is_quant_model: bool,
     ) -> Result<Self> {
-        let start_time = Instant::now();
-        println!(
-            "Start calculate time, Loading Qwen3 model from directory: {:?}",
-            model_dir.as_ref()
-        );
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
         let tensor_names: std::collections::HashSet<String> =
             loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
         let cuda_config = CudaConfig::new()?;
-
-        println!("Creating Qwen3 model layers...");
 
         let (
             embedding_layer,
@@ -389,12 +361,8 @@ impl Qwen3 {
 
             // 检查是否有独立的 lm_head 权重
             let cls_layer = if tensor_names.contains("lm_head.weight") {
-                println!("Found independent 'lm_head.weight'. Loading it.");
                 Self::load_matmul("lm_head.weight", &loader, device_type)?
             } else {
-                println!(
-                    "'lm_head.weight' not found. Reusing token embedding weights (tied weights)."
-                );
                 Matmul::from(embedding_layer.weight.clone(), None)
             };
 
@@ -434,17 +402,12 @@ impl Qwen3 {
         };
 
         let layer_num = config.layer_num;
-        #[cfg(not(feature = "flashinfer"))]
         let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
             .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size))
             .collect();
-        #[cfg(feature = "flashinfer")]
-        let mha_layers: Result<Vec<FlashInferAttn>> = (0..layer_num)
-            .map(|_| FlashInferAttn::new(config.head_num, config.kv_head_num, config.head_size))
-            .collect();
         let mha_layers = mha_layers?;
         let rope_layers: Result<Vec<RoPEOp>> = (0..layer_num)
-            .map(|_| RoPEOp::new(config.dim, config.kv_dim, config.head_size))
+            .map(|_| RoPEOp::new(config.q_dim, config.kv_dim, config.head_size))
             .collect();
         let rope_layers = rope_layers?;
         let add_layers = AddInplace::new();
@@ -506,8 +469,6 @@ impl Qwen3 {
             .into());
         }
 
-        println!("All Qwen3 layers created and checked successfully.");
-
         // --- 组装 Qwen3Layers ---
         let layers = Qwen3Layers {
             embedding_layer,
@@ -538,8 +499,18 @@ impl Qwen3 {
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
         let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
-        let kcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
-        let vcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        // 临时 k/v cache 的 dtype 需与其他张量保持一致：CPU 用 F32，GPU 用模型配置的 dtype
+        let float_dtype = if device_type.is_cpu() {
+            DataType::F32
+        } else {
+            match config.torch_dtype.as_str() {
+                "bfloat16" => DataType::BF16,
+                "float32" => DataType::F32,
+                _ => DataType::BF16,
+            }
+        };
+        let kcache = Tensor::new(&[1, config.kv_dim], float_dtype, device_type)?;
+        let vcache = Tensor::new(&[1, config.kv_dim], float_dtype, device_type)?;
         let mut model = Self {
             config,
             device_type,
@@ -555,14 +526,7 @@ impl Qwen3 {
             vcache,
         };
 
-        println!("Calculating RoPE sin/cos cache...");
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
-
-        let duration = start_time.elapsed();
-        println!(
-            "Qwen3 model successfully initialized. Loading time: {:.2} seconds",
-            duration.as_secs_f64()
-        );
         Ok(model)
     }
 
@@ -575,6 +539,7 @@ impl Qwen3 {
                     crate::op::kernels::cpu::rope_sin_cos_cache_calc(
                         config.head_size,
                         config.seq_len,
+                        config.rope_theta,
                         sin_cache,
                         cos_cache,
                     )?;
@@ -585,6 +550,7 @@ impl Qwen3 {
                     crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
                         config.head_size,
                         config.seq_len,
+                        config.rope_theta,
                         sin_cache,
                         cos_cache,
                         Some(&stream),
@@ -602,25 +568,14 @@ impl Qwen3 {
 
     /// 预分配前向传播所需的所有中间张量。
     fn init_workspace(config: &RuntimeModelConfig, device: &DeviceType) -> Result<Workspace> {
-        println!(
-            "Initializing Qwen3 inference workspace for device {:?}...",
-            device
-        );
         let mut buffers = HashMap::new();
 
         let float_dtype = if device.is_cpu() {
-            println!("  -> Using F32 for CPU device.");
             DataType::F32
         } else {
             match config.torch_dtype.as_str() {
-                "float32" => {
-                    println!("  -> torch_dtype is float32.");
-                    DataType::F32
-                }
-                "bfloat16" => {
-                    println!("  -> torch_dtype is bfloat16.");
-                    DataType::BF16
-                }
+                "float32" => DataType::F32,
+                "bfloat16" => DataType::BF16,
                 _ => {
                     return Err(Error::InvalidArgument(format!(
                         "Unsupported torch_dtype: {}",
@@ -668,10 +623,16 @@ impl Qwen3 {
             Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
         );
 
-        // 5. Query 缓冲区
+        // 4.5 Attention output 缓冲区 (q_dim = num_heads * head_size)
+        buffers.insert(
+            BufferType::AttnOutput,
+            Tensor::new(&[max_seq_len, config.q_dim], float_dtype, *device)?,
+        );
+
+        // 5. Query 缓冲区 (q_dim = num_heads * head_size, 可能不等于 dim)
         buffers.insert(
             BufferType::Query,
-            Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
+            Tensor::new(&[max_seq_len, config.q_dim], float_dtype, *device)?,
         );
 
         // 6. FFN 的输入缓冲区
@@ -692,15 +653,7 @@ impl Qwen3 {
             )?,
         );
 
-        // 7. Attention scores (QK^T) 的缓冲区
-        buffers.insert(
-            BufferType::AttnScores,
-            Tensor::new(
-                &[config.head_num, max_seq_len, max_seq_len],
-                float_dtype,
-                *device,
-            )?,
-        );
+        // 7. (AttnScores 在 Flash Attention 下不需要，已移除)
 
         // 8. 用于前向传播的临时 K 和 V 缓冲区
         buffers.insert(
@@ -717,14 +670,30 @@ impl Qwen3 {
             Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
         );
 
+        // QK-norm buffers for per-head normalization
+        // Q reshaped: [max_seq_len * head_num, head_size]
+        buffers.insert(
+            BufferType::QNormBuffer,
+            Tensor::new(
+                &[max_seq_len * config.head_num, config.head_size],
+                float_dtype,
+                *device,
+            )?,
+        );
+        // K reshaped: [max_seq_len * kv_head_num, head_size]
+        buffers.insert(
+            BufferType::KNormBuffer,
+            Tensor::new(
+                &[max_seq_len * config.kv_head_num, config.head_size],
+                float_dtype,
+                *device,
+            )?,
+        );
+
         // 10. 模型的最终 logits 输出
         let forward_output = Tensor::new(&[config.vocab_size], float_dtype, *device)?;
         buffers.insert(BufferType::ForwardOutput, forward_output);
 
-        println!(
-            "Qwen3 workspace (batch-enabled) initialized with {} buffers.",
-            buffers.len()
-        );
         Ok(buffers)
     }
 
@@ -809,11 +778,13 @@ impl Qwen3 {
 
         // Generation stage
         let mut generated_tokens = vec![current_token];
+        let mut printed_len = 0usize; // 已打印的字符数
 
         if print_output {
-            let decoded = self.tokenizer.decode(&[current_token])?;
-            let _ = write!(stdout, "{}", decoded);
-            io::stdout().flush().expect("Failed to flush stdout");
+            let decoded = self.tokenizer.decode(&generated_tokens)?;
+            let _ = write!(stdout, "{}", &decoded[printed_len..]);
+            printed_len = decoded.len();
+            stdout.flush()?;
         }
 
         // Generate tokens starting from the end of the prompt
@@ -834,9 +805,16 @@ impl Qwen3 {
             decode_iterations += 1;
 
             if print_output {
-                let decoded = self.tokenizer.decode(&[current_token])?;
-                let _ = write!(stdout, "{}", decoded);
-                stdout.flush()?;
+                let decoded = self.tokenizer.decode(&generated_tokens)?;
+                if decoded.len() > printed_len {
+                    let new_text = &decoded[printed_len..];
+                    // 只输出不含 replacement character 的部分
+                    if !new_text.contains('\u{FFFD}') {
+                        let _ = write!(stdout, "{}", new_text);
+                        printed_len = decoded.len();
+                        stdout.flush()?;
+                    }
+                }
             }
         }
         let decode_duration = decode_start.elapsed();
@@ -858,17 +836,21 @@ impl Qwen3 {
 
     fn forward_decoding(&mut self, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
         self.input_pos.copy_from(pos_cpu)?;
-        let config = self
-            .cuda_config
-            .as_mut()
-            .expect("CudaConfig should be initialized");
-        if config.cuda_graph.is_none() {
-            config.capture_graph_begin()?;
-        } else {
-            config.launch_graph()?;
-            config.sync_stream()?;
-            let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-            return Ok(next_token);
+
+        // CUDA Graph 逻辑仅在 CUDA 设备上启用
+        if self.device_type.is_cuda() {
+            let config = self
+                .cuda_config
+                .as_mut()
+                .expect("CudaConfig should be initialized");
+            if config.cuda_graph.is_none() {
+                config.capture_graph_begin()?;
+            } else {
+                config.launch_graph()?;
+                config.sync_stream()?;
+                let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+                return Ok(next_token);
+            }
         }
 
         let cuda_config_ref = if self.device_type.is_cuda() {
@@ -898,7 +880,7 @@ impl Qwen3 {
             ))?;
 
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+            let mut q = q_buffer.slice(&[0, 0], &[1, self.config.q_dim])?;
             self.layers.wq_layers[i].forward(&mut OpContext::new(
                 &[&attn_norm_out],
                 &mut [&mut q],
@@ -915,28 +897,34 @@ impl Qwen3 {
                 cuda_config_ref,
             ))?;
 
-            // ---- Qwen3 特定：QK-norm 层应用在原始 Query 和 Key 上 ----
-            // Normalize Q if qnorm_layers exist
-            if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
-                let mut q_normed = attn_norm_out; // Reuse buffer for normed Q
+            // ---- Qwen3 特定：Per-head QK-norm ----
+            let mut q = if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
+                let q_reshaped = q.reshape(&[self.config.head_num, self.config.head_size])?;
+                let qnorm_buffer = self.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
+                let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[self.config.head_num, self.config.head_size])?;
                 qnorm_layers[i].forward(&mut OpContext::new(
-                    &[&q],
-                    &mut [&mut q_normed],
+                    &[&q_reshaped],
+                    &mut [&mut qnorm_out],
                     cuda_config_ref,
                 ))?;
-                q.copy_from(&q_normed)?;
-            }
+                qnorm_out.reshape(&[1, self.config.q_dim])?
+            } else {
+                q
+            };
 
-            // Normalize K if knorm_layers exist
-            if let Some(ref knorm_layers) = self.layers.knorm_layers {
-                let mut k_normed = self.vcache.clone(); // Use temporary buffer
+            let mut k_active = if let Some(ref knorm_layers) = self.layers.knorm_layers {
+                let k_reshaped = self.kcache.reshape(&[self.config.kv_head_num, self.config.head_size])?;
+                let knorm_buffer = self.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
+                let mut knorm_out = knorm_buffer.slice(&[0, 0], &[self.config.kv_head_num, self.config.head_size])?;
                 knorm_layers[i].forward(&mut OpContext::new(
-                    &[&self.kcache],
-                    &mut [&mut k_normed],
+                    &[&k_reshaped],
+                    &mut [&mut knorm_out],
                     cuda_config_ref,
                 ))?;
-                self.kcache.copy_from(&k_normed)?;
-            }
+                knorm_out.reshape(&[1, self.config.kv_dim])?
+            } else {
+                self.kcache.reshape(&[1, self.config.kv_dim])?
+            };
 
             let (k_cache_full, v_cache_full) = self.kv_cache.get_mut(i)?;
 
@@ -945,11 +933,11 @@ impl Qwen3 {
 
             self.layers.rope_layers[i].forward(&mut OpContext::new(
                 &[&self.input_pos, sin_cache, cos_cache],
-                &mut [&mut q, &mut self.kcache],
+                &mut [&mut q, &mut k_active],
                 cuda_config_ref,
             ))?;
             self.layers.scatter_layer.forward(&mut OpContext::new(
-                &[&self.kcache, &self.input_pos],
+                &[&k_active, &self.input_pos],
                 &mut [k_cache_full],
                 cuda_config_ref,
             ))?;
@@ -959,20 +947,16 @@ impl Qwen3 {
                 cuda_config_ref,
             ))?;
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out; // Reuse buffer
-            #[cfg(feature = "flashinfer")]
-            self.layers.mha_layers[i].forward(&mut OpContext::new(
-                &[&q, k_cache_history, v_cache_history, pos_cpu],
-                &mut [&mut attn_out],
-                cuda_config_ref,
-            ))?;
-            #[cfg(not(feature = "flashinfer"))]
+            let attn_out_buffer = self.workspace.get_mut(&BufferType::AttnOutput).unwrap();
+            let mut attn_out = attn_out_buffer.slice(&[0, 0], &[1, self.config.q_dim])?;
             self.layers.mha_layers[i].forward(&mut OpContext::new(
                 &[&q, k_cache_history, v_cache_history, &self.input_pos],
                 &mut [&mut attn_out],
                 cuda_config_ref,
             ))?;
-            let mut wo_out = q; // Reuse buffer
+            // wo_proj: [1, q_dim] -> [1, dim], 不能复用 q 因为 q_dim != dim
+            let wo_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
+            let mut wo_out = wo_buffer.slice(&[0, 0], &[1, self.config.dim])?;
             self.layers.wo_layers[i].forward(&mut OpContext::new(
                 &[&attn_out],
                 &mut [&mut wo_out],
@@ -983,8 +967,9 @@ impl Qwen3 {
                 &mut [&mut x],
                 cuda_config_ref,
             ))?;
-            // FFN Block
-            let mut ffn_norm_out = attn_out; // Reuse buffer
+            // FFN Block - 用 RmsOutput 缓冲区，它是 [1, dim]
+            let ffn_norm_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut ffn_norm_out = ffn_norm_buffer.slice(&[0, 0], &[1, self.config.dim])?;
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(
                 &[&x],
                 &mut [&mut ffn_norm_out],
@@ -1044,12 +1029,14 @@ impl Qwen3 {
             &mut [logits],
             cuda_config_ref,
         ))?;
-        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        // 截断到 tokenizer 的实际 vocab_size，避免采样到 padding 区域的 token
+        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         self.sampler
-            .sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+            .sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
 
-        #[cfg(not(feature = "flashinfer"))]
-        {
+        // CUDA Graph: 结束捕获（仅 CUDA 设备）
+        if self.device_type.is_cuda() {
             let config = self
                 .cuda_config
                 .as_mut()
@@ -1057,17 +1044,6 @@ impl Qwen3 {
             if config.cuda_graph.is_none() {
                 config.capture_graph_end()?;
             }
-        }
-
-        #[cfg(feature = "flashinfer")]
-        {
-            let config = self
-                .cuda_config
-                .as_mut()
-                .expect("CudaConfig should be initialized");
-            config.capture_graph_end()?;
-            config.launch_graph()?;
-            config.sync_stream()?;
         }
 
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
@@ -1116,7 +1092,7 @@ impl Qwen3 {
             ))?;
 
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
+            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
             let (mut k, mut v) =
                 self.kv_cache
                     .slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
@@ -1136,31 +1112,31 @@ impl Qwen3 {
                 cuda_config_ref,
             ))?;
 
-            // ---- Qwen3 特定：QK-norm 层应用在原始 Query 和 Key 上 ----
-            // Normalize Q if qnorm_layers exist
+            // ---- Qwen3 Per-head QK-norm ----
             if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
-                let mut q_normed = attn_norm_out; // Reuse buffer for normed Q
+                let q_reshaped = q.reshape(&[seq_len * self.config.head_num, self.config.head_size])?;
+                let qnorm_buffer = self.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
+                let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[seq_len * self.config.head_num, self.config.head_size])?;
                 qnorm_layers[i].forward(&mut OpContext::new(
-                    &[&q],
-                    &mut [&mut q_normed],
+                    &[&q_reshaped],
+                    &mut [&mut qnorm_out],
                     cuda_config_ref,
                 ))?;
-                q.copy_from(&q_normed)?;
+                let qnorm_flat = qnorm_out.reshape(&[seq_len, self.config.q_dim])?;
+                q.copy_from(&qnorm_flat)?;
             }
 
-            // Normalize K if knorm_layers exist
             if let Some(ref knorm_layers) = self.layers.knorm_layers {
-                let k_buffer = self
-                    .workspace
-                    .get_mut(&BufferType::IntermediateBuffer1)
-                    .unwrap();
-                let mut k_normed = k_buffer.slice(&[0, 0], &[seq_len, self.config.kv_dim])?;
+                let k_reshaped = k.reshape(&[seq_len * self.config.kv_head_num, self.config.head_size])?;
+                let knorm_buffer = self.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
+                let mut knorm_out = knorm_buffer.slice(&[0, 0], &[seq_len * self.config.kv_head_num, self.config.head_size])?;
                 knorm_layers[i].forward(&mut OpContext::new(
-                    &[&k],
-                    &mut [&mut k_normed],
+                    &[&k_reshaped],
+                    &mut [&mut knorm_out],
                     cuda_config_ref,
                 ))?;
-                k.copy_from(&k_normed)?;
+                let knorm_flat = knorm_out.reshape(&[seq_len, self.config.kv_dim])?;
+                k.copy_from(&knorm_flat)?;
             }
 
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
@@ -1171,13 +1147,16 @@ impl Qwen3 {
                 cuda_config_ref,
             ))?;
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out; // Reuse buffer
+            let attn_out_buffer = self.workspace.get_mut(&BufferType::AttnOutput).unwrap();
+            let mut attn_out = attn_out_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
             self.layers.mha_layers[i].forward(&mut OpContext::new(
                 &[&q, k_cache_history, v_cache_history, pos_cpu],
                 &mut [&mut attn_out],
                 cuda_config_ref,
             ))?;
-            let mut wo_out = q; // Reuse buffer
+            // wo_proj: [seq_len, q_dim] -> [seq_len, dim], 不能复用 q 因为 q_dim != dim
+            let wo_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
+            let mut wo_out = wo_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             self.layers.wo_layers[i].forward(&mut OpContext::new(
                 &[&attn_out],
                 &mut [&mut wo_out],
@@ -1188,8 +1167,9 @@ impl Qwen3 {
                 &mut [&mut x],
                 cuda_config_ref,
             ))?;
-            // FFN Block
-            let mut ffn_norm_out = attn_out; // Reuse buffer
+            // FFN Block - 用 RmsOutput 缓冲区
+            let ffn_norm_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut ffn_norm_out = ffn_norm_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(
                 &[&x],
                 &mut [&mut ffn_norm_out],
@@ -1257,11 +1237,12 @@ impl Qwen3 {
             &mut [logits],
             cuda_config_ref,
         ))?;
-        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        // 截断到 tokenizer 的实际 vocab_size，避免采样到 padding 区域的 token
+        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         self.sampler
-            .sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+            .sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-
         Ok(next_token)
     }
 }
@@ -1304,5 +1285,404 @@ impl Model for Qwen3 {
             Error::InvalidArgument("slice_kv_cache not yet implemented for Qwen3".to_string())
                 .into(),
         )
+    }
+}
+
+// ============================================================================
+//  集成测试 (Integration Tests)
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::Instant;
+    use crate::base::error::Result;
+
+    /// 辅助函数：执行生成并返回性能指标
+    fn generate_and_measure(
+        model: &mut Qwen3,
+        prompt: &str,
+        max_tokens: usize,
+        verbose: bool,
+    ) -> Result<(String, u64, u32, u64, u64, usize)> {
+        let start_time = Instant::now();
+        let (generated_text, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) =
+            model.generate(prompt, max_tokens, verbose)?;
+        let duration = start_time.elapsed();
+        let duration_ms = duration.as_millis() as u64;
+
+        Ok((
+            generated_text,
+            duration_ms,
+            num_generated_tokens,
+            prefill_ms,
+            decode_ms,
+            decode_iterations,
+        ))
+    }
+
+    fn get_qwen3_model_path() -> &'static Path {
+        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct")
+    }
+
+    #[test]
+    #[ignore = "需要 Qwen3 模型权重，请单独运行。"]
+    #[cfg(feature = "cuda")]
+    fn test_qwen3_cuda_performance() -> Result<()> {
+        let model_path = get_qwen3_model_path();
+        assert!(model_path.exists(), "Qwen3 model directory not found at {:?}", model_path);
+
+        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n写一段C++代码，实现一个简单的中序遍历函数。<|im_end|>\n<|im_start|>assistant\n";
+        let max_tokens = 2000;
+
+        println!("\n=== Running Qwen3 on CUDA ===");
+        let mut model = Qwen3::new(model_path, DeviceType::Cuda(0), false)?;
+        let (_text, _duration_ms, num_tokens, prefill_ms, decode_ms, decode_iterations) =
+            generate_and_measure(&mut model, prompt, max_tokens, true)?;
+
+        // 性能指标计算
+        let prompt_tokens = model.tokenizer.encode(prompt)?;
+        let prompt_tokens_len = prompt_tokens.len() as f64;
+        let generated_tokens_len = num_tokens as f64;
+        let total_tokens = prompt_tokens_len + generated_tokens_len;
+        let total_compute_ms = (prefill_ms + decode_ms) as f64;
+
+        let tps = if total_compute_ms > 0.0 {
+            total_tokens / (total_compute_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        let prefill_throughput = if prefill_ms > 0 {
+            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        let decode_avg_itl = if decode_iterations > 0 {
+            decode_ms as f64 / decode_iterations as f64
+        } else {
+            0.0
+        };
+
+        let decode_throughput = if decode_ms > 0 {
+            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        println!("\n================ QWEN3 CUDA PERFORMANCE ================");
+        println!(
+            "Total Time (compute only): {} ms, Total Tokens: {}, TPS: {:.2}",
+            total_compute_ms as u64, total_tokens as usize, tps
+        );
+        println!(
+            "Generated Tokens: {}, Prompt Tokens: {}",
+            num_tokens, prompt_tokens_len as usize
+        );
+        println!(
+            "Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s",
+            prefill_ms, prefill_throughput
+        );
+        println!(
+            "Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s",
+            decode_avg_itl, decode_throughput
+        );
+        println!("=========================================================\n");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "需要 Qwen3 模型权重，请单独运行。"]
+    fn test_qwen3_cpu_loading_and_generation() -> Result<()> {
+        let model_path = get_qwen3_model_path();
+        assert!(model_path.exists(), "Qwen3 model directory not found at {:?}", model_path);
+
+        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n写一段C++代码，实现一个简单的中序遍历函数。<|im_end|>\n<|im_start|>assistant\n";
+        let max_tokens = 150;
+
+        println!("\n=== Running Qwen3 on CPU ===");
+        let mut model = Qwen3::new(model_path, DeviceType::Cpu, false)?;
+        let (_text, _duration_ms, num_tokens, prefill_ms, decode_ms, decode_iterations) =
+            generate_and_measure(&mut model, prompt, max_tokens, true)?;
+
+        let prompt_tokens = model.tokenizer.encode(prompt)?;
+        let prompt_tokens_len = prompt_tokens.len() as f64;
+        let generated_tokens_len = num_tokens as f64;
+        let total_tokens = prompt_tokens_len + generated_tokens_len;
+        let total_compute_ms = (prefill_ms + decode_ms) as f64;
+
+        let tps = if total_compute_ms > 0.0 {
+            total_tokens / (total_compute_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        let prefill_throughput = if prefill_ms > 0 {
+            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        let decode_avg_itl = if decode_iterations > 0 {
+            decode_ms as f64 / decode_iterations as f64
+        } else {
+            0.0
+        };
+
+        let decode_throughput = if decode_ms > 0 {
+            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        println!("\n================ QWEN3 CPU PERFORMANCE ================");
+        println!(
+            "Total Time (compute only): {} ms, Total Tokens: {}, TPS: {:.2}",
+            total_compute_ms as u64, total_tokens as usize, tps
+        );
+        println!(
+            "Generated Tokens: {}, Prompt Tokens: {}",
+            num_tokens, prompt_tokens_len as usize
+        );
+        println!(
+            "Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s",
+            prefill_ms, prefill_throughput
+        );
+        println!(
+            "Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s",
+            decode_avg_itl, decode_throughput
+        );
+        println!("=========================================================\n");
+        Ok(())
+    }
+
+    /// 二分对比 CPU vs GPU 的逐算子输出，定位第一个产生差异的算子。
+    /// 只跑第 0 层的 prefill 第一步。
+    #[test]
+    #[ignore = "需要 Qwen3 模型权重和 CUDA，请单独运行。"]
+    #[cfg(feature = "cuda")]
+    fn test_qwen3_cpu_vs_gpu_layer0() -> Result<()> {
+        let model_path = get_qwen3_model_path();
+        assert!(model_path.exists());
+
+        // 短 prompt 方便对比
+        let prompt = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n";
+
+        println!("=== Loading CPU model ===");
+        let mut cpu_model = Qwen3::new(model_path, DeviceType::Cpu, false)?;
+        println!("=== Loading GPU model ===");
+        let mut gpu_model = Qwen3::new(model_path, DeviceType::Cuda(0), false)?;
+
+        // Tokenize
+        let prompt_tokens = cpu_model.tokenizer.encode(prompt)?;
+        let seq_len = prompt_tokens.len();
+        println!("Prompt tokens: {:?} (len={})", &prompt_tokens[..seq_len.min(20)], seq_len);
+
+        // 准备输入
+        let mut input_tokens = Tensor::new(&[seq_len], DataType::I32, DeviceType::Cpu)?;
+        input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
+        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
+
+        // ============ CPU forward (手动第0层) ============
+        let cpu_cfg = None;
+        {
+            let m = &mut cpu_model;
+            m.input_pos.copy_from(&input_pos)?;
+            // embedding
+            let input_buf = m.workspace.get_mut(&BufferType::InputTokens).unwrap();
+            let mut itv = input_buf.slice(&[0], &[seq_len])?;
+            itv.copy_from(&input_tokens)?;
+
+            let x_buf = m.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+            let mut x = x_buf.slice(&[0, 0], &[seq_len, m.config.dim])?;
+            m.layers.embedding_layer.forward(&mut OpContext::new(&[&itv], &mut [&mut x], cpu_cfg))?;
+            let cpu_embed = x.as_f32()?.as_slice()?.to_vec();
+            println!("[CPU] embedding first 8: {:?}", &cpu_embed[..8]);
+
+            // attn_norm
+            let norm_buf = m.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut norm_out = norm_buf.slice(&[0, 0], &[seq_len, m.config.dim])?;
+            m.layers.rmsnorm_attn_layers[0].forward(&mut OpContext::new(&[&x], &mut [&mut norm_out], cpu_cfg))?;
+            let cpu_norm = norm_out.as_f32()?.as_slice()?.to_vec();
+            println!("[CPU] attn_norm first 8: {:?}", &cpu_norm[..8]);
+
+            // wq
+            let q_buf = m.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buf.slice(&[0, 0], &[seq_len, m.config.q_dim])?;
+            m.layers.wq_layers[0].forward(&mut OpContext::new(&[&norm_out], &mut [&mut q], cpu_cfg))?;
+            let cpu_q = q.as_f32()?.as_slice()?.to_vec();
+            println!("[CPU] wq first 8: {:?}", &cpu_q[..8]);
+
+            // wk, wv
+            let (mut k, mut v) = m.kv_cache.slice_kv_cache(0, 0, seq_len, m.config.kv_dim)?;
+            m.layers.wk_layers[0].forward(&mut OpContext::new(&[&norm_out], &mut [&mut k], cpu_cfg))?;
+            m.layers.wv_layers[0].forward(&mut OpContext::new(&[&norm_out], &mut [&mut v], cpu_cfg))?;
+            let cpu_k = k.as_f32()?.as_slice()?.to_vec();
+            println!("[CPU] wk first 8: {:?}", &cpu_k[..8]);
+
+            // qk-norm
+            if let Some(ref qnorm) = m.layers.qnorm_layers {
+                let q_reshaped = q.reshape(&[seq_len * m.config.head_num, m.config.head_size])?;
+                let qn_buf = m.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
+                let mut qn_out = qn_buf.slice(&[0, 0], &[seq_len * m.config.head_num, m.config.head_size])?;
+                qnorm[0].forward(&mut OpContext::new(&[&q_reshaped], &mut [&mut qn_out], cpu_cfg))?;
+                let qn_flat = qn_out.reshape(&[seq_len, m.config.q_dim])?;
+                q.copy_from(&qn_flat)?;
+                let cpu_qn = q.as_f32()?.as_slice()?.to_vec();
+                println!("[CPU] q after qk-norm first 8: {:?}", &cpu_qn[..8]);
+            }
+
+            if let Some(ref knorm) = m.layers.knorm_layers {
+                let k_reshaped = k.reshape(&[seq_len * m.config.kv_head_num, m.config.head_size])?;
+                let kn_buf = m.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
+                let mut kn_out = kn_buf.slice(&[0, 0], &[seq_len * m.config.kv_head_num, m.config.head_size])?;
+                knorm[0].forward(&mut OpContext::new(&[&k_reshaped], &mut [&mut kn_out], cpu_cfg))?;
+                let kn_flat = kn_out.reshape(&[seq_len, m.config.kv_dim])?;
+                k.copy_from(&kn_flat)?;
+                let cpu_kn = k.as_f32()?.as_slice()?.to_vec();
+                println!("[CPU] k after kk-norm first 8: {:?}", &cpu_kn[..8]);
+            }
+
+            // RoPE
+            let sin = m.workspace.get(&BufferType::SinCache).unwrap();
+            let cos = m.workspace.get(&BufferType::CosCache).unwrap();
+            m.layers.rope_layers[0].forward(&mut OpContext::new(
+                &[&m.input_pos, sin, cos], &mut [&mut q, &mut k], cpu_cfg
+            ))?;
+            let cpu_q_rope = q.as_f32()?.as_slice()?.to_vec();
+            let cpu_k_rope = k.as_f32()?.as_slice()?.to_vec();
+            println!("[CPU] q after RoPE first 8: {:?}", &cpu_q_rope[..8]);
+            println!("[CPU] k after RoPE first 8: {:?}", &cpu_k_rope[..8]);
+
+            // Attention
+            let (k_hist, v_hist) = m.kv_cache.get(0).unwrap();
+            let attn_buf = m.workspace.get_mut(&BufferType::AttnOutput).unwrap();
+            let mut attn_out = attn_buf.slice(&[0, 0], &[seq_len, m.config.q_dim])?;
+            m.layers.mha_layers[0].forward(&mut OpContext::new(
+                &[&q, k_hist, v_hist, &input_pos], &mut [&mut attn_out], cpu_cfg
+            ))?;
+            let cpu_attn = attn_out.as_f32()?.as_slice()?.to_vec();
+            println!("[CPU] attn_out first 8: {:?}", &cpu_attn[..8]);
+        }
+
+        // ============ GPU forward (手动第0层) ============
+        {
+            let m = &mut gpu_model;
+            let gpu_cfg = m.cuda_config.as_ref();
+
+            let input_tokens_gpu = input_tokens.to_cuda(0)?;
+            let input_pos_gpu = input_pos.to_cuda(0)?;
+            m.input_pos.copy_from(&input_pos_gpu)?;
+
+            // embedding
+            let input_buf = m.workspace.get_mut(&BufferType::InputTokens).unwrap();
+            let mut itv = input_buf.slice(&[0], &[seq_len])?;
+            itv.copy_from(&input_tokens_gpu)?;
+
+            let x_buf = m.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+            let mut x = x_buf.slice(&[0, 0], &[seq_len, m.config.dim])?;
+            m.layers.embedding_layer.forward(&mut OpContext::new(&[&itv], &mut [&mut x], gpu_cfg))?;
+            let gpu_embed: Vec<f32> = {
+                let t = x.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            println!("[GPU] embedding first 8: {:?}", &gpu_embed[..8]);
+
+            // attn_norm
+            let norm_buf = m.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut norm_out = norm_buf.slice(&[0, 0], &[seq_len, m.config.dim])?;
+            m.layers.rmsnorm_attn_layers[0].forward(&mut OpContext::new(&[&x], &mut [&mut norm_out], gpu_cfg))?;
+            let gpu_norm: Vec<f32> = {
+                let t = norm_out.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            println!("[GPU] attn_norm first 8: {:?}", &gpu_norm[..8]);
+
+            // wq
+            let q_buf = m.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buf.slice(&[0, 0], &[seq_len, m.config.q_dim])?;
+            m.layers.wq_layers[0].forward(&mut OpContext::new(&[&norm_out], &mut [&mut q], gpu_cfg))?;
+            let gpu_q: Vec<f32> = {
+                let t = q.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            println!("[GPU] wq first 8: {:?}", &gpu_q[..8]);
+
+            // wk
+            let (mut k, mut v) = m.kv_cache.slice_kv_cache(0, 0, seq_len, m.config.kv_dim)?;
+            m.layers.wk_layers[0].forward(&mut OpContext::new(&[&norm_out], &mut [&mut k], gpu_cfg))?;
+            let gpu_k: Vec<f32> = {
+                let t = k.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            println!("[GPU] wk first 8: {:?}", &gpu_k[..8]);
+
+            // wv
+            m.layers.wv_layers[0].forward(&mut OpContext::new(&[&norm_out], &mut [&mut v], gpu_cfg))?;
+
+            // qk-norm
+            if let Some(ref qnorm) = m.layers.qnorm_layers {
+                let q_reshaped = q.reshape(&[seq_len * m.config.head_num, m.config.head_size])?;
+                let qn_buf = m.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
+                let mut qn_out = qn_buf.slice(&[0, 0], &[seq_len * m.config.head_num, m.config.head_size])?;
+                qnorm[0].forward(&mut OpContext::new(&[&q_reshaped], &mut [&mut qn_out], gpu_cfg))?;
+                let qn_flat = qn_out.reshape(&[seq_len, m.config.q_dim])?;
+                q.copy_from(&qn_flat)?;
+                let gpu_qn: Vec<f32> = {
+                    let t = q.to_cpu()?;
+                    t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+                };
+                println!("[GPU] q after qk-norm first 8: {:?}", &gpu_qn[..8]);
+            }
+
+            if let Some(ref knorm) = m.layers.knorm_layers {
+                let k_reshaped = k.reshape(&[seq_len * m.config.kv_head_num, m.config.head_size])?;
+                let kn_buf = m.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
+                let mut kn_out = kn_buf.slice(&[0, 0], &[seq_len * m.config.kv_head_num, m.config.head_size])?;
+                knorm[0].forward(&mut OpContext::new(&[&k_reshaped], &mut [&mut kn_out], gpu_cfg))?;
+                let kn_flat = kn_out.reshape(&[seq_len, m.config.kv_dim])?;
+                k.copy_from(&kn_flat)?;
+                let gpu_kn: Vec<f32> = {
+                    let t = k.to_cpu()?;
+                    t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+                };
+                println!("[GPU] k after kk-norm first 8: {:?}", &gpu_kn[..8]);
+            }
+
+            // RoPE
+            let sin = m.workspace.get(&BufferType::SinCache).unwrap();
+            let cos = m.workspace.get(&BufferType::CosCache).unwrap();
+            m.layers.rope_layers[0].forward(&mut OpContext::new(
+                &[&m.input_pos, sin, cos], &mut [&mut q, &mut k], gpu_cfg
+            ))?;
+            let gpu_q_rope: Vec<f32> = {
+                let t = q.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            let gpu_k_rope: Vec<f32> = {
+                let t = k.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            println!("[GPU] q after RoPE first 8: {:?}", &gpu_q_rope[..8]);
+            println!("[GPU] k after RoPE first 8: {:?}", &gpu_k_rope[..8]);
+
+            // Attention
+            let (k_hist, v_hist) = m.kv_cache.get(0).unwrap();
+            let attn_buf = m.workspace.get_mut(&BufferType::AttnOutput).unwrap();
+            let mut attn_out = attn_buf.slice(&[0, 0], &[seq_len, m.config.q_dim])?;
+            m.layers.mha_layers[0].forward(&mut OpContext::new(
+                &[&q, k_hist, v_hist, &input_pos], &mut [&mut attn_out], gpu_cfg
+            ))?;
+            let gpu_attn: Vec<f32> = {
+                let t = attn_out.to_cpu()?;
+                t.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect()
+            };
+            println!("[GPU] attn_out first 8: {:?}", &gpu_attn[..8]);
+        }
+
+        println!("\n=== Compare above CPU vs GPU values to find first divergence ===");
+        Ok(())
     }
 }

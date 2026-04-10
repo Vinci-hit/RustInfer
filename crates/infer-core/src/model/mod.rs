@@ -3,6 +3,7 @@ pub mod safetensor_loader;
 pub mod tokenizer;
 pub mod llama3;
 use tokenizer::{GenericHfTokenizer, Tokenizer};
+pub mod qwen3;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -79,14 +80,12 @@ impl ModelLoader {
             .map_err(|e| Error::InvalidArgument(format!("Failed to parse config.json: {}", e)))?;
 
         let config = RuntimeModelConfig::new(&file_config)?;
-        println!("运行时配置生成成功: dim={}, heads={}, layers={}", config.dim, config.head_num, config.layer_num);
         // --- 核心改动：动态构建 weight_map ---
         let mut weight_map = HashMap::new();
         let index_path = model_dir.join("model.safetensors.index.json");
 
         if index_path.exists() {
             // **路径 A: 分片模型 (Sharded Model)**
-            println!("检测到 index.json，按分片模型加载...");
             let index_file = File::open(&index_path)?;
             let index: serde_json::Value = serde_json::from_reader(index_file)
                 .map_err(|e| Error::InvalidArgument(format!("Failed to parse index.json: {}", e)))?;
@@ -102,7 +101,6 @@ impl ModelLoader {
 
         } else {
             // **路径 B: 单文件模型 (Single-file Model) - 备用逻辑**
-            println!("未检测到 index.json，尝试按单文件模型加载...");
             let single_file_path = model_dir.join("model.safetensors");
             if !single_file_path.exists() {
                 // 如果两种模式的文件都找不到，则报错
@@ -114,10 +112,7 @@ impl ModelLoader {
             // 临时映射文件以读取其内部的张量名称
             let mmap = safetensor_loader::load_and_mmap(&single_file_path)?;
             let reader = SafetensorReader::new(&mmap)?;
-            // println!("[DEBUG] Available tensors in the model file:");
-            // 为这个文件中的所有张量构建 weight_map
             for tensor_name in reader.get_tensor_names() {
-                // println!("- {}", tensor_name);
                 weight_map.insert(tensor_name, "model.safetensors".to_string());
             }
         }
@@ -172,8 +167,6 @@ impl ModelLoader {
             readers.insert(path.clone(), reader);
         }
 
-        println!("所有权重文件均已成功映射，并为每个文件创建了 SafetensorReader。");
-
         Ok(Self { config, tensor_names, _mmaps: mmaps, tensor_index, readers })
     }
 
@@ -210,17 +203,13 @@ impl ModelLoader {
         let tokenizer = GenericHfTokenizer::from_file(&tokenizer_path)?;
         let boxed_tokenizer: Box<dyn Tokenizer> = Box::new(tokenizer);
 
-        // 更新 vocab_size 的逻辑保持不变
+        // vocab_size: config.json 的值用于权重维度，tokenizer 的值用于采样范围
         let tokenizer_vocab_size = boxed_tokenizer.vocab_size();
         if tokenizer_vocab_size == 0 {
             return Err(Error::InvalidArgument("Tokenizer vocabulary size must be positive".to_string()).into());
         }
-        
-        println!(
-            "模型配置 vocab_size: {}, Tokenizer vocab_size: {}. 将使用 Tokenizer 的值。",
-            self.config.vocab_size, tokenizer_vocab_size
-        );
-        self.config.vocab_size = tokenizer_vocab_size;
+
+        self.config.tokenizer_vocab_size = tokenizer_vocab_size;
 
         Ok(boxed_tokenizer)
     }
@@ -257,6 +246,10 @@ pub enum BufferType {
     ValueCache,
 
     IntermediateBuffer1,
+
+    // Qwen3 QK-norm buffers (per-head reshape)
+    QNormBuffer,
+    KNormBuffer,
 }
 
 pub type Workspace = HashMap<BufferType, Tensor>;

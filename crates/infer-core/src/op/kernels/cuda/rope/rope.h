@@ -37,6 +37,7 @@ void rope_kernel_cu(
 void sin_cos_cache_calc_cu(
     int32_t head_size,
     int32_t max_seq_len,
+    float rope_theta,
     float* sin_cache,
     float* cos_cache,
     cudaStream_t stream);
@@ -80,6 +81,7 @@ void rope_kernel_cu_bf16(
 void sin_cos_cache_calc_cu_bf16(
     int32_t head_size,
     int32_t max_seq_len,
+    float rope_theta,
     __nv_bfloat16* sin_cache,
     __nv_bfloat16* cos_cache,
     cudaStream_t stream

@@ -222,7 +222,7 @@ mod tests {
         // Sin/Cos 缓存 (F32)
         let mut sin_cache_f32 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
         let mut cos_cache_f32 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
-        kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, &mut sin_cache_f32, &mut cos_cache_f32)?;
+        kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, 500000.0, &mut sin_cache_f32, &mut cos_cache_f32)?;
         
         // --- 2. 准备 BF16 数据 (从 F32 转换) ---
         let dtype_bf16 = DataType::BF16;
@@ -248,7 +248,7 @@ mod tests {
         // Calculate sin/cos cache in F32 first for accuracy
         let mut sin_cache_f32_tmp = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
         let mut cos_cache_f32_tmp = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
-        kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, &mut sin_cache_f32_tmp, &mut cos_cache_f32_tmp)?;
+        kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, 500000.0, &mut sin_cache_f32_tmp, &mut cos_cache_f32_tmp)?;
 
         // Convert to BF16
         for i in 0..(max_seq_len * head_size) {
@@ -332,7 +332,7 @@ mod tests {
             // Calculate cache in F32 first
             let mut sin_f32 = Tensor::new(&[max_seq_len, head_size], DataType::F32, device)?;
             let mut cos_f32 = Tensor::new(&[max_seq_len, head_size], DataType::F32, device)?;
-            kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, &mut sin_f32, &mut cos_f32)?;
+            kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, 500000.0, &mut sin_f32, &mut cos_f32)?;
 
             // Convert to BF16
             for i in 0..(max_seq_len * head_size) {
@@ -394,7 +394,7 @@ mod tests {
             // Calculate cache in F32 on CPU first
             let mut sin_f32 = Tensor::new(&[max_seq_len, head_size], DataType::F32, DeviceType::Cpu)?;
             let mut cos_f32 = Tensor::new(&[max_seq_len, head_size], DataType::F32, DeviceType::Cpu)?;
-            kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, &mut sin_f32, &mut cos_f32)?;
+            kernels::cpu::rope_sin_cos_cache_calc(head_size, max_seq_len, 500000.0, &mut sin_f32, &mut cos_f32)?;
 
             // Convert to BF16 and move to GPU
             let sin_data_bf16: Vec<half::bf16> = sin_f32.as_f32()?.as_slice()?

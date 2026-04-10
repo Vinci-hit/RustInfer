@@ -116,7 +116,7 @@ fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
     // 使用 filter_entry 可以高效跳过整个文件夹，不进入其内部扫描
     let iter = walker.filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        name != "third_party" // <--- 关键：如果文件夹名叫 third_party，直接跳过
+        name != "third_party" // 跳过 third_party
     });
 
     for entry in iter {
