@@ -2,12 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // 检查 "cuda" feature 是否被启用
     #[cfg(feature = "cuda")]{
-        // --- 新增代码：如果是 cargo check，直接退出，不跑编译器 ---
-        let _profile = std::env::var("PROFILE").unwrap_or_default();
-        // 或者检查是否由 cargo check 触发 (有些环境下可以用 RUST_CHECK)
-        // 一个更通用的办法是检查具体的指令，但最快的是自定义一个环境变量
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
              return;
         }
