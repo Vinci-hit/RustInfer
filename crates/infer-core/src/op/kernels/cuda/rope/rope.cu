@@ -219,22 +219,21 @@ void rope_kernel_cu(
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, float* cos_cache) {
+__global__ void sin_cos_calc(int head_size, int max_seq_len, float rope_theta, float* sin_cache, float* cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   // 确保不越界
   if (idx >= head_size) return; 
   
   int head_dim = idx; // idx 直接就是 head_dim，因为我们每个线程处理一个 head_dim
   
-  // 预先计算一次 base_power，避免循环中重复计算
-  float base = 500000.0f;
+  float base = rope_theta;
   float head_size_f = (float)head_size;
   float head_dim_f = (float)head_dim;
-  
+
   // exponent = head_dim / head_size
   float exponent = head_dim_f / head_size_f;
-  
-  // freq = 1.0f / pow(10000.0f, exponent)
+
+  // freq = 1.0f / pow(rope_theta, exponent)
   float freq = 1.0f / powf(base, exponent);
 
   // 循环 pos 维度
@@ -252,7 +251,7 @@ __global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, f
   }
 }
 
-__global__ void sin_cos_calc_bf16(int head_size, int max_seq_len,
+__global__ void sin_cos_calc_bf16(int head_size, int max_seq_len, float rope_theta,
                                   __nv_bfloat16* sin_cache,
                                   __nv_bfloat16* cos_cache) {
     // 每个线程处理一个“偶数维度对”的索引 k（k = 0, 1, ..., head_size/2 - 1）
@@ -264,7 +263,7 @@ __global__ void sin_cos_calc_bf16(int head_size, int max_seq_len,
     // 对应的原始偶数维度索引：dim = 2 * k
     int dim = 2 * k;
 
-    float base = 500000.0f;
+    float base = rope_theta;
     float exponent = (float)dim / (float)head_size;
     float freq = 1.0f / powf(base, exponent);
 
@@ -283,20 +282,22 @@ __global__ void sin_cos_calc_bf16(int head_size, int max_seq_len,
 
 
 // --- FFI 包装函数 (Host Function) ---
-void sin_cos_cache_calc_cu(
+extern "C" void sin_cos_cache_calc_cu(
     int32_t head_size,
     int32_t max_seq_len,
+    float rope_theta,
     float* sin_cache,
     float* cos_cache,
-    cudaStream_t stream) 
+    cudaStream_t stream)
 {
     // 启动配置：1 个 Block，head_size 个 Threads
     int threads = head_size;
 
     sin_cos_calc<<<1, threads, 0, stream>>>(
-        head_size, 
-        max_seq_len, 
-        sin_cache, 
+        head_size,
+        max_seq_len,
+        rope_theta,
+        sin_cache,
         cos_cache
     );
     
@@ -304,21 +305,23 @@ void sin_cos_cache_calc_cu(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void sin_cos_cache_calc_cu_bf16(
+extern "C" void sin_cos_cache_calc_cu_bf16(
     int32_t head_size,
     int32_t max_seq_len,
+    float rope_theta,
     __nv_bfloat16* sin_cache,
     __nv_bfloat16* cos_cache,
-    cudaStream_t stream) 
+    cudaStream_t stream)
 {
-    
+
     // 启动配置：1 个 Block，head_size 个 Threads
     int threads = head_size;
 
     sin_cos_calc_bf16<<<1, threads, 0, stream>>>(
-        head_size, 
-        max_seq_len, 
-        sin_cache, 
+        head_size,
+        max_seq_len,
+        rope_theta,
+        sin_cache,
         cos_cache
     );
     

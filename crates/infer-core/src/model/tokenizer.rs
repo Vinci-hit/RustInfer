@@ -62,10 +62,10 @@ impl GenericHfTokenizer {
         // --- 方法 C: 尝试通过已知的 token 字符串直接查找 ID ---
         // 这是最后的、针对特定模型的后备方案
         let mut eos_token_id = Vec::new();
-        for token_str in ["<|end_of_text|>", "</s>", "<|eot_id|>"] {
+        for token_str in ["<|end_of_text|>", "</s>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>"] {
             if let Some(id) = tokenizer.token_to_id(token_str) {
-                println!("[DEBUG] Found EOS token ID {} using token string '{}'", id, token_str);
-                eos_token_id.push(id); // 找到了！
+                eos_token_id.push(id);
+
             }
         }
         if !eos_token_id.is_empty() {

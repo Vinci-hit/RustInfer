@@ -144,15 +144,17 @@ unsafe extern "C" {
     pub fn sin_cos_cache_calc_cu(
         head_size: i32,
         max_seq_len: i32,
+        rope_theta: f32,
         sin_cache: *mut f32,
         cos_cache: *mut f32,
         stream: cuda::ffi::cudaStream_t,
     );
-    
+
     // BF16版本的sin_cos_cache_calc CUDA kernel
     pub fn sin_cos_cache_calc_cu_bf16(
         head_size: i32,
         max_seq_len: i32,
+        rope_theta: f32,
         sin_cache: *mut half::bf16,
         cos_cache: *mut half::bf16,
         stream: cuda::ffi::cudaStream_t,
@@ -170,6 +172,7 @@ unsafe extern "C" {
 pub fn sin_cos_cache_calc_cuda(
     head_size: usize,
     max_seq_len: usize,
+    rope_theta: f32,
     sin_cache: &mut Tensor,
     cos_cache: &mut Tensor,
     cuda_config: Option<&CudaConfig>,
@@ -204,6 +207,7 @@ pub fn sin_cos_cache_calc_cuda(
                 sin_cos_cache_calc_cu(
                     head_size_i32,
                     max_seq_len_i32,
+                    rope_theta,
                     sin_ptr,
                     cos_ptr,
                     stream,
@@ -219,6 +223,7 @@ pub fn sin_cos_cache_calc_cuda(
                 sin_cos_cache_calc_cu_bf16(
                     head_size_i32,
                     max_seq_len_i32,
+                    rope_theta,
                     sin_ptr,
                     cos_ptr,
                     stream,
