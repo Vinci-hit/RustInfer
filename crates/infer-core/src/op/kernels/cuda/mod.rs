@@ -1,6 +1,7 @@
 mod rmsnorm;
 
 pub use rmsnorm::rmsnorm;
+pub use rmsnorm::fused_add_rmsnorm;
 
 mod add;
 pub use add::*;
@@ -26,3 +27,6 @@ pub use sampler::*;
 
 mod scatter;
 pub use scatter::*;
+
+mod split_cols;
+pub use split_cols::*;
