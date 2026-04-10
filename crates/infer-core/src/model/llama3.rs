@@ -83,8 +83,7 @@ impl LlamaLayers {
         self.rope_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
         self.add_layers.to_cuda(device_id)?;
         self.swiglu_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        
-        println!("All layers successfully moved to CUDA device {}.", device_id);
+
         Ok(())
     }
 }
@@ -168,18 +167,11 @@ impl KvCache {
 
         // 如果设备是CPU，则使用F32以获得更好的精度和兼容性
         let float_type = if device.is_cpu() {
-            println!("  -> Initializing F32 KV Cache for CPU device.");
             DataType::F32
         } else {
             match config.torch_dtype.as_str() {
-                "float32" => {
-                    println!("  -> torch_dtype is float32.");
-                    DataType::F32
-                },
-                "bfloat16" => {
-                    println!("  -> torch_dtype is bfloat16.");
-                    DataType::BF16
-                },
+                "float32" => DataType::F32,
+                "bfloat16" => DataType::BF16,
                 _ => {
                     return Err(Error::InvalidArgument(format!(
                         "Unsupported torch_dtype: {}", config.torch_dtype
@@ -187,11 +179,7 @@ impl KvCache {
                 }
             }
         };
-        
-        println!(
-            "Initializing KV Cache for {} layers with shape {:?}...",
-            config.layer_num, cache_shape
-        );
+
         let mut kv_cache = Vec::with_capacity(config.layer_num);
         for _ in 0..config.layer_num {
             // **核心变化**: 创建 bf16 类型的空张量
@@ -213,16 +201,13 @@ impl Llama3 {
         device_type: DeviceType,
         is_quant_model: bool
     ) -> Result<Self> {
-        let start_time = Instant::now();
-        println!("Start calculate time, Loading model from directory: {:?}", model_dir.as_ref());
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
         let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
         let cuda_config = CudaConfig::new()?;
 
-        println!("Creating model layers...");
-        
+
         let (
             embedding_layer,
             rmsnorm_final_layer,
@@ -266,18 +251,10 @@ impl Llama3 {
             // 通常是通过检查 `lm_head.weight` 是否存在来隐式判断的。
             let cls_layer = if tensor_names.contains("lm_head.weight") {
                 // --- 情况 B：权重是独立的 ---
-                // 如果 `lm_head.weight` 存在，我们就加载它。
-                println!("Found independent 'lm_head.weight'. Loading it.");
                 Self::load_matmul("lm_head.weight", &loader, device_type)?
 
             } else {
                 // --- 情况 A：权重是共享/绑定的 (Tied Weights) ---
-                // 如果 `lm_head.weight` 不存在，我们就复用词嵌入层的权重。
-                println!("'lm_head.weight' not found. Reusing token embedding weights (tied weights).");
-                
-                // `Matmul::from` 接收一个拥有的 Tensor 和一个可选的 bias。
-                // `embedding_layer.weight` 是一个 Tensor，它的 `clone()` 是廉价的 Arc clone，
-                // 这实现了权重的共享，而不是数据的复制。
                 Matmul::from(embedding_layer.weight.clone(), None)
             };
 
@@ -334,9 +311,7 @@ impl Llama3 {
            swiglu_layers.len() != layer_num{
             return Err(InternalError("Incorrect number of non-parameterized layers created.".to_string()).into());
         }
-        
-        println!("All layers created and checked successfully.");
-        
+
         // --- 组装 LlamaLayers ---
         let layers = LlamaLayers {
             embedding_layer,
@@ -365,13 +340,20 @@ impl Llama3 {
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
         let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
-        let kcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
-        let vcache = Tensor::new(&[1, config.kv_dim], DataType::BF16, device_type)?;
+        // 临时 k/v cache 的 dtype 需与其他张量保持一致：CPU 用 F32，GPU 用模型配置的 dtype
+        let float_dtype = if device_type.is_cpu() {
+            DataType::F32
+        } else {
+            match config.torch_dtype.as_str() {
+                "bfloat16" => DataType::BF16,
+                "float32" => DataType::F32,
+                _ => DataType::BF16,
+            }
+        };
+        let kcache = Tensor::new(&[1, config.kv_dim], float_dtype, device_type)?;
+        let vcache = Tensor::new(&[1, config.kv_dim], float_dtype, device_type)?;
         let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos, kcache, vcache };
-        println!("Calculating RoPE sin/cos cache...");
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
-        let duration = start_time.elapsed();
-        println!("Model successfully initialized. Loading time: {:.2} seconds", duration.as_secs_f64());
         Ok(model)
     }
 
@@ -396,6 +378,7 @@ impl Llama3 {
                     crate::op::kernels::cpu::rope_sin_cos_cache_calc(
                         config.head_size,
                         config.seq_len,
+                        config.rope_theta,
                         sin_cache, // 直接传递 &mut Tensor
                         cos_cache, // 直接传递 &mut Tensor
                     )?;
@@ -406,6 +389,7 @@ impl Llama3 {
                     crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
                         config.head_size,
                         config.seq_len,
+                        config.rope_theta,
                         sin_cache, // 直接传递 &mut Tensor
                         cos_cache, // 直接传递 &mut Tensor
                         Some(&stream),
@@ -424,24 +408,14 @@ impl Llama3 {
         config: &RuntimeModelConfig,
         device: &DeviceType
     ) -> Result<Workspace> {
-        println!("Initializing inference workspace for device {:?}...", device);
         let mut buffers = HashMap::new();
 
-        // 遵循您的代码风格，大部分浮点运算使用 BF16
-        // 但如果设备是CPU，则使用F32以获得更好的精度和兼容性
         let float_dtype = if device.is_cpu() {
-            println!("  -> Using F32 for CPU device.");
             DataType::F32
         } else {
             match config.torch_dtype.as_str() {
-                "float32" => {
-                    println!("  -> torch_dtype is float32.");
-                    DataType::F32
-                },
-                "bfloat16" => {
-                    println!("  -> torch_dtype is bfloat16.");
-                    DataType::BF16
-                },
+                "float32" => DataType::F32,
+                "bfloat16" => DataType::BF16,
                 _ => {
                     return Err(Error::InvalidArgument(format!(
                         "Unsupported torch_dtype: {}", config.torch_dtype
@@ -534,7 +508,6 @@ impl Llama3 {
         let forward_output = Tensor::new(&[config.vocab_size], float_dtype, *device)?;
         buffers.insert(BufferType::ForwardOutput, forward_output);
 
-        println!("Workspace (batch-enabled) initialized with {} buffers.", buffers.len());
         Ok(buffers)
     }
 
@@ -545,7 +518,7 @@ impl Llama3 {
         
         // 如果目标设备是CPU，则将权重转换为F32
         let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            // println!("Converting {} weight to F32 for CPU device", name);
+
             weight.to_dtype(DataType::F32)?
         } else {
             weight
@@ -565,7 +538,7 @@ impl Llama3 {
 
         // 如果目标设备是CPU，则将权重转换为F32
         let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            // println!("Converting {} weight to F32 for CPU device", name);
+
             weight.to_dtype(DataType::F32)?
         } else {
             weight
@@ -586,7 +559,7 @@ impl Llama3 {
         
         // 如果目标设备是CPU，则将权重转换为F32
         let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            // println!("Converting {} weight to F32 for CPU device", name);
+
             weight.to_dtype(DataType::F32)?
         } else {
             weight
@@ -630,11 +603,13 @@ impl Llama3 {
 
         // Generation stage
         let mut generated_tokens = vec![current_token];
-        
+        let mut printed_len = 0usize;
+
         if print_output {
-            let decoded = self.tokenizer.decode(&[current_token])?;
-            let _ = write!(stdout,"{}", decoded);
-            io::stdout().flush().expect("Failed to flush stdout");
+            let decoded = self.tokenizer.decode(&generated_tokens)?;
+            let _ = write!(stdout,"{}", &decoded[printed_len..]);
+            printed_len = decoded.len();
+            stdout.flush()?;
         }
 
         // Generate tokens starting from the end of the prompt
@@ -653,11 +628,17 @@ impl Llama3 {
             generated_tokens.push(next_token);
             current_token = next_token;
             decode_iterations += 1;
-            
+
             if print_output {
-                let decoded = self.tokenizer.decode(&[current_token])?;
-                let _ = write!(stdout,"{}", decoded);
-                stdout.flush()?;
+                let decoded = self.tokenizer.decode(&generated_tokens)?;
+                if decoded.len() > printed_len {
+                    let new_text = &decoded[printed_len..];
+                    if !new_text.contains('\u{FFFD}') {
+                        let _ = write!(stdout,"{}", new_text);
+                        printed_len = decoded.len();
+                        stdout.flush()?;
+                    }
+                }
             }
         }
         let decode_duration = decode_start.elapsed();
@@ -674,16 +655,20 @@ impl Llama3 {
     fn forward_decoding(&mut self, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
         self.input_pos.copy_from(pos_cpu)?;
         let input_tokens_view = &self.output_token;
-        let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-        if config.cuda_graph.is_none(){
-            config.capture_graph_begin()?;
-        }else{
-            config.launch_graph()?;
-            config.sync_stream()?;
-            let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-            return Ok(next_token);
+
+        // CUDA Graph 逻辑仅在 CUDA 设备上启用
+        if self.device_type.is_cuda() {
+            let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
+            if config.cuda_graph.is_none(){
+                config.capture_graph_begin()?;
+            }else{
+                config.launch_graph()?;
+                config.sync_stream()?;
+                let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+                return Ok(next_token);
+            }
         }
-        
+
         let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
         // Token embedding
         let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
@@ -730,7 +715,7 @@ impl Llama3 {
             let mut w2_out = ffn_norm_out; // Reuse buffer
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
-            
+
         }
         // Extract last token's hidden state
         let last_hidden_state_view = x.slice(&[0, 0], &[1, self.config.dim])?;
@@ -748,12 +733,18 @@ impl Llama3 {
         self.layers.cls_layer.forward(
             &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
         )?;
-        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
-        self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
-        let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-        if config.cuda_graph.is_none(){
-            config.capture_graph_end()?;
+        let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
+        self.sampler.sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
+
+        // CUDA Graph: 结束捕获（仅 CUDA 设备）
+        if self.device_type.is_cuda() {
+            let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
+            if config.cuda_graph.is_none(){
+                config.capture_graph_end()?;
+            }
         }
+
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
         Ok(next_token)
     }
@@ -867,8 +858,9 @@ impl Llama3 {
             )?;
 
             // Sample token for this user
-            let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
-            self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+            let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+            let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
+            self.sampler.sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
             let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
 
             first_tokens.push(next_token);
@@ -950,10 +942,11 @@ impl Llama3 {
         self.layers.cls_layer.forward(
             &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
         )?;
-        let logits_ref = self.workspace.get(&BufferType::ForwardOutput).unwrap();
-        self.sampler.sample(logits_ref, &mut self.output_token, cuda_config_ref)?;
+        let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
+        self.sampler.sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-        
+
         Ok(next_token)
     }
 
@@ -1144,228 +1137,6 @@ Today Date: 14 Dec 2025
 
     // 辅助函数，获取虚拟模型的路径
     fn get_dummy_model_path() -> &'static Path {
-        Path::new("/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct")
-    }
-
-    /// Test TRUE batch processing with 8 users sending "How are you" simultaneously
-    /// This test demonstrates real batch inference where all 8 users are processed in parallel
-    /// within a single forward pass, maximizing GPU utilization
-    #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_llama3_concurrent_batch_users() -> Result<()> {
-        println!("\n========== TRUE BATCH PROCESSING TEST ==========");
-        println!("Processing 8 users in a SINGLE batch (parallel inference)");
-
-        let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Model directory not found at {:?}", model_path);
-
-        // Create model on CUDA device
-        println!("\n[1/5] Loading model on CUDA...");
-        let mut model = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        println!("✓ Model loaded successfully");
-
-        // Define the prompt that all 8 users are sending
-        let base_prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-Cutting Knowledge Date: December 2023
-Today Date: 14 Dec 2025
-
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-How are you<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-
-        let batch_size = 8;
-        let max_tokens_per_user = 50;
-
-        println!("\n[2/5] Preparing batch input for {} users...", batch_size);
-
-        // Tokenize the prompt (same for all users)
-        let prompt_tokens = model.tokenizer.encode(base_prompt)?;
-        let prompt_len = prompt_tokens.len();
-        println!("  Prompt length: {} tokens", prompt_len);
-        println!("  Prompt: {:?}", &prompt_tokens[..prompt_len.min(10)]);
-
-        // Create batch tensor: [batch_size, seq_len]
-        let batch_token_data: Vec<i32> = (0..batch_size)
-            .flat_map(|_| prompt_tokens.iter().copied())
-            .collect();
-
-        let mut batch_tokens = Tensor::new(&[batch_size * prompt_len], DataType::I32, DeviceType::Cpu)?;
-        batch_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&batch_token_data);
-
-        println!("  Created batch tensor: [{}, {}]", batch_size, prompt_len);
-
-        println!("\n[3/5] Running BATCH prefill (all {} users in parallel)...", batch_size);
-        let prefill_start = Instant::now();
-
-        // Process all users in a SINGLE batch prefill - TRUE PARALLEL PROCESSING
-        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
-
-        let batch_first_tokens = model.forward_prefill_batch(&batch_tokens, &input_pos, batch_size, prompt_len)?;
-
-        let prefill_duration = prefill_start.elapsed();
-        let prefill_ms = prefill_duration.as_millis() as u64;
-
-        println!("  ✓ Batch prefill completed in {:.2}ms", prefill_ms);
-        println!("  First tokens generated for all users: {:?}", batch_first_tokens);
-        println!("  TRUE PARALLEL: {} users processed in a SINGLE forward pass!", batch_size);
-
-        println!("\n[4/5] Running sequential decode for each user...");
-        println!("  (Note: Decode is sequential because users may have different generation lengths)");
-
-        let decode_start = Instant::now();
-        let mut results = Vec::new();
-
-        // For decode phase, we process each user sequentially
-        // (In production, you'd implement batched decode with dynamic batching)
-        for user_id in 0..batch_size {
-            let user_decode_start = Instant::now();
-            let first_token = batch_first_tokens[user_id];
-
-            let mut generated_tokens = vec![first_token];
-            let mut current_token = first_token;
-
-            // Generate remaining tokens for this user
-            for pos in prompt_len..(prompt_len + max_tokens_per_user - 1) {
-                let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-
-                let mut input_tokens = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                input_tokens.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-
-                let next_token = model.forward_decoding(&input_tokens, &input_pos)?;
-
-                if model.tokenizer.is_eos(next_token) {
-                    break;
-                }
-
-                generated_tokens.push(next_token);
-                current_token = next_token;
-            }
-
-            let user_decode_time = user_decode_start.elapsed().as_millis() as u64;
-            let generated_text = model.tokenizer.decode(&generated_tokens)?;
-
-            results.push(UserResult {
-                user_id,
-                generated_text,
-                num_tokens: generated_tokens.len() as u32,
-                prefill_ms: prefill_ms / batch_size as u64, // Amortized prefill time
-                decode_ms: user_decode_time,
-                decode_iterations: generated_tokens.len() - 1,
-                total_duration_ms: prefill_ms / batch_size as u64 + user_decode_time,
-                success: true,
-                error: None,
-            });
-
-            println!("  [User {}] Generated {} tokens in {:.2}ms", user_id, generated_tokens.len(), user_decode_time);
-        }
-
-        let total_decode_time = decode_start.elapsed().as_millis() as u64;
-        let total_time = prefill_duration.as_millis() as u64 + total_decode_time;
-
-        println!("\n[5/5] Analyzing batch processing results...");
-
-        println!("\n================ BATCH PROCESSING RESULTS ================");
-        println!("Batch Size: {} users", batch_size);
-        println!("Processing Mode: TRUE PARALLEL BATCH (single forward pass)");
-        println!("----------------------------------------------------------");
-        println!("Timing Breakdown:");
-        println!("  Batch Prefill (parallel): {:.2}ms", prefill_ms);
-        println!("  Per-user prefill (amortized): {:.2}ms", prefill_ms as f64 / batch_size as f64);
-        println!("  Sequential Decode (all users): {:.2}ms", total_decode_time);
-        println!("  Total Time: {:.2}ms", total_time);
-        println!("----------------------------------------------------------");
-        
-        let mut total_tokens = 0;
-        let mut total_decode_ms = 0u64;
-
-        // Print individual user results
-        for result in &results {
-            total_tokens += result.num_tokens;
-            total_decode_ms += result.decode_ms;
-
-            let tps = if result.decode_ms > 0 {
-                (result.num_tokens as f64 - 1.0) / (result.decode_ms as f64 / 1000.0)
-            } else {
-                0.0
-            };
-
-            println!("[User {}] Tokens: {}, Decode: {}ms, TPS: {:.2}",
-                result.user_id,
-                result.num_tokens,
-                result.decode_ms,
-                tps
-            );
-
-            // Print response preview
-            let preview = if result.generated_text.len() > 80 {
-                format!("{}...", &result.generated_text[..80])
-            } else {
-                result.generated_text.clone()
-            };
-            println!("         Response: {}", preview);
-        }
-
-        println!("----------------------------------------------------------");
-
-        // Calculate batch metrics
-        let avg_tokens_per_user = total_tokens as f64 / batch_size as f64;
-        let avg_decode_time = total_decode_ms as f64 / batch_size as f64;
-
-        // Batch prefill throughput
-        let batch_prefill_throughput = (batch_size * prompt_len) as f64 / (prefill_ms as f64 / 1000.0);
-
-        // Overall throughput
-        let overall_throughput = total_tokens as f64 / (total_time as f64 / 1000.0);
-
-        println!("\nBatch Performance Metrics:");
-        println!("  Average tokens/user: {:.1}", avg_tokens_per_user);
-        println!("  Average decode time/user: {:.2}ms", avg_decode_time);
-        println!("  Batch prefill throughput: {:.2} tokens/sec", batch_prefill_throughput);
-        println!("  Overall throughput: {:.2} tokens/sec", overall_throughput);
-        println!("  Total tokens processed: {}", total_tokens);
-
-        // Calculate speedup vs sequential processing
-        let sequential_prefill_time = prefill_ms * batch_size as u64;
-        let speedup = sequential_prefill_time as f64 / prefill_ms as f64;
-        println!("\nBatch Efficiency:");
-        println!("  Prefill speedup vs sequential: {:.2}x", speedup);
-        println!("  Time saved in prefill: {:.2}ms ({:.1}%)",
-            sequential_prefill_time as f64 - prefill_ms as f64,
-            ((sequential_prefill_time as f64 - prefill_ms as f64) / sequential_prefill_time as f64) * 100.0
-        );
-
-        println!("==========================================================\n");
-
-        // Assertions
-        assert_eq!(results.len(), batch_size, "Not all users were processed");
-
-        for result in &results {
-            assert!(result.success, "User {} failed", result.user_id);
-            assert!(result.num_tokens > 0, "User {} generated 0 tokens", result.user_id);
-            assert!(!result.generated_text.is_empty(), "User {} has empty response", result.user_id);
-        }
-
-        println!("✓ All assertions passed!");
-        println!("✓ Batch processing successfully handled {} users in parallel", batch_size);
-
-        Ok(())
-    }
-
-    /// Helper struct to store results from each concurrent user
-    #[derive(Debug, Clone)]
-    struct UserResult {
-        user_id: usize,
-        generated_text: String,
-        num_tokens: u32,
-        prefill_ms: u64,
-        decode_ms: u64,
-        decode_iterations: usize,
-        total_duration_ms: u64,
-        success: bool,
-        error: Option<String>,
+        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b")
     }
 }

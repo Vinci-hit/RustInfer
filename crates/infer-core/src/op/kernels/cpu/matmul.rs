@@ -30,8 +30,12 @@ pub fn matmul(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()
 
 /// F32版本的Matmul实现: C = A * B^T
 fn matmul_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()> {
-    // --- 1. 获取类型化的张量和数据 slice ---
+    // --- 0. 在获取可变借用之前，先保存调试信息 ---
+    let input_shape = input.shape().to_vec();
+    let weight_shape = weight.shape().to_vec();
+    let output_shape_dbg = output.shape().to_vec();
 
+    // --- 1. 获取类型化的张量和数据 slice ---
     let input_typed = input.as_f32()?;
     let weight_typed = weight.as_f32()?;
     let output_typed = output.as_f32_mut()?;
@@ -39,39 +43,61 @@ fn matmul_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()
     let input_slice = input_typed.as_slice()?;
     let weight_slice = weight_typed.as_slice()?;
     let output_slice = output_typed.as_slice_mut()?;
-    
+
     // --- 2. 形状检查和 ndarray 视图创建 ---
-    let weight_shape = weight.shape();
     let out_features = weight_shape[0];
     let in_features = weight_shape[1];
-    
-    
+
+    let m_dim: usize = input_shape[..input_shape.len() - 1].iter().product();
+    let k_dim = *input_shape.last().unwrap();
+
+    // 验证内积维度匹配
+    if k_dim != in_features {
+        return Err(Error::InvalidArgument(format!(
+            "Matmul F32 dimension mismatch: input last dim {} != weight in_features {}. input_shape={:?}, weight_shape={:?}, output_shape={:?}",
+            k_dim, in_features, input_shape, weight_shape, output_shape_dbg
+        )).into());
+    }
+
+    // 验证 slice 长度匹配
+    if input_slice.len() != m_dim * k_dim {
+        return Err(Error::InvalidArgument(format!(
+            "Matmul F32: input_slice.len()={} != m_dim*k_dim={}*{}={}. input_shape={:?}",
+            input_slice.len(), m_dim, k_dim, m_dim * k_dim, input_shape
+        )).into());
+    }
+    if output_slice.len() != m_dim * out_features {
+        return Err(Error::InvalidArgument(format!(
+            "Matmul F32: output_slice.len()={} != m_dim*out_features={}*{}={}. output_shape={:?}",
+            output_slice.len(), m_dim, out_features, m_dim * out_features, output_shape_dbg
+        )).into());
+    }
+
     // 将权重 W [N, K] 转换为 ndarray 视图
     let weight_view: ArrayView2<f32> = ArrayView2::from_shape(
         (out_features, in_features),
         weight_slice
     ).map_err(|e| Error::InvalidArgument(e.to_string()))?;
 
-    // 输入可能是多维的 (e.g., [B, S, K])，我们需要处理 batch 维度
-    // 我们将输入 reshape 成一个 2D 矩阵 [M, K]，其中 M 是所有前缀维度的乘积
-    let input_shape = input.shape();
-    let m_dim = input_shape[..input_shape.len() - 1].iter().product();
-    
     let input_view: ArrayView2<f32> = ArrayView2::from_shape(
         (m_dim, in_features),
         input_slice
-    ).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    ).map_err(|e| Error::InvalidArgument(format!(
+        "input view failed: {}. input_shape={:?}, m_dim={}, in_features={}, slice_len={}",
+        e, input_shape, m_dim, in_features, input_slice.len()
+    )))?;
 
     // 创建输出的 2D 可变视图 [M, N]
     let mut output_view: ArrayViewMut2<f32> = ArrayViewMut2::from_shape(
         (m_dim, out_features),
         output_slice
-    ).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    ).map_err(|e| Error::InvalidArgument(format!(
+        "output view failed: {}. output_shape={:?}, m_dim={}, out_features={}, slice_len={}",
+        e, output_shape_dbg, m_dim, out_features, m_dim * out_features
+    )))?;
     
     // --- 3. 执行高性能矩阵乘法 ---
     // 计算 C = A * B^T。 ndarray 的 .dot() 会自动调用 BLAS GEMM。
-    // weight_view.t() 是权重的转置 (transpose)，这是一个零拷贝操作。
-    // println!("Performing matmul with shapes: input: {:?}, weight: {:?}, output: {:?}", input_view.dim(), weight_view.dim(), output_view.dim());
     output_view.assign(&input_view.dot(&weight_view.t()));
     Ok(())
 }
