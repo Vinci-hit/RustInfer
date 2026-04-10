@@ -30,26 +30,27 @@ void argmax_cu_f32_ffi(
 }
 
 
-// ------------------- BF16 版本 -------------------
+// ------------------- BF16 版本 (Two-phase parallel argmax) -------------------
 #include <cuda_bf16.h>
-#include <cub/cub.cuh> // 仅使用 BlockReduce，这是 header-only 的
+#include <cub/cub.cuh>
 
-// 1. 定义 Kernel
-__global__ void argmax_kernel_bf16(
-    const __nv_bfloat16* __restrict__ input, 
-    int n, 
-    int* __restrict__ output_idx
+// Static device arrays for inter-block communication
+__device__ float d_partial_vals[1024];
+__device__ int   d_partial_idxs[1024];
+
+// Phase 1: Each block reduces a chunk of the input, writes (max_val, max_idx) to d_partial_*
+__global__ void argmax_phase1_bf16(
+    const __nv_bfloat16* __restrict__ input,
+    int n
 ) {
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
 
-    // 每个线程维护当前的局部最大值和索引
-    // 初始化为极小值
-    float max_val = -3.40282e38f; // -FLT_MAX
+    float max_val = -3.40282e38f;
     int max_idx = -1;
 
-    // Grid-Stride Loop: 处理数据量 > 线程数的情况
-    for (int i = gid; i < n; i += gridDim.x * blockDim.x) {
+    for (int i = gid; i < n; i += stride) {
         float val = __bfloat162float(input[i]);
         if (val > max_val) {
             max_val = val;
@@ -57,51 +58,67 @@ __global__ void argmax_kernel_bf16(
         }
     }
 
-    // Block 内归约 (使用 CUB BlockReduce)
-    // 定义 Pair 类型: <数值, 索引>。注意 CUB ArgMax 默认找 Key 最大，我们这里需要自定义
-    // 为了简单，我们手动做 Block Reduce
-    
-    // 共享内存
     using BlockReduce = cub::BlockReduce<cub::KeyValuePair<int, float>, 256>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
 
-    // 创建当前线程的 KV 对 (注意：CUB ArgMax 比较器有点绕，我们直接用 reduce 找最大 float)
-    // 更简单的办法：把 (val, idx) 作为一个对象，自定义 max 操作
-    
-    cub::KeyValuePair<int, float> thread_data;
-    thread_data.key = max_idx; // 索引
-    thread_data.value = max_val; // 数值
-
-    // 归约操作符：返回 Value 更大的那个；如果 Value 相等，返回 Key (Index) 更小的
+    cub::KeyValuePair<int, float> thread_data{max_idx, max_val};
     auto argmax_op = [](const cub::KeyValuePair<int, float>& a, const cub::KeyValuePair<int, float>& b) {
-        if (a.value != b.value) return (a.value > b.value) ? a : b;
-        return (a.key < b.key) ? a : b; // 索引越小越优先
+        return (a.value >= b.value) ? a : b;
     };
 
-    // 执行 Block Reduce
-    // 结果在 threadIdx.x == 0 的线程中
-    cub::KeyValuePair<int, float> block_result = BlockReduce(temp_storage).Reduce(thread_data, argmax_op);
+    auto block_result = BlockReduce(temp_storage).Reduce(thread_data, argmax_op);
 
-    // 2. Block 间归约 (由于 ArgMax 很难用 atomicMax 实现，
-    // 对于 LLM 的 vocab_size (比如 32000/128000)，通常一个 Block (256/1024线程) 就能处理完一行的 ArgMax)
-    // 所以这里我们可以只启动 **1个 Block** 即可！
-    
+    if (tid == 0) {
+        d_partial_vals[blockIdx.x] = block_result.value;
+        d_partial_idxs[blockIdx.x] = block_result.key;
+    }
+}
+
+// Phase 2: Single block reduces partial results → final answer
+__global__ void argmax_phase2(
+    int num_blocks,
+    int* __restrict__ output_idx
+) {
+    int tid = threadIdx.x;
+
+    float max_val = -3.40282e38f;
+    int max_idx = -1;
+
+    for (int i = tid; i < num_blocks; i += blockDim.x) {
+        float val = d_partial_vals[i];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = d_partial_idxs[i];
+        }
+    }
+
+    using BlockReduce = cub::BlockReduce<cub::KeyValuePair<int, float>, 256>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    cub::KeyValuePair<int, float> thread_data{max_idx, max_val};
+    auto argmax_op = [](const cub::KeyValuePair<int, float>& a, const cub::KeyValuePair<int, float>& b) {
+        return (a.value >= b.value) ? a : b;
+    };
+
+    auto block_result = BlockReduce(temp_storage).Reduce(thread_data, argmax_op);
+
     if (tid == 0) {
         *output_idx = block_result.key;
     }
 }
 
 void argmax_cu_bf16_ffi(
-    const __nv_bfloat16* logits_ptr, 
+    const __nv_bfloat16* logits_ptr,
     int vocab_size,
-    int* result_ptr_gpu, 
+    int* result_ptr_gpu,
     cudaStream_t stream
 ) {
-    // 针对 LLM Vocab Size (e.g. 32k ~ 128k) 的优化配置
-    // 一个 Block 256 线程，每个线程处理约 128~500 个元素，效率很高，无需多 Block 级联
     const int threads = 256;
-    const int blocks = 1; 
+    // Each thread processes ~4 elements for good occupancy
+    int num_blocks = (vocab_size + threads * 4 - 1) / (threads * 4);
+    if (num_blocks > 1024) num_blocks = 1024;
+    if (num_blocks < 1) num_blocks = 1;
 
-    argmax_kernel_bf16<<<blocks, threads, 0, stream>>>(logits_ptr, vocab_size, result_ptr_gpu);
-
+    argmax_phase1_bf16<<<num_blocks, threads, 0, stream>>>(logits_ptr, vocab_size);
+    argmax_phase2<<<1, threads, 0, stream>>>(num_blocks, result_ptr_gpu);
 }
