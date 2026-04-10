@@ -6,7 +6,7 @@ mod engine;
 mod scheduler;
 mod zmq_server;
 
-use engine::InferenceEngine;
+use engine::{InferenceEngine, ModelInstance};
 use infer_core::base::DeviceType;
 
 #[derive(Parser, Debug)]
@@ -16,6 +16,10 @@ struct Args {
     /// 模型路径
     #[arg(short, long)]
     model: String,
+
+    /// 模型类型: llama3 或 qwen3
+    #[arg(long, default_value = "llama3")]
+    model_type: String,
 
     /// 设备: cpu 或 cuda:0, cuda:1 等
     #[arg(short, long, default_value = "cuda:0")]
@@ -57,6 +61,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("🚀 RustInfer Engine starting...");
     tracing::info!("  Model: {}", args.model);
+    tracing::info!("  Model Type: {}", args.model_type);
     tracing::info!("  Device: {}", args.device);
     tracing::info!("  ZMQ Endpoint: {}", args.zmq_endpoint);
     tracing::info!("  Max Batch Size: {}", args.batch_size);
@@ -66,7 +71,22 @@ async fn main() -> Result<()> {
 
     // 加载模型
     tracing::info!("Loading model...");
-    let model = infer_core::model::llama3::Llama3::new(&args.model, device, false)?;
+    let model = match args.model_type.to_lowercase().as_str() {
+        "llama3" | "llama" => {
+            let m = infer_core::model::llama3::Llama3::new(&args.model, device, false)?;
+            ModelInstance::Llama3(m)
+        }
+        "qwen3" | "qwen" => {
+            let m = infer_core::model::qwen3::Qwen3::new(&args.model, device, false)?;
+            ModelInstance::Qwen3(m)
+        }
+        _ => {
+            anyhow::bail!(
+                "Unsupported model type: {}. Use 'llama3' or 'qwen3'.",
+                args.model_type
+            );
+        }
+    };
     tracing::info!("✅ Model loaded successfully!");
 
     // 创建Engine

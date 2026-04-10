@@ -7,6 +7,10 @@ use crate::base::error::{Error, Result};
 
 const MAX_SEQ_LEN: usize = 2048; // 根据调整此值
 
+fn default_rope_theta() -> f64 {
+    500000.0
+}
+
 // ======================= 新增的顶层结构体 =======================
 /// 这个结构体匹配 config.json 的顶层结构。
 /// 它的唯一作用就是提取出我们关心的 "text_config" 部分。
@@ -61,9 +65,16 @@ pub struct ModelFileConfig {
     pub torch_dtype: String,
     
     // 可能存在的、模型特有的参数 (使用 Option)
-    // 比如 Qwen3 的 immediate_dim
-    #[serde(default)] // 如果 JSON 中没有这个字段，则使用默认值 (None)
+    #[serde(default)]
     pub immediate_dim: Option<usize>,
+
+    /// 显式的 head_dim（Qwen3 等模型使用，可能不等于 hidden_size/num_attention_heads）
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+
+    /// RoPE theta (base frequency)
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f64,
 }
 
 /// 模型在运行时实际使用的配置，包含所有直接和派生参数。
@@ -82,10 +93,16 @@ pub struct RuntimeModelConfig {
     pub kv_dim: usize,
     pub kv_mul: usize,
     pub head_size: usize,
+    /// Q 投影输出维度 = head_num * head_size（当 head_size != dim/head_num 时不等于 dim）
+    pub q_dim: usize,
 
     // === 标志位和元数据 ===
     pub is_shared_weight: bool,
-    pub torch_dtype: String, // 保留原始数据类型信息
+    pub torch_dtype: String,
+    pub rope_theta: f32,
+    /// tokenizer 实际的 vocab size（可能小于权重的 vocab_size）
+    /// 采样时应只在 [0, tokenizer_vocab_size) 范围内进行 argmax
+    pub tokenizer_vocab_size: usize,
 
     // === 模型特定参数 ===
     pub immediate_dim: Option<usize>,
@@ -113,10 +130,11 @@ impl RuntimeModelConfig {
         let head_num = file_config.num_attention_heads;
         let kv_head_num = file_config.num_key_value_heads;
         let seq_len = MAX_SEQ_LEN;
-        println!("模型最大序列长度 (max_position_embeddings) 设置为默认值 {}, 忽略 config.json 中的值 {}, 在model/config.rs中修改",MAX_SEQ_LEN, file_config.max_position_embeddings);
+
         
-        let head_size = dim / head_num;
-        let kv_dim = (dim * kv_head_num) / head_num;
+        let head_size = file_config.head_dim.unwrap_or(dim / head_num);
+        let q_dim = head_num * head_size;
+        let kv_dim = kv_head_num * head_size;
         let kv_mul = head_num / kv_head_num;
 
         let is_shared_weight = file_config.vocab_size > 0;
@@ -136,8 +154,11 @@ impl RuntimeModelConfig {
             kv_dim,
             kv_mul,
             head_size,
+            q_dim,
             is_shared_weight,
             torch_dtype: file_config.torch_dtype.clone(),
+            rope_theta: file_config.rope_theta as f32,
+            tokenizer_vocab_size: vocab_size, // 初始值等于 config 的 vocab_size，后续被 tokenizer 覆盖
             immediate_dim,
         })
     }

@@ -2,12 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // 检查 "cuda" feature 是否被启用
     #[cfg(feature = "cuda")]{
-        // --- 新增代码：如果是 cargo check，直接退出，不跑编译器 ---
-        let _profile = std::env::var("PROFILE").unwrap_or_default();
-        // 或者检查是否由 cargo check 触发 (有些环境下可以用 RUST_CHECK)
-        // 一个更通用的办法是检查具体的指令，但最快的是自定义一个环境变量
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
              return;
         }
@@ -116,7 +111,7 @@ fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
     // 使用 filter_entry 可以高效跳过整个文件夹，不进入其内部扫描
     let iter = walker.filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        name != "third_party" // <--- 关键：如果文件夹名叫 third_party，直接跳过
+        name != "third_party" // 跳过 third_party
     });
 
     for entry in iter {
