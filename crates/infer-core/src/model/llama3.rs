@@ -34,9 +34,7 @@ pub struct LlamaLayers {
     // ---- Transformer Blocks (按类型组织) ----
     pub rmsnorm_attn_layers: Vec<RMSNorm>,
     pub rmsnorm_ffn_layers: Vec<RMSNorm>,
-    pub wq_layers: Vec<Matmul>,
-    pub wk_layers: Vec<Matmul>,
-    pub wv_layers: Vec<Matmul>,
+    pub wqkv_layers: Vec<Matmul>,  // fused QKV
     pub wo_layers: Vec<Matmul>,
     pub mha_layers: Vec<FlashAttnGQA>,
     pub rope_layers: Vec<RoPEOp>,
@@ -44,9 +42,8 @@ pub struct LlamaLayers {
     pub scatter_layer: Scatter,
     
     // FFN layers
-    pub w1_layers: Vec<Matmul>, // gate_proj
+    pub w_gate_up_layers: Vec<Matmul>, // fused gate+up
     pub w2_layers: Vec<Matmul>, // down_proj
-    pub w3_layers: Vec<Matmul>, // up_proj
     pub swiglu_layers: Vec<SwiGLU>,
 }
 
@@ -67,15 +64,12 @@ impl LlamaLayers {
         self.rmsnorm_ffn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
 
         // --- Attention Matmul Layers ---
-        self.wq_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wk_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wv_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
+        self.wqkv_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
         self.wo_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
 
         // --- FFN Matmul Layers ---
-        self.w1_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
+        self.w_gate_up_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
         self.w2_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.w3_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
 
         // --- Non-parameterized Layers (如果它们有 to_cuda 实现) ---
         // 这种写法等同于您参考代码中的 for 循环，但更符合 Rust 风格
@@ -214,33 +208,24 @@ impl Llama3 {
             cls_layer,
             rmsnorm_attn_layers,
             rmsnorm_ffn_layers,
-            wq_layers,
-            wk_layers,
-            wv_layers,
+            wqkv_layers,
             wo_layers,
-            w1_layers,
+            w_gate_up_layers,
             w2_layers,
-            w3_layers,
         ) = if !is_quant_model {
             // === 非量化路径 (Normal Path) ===
             let layer_num = config.layer_num;
             let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
             let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
-            let mut wq_layers = Vec::with_capacity(layer_num);
-            let mut wk_layers = Vec::with_capacity(layer_num);
-            let mut wv_layers = Vec::with_capacity(layer_num);
+            let mut wqkv_layers = Vec::with_capacity(layer_num);
             let mut wo_layers = Vec::with_capacity(layer_num);
-            let mut w1_layers = Vec::with_capacity(layer_num);
+            let mut w_gate_up_layers = Vec::with_capacity(layer_num);
             let mut w2_layers = Vec::with_capacity(layer_num);
-            let mut w3_layers = Vec::with_capacity(layer_num);
-            
+
             for i in 0..layer_num {
-                wq_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.q_proj.weight", i), &loader, device_type)?);
-                wk_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.k_proj.weight", i), &loader, device_type)?);
-                wv_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.v_proj.weight", i), &loader, device_type)?);
+                wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
                 wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
-                w1_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.gate_proj.weight", i), &loader, device_type)?);
-                w3_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.up_proj.weight", i), &loader, device_type)?);
+                w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
                 w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
                 rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type)?);
                 rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type)?);
@@ -264,13 +249,10 @@ impl Llama3 {
                 cls_layer,
                 rmsnorm_attn_layers,
                 rmsnorm_ffn_layers,
-                wq_layers,
-                wk_layers,
-                wv_layers,
+                wqkv_layers,
                 wo_layers,
-                w1_layers,
+                w_gate_up_layers,
                 w2_layers,
-                w3_layers,
             )
         } else {
             // === 量化路径 (Quantized Path) ===
@@ -298,12 +280,11 @@ impl Llama3 {
              return Err(InternalError("Incorrect number of RMSNorm layers created.".to_string()).into());
         }
 
-        if wq_layers.len() != layer_num || wk_layers.len() != layer_num || 
-           wv_layers.len() != layer_num || wo_layers.len() != layer_num {
+        if wqkv_layers.len() != layer_num || wo_layers.len() != layer_num {
             return Err(InternalError("Incorrect number of attention Matmul layers created.".to_string()).into());
         }
-        
-        if w1_layers.len() != layer_num || w2_layers.len() != layer_num || w3_layers.len() != layer_num {
+
+        if w_gate_up_layers.len() != layer_num || w2_layers.len() != layer_num {
             return Err(InternalError("Incorrect number of FFN Matmul layers created.".to_string()).into());
         }
         // 对于无参数算子，`.collect()` 保证了长度，但检查一下也无妨。
@@ -319,17 +300,14 @@ impl Llama3 {
             cls_layer,
             rmsnorm_attn_layers,
             rmsnorm_ffn_layers,
-            wq_layers,
-            wk_layers,
-            wv_layers,
+            wqkv_layers,
             wo_layers,
             mha_layers,
             rope_layers,
             add_layers,
             scatter_layer: Scatter::new(),
-            w1_layers,
+            w_gate_up_layers,
             w2_layers,
-            w3_layers,
             swiglu_layers,
         };
         
@@ -502,6 +480,16 @@ impl Llama3 {
             BufferType::IntermediateBuffer1,
             Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
         );
+
+        // Fused GEMM output buffers
+        buffers.insert(
+            BufferType::QkvOutput,
+            Tensor::new(&[max_seq_len, config.q_dim + 2 * config.kv_dim], float_dtype, *device)?,
+        );
+        buffers.insert(
+            BufferType::GateUpOutput,
+            Tensor::new(&[max_seq_len, 2 * config.intermediate_size], float_dtype, *device)?,
+        );
         // ==========================================================
         
         // 10. 模型的最终 logits 输出 (用于单 token)
@@ -529,7 +517,93 @@ impl Llama3 {
         Ok(Matmul::from(weight_on_device, None))
     }
 
-    // ======================= 已修改的函数 =======================
+    /// Load q_proj, k_proj, v_proj weights and concat into fused [q_dim + 2*kv_dim, dim]
+    fn load_fused_qkv(
+        layer_idx: usize,
+        loader: &ModelLoader,
+        device: DeviceType,
+        q_dim: usize,
+        kv_dim: usize,
+        dim: usize,
+    ) -> Result<Matmul> {
+        let wq_view = loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))?;
+        let wk_view = loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx))?;
+        let wv_view = loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx))?;
+
+        let wq = Tensor::from_view_on_cpu(&wq_view)?;
+        let wk = Tensor::from_view_on_cpu(&wk_view)?;
+        let wv = Tensor::from_view_on_cpu(&wv_view)?;
+
+        // Determine dtype (BF16 for GPU, F32 for CPU)
+        let dtype = wq.dtype();
+        let fused_rows = q_dim + 2 * kv_dim;
+        let mut fused = Tensor::new(&[fused_rows, dim], dtype, DeviceType::Cpu)?;
+
+        // Copy weight data: [Wq; Wk; Wv] along rows
+        let elem_size = dtype.size_in_bytes();
+        let wq_bytes = q_dim * dim * elem_size;
+        let wk_bytes = kv_dim * dim * elem_size;
+        let wv_bytes = kv_dim * dim * elem_size;
+
+        let fused_ptr = fused.buffer_mut().as_mut_ptr();
+        let wq_ptr = wq.buffer().as_ptr();
+        let wk_ptr = wk.buffer().as_ptr();
+        let wv_ptr = wv.buffer().as_ptr();
+        // SAFETY: All pointers are valid and non-overlapping. Sizes are checked above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(wq_ptr, fused_ptr, wq_bytes);
+            std::ptr::copy_nonoverlapping(wk_ptr, fused_ptr.add(wq_bytes), wk_bytes);
+            std::ptr::copy_nonoverlapping(wv_ptr, fused_ptr.add(wq_bytes + wk_bytes), wv_bytes);
+        }
+
+        let fused_converted = if device.is_cpu() && dtype != DataType::F32 {
+            fused.to_dtype(DataType::F32)?
+        } else {
+            fused
+        };
+        let fused_on_device = fused_converted.to_device(device)?;
+        Ok(Matmul::from(fused_on_device, None))
+    }
+
+    /// Load gate_proj, up_proj weights and concat into fused [2*intermediate_size, dim]
+    fn load_fused_gate_up(
+        layer_idx: usize,
+        loader: &ModelLoader,
+        device: DeviceType,
+        intermediate_size: usize,
+        dim: usize,
+    ) -> Result<Matmul> {
+        let w1_view = loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))?;
+        let w3_view = loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))?;
+
+        let w1 = Tensor::from_view_on_cpu(&w1_view)?;
+        let w3 = Tensor::from_view_on_cpu(&w3_view)?;
+
+        let dtype = w1.dtype();
+        let fused_rows = 2 * intermediate_size;
+        let mut fused = Tensor::new(&[fused_rows, dim], dtype, DeviceType::Cpu)?;
+
+        let elem_size = dtype.size_in_bytes();
+        let w1_bytes = intermediate_size * dim * elem_size;
+        let w3_bytes = intermediate_size * dim * elem_size;
+
+        let fused_ptr = fused.buffer_mut().as_mut_ptr();
+        let w1_ptr = w1.buffer().as_ptr();
+        let w3_ptr = w3.buffer().as_ptr();
+        // SAFETY: All pointers are valid and non-overlapping. Sizes are checked above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(w1_ptr, fused_ptr, w1_bytes);
+            std::ptr::copy_nonoverlapping(w3_ptr, fused_ptr.add(w1_bytes), w3_bytes);
+        }
+
+        let fused_converted = if device.is_cpu() && dtype != DataType::F32 {
+            fused.to_dtype(DataType::F32)?
+        } else {
+            fused
+        };
+        let fused_on_device = fused_converted.to_device(device)?;
+        Ok(Matmul::from(fused_on_device, None))
+    }
     fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<RMSNorm> {
         let tensor_view = loader.get_tensor(name)?;
         
@@ -680,53 +754,106 @@ impl Llama3 {
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
-            
-            let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
-            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.kcache], cuda_config_ref))?;
-            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut self.vcache], cuda_config_ref))?;
+            // Layer 0: compute attn_norm normally
+            // Layer 1+: attn_norm already computed by previous layer's fused_add_rmsnorm (on CUDA)
+            #[cfg(feature = "cuda")]
+            if i == 0 || !self.device_type.is_cuda() {
+                self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+            }
+
+            // Fused QKV GEMM
+            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
+            let qkv_buffer = self.workspace.get_mut(&BufferType::QkvOutput).unwrap();
+            let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
+            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
+
+            // Zero-copy slice: seq_len=1, contiguous memory
+            let mut q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
+            let mut k = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
+            let v = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[1, self.config.kv_dim])?;
             let (k_cache_full, v_cache_full) = self.kv_cache.get_mut(i)?;
-            
+
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
-            
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut self.kcache], cuda_config_ref))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.kcache, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(&[&self.vcache, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
+
+            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
+            self.layers.scatter_layer.forward(&mut OpContext::new(&[&k, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
+            self.layers.scatter_layer.forward(&mut OpContext::new(&[&v, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out; // Reuse buffer
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
             let mut wo_out = q; // Reuse buffer
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
-            // FFN Block
+            // Fused: x += wo_out; ffn_norm_out = rmsnorm(x, ffn_weight)
             let mut ffn_norm_out = attn_out; // Reuse buffer
-            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
-            let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
-            let mut w1_out = w1_buffer.slice(&[0, 0], &[1, self.config.intermediate_size])?;
-            let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
-            let mut w3_out = w3_buffer.slice(&[0, 0], &[1, self.config.intermediate_size])?;
-            self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
-            self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                crate::op::kernels::cuda::fused_add_rmsnorm(
+                    &mut ffn_norm_out,
+                    &mut x,
+                    &wo_out,
+                    &self.layers.rmsnorm_ffn_layers[i].weight,
+                    cuda_config_ref,
+                )?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
+                self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
+            }
+
+            // Fused Gate-Up GEMM
+            let inter = self.config.intermediate_size;
+            let gu_buffer = self.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
+            let mut gate_up = gu_buffer.slice(&[0, 0], &[1, 2 * inter])?;
+            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
+            // Zero-copy slice
+            let mut w1_out = gate_up.slice(&[0, 0], &[1, inter])?;
+            let w3_out = gate_up.slice(&[0, inter], &[1, inter])?;
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
 
             let mut w2_out = ffn_norm_out; // Reuse buffer
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+            // Fused: x += w2_out; next_norm = rmsnorm(x, next_weight)
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                if i + 1 < self.config.layer_num {
+                    let next_norm_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+                    let mut next_attn_norm_out = next_norm_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+                    crate::op::kernels::cuda::fused_add_rmsnorm(
+                        &mut next_attn_norm_out, &mut x, &w2_out,
+                        &self.layers.rmsnorm_attn_layers[i + 1].weight, cuda_config_ref,
+                    )?;
+                } else {
+                    let final_norm_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+                    let mut final_norm_out = final_norm_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+                    crate::op::kernels::cuda::fused_add_rmsnorm(
+                        &mut final_norm_out, &mut x, &w2_out,
+                        &self.layers.rmsnorm_final_layer.weight, cuda_config_ref,
+                    )?;
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+            }
 
         }
-        // Extract last token's hidden state
-        let last_hidden_state_view = x.slice(&[0, 0], &[1, self.config.dim])?;
-        
-        // Final Norm and classifier
+
+        // For CUDA: final_norm already computed in fused kernel above
+        // For CPU: compute final_norm separately
         let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-
-        self.layers.rmsnorm_final_layer.forward(
-            &mut OpContext::new(&[&last_hidden_state_view], &mut [&mut final_norm_out], cuda_config_ref)
-        )?;
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.layers.rmsnorm_final_layer.forward(
+                &mut OpContext::new(&[&x], &mut [&mut final_norm_out], cuda_config_ref)
+            )?;
+        }
 
         let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
 
@@ -786,15 +913,34 @@ impl Llama3 {
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
 
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[total_tokens, self.config.dim])?;
+            let mut q = q_buffer.slice(&[0, 0], &[total_tokens, self.config.q_dim])?;
 
             // For batch processing, we need to handle KV cache for each sequence separately
             // For now, process each user's KV cache sequentially within the batch
             let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, total_tokens, self.config.kv_dim)?;
 
-            self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
-            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
-            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
+            // Fused QKV GEMM
+            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
+            let qkv_buffer = self.workspace.get_mut(&BufferType::QkvOutput).unwrap();
+            let mut qkv = qkv_buffer.slice(&[0, 0], &[total_tokens, qkv_cols])?;
+            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
+
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut q, total_tokens, qkv_cols, 0, self.config.q_dim, stream)?;
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut k, total_tokens, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut v, total_tokens, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let q_view = qkv.slice(&[0, 0], &[total_tokens, self.config.q_dim])?;
+                q.copy_from(&q_view)?;
+                let k_view = qkv.slice(&[0, self.config.q_dim], &[total_tokens, self.config.kv_dim])?;
+                k.copy_from(&k_view)?;
+                let v_view = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[total_tokens, self.config.kv_dim])?;
+                v.copy_from(&v_view)?;
+            }
 
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
@@ -817,8 +963,25 @@ impl Llama3 {
             let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
             let mut w3_out = w3_buffer.slice(&[0, 0], &[total_tokens, self.config.intermediate_size])?;
 
-            self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
-            self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
+            // Fused Gate-Up GEMM
+            let inter = self.config.intermediate_size;
+            let gu_buffer = self.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
+            let mut gate_up = gu_buffer.slice(&[0, 0], &[total_tokens, 2 * inter])?;
+            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
+
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&gate_up, &mut w1_out, total_tokens, 2 * inter, 0, inter, stream)?;
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&gate_up, &mut w3_out, total_tokens, 2 * inter, inter, inter, stream)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let g_view = gate_up.slice(&[0, 0], &[total_tokens, inter])?;
+                w1_out.copy_from(&g_view)?;
+                let u_view = gate_up.slice(&[0, inter], &[total_tokens, inter])?;
+                w3_out.copy_from(&u_view)?;
+            }
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
 
             let mut w2_out = ffn_norm_out; // Reuse buffer
@@ -892,11 +1055,32 @@ impl Llama3 {
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
             
             let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
+            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
             let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
-            self.layers.wq_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut q], cuda_config_ref))?;
-            self.layers.wk_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut k], cuda_config_ref))?;
-            self.layers.wv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut v], cuda_config_ref))?;
+
+            // Fused QKV GEMM
+            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
+            let qkv_buffer = self.workspace.get_mut(&BufferType::QkvOutput).unwrap();
+            let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
+            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
+
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                // CPU fallback: use copy_from with slices
+                let q_view = qkv.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
+                q.copy_from(&q_view)?;
+                let k_view = qkv.slice(&[0, self.config.q_dim], &[seq_len, self.config.kv_dim])?;
+                k.copy_from(&k_view)?;
+                let v_view = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[seq_len, self.config.kv_dim])?;
+                v.copy_from(&v_view)?;
+            }
             let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
@@ -913,8 +1097,26 @@ impl Llama3 {
             let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
             let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
             let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
-            self.layers.w1_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w1_out], cuda_config_ref))?;
-            self.layers.w3_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut w3_out], cuda_config_ref))?;
+
+            // Fused Gate-Up GEMM
+            let inter = self.config.intermediate_size;
+            let gu_buffer = self.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
+            let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
+            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
+
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
+                crate::op::kernels::cuda::split_cols_bf16_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let g_view = gate_up.slice(&[0, 0], &[seq_len, inter])?;
+                w1_out.copy_from(&g_view)?;
+                let u_view = gate_up.slice(&[0, inter], &[seq_len, inter])?;
+                w3_out.copy_from(&u_view)?;
+            }
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
 
             let mut w2_out = ffn_norm_out; // Reuse buffer

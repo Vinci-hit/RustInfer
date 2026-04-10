@@ -250,6 +250,10 @@ pub enum BufferType {
     // Qwen3 QK-norm buffers (per-head reshape)
     QNormBuffer,
     KNormBuffer,
+
+    // Fused GEMM output buffers
+    QkvOutput,     // [max_seq_len, q_dim + 2 * kv_dim]
+    GateUpOutput,  // [max_seq_len, 2 * intermediate_size]
 }
 
 pub type Workspace = HashMap<BufferType, Tensor>;
