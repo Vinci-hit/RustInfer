@@ -781,8 +781,20 @@ impl Llama3 {
             let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
 
             self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(&[&k, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(&[&v, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
+            // Fused scatter: write K and V to cache in a single kernel launch
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                crate::op::kernels::cuda::scatter_kv(
+                    k_cache_full, &k,
+                    v_cache_full, &v,
+                    &self.input_pos, cuda_config_ref,
+                )?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                self.layers.scatter_layer.forward(&mut OpContext::new(&[&k, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
+                self.layers.scatter_layer.forward(&mut OpContext::new(&[&v, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
+            }
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out; // Reuse buffer
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
@@ -1223,7 +1235,7 @@ Today Date: 14 Dec 2025
         let max_tokens = 150;
         
         println!("Starting CPU generation...");
-        let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, true)?;
+        let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, false)?;
         
         // --- 3. Assert & Report (断言 & 报告) ---
         assert!(num_generated_tokens > 0, "No tokens were generated.");
@@ -1293,7 +1305,7 @@ Today Date: 14 Dec 2025
         // --- 2. 在 CUDA 上运行并获取结果和性能 ---
         println!("\n=== Step 2: Running on CUDA ===");
         let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (_cuda_generated_text, _cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, true)?;
+        let (_cuda_generated_text, _cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, false)?;
 
         // 计算更详细的性能指标
         let prompt_tokens = model_cuda.tokenizer.encode(prompt)?;

@@ -201,6 +201,92 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtMatrixLayoutDestroy(Cdesc);
     cublasLtMatmulDescDestroy(operationDesc);
 }
+// ============================================================================
+// BF16 GEMV kernel v2 for decode phase (M=1)
+// y[n] = dot(W[n,:], x[:])  where W is [N, K], x is [1, K], y is [1, N]
+//
+// Design: 1 warp (32 threads) computes 1 row, 1 block has 8 warps.
+// Input vector x is loaded into shared memory once per block and reused.
+// ============================================================================
+
+__device__ __forceinline__ float warp_reduce_sum_gemv(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+template <int WARPS_PER_BLOCK>
+__global__ void hgemv_bf16_v2_kernel(
+    const __nv_bfloat16* __restrict__ input,   // [K]
+    const __nv_bfloat16* __restrict__ weight,  // [N, K] row-major
+    __nv_bfloat16* __restrict__ output,        // [N]
+    int N,
+    int K
+) {
+    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+    constexpr int PACK_SIZE = 8;
+    extern __shared__ float4 smem_input[];
+
+    const int pack_num = K / PACK_SIZE;
+    const float4* input_f4 = reinterpret_cast<const float4*>(input);
+
+    for (int i = tid; i < pack_num; i += THREADS_PER_BLOCK) {
+        smem_input[i] = input_f4[i];
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const float4* weight_f4 = reinterpret_cast<const float4*>(weight + row * K);
+
+    float thread_sum = 0.0f;
+
+    for (int i = lane_id; i < pack_num; i += 32) {
+        float4 x_pack = smem_input[i];
+        float4 w_pack = __ldg(&weight_f4[i]);  // read-only cache path, avoids L1 thrashing
+
+        const __nv_bfloat16* x_bf16 = reinterpret_cast<const __nv_bfloat16*>(&x_pack);
+        const __nv_bfloat16* w_bf16 = reinterpret_cast<const __nv_bfloat16*>(&w_pack);
+
+        #pragma unroll
+        for (int j = 0; j < PACK_SIZE; j++) {
+            thread_sum += __bfloat162float(x_bf16[j]) * __bfloat162float(w_bf16[j]);
+        }
+    }
+
+    thread_sum = warp_reduce_sum_gemv(thread_sum);
+
+    if (lane_id == 0) {
+        output[row] = __float2bfloat16(thread_sum);
+    }
+}
+
+extern "C" void hgemv_bf16_cu(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* weight,
+    __nv_bfloat16* output,
+    int N,
+    int K,
+    cudaStream_t stream
+) {
+    constexpr int WARPS_PER_BLOCK = 8;
+    constexpr int THREADS = WARPS_PER_BLOCK * 32;  // 256
+
+    int grid = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    size_t smem_bytes = ((K + 7) / 8) * sizeof(float4);
+
+    hgemv_bf16_v2_kernel<WARPS_PER_BLOCK><<<grid, THREADS, smem_bytes, stream>>>(
+        input, weight, output, N, K);
+}
+
 void gemm_cublaslt_bf16(
     const __nv_bfloat16* A,
     const __nv_bfloat16* B,
