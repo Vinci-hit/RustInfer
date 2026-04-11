@@ -26,6 +26,19 @@ void scatter_kernel_f32(
     cudaStream_t stream
 );
 
+// Fused scatter for K and V caches simultaneously (BF16)
+// Saves one kernel launch per layer in decode phase
+void scatter_kv_kernel_bf16(
+    __nv_bfloat16* dst_k,
+    const __nv_bfloat16* src_k,
+    __nv_bfloat16* dst_v,
+    const __nv_bfloat16* src_v,
+    int* pos,
+    int kvdim,
+    int max_seq_len,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

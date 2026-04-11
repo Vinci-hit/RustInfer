@@ -38,6 +38,45 @@ unsafe extern "C" {
         workspace: *mut c_void,
         workspaceSize: usize,
     );
+    // BF16 GEMV for decode (M=1)
+    fn hgemv_bf16_cu(
+        input: *const half::bf16,
+        weight: *const half::bf16,
+        output: *mut half::bf16,
+        N: i32,
+        K: i32,
+        stream: crate::cuda::ffi::cudaStream_t,
+    );
+}
+
+/// BF16 GEMV for decode phase (M=1): y = W * x
+/// input: [1, K], weight: [N, K], output: [1, N]
+/// Uses custom CUDA kernel with bf16x8 vectorized loads, FP32 accumulation,
+/// and warp shuffle reduction. ~1.5x faster than cublasLt for M=1.
+pub fn hgemv_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
+    let a_shape = input.shape();
+    let b_shape = weight.shape();
+
+    let k = a_shape[1];     // inner dimension
+    let n = b_shape[0];     // output dimension (rows of weight)
+
+    let input_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let weight_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let output_ptr = output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+
+    unsafe {
+        hgemv_bf16_cu(
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            n as i32,
+            k as i32,
+            stream,
+        );
+    }
+
+    Ok(())
 }
 
 pub fn hgemm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config:Option<&CudaConfig>) -> Result<()> {
