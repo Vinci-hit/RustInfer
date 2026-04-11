@@ -103,7 +103,16 @@ impl Op for Matmul {
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
                 if input.dtype() == DataType::BF16{
-                    kernels::cuda::hgemm_bf16(input, weight, output, ctx.cuda_config)?;
+                    let n = weight.shape()[0]; // output dimension
+                    if input.shape()[0] == 1 && n <= 16384 {
+                        // Decode (M=1) + small/medium N: custom GEMV kernel
+                        // Benchmarked on H20: 25-44% faster than cublasLt for N≤13824
+                        // (avoids splitK overhead + Tensor Core padding waste)
+                        kernels::cuda::hgemv_bf16(input, weight, output, ctx.cuda_config)?;
+                    } else {
+                        // Prefill (M>1) or large N (lm_head vocab=151936): cublasLt
+                        kernels::cuda::hgemm_bf16(input, weight, output, ctx.cuda_config)?;
+                    }
                 }else if input.shape()[0] == 1{
                     kernels::cuda::sgemv(input, weight, output, ctx.cuda_config)?;
                 }else{
