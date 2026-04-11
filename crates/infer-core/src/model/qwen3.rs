@@ -838,7 +838,7 @@ impl Qwen3 {
 
         // Generation stage
         let mut generated_tokens = vec![current_token];
-        let mut printed_len = 0usize; // 已打印的字符数
+        let mut printed_len = 0usize;
 
         if print_output {
             let decoded = self.tokenizer.decode(&generated_tokens)?;
@@ -868,7 +868,6 @@ impl Qwen3 {
                 let decoded = self.tokenizer.decode(&generated_tokens)?;
                 if decoded.len() > printed_len {
                     let new_text = &decoded[printed_len..];
-                    // 只输出不含 replacement character 的部分
                     if !new_text.contains('\u{FFFD}') {
                         let _ = write!(stdout, "{}", new_text);
                         printed_len = decoded.len();
@@ -1006,16 +1005,28 @@ impl Qwen3 {
                 &mut [&mut q, &mut k_active],
                 cuda_config_ref,
             ))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(
-                &[&k_active, &self.input_pos],
-                &mut [k_cache_full],
-                cuda_config_ref,
-            ))?;
-            self.layers.scatter_layer.forward(&mut OpContext::new(
-                &[&v_view, &self.input_pos],
-                &mut [v_cache_full],
-                cuda_config_ref,
-            ))?;
+            // Fused scatter: write K and V to cache in a single kernel launch
+            #[cfg(feature = "cuda")]
+            if self.device_type.is_cuda() {
+                crate::op::kernels::cuda::scatter_kv(
+                    k_cache_full, &k_active,
+                    v_cache_full, &v_view,
+                    &self.input_pos, cuda_config_ref,
+                )?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                self.layers.scatter_layer.forward(&mut OpContext::new(
+                    &[&k_active, &self.input_pos],
+                    &mut [k_cache_full],
+                    cuda_config_ref,
+                ))?;
+                self.layers.scatter_layer.forward(&mut OpContext::new(
+                    &[&v_view, &self.input_pos],
+                    &mut [v_cache_full],
+                    cuda_config_ref,
+                ))?;
+            }
             let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
             let attn_out_buffer = self.workspace.get_mut(&BufferType::AttnOutput).unwrap();
             let mut attn_out = attn_out_buffer.slice(&[0, 0], &[1, self.config.q_dim])?;
@@ -1515,7 +1526,7 @@ mod tests {
         println!("\n=== Running Qwen3 on CUDA ===");
         let mut model = Qwen3::new(model_path, DeviceType::Cuda(0), false)?;
         let (_text, _duration_ms, num_tokens, prefill_ms, decode_ms, decode_iterations) =
-            generate_and_measure(&mut model, prompt, max_tokens, true)?;
+            generate_and_measure(&mut model, prompt, max_tokens, false)?;
 
         // 性能指标计算
         let prompt_tokens = model.tokenizer.encode(prompt)?;
@@ -1549,6 +1560,7 @@ mod tests {
         };
 
         println!("\n================ QWEN3 CUDA PERFORMANCE ================");
+        println!("Generated text:\n{}", _text);
         println!(
             "Total Time (compute only): {} ms, Total Tokens: {}, TPS: {:.2}",
             total_compute_ms as u64, total_tokens as usize, tps
@@ -1581,7 +1593,7 @@ mod tests {
         println!("\n=== Running Qwen3 on CPU ===");
         let mut model = Qwen3::new(model_path, DeviceType::Cpu, false)?;
         let (_text, _duration_ms, num_tokens, prefill_ms, decode_ms, decode_iterations) =
-            generate_and_measure(&mut model, prompt, max_tokens, true)?;
+            generate_and_measure(&mut model, prompt, max_tokens, false)?;
 
         let prompt_tokens = model.tokenizer.encode(prompt)?;
         let prompt_tokens_len = prompt_tokens.len() as f64;

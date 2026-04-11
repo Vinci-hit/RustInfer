@@ -7,42 +7,42 @@ __global__ void swiglu_inplace_kernel_bf16x8(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
-    __nv_bfloat162 one = {1.0, 1.0};
     for (; i < num_float4_elements; i += stride) {
-        // a. 读取 x 的原始值
-        auto x_bf162_vec4 = reinterpret_cast<__nv_bfloat162*>(&input_output_x[i]);
-        // b. 读取 y 的值
-        auto y_bf162_vec4 = reinterpret_cast<const __nv_bfloat162*>(&input_y[i]);
-        for (int j =0;j<4;j++)
-        {
-            x_bf162_vec4[j] = x_bf162_vec4[j] * y_bf162_vec4[j] / (one + h2exp(-x_bf162_vec4[j]));
+        float4 x_f4 = input_output_x[i];
+        float4 y_f4 = input_y[i];
+
+        __nv_bfloat16* x_bf16 = reinterpret_cast<__nv_bfloat16*>(&x_f4);
+        const __nv_bfloat16* y_bf16 = reinterpret_cast<const __nv_bfloat16*>(&y_f4);
+
+        // Compute SwiGLU in FP32 for precision: silu(x) * y = x * sigmoid(x) * y
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float xf = __bfloat162float(x_bf16[j]);
+            float yf = __bfloat162float(y_bf16[j]);
+            float sigmoid_x = 1.0f / (1.0f + expf(-xf));
+            x_bf16[j] = __float2bfloat16(xf * sigmoid_x * yf);
         }
-        
+
+        input_output_x[i] = x_f4;
     }
 }
 
 
 // ======================= 主机端 FFI 函数修改 =======================
-// 函数名和签名被修改以反映其原地操作的特性
-// 这是将要从 Rust 调用的 FFI 函数
 void swiglu_inplace_cu_bf16x8(
-    const __nv_bfloat16* input_y,      // <--- 只读的 y
-    __nv_bfloat16* input_output_x, // <--- 可读写的 x
+    const __nv_bfloat16* input_y,
+    __nv_bfloat16* input_output_x,
     int num_elements,
     cudaStream_t stream
 ) {
     int num_float4_elements = num_elements / 8;
     const int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
-    const int blocks_per_grid = num_sm * 8;
-    // --- 类型转换 (指针调整) ---
+    // Fixed grid size to avoid runtime cudaGetDevice/cudaDeviceGetAttribute overhead
+    const int blocks_per_grid = (num_float4_elements + threads_per_block - 1) / threads_per_block;
+
     float4* in_out_x_f4 = reinterpret_cast<float4*>(input_output_x);
     const float4* in_y_f4 = reinterpret_cast<const float4*>(input_y);
 
-    // --- 启动原地内核 ---
     swiglu_inplace_kernel_bf16x8<<<blocks_per_grid, threads_per_block, 0, stream>>>(
         in_out_x_f4, in_y_f4, num_float4_elements
     );
@@ -152,13 +152,9 @@ extern "C" void swiglu_inplace_kernel_cu_fp32x4(
     
     int num_float4_elements = num_elements / 4;
     
-    // --- 启动配置 (保持不变) ---
+    // --- 启动配置 ---
     const int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
-    const int blocks_per_grid = num_sm * 8;
+    const int blocks_per_grid = (num_float4_elements + threads_per_block - 1) / threads_per_block;
     
     // --- 类型转换 (指针调整) ---
     float4* in_out_x_f4 = reinterpret_cast<float4*>(input_output_x);

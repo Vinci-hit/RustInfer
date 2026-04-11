@@ -38,6 +38,18 @@ void gemm_cublaslt_bf16(
     void* workspace, size_t workspaceSize
 );
 
+/// @brief BF16 GEMV: y = W * x, where W is [N, K] and x is [1, K], output y is [1, N].
+///        Uses bf16x8 vectorized loads with FP32 accumulation and warp-level reduction.
+///        Optimized for decode phase (M=1) where cublasLt has excessive overhead.
+void hgemv_bf16_cu(
+    const __nv_bfloat16* input,   // [1, K]
+    const __nv_bfloat16* weight,  // [N, K]
+    __nv_bfloat16* output,        // [1, N]
+    int N,
+    int K,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif
