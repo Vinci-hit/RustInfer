@@ -26,16 +26,19 @@ fn main() {
                 cutlass_include
             );
         }
-        // 1. 使用 cc crate 编译 CUDA 代码 (这部分保持不变)
+        // 自动检测 GPU 架构，无需手动修改
+        let cuda_arch = detect_cuda_arch();
+        println!("cargo:warning=Detected CUDA arch: {}", cuda_arch);
+
         let mut build = cc::Build::new();
         build.cuda(true)
         .opt_level(3)
         .debug(false)
         .flag("-O3")
-        .flag("-w") 
+        .flag("-w")
         .include(&cutlass_include)
         .flag("-std=c++17")
-        .flag("-arch=sm_89");// 请根据你的 GPU 架构修改       // 禁用优化（避免变量被优化掉，调试时能看到真实值）
+        .flag(&format!("-arch={}", cuda_arch));
 
         for path in &kernel_paths {
             build.file(path);
@@ -100,6 +103,34 @@ fn main() {
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
+}
+
+/// 自动检测当前 GPU 的 compute capability，返回如 "sm_90" 的字符串
+/// 优先读取环境变量 CUDA_ARCH（如 CUDA_ARCH=sm_90a），否则用 nvidia-smi 自动检测
+#[cfg(feature = "cuda")]
+fn detect_cuda_arch() -> String {
+    // 1. 环境变量优先，允许手动覆盖
+    if let Ok(arch) = env::var("CUDA_ARCH") {
+        return arch;
+    }
+
+    // 2. 用 nvidia-smi 查询第一块 GPU 的 compute capability
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader,nounits", "-i", "0"])
+        .output();
+
+    if let Ok(output) = output {
+        if output.status.success() {
+            let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // cap 格式如 "9.0", "8.9", "8.0"
+            let sm = cap.replace('.', "");
+            return format!("sm_{}", sm);
+        }
+    }
+
+    // 3. fallback
+    println!("cargo:warning=Could not detect GPU arch, falling back to sm_80");
+    "sm_80".to_string()
 }
 
 /// 辅助函数：递归地查找指定目录中具有特定扩展名的文件
