@@ -25,7 +25,7 @@ void argmax_cu_f32_ffi(
     auto max_elem_it = thrust::max_element(policy, d_logits, d_logits + vocab_size);
     
     // 计算索引并将其写入到 GPU 上的结果指针
-    *d_result = thrust::distance(d_logits, max_elem_it);
+    *d_result = max_elem_it - d_logits;
 
 }
 
