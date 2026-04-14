@@ -92,8 +92,6 @@ pub struct Llama3 {
 
     /// KV Cache
     kv_cache: KvCache,
-    kcache: Tensor,
-    vcache: Tensor,
     /// 工作空间，用于存放中间计算结果，避免频繁分配和释放内存
     workspace: Workspace,
     output_token: Tensor,
@@ -318,19 +316,7 @@ impl Llama3 {
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
         let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
-        // 临时 k/v cache 的 dtype 需与其他张量保持一致：CPU 用 F32，GPU 用模型配置的 dtype
-        let float_dtype = if device_type.is_cpu() {
-            DataType::F32
-        } else {
-            match config.torch_dtype.as_str() {
-                "bfloat16" => DataType::BF16,
-                "float32" => DataType::F32,
-                _ => DataType::BF16,
-            }
-        };
-        let kcache = Tensor::new(&[1, config.kv_dim], float_dtype, device_type)?;
-        let vcache = Tensor::new(&[1, config.kv_dim], float_dtype, device_type)?;
-        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos, kcache, vcache };
+        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos};
         Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
         Ok(model)
     }
@@ -639,9 +625,6 @@ impl Llama3 {
             weight
         };
 
-        // 2. 直接将BF16权重移动到目标设备，不进行类型转换
-        
-        // 3. 将权重移动到目标设备
         let weight_on_device = weight_converted.to_device(device)?;
         
         Ok(Embedding::from(weight_on_device))
@@ -886,162 +869,6 @@ impl Llama3 {
 
         let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
         Ok(next_token)
-    }
-    /// Forward prefill with TRUE batch processing
-    /// Processes multiple users in a single forward pass
-    ///
-    /// # Arguments
-    /// * `tokens` - Batched tokens with shape [batch_size * seq_len]
-    /// * `pos_cpu` - Starting position (should be 0 for prefill)
-    /// * `batch_size` - Number of users in the batch
-    /// * `seq_len` - Sequence length per user
-    ///
-    /// # Returns
-    /// Vec<i32> - First generated token for each user
-    fn forward_prefill_batch(&mut self, tokens: &Tensor, pos_cpu: &Tensor, batch_size: usize, seq_len: usize) -> Result<Vec<i32>> {
-        let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
-        let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
-        self.input_pos.copy_from(pos_cpu)?;
-
-        let total_tokens = batch_size * seq_len;
-
-        // Prepare batch input tokens [batch_size * seq_len]
-        let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
-        let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[total_tokens])?;
-        input_tokens_view.copy_from(tokens)?;
-
-        // Token embedding: [batch_size * seq_len] -> [batch_size * seq_len, dim]
-        let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
-        let mut x = x_buffer.slice(&[0, 0], &[total_tokens, self.config.dim])?;
-        self.layers.embedding_layer.forward(
-            &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
-        )?;
-
-        // Process all transformer layers with batched input
-        for i in 0..self.config.layer_num {
-            // Attention Block
-            let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[total_tokens, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
-
-            let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[total_tokens, self.config.q_dim])?;
-
-            // For batch processing, we need to handle KV cache for each sequence separately
-            // For now, process each user's KV cache sequentially within the batch
-            let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, total_tokens, self.config.kv_dim)?;
-
-            // Fused QKV GEMM
-            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = self.workspace.get_mut(&BufferType::QkvOutput).unwrap();
-            let mut qkv = qkv_buffer.slice(&[0, 0], &[total_tokens, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
-
-            #[cfg(feature = "cuda")]
-            if self.device_type.is_cuda() {
-                let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut q, total_tokens, qkv_cols, 0, self.config.q_dim, stream)?;
-                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut k, total_tokens, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-                crate::op::kernels::cuda::split_cols_bf16_tensor(&qkv, &mut v, total_tokens, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let q_view = qkv.slice(&[0, 0], &[total_tokens, self.config.q_dim])?;
-                q.copy_from(&q_view)?;
-                let k_view = qkv.slice(&[0, self.config.q_dim], &[total_tokens, self.config.kv_dim])?;
-                k.copy_from(&k_view)?;
-                let v_view = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[total_tokens, self.config.kv_dim])?;
-                v.copy_from(&v_view)?;
-            }
-
-            let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
-
-            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out; // Reuse buffer
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
-
-            let mut wo_out = q; // Reuse buffer
-            self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
-
-            // FFN Block
-            let mut ffn_norm_out = attn_out; // Reuse buffer
-            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
-
-            let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
-            let mut w1_out = w1_buffer.slice(&[0, 0], &[total_tokens, self.config.intermediate_size])?;
-            let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
-            let mut w3_out = w3_buffer.slice(&[0, 0], &[total_tokens, self.config.intermediate_size])?;
-
-            // Fused Gate-Up GEMM
-            let inter = self.config.intermediate_size;
-            let gu_buffer = self.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
-            let mut gate_up = gu_buffer.slice(&[0, 0], &[total_tokens, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
-
-            #[cfg(feature = "cuda")]
-            if self.device_type.is_cuda() {
-                let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-                crate::op::kernels::cuda::split_cols_bf16_tensor(&gate_up, &mut w1_out, total_tokens, 2 * inter, 0, inter, stream)?;
-                crate::op::kernels::cuda::split_cols_bf16_tensor(&gate_up, &mut w3_out, total_tokens, 2 * inter, inter, inter, stream)?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let g_view = gate_up.slice(&[0, 0], &[total_tokens, inter])?;
-                w1_out.copy_from(&g_view)?;
-                let u_view = gate_up.slice(&[0, inter], &[total_tokens, inter])?;
-                w3_out.copy_from(&u_view)?;
-            }
-            self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
-
-            let mut w2_out = ffn_norm_out; // Reuse buffer
-            self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
-        }
-
-        // Extract last token's hidden state for each user in the batch
-        // For batch_size users with seq_len tokens each:
-        // User 0: position seq_len-1
-        // User 1: position 2*seq_len-1
-        // User 2: position 3*seq_len-1, etc.
-        let mut first_tokens = Vec::with_capacity(batch_size);
-
-        for batch_idx in 0..batch_size {
-            let last_token_pos = (batch_idx + 1) * seq_len - 1;
-
-            // Extract this user's last token hidden state
-            let last_hidden_state_view = x.slice(&[last_token_pos, 0], &[1, self.config.dim])?;
-
-            // Prepare for final norm and classifier
-            let final_norm_input_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-            let mut final_norm_input = final_norm_input_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            final_norm_input.copy_from(&last_hidden_state_view)?;
-
-            // Final Norm
-            let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            self.layers.rmsnorm_final_layer.forward(
-                &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
-            )?;
-
-            // Classifier
-            let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-            self.layers.cls_layer.forward(
-                &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
-            )?;
-
-            // Sample token for this user
-            let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
-            let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-            self.sampler.sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
-            let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-
-            first_tokens.push(next_token);
-        }
-
-        Ok(first_tokens)
     }
 
     fn forward_prefill(&mut self, tokens: &Tensor, pos_cpu: &Tensor, seq_len:usize) -> Result<i32> {
@@ -1351,6 +1178,6 @@ Today Date: 14 Dec 2025
 
     // 辅助函数，获取虚拟模型的路径
     fn get_dummy_model_path() -> &'static Path {
-        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b")
+        Path::new("/root/models/Llama-3.2-1B")
     }
 }
