@@ -6,7 +6,7 @@ use anyhow::Result;
 
 /// 模型实例枚举，支持多种模型类型
 pub enum ModelInstance {
-    Llama3(infer_core::model::llama3::Llama3),
+    Llama3(infer_core::model::llama3::Llama3, infer_core::runtime::InferenceState),
     Qwen3(infer_core::model::qwen3::Qwen3),
 }
 
@@ -19,7 +19,7 @@ impl ModelInstance {
         print_output: bool,
     ) -> Result<(String, u32, u64, u64, usize)> {
         match self {
-            ModelInstance::Llama3(model) => Ok(model.generate(prompt, max_tokens, print_output)?),
+            ModelInstance::Llama3(model, state) => Ok(model.generate(state, prompt, max_tokens, print_output)?),
             ModelInstance::Qwen3(model) => Ok(model.generate(prompt, max_tokens, print_output)?),
         }
     }
