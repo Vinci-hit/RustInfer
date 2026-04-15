@@ -22,8 +22,6 @@ use crate::model::BufferType;
 use crate::op::scatter::Scatter;
 use crate::runtime::InferenceState;
 
-#[cfg(feature = "cuda")]
-use crate::cuda::CudaConfig;
 
 /// LlamaLayers holds all operators and weights for the model.
 pub struct LlamaLayers {
@@ -103,12 +101,12 @@ impl Llama3 {
                 wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
                 w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
                 w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
-                rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type)?);
-                rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type)?);
+                rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
+                rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
             }
 
             let embedding_layer = Self::load_embedding("model.embed_tokens.weight", &loader, device_type)?;
-            let rmsnorm_final_layer = Self::load_rmsnorm("model.norm.weight", &loader, device_type)?;
+            let rmsnorm_final_layer = Self::load_rmsnorm("model.norm.weight", &loader, device_type, config.rms_norm_eps)?;
             let cls_layer = if tensor_names.contains("lm_head.weight") {
                 Self::load_matmul("lm_head.weight", &loader, device_type)?
             } else {
@@ -216,10 +214,10 @@ impl Llama3 {
         Ok(Matmul::from(fused.to_device(device)?, None))
     }
 
-    fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<RMSNorm> {
+    fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType, eps: f32) -> Result<RMSNorm> {
         let weight = Tensor::from_view_on_cpu(&loader.get_tensor(name)?)?;
         let weight = if device.is_cpu() && weight.dtype() != DataType::F32 { weight.to_dtype(DataType::F32)? } else { weight };
-        Ok(RMSNorm::from(weight.to_device(device)?))
+        Ok(RMSNorm::from(weight.to_device(device)?, eps))
     }
 
     fn load_embedding(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Embedding> {
@@ -306,17 +304,17 @@ impl Llama3 {
         let input_tokens_view = &state.output_token;
 
         // CUDA Graph
-        #[cfg(feature = "cuda")]
-        if self.device_type.is_cuda() {
-            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if cfg.cuda_graph.is_none() {
-                cfg.capture_graph_begin()?;
-            } else {
-                cfg.launch_graph()?;
-                cfg.sync_stream()?;
-                return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
-            }
-        }
+        // #[cfg(feature = "cuda")]
+        // if self.device_type.is_cuda() {
+        //     let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
+        //     if cfg.cuda_graph.is_none() {
+        //         cfg.capture_graph_begin()?;
+        //     } else {
+        //         cfg.launch_graph()?;
+        //         cfg.sync_stream()?;
+        //         return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
+        //     }
+        // }
 
         #[cfg(feature = "cuda")]
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
@@ -370,7 +368,7 @@ impl Llama3 {
             let mut ffn_norm_out = attn_out;
             #[cfg(feature = "cuda")]
             if self.device_type.is_cuda() {
-                crate::op::kernels::cuda::fused_add_rmsnorm(&mut ffn_norm_out, &mut x, &wo_out, &self.layers.rmsnorm_ffn_layers[i].weight, cuda_config_ref)?;
+                crate::op::kernels::cuda::fused_add_rmsnorm(&mut ffn_norm_out, &mut x, &wo_out, &self.layers.rmsnorm_ffn_layers[i].weight, self.config.rms_norm_eps, cuda_config_ref)?;
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -394,11 +392,11 @@ impl Llama3 {
                 if i + 1 < self.config.layer_num {
                     let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                     let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::cuda::fused_add_rmsnorm(&mut next_out, &mut x, &w2_out, &self.layers.rmsnorm_attn_layers[i + 1].weight, cuda_config_ref)?;
+                    crate::op::kernels::cuda::fused_add_rmsnorm(&mut next_out, &mut x, &w2_out, &self.layers.rmsnorm_attn_layers[i + 1].weight, self.config.rms_norm_eps, cuda_config_ref)?;
                 } else {
                     let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                     let mut final_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::cuda::fused_add_rmsnorm(&mut final_out, &mut x, &w2_out, &self.layers.rmsnorm_final_layer.weight, cuda_config_ref)?;
+                    crate::op::kernels::cuda::fused_add_rmsnorm(&mut final_out, &mut x, &w2_out, &self.layers.rmsnorm_final_layer.weight, self.config.rms_norm_eps, cuda_config_ref)?;
                 }
             }
             #[cfg(not(feature = "cuda"))]
@@ -416,11 +414,11 @@ impl Llama3 {
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
 
-        #[cfg(feature = "cuda")]
-        if self.device_type.is_cuda() {
-            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if cfg.cuda_graph.is_none() { cfg.capture_graph_end()?; }
-        }
+        // #[cfg(feature = "cuda")]
+        // if self.device_type.is_cuda() {
+        //     let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
+        //     if cfg.cuda_graph.is_none() { cfg.capture_graph_end()?; }
+        // }
 
         Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
     }
@@ -583,7 +581,7 @@ mod tests {
         let mut state = model.create_state()?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
+        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, true)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;

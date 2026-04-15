@@ -295,11 +295,13 @@ impl Qwen3 {
                     &format!("model.layers.{}.input_layernorm.weight", i),
                     &loader,
                     device_type,
+                    config.rms_norm_eps,
                 )?);
                 rmsnorm_ffn_layers.push(Self::load_rmsnorm(
                     &format!("model.layers.{}.post_attention_layernorm.weight", i),
                     &loader,
                     device_type,
+                    config.rms_norm_eps,
                 )?);
 
                 // ---- Qwen3 特定：QK-norm 层 ----
@@ -308,6 +310,7 @@ impl Qwen3 {
                         &format!("model.layers.{}.self_attn.q_norm.weight", i),
                         &loader,
                         device_type,
+                        config.rms_norm_eps,
                     )?);
                 }
                 if has_knorm {
@@ -315,6 +318,7 @@ impl Qwen3 {
                         &format!("model.layers.{}.self_attn.k_norm.weight", i),
                         &loader,
                         device_type,
+                        config.rms_norm_eps,
                     )?);
                 }
             }
@@ -322,7 +326,7 @@ impl Qwen3 {
             let embedding_layer =
                 Self::load_embedding("model.embed_tokens.weight", &loader, device_type)?;
             let rmsnorm_final_layer =
-                Self::load_rmsnorm("model.norm.weight", &loader, device_type)?;
+                Self::load_rmsnorm("model.norm.weight", &loader, device_type, config.rms_norm_eps)?;
 
             // 检查是否有独立的 lm_head 权重
             let cls_layer = if tensor_names.contains("lm_head.weight") {
@@ -687,7 +691,7 @@ impl Qwen3 {
         Ok(Matmul::from(weight_on_device, None))
     }
 
-    fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<RMSNorm> {
+    fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType, eps: f32) -> Result<RMSNorm> {
         let tensor_view = loader.get_tensor(name)?;
         let weight = Tensor::from_view_on_cpu(&tensor_view)?;
 
@@ -699,7 +703,7 @@ impl Qwen3 {
 
         let weight_on_device = weight_converted.to_device(device)?;
 
-        Ok(RMSNorm::from(weight_on_device))
+        Ok(RMSNorm::from(weight_on_device, eps))
     }
 
     fn load_embedding(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Embedding> {
@@ -1053,6 +1057,7 @@ impl Qwen3 {
                     &mut x,
                     &wo_out,
                     &self.layers.rmsnorm_ffn_layers[i].weight,
+                    self.config.rms_norm_eps,
                     cuda_config_ref,
                 )?;
             }
@@ -1108,6 +1113,7 @@ impl Qwen3 {
                         &mut x,
                         &w2_out,
                         &self.layers.rmsnorm_attn_layers[i + 1].weight,
+                        self.config.rms_norm_eps,
                         cuda_config_ref,
                     )?;
                 } else {
@@ -1119,6 +1125,7 @@ impl Qwen3 {
                         &mut x,
                         &w2_out,
                         &self.layers.rmsnorm_final_layer.weight,
+                        self.config.rms_norm_eps,
                         cuda_config_ref,
                     )?;
                 }

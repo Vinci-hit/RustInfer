@@ -10,17 +10,18 @@ use super::kernels;
 pub struct RMSNorm {
     pub weight: Tensor,
     dim: usize,
+    eps: f32,
 }
 
 impl RMSNorm {
     /// 创建一个新的 RMSNorm 算子
-    pub fn new(dim: usize, dtype: DataType, device: DeviceType) -> Result<Self> {
+    pub fn new(dim: usize, dtype: DataType, device: DeviceType, eps: f32) -> Result<Self> {
         let weight = Tensor::new(&[dim], dtype, device)?;
-        Ok(Self { weight, dim })
+        Ok(Self { weight, dim, eps })
     }
-    pub fn from(weight: Tensor) -> Self {
+    pub fn from(weight: Tensor, eps: f32) -> Self {
         let dim = weight.shape()[0];
-        Self { weight, dim }
+        Self { weight, dim, eps }
     }
 }
 
@@ -104,9 +105,9 @@ impl Op for RMSNorm {
         // ==================== 检查逻辑结束 ====================
         // --- 4. 分派到具体的内核实现 ---
         match input.device() {
-            DeviceType::Cpu => kernels::cpu::rmsnorm(input, weight, output),
+            DeviceType::Cpu => kernels::cpu::rmsnorm(input, weight, output, self.eps),
             #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => kernels::cuda::rmsnorm(input, weight, output, ctx.cuda_config),
+            DeviceType::Cuda(_) => kernels::cuda::rmsnorm(input, weight, output, self.eps, ctx.cuda_config),
         }
     }
 }
@@ -149,7 +150,7 @@ mod tests {
         device: DeviceType,
     ) -> Result<(RMSNorm, Tensor, Tensor)> {
         let dim = *shape.last().unwrap();
-        let op = RMSNorm::new(dim, DataType::F32, device)?;
+        let op = RMSNorm::new(dim, DataType::F32, device, 1e-6)?;
         let input = Tensor::new(shape, DataType::F32, device)?;
         let output = Tensor::new(shape, DataType::F32, device)?;
         Ok((op, input, output))
@@ -281,7 +282,7 @@ mod tests {
             let shape = &[batch, seq_len, dim];
 
             // Create operator and tensors
-            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device)?;
+            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device, 1e-6)?;
             let mut input = Tensor::new(shape, dtype, device)?;
             let mut output = Tensor::new(shape, dtype, device)?;
 
@@ -347,7 +348,7 @@ mod tests {
             let shape = &[batch, seq_len, dim];
 
             // Create operator and tensors
-            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device)?;
+            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device, 1e-6)?;
             let mut input = Tensor::new(shape, dtype, device)?;
             let mut output = Tensor::new(shape, dtype, device)?;
 
@@ -420,7 +421,7 @@ mod tests {
                 .collect();
 
             // CPU computation
-            let mut rmsnorm_op_cpu = RMSNorm::new(dim, dtype, DeviceType::Cpu)?;
+            let mut rmsnorm_op_cpu = RMSNorm::new(dim, dtype, DeviceType::Cpu, 1e-6)?;
             let mut input_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
             let mut output_cpu = Tensor::new(shape, dtype, DeviceType::Cpu)?;
 
@@ -431,7 +432,7 @@ mod tests {
             let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
 
             // GPU computation
-            let mut rmsnorm_op_gpu = RMSNorm::new(dim, dtype, DeviceType::Cuda(0))?;
+            let mut rmsnorm_op_gpu = RMSNorm::new(dim, dtype, DeviceType::Cuda(0), 1e-6)?;
             let mut input_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
             let mut output_gpu = Tensor::new(shape, dtype, DeviceType::Cuda(0))?;
 
@@ -461,7 +462,7 @@ mod tests {
         for dim in [128, 256, 512] {
             let shape = &[dim];
 
-            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device)?;
+            let mut rmsnorm_op = RMSNorm::new(dim, dtype, device, 1e-6)?;
             let mut input = Tensor::new(shape, dtype, device)?;
             let mut output = Tensor::new(shape, dtype, device)?;
 

@@ -7,10 +7,6 @@ use crate::base::error::{Error, Result};
 
 const MAX_SEQ_LEN: usize = 2048; // 根据调整此值
 
-fn default_rope_theta() -> f64 {
-    500000.0
-}
-
 // ======================= 新增的顶层结构体 =======================
 /// 这个结构体匹配 config.json 的顶层结构。
 /// 它的唯一作用就是提取出我们关心的 "text_config" 部分。
@@ -65,16 +61,16 @@ pub struct ModelFileConfig {
     pub torch_dtype: String,
     
     // 可能存在的、模型特有的参数 (使用 Option)
-    #[serde(default)]
     pub immediate_dim: Option<usize>,
 
     /// 显式的 head_dim（Qwen3 等模型使用，可能不等于 hidden_size/num_attention_heads）
-    #[serde(default)]
     pub head_dim: Option<usize>,
 
     /// RoPE theta (base frequency)
-    #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+
+    /// RMSNorm epsilon from model config
+    pub rms_norm_eps: f32,
 }
 
 /// 模型在运行时实际使用的配置，包含所有直接和派生参数。
@@ -100,6 +96,7 @@ pub struct RuntimeModelConfig {
     pub is_shared_weight: bool,
     pub torch_dtype: String,
     pub rope_theta: f32,
+    pub rms_norm_eps: f32,
     /// tokenizer 实际的 vocab size（可能小于权重的 vocab_size）
     /// 采样时应只在 [0, tokenizer_vocab_size) 范围内进行 argmax
     pub tokenizer_vocab_size: usize,
@@ -158,6 +155,7 @@ impl RuntimeModelConfig {
             is_shared_weight,
             torch_dtype: file_config.torch_dtype.clone(),
             rope_theta: file_config.rope_theta as f32,
+            rms_norm_eps: file_config.rms_norm_eps,
             tokenizer_vocab_size: vocab_size, // 初始值等于 config 的 vocab_size，后续被 tokenizer 覆盖
             immediate_dim,
         })
