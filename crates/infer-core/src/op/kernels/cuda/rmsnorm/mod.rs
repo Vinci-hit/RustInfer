@@ -35,7 +35,7 @@ unsafe extern "C" {
 }
 
 /// RMSNorm 的 CUDA 内核包装函数
-pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config:Option<&CudaConfig>) -> Result<()> {
+pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, cuda_config:Option<&CudaConfig>) -> Result<()> {
     let dim = weight.shape()[0];
     let rows = input.num_elements() / dim;
     
@@ -65,7 +65,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
                     weight_ptr,
                     rows as i32,
                     dim as i32,
-                    1e-6, // epsilon
+                    eps,
                     stream
                 );
             }
@@ -90,7 +90,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config
                     weight_ptr,
                     rows as i32,
                     dim as i32,
-                    1e-6, // epsilon
+                    eps,
                     stream
                 );
             }
@@ -112,6 +112,7 @@ pub fn fused_add_rmsnorm(
     residual: &mut Tensor,
     input: &Tensor,
     weight: &Tensor,
+    eps: f32,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     let dim = weight.shape()[0];
@@ -131,7 +132,7 @@ pub fn fused_add_rmsnorm(
             weight_ptr,
             rows as i32,
             dim as i32,
-            1e-6,
+            eps,
             stream,
         );
     }

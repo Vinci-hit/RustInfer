@@ -4,17 +4,16 @@ use half::bf16;
 use ndarray::{ArrayView1, ArrayViewMut1};
 use ndarray_linalg::Norm;
 use rayon::prelude::*;
-const RMS_NORM_EPSILON: f32 = 1e-6;
 
 /// RMSNorm 的 CPU 内核实现，使用 ndarray 库进行高性能计算。
-pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()> {
+pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) -> Result<()> {
     // 根据数据类型自动分发到对应的实现
     match (input.dtype(), weight.dtype(), output.dtype()) {
         (crate::base::DataType::F32, crate::base::DataType::F32, crate::base::DataType::F32) => {
-            rmsnorm_f32(input, weight, output)
+            rmsnorm_f32(input, weight, output, eps)
         }
         (crate::base::DataType::BF16, crate::base::DataType::BF16, crate::base::DataType::BF16) => {
-            rmsnorm_bf16(input, weight, output)
+            rmsnorm_bf16(input, weight, output, eps)
         }
         _ => {
             // 如果输入和输出的数据类型不匹配，则返回错误
@@ -27,7 +26,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<(
 }
 
 /// F32版本的RMSNorm实现
-fn rmsnorm_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()> {
+fn rmsnorm_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) -> Result<()> {
     // --- 1. 获取 Rust slice ---
     // 类型和设备检查已在上层完成，这里可以直接 unwrap
     let input_typed = input.as_f32().unwrap();
@@ -51,7 +50,7 @@ fn rmsnorm_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<(
             let mut output_row_view = ArrayViewMut1::from(output_chunk);
             let norm = input_row_view.norm_l2();
             let rms = norm / dim_sqrt;
-            let rsqrt = (rms * rms + RMS_NORM_EPSILON).sqrt().recip();
+            let rsqrt = (rms * rms + eps).sqrt().recip();
             
             output_row_view.assign(&(&weight_view * (&input_row_view * rsqrt)));
         });
@@ -60,7 +59,7 @@ fn rmsnorm_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<(
 }
 
 /// BF16版本的RMSNorm实现
-fn rmsnorm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<()> {
+fn rmsnorm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) -> Result<()> {
     // --- 1. 获取 Rust slice ---
     let input_typed = input.as_bf16()?;
     let weight_typed = weight.as_bf16()?;
@@ -88,7 +87,7 @@ fn rmsnorm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor) -> Result<
             
             let norm = input_row_view.norm_l2();
             let rms = norm / dim_sqrt;
-            let rsqrt = (rms * rms + RMS_NORM_EPSILON).sqrt().recip();
+            let rsqrt = (rms * rms + eps).sqrt().recip();
             
             // 计算结果并转换回BF16
             let result: Vec<bf16> = input_row_view.iter()
