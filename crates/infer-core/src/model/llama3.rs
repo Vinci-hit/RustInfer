@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -6,7 +5,6 @@ use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
 use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
-use crate::cuda::CudaConfig;
 use crate::op::{Op, OpContext};
 use super::config::RuntimeModelConfig;
 use super::ModelLoader;
@@ -20,198 +18,78 @@ use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::rope::RoPEOp;
 use crate::op::swiglu::SwiGLU;
-use crate::model::{BufferType, Workspace};
-use crate::op::sampler::{Sampler, ArgmaxSampler};
+use crate::model::BufferType;
 use crate::op::scatter::Scatter;
+use crate::runtime::InferenceState;
 
-/// LlamaLayers 结构体，用于持有模型的所有算子。
+#[cfg(feature = "cuda")]
+use crate::cuda::CudaConfig;
+
+/// LlamaLayers holds all operators and weights for the model.
 pub struct LlamaLayers {
-    // ---- Token Embedding ----
     pub embedding_layer: Embedding,
-    pub rmsnorm_final_layer: RMSNorm, // 对应 model.norm.weight
-    pub cls_layer: Matmul, // 对应 lm_head.weight
+    pub rmsnorm_final_layer: RMSNorm,
+    pub cls_layer: Matmul,
 
-    // ---- Transformer Blocks (按类型组织) ----
     pub rmsnorm_attn_layers: Vec<RMSNorm>,
     pub rmsnorm_ffn_layers: Vec<RMSNorm>,
-    pub wqkv_layers: Vec<Matmul>,  // fused QKV
+    pub wqkv_layers: Vec<Matmul>,
     pub wo_layers: Vec<Matmul>,
     pub mha_layers: Vec<FlashAttnGQA>,
     pub rope_layers: Vec<RoPEOp>,
     pub add_layers: AddInplace,
     pub scatter_layer: Scatter,
-    
-    // FFN layers
-    pub w_gate_up_layers: Vec<Matmul>, // fused gate+up
-    pub w2_layers: Vec<Matmul>, // down_proj
+
+    pub w_gate_up_layers: Vec<Matmul>,
+    pub w2_layers: Vec<Matmul>,
     pub swiglu_layers: Vec<SwiGLU>,
 }
 
 impl LlamaLayers {
-    /// 将所有层和它们的权重移动到指定的 CUDA 设备。
     #[cfg(feature = "cuda")]
     pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        // ---- Token Embedding, Final Norm, and Classifier ----
         self.embedding_layer.to_cuda(device_id)?;
         self.rmsnorm_final_layer.to_cuda(device_id)?;
         self.cls_layer.to_cuda(device_id)?;
-
-        // ---- Transformer Blocks (按类型遍历) ----
-        
-        // --- RMSNorm Layers ---
-        // 为了提高可读性，我们可以用 for_each 结合闭包
-        self.rmsnorm_attn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.rmsnorm_ffn_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
-        // --- Attention Matmul Layers ---
-        self.wqkv_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.wo_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
-        // --- FFN Matmul Layers ---
-        self.w_gate_up_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.w2_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
-        // --- Non-parameterized Layers (如果它们有 to_cuda 实现) ---
-        // 这种写法等同于您参考代码中的 for 循环，但更符合 Rust 风格
-        self.mha_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-        self.rope_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
+        self.rmsnorm_attn_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.rmsnorm_ffn_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.wqkv_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.wo_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.w_gate_up_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.w2_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.mha_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        self.rope_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
         self.add_layers.to_cuda(device_id)?;
-        self.swiglu_layers.iter_mut().try_for_each(|layer| layer.to_cuda(device_id))?;
-
+        self.swiglu_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
         Ok(())
     }
 }
 
-
+/// Llama3 model — holds only static weights and configuration.
+/// Request-level mutable state lives in `InferenceState`.
 pub struct Llama3 {
-    config: RuntimeModelConfig,
-    device_type: DeviceType,
-    tokenizer: Box<dyn Tokenizer>,
-    /// 核心算子和权重容器
-    layers: LlamaLayers,
-
-    /// KV Cache
-    kv_cache: KvCache,
-    /// 工作空间，用于存放中间计算结果，避免频繁分配和释放内存
-    workspace: Workspace,
-    output_token: Tensor,
-    input_pos: Tensor,
-    sampler: Box<dyn Sampler>,
-    cuda_config: Option<CudaConfig>,
+    pub(crate) config: RuntimeModelConfig,
+    pub(crate) device_type: DeviceType,
+    pub(crate) tokenizer: Box<dyn Tokenizer>,
+    pub(crate) layers: LlamaLayers,
 }
-
-struct KvCache {
-    cache: Vec<(Tensor, Tensor)>,
-}
-impl KvCache {
-    pub fn slice_kv_cache(
-        &mut self, 
-        layer_idx: usize, 
-        start_pos: i32, 
-        len: usize,
-        kv_dim: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        // 1. 安全地获取指定层的 (Key, Value) 缓存张量的可变引用
-        let (k_cache_full, v_cache_full) = self.get_mut(layer_idx)?;
-
-        // 2. 确定 KV 缓存的形状和要切片的维度
-        // 假设您的 KV 缓存形状是 `[max_seq_len, num_heads, head_size]` 或 `[max_seq_len, hidden_dim]`
-        // 我们总是在第一个维度 (seq_len) 上进行切片。
-        let seq_len_dim_idx = 0;
-        let max_seq_len = k_cache_full.shape()[seq_len_dim_idx];
-
-        // 3. 边界检查，确保切片范围 `[start_pos, start_pos + len)` 不会越界
-        if start_pos as usize + len > max_seq_len {
-            return Err(anyhow::anyhow!(
-                "KV cache slice is out of bounds. Attempted to slice from pos {} with length {}, but max_seq_len is {}.",
-                start_pos, len, max_seq_len
-            ));
-        }
-
-
-        // 5. 调用 Tensor::slice 方法来创建零拷贝视图
-        let k_slice = k_cache_full.slice(&[start_pos as usize,0], &[len,kv_dim])?;
-        let v_slice = v_cache_full.slice(&[start_pos as usize,0], &[len,kv_dim])?;
-
-        // 6. 返回包含两个视图的元组
-        Ok((k_slice, v_slice))
-    }
-
-    fn get(&self, layer_id: usize) -> Result<(&Tensor, &Tensor)> {
-        let (k_cache, v_cache) = self.cache.get(layer_id)
-            .ok_or_else(|| anyhow::anyhow!("Layer index {} is out of bounds for KV cache with layers.", layer_id))?;
-        Ok((k_cache, v_cache))
-    }
-    fn get_mut(&mut self, layer_id: usize) -> Result<(&mut Tensor, &mut Tensor)> {
-        let (k_cache, v_cache) = self.cache.get_mut(layer_id)
-            .ok_or_else(|| anyhow::anyhow!("Layer index {} is out of bounds for KV cache with layers.", layer_id))?;
-        Ok((k_cache, v_cache))
-    }
-
-    pub fn init_kv_cache(
-        config: &RuntimeModelConfig,
-        device: &DeviceType
-    ) -> Result<Self> {
-        let cache_shape = vec![
-            config.seq_len,
-            config.kv_head_num*config.head_size
-        ];
-
-        // 如果设备是CPU，则使用F32以获得更好的精度和兼容性
-        let float_type = if device.is_cpu() {
-            DataType::F32
-        } else {
-            match config.torch_dtype.as_str() {
-                "float32" => DataType::F32,
-                "bfloat16" => DataType::BF16,
-                _ => {
-                    return Err(Error::InvalidArgument(format!(
-                        "Unsupported torch_dtype: {}", config.torch_dtype
-                    )).into());
-                }
-            }
-        };
-
-        let mut kv_cache = Vec::with_capacity(config.layer_num);
-        for _ in 0..config.layer_num {
-            // **核心变化**: 创建 bf16 类型的空张量
-            let k_cache = Tensor::new(&cache_shape, float_type, *device)?;
-            let v_cache = Tensor::new(&cache_shape, float_type, *device)?;
-
-            kv_cache.push((k_cache, v_cache));
-        }
-
-        Ok(KvCache { cache: kv_cache })
-    }
-}
-
-// 在 impl Llama3 中
 
 impl Llama3 {
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
         device_type: DeviceType,
-        is_quant_model: bool
+        is_quant_model: bool,
     ) -> Result<Self> {
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
         let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
-        let cuda_config = CudaConfig::new()?;
-
 
         let (
-            embedding_layer,
-            rmsnorm_final_layer,
-            cls_layer,
-            rmsnorm_attn_layers,
-            rmsnorm_ffn_layers,
-            wqkv_layers,
-            wo_layers,
-            w_gate_up_layers,
-            w2_layers,
+            embedding_layer, rmsnorm_final_layer, cls_layer,
+            rmsnorm_attn_layers, rmsnorm_ffn_layers,
+            wqkv_layers, wo_layers, w_gate_up_layers, w2_layers,
         ) = if !is_quant_model {
-            // === 非量化路径 (Normal Path) ===
             let layer_num = config.layer_num;
             let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
             let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
@@ -231,408 +109,130 @@ impl Llama3 {
 
             let embedding_layer = Self::load_embedding("model.embed_tokens.weight", &loader, device_type)?;
             let rmsnorm_final_layer = Self::load_rmsnorm("model.norm.weight", &loader, device_type)?;
-            // 通常是通过检查 `lm_head.weight` 是否存在来隐式判断的。
             let cls_layer = if tensor_names.contains("lm_head.weight") {
-                // --- 情况 B：权重是独立的 ---
                 Self::load_matmul("lm_head.weight", &loader, device_type)?
-
             } else {
-                // --- 情况 A：权重是共享/绑定的 (Tied Weights) ---
                 Matmul::from(embedding_layer.weight.clone(), None)
             };
 
-            (
-                embedding_layer,
-                rmsnorm_final_layer,
-                cls_layer,
-                rmsnorm_attn_layers,
-                rmsnorm_ffn_layers,
-                wqkv_layers,
-                wo_layers,
-                w_gate_up_layers,
-                w2_layers,
-            )
+            (embedding_layer, rmsnorm_final_layer, cls_layer,
+             rmsnorm_attn_layers, rmsnorm_ffn_layers,
+             wqkv_layers, wo_layers, w_gate_up_layers, w2_layers)
         } else {
-            // === 量化路径 (Quantized Path) ===
             return Err(Error::InvalidArgument("Quantized models are not yet supported.".to_string()).into());
         };
 
-
         let layer_num = config.layer_num;
         let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
-            .map(|_| {
-                FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size)
-            })
+            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size))
             .collect();
-        let mha_layers = mha_layers?; 
+        let mha_layers = mha_layers?;
         let rope_layers: Result<Vec<RoPEOp>> = (0..layer_num)
             .map(|_| RoPEOp::new(config.dim, config.kv_dim, config.head_size))
             .collect();
         let rope_layers = rope_layers?;
-        let add_layers = AddInplace::new(); 
-        let swiglu_layers:Vec<SwiGLU> = (0..layer_num).map(|_| SwiGLU::new()).collect();
+        let add_layers = AddInplace::new();
+        let swiglu_layers: Vec<SwiGLU> = (0..layer_num).map(|_| SwiGLU::new()).collect();
 
-        // 在 Rust 中，许多检查是隐式的。`load_*` 函数返回 Result，如果失败 `?` 会立即返回错误。
-        // 但我们可以添加对集合长度的显式检查，这是一种很好的防御性编程。
         if rmsnorm_attn_layers.len() != layer_num || rmsnorm_ffn_layers.len() != layer_num {
-             return Err(InternalError("Incorrect number of RMSNorm layers created.".to_string()).into());
+            return Err(InternalError("Incorrect number of RMSNorm layers.".to_string()).into());
         }
-
         if wqkv_layers.len() != layer_num || wo_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of attention Matmul layers created.".to_string()).into());
+            return Err(InternalError("Incorrect number of attention Matmul layers.".to_string()).into());
         }
-
         if w_gate_up_layers.len() != layer_num || w2_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of FFN Matmul layers created.".to_string()).into());
+            return Err(InternalError("Incorrect number of FFN Matmul layers.".to_string()).into());
         }
-        // 对于无参数算子，`.collect()` 保证了长度，但检查一下也无妨。
-        if mha_layers.len() != layer_num || rope_layers.len() != layer_num ||
-           swiglu_layers.len() != layer_num{
-            return Err(InternalError("Incorrect number of non-parameterized layers created.".to_string()).into());
+        if mha_layers.len() != layer_num || rope_layers.len() != layer_num || swiglu_layers.len() != layer_num {
+            return Err(InternalError("Incorrect number of non-parameterized layers.".to_string()).into());
         }
 
-        // --- 组装 LlamaLayers ---
         let layers = LlamaLayers {
-            embedding_layer,
-            rmsnorm_final_layer,
-            cls_layer,
-            rmsnorm_attn_layers,
-            rmsnorm_ffn_layers,
-            wqkv_layers,
-            wo_layers,
-            mha_layers,
-            rope_layers,
-            add_layers,
-            scatter_layer: Scatter::new(),
-            w_gate_up_layers,
-            w2_layers,
-            swiglu_layers,
+            embedding_layer, rmsnorm_final_layer, cls_layer,
+            rmsnorm_attn_layers, rmsnorm_ffn_layers,
+            wqkv_layers, wo_layers, mha_layers, rope_layers,
+            add_layers, scatter_layer: Scatter::new(),
+            w_gate_up_layers, w2_layers, swiglu_layers,
         };
-        
-        let kv_cache = KvCache::init_kv_cache(&config, &device_type)?;
-        
-        // --- 初始化工作区 (这是新添加的部分) ---
-        let workspace = Self::init_workspace(&config, &device_type)?;
-        let sampler = Box::new(ArgmaxSampler::new(device_type));
-        let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
-        let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
-        let mut model = Self { config, device_type, tokenizer, layers, kv_cache, workspace, sampler, cuda_config: Some(cuda_config), output_token, input_pos};
-        Self::calculate_rope_cache(&model.config, &mut model.workspace)?;
-        Ok(model)
+
+        Ok(Self { config, device_type, tokenizer, layers })
     }
 
-    fn calculate_rope_cache(
-        config: &RuntimeModelConfig,
-        workspace: &mut Workspace,
-    ) -> Result<()> {
-        // 从工作区获取 sin 和 cos 缓存张量的可变引用
-        // 注意：这里我们同时借用两个可变的元素，这在 Rust 中是安全的，
-        // 因为 HashMap::get_mut 每次只返回一个元素的生命周期。
-        // 为了避免借用冲突，我们分开获取。
-        let caches = workspace.get_disjoint_mut([
-            &BufferType::SinCache,
-            &BufferType::CosCache,
-        ]);
-
-        // 使用 if let 来安全地解构元组
-        if let [Some(sin_cache), Some(cos_cache)] = caches {
-            // ---- 成功获取了两个可变的张量，现在可以安全地使用它们 ----
-            match sin_cache.device() {
-                DeviceType::Cpu => {
-                    crate::op::kernels::cpu::rope_sin_cos_cache_calc(
-                        config.head_size,
-                        config.seq_len,
-                        config.rope_theta,
-                        sin_cache, // 直接传递 &mut Tensor
-                        cos_cache, // 直接传递 &mut Tensor
-                    )?;
-                }
-                #[cfg(feature = "cuda")]
-                DeviceType::Cuda(_) => {
-                    let stream = crate::cuda::config::CudaConfig::new()?;
-                    crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
-                        config.head_size,
-                        config.seq_len,
-                        config.rope_theta,
-                        sin_cache, // 直接传递 &mut Tensor
-                        cos_cache, // 直接传递 &mut Tensor
-                        Some(&stream),
-                    )?;
-                }
-            }
-            Ok(())
-        } else {
-            // 如果有一个或多个键不存在，返回错误
-            Err(Error::InternalError("SinCache or CosCache not found in workspace".to_string()).into())
-        }
+    /// Create a new InferenceState for this model.
+    pub fn create_state(&self) -> Result<InferenceState> {
+        InferenceState::new(&self.config, self.device_type)
     }
 
-    /// 预分配前向传播所需的所有中间张量。
-    fn init_workspace(
-        config: &RuntimeModelConfig,
-        device: &DeviceType
-    ) -> Result<Workspace> {
-        let mut buffers = HashMap::new();
+    // ---- Weight loading helpers ----
 
-        let float_dtype = if device.is_cpu() {
-            DataType::F32
-        } else {
-            match config.torch_dtype.as_str() {
-                "float32" => DataType::F32,
-                "bfloat16" => DataType::BF16,
-                _ => {
-                    return Err(Error::InvalidArgument(format!(
-                        "Unsupported torch_dtype: {}", config.torch_dtype
-                    )).into());
-                }
-            }
-        };
-        let int_dtype = DataType::I32;
-        
-        // 为了支持批处理，许多缓冲区的大小需要基于 max_seq_len
-        let max_seq_len = config.seq_len;
-
-        // ---- 分配缓冲区 ----
-
-        // 1. 输入张量
-        // InputTokens 需要足够大以容纳整个批处理的 prompt
-        buffers.insert(
-            BufferType::InputTokens,
-            Tensor::new(&[max_seq_len], int_dtype, *device)?, // << 尺寸变更为 device
-        );
-        buffers.insert(
-            BufferType::InputPos,
-            Tensor::new(&[1], int_dtype, DeviceType::Cpu)?,
-        );
-
-        // 2. 词嵌入层的输出 (现在是批处理形状)
-        buffers.insert(
-            BufferType::InputEmbeddings,
-            Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
-        );
-        
-        // 3. RoPE 缓存 (形状不变)
-        buffers.insert(
-            BufferType::SinCache,
-            Tensor::new(&[max_seq_len, config.head_size], float_dtype, *device)?,
-        );
-        buffers.insert(
-            BufferType::CosCache,
-            Tensor::new(&[max_seq_len, config.head_size], float_dtype, *device)?,
-        );
-        
-        // 4. 关键的、可复用的缓冲区 (现在是批处理形状)
-        // 这个缓冲区将被 RMSNorm, MHA output 等轮流使用
-        buffers.insert(
-            BufferType::RmsOutput,
-            Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
-        );
-
-        // 5. Query 缓冲区 (批处理形状)
-        buffers.insert(
-            BufferType::Query,
-            Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
-        );
-        
-        // 6. FFN (SwiGLU) 的输入缓冲区 (批处理形状)
-        buffers.insert(
-            BufferType::W1Output,
-            Tensor::new(&[max_seq_len, config.intermediate_size], float_dtype, *device)?,
-        );
-        buffers.insert(
-            BufferType::W3Output,
-            Tensor::new(&[max_seq_len, config.intermediate_size], float_dtype, *device)?,
-        );
-        
-        // 7. Attention scores (QK^T) 的缓冲区 (批处理形状)
-        buffers.insert(
-            BufferType::AttnScores,
-            Tensor::new(&[config.head_num, max_seq_len, max_seq_len], float_dtype, *device)?,
-        );
-
-        // ======================= 新增的缓冲区 =======================
-        // 8. 用于 forward_batch 的临时 K 和 V 缓冲区
-        // 它们的形状与 Q 类似，都是 [max_seq_len, dim]
-        buffers.insert(
-            BufferType::KeyCache, // 临时 K 缓冲区
-            Tensor::new(&[max_seq_len, config.kv_dim], float_dtype, *device)?,
-        );
-        buffers.insert(
-            BufferType::ValueCache, // 临时 V 缓冲区
-            Tensor::new(&[max_seq_len, config.kv_dim], float_dtype, *device)?,
-        );
-
-        buffers.insert(
-            BufferType::IntermediateBuffer1,
-            Tensor::new(&[max_seq_len, config.dim], float_dtype, *device)?,
-        );
-
-        // Fused GEMM output buffers
-        buffers.insert(
-            BufferType::QkvOutput,
-            Tensor::new(&[max_seq_len, config.q_dim + 2 * config.kv_dim], float_dtype, *device)?,
-        );
-        buffers.insert(
-            BufferType::GateUpOutput,
-            Tensor::new(&[max_seq_len, 2 * config.intermediate_size], float_dtype, *device)?,
-        );
-        // ==========================================================
-        
-        // 10. 模型的最终 logits 输出 (用于单 token)
-        let forward_output = Tensor::new(&[config.vocab_size], float_dtype, *device)?;
-        buffers.insert(BufferType::ForwardOutput, forward_output);
-
-        Ok(buffers)
-    }
-
-    // --- 创建一系列辅助加载函数，提高代码可读性 ---
     fn load_matmul(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Matmul> {
         let tensor_view = loader.get_tensor(name)?;
         let weight = Tensor::from_view_on_cpu(&tensor_view)?;
-        
-        // 如果目标设备是CPU，则将权重转换为F32
-        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-        
-        let weight_on_device = weight_converted.to_device(device)?;
-
-        Ok(Matmul::from(weight_on_device, None))
+        let weight = if device.is_cpu() && weight.dtype() != DataType::F32 { weight.to_dtype(DataType::F32)? } else { weight };
+        Ok(Matmul::from(weight.to_device(device)?, None))
     }
 
-    /// Load q_proj, k_proj, v_proj weights and concat into fused [q_dim + 2*kv_dim, dim]
     fn load_fused_qkv(
-        layer_idx: usize,
-        loader: &ModelLoader,
-        device: DeviceType,
-        q_dim: usize,
-        kv_dim: usize,
-        dim: usize,
+        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
+        q_dim: usize, kv_dim: usize, dim: usize,
     ) -> Result<Matmul> {
-        let wq_view = loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))?;
-        let wk_view = loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx))?;
-        let wv_view = loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx))?;
+        let wq = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))?)?;
+        let wk = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx))?)?;
+        let wv = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx))?)?;
 
-        let wq = Tensor::from_view_on_cpu(&wq_view)?;
-        let wk = Tensor::from_view_on_cpu(&wk_view)?;
-        let wv = Tensor::from_view_on_cpu(&wv_view)?;
-
-        // Determine dtype (BF16 for GPU, F32 for CPU)
         let dtype = wq.dtype();
         let fused_rows = q_dim + 2 * kv_dim;
         let mut fused = Tensor::new(&[fused_rows, dim], dtype, DeviceType::Cpu)?;
-
-        // Copy weight data: [Wq; Wk; Wv] along rows
         let elem_size = dtype.size_in_bytes();
-        let wq_bytes = q_dim * dim * elem_size;
-        let wk_bytes = kv_dim * dim * elem_size;
-        let wv_bytes = kv_dim * dim * elem_size;
-
+        let (wq_bytes, wk_bytes, wv_bytes) = (q_dim * dim * elem_size, kv_dim * dim * elem_size, kv_dim * dim * elem_size);
         let fused_ptr = fused.buffer_mut().as_mut_ptr();
-        let wq_ptr = wq.buffer().as_ptr();
-        let wk_ptr = wk.buffer().as_ptr();
-        let wv_ptr = wv.buffer().as_ptr();
-        // SAFETY: All pointers are valid and non-overlapping. Sizes are checked above.
         unsafe {
-            std::ptr::copy_nonoverlapping(wq_ptr, fused_ptr, wq_bytes);
-            std::ptr::copy_nonoverlapping(wk_ptr, fused_ptr.add(wq_bytes), wk_bytes);
-            std::ptr::copy_nonoverlapping(wv_ptr, fused_ptr.add(wq_bytes + wk_bytes), wv_bytes);
+            std::ptr::copy_nonoverlapping(wq.buffer().as_ptr(), fused_ptr, wq_bytes);
+            std::ptr::copy_nonoverlapping(wk.buffer().as_ptr(), fused_ptr.add(wq_bytes), wk_bytes);
+            std::ptr::copy_nonoverlapping(wv.buffer().as_ptr(), fused_ptr.add(wq_bytes + wk_bytes), wv_bytes);
         }
-
-        let fused_converted = if device.is_cpu() && dtype != DataType::F32 {
-            fused.to_dtype(DataType::F32)?
-        } else {
-            fused
-        };
-        let fused_on_device = fused_converted.to_device(device)?;
-        Ok(Matmul::from(fused_on_device, None))
+        let fused = if device.is_cpu() && dtype != DataType::F32 { fused.to_dtype(DataType::F32)? } else { fused };
+        Ok(Matmul::from(fused.to_device(device)?, None))
     }
 
-    /// Load gate_proj, up_proj weights and concat into fused [2*intermediate_size, dim]
     fn load_fused_gate_up(
-        layer_idx: usize,
-        loader: &ModelLoader,
-        device: DeviceType,
-        intermediate_size: usize,
-        dim: usize,
+        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
+        intermediate_size: usize, dim: usize,
     ) -> Result<Matmul> {
-        let w1_view = loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))?;
-        let w3_view = loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))?;
-
-        let w1 = Tensor::from_view_on_cpu(&w1_view)?;
-        let w3 = Tensor::from_view_on_cpu(&w3_view)?;
+        let w1 = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))?)?;
+        let w3 = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))?)?;
 
         let dtype = w1.dtype();
         let fused_rows = 2 * intermediate_size;
         let mut fused = Tensor::new(&[fused_rows, dim], dtype, DeviceType::Cpu)?;
-
         let elem_size = dtype.size_in_bytes();
-        let w1_bytes = intermediate_size * dim * elem_size;
-        let w3_bytes = intermediate_size * dim * elem_size;
-
+        let (w1_bytes, w3_bytes) = (intermediate_size * dim * elem_size, intermediate_size * dim * elem_size);
         let fused_ptr = fused.buffer_mut().as_mut_ptr();
-        let w1_ptr = w1.buffer().as_ptr();
-        let w3_ptr = w3.buffer().as_ptr();
-        // SAFETY: All pointers are valid and non-overlapping. Sizes are checked above.
         unsafe {
-            std::ptr::copy_nonoverlapping(w1_ptr, fused_ptr, w1_bytes);
-            std::ptr::copy_nonoverlapping(w3_ptr, fused_ptr.add(w1_bytes), w3_bytes);
+            std::ptr::copy_nonoverlapping(w1.buffer().as_ptr(), fused_ptr, w1_bytes);
+            std::ptr::copy_nonoverlapping(w3.buffer().as_ptr(), fused_ptr.add(w1_bytes), w3_bytes);
         }
-
-        let fused_converted = if device.is_cpu() && dtype != DataType::F32 {
-            fused.to_dtype(DataType::F32)?
-        } else {
-            fused
-        };
-        let fused_on_device = fused_converted.to_device(device)?;
-        Ok(Matmul::from(fused_on_device, None))
+        let fused = if device.is_cpu() && dtype != DataType::F32 { fused.to_dtype(DataType::F32)? } else { fused };
+        Ok(Matmul::from(fused.to_device(device)?, None))
     }
+
     fn load_rmsnorm(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<RMSNorm> {
-        let tensor_view = loader.get_tensor(name)?;
-        
-        // 1. 在 CPU 上加载 bf16/f32 权重
-        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
-
-        // 如果目标设备是CPU，则将权重转换为F32
-        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-
-        // 2. 直接将权重移动到目标设备，不进行类型转换
-        let weight_on_device = weight_converted.to_device(device)?;
-
-        // RMSNorm::from 接收一个最终的、位于正确设备和类型的权重
-        Ok(RMSNorm::from(weight_on_device))
+        let weight = Tensor::from_view_on_cpu(&loader.get_tensor(name)?)?;
+        let weight = if device.is_cpu() && weight.dtype() != DataType::F32 { weight.to_dtype(DataType::F32)? } else { weight };
+        Ok(RMSNorm::from(weight.to_device(device)?))
     }
 
     fn load_embedding(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Embedding> {
-        let tensor_view = loader.get_tensor(name)?;
-
-        // 1. 在 CPU 上加载 bf16 权重
-        let weight = Tensor::from_view_on_cpu(&tensor_view)?;
-        
-        // 如果目标设备是CPU，则将权重转换为F32
-        let weight_converted = if device.is_cpu() && weight.dtype() != DataType::F32 {
-
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-
-        let weight_on_device = weight_converted.to_device(device)?;
-        
-        Ok(Embedding::from(weight_on_device))
+        let weight = Tensor::from_view_on_cpu(&loader.get_tensor(name)?)?;
+        let weight = if device.is_cpu() && weight.dtype() != DataType::F32 { weight.to_dtype(DataType::F32)? } else { weight };
+        Ok(Embedding::from(weight.to_device(device)?))
     }
 
+    // ---- Inference methods (&self + &mut InferenceState) ----
 
     pub fn generate(
-        &mut self,
+        &self,
+        state: &mut InferenceState,
         prompt: &str,
         max_tokens: usize,
         print_output: bool,
@@ -643,7 +243,7 @@ impl Llama3 {
             println!("Prompt: {}", prompt);
             stdout.flush()?;
         }
-        
+
         let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
         input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
         let prompt_tokens = self.tokenizer.encode(prompt)?;
@@ -652,35 +252,31 @@ impl Llama3 {
         }
         let mut input_tokens_cpu = Tensor::new(&[prompt_tokens.len()], DataType::I32, DeviceType::Cpu)?;
         input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
-        // Prefill stage - fill KV cache
-        let prefill_start = Instant::now();
-        let mut current_token = self.forward_prefill(&input_tokens_cpu, &input_pos, prompt_tokens.len())?;
-        let prefill_duration = prefill_start.elapsed();
-        let prefill_ms = prefill_duration.as_millis() as u64;
 
-        // Generation stage
+        // Prefill
+        let prefill_start = Instant::now();
+        let mut current_token = self.forward_prefill(state, &input_tokens_cpu, &input_pos, prompt_tokens.len())?;
+        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
+
         let mut generated_tokens = vec![current_token];
         let mut printed_len = 0usize;
-
         if print_output {
             let decoded = self.tokenizer.decode(&generated_tokens)?;
-            let _ = write!(stdout,"{}", &decoded[printed_len..]);
+            let _ = write!(stdout, "{}", &decoded[printed_len..]);
             printed_len = decoded.len();
             stdout.flush()?;
         }
 
-        // Generate tokens starting from the end of the prompt
+        // Decode
         let decode_start = Instant::now();
         let mut decode_iterations = 0;
         let mut input_tokens_cpu = input_tokens_cpu.slice(&[0], &[1])?;
         for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
             input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
             input_tokens_cpu.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = self.forward_decoding(&input_tokens_cpu, &input_pos)?;
+            let next_token = self.forward_decoding(state, &input_tokens_cpu, &input_pos)?;
 
-            if self.tokenizer.is_eos(next_token) {
-                break;
-            }
+            if self.tokenizer.is_eos(next_token) { break; }
 
             generated_tokens.push(next_token);
             current_token = next_token;
@@ -691,109 +287,90 @@ impl Llama3 {
                 if decoded.len() > printed_len {
                     let new_text = &decoded[printed_len..];
                     if !new_text.contains('\u{FFFD}') {
-                        let _ = write!(stdout,"{}", new_text);
+                        let _ = write!(stdout, "{}", new_text);
                         printed_len = decoded.len();
                         stdout.flush()?;
                     }
                 }
             }
         }
-        let decode_duration = decode_start.elapsed();
-        let decode_ms = decode_duration.as_millis() as u64;
-
-        // 最后输出换行并刷新（可选，让终端提示符回到新行）
-        if print_output {
-            println!();
-        }
+        let decode_ms = decode_start.elapsed().as_millis() as u64;
+        if print_output { println!(); }
 
         let generated_text = self.tokenizer.decode(&generated_tokens)?;
         Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
-    fn forward_decoding(&mut self, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
-        self.input_pos.copy_from(pos_cpu)?;
-        let input_tokens_view = &self.output_token;
 
-        // CUDA Graph 逻辑仅在 CUDA 设备上启用
+    fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
+        state.input_pos.copy_from(pos_cpu)?;
+        let input_tokens_view = &state.output_token;
+
+        // CUDA Graph
+        #[cfg(feature = "cuda")]
         if self.device_type.is_cuda() {
-            let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if config.cuda_graph.is_none(){
-                config.capture_graph_begin()?;
-            }else{
-                config.launch_graph()?;
-                config.sync_stream()?;
-                let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-                return Ok(next_token);
+            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
+            if cfg.cuda_graph.is_none() {
+                cfg.capture_graph_begin()?;
+            } else {
+                cfg.launch_graph()?;
+                cfg.sync_stream()?;
+                return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
             }
         }
 
-        let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
-        // Token embedding
-        let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+        #[cfg(feature = "cuda")]
+        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
+        #[cfg(not(feature = "cuda"))]
+        let cuda_config_ref: Option<&CudaConfig> = None;
+
+        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.embedding_layer.forward(
-            &mut OpContext::new(&[input_tokens_view], &mut [&mut x], cuda_config_ref)
-        )?;
-        // Process all transformer layers
+        self.layers.embedding_layer.forward(&mut OpContext::new(&[input_tokens_view], &mut [&mut x], cuda_config_ref))?;
+
         for i in 0..self.config.layer_num {
-            let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            // Layer 0: compute attn_norm normally
-            // Layer 1+: attn_norm already computed by previous layer's fused_add_rmsnorm (on CUDA)
             #[cfg(feature = "cuda")]
             if i == 0 || !self.device_type.is_cuda() {
                 self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
             }
             #[cfg(not(feature = "cuda"))]
-            {
-                self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
-            }
+            { self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?; }
 
-            // Fused QKV GEMM
             let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = self.workspace.get_mut(&BufferType::QkvOutput).unwrap();
+            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
             self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
 
-            // Zero-copy slice: seq_len=1, contiguous memory
             let mut q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
             let mut k = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
             let v = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[1, self.config.kv_dim])?;
-            let (k_cache_full, v_cache_full) = self.kv_cache.get_mut(i)?;
+            let (k_cache_full, v_cache_full) = state.kv_cache.get_mut(i)?;
 
-            let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
+            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
+            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
+            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&state.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
 
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
-            // Fused scatter: write K and V to cache in a single kernel launch
             #[cfg(feature = "cuda")]
             if self.device_type.is_cuda() {
-                crate::op::kernels::cuda::scatter_kv(
-                    k_cache_full, &k,
-                    v_cache_full, &v,
-                    &self.input_pos, cuda_config_ref,
-                )?;
+                crate::op::kernels::cuda::scatter_kv(k_cache_full, &k, v_cache_full, &v, &state.input_pos, cuda_config_ref)?;
             }
             #[cfg(not(feature = "cuda"))]
             {
-                self.layers.scatter_layer.forward(&mut OpContext::new(&[&k, &self.input_pos], &mut [k_cache_full], cuda_config_ref))?;
-                self.layers.scatter_layer.forward(&mut OpContext::new(&[&v, &self.input_pos], &mut [v_cache_full], cuda_config_ref))?;
+                self.layers.scatter_layer.forward(&mut OpContext::new(&[&k, &state.input_pos], &mut [k_cache_full], cuda_config_ref))?;
+                self.layers.scatter_layer.forward(&mut OpContext::new(&[&v, &state.input_pos], &mut [v_cache_full], cuda_config_ref))?;
             }
-            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out; // Reuse buffer
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, &self.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
-            let mut wo_out = q; // Reuse buffer
+
+            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
+            let mut attn_out = attn_norm_out;
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, &state.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
+            let mut wo_out = q;
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
-            // Fused: x += wo_out; ffn_norm_out = rmsnorm(x, ffn_weight)
-            let mut ffn_norm_out = attn_out; // Reuse buffer
+
+            let mut ffn_norm_out = attn_out;
             #[cfg(feature = "cuda")]
             if self.device_type.is_cuda() {
-                crate::op::kernels::cuda::fused_add_rmsnorm(
-                    &mut ffn_norm_out,
-                    &mut x,
-                    &wo_out,
-                    &self.layers.rmsnorm_ffn_layers[i].weight,
-                    cuda_config_ref,
-                )?;
+                crate::op::kernels::cuda::fused_add_rmsnorm(&mut ffn_norm_out, &mut x, &wo_out, &self.layers.rmsnorm_ffn_layers[i].weight, cuda_config_ref)?;
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -801,105 +378,82 @@ impl Llama3 {
                 self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
             }
 
-            // Fused Gate-Up GEMM
             let inter = self.config.intermediate_size;
-            let gu_buffer = self.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
+            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[1, 2 * inter])?;
             self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
-            // Zero-copy slice
             let mut w1_out = gate_up.slice(&[0, 0], &[1, inter])?;
             let w3_out = gate_up.slice(&[0, inter], &[1, inter])?;
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
 
-            let mut w2_out = ffn_norm_out; // Reuse buffer
+            let mut w2_out = ffn_norm_out;
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
-            // Fused: x += w2_out; next_norm = rmsnorm(x, next_weight)
+
             #[cfg(feature = "cuda")]
             if self.device_type.is_cuda() {
                 if i + 1 < self.config.layer_num {
-                    let next_norm_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-                    let mut next_attn_norm_out = next_norm_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::cuda::fused_add_rmsnorm(
-                        &mut next_attn_norm_out, &mut x, &w2_out,
-                        &self.layers.rmsnorm_attn_layers[i + 1].weight, cuda_config_ref,
-                    )?;
+                    let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+                    let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
+                    crate::op::kernels::cuda::fused_add_rmsnorm(&mut next_out, &mut x, &w2_out, &self.layers.rmsnorm_attn_layers[i + 1].weight, cuda_config_ref)?;
                 } else {
-                    let final_norm_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-                    let mut final_norm_out = final_norm_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::cuda::fused_add_rmsnorm(
-                        &mut final_norm_out, &mut x, &w2_out,
-                        &self.layers.rmsnorm_final_layer.weight, cuda_config_ref,
-                    )?;
+                    let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+                    let mut final_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
+                    crate::op::kernels::cuda::fused_add_rmsnorm(&mut final_out, &mut x, &w2_out, &self.layers.rmsnorm_final_layer.weight, cuda_config_ref)?;
                 }
             }
             #[cfg(not(feature = "cuda"))]
-            {
-                self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
-            }
-
+            { self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?; }
         }
 
-        // For CUDA: final_norm already computed in fused kernel above
-        // For CPU: compute final_norm separately
-        let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+        let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         #[cfg(not(feature = "cuda"))]
-        {
-            self.layers.rmsnorm_final_layer.forward(
-                &mut OpContext::new(&[&x], &mut [&mut final_norm_out], cuda_config_ref)
-            )?;
-        }
+        { self.layers.rmsnorm_final_layer.forward(&mut OpContext::new(&[&x], &mut [&mut final_norm_out], cuda_config_ref))?; }
 
-        let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-
-        self.layers.cls_layer.forward(
-            &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
-        )?;
-        let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
+        self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+        let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-        self.sampler.sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
+        state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
 
-        // CUDA Graph: 结束捕获（仅 CUDA 设备）
+        #[cfg(feature = "cuda")]
         if self.device_type.is_cuda() {
-            let config = self.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if config.cuda_graph.is_none(){
-                config.capture_graph_end()?;
-            }
+            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
+            if cfg.cuda_graph.is_none() { cfg.capture_graph_end()?; }
         }
 
-        let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
-        Ok(next_token)
+        Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
     }
 
-    fn forward_prefill(&mut self, tokens: &Tensor, pos_cpu: &Tensor, seq_len:usize) -> Result<i32> {
+    fn forward_prefill(&self, state: &mut InferenceState, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
         let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
-        let cuda_config_ref = if self.device_type.is_cuda() { self.cuda_config.as_ref() } else { None };
-        self.input_pos.copy_from(pos_cpu)?;
-        // Prepare batch input tokens
-        let input_tokens_buffer = self.workspace.get_mut(&BufferType::InputTokens).unwrap();
+
+        #[cfg(feature = "cuda")]
+        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
+        #[cfg(not(feature = "cuda"))]
+        let cuda_config_ref: Option<&CudaConfig> = None;
+
+        state.input_pos.copy_from(pos_cpu)?;
+
+        let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
         input_tokens_view.copy_from(tokens)?;
 
-        // Token embedding
-        let x_buffer = self.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-        self.layers.embedding_layer.forward(
-            &mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref)
-        )?;
-        // Process all transformer layers
+        self.layers.embedding_layer.forward(&mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref))?;
+
         for i in 0..self.config.layer_num {
-            // Attention Block
-            let attn_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
             self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
-            
-            let q_buffer = self.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            let (mut k, mut v) = self.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
 
-            // Fused QKV GEMM
+            let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
+            let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
+
             let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = self.workspace.get_mut(&BufferType::QkvOutput).unwrap();
+            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
             self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
 
@@ -912,34 +466,32 @@ impl Llama3 {
             }
             #[cfg(not(feature = "cuda"))]
             {
-                // CPU fallback: use copy_from with slices
-                let q_view = qkv.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-                q.copy_from(&q_view)?;
-                let k_view = qkv.slice(&[0, self.config.q_dim], &[seq_len, self.config.kv_dim])?;
-                k.copy_from(&k_view)?;
-                let v_view = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[seq_len, self.config.kv_dim])?;
-                v.copy_from(&v_view)?;
+                q.copy_from(&qkv.slice(&[0, 0], &[seq_len, self.config.q_dim])?)?;
+                k.copy_from(&qkv.slice(&[0, self.config.q_dim], &[seq_len, self.config.kv_dim])?)?;
+                v.copy_from(&qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[seq_len, self.config.kv_dim])?)?;
             }
-            let sin_cache = self.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = self.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&self.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
-            let (k_cache_history, v_cache_history) = self.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out; // Reuse buffer
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_cache_history, v_cache_history, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
-            let mut wo_out = q; // Reuse buffer
+
+            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
+            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
+            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&state.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
+
+            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
+            let mut attn_out = attn_norm_out;
+            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
+            let mut wo_out = q;
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
-            // FFN Block
-            let mut ffn_norm_out = attn_out; // Reuse buffer
+
+            // FFN
+            let mut ffn_norm_out = attn_out;
             self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
-            let w1_buffer = self.workspace.get_mut(&BufferType::W1Output).unwrap();
+            let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
             let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
-            let w3_buffer = self.workspace.get_mut(&BufferType::W3Output).unwrap();
+            let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
             let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
 
-            // Fused Gate-Up GEMM
             let inter = self.config.intermediate_size;
-            let gu_buffer = self.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
+            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
             self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
 
@@ -951,232 +503,97 @@ impl Llama3 {
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let g_view = gate_up.slice(&[0, 0], &[seq_len, inter])?;
-                w1_out.copy_from(&g_view)?;
-                let u_view = gate_up.slice(&[0, inter], &[seq_len, inter])?;
-                w3_out.copy_from(&u_view)?;
+                w1_out.copy_from(&gate_up.slice(&[0, 0], &[seq_len, inter])?)?;
+                w3_out.copy_from(&gate_up.slice(&[0, inter], &[seq_len, inter])?)?;
             }
             self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
 
-            let mut w2_out = ffn_norm_out; // Reuse buffer
+            let mut w2_out = ffn_norm_out;
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
             self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
         }
-        // Extract last token's hidden state
-        let last_hidden_state_view = x.slice(&[seq_len - 1, 0], &[1, self.config.dim])?;
-        
-        // Prepare for final norm and classifier
-        let final_norm_input_buffer = self.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-        let mut final_norm_input = final_norm_input_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        final_norm_input.copy_from(&last_hidden_state_view)?;
-        
-        // Final Norm and classifier
-        let final_norm_out_buffer = self.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+
+        // Extract last token
+        let last_hidden = x.slice(&[seq_len - 1, 0], &[1, self.config.dim])?;
+        let buf = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
+        let mut final_norm_input = buf.slice(&[0, 0], &[1, self.config.dim])?;
+        final_norm_input.copy_from(&last_hidden)?;
+
+        let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
+        self.layers.rmsnorm_final_layer.forward(&mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref))?;
 
-        self.layers.rmsnorm_final_layer.forward(
-            &mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref)
-        )?;
-        
-        let logits = self.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        
-        self.layers.cls_layer.forward(
-            &mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref)
-        )?;
-        let logits_full = self.workspace.get(&BufferType::ForwardOutput).unwrap();
+        let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
+        self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+        let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-        self.sampler.sample(&logits_ref, &mut self.output_token, cuda_config_ref)?;
-        let next_token = self.output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+        state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
 
-        Ok(next_token)
-    }
-
-    pub fn get_buffer(&self, buffer_type: BufferType) -> Result<&Tensor> {
-        self.workspace.get(&buffer_type).ok_or_else(|| {
-            Error::InternalError(format!(
-                "Buffer {:?} not found in workspace.",
-                buffer_type
-            )).into()
-        })
-    }
-
-    pub fn get_buffer_mut(&mut self, buffer_type: BufferType) -> Result<&mut Tensor> {
-        self.workspace.get_mut(&buffer_type).ok_or_else(|| {
-            Error::InternalError(format!(
-                "Mutable buffer {:?} not found in workspace.",
-                buffer_type
-            )).into()
-        })
+        Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
     }
 }
 
 // ============================================================================
-//  集成测试 (Integration Tests)
+//  Tests
 // ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
     use crate::base::error::Result;
 
-    /// 辅助函数：执行生成并返回 (生成的文本, 耗时(毫秒), 生成的Token数)
     fn generate_and_measure(
-        model: &mut Llama3,
-        prompt: &str,
-        max_tokens: usize,
-        verbose: bool
+        model: &Llama3, state: &mut InferenceState,
+        prompt: &str, max_tokens: usize, verbose: bool,
     ) -> Result<(String, u64, u32, u64, u64, usize)> {
-        
-        let start_time = Instant::now();
-        let (generated_text, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = model.generate(prompt, max_tokens, verbose)?;
-        let duration = start_time.elapsed();
-        let duration_ms = duration.as_millis() as u64;
-        
-        Ok((generated_text, duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations))
+        let start = Instant::now();
+        let (text, n_tok, prefill_ms, decode_ms, decode_iter) = model.generate(state, prompt, max_tokens, verbose)?;
+        Ok((text, start.elapsed().as_millis() as u64, n_tok, prefill_ms, decode_ms, decode_iter))
     }
 
     #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
+    #[ignore = "Long running test"]
     fn test_llama3_cpu_loading_and_generation() -> Result<()> {
-        // --- 1. Arrange (准备) ---
         let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Dummy model directory not found.");
+        assert!(model_path.exists(), "Model not found.");
 
-        println!("Loading model on CPU...");
-        let mut model = Llama3::new(
-            model_path,
-            DeviceType::Cpu,
-            false // is_quant_model
-        )?;
-        println!("Model loaded.");
+        let model = Llama3::new(model_path, DeviceType::Cpu, false)?;
+        let mut state = model.create_state()?;
 
-        // --- 2. Act (执行) ---
-        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 150, false)?;
+        assert!(n_tok > 0, "No tokens generated.");
 
-Cutting Knowledge Date: December 2023
-Today Date: 14 Dec 2025
-
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let max_tokens = 150;
-        
-        println!("Starting CPU generation...");
-        let (_, _duration_ms, num_generated_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model, prompt, max_tokens, false)?;
-        
-        // --- 3. Assert & Report (断言 & 报告) ---
-        assert!(num_generated_tokens > 0, "No tokens were generated.");
-        
-        // 计算更详细的性能指标
-        let prompt_tokens = model.tokenizer.encode(prompt)?;
-        let prompt_tokens_len = prompt_tokens.len() as f64;
-        let generated_tokens_len = num_generated_tokens as f64;
-        let total_tokens = prompt_tokens_len + generated_tokens_len;
-        
-        // 使用generate内部测量的纯计算时间作为总时间，而不是generate_and_measure的外部时间
-        let total_compute_ms = (prefill_ms + decode_ms) as f64;
-        
-        let tps = if total_compute_ms > 0.0 {
-            total_tokens / (total_compute_ms / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let prefill_throughput = if prefill_ms > 0 {
-            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let decode_avg_itl = if decode_iterations > 0 {
-            decode_ms as f64 / decode_iterations as f64
-        } else {
-            0.0
-        };
-        
-        let decode_throughput = if decode_ms > 0 {
-            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        println!("\n================ CPU PERFORMANCE ================");
-        println!("Total Generation Time (compute only): {} ms", total_compute_ms as u64);
-        println!("Generated Tokens: {}, Prompt Tokens: {}", num_generated_tokens, prompt_tokens_len as usize);
-        println!("Total Tokens: {}, Tokens Per Second (TPS): {:.2}", total_tokens as usize, tps);
-        println!("Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, prefill_throughput);
-        println!("Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
-        println!("==================================================\n");
-        
+        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
+        let total_ms = (prefill_ms + decode_ms) as f64;
+        println!("\n=== CPU: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
+            n_tok, total_ms,
+            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
+            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
         Ok(())
     }
+
     #[test]
-    #[ignore = "该测试花费时间较长，请单独测试运行。"]
+    #[ignore = "Long running test"]
     #[cfg(feature = "cuda")]
     fn test_llama3_cuda_performance() -> Result<()> {
-        // 这个测试现在同时验证一致性和性能
-        
         let model_path = get_dummy_model_path();
-        assert!(model_path.exists(), "Dummy model directory not found.");
+        assert!(model_path.exists(), "Model not found.");
 
-        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        let model = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
+        let mut state = model.create_state()?;
 
-Cutting Knowledge Date: December 2023
-Today Date: 14 Dec 2025
+        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
 
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let max_tokens = 2000;
-
-        // --- 2. 在 CUDA 上运行并获取结果和性能 ---
-        println!("\n=== Step 2: Running on CUDA ===");
-        let mut model_cuda = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
-        let (_cuda_generated_text, _cuda_duration_ms, cuda_num_tokens, prefill_ms, decode_ms, decode_iterations) = generate_and_measure(&mut model_cuda, prompt, max_tokens, false)?;
-
-        // 计算更详细的性能指标
-        let prompt_tokens = model_cuda.tokenizer.encode(prompt)?;
-        let prompt_tokens_len = prompt_tokens.len() as f64;
-        let generated_tokens_len = cuda_num_tokens as f64;
-        let total_tokens = prompt_tokens_len + generated_tokens_len;
-        
-        // 使用generate内部测量的纯计算时间作为总时间，而不是generate_and_measure的外部时间
-        let total_compute_ms = (prefill_ms + decode_ms) as f64;
-        
-        let cuda_tps = if total_compute_ms > 0.0 {
-            total_tokens / (total_compute_ms / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let prefill_throughput = if prefill_ms > 0 {
-            prompt_tokens_len / (prefill_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-        
-        let decode_avg_itl = if decode_iterations > 0 {
-            decode_ms as f64 / decode_iterations as f64
-        } else {
-            0.0
-        };
-        
-        let decode_throughput = if decode_ms > 0 {
-            (decode_iterations as f64) / (decode_ms as f64 / 1000.0)
-        } else {
-            0.0
-        };
-
-        println!("\n================ PERFORMANCE COMPARISON ================");
-        println!("CUDA - Total Time (compute only): {} ms, Total Tokens: {}, TPS: {:.2}", total_compute_ms as u64, total_tokens as usize, cuda_tps);
-        println!("CUDA - Generated Tokens: {}, Prompt Tokens: {}", cuda_num_tokens, prompt_tokens_len as usize);
-        println!("CUDA - Prefill TTFT: {:.2} ms  Throughput: {:.2} tok/s", prefill_ms, prefill_throughput);
-        println!("CUDA - Decode  Avg ITL: {:.2} ms   Throughput: {:.2} tok/s", decode_avg_itl, decode_throughput);
-        println!("=========================================================\n");
+        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
+        let total_ms = (prefill_ms + decode_ms) as f64;
+        println!("\n=== CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
+            n_tok, total_ms,
+            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
+            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
         Ok(())
     }
 
-    // 辅助函数，获取虚拟模型的路径
     fn get_dummy_model_path() -> &'static Path {
         Path::new("/root/models/Llama-3.2-1B")
     }
