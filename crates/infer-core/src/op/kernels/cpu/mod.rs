@@ -1,5 +1,6 @@
 mod rmsnorm;
 pub use rmsnorm::rmsnorm;
+pub use rmsnorm::fused_add_rmsnorm;
 mod add;
 pub use add::add;
 pub use add::add_inplace;
@@ -26,3 +27,10 @@ pub use argmax::argmax;
 
 mod cast;
 pub use cast::cast_kernel;
+
+mod scatter;
+pub use scatter::scatter;
+pub use scatter::scatter_kv;
+
+mod split_cols;
+pub use split_cols::split_cols_tensor;
