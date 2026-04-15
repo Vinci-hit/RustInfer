@@ -183,6 +183,12 @@ cargo build --release --features cuda
 
 ### 4. 运行测试
 
+先下载测试模型（Llama-3.2-1B-Instruct）：
+
+```bash
+uv run hf download unsloth/Llama-3.2-1B-Instruct --local-dir ./Llama-3.2-1B-Instruct
+```
+
 ```bash
 # 基础测试
 cargo test
@@ -294,11 +300,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | 版本 | Decode 吞吐量 | 关键优化 |
 |------|--------------|----------|
-| v0.7.0 | **276 tok/s (Qwen3-4B)** / **800 tok/s (Llama-1B)** | 手写GEMV + kernel融合 + 算子调优 |
+| v0.7.0 | **276 tok/s (Qwen3-4B)** / **800 tok/s (Llama-3.2-1B-Instruct)** | 手写GEMV + kernel融合 + 算子调优 |
 | v0.6.0 | 259 tok/s | 融合GEMM + 零拷贝decode + 融合add+rmsnorm |
 | v0.5.0 | 192 tok/s | Qwen3-4B支持 |
-| v0.2.0 | 436 tok/s (Llama-1B) | BF16 + Flash Attention |
-| v0.1.0 | 220 tok/s (Llama-1B) | 基线 |
+| v0.2.0 | 436 tok/s (Llama-3.2-1B-Instruct) | BF16 + Flash Attention |
+| v0.1.0 | 220 tok/s (Llama-3.2-1B-Instruct) | 基线 |
 
 ### 版本历史
 
@@ -317,7 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **性能**:
 - Qwen3-4B (H20): 259 → **276 tok/s**（+7%，超越 vLLM 8.2%）
-- Llama-3.2-1B (H20): **800 tok/s**
+- Llama-3.2-1B-Instruct (H20): **800 tok/s**
 
 #### v0.6.0 - Decode性能优化，超越vLLM
 **发布日期**: 2026-04
