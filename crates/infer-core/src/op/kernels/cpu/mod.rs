@@ -1,6 +1,7 @@
 mod rmsnorm;
 pub use rmsnorm::rmsnorm;
-pub use rmsnorm::fused_add_rmsnorm;
+mod fused_add_rmsnorm;
+pub use fused_add_rmsnorm::fused_add_rmsnorm;
 mod add;
 pub use add::add;
 pub use add::add_inplace;
