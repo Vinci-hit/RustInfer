@@ -131,7 +131,7 @@ impl RuntimeModelConfig {
         let layer_num = file_config.num_hidden_layers;
         let head_num = file_config.num_attention_heads;
         let kv_head_num = file_config.num_key_value_heads;
-        let seq_len = file_config.max_position_embeddings;
+        let seq_len = 2048;
 
         let head_size = file_config.head_dim.unwrap_or(dim / head_num);
         let q_dim = head_num * head_size;
@@ -186,4 +186,3 @@ fn normalize_torch_dtype(dtype: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-

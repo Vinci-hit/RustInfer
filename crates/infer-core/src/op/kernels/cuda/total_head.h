@@ -1,4 +1,5 @@
 #include "./rmsnorm/rmsnorm.h"
+#include "./fused_add_rmsnorm/fused_add_rmsnorm.h"
 #include "./matmul/matmul.h"
 #include "./add/add.h"
 #include "./swiglu/swiglu.h"
