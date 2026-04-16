@@ -1,4 +1,4 @@
-use crate::base::error::{Error, Result};
+use crate::base::error::Result;
 use crate::base::{DataType, DeviceType};
 use crate::model::config::RuntimeModelConfig;
 use crate::tensor::Tensor;
@@ -14,19 +14,7 @@ impl KvCache {
             config.kv_head_num * config.head_size,
         ];
 
-        let float_type = if device.is_cpu() {
-            DataType::F32
-        } else {
-            match config.torch_dtype.as_str() {
-                "float32" => DataType::F32,
-                "bfloat16" => DataType::BF16,
-                _ => {
-                    return Err(Error::InvalidArgument(format!(
-                        "Unsupported torch_dtype: {}", config.torch_dtype
-                    )).into());
-                }
-            }
-        };
+        let float_type = config.runtime_float_dtype(*device)?;
 
         let mut kv_cache = Vec::with_capacity(config.layer_num);
         for _ in 0..config.layer_num {

@@ -93,19 +93,7 @@ impl InferenceState {
     ) -> Result<Workspace> {
         let mut buffers = HashMap::new();
 
-        let float_dtype = if device.is_cpu() {
-            DataType::F32
-        } else {
-            match config.torch_dtype.as_str() {
-                "float32" => DataType::F32,
-                "bfloat16" => DataType::BF16,
-                _ => {
-                    return Err(Error::InvalidArgument(format!(
-                        "Unsupported torch_dtype: {}", config.torch_dtype
-                    )).into());
-                }
-            }
-        };
+        let float_dtype = config.runtime_float_dtype(*device)?;
         let int_dtype = DataType::I32;
         let max_seq_len = config.seq_len;
 

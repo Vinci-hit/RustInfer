@@ -178,17 +178,7 @@ impl Qwen3 {
     pub fn create_state(&self) -> Result<InferenceState> {
         let mut state = InferenceState::new(&self.config, self.device_type)?;
 
-        let float_dtype = if self.device_type.is_cpu() {
-            DataType::F32
-        } else {
-            match self.config.torch_dtype.as_str() {
-                "float32" => DataType::F32,
-                "bfloat16" => DataType::BF16,
-                _ => return Err(Error::InvalidArgument(
-                    format!("Unsupported torch_dtype: {}", self.config.torch_dtype)
-                ).into()),
-            }
-        };
+        let float_dtype = self.config.runtime_float_dtype(self.device_type)?;
         let max_seq_len = self.config.seq_len;
 
         // Override Query buffer: Qwen3 needs [max_seq_len, q_dim], not [max_seq_len, dim]
@@ -630,7 +620,7 @@ mod tests {
     }
 
     fn get_qwen3_model_path() -> &'static Path {
-        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct")
+        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/checkpoint-800-1")
     }
 
     #[test]
@@ -645,7 +635,7 @@ mod tests {
         let model = Qwen3::new(model_path, DeviceType::Cuda(0), false)?;
         let mut state = model.create_state()?;
         let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
-            generate_and_measure(&model, &mut state, prompt, 2000, false)?;
+            generate_and_measure(&model, &mut state, prompt, 2000, true)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;
@@ -667,7 +657,7 @@ mod tests {
         let model = Qwen3::new(model_path, DeviceType::Cpu, false)?;
         let mut state = model.create_state()?;
         let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
-            generate_and_measure(&model, &mut state, prompt, 150, false)?;
+            generate_and_measure(&model, &mut state, prompt, 150, true)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;
