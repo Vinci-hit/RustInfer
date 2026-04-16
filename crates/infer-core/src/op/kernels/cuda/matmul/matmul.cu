@@ -202,70 +202,72 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtMatmulDescDestroy(operationDesc);
 }
 // ============================================================================
-// BF16 GEMV kernel v2 for decode phase (M=1)
+// BF16 GEMV kernel v3 for decode phase (M=1)
 // y[n] = dot(W[n,:], x[:])  where W is [N, K], x is [1, K], y is [1, N]
 //
 // Design: 1 warp (32 threads) computes 1 row, 1 block has 8 warps.
-// Input vector x is loaded into shared memory once per block and reused.
+// No shared memory: input vector (8KB for K=4096) fits in L1 cache (128KB)
+// and is implicitly cached across warps/blocks on same SM. This avoids
+// __syncthreads() overhead and saves shared memory for higher occupancy.
+//
+// NCU-validated improvements over v2 (N=11008, K=4096, A10 sm_86):
+//   - L1/TEX hit rate: 8.3% -> 49.8% (input vector cached in L1)
+//   - Achieved occupancy: 87% -> 91.6%
+//   - DRAM throughput: 92.6% -> 93.9%
+//   - Duration: 185us -> 181us (~2% faster)
+//   - No __syncthreads() needed
 // ============================================================================
 
 __device__ __forceinline__ float warp_reduce_sum_gemv(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    }
+    val += __shfl_xor_sync(0xffffffff, val, 16);
+    val += __shfl_xor_sync(0xffffffff, val, 8);
+    val += __shfl_xor_sync(0xffffffff, val, 4);
+    val += __shfl_xor_sync(0xffffffff, val, 2);
+    val += __shfl_xor_sync(0xffffffff, val, 1);
     return val;
 }
 
 template <int WARPS_PER_BLOCK>
-__global__ void hgemv_bf16_v2_kernel(
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 6)
+hgemv_bf16_v3_kernel(
     const __nv_bfloat16* __restrict__ input,   // [K]
     const __nv_bfloat16* __restrict__ weight,  // [N, K] row-major
     __nv_bfloat16* __restrict__ output,        // [N]
-    int N,
-    int K
+    const int N,
+    const int K
 ) {
-    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
-    const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
-    const int lane_id = tid % 32;
-
-    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-
-    constexpr int PACK_SIZE = 8;
-    extern __shared__ float4 smem_input[];
-
-    const int pack_num = K / PACK_SIZE;
-    const float4* input_f4 = reinterpret_cast<const float4*>(input);
-
-    for (int i = tid; i < pack_num; i += THREADS_PER_BLOCK) {
-        smem_input[i] = input_f4[i];
-    }
-    __syncthreads();
+    const int lane_id = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
 
     if (row >= N) return;
 
-    const float4* weight_f4 = reinterpret_cast<const float4*>(weight + row * K);
+    const int pack_num = K >> 3;  // K / 8, each pack = 8 bf16 = float4
+    const float4* __restrict__ input_f4 = reinterpret_cast<const float4*>(input);
+    const float4* __restrict__ weight_f4 = reinterpret_cast<const float4*>(weight + row * K);
 
-    float thread_sum = 0.0f;
+    float sum = 0.0f;
 
     for (int i = lane_id; i < pack_num; i += 32) {
-        float4 x_pack = smem_input[i];
-        float4 w_pack = __ldg(&weight_f4[i]);  // read-only cache path, avoids L1 thrashing
+        float4 x = __ldg(input_f4 + i);
+        float4 w = __ldg(weight_f4 + i);
 
-        const __nv_bfloat16* x_bf16 = reinterpret_cast<const __nv_bfloat16*>(&x_pack);
-        const __nv_bfloat16* w_bf16 = reinterpret_cast<const __nv_bfloat16*>(&w_pack);
+        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&x);
+        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&w);
 
-        #pragma unroll
-        for (int j = 0; j < PACK_SIZE; j++) {
-            thread_sum += __bfloat162float(x_bf16[j]) * __bfloat162float(w_bf16[j]);
-        }
+        sum += __bfloat162float(xb[0]) * __bfloat162float(wb[0]);
+        sum += __bfloat162float(xb[1]) * __bfloat162float(wb[1]);
+        sum += __bfloat162float(xb[2]) * __bfloat162float(wb[2]);
+        sum += __bfloat162float(xb[3]) * __bfloat162float(wb[3]);
+        sum += __bfloat162float(xb[4]) * __bfloat162float(wb[4]);
+        sum += __bfloat162float(xb[5]) * __bfloat162float(wb[5]);
+        sum += __bfloat162float(xb[6]) * __bfloat162float(wb[6]);
+        sum += __bfloat162float(xb[7]) * __bfloat162float(wb[7]);
     }
 
-    thread_sum = warp_reduce_sum_gemv(thread_sum);
+    sum = warp_reduce_sum_gemv(sum);
 
     if (lane_id == 0) {
-        output[row] = __float2bfloat16(thread_sum);
+        output[row] = __float2bfloat16(sum);
     }
 }
 
@@ -281,9 +283,8 @@ extern "C" void hgemv_bf16_cu(
     constexpr int THREADS = WARPS_PER_BLOCK * 32;  // 256
 
     int grid = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    size_t smem_bytes = ((K + 7) / 8) * sizeof(float4);
 
-    hgemv_bf16_v2_kernel<WARPS_PER_BLOCK><<<grid, THREADS, smem_bytes, stream>>>(
+    hgemv_bf16_v3_kernel<WARPS_PER_BLOCK><<<grid, THREADS, 0, stream>>>(
         input, weight, output, N, K);
 }
 
