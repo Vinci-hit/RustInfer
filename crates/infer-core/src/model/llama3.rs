@@ -573,6 +573,6 @@ mod tests {
     }
 
     fn get_dummy_model_path() -> &'static Path {
-        Path::new("/root/models/Llama-3.2-1B-Instruct")
+        Path::new("/data/home/vinciiliu/models/Llama-3.2-1B-Instruct")
     }
 }
