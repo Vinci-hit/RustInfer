@@ -1,6 +1,6 @@
 use crate::base::error::Result;
 use crate::base::{DataType, DeviceType};
-use crate::model::config::RuntimeModelConfig;
+use crate::model::common::config::RuntimeModelConfig;
 use crate::tensor::Tensor;
 
 pub struct KvCache {

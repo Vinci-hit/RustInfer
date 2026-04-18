@@ -1,18 +1,18 @@
-pub mod config;
-pub mod safetensor_loader;
-pub mod tokenizer;
+pub mod common;
+pub mod runtime;
 pub mod llama3;
-use tokenizer::{GenericHfTokenizer, Tokenizer};
 pub mod qwen3;
+
+use common::tokenizer::{GenericHfTokenizer, Tokenizer};
+use common::config::{ModelFileConfig, RuntimeModelConfig};
+use common::safetensor_loader::SafetensorReader;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use crate::model::config::{ModelFileConfig, RuntimeModelConfig};
 
 // 引入我们自己的模块和统一的错误处理
 use crate::base::error::{Error, Result};
-use crate::model::safetensor_loader::SafetensorReader;
 use safetensors::tensor::TensorView;
 use crate::{base::DeviceType, tensor::Tensor};
 
@@ -76,7 +76,7 @@ impl ModelLoader {
         // 1. 加载 config.json (不变)
         let config_path = model_dir.join("config.json");
         let config_file = File::open(&config_path)?;
-        let file_config: ModelFileConfig = config::load_config_from_json(config_file)
+        let file_config: ModelFileConfig = common::config::load_config_from_json(config_file)
             .map_err(|e| Error::InvalidArgument(format!("Failed to parse config.json: {}", e)))?;
 
         let config = RuntimeModelConfig::new(&file_config)?;
@@ -110,7 +110,7 @@ impl ModelLoader {
             }
 
             // 临时映射文件以读取其内部的张量名称
-            let mmap = safetensor_loader::load_and_mmap(&single_file_path)?;
+            let mmap = common::safetensor_loader::load_and_mmap(&single_file_path)?;
             let reader = SafetensorReader::new(&mmap)?;
             for tensor_name in reader.get_tensor_names() {
                 weight_map.insert(tensor_name, "model.safetensors".to_string());
@@ -136,7 +136,7 @@ impl ModelLoader {
         // 4. 内存映射所有需要的文件 (现在这个集合可能是1个或多个)
         let mut mmaps = HashMap::new();
         for file_path in files_to_mmap {
-            let mmap = safetensor_loader::load_and_mmap(&file_path)?;
+            let mmap = common::safetensor_loader::load_and_mmap(&file_path)?;
             mmaps.insert(file_path, mmap);
         }
 

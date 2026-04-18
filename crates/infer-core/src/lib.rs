@@ -2,7 +2,7 @@ pub mod base;
 pub mod op;
 pub mod tensor;
 pub mod model;
-pub mod runtime;
+pub use model::runtime;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;

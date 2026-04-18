@@ -4,7 +4,7 @@ use crate::base::error::{Error, Result};
 use crate::base::{DataType, DeviceType};
 #[cfg(feature = "cuda")]
 use crate::cuda::CudaConfig;
-use crate::model::config::RuntimeModelConfig;
+use crate::model::common::config::RuntimeModelConfig;
 use crate::model::{BufferType, Workspace};
 use crate::op::sampler::{ArgmaxSampler, Sampler};
 use crate::tensor::Tensor;
