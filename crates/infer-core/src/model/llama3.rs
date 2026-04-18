@@ -6,10 +6,10 @@ use crate::base::error::{Error, Result};
 use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
 use crate::op::{Op, OpContext};
-use super::config::RuntimeModelConfig;
+use super::common::config::RuntimeModelConfig;
 use super::ModelLoader;
 use crate::tensor::Tensor;
-use super::tokenizer::Tokenizer;
+use super::common::tokenizer::Tokenizer;
 use crate::base::error::Error::InternalError;
 use std::boxed::Box;
 use crate::op::embedding::Embedding;
@@ -20,7 +20,7 @@ use crate::op::rope::RoPEOp;
 use crate::op::swiglu::SwiGLU;
 use crate::model::BufferType;
 use crate::op::scatter::Scatter;
-use crate::runtime::InferenceState;
+use super::runtime::InferenceState;
 
 
 /// LlamaLayers holds all operators and weights for the model.
@@ -76,48 +76,35 @@ impl Llama3 {
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
         device_type: DeviceType,
-        is_quant_model: bool,
     ) -> Result<Self> {
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
         let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
 
-        let (
-            embedding_layer, rmsnorm_final_layer, cls_layer,
-            rmsnorm_attn_layers, rmsnorm_ffn_layers,
-            wqkv_layers, wo_layers, w_gate_up_layers, w2_layers,
-        ) = if !is_quant_model {
-            let layer_num = config.layer_num;
-            let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
-            let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
-            let mut wqkv_layers = Vec::with_capacity(layer_num);
-            let mut wo_layers = Vec::with_capacity(layer_num);
-            let mut w_gate_up_layers = Vec::with_capacity(layer_num);
-            let mut w2_layers = Vec::with_capacity(layer_num);
+        let layer_num = config.layer_num;
+        let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
+        let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
+        let mut wqkv_layers = Vec::with_capacity(layer_num);
+        let mut wo_layers = Vec::with_capacity(layer_num);
+        let mut w_gate_up_layers = Vec::with_capacity(layer_num);
+        let mut w2_layers = Vec::with_capacity(layer_num);
 
-            for i in 0..layer_num {
-                wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
-                wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
-                w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
-                w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
-                rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
-                rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
-            }
+        for i in 0..layer_num {
+            wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
+            wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
+            w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
+            w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
+            rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
+            rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
+        }
 
-            let embedding_layer = Self::load_embedding("model.embed_tokens.weight", &loader, device_type)?;
-            let rmsnorm_final_layer = Self::load_rmsnorm("model.norm.weight", &loader, device_type, config.rms_norm_eps)?;
-            let cls_layer = if tensor_names.contains("lm_head.weight") {
-                Self::load_matmul("lm_head.weight", &loader, device_type)?
-            } else {
-                Matmul::from(embedding_layer.weight.clone(), None)
-            };
-
-            (embedding_layer, rmsnorm_final_layer, cls_layer,
-             rmsnorm_attn_layers, rmsnorm_ffn_layers,
-             wqkv_layers, wo_layers, w_gate_up_layers, w2_layers)
+        let embedding_layer = Self::load_embedding("model.embed_tokens.weight", &loader, device_type)?;
+        let rmsnorm_final_layer = Self::load_rmsnorm("model.norm.weight", &loader, device_type, config.rms_norm_eps)?;
+        let cls_layer = if tensor_names.contains("lm_head.weight") {
+            Self::load_matmul("lm_head.weight", &loader, device_type)?
         } else {
-            return Err(Error::InvalidArgument("Quantized models are not yet supported.".to_string()).into());
+            Matmul::from(embedding_layer.weight.clone(), None)
         };
 
         let layer_num = config.layer_num;
@@ -534,7 +521,7 @@ mod tests {
         let model_path = get_dummy_model_path();
         assert!(model_path.exists(), "Model not found.");
 
-        let model = Llama3::new(model_path, DeviceType::Cpu, false)?;
+        let model = Llama3::new(model_path, DeviceType::Cpu)?;
         let mut state = model.create_state()?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
@@ -557,7 +544,7 @@ mod tests {
         let model_path = get_dummy_model_path();
         assert!(model_path.exists(), "Model not found.");
 
-        let model = Llama3::new(model_path, DeviceType::Cuda(0), false)?;
+        let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";

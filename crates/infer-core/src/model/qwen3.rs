@@ -15,11 +15,11 @@ use crate::op::rmsnorm::RMSNorm;
 use crate::op::rope::RoPEOp;
 use crate::op::scatter::Scatter;
 use crate::op::swiglu::SwiGLU;
-use crate::runtime::InferenceState;
+use super::runtime::InferenceState;
 use crate::tensor::Tensor;
-use super::config::RuntimeModelConfig;
+use super::common::config::RuntimeModelConfig;
 use super::ModelLoader;
-use super::tokenizer::Tokenizer;
+use super::common::tokenizer::Tokenizer;
 
 
 /// Qwen3Layers holds all operators and weights for the model.
@@ -86,11 +86,7 @@ impl Qwen3 {
     pub fn new<P: AsRef<Path>>(
         model_dir: P,
         device_type: DeviceType,
-        is_quant_model: bool,
     ) -> Result<Self> {
-        if is_quant_model {
-            return Err(Error::InvalidArgument("Quantized models are not yet supported.".to_string()).into());
-        }
 
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
         let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
@@ -632,7 +628,7 @@ mod tests {
 
         let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n写一段C++代码，实现一个简单的中序遍历函数。<|im_end|>\n<|im_start|>assistant\n";
 
-        let model = Qwen3::new(model_path, DeviceType::Cuda(0), false)?;
+        let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
         let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
             generate_and_measure(&model, &mut state, prompt, 2000, true)?;
@@ -654,7 +650,7 @@ mod tests {
 
         let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n写一段C++代码，实现一个简单的中序遍历函数。<|im_end|>\n<|im_start|>assistant\n";
 
-        let model = Qwen3::new(model_path, DeviceType::Cpu, false)?;
+        let model = Qwen3::new(model_path, DeviceType::Cpu)?;
         let mut state = model.create_state()?;
         let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
             generate_and_measure(&model, &mut state, prompt, 150, true)?;
