@@ -106,11 +106,21 @@ impl Qwen3 {
         let mut w_gate_up_layers = Vec::with_capacity(layer_num);
         let mut w2_layers = Vec::with_capacity(layer_num);
 
+        let is_awq = config.quant_config.as_ref().map_or(false, |q|
+            q.quant_method == "compressed-tensors" || q.quant_method == "awq");
+        let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
+
         for i in 0..layer_num {
             wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
             wo_layers.push(Matmul::from(Self::load_weight(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?, None));
-            w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
-            w2_layers.push(Matmul::from(Self::load_weight(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?, None));
+
+            if is_awq {
+                w_gate_up_layers.push(Self::load_fused_gate_up_awq(i, &loader, device_type, config.intermediate_size, group_size)?);
+                w2_layers.push(Self::load_awq_matmul(&format!("model.layers.{}.mlp.down_proj", i), &loader, device_type, group_size)?);
+            } else {
+                w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
+                w2_layers.push(Matmul::from(Self::load_weight(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?, None));
+            }
             rmsnorm_attn_layers.push(RMSNorm::from(Self::load_weight(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type)?, config.rms_norm_eps));
             rmsnorm_ffn_layers.push(RMSNorm::from(Self::load_weight(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type)?, config.rms_norm_eps));
             if has_qnorm {
@@ -251,6 +261,85 @@ impl Qwen3 {
         }
         let fused = if device.is_cpu() && dtype != DataType::F32 { fused.to_dtype(DataType::F32)? } else { fused };
         Ok(Matmul::from(fused.to_device(device)?, None))
+    }
+
+    // ---- AWQ weight loading helpers (K-packed format) ----
+
+    /// 辅助: 将多个 [rows_i, cols] 的张量纵向拼接为 [sum(rows_i), cols]
+    fn fuse_tensors_vertically(tensors: &[&Tensor], row_counts: &[usize], cols: usize, dtype: DataType) -> Result<Tensor> {
+        let total_rows: usize = row_counts.iter().sum();
+        let elem_size = dtype.size_in_bytes();
+        let mut fused = Tensor::new(&[total_rows, cols], dtype, DeviceType::Cpu)?;
+        let fused_ptr = fused.buffer_mut().as_mut_ptr();
+        let mut offset = 0usize;
+        for (tensor, &rows) in tensors.iter().zip(row_counts) {
+            let bytes = rows * cols * elem_size;
+            unsafe {
+                std::ptr::copy_nonoverlapping(tensor.buffer().as_ptr(), fused_ptr.add(offset), bytes);
+            }
+            offset += bytes;
+        }
+        Ok(fused)
+    }
+
+    fn load_awq_matmul(name_prefix: &str, loader: &ModelLoader, device: DeviceType, group_size: usize) -> Result<Matmul> {
+        let weight_packed = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_packed", name_prefix))?)?;
+        let weight_zero_point = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_zero_point", name_prefix))?)?;
+        let weight_scale = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_scale", name_prefix))?)?;
+
+        Ok(Matmul::from_awq(
+            weight_packed.to_device(device)?,
+            weight_zero_point.to_device(device)?,
+            weight_scale.to_device(device)?,
+            group_size,
+            None,
+        ))
+    }
+
+    fn load_fused_gate_up_awq(
+        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
+        intermediate_size: usize, group_size: usize,
+    ) -> Result<Matmul> {
+        let gate_wp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_packed", layer_idx))?)?;
+        let up_wp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_packed", layer_idx))?)?;
+
+        let gate_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_scale", layer_idx))?)?;
+        let up_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_scale", layer_idx))?)?;
+
+        let gate_zp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_zero_point", layer_idx))?)?;
+        let up_zp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_zero_point", layer_idx))?)?;
+
+        let k_packed = gate_wp.shape()[1];
+        let num_groups = gate_sc.shape()[1];
+
+        let fused_wp = Self::fuse_tensors_vertically(
+            &[&gate_wp, &up_wp],
+            &[intermediate_size, intermediate_size],
+            k_packed, DataType::I32,
+        )?;
+
+        let sc_dtype = gate_sc.dtype();
+        let fused_sc = Self::fuse_tensors_vertically(
+            &[&gate_sc, &up_sc],
+            &[intermediate_size, intermediate_size],
+            num_groups, sc_dtype,
+        )?;
+
+        let gate_n_packed = intermediate_size / 8;
+        let up_n_packed = intermediate_size / 8;
+        let fused_zp = Self::fuse_tensors_vertically(
+            &[&gate_zp, &up_zp],
+            &[gate_n_packed, up_n_packed],
+            num_groups, DataType::I32,
+        )?;
+
+        Ok(Matmul::from_awq(
+            fused_wp.to_device(device)?,
+            fused_zp.to_device(device)?,
+            fused_sc.to_device(device)?,
+            group_size,
+            None,
+        ))
     }
 
     // ---- Inference methods (&self + &mut InferenceState) ----
@@ -658,6 +747,33 @@ mod tests {
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;
         println!("\n=== CPU: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
+            n_tok, total_ms,
+            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
+            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
+        Ok(())
+    }
+
+    fn get_qwen3_awq_model_path() -> &'static Path {
+        Path::new("/data/home/vinciiliu/models/qwen3-4b-instruct-AWQ-mlp3")
+    }
+
+    #[test]
+    #[ignore = "Long running test"]
+    #[cfg(feature = "cuda")]
+    fn test_qwen3_awq_cuda() -> Result<()> {
+        let model_path = get_qwen3_awq_model_path();
+        assert!(model_path.exists(), "Qwen3 AWQ model not found.");
+
+        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello, who are you?<|im_end|>\n<|im_start|>assistant\n";
+
+        let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
+        let mut state = model.create_state()?;
+        let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
+            generate_and_measure(&model, &mut state, prompt, 2000, true)?;
+
+        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
+        let total_ms = (prefill_ms + decode_ms) as f64;
+        println!("\n=== Qwen3 AWQ CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
             n_tok, total_ms,
             (prompt_len + n_tok as f64) / (total_ms / 1000.0),
             if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
