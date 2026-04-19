@@ -58,26 +58,42 @@ impl InferenceState {
         ]);
 
         if let [Some(sin_cache), Some(cos_cache)] = caches {
-            match sin_cache.device() {
+            let target_device = sin_cache.device();
+            let head_size = config.head_size;
+            let max_seq_len = config.seq_len;
+
+            // Extract llama3 rope scaling params (factor=1.0 means no scaling)
+            let (factor, low_freq_factor, high_freq_factor, original_max_pos_emb) =
+                if let Some(ref scaling) = config.rope_scaling {
+                    if scaling.rope_type == "llama3" {
+                        (
+                            scaling.factor as f32,
+                            scaling.low_freq_factor.unwrap_or(1.0) as f32,
+                            scaling.high_freq_factor.unwrap_or(4.0) as f32,
+                            scaling.original_max_position_embeddings.unwrap_or(8192) as f32,
+                        )
+                    } else {
+                        (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
+                    }
+                } else {
+                    (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
+                };
+
+            match target_device {
                 DeviceType::Cpu => {
+                    // CPU path: use existing CPU kernel (no scaling support, fallback)
                     crate::op::kernels::cpu::rope_sin_cos_cache_calc(
-                        config.head_size,
-                        config.seq_len,
-                        config.rope_theta,
-                        sin_cache,
-                        cos_cache,
+                        head_size, max_seq_len, config.rope_theta,
+                        sin_cache, cos_cache,
                     )?;
                 }
                 #[cfg(feature = "cuda")]
                 DeviceType::Cuda(_) => {
-                    let stream = CudaConfig::new()?;
                     crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
-                        config.head_size,
-                        config.seq_len,
-                        config.rope_theta,
-                        sin_cache,
-                        cos_cache,
-                        Some(&stream),
+                        head_size, max_seq_len, config.rope_theta,
+                        sin_cache, cos_cache,
+                        factor, low_freq_factor, high_freq_factor, original_max_pos_emb,
+                        None,
                     )?;
                 }
             }

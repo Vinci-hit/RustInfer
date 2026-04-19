@@ -50,6 +50,20 @@ void hgemv_bf16_cu(
     cudaStream_t stream
 );
 
+// INT4 quantized GEMV (decode, M=1) — K-packed format, BF16
+void kpack_gemv_cu(
+    const void* input, const void* weight_packed, const void* weight_zero_point,
+    const void* weight_scale, void* output,
+    int N, int K, int group_size, cudaStream_t stream
+);
+
+// INT4 quantized GEMM (prefill, M>1) — K-packed format, BF16
+void kpack_gemm_cu(
+    const void* input, const void* weight_packed, const void* weight_zero_point,
+    const void* weight_scale, void* output,
+    int M, int N, int K, int group_size, cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

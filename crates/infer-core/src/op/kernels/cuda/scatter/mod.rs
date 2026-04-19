@@ -12,6 +12,15 @@ unsafe extern "C" {
         stream: cuda::ffi::cudaStream_t,
     );
 
+    fn scatter_kernel_fp16(
+        dst: *mut half::f16,
+        src: *const half::f16,
+        pos: *const i32,
+        kvdim: i32,
+        max_seq_len: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
     fn scatter_kernel_f32(
         dst: *mut f32,
         src: *const f32,
@@ -26,6 +35,17 @@ unsafe extern "C" {
         src_k: *const half::bf16,
         dst_v: *mut half::bf16,
         src_v: *const half::bf16,
+        pos: *const i32,
+        kvdim: i32,
+        max_seq_len: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    fn scatter_kv_kernel_fp16(
+        dst_k: *mut half::f16,
+        src_k: *const half::f16,
+        dst_v: *mut half::f16,
+        src_v: *const half::f16,
         pos: *const i32,
         kvdim: i32,
         max_seq_len: i32,
@@ -105,6 +125,24 @@ pub fn scatter(
                 );
             }
         }
+        crate::base::DataType::F16 => {
+            let dst_typed: &mut TypedTensor<half::f16> = dst.as_f16_mut()?;
+            let src_typed = src.as_f16()?;
+
+            let dst_ptr = dst_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let src_ptr = src_typed.buffer().as_ptr() as *const half::f16;
+
+            unsafe {
+                scatter_kernel_fp16(
+                    dst_ptr,
+                    src_ptr,
+                    pos.as_i32()?.buffer().as_ptr() as *const i32,
+                    kvdim as i32,
+                    max_seq_len as i32,
+                    stream,
+                );
+            }
+        }
         crate::base::DataType::F32 => {
             let dst_typed: &mut TypedTensor<f32> = dst.as_f32_mut()?;
             let src_typed = src.as_f32()?;
@@ -150,22 +188,39 @@ pub fn scatter_kv(
     let kvdim = dst_k.shape()[1];
     let max_seq_len = dst_k.shape()[0];
     let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
-
-    let dst_k_ptr = dst_k.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let src_k_ptr = src_k.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let dst_v_ptr = dst_v.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let src_v_ptr = src_v.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let dtype = dst_k.dtype();
     let pos_ptr = pos.as_i32()?.buffer().as_ptr() as *const i32;
 
-    unsafe {
-        scatter_kv_kernel_bf16(
-            dst_k_ptr, src_k_ptr,
-            dst_v_ptr, src_v_ptr,
-            pos_ptr,
-            kvdim as i32,
-            max_seq_len as i32,
-            stream,
-        );
+    match dtype {
+        crate::base::DataType::BF16 => {
+            let dst_k_ptr = dst_k.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let src_k_ptr = src_k.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let dst_v_ptr = dst_v.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let src_v_ptr = src_v.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            unsafe {
+                scatter_kv_kernel_bf16(
+                    dst_k_ptr, src_k_ptr, dst_v_ptr, src_v_ptr,
+                    pos_ptr, kvdim as i32, max_seq_len as i32, stream,
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            let dst_k_ptr = dst_k.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let src_k_ptr = src_k.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let dst_v_ptr = dst_v.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let src_v_ptr = src_v.as_f16()?.buffer().as_ptr() as *const half::f16;
+            unsafe {
+                scatter_kv_kernel_fp16(
+                    dst_k_ptr, src_k_ptr, dst_v_ptr, src_v_ptr,
+                    pos_ptr, kvdim as i32, max_seq_len as i32, stream,
+                );
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported data type for scatter_kv: {:?}", dtype
+            )).into());
+        }
     }
 
     Ok(())

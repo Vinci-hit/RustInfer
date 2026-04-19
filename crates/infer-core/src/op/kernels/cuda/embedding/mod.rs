@@ -25,6 +25,16 @@ unsafe extern "C" {
         vocab_size: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+
+    fn embedding_kernel_cu_fp16x8(
+        output: *mut half::f16,
+        input_token_ids: *const i32,
+        weight: *const half::f16,
+        token_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Embedding 的 CUDA 内核包装函数
@@ -89,6 +99,33 @@ pub fn embedding(
             // --- 4. 调用 FFI 函数 ---
             unsafe {
                 embedding_kernel_cu_bf16x8(
+                    out_ptr,
+                    tokens_ptr,
+                    weight_ptr,
+                    token_len as i32,
+                    dim as i32,
+                    vocab_size as i32,
+                    stream,
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            let weight_typed = weight.as_f16()?;
+            let out_typed = output.as_f16_mut()?;
+            
+            // --- 3. 检查前置条件 (对齐) ---
+            if !dim.is_multiple_of(8) {
+                return Err(Error::InvalidArgument(
+                    "CUDA Embedding kernel (fp16x8) requires the embedding dimension to be a multiple of 8.".into()
+                ).into());
+            }
+            
+            let weight_ptr = weight_typed.buffer().as_ptr() as *const half::f16;
+            let out_ptr = out_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            
+            // --- 4. 调用 FFI 函数 ---
+            unsafe {
+                embedding_kernel_cu_fp16x8(
                     out_ptr,
                     tokens_ptr,
                     weight_ptr,
