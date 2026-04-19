@@ -237,4 +237,40 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_add_inplace_cuda_fp16() -> Result<()> {
+        use half::f16;
+        let device = DeviceType::Cuda(0);
+        let size = 2048;
+
+        let host_a: Vec<f16> = (0..size).map(|i| f16::from_f32(i as f32 * 0.001)).collect();
+        let host_b: Vec<f16> = (0..size).map(|i| f16::from_f32(i as f32 * 0.002)).collect();
+
+        let mut t_a = Tensor::new(&[size], DataType::F16, device)?;
+        t_a.as_f16_mut()?.buffer_mut().copy_from_host(&host_a)?;
+
+        let mut t_b = Tensor::new(&[size], DataType::F16, device)?;
+        t_b.as_f16_mut()?.buffer_mut().copy_from_host(&host_b)?;
+
+        let add_inplace_op = AddInplace::new();
+        add_inplace_op.forward(&mut OpContext::new(&[&t_b], &mut [&mut t_a], None))?;
+
+        unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
+
+        let result_tensor = t_a.to_cpu()?;
+        let result = result_tensor.as_f16()?.as_slice()?;
+
+        println!("FP16 add_inplace result[0..10]: {:?}", result[0..10].iter().map(|v| v.to_f32()).collect::<Vec<f32>>());
+
+        for i in 0..10 {
+            let expected = host_a[i].to_f32() + host_b[i].to_f32();
+            let actual = result[i].to_f32();
+            assert!(!actual.is_nan(), "NaN at index {}", i);
+            assert!((actual - expected).abs() < 0.01, "Mismatch at {}: expected {}, got {}", i, expected, actual);
+        }
+
+        Ok(())
+    }
 }

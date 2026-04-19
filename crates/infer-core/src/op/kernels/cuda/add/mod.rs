@@ -11,9 +11,24 @@ unsafe extern "C" {
         stream: cuda::ffi::cudaStream_t,
     );
 
+    fn add_kernel_fp16x8(
+        c: *mut half::f16,
+        a: *const half::f16,
+        b: *const half::f16,
+        num_elements: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
     fn add_inplace_kernel_bf16x8(
         a_and_c: *mut half::bf16,
         b: *const half::bf16,
+        num_elements: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    fn add_inplace_kernel_fp16x8(
+        a_and_c: *mut half::f16,
+        b: *const half::f16,
         num_elements: i32,
         stream: cuda::ffi::cudaStream_t,
     );
@@ -123,6 +138,25 @@ pub fn add(
                 );
             }
         }
+        crate::base::DataType::F16 => {
+            let input_a_typed = input_a.as_f16()?;
+            let input_b_typed = input_b.as_f16()?;
+            let output_c_typed: &mut TypedTensor<half::f16> = output_c.as_f16_mut()?;
+            
+            let a_ptr = input_a_typed.buffer().as_ptr() as *const half::f16;
+            let b_ptr = input_b_typed.buffer().as_ptr() as *const half::f16;
+            let c_ptr = output_c_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+
+            unsafe {
+                add_kernel_fp16x8(
+                    c_ptr,
+                    a_ptr,
+                    b_ptr,
+                    num_elements as i32,
+                    stream,
+                );
+            }
+        }
         _ => {
             return Err(Error::InvalidArgument(format!(
                 "Unsupported data type for add CUDA kernel: {:?}", dtype
@@ -204,6 +238,22 @@ pub fn add_inplace(
 
             unsafe {
                 add_inplace_kernel_bf16x8(
+                    a_and_c_ptr, // FFI 参数 a_and_c
+                    b_ptr,       // FFI 参数 b
+                    num_elements as i32,
+                    stream,
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            let input_output_a_typed: &mut TypedTensor<half::f16> = input_output_a.as_f16_mut()?;
+            let input_b_typed = input_b.as_f16()?;
+            
+            let a_and_c_ptr = input_output_a_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let b_ptr = input_b_typed.buffer().as_ptr() as *const half::f16;
+
+            unsafe {
+                add_inplace_kernel_fp16x8(
                     a_and_c_ptr, // FFI 参数 a_and_c
                     b_ptr,       // FFI 参数 b
                     num_elements as i32,

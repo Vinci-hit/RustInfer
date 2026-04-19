@@ -31,6 +31,19 @@ unsafe extern "C" {
         cos_cache: *const half::bf16,
         stream: cuda::ffi::cudaStream_t,
     );
+
+    pub fn rope_kernel_cu_fp16(
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        input_q: *mut half::f16,
+        input_k: *mut half::f16,
+        input_pos: *const i32,
+        seq_len: i32,
+        sin_cache: *const half::f16,
+        cos_cache: *const half::f16,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Rotary Positional Embedding (RoPE) 的 CUDA 内核包装函数
@@ -130,6 +143,30 @@ pub fn rope(
                 );
             }
         }
+        crate::base::DataType::F16 => {
+            // Q 和 K 需要可变指针
+            let q_ptr = input_q.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let k_ptr = input_k.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+
+            // Cache 是 fp16，需要不可变指针
+            let sin_ptr = sin_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let cos_ptr = cos_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+
+            unsafe {
+                rope_kernel_cu_fp16(
+                    dim_i32,
+                    kv_dim_i32,
+                    head_size_i32,
+                    q_ptr,       // *mut fp16
+                    k_ptr,       // *mut fp16
+                    pos,     // const  * i32
+                    seq_len,
+                    sin_ptr,     // *const fp16
+                    cos_ptr,     // *const fp16
+                    stream,
+                );
+            }
+        }
         _ => {
             return Err(Error::InvalidArgument(format!(
                 "Unsupported data type for ROPE CUDA kernel: {:?}", dtype
@@ -157,6 +194,15 @@ unsafe extern "C" {
         rope_theta: f32,
         sin_cache: *mut half::bf16,
         cos_cache: *mut half::bf16,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn sin_cos_cache_calc_cu_fp16(
+        head_size: i32,
+        max_seq_len: i32,
+        rope_theta: f32,
+        sin_cache: *mut half::f16,
+        cos_cache: *mut half::f16,
         stream: cuda::ffi::cudaStream_t,
     );
 }
@@ -221,6 +267,22 @@ pub fn sin_cos_cache_calc_cuda(
 
             unsafe {
                 sin_cos_cache_calc_cu_bf16(
+                    head_size_i32,
+                    max_seq_len_i32,
+                    rope_theta,
+                    sin_ptr,
+                    cos_ptr,
+                    stream,
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut fp16)
+            let sin_ptr = sin_cache.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let cos_ptr = cos_cache.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+
+            unsafe {
+                sin_cos_cache_calc_cu_fp16(
                     head_size_i32,
                     max_seq_len_i32,
                     rope_theta,

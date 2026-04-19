@@ -1,4 +1,4 @@
-use half::bf16;
+use half::{bf16, f16};
 
 use crate::base::allocator::{CpuAllocator, DeviceAllocator};
 use crate::base::buffer::Buffer;
@@ -21,6 +21,7 @@ pub trait Dtype: Send + Sync + Copy + 'static {
 impl Dtype for f32 { const DTYPE: DataType = DataType::F32; }
 impl Dtype for i32 { const DTYPE: DataType = DataType::I32; }
 impl Dtype for i8 { const DTYPE: DataType = DataType::I8; }
+impl Dtype for f16 { const DTYPE: DataType = DataType::F16; }
 impl Dtype for bf16 { const DTYPE: DataType = DataType::BF16; }
 
 #[derive(Clone,Debug)] // Clone 是廉价的，因为它只克隆 Arc
@@ -124,16 +125,16 @@ pub enum Tensor {
     F32(TypedTensor<f32>),
     I32(TypedTensor<i32>),
     I8(TypedTensor<i8>),
+    F16(TypedTensor<f16>),
     BF16(TypedTensor<bf16>),
-    // 未来可以轻松扩展，比如 F16, BF16 等
 }
 macro_rules! dispatch_on_tensor {
     ($self:expr, $method:ident($($args:expr),*)) => {
-        // 宏的“展开体”
         match $self {
             Tensor::F32(t) => t.$method($($args),*),
             Tensor::I32(t) => t.$method($($args),*),
             Tensor::I8(t) => t.$method($($args),*),
+            Tensor::F16(t) => t.$method($($args),*),
             Tensor::BF16(t) => t.$method($($args),*),
         }
     };
@@ -145,6 +146,7 @@ impl Tensor {
             DataType::F32 => Ok(Tensor::F32(TypedTensor::<f32>::new(shape, device)?)),
             DataType::I32 => Ok(Tensor::I32(TypedTensor::<i32>::new(shape, device)?)),
             DataType::I8 => Ok(Tensor::I8(TypedTensor::<i8>::new(shape, device)?)),
+            DataType::F16 => Ok(Tensor::F16(TypedTensor::<f16>::new(shape, device)?)),
             DataType::BF16 => Ok(Tensor::BF16(TypedTensor::<bf16>::new(shape, device)?)),
             _ => unimplemented!()
         }
@@ -154,6 +156,7 @@ impl Tensor {
             DataType::F32 => Ok(Tensor::F32(TypedTensor::<f32>::from_buffer(buffer, shape)?)),
             DataType::I32 => Ok(Tensor::I32(TypedTensor::<i32>::from_buffer(buffer, shape)?)),
             DataType::I8 => Ok(Tensor::I8(TypedTensor::<i8>::from_buffer(buffer, shape)?)),
+            DataType::F16 => Ok(Tensor::F16(TypedTensor::<f16>::from_buffer(buffer, shape)?)),
             DataType::BF16 => Ok(Tensor::BF16(TypedTensor::<bf16>::from_buffer(buffer, shape)?)),
             _ => unimplemented!()
         }
@@ -170,6 +173,7 @@ impl Tensor {
             Tensor::F32(_) => DataType::F32,
             Tensor::I32(_) => DataType::I32,
             Tensor::I8(_) => DataType::I8,
+            Tensor::F16(_) => DataType::F16,
             Tensor::BF16(_) => DataType::BF16,
         }
     }
@@ -202,8 +206,8 @@ impl Tensor {
         match self {
             Tensor::F32(t) => Ok(Tensor::F32(TypedTensor {
                 dims: new_dims,
-                num_elements: self.num_elements(), // 新形状的元素数量与原形状相同
-                buffer: t.buffer().clone(), // 廉价的 Arc clone
+                num_elements: self.num_elements(),
+                buffer: t.buffer().clone(),
                 _phantom: std::marker::PhantomData,
             })),
             Tensor::I32(t) => Ok(Tensor::I32(TypedTensor {
@@ -213,6 +217,12 @@ impl Tensor {
                 _phantom: std::marker::PhantomData,
             })),
             Tensor::I8(t) => Ok(Tensor::I8(TypedTensor {
+                dims: new_dims,
+                num_elements: self.num_elements(),
+                buffer: t.buffer().clone(),
+                _phantom: std::marker::PhantomData,
+            })),
+            Tensor::F16(t) => Ok(Tensor::F16(TypedTensor {
                 dims: new_dims,
                 num_elements: self.num_elements(),
                 buffer: t.buffer().clone(),
@@ -277,6 +287,26 @@ impl Tensor {
         }
     }
 
+    pub fn as_f16(&self) -> Result<&TypedTensor<f16>> {
+        match self {
+            Tensor::F16(t) => Ok(t),
+            _ => Err(Error::InvalidArgument(format!(
+                "Type mismatch: expected F16, found {:?}",
+                self.dtype()
+            )).into()),
+        }
+    }
+
+    pub fn as_f16_mut(&mut self) -> Result<&mut TypedTensor<f16>> {
+        match self {
+            Tensor::F16(t) => Ok(t),
+            _ => Err(Error::InvalidArgument(format!(
+                "Type mismatch: expected F16, found {:?}",
+                self.dtype()
+            )).into()),
+        }
+    }
+
     pub fn as_bf16(&self) -> Result<&TypedTensor<bf16>> {
         match self {
             Tensor::BF16(t) => Ok(t),
@@ -315,6 +345,12 @@ impl Tensor {
                 _phantom: std::marker::PhantomData,
             }),
             Tensor::I8(t) => Tensor::I8(TypedTensor {
+                dims: t.shape().clone(),
+                num_elements: t.num_elements(),
+                buffer: cpu_buffer,
+                _phantom: std::marker::PhantomData,
+            }),
+            Tensor::F16(t) => Tensor::F16(TypedTensor {
                 dims: t.shape().clone(),
                 num_elements: t.num_elements(),
                 buffer: cpu_buffer,
@@ -366,6 +402,12 @@ impl Tensor {
                 buffer: gpu_buffer,
                 _phantom: std::marker::PhantomData,
             }),
+            Tensor::F16(t) => Tensor::F16(TypedTensor {
+                dims: t.shape().clone(),
+                num_elements: t.num_elements(),
+                buffer: gpu_buffer,
+                _phantom: std::marker::PhantomData,
+            }),
             Tensor::BF16(t) => Tensor::BF16(TypedTensor {
                 dims: t.shape().clone(),
                 num_elements: t.num_elements(),
@@ -384,6 +426,7 @@ impl Tensor {
         // 1. 将 safetensors 的 Dtype 映射到我们自己的 DataType 枚举
         let our_dtype = match safetensor_dtype {
             SafetensorDtype::F32 => DataType::F32,
+            SafetensorDtype::F16 => DataType::F16,
             SafetensorDtype::BF16 => DataType::BF16,
             SafetensorDtype::I32 => DataType::I32,
             SafetensorDtype::I8 => DataType::I8,
@@ -433,6 +476,7 @@ impl Tensor {
         // 1. 将 safetensors 的 Dtype 映射到我们自己的 DataType 枚举
         let our_dtype = match safetensor_dtype {
             SafetensorDtype::F32 => DataType::F32,
+            SafetensorDtype::F16 => DataType::F16,
             SafetensorDtype::BF16 => DataType::BF16,
             SafetensorDtype::I32 => DataType::I32,
             SafetensorDtype::I8 => DataType::I8,
@@ -451,6 +495,7 @@ impl Tensor {
             Tensor::F32(t) => t.buffer_mut(),
             Tensor::I32(t) => t.buffer_mut(),
             Tensor::I8(t) => t.buffer_mut(),
+            Tensor::F16(t) => t.buffer_mut(),
             Tensor::BF16(t) => t.buffer_mut(),
         }
     }
@@ -531,6 +576,7 @@ impl Tensor {
             Tensor::F32(_) => Tensor::F32(TypedTensor::<f32>::from_buffer(sliced_buffer, new_shape)?),
             Tensor::I32(_) => Tensor::I32(TypedTensor::<i32>::from_buffer(sliced_buffer, new_shape)?),
             Tensor::I8(_) => Tensor::I8(TypedTensor::<i8>::from_buffer(sliced_buffer, new_shape)?),
+            Tensor::F16(_) => Tensor::F16(TypedTensor::<f16>::from_buffer(sliced_buffer, new_shape)?),
             Tensor::BF16(_) => Tensor::BF16(TypedTensor::<bf16>::from_buffer(sliced_buffer, new_shape)?),
         };
         

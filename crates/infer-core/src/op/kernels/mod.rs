@@ -66,21 +66,13 @@ pub fn split_cols_tensor(
         DeviceType::Cpu => cpu::split_cols_tensor(src, dst, rows, total_cols, col_offset, dst_cols),
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
-            if src.dtype() != DataType::BF16 {
-                return Err(Error::InvalidArgument(format!(
-                    "CUDA split_cols currently supports BF16 only, got {:?}",
-                    src.dtype()
-                )).into());
+            match src.dtype() {
+                DataType::BF16 => cuda::split_cols_bf16_tensor(src, dst, rows, total_cols, col_offset, dst_cols, cuda_stream),
+                DataType::F16 => cuda::split_cols_fp16_tensor(src, dst, rows, total_cols, col_offset, dst_cols, cuda_stream),
+                other => Err(Error::InvalidArgument(format!(
+                    "CUDA split_cols supports BF16/F16 only, got {:?}", other
+                )).into()),
             }
-            cuda::split_cols_bf16_tensor(
-                src,
-                dst,
-                rows,
-                total_cols,
-                col_offset,
-                dst_cols,
-                cuda_stream,
-            )
         }
     }
 }

@@ -22,6 +22,16 @@ unsafe extern "C" {
         eps: f32,
         stream:crate::cuda::ffi::cudaStream_t,
     );
+
+    fn rmsnorm_kernel_cu_fp16x8(
+        output: *mut half::f16,
+        input: *const half::f16,
+        weight: *const half::f16,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream:crate::cuda::ffi::cudaStream_t,
+    );
 }
 
 /// RMSNorm 的 CUDA 内核包装函数
@@ -75,6 +85,31 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, c
             
             unsafe {
                 rmsnorm_kernel_cu_bf16x8(
+                    output_ptr,
+                    input_ptr,
+                    weight_ptr,
+                    rows as i32,
+                    dim as i32,
+                    eps,
+                    stream
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            let input_typed = input.as_f16()?;
+            let weight_typed = weight.as_f16()?;
+            let output_typed:&mut TypedTensor<half::f16> = output.as_f16_mut()?;
+            // 检查对齐要求
+            if !dim.is_multiple_of(16) {
+                return Err(Error::InvalidArgument("RMSNorm fp16 kernel requires dimension to be multiple of 16".to_string()).into());
+            }
+            
+            let input_ptr = input_typed.buffer().as_ptr() as *const half::f16;
+            let weight_ptr = weight_typed.buffer().as_ptr() as *const half::f16;
+            let output_ptr = output_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            
+            unsafe {
+                rmsnorm_kernel_cu_fp16x8(
                     output_ptr,
                     input_ptr,
                     weight_ptr,
