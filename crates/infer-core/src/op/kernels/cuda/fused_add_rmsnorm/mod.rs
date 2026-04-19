@@ -1,4 +1,5 @@
-use crate::base::error::Result;
+use crate::base::error::{Result, Error};
+use crate::base::DataType;
 use crate::cuda::config::CudaConfig;
 use crate::tensor::Tensor;
 
@@ -13,10 +14,21 @@ unsafe extern "C" {
         eps: f32,
         stream: crate::cuda::ffi::cudaStream_t,
     );
+
+    fn fused_add_rmsnorm_kernel_cu_fp16(
+        norm_output: *mut half::f16,
+        residual: *mut half::f16,
+        input: *const half::f16,
+        weight: *const half::f16,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        stream: crate::cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Fused: residual += input; norm_output = rmsnorm(residual, weight)
-/// BF16 only. Saves one kernel launch vs separate add + rmsnorm.
+/// Supports BF16 and FP16. Saves one kernel launch vs separate add + rmsnorm.
 pub fn fused_add_rmsnorm(
     norm_output: &mut Tensor,
     residual: &mut Tensor,
@@ -28,23 +40,38 @@ pub fn fused_add_rmsnorm(
     let dim = weight.shape()[0];
     let rows = input.num_elements() / dim;
     let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let dtype = input.dtype();
 
-    let norm_out_ptr = norm_output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let res_ptr = residual.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let input_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let weight_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-
-    unsafe {
-        fused_add_rmsnorm_kernel_cu_bf16(
-            norm_out_ptr,
-            res_ptr,
-            input_ptr,
-            weight_ptr,
-            rows as i32,
-            dim as i32,
-            eps,
-            stream,
-        );
+    match dtype {
+        DataType::BF16 => {
+            let norm_out_ptr = norm_output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let res_ptr = residual.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let input_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let weight_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            unsafe {
+                fused_add_rmsnorm_kernel_cu_bf16(
+                    norm_out_ptr, res_ptr, input_ptr, weight_ptr,
+                    rows as i32, dim as i32, eps, stream,
+                );
+            }
+        }
+        DataType::F16 => {
+            let norm_out_ptr = norm_output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let res_ptr = residual.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let input_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let weight_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
+            unsafe {
+                fused_add_rmsnorm_kernel_cu_fp16(
+                    norm_out_ptr, res_ptr, input_ptr, weight_ptr,
+                    rows as i32, dim as i32, eps, stream,
+                );
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported data type for fused_add_rmsnorm: {:?}", dtype
+            )).into());
+        }
     }
     Ok(())
 }

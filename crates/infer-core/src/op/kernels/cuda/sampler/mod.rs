@@ -22,6 +22,13 @@ unsafe extern "C" {
         result_ptr_gpu: *mut i32, // << 指向 GPU 内存
         stream: cuda::ffi::cudaStream_t,
     );
+
+    fn argmax_cu_fp16_ffi(
+        logits_ptr: *const half::f16, // Rust 的 f16 类型
+        vocab_size: i32,
+        result_ptr_gpu: *mut i32, // << 指向 GPU 内存
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// 在 GPU 上执行 argmax，并通过 D2H 拷贝隐式同步返回结果。
@@ -58,6 +65,20 @@ pub fn argmax(logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&C
             // 调用 bf16 专用的 FFI 函数
             unsafe {
                 argmax_cu_bf16_ffi(
+                    logits_ptr,
+                    vocab_size as i32,
+                    output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
+                    stream,
+                )
+            }
+        }
+        DataType::F16 => {
+            // 提取类型化指针
+            let logits_ptr = logits.as_f16()?.buffer().as_ptr() as *const half::f16;
+
+            // 调用 bf16 专用的 FFI 函数
+            unsafe {
+                argmax_cu_fp16_ffi(
                     logits_ptr,
                     vocab_size as i32,
                     output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,

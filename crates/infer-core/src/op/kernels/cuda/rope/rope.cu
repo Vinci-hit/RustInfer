@@ -3,6 +3,7 @@
 #include <device_launch_parameters.h>
 #include <cstdio>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 // 宏定义：用于处理 CUDA 核函数中的错误检查，在实际生产代码中推荐使用
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
@@ -253,30 +254,38 @@ __global__ void sin_cos_calc(int head_size, int max_seq_len, float rope_theta, f
 
 __global__ void sin_cos_calc_bf16(int head_size, int max_seq_len, float rope_theta,
                                   __nv_bfloat16* sin_cache,
-                                  __nv_bfloat16* cos_cache) {
-    // 每个线程处理一个“偶数维度对”的索引 k（k = 0, 1, ..., head_size/2 - 1）
+                                  __nv_bfloat16* cos_cache,
+                                  float factor, float low_freq_factor, float high_freq_factor,
+                                  float original_max_pos_emb) {
     int k = threadIdx.x + blockDim.x * blockIdx.x;
     int half_head = head_size / 2;
 
     if (k >= half_head) return;
 
-    // 对应的原始偶数维度索引：dim = 2 * k
     int dim = 2 * k;
-
-    float base = rope_theta;
     float exponent = (float)dim / (float)head_size;
-    float freq = 1.0f / powf(base, exponent);
+    float freq = 1.0f / powf(rope_theta, exponent);
 
-    // 遍历所有位置
+    // Apply llama3 rope scaling if factor > 1
+    if (factor > 1.0f) {
+        float old_context_len = original_max_pos_emb;
+        float low_freq_wavelen = old_context_len / low_freq_factor;
+        float high_freq_wavelen = old_context_len / high_freq_factor;
+        float wavelen = 2.0f * 3.14159265358979323846f / freq;
+
+        if (wavelen > low_freq_wavelen) {
+            freq = freq / factor;
+        } else if (wavelen >= high_freq_wavelen) {
+            float smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+            freq = (1.0f - smooth) * freq / factor + smooth * freq;
+        }
+    }
+
     for (int pos = 0; pos < max_seq_len; ++pos) {
         float val = (float)pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
-
-        // 写入压缩后的缓存：每个 pos 只占 half_head 个元素
         int cache_idx = pos * half_head + k;
-        sin_cache[cache_idx] = __float2bfloat16(fci);
-        cos_cache[cache_idx] = __float2bfloat16(fcr);
+        sin_cache[cache_idx] = __float2bfloat16(sinf(val));
+        cos_cache[cache_idx] = __float2bfloat16(cosf(val));
     }
 }
 
@@ -311,10 +320,10 @@ extern "C" void sin_cos_cache_calc_cu_bf16(
     float rope_theta,
     __nv_bfloat16* sin_cache,
     __nv_bfloat16* cos_cache,
+    float factor, float low_freq_factor, float high_freq_factor,
+    float original_max_pos_emb,
     cudaStream_t stream)
 {
-
-    // 启动配置：1 个 Block，head_size 个 Threads
     int threads = head_size;
 
     sin_cos_calc_bf16<<<1, threads, 0, stream>>>(
@@ -322,9 +331,173 @@ extern "C" void sin_cos_cache_calc_cu_bf16(
         max_seq_len,
         rope_theta,
         sin_cache,
-        cos_cache
+        cos_cache,
+        factor, low_freq_factor, high_freq_factor, original_max_pos_emb
     );
-    
-    // 检查核函数启动错误
+
     CUDA_CHECK(cudaGetLastError());
 }
+
+
+
+
+// ============= FP16 variants (auto-generated from BF16) =============
+
+__global__ void rope_rotate_kernel_llama3_fp16(
+    __half* __restrict__ input_q,      // [seq_len, num_heads, head_size]
+    __half* __restrict__ input_k,      // [seq_len, num_kv_heads, head_size]
+    const __half* __restrict__ sin_cache, // [max_seq_len, head_size / 2]
+    const __half* __restrict__ cos_cache, // [max_seq_len, head_size / 2]
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_size,
+    const int* pos_offset,                     // 当前 batch 的起始位置偏移
+    const int seq_len                         // 当前处理的序列长度
+) {
+    // 1. 维度计算
+    const int tid = threadIdx.x;              // 0 -> half_head - 1
+    const int q_head_idx = blockIdx.x;        // 当前是第几个 Q head
+    const int seq_idx = blockIdx.y;           // 当前是序列中的第几个 token
+    const int half_head = head_size / 2;
+    const int group_size = num_heads / num_kv_heads; // GQA 分组大小
+
+    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= seq_len) {
+        return;
+    }
+
+    // 2. 计算 RoPE Cache 的绝对位置索引
+    // Llama 3 通常预计算好了 sin/cos，形状为 [max_seq, half_head]
+    int abs_pos = *pos_offset + seq_idx;
+    float sin_val = __half2float(sin_cache[abs_pos * half_head + tid]);
+    float cos_val = __half2float(cos_cache[abs_pos * half_head + tid]);
+
+    // 3. 处理 Query (Q)
+    // 计算当前线程对应的 Q 的两个分量位置
+    // 数据布局假设为: [seq, num_heads, head_size]
+    int q_base = (seq_idx * num_heads + q_head_idx) * head_size;
+    int idx_1 = q_base + tid;
+    int idx_2 = q_base + tid + half_head;
+
+    float q1 = __half2float(input_q[idx_1]);
+    float q2 = __half2float(input_q[idx_2]);
+
+    // RoPE 核心旋转公式
+    input_q[idx_1] = __float2half(q1 * cos_val - q2 * sin_val);
+    input_q[idx_2] = __float2half(q1 * sin_val + q2 * cos_val);
+
+    // 4. 处理 Key (K) - GQA 逻辑
+    // 只有当当前的 Q head 索引是一个组的第一个时，才处理 K，防止重复计算
+    if (q_head_idx % group_size == 0) {
+        int kv_head_idx = q_head_idx / group_size;
+        int k_base = (seq_idx * num_kv_heads + kv_head_idx) * head_size;
+        
+        int k_idx_1 = k_base + tid;
+        int k_idx_2 = k_base + tid + half_head;
+
+        float k1 = __half2float(input_k[k_idx_1]);
+        float k2 = __half2float(input_k[k_idx_2]);
+
+        input_k[k_idx_1] = __float2half(k1 * cos_val - k2 * sin_val);
+        input_k[k_idx_2] = __float2half(k1 * sin_val + k2 * cos_val);
+    }
+}
+
+extern "C" void rope_kernel_cu_fp16(
+    int32_t dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    __half* input_q,
+    __half* input_k,
+    int32_t* input_pos,
+    int32_t seq_len,
+    __half* sin_cache,
+    __half* cos_cache,
+    cudaStream_t stream)
+{
+    // 每个线程处理一对元素，所以 Block 大小为 head_size / 2
+    // 假设 head_size = 128 (Llama-3), threads = 64，一个 Warp 也就搞定了，效率很高
+    int threads_per_block = head_size / 2;
+    
+    // Grid.x = Head 的数量
+    int num_heads = dim / head_size; 
+    
+    // Grid.y = Sequence Length
+    dim3 grid(num_heads, seq_len);
+    rope_rotate_kernel_llama3_fp16<<<grid, threads_per_block, 0, stream>>>(
+        input_q,
+        input_k,
+        sin_cache,
+        cos_cache,
+        num_heads,
+        kv_dim / head_size,
+        head_size,
+        input_pos,
+        seq_len
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("RoPE Kernel Failed: %s\n", cudaGetErrorString(err));
+    }
+}
+
+__global__ void sin_cos_calc_fp16(int head_size, int max_seq_len, float rope_theta,
+                                  __half* sin_cache,
+                                  __half* cos_cache,
+                                  float factor, float low_freq_factor, float high_freq_factor,
+                                  float original_max_pos_emb) {
+    int k = threadIdx.x + blockDim.x * blockIdx.x;
+    int half_head = head_size / 2;
+
+    if (k >= half_head) return;
+
+    int dim = 2 * k;
+    float exponent = (float)dim / (float)head_size;
+    float freq = 1.0f / powf(rope_theta, exponent);
+
+    if (factor > 1.0f) {
+        float old_context_len = original_max_pos_emb;
+        float low_freq_wavelen = old_context_len / low_freq_factor;
+        float high_freq_wavelen = old_context_len / high_freq_factor;
+        float wavelen = 2.0f * 3.14159265358979323846f / freq;
+
+        if (wavelen > low_freq_wavelen) {
+            freq = freq / factor;
+        } else if (wavelen >= high_freq_wavelen) {
+            float smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+            freq = (1.0f - smooth) * freq / factor + smooth * freq;
+        }
+    }
+
+    for (int pos = 0; pos < max_seq_len; ++pos) {
+        float val = (float)pos * freq;
+        int cache_idx = pos * half_head + k;
+        sin_cache[cache_idx] = __float2half(sinf(val));
+        cos_cache[cache_idx] = __float2half(cosf(val));
+    }
+}
+
+extern "C" void sin_cos_cache_calc_cu_fp16(
+    int32_t head_size,
+    int32_t max_seq_len,
+    float rope_theta,
+    __half* sin_cache,
+    __half* cos_cache,
+    float factor, float low_freq_factor, float high_freq_factor,
+    float original_max_pos_emb,
+    cudaStream_t stream)
+{
+    int threads = head_size;
+
+    sin_cos_calc_fp16<<<1, threads, 0, stream>>>(
+        head_size,
+        max_seq_len,
+        rope_theta,
+        sin_cache,
+        cos_cache,
+        factor, low_freq_factor, high_freq_factor, original_max_pos_emb
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+}
+

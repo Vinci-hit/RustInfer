@@ -3,18 +3,29 @@ use crate::base::{DataType, DeviceType};
 use crate::op::{kernels, Op, OpContext};
 use crate::tensor::Tensor;
 
+/// 量化参数，封装不同量化格式所需的张量和超参数。
+/// 未来扩展 GPTQ / FP8 等格式只需在此 enum 增加变体。
+pub enum QuantParams {
+    /// AWQ INT4 量化 (K-packed 格式)
+    /// weight_packed: [N, K/8] I32 — 8 个连续 K 位置的 INT4 打包在一个 int32
+    /// zeros: [N/8, num_groups] I32 — 零点沿 N 方向打包
+    /// scales: [N, num_groups] BF16
+    Awq {
+        zeros: Tensor,
+        scales: Tensor,
+        group_size: usize,
+    },
+}
+
 /// Matmul 算子，执行 Y = W@X^T + B
 ///
-/// 其中：
-/// - X 是输入张量
-/// - W 是权重矩阵
-/// - B 是可选的偏置向量
+/// 支持两种模式：
+/// 1. 普通模式: weight 为 FP16/BF16/FP32 权重，quant = None
+/// 2. INT4 量化模式: weight 为 weight_packed [N, K/8] I32，quant = Some(QuantParams::Int4 { ... })
 pub struct Matmul {
-    /// 权重矩阵 W，形状通常为 [out_features, in_features]
     pub weight: Tensor,
-    
-    /// 可选的偏置向量 B，形状通常为 [out_features]
     pub bias: Option<Tensor>,
+    pub quant: Option<QuantParams>,
 }
 
 impl Matmul {
@@ -44,10 +55,28 @@ impl Matmul {
             None
         };
 
-        Ok(Self { weight, bias })
+        Ok(Self { weight, bias, quant: None })
     }
     pub fn from(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
+        Self { weight, bias, quant: None }
+    }
+
+    /// 创建一个 AWQ 量化的 Matmul 算子。
+    /// weight_packed: [N, K/8] I32 — INT4 packed along K, sequential order
+    /// zeros: [N/8, num_groups] I32 — zero points packed along N
+    /// scales: [N, num_groups] BF16
+    pub fn from_awq(
+        weight_packed: Tensor,
+        zeros: Tensor,
+        scales: Tensor,
+        group_size: usize,
+        bias: Option<Tensor>,
+    ) -> Self {
+        Self {
+            weight: weight_packed,
+            bias,
+            quant: Some(QuantParams::Awq { zeros, scales, group_size }),
+        }
     }
 }
 
@@ -75,8 +104,17 @@ impl Op for Matmul {
         if output.device() != device || weight.device() != device {
             return Err(Error::InvalidArgument("All tensors must be on the same device".into()).into());
         }
-        if output.dtype() != dtype || weight.dtype() != dtype {
-            return Err(Error::InvalidArgument("All tensors must have the same data type".into()).into());
+        // AWQ 模式下 weight 是 I32 (打包的 qweight)，跳过 weight dtype 检查
+        if self.quant.is_none() {
+            if output.dtype() != dtype || weight.dtype() != dtype {
+                return Err(Error::InvalidArgument("All tensors must have the same data type".into()).into());
+            }
+        } else {
+            if output.dtype() != dtype {
+                return Err(Error::InvalidArgument(format!(
+                    "Quantized Matmul: output dtype {:?} != input dtype {:?}", output.dtype(), dtype
+                )).into());
+            }
         }
         if let Some(bias) = &self.bias
             && (bias.device() != device || bias.dtype() != dtype)
@@ -97,21 +135,36 @@ impl Op for Matmul {
         // ==================== 2. 分派到内核 (对应 C++ 的 forward() 主体) ====================
         match device {
             DeviceType::Cpu => {
+                if self.quant.is_some() {
+                    return Err(Error::InvalidArgument(
+                        "Quantized Matmul is only supported on CUDA devices".into()
+                    ).into());
+                }
                 // 调用 CPU 内核函数Y = W@X^T + B
                 kernels::cpu::matmul(input,weight,output)?;
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                if input.dtype() == DataType::BF16{
+                if let Some(QuantParams::Awq { zeros, scales, group_size }) = &self.quant {
+                    // ---- AWQ INT4 量化路径 ----
+                    if input.shape()[0] == 1 {
+                        kernels::cuda::kpack_gemv(input, &self.weight, zeros, scales, *group_size, output, ctx.cuda_config)?;
+                    } else {
+                        kernels::cuda::kpack_gemm(input, &self.weight, zeros, scales, *group_size, output, ctx.cuda_config)?;
+                    }
+                } else if input.dtype() == DataType::BF16{
                     let n = weight.shape()[0]; // output dimension
                     if input.shape()[0] == 1 && n <= 16384 {
-                        // Decode (M=1) + small/medium N: custom GEMV kernel
-                        // Benchmarked on H20: 25-44% faster than cublasLt for N≤13824
-                        // (avoids splitK overhead + Tensor Core padding waste)
                         kernels::cuda::hgemv_bf16(input, weight, output, ctx.cuda_config)?;
                     } else {
-                        // Prefill (M>1) or large N (lm_head vocab=151936): cublasLt
                         kernels::cuda::hgemm_bf16(input, weight, output, ctx.cuda_config)?;
+                    }
+                } else if input.dtype() == DataType::F16{
+                    let n = weight.shape()[0];
+                    if input.shape()[0] == 1 && n <= 16384 {
+                        kernels::cuda::hgemv_fp16(input, weight, output, ctx.cuda_config)?;
+                    } else {
+                        kernels::cuda::hgemm_fp16(input, weight, output, ctx.cuda_config)?;
                     }
                 }else if input.shape()[0] == 1{
                     kernels::cuda::sgemv(input, weight, output, ctx.cuda_config)?;
@@ -144,11 +197,17 @@ impl Op for Matmul {
 impl Matmul {
     /// Move Matmul internal parameters to CUDA device
     pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        // move weight
         self.weight = self.weight.to_cuda(device_id)?;
-        // move bias if exists
         if let Some(b) = &self.bias {
             self.bias = Some(b.to_cuda(device_id)?);
+        }
+        if let Some(QuantParams::Awq { zeros, scales, .. }) = &self.quant {
+            let new_zeros = zeros.to_cuda(device_id)?;
+            let new_scales = scales.to_cuda(device_id)?;
+            if let Some(QuantParams::Awq { zeros: z, scales: s, .. }) = &mut self.quant {
+                *z = new_zeros;
+                *s = new_scales;
+            }
         }
         Ok(())
     }

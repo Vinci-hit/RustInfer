@@ -301,3 +301,312 @@ void gemm_cublaslt_bf16(
 ) {
     gemm_cublasLt_AxBT_RowMajor_bf16(handle, M, N, K, A, B, C, workspace, workspaceSize,stream);
 }
+
+// ============================================================================
+// FP16 variants (for AWQ / float16 models)
+// ============================================================================
+
+// --- FP16 cublasLt GEMM: C = A @ B^T, row-major, all FP16 ---
+void gemm_cublasLt_AxBT_RowMajor_fp16(
+    cublasLtHandle_t ltHandle,
+    int M, int N, int K,
+    const half *d_A,
+    const half *d_B,
+    half *d_C,
+    void *workspace,
+    size_t workspaceSize,
+    cudaStream_t stream)
+{
+    int m_gemm = N;
+    int n_gemm = M;
+    int k_gemm = K;
+
+    cublasOperation_t transA = CUBLAS_OP_T;
+    cublasOperation_t transB = CUBLAS_OP_N;
+
+    cublasLtMatmulDesc_t operationDesc = NULL;
+    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
+
+    cublasLtMatrixLayout_t Adesc = NULL;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16F, k_gemm, m_gemm, k_gemm));
+    cublasLtMatrixLayout_t Bdesc = NULL;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16F, k_gemm, n_gemm, k_gemm));
+    cublasLtMatrixLayout_t Cdesc = NULL;
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16F, m_gemm, n_gemm, m_gemm));
+
+    cublasLtMatmulPreference_t preference = NULL;
+    CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
+    CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
+
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+    int returnedResults = 0;
+    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
+    if (returnedResults == 0) { printf("cuBLASLt FP16: No algorithm found!\n"); exit(1); }
+
+    float alpha = 1.0f, beta = 0.0f;
+    CHECK_CUBLAS(cublasLtMatmul(ltHandle, operationDesc, &alpha,
+                                d_B, Adesc, d_A, Bdesc, &beta,
+                                d_C, Cdesc, d_C, Cdesc,
+                                &heuristicResult.algo, workspace, workspaceSize, stream));
+
+    cublasLtMatmulPreferenceDestroy(preference);
+    cublasLtMatrixLayoutDestroy(Adesc);
+    cublasLtMatrixLayoutDestroy(Bdesc);
+    cublasLtMatrixLayoutDestroy(Cdesc);
+    cublasLtMatmulDescDestroy(operationDesc);
+}
+
+// --- FP16 GEMV kernel (same structure as BF16 v3) ---
+template <int WARPS_PER_BLOCK>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 6)
+hgemv_fp16_v3_kernel(
+    const half* __restrict__ input,
+    const half* __restrict__ weight,
+    half* __restrict__ output,
+    const int N,
+    const int K
+) {
+    const int lane_id = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+
+    const int pack_num = K >> 3;
+    const float4* __restrict__ input_f4 = reinterpret_cast<const float4*>(input);
+    const float4* __restrict__ weight_f4 = reinterpret_cast<const float4*>(weight + row * K);
+
+    float sum = 0.0f;
+    for (int i = lane_id; i < pack_num; i += 32) {
+        float4 x = __ldg(input_f4 + i);
+        float4 w = __ldg(weight_f4 + i);
+        const half* xh = reinterpret_cast<const half*>(&x);
+        const half* wh = reinterpret_cast<const half*>(&w);
+        sum += __half2float(xh[0]) * __half2float(wh[0]);
+        sum += __half2float(xh[1]) * __half2float(wh[1]);
+        sum += __half2float(xh[2]) * __half2float(wh[2]);
+        sum += __half2float(xh[3]) * __half2float(wh[3]);
+        sum += __half2float(xh[4]) * __half2float(wh[4]);
+        sum += __half2float(xh[5]) * __half2float(wh[5]);
+        sum += __half2float(xh[6]) * __half2float(wh[6]);
+        sum += __half2float(xh[7]) * __half2float(wh[7]);
+    }
+    sum = warp_reduce_sum_gemv(sum);
+    if (lane_id == 0) output[row] = __float2half(sum);
+}
+
+extern "C" void hgemv_fp16_cu(
+    const half* input, const half* weight, half* output,
+    int N, int K, cudaStream_t stream
+) {
+    constexpr int WARPS_PER_BLOCK = 8;
+    constexpr int THREADS = WARPS_PER_BLOCK * 32;
+    int grid = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    hgemv_fp16_v3_kernel<WARPS_PER_BLOCK><<<grid, THREADS, 0, stream>>>(input, weight, output, N, K);
+}
+
+extern "C" void gemm_cublaslt_fp16(
+    const half* A, const half* B, half* C,
+    int M, int N, int K,
+    cudaStream_t stream, cublasLtHandle_t handle,
+    void* workspace, size_t workspaceSize
+) {
+    gemm_cublasLt_AxBT_RowMajor_fp16(handle, M, N, K, A, B, C, workspace, workspaceSize, stream);
+}
+
+// ============================================================================
+//  INT4 GEMV (decode, M=1) — K-packed, int4 vectorized, BF16
+//
+//  Weight layout (compressed-tensors / pack-quantized format):
+//    weight_packed:     [N, K/8]        (int32) — 8 consecutive K-position INT4 per int32
+//    weight_zero_point: [N/8, num_groups] (int32) — zero points packed along N
+//    weight_scale:      [N, num_groups]   (bf16)  — per-group scale factors
+//
+//  Dequant: w = (extract(packed, k%8) - extract(zeros, n%8)) * scale
+//
+//  GEMV: 1 warp per output row, int4 vectorized reads along K/8.
+//        Each int4 load = 4 x int32 = 32 INT4 = 32 K positions.
+//        Input also loaded as int4 (8 bf16 = 16 bytes).
+// ============================================================================
+
+template <int WARPS_PER_BLOCK>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 4)
+kpack_gemv_kernel(
+    const __nv_bfloat16* __restrict__ input,        // [K]
+    const int32_t* __restrict__ weight_packed,       // [N, K/8]
+    const int32_t* __restrict__ weight_zero_point,   // [N/8, num_groups]
+    const __nv_bfloat16* __restrict__ weight_scale,  // [N, num_groups]
+    __nv_bfloat16* __restrict__ output,              // [N]
+    const int N, const int K, const int group_size
+) {
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int K_packed = K >> 3;
+    const int num_groups = K / group_size;
+
+    const int row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (row >= N) return;
+
+    const int32_t* wp_row = weight_packed + row * K_packed;
+    const __nv_bfloat16* sc_row = weight_scale + row * num_groups;
+
+    const int zp_row_packed = row >> 3;
+    const int zp_bit_offset = (row & 7) * 4;
+    const int32_t* zp_row = weight_zero_point + zp_row_packed * num_groups;
+
+    const int4* wp_i4 = reinterpret_cast<const int4*>(wp_row);
+    const int num_int4 = K_packed >> 2;  // K / 32
+
+    const int4* input_i4 = reinterpret_cast<const int4*>(input);
+
+    float acc = 0.0f;
+
+    for (int i4 = lane_id; i4 < num_int4; i4 += 32) {
+        int4 w4 = __ldg(&wp_i4[i4]);
+        int k_base = i4 * 32;
+        int g = k_base / group_size;
+
+        float scale = __bfloat162float(__ldg(&sc_row[g]));
+        int32_t zp_packed = __ldg(&zp_row[g]);
+        int zero = (zp_packed >> zp_bit_offset) & 0xF;
+
+        int input_i4_base = k_base >> 3;
+        int4 in0 = __ldg(&input_i4[input_i4_base]);
+        int4 in1 = __ldg(&input_i4[input_i4_base + 1]);
+        int4 in2 = __ldg(&input_i4[input_i4_base + 2]);
+        int4 in3 = __ldg(&input_i4[input_i4_base + 3]);
+
+        const __nv_bfloat16* inp0 = reinterpret_cast<const __nv_bfloat16*>(&in0);
+        const __nv_bfloat16* inp1 = reinterpret_cast<const __nv_bfloat16*>(&in1);
+        const __nv_bfloat16* inp2 = reinterpret_cast<const __nv_bfloat16*>(&in2);
+        const __nv_bfloat16* inp3 = reinterpret_cast<const __nv_bfloat16*>(&in3);
+
+        int32_t word;
+        float dz = (float)(-zero) * scale;
+
+        word = w4.x;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int w_int4 = (word >> (j * 4)) & 0xF;
+            acc += ((float)w_int4 * scale + dz) * __bfloat162float(inp0[j]);
+        }
+        word = w4.y;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int w_int4 = (word >> (j * 4)) & 0xF;
+            acc += ((float)w_int4 * scale + dz) * __bfloat162float(inp1[j]);
+        }
+        word = w4.z;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int w_int4 = (word >> (j * 4)) & 0xF;
+            acc += ((float)w_int4 * scale + dz) * __bfloat162float(inp2[j]);
+        }
+        word = w4.w;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int w_int4 = (word >> (j * 4)) & 0xF;
+            acc += ((float)w_int4 * scale + dz) * __bfloat162float(inp3[j]);
+        }
+    }
+
+    // Handle remainder (K_packed not divisible by 4)
+    int k_packed_start = num_int4 * 4;
+    for (int kp = k_packed_start + lane_id; kp < K_packed; kp += 32) {
+        int k_base = kp * 8;
+        int g = k_base / group_size;
+        float scale = __bfloat162float(__ldg(&sc_row[g]));
+        int32_t zp_packed = __ldg(&zp_row[g]);
+        int zero = (zp_packed >> zp_bit_offset) & 0xF;
+        int32_t word = __ldg(&wp_row[kp]);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int w_int4 = (word >> (j * 4)) & 0xF;
+            float x_val = __bfloat162float(__ldg(&input[k_base + j]));
+            acc += (float)(w_int4 - zero) * scale * x_val;
+        }
+    }
+
+    acc = warp_reduce_sum_gemv(acc);
+    if (lane_id == 0) {
+        output[row] = __float2bfloat16(acc);
+    }
+}
+
+// ============================================================================
+//  INT4 GEMM (prefill, M>1) — K-packed, BF16
+// ============================================================================
+#define INT4_GEMM_BX 16
+#define INT4_GEMM_BY 16
+
+extern "C" __global__ void kpack_gemm_kernel(
+    const __nv_bfloat16* __restrict__ input,         // [M, K]
+    const int32_t* __restrict__ weight_packed,        // [N, K/8]
+    const int32_t* __restrict__ weight_zero_point,    // [N/8, num_groups]
+    const __nv_bfloat16* __restrict__ weight_scale,   // [N, num_groups]
+    __nv_bfloat16* __restrict__ output,               // [M, N]
+    int M, int N, int K, int group_size
+) {
+    const int row = blockIdx.y * INT4_GEMM_BY + threadIdx.y;  // M dim
+    const int col = blockIdx.x * INT4_GEMM_BX + threadIdx.x;  // N dim
+    if (row >= M || col >= N) return;
+
+    const int K_packed = K / 8;
+    const int num_groups = K / group_size;
+
+    const int32_t* wp_row = weight_packed + col * K_packed;
+    const __nv_bfloat16* sc_row = weight_scale + col * num_groups;
+
+    const int zp_col_packed = col >> 3;
+    const int zp_bit_offset = (col & 7) * 4;
+    const int32_t* zp_row = weight_zero_point + zp_col_packed * num_groups;
+
+    float acc = 0.0f;
+
+    for (int kp = 0; kp < K_packed; kp++) {
+        int k_base = kp * 8;
+        int g = k_base / group_size;
+        float scale = __bfloat162float(sc_row[g]);
+        int32_t zp_packed = zp_row[g];
+        int zero = (zp_packed >> zp_bit_offset) & 0xF;
+        int32_t word = wp_row[kp];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int w_int4 = (word >> (j * 4)) & 0xF;
+            float x_val = __bfloat162float(input[row * K + k_base + j]);
+            acc += (float)(w_int4 - zero) * scale * x_val;
+        }
+    }
+    output[row * N + col] = __float2bfloat16(acc);
+}
+
+// ============================================================================
+//  INT4 C-linkage wrappers
+// ============================================================================
+
+extern "C" void kpack_gemv_cu(
+    const void* input, const void* weight_packed, const void* weight_zero_point,
+    const void* weight_scale, void* output,
+    int N, int K, int group_size, cudaStream_t stream
+) {
+    constexpr int WARPS = 4;
+    int grid_x = (N + WARPS - 1) / WARPS;
+
+    kpack_gemv_kernel<WARPS><<<grid_x, WARPS * 32, 0, stream>>>(
+        (const __nv_bfloat16*)input, (const int32_t*)weight_packed,
+        (const int32_t*)weight_zero_point, (const __nv_bfloat16*)weight_scale,
+        (__nv_bfloat16*)output, N, K, group_size);
+}
+
+extern "C" void kpack_gemm_cu(
+    const void* input, const void* weight_packed, const void* weight_zero_point,
+    const void* weight_scale, void* output,
+    int M, int N, int K, int group_size, cudaStream_t stream
+) {
+    dim3 block(INT4_GEMM_BX, INT4_GEMM_BY);
+    dim3 grid((N + INT4_GEMM_BX - 1) / INT4_GEMM_BX, (M + INT4_GEMM_BY - 1) / INT4_GEMM_BY);
+    kpack_gemm_kernel<<<grid, block, 0, stream>>>(
+        (const __nv_bfloat16*)input, (const int32_t*)weight_packed,
+        (const int32_t*)weight_zero_point, (const __nv_bfloat16*)weight_scale,
+        (__nv_bfloat16*)output, M, N, K, group_size);
+}

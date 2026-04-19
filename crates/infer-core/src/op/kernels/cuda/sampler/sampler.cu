@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <thrust/device_ptr.h>
 #include <thrust/extrema.h>
 #include <thrust/system/cuda/execution_policy.h>
@@ -32,6 +33,7 @@ void argmax_cu_f32_ffi(
 
 // ------------------- BF16 版本 (Two-phase parallel argmax) -------------------
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cub/cub.cuh>
 
 // Static device arrays for inter-block communication
@@ -122,3 +124,60 @@ void argmax_cu_bf16_ffi(
     argmax_phase1_bf16<<<num_blocks, threads, 0, stream>>>(logits_ptr, vocab_size);
     argmax_phase2<<<1, threads, 0, stream>>>(num_blocks, result_ptr_gpu);
 }
+
+
+
+
+// ============= FP16 variants (auto-generated from BF16) =============
+
+__global__ void argmax_phase1_fp16(
+    const __half* __restrict__ input,
+    int n
+) {
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    float max_val = -3.40282e38f;
+    int max_idx = -1;
+
+    for (int i = gid; i < n; i += stride) {
+        float val = __half2float(input[i]);
+        if (val > max_val) {
+            max_val = val;
+            max_idx = i;
+        }
+    }
+
+    using BlockReduce = cub::BlockReduce<cub::KeyValuePair<int, float>, 256>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    cub::KeyValuePair<int, float> thread_data{max_idx, max_val};
+    auto argmax_op = [](const cub::KeyValuePair<int, float>& a, const cub::KeyValuePair<int, float>& b) {
+        return (a.value >= b.value) ? a : b;
+    };
+
+    auto block_result = BlockReduce(temp_storage).Reduce(thread_data, argmax_op);
+
+    if (tid == 0) {
+        d_partial_vals[blockIdx.x] = block_result.value;
+        d_partial_idxs[blockIdx.x] = block_result.key;
+    }
+}
+
+extern "C" void argmax_cu_fp16_ffi(
+    const __half* logits_ptr,
+    int vocab_size,
+    int* result_ptr_gpu,
+    cudaStream_t stream
+) {
+    const int threads = 256;
+    // Each thread processes ~4 elements for good occupancy
+    int num_blocks = (vocab_size + threads * 4 - 1) / (threads * 4);
+    if (num_blocks > 1024) num_blocks = 1024;
+    if (num_blocks < 1) num_blocks = 1;
+
+    argmax_phase1_fp16<<<num_blocks, threads, 0, stream>>>(logits_ptr, vocab_size);
+    argmax_phase2<<<1, threads, 0, stream>>>(num_blocks, result_ptr_gpu);
+}
+
