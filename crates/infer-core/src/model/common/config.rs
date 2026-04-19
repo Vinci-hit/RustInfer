@@ -44,6 +44,89 @@ pub fn load_config_from_json<R: Read>(mut json_reader: R) -> Result<ModelFileCon
     }
 }
 
+/// AWQ / GPTQ / compressed-tensors 等量化方案在 config.json 中的 quantization_config 字段。
+/// 支持两种格式：
+/// 1. AWQ 格式: { quant_method: "awq", bits: 4, group_size: 128, zero_point: true }
+/// 2. compressed-tensors 格式: { quant_method: "compressed-tensors", config_groups: { group_0: { weights: { num_bits: 4, group_size: 128 } } } }
+#[derive(Debug, Clone)]
+pub struct QuantizationConfig {
+    pub quant_method: String,      // "awq", "compressed-tensors", ...
+    pub bits: usize,               // 4
+    pub group_size: usize,         // 128
+    pub zero_point: bool,          // true
+}
+
+/// 用于中间反序列化的 raw 结构体
+#[derive(Debug, Clone, Deserialize)]
+struct RawQuantizationConfig {
+    pub quant_method: String,
+    #[serde(default)]
+    pub bits: Option<usize>,
+    #[serde(default)]
+    pub group_size: Option<usize>,
+    #[serde(default)]
+    pub zero_point: Option<bool>,
+    #[serde(default)]
+    pub config_groups: Option<serde_json::Value>,
+}
+
+impl<'de> serde::Deserialize<'de> for QuantizationConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawQuantizationConfig::deserialize(deserializer)?;
+
+        match raw.quant_method.as_str() {
+            "awq" | "gptq" => {
+                Ok(QuantizationConfig {
+                    quant_method: raw.quant_method,
+                    bits: raw.bits.unwrap_or(4),
+                    group_size: raw.group_size.unwrap_or(128),
+                    zero_point: raw.zero_point.unwrap_or(true),
+                })
+            }
+            "compressed-tensors" => {
+                // Extract from config_groups.group_0.weights
+                let mut bits = 4usize;
+                let mut group_size = 128usize;
+                let mut zero_point = false;
+                if let Some(cg) = &raw.config_groups {
+                    if let Some(g0) = cg.get("group_0") {
+                        if let Some(w) = g0.get("weights") {
+                            if let Some(nb) = w.get("num_bits").and_then(|v| v.as_u64()) {
+                                bits = nb as usize;
+                            }
+                            if let Some(gs) = w.get("group_size").and_then(|v| v.as_u64()) {
+                                group_size = gs as usize;
+                            }
+                            // symmetric: false means zero_point is used
+                            if let Some(sym) = w.get("symmetric").and_then(|v| v.as_bool()) {
+                                zero_point = !sym;
+                            }
+                        }
+                    }
+                }
+                Ok(QuantizationConfig {
+                    quant_method: raw.quant_method,
+                    bits,
+                    group_size,
+                    zero_point,
+                })
+            }
+            other => {
+                // Fallback: try to parse flat fields
+                Ok(QuantizationConfig {
+                    quant_method: other.to_string(),
+                    bits: raw.bits.unwrap_or(4),
+                    group_size: raw.group_size.unwrap_or(128),
+                    zero_point: raw.zero_point.unwrap_or(true),
+                })
+            }
+        }
+    }
+}
+
 /// 直接从 config.json 文件反序列化的原始模型配置。
 /// 不提供默认值，缺字段直接报错。
 #[derive(Debug, Clone, Deserialize)]
@@ -68,7 +151,33 @@ pub struct ModelFileConfig {
     pub rope_theta: f64,
     #[serde(alias = "layer_norm_eps")]
     pub rms_norm_eps: f32,
+
+    // 量化配置（AWQ 等），非量化模型中不存在此字段
+    #[serde(default)]
+    pub quantization_config: Option<QuantizationConfig>,
+
+    // RoPE scaling 配置（Llama 3.1/3.2 等），非 scaling 模型中不存在此字段
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
 }
+
+/// RoPE scaling 配置 (Llama 3.1/3.2 等)
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeScalingConfig {
+    #[serde(default = "default_rope_type")]
+    pub rope_type: String,          // "default", "llama3", "linear", etc.
+    #[serde(default = "default_factor")]
+    pub factor: f64,                // 32.0
+    #[serde(default)]
+    pub high_freq_factor: Option<f64>,  // 4.0 for llama3
+    #[serde(default)]
+    pub low_freq_factor: Option<f64>,   // 1.0 for llama3
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,  // 8192 for llama3
+}
+
+fn default_rope_type() -> String { "default".to_string() }
+fn default_factor() -> f64 { 1.0 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeModelConfig {
@@ -92,6 +201,12 @@ pub struct RuntimeModelConfig {
     pub tokenizer_vocab_size: usize,
 
     pub immediate_dim: Option<usize>,
+
+    /// AWQ 等量化配置，None 表示非量化模型
+    pub quant_config: Option<QuantizationConfig>,
+
+    /// RoPE scaling 配置
+    pub rope_scaling: Option<RopeScalingConfig>,
 }
 
 impl RuntimeModelConfig {
@@ -159,6 +274,8 @@ impl RuntimeModelConfig {
             rms_norm_eps: file_config.rms_norm_eps,
             tokenizer_vocab_size: vocab_size,
             immediate_dim: file_config.immediate_dim,
+            quant_config: file_config.quantization_config.clone(),
+            rope_scaling: file_config.rope_scaling.clone(),
         })
     }
 
@@ -169,6 +286,7 @@ impl RuntimeModelConfig {
 
         match self.torch_dtype.as_str() {
             "float32" => Ok(DataType::F32),
+            "float16" => Ok(DataType::F16),
             "bfloat16" => Ok(DataType::BF16),
             _ => Err(Error::InvalidArgument(format!(
                 "Unsupported torch_dtype for runtime allocation: {}",
@@ -182,6 +300,7 @@ impl RuntimeModelConfig {
 fn normalize_torch_dtype(dtype: &str) -> Option<&'static str> {
     match dtype {
         "float32" | "float" | "f32" | "fp32" => Some("float32"),
+        "float16" | "f16" | "fp16" | "half" => Some("float16"),
         "bfloat16" | "bf16" => Some("bfloat16"),
         _ => None,
     }

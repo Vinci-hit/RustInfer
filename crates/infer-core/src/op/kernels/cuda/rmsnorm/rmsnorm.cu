@@ -1,6 +1,7 @@
 #include <cub/block/block_reduce.cuh>
 #include "rmsnorm.h"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 __global__ void rmsnorm_bf16_optimized(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
@@ -116,3 +117,70 @@ void rmsnorm_kernel_cu_dim(float* output, float* input, float* weight, int row, 
     constexpr int threads_num = 128;
     row_rmsnorm_f32_dim<<<row, threads_num, 0, stream>>>(output, input,  weight, row, dim, eps);
 }
+
+
+
+
+
+// ============= FP16 variants (auto-generated from BF16) =============
+
+__global__ void rmsnorm_fp16_optimized(
+    __half* __restrict__ output,
+    const __half* __restrict__ input,
+    const __half* __restrict__ weight,
+    int dim,
+    float eps
+) {
+    const int offset = blockIdx.x * dim;
+    const int tid = threadIdx.x;
+
+    const float4* in_ptr = reinterpret_cast<const float4*>(input + offset);
+    const float4* weight_ptr = reinterpret_cast<const float4*>(weight);
+    float4* out_ptr = reinterpret_cast<float4*>(output + offset);
+
+    float sum = 0.0f;
+
+    for (int i = tid; i < dim / 8; i += blockDim.x) {
+        float4 tmp_in = in_ptr[i];
+        half2* b162_vals = reinterpret_cast<half2*>(&tmp_in);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            half2 squared = __hmul2(b162_vals[j], b162_vals[j]);
+            sum += (__half2float(squared.x) + __half2float(squared.y));
+        }
+    }
+
+    typedef cub::BlockReduce<float, 256> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    float total_sum = BlockReduce(temp_storage).Sum(sum);
+
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrtf(total_sum / float(dim) + eps);
+    }
+    __syncthreads();
+
+    float f_inv_rms = inv_rms;
+    for (int i = tid; i < dim / 8; i += blockDim.x) {
+        float4 tmp_in = in_ptr[i];
+        float4 tmp_weight = weight_ptr[i];
+
+        half2* in_b162 = reinterpret_cast<half2*>(&tmp_in);
+        half2* weight_b162 = reinterpret_cast<half2*>(&tmp_weight);
+
+        half2 scale_fp162 = __floats2half2_rn(f_inv_rms, f_inv_rms);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            in_b162[j] = __hmul2(__hmul2(in_b162[j], scale_fp162), weight_b162[j]);
+        }
+        out_ptr[i] = tmp_in;
+    }
+}
+
+extern "C" void rmsnorm_kernel_cu_fp16x8(__half* output, __half* input, __half* weight, int row, int dim, float eps, cudaStream_t stream) {
+    constexpr int threads_num = 256;
+    rmsnorm_fp16_optimized<<<row, threads_num, 0, stream>>>(output, input, weight, dim, eps);
+}
+

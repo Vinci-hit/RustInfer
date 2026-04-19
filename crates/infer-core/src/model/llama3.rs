@@ -90,11 +90,30 @@ impl Llama3 {
         let mut w_gate_up_layers = Vec::with_capacity(layer_num);
         let mut w2_layers = Vec::with_capacity(layer_num);
 
+        let is_awq = config.quant_config.as_ref().map_or(false, |q| q.quant_method == "awq");
+        let is_kpacked = config.quant_config.as_ref().map_or(false, |q| q.quant_method == "compressed-tensors");
+        let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
+
         for i in 0..layer_num {
-            wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
-            wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
-            w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
-            w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
+            if is_awq {
+                // AWQ 量化模型 (N-packed, FP16): 全部 linear 层量化
+                wqkv_layers.push(Self::load_fused_qkv_awq(i, &loader, device_type, config.q_dim, config.kv_dim, group_size)?);
+                wo_layers.push(Self::load_awq_matmul(&format!("model.layers.{}.self_attn.o_proj", i), &loader, device_type, group_size)?);
+                w_gate_up_layers.push(Self::load_fused_gate_up_awq(i, &loader, device_type, config.intermediate_size, group_size)?);
+                w2_layers.push(Self::load_awq_matmul(&format!("model.layers.{}.mlp.down_proj", i), &loader, device_type, group_size)?);
+            } else if is_kpacked {
+                // compressed-tensors 量化模型 (K-packed, BF16): 只有 MLP 层量化，attention 保持 BF16
+                wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
+                wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
+                w_gate_up_layers.push(Self::load_fused_gate_up_kpacked(i, &loader, device_type, config.intermediate_size, group_size)?);
+                w2_layers.push(Self::load_kpacked_matmul(&format!("model.layers.{}.mlp.down_proj", i), &loader, device_type, group_size)?);
+            } else {
+                // 原始精度模型
+                wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
+                wo_layers.push(Self::load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?);
+                w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
+                w2_layers.push(Self::load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?);
+            }
             rmsnorm_attn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
             rmsnorm_ffn_layers.push(Self::load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type, config.rms_norm_eps)?);
         }
@@ -211,6 +230,264 @@ impl Llama3 {
         let weight = Tensor::from_view_on_cpu(&loader.get_tensor(name)?)?;
         let weight = if device.is_cpu() && weight.dtype() != DataType::F32 { weight.to_dtype(DataType::F32)? } else { weight };
         Ok(Embedding::from(weight.to_device(device)?))
+    }
+
+    // ---- AWQ weight loading helpers ----
+
+    /// 加载单个 AWQ 量化 Linear 层的 qweight/qzeros/scales
+    /// 加载后转置 qweight [K, N/8] -> [N/8, K]，qzeros [G, N/8] -> [N/8, G]，
+    /// scales [G, N] -> [N, G]，使 GEMV 沿 K 方向 coalesced 访问。
+    fn load_awq_matmul(name_prefix: &str, loader: &ModelLoader, device: DeviceType, group_size: usize) -> Result<Matmul> {
+        let qweight = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.qweight", name_prefix))?)?;
+        let qzeros = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.qzeros", name_prefix))?)?;
+        let scales = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.scales", name_prefix))?)?;
+
+        // 转置 qweight: [K, N/8] -> [N/8, K]
+        let qweight_t = Self::transpose_2d_i32(&qweight)?;
+        // 转置 qzeros: [G, N/8] -> [N/8, G]
+        let qzeros_t = Self::transpose_2d_i32(&qzeros)?;
+        // 转置 scales: [G, N] -> [N, G]
+        let scales_t = Self::transpose_2d_f16(&scales)?;
+
+        Ok(Matmul::from_awq(
+            qweight_t.to_device(device)?,
+            qzeros_t.to_device(device)?,
+            scales_t.to_device(device)?,
+            group_size,
+            None,
+        ))
+    }
+
+    /// CPU 上转置 2D I32 tensor: [rows, cols] -> [cols, rows]
+    fn transpose_2d_i32(t: &Tensor) -> Result<Tensor> {
+        let shape = t.shape();
+        let (rows, cols) = (shape[0], shape[1]);
+        let src = t.as_i32()?.as_slice()?;
+        let mut dst_t = Tensor::new(&[cols, rows], DataType::I32, DeviceType::Cpu)?;
+        let dst = dst_t.as_i32_mut()?.as_slice_mut()?;
+        for r in 0..rows {
+            for c in 0..cols {
+                dst[c * rows + r] = src[r * cols + c];
+            }
+        }
+        Ok(dst_t)
+    }
+
+    /// CPU 上转置 2D F16 tensor: [rows, cols] -> [cols, rows]
+    fn transpose_2d_f16(t: &Tensor) -> Result<Tensor> {
+        let shape = t.shape();
+        let (rows, cols) = (shape[0], shape[1]);
+        let src = t.as_f16()?.as_slice()?;
+        let mut dst_t = Tensor::new(&[cols, rows], DataType::F16, DeviceType::Cpu)?;
+        let dst = dst_t.as_f16_mut()?.as_slice_mut()?;
+        for r in 0..rows {
+            for c in 0..cols {
+                dst[c * rows + r] = src[r * cols + c];
+            }
+        }
+        Ok(dst_t)
+    }
+
+    /// AWQ 版本的 fused QKV 加载。
+    /// AWQ 模型中 q_proj/k_proj/v_proj 各自有独立的 qweight/qzeros/scales，
+    /// 这里将它们的 qweight 纵向拼接 (行维度)，scales 和 qzeros 也相应拼接。
+    fn load_fused_qkv_awq(
+        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
+        q_dim: usize, kv_dim: usize, group_size: usize,
+    ) -> Result<Matmul> {
+        // 加载三组 AWQ 张量到 CPU
+        let q_qw = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.qweight", layer_idx))?)?;
+        let k_qw = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.qweight", layer_idx))?)?;
+        let v_qw = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.qweight", layer_idx))?)?;
+
+        let q_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.scales", layer_idx))?)?;
+        let k_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.scales", layer_idx))?)?;
+        let v_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.scales", layer_idx))?)?;
+
+        let q_qz = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.qzeros", layer_idx))?)?;
+        let k_qz = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.qzeros", layer_idx))?)?;
+        let v_qz = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.qzeros", layer_idx))?)?;
+
+        // qweight layout: [K, N/8]. Fuse Q/K/V along column (N) dimension.
+        let in_features = q_qw.shape()[0];  // K dimension (same for all)
+        let q_n_packed = q_qw.shape()[1];   // q_dim / 8
+        let k_n_packed = k_qw.shape()[1];   // kv_dim / 8
+        let v_n_packed = v_qw.shape()[1];   // kv_dim / 8
+        let num_groups = in_features / group_size;
+
+        // qweight: [K, N/8] -> fuse cols -> [K, (q_dim + 2*kv_dim) / 8]
+        let fused_qw = Self::fuse_tensors_vertically_cols(&[&q_qw, &k_qw, &v_qw],
+            &[q_n_packed, k_n_packed, v_n_packed], in_features, DataType::I32)?;
+
+        // scales: [num_groups, N] -> fuse cols -> [num_groups, q_dim + 2*kv_dim]
+        let sc_dtype = q_sc.dtype();
+        let fused_sc = Self::fuse_tensors_vertically_cols(&[&q_sc, &k_sc, &v_sc],
+            &[q_dim, kv_dim, kv_dim], num_groups, sc_dtype)?;
+
+        // qzeros: [num_groups, N/8] -> fuse cols -> [num_groups, (q_dim + 2*kv_dim) / 8]
+        let fused_qz = Self::fuse_tensors_vertically_cols(&[&q_qz, &k_qz, &v_qz],
+            &[q_n_packed, k_n_packed, v_n_packed], num_groups, DataType::I32)?;
+
+        Ok(Matmul::from_awq(
+            Self::transpose_2d_i32(&fused_qw)?.to_device(device)?,
+            Self::transpose_2d_i32(&fused_qz)?.to_device(device)?,
+            Self::transpose_2d_f16(&fused_sc)?.to_device(device)?,
+            group_size,
+            None,
+        ))
+    }
+
+    /// AWQ 版本的 fused Gate+Up 加载
+    fn load_fused_gate_up_awq(
+        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
+        intermediate_size: usize, group_size: usize,
+    ) -> Result<Matmul> {
+        let gate_qw = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.qweight", layer_idx))?)?;
+        let up_qw = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.qweight", layer_idx))?)?;
+
+        let gate_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.scales", layer_idx))?)?;
+        let up_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.scales", layer_idx))?)?;
+
+        let gate_qz = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.qzeros", layer_idx))?)?;
+        let up_qz = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.qzeros", layer_idx))?)?;
+
+        let in_features = gate_qw.shape()[0];  // K dimension (same for both)
+        let gate_n_packed = gate_qw.shape()[1];  // gate out_features / 8
+        let up_n_packed = up_qw.shape()[1];      // up out_features / 8
+        let num_groups = in_features / group_size;
+
+        // qweight: [K, N/8] -> fuse along columns -> [K, (gate_N + up_N) / 8]
+        let fused_qw = Self::fuse_tensors_vertically_cols(&[&gate_qw, &up_qw],
+            &[gate_n_packed, up_n_packed], in_features, DataType::I32)?;
+
+        let sc_dtype = gate_sc.dtype();
+        // scales: [num_groups, N] -> fuse along columns -> [num_groups, gate_N + up_N]
+        let fused_sc = Self::fuse_tensors_vertically_cols(&[&gate_sc, &up_sc],
+            &[intermediate_size, intermediate_size], num_groups, sc_dtype)?;
+
+        // qzeros: [num_groups, N/8] -> fuse along columns -> [num_groups, (gate_N + up_N) / 8]
+        let fused_qz = Self::fuse_tensors_vertically_cols(&[&gate_qz, &up_qz],
+            &[gate_n_packed, up_n_packed], num_groups, DataType::I32)?;
+
+        Ok(Matmul::from_awq(
+            Self::transpose_2d_i32(&fused_qw)?.to_device(device)?,
+            Self::transpose_2d_i32(&fused_qz)?.to_device(device)?,
+            Self::transpose_2d_f16(&fused_sc)?.to_device(device)?,
+            group_size,
+            None,
+        ))
+    }
+
+    /// 辅助: 将多个 [rows_i, cols] 的张量纵向拼接为 [sum(rows_i), cols]
+    fn fuse_tensors_vertically(tensors: &[&Tensor], row_counts: &[usize], cols: usize, dtype: DataType) -> Result<Tensor> {
+        let total_rows: usize = row_counts.iter().sum();
+        let elem_size = dtype.size_in_bytes();
+        let mut fused = Tensor::new(&[total_rows, cols], dtype, DeviceType::Cpu)?;
+        let fused_ptr = fused.buffer_mut().as_mut_ptr();
+        let mut offset = 0usize;
+        for (tensor, &rows) in tensors.iter().zip(row_counts) {
+            let bytes = rows * cols * elem_size;
+            unsafe {
+                std::ptr::copy_nonoverlapping(tensor.buffer().as_ptr(), fused_ptr.add(offset), bytes);
+            }
+            offset += bytes;
+        }
+        Ok(fused)
+    }
+
+    /// 辅助: 将多个 [rows, cols_i] 的张量横向拼接为 [rows, sum(cols_i)]
+    /// 用于 scales 和 qzeros 的列维度拼接
+    fn fuse_tensors_vertically_cols(tensors: &[&Tensor], col_counts: &[usize], rows: usize, dtype: DataType) -> Result<Tensor> {
+        let total_cols: usize = col_counts.iter().sum();
+        let elem_size = dtype.size_in_bytes();
+        let mut fused = Tensor::new(&[rows, total_cols], dtype, DeviceType::Cpu)?;
+        let fused_ptr = fused.buffer_mut().as_mut_ptr();
+
+        for row in 0..rows {
+            let mut col_offset = 0usize;
+            for (tensor, &cols) in tensors.iter().zip(col_counts) {
+                let src_ptr = unsafe { tensor.buffer().as_ptr().add(row * cols * elem_size) };
+                let dst_ptr = unsafe { fused_ptr.add((row * total_cols + col_offset) * elem_size) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, cols * elem_size);
+                }
+                col_offset += cols;
+            }
+        }
+        Ok(fused)
+    }
+
+    // ---- K-packed (compressed-tensors) weight loading helpers ----
+
+    /// 加载单个 K-packed 量化 Linear 层
+    /// weight_packed: [N, K/8] (I32) — 直接加载，无需转置
+    /// weight_zero_point: [N/8, num_groups] (I32)
+    /// weight_scale: [N, num_groups] (BF16)
+    fn load_kpacked_matmul(name_prefix: &str, loader: &ModelLoader, device: DeviceType, group_size: usize) -> Result<Matmul> {
+        let weight_packed = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_packed", name_prefix))?)?;
+        let weight_zero_point = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_zero_point", name_prefix))?)?;
+        let weight_scale = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_scale", name_prefix))?)?;
+
+        Ok(Matmul::from_kpacked(
+            weight_packed.to_device(device)?,
+            weight_zero_point.to_device(device)?,
+            weight_scale.to_device(device)?,
+            group_size,
+            None,
+        ))
+    }
+
+    /// K-packed 版本的 fused Gate+Up 加载
+    /// weight_packed 按行(N)拼接: [gate_N, K/8] + [up_N, K/8] -> [2*inter, K/8]
+    /// weight_scale 按行拼接: [gate_N, G] + [up_N, G] -> [2*inter, G]
+    /// weight_zero_point 按行拼接: [gate_N/8, G] + [up_N/8, G] -> [2*inter/8, G]
+    fn load_fused_gate_up_kpacked(
+        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
+        intermediate_size: usize, group_size: usize,
+    ) -> Result<Matmul> {
+        let gate_wp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_packed", layer_idx))?)?;
+        let up_wp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_packed", layer_idx))?)?;
+
+        let gate_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_scale", layer_idx))?)?;
+        let up_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_scale", layer_idx))?)?;
+
+        let gate_zp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_zero_point", layer_idx))?)?;
+        let up_zp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_zero_point", layer_idx))?)?;
+
+        let k_packed = gate_wp.shape()[1]; // K/8, same for both
+        let num_groups = gate_sc.shape()[1]; // num_groups, same for both
+
+        // weight_packed: [gate_N, K/8] + [up_N, K/8] -> [2*inter, K/8] (row concat)
+        let fused_wp = Self::fuse_tensors_vertically(
+            &[&gate_wp, &up_wp],
+            &[intermediate_size, intermediate_size],
+            k_packed, DataType::I32,
+        )?;
+
+        // weight_scale: [gate_N, G] + [up_N, G] -> [2*inter, G] (row concat)
+        let sc_dtype = gate_sc.dtype();
+        let fused_sc = Self::fuse_tensors_vertically(
+            &[&gate_sc, &up_sc],
+            &[intermediate_size, intermediate_size],
+            num_groups, sc_dtype,
+        )?;
+
+        // weight_zero_point: [gate_N/8, G] + [up_N/8, G] -> [2*inter/8, G] (row concat)
+        let gate_n_packed = intermediate_size / 8;
+        let up_n_packed = intermediate_size / 8;
+        let fused_zp = Self::fuse_tensors_vertically(
+            &[&gate_zp, &up_zp],
+            &[gate_n_packed, up_n_packed],
+            num_groups, DataType::I32,
+        )?;
+
+        Ok(Matmul::from_kpacked(
+            fused_wp.to_device(device)?,
+            fused_zp.to_device(device)?,
+            fused_sc.to_device(device)?,
+            group_size,
+            None,
+        ))
     }
 
     // ---- Inference methods (&self + &mut InferenceState) ----
@@ -454,6 +731,7 @@ impl Llama3 {
             self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
             let mut wo_out = q;
             self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
+
             self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
 
             // FFN
@@ -475,6 +753,7 @@ impl Llama3 {
 
             let mut w2_out = ffn_norm_out;
             self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
+
             self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
         }
 
@@ -490,6 +769,7 @@ impl Llama3 {
 
         let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
         self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+
         let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
@@ -548,11 +828,11 @@ mod tests {
         let mut state = model.create_state()?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, true)?;
+        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;
-        println!("\n=== CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
+        println!("\n=== BF16 CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
             n_tok, total_ms,
             (prompt_len + n_tok as f64) / (total_ms / 1000.0),
             if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
@@ -561,5 +841,57 @@ mod tests {
 
     fn get_dummy_model_path() -> &'static Path {
         Path::new("/data/home/vinciiliu/models/Llama-3.2-1B-Instruct")
+    }
+
+    fn get_awq_model_path() -> &'static Path {
+        Path::new("/data/home/vinciiliu/models/llama-3.2-1B-Instruct-AWQ")
+    }
+
+    #[test]
+    #[ignore = "Long running test"]
+    #[cfg(feature = "cuda")]
+    fn test_llama3_awq_cuda() -> Result<()> {
+        let model_path = get_awq_model_path();
+        assert!(model_path.exists(), "AWQ model not found.");
+
+        let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
+        let mut state = model.create_state()?;
+
+        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+        let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
+
+        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
+        let total_ms = (prefill_ms + decode_ms) as f64;
+        println!("\n=== AWQ INT4 CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
+            n_tok, total_ms,
+            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
+            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
+        Ok(())
+    }
+
+    fn get_kpacked_model_path() -> &'static Path {
+        Path::new("/data/home/vinciiliu/models/llama3.2-1b-AWQ-mlp3")
+    }
+
+    #[test]
+    #[ignore = "Long running test"]
+    #[cfg(feature = "cuda")]
+    fn test_llama3_kpacked_cuda() -> Result<()> {
+        let model_path = get_kpacked_model_path();
+        assert!(model_path.exists(), "K-packed model not found.");
+
+        let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
+        let mut state = model.create_state()?;
+
+        let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+        let (text, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, true)?;
+
+        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
+        let total_ms = (prefill_ms + decode_ms) as f64;
+        println!("\n=== K-packed INT4 CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
+            n_tok, total_ms,
+            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
+            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
+        Ok(())
     }
 }

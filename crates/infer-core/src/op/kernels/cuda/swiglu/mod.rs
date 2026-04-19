@@ -20,6 +20,13 @@ unsafe extern "C" {
         num_elements: i32,
         stream: crate::cuda::ffi::cudaStream_t,
     );
+
+    fn swiglu_inplace_cu_fp16x8(
+        input_y: *const half::f16,      // <--- 只读的 y
+        input_output_x: *mut half::f16, // <--- 可读写的 x
+        num_elements: i32,
+        stream: crate::cuda::ffi::cudaStream_t,
+    );
 }
 
 /// (原地版本) SwiGLU 的 CUDA 内核包装函数。
@@ -77,6 +84,20 @@ pub fn swiglu(
 
             unsafe {
                 swiglu_inplace_cu_bf16x8(
+                    y_ptr,
+                    x_ptr,
+                    num_elements as i32,
+                    stream,
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            // --- FP16 路径 ---
+            let y_ptr = input_y.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let x_ptr = input_output_x.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+
+            unsafe {
+                swiglu_inplace_cu_fp16x8(
                     y_ptr,
                     x_ptr,
                     num_elements as i32,

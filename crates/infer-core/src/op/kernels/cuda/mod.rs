@@ -31,3 +31,6 @@ pub use scatter::*;
 
 mod split_cols;
 pub use split_cols::*;
+
+mod awq_gemm;
+pub use awq_gemm::*;

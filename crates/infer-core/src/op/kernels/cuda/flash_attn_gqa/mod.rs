@@ -41,11 +41,34 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+
+    pub fn flash_decoding_cu_fp16(
+        q_ptr: *const half::f16,
+        k_ptr: *const half::f16,
+        v_ptr: *const half::f16,
+        o_ptr: *mut half::f16,
+        kv_seq_len: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
     pub fn launch_flash_attn_cute_128x64x64_tile(
         q_ptr: *const half::bf16,
         k_ptr: *const half::bf16,
         v_ptr: *const half::bf16,
         o_ptr: *mut half::bf16,
+        q_seq_len: i32,
+        kv_seq_len: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+    pub fn launch_flash_attn_cute_128x64x64_tile_fp16(
+        q_ptr: *const half::f16,
+        k_ptr: *const half::f16,
+        v_ptr: *const half::f16,
+        o_ptr: *mut half::f16,
         q_seq_len: i32,
         kv_seq_len: *const i32,
         num_q_heads: i32,
@@ -63,11 +86,35 @@ unsafe extern "C" {
         head_dim: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+
+    pub fn flash_decoding_cu_fp16_hdim128(
+        q_ptr: *const half::f16,
+        k_ptr: *const half::f16,
+        v_ptr: *const half::f16,
+        o_ptr: *mut half::f16,
+        kv_seq_len: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
     pub fn launch_flash_attn_cute_bf16_hdim128(
         q_ptr: *const half::bf16,
         k_ptr: *const half::bf16,
         v_ptr: *const half::bf16,
         o_ptr: *mut half::bf16,
+        q_seq_len: i32,
+        kv_seq_len: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn launch_flash_attn_cute_fp16_hdim128(
+        q_ptr: *const half::f16,
+        k_ptr: *const half::f16,
+        v_ptr: *const half::f16,
+        o_ptr: *mut half::f16,
         q_seq_len: i32,
         kv_seq_len: *const i32,
         num_q_heads: i32,
@@ -218,6 +265,66 @@ pub unsafe fn flash_attn_gqa(
                     );
                 } else {
                     launch_flash_attn_cute_bf16_hdim128(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        o_ptr,
+                        q_seq_len_i32,
+                        current_kv_len_gpu,
+                        num_q_heads_i32,
+                        num_kv_heads_i32,
+                        stream,
+                    );
+                }
+            }
+        }
+        crate::base::DataType::F16 => {
+            let q_ptr = input_q.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let k_ptr = input_k_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let v_ptr = input_v_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let o_ptr = output_o.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+
+            unsafe {
+                if q_seq_len == 1 {
+                    if head_dim_i32 <= 64 {
+                        flash_decoding_cu_fp16(
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            o_ptr,
+                            current_kv_len_gpu,
+                            num_q_heads_i32,
+                            num_kv_heads_i32,
+                            head_dim_i32,
+                            stream,
+                        );
+                    } else {
+                        flash_decoding_cu_fp16_hdim128(
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            o_ptr,
+                            current_kv_len_gpu,
+                            num_q_heads_i32,
+                            num_kv_heads_i32,
+                            head_dim_i32,
+                            stream,
+                        );
+                    }
+                } else if head_dim_i32 <= 64 {
+                    launch_flash_attn_cute_128x64x64_tile_fp16(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        o_ptr,
+                        q_seq_len_i32,
+                        current_kv_len_gpu,
+                        num_q_heads_i32,
+                        num_kv_heads_i32,
+                        stream,
+                    );
+                } else {
+                    launch_flash_attn_cute_fp16_hdim128(
                         q_ptr,
                         k_ptr,
                         v_ptr,

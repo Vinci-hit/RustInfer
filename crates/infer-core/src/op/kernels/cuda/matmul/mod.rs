@@ -47,6 +47,28 @@ unsafe extern "C" {
         K: i32,
         stream: crate::cuda::ffi::cudaStream_t,
     );
+    // FP16 GEMV
+    fn hgemv_fp16_cu(
+        input: *const half::f16,
+        weight: *const half::f16,
+        output: *mut half::f16,
+        N: i32,
+        K: i32,
+        stream: crate::cuda::ffi::cudaStream_t,
+    );
+    // FP16 GEMM via cublasLt
+    fn gemm_cublaslt_fp16(
+        a: *const half::f16,
+        b: *const half::f16,
+        c: *mut half::f16,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: crate::cuda::ffi::cudaStream_t,
+        handle: cuda::ffi::cublasLtHandle_t,
+        workspace: *mut c_void,
+        workspaceSize: usize,
+    );
 }
 
 /// BF16 GEMV for decode phase (M=1): y = W * x
@@ -116,6 +138,40 @@ pub fn hgemm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
         );
     }
     
+    Ok(())
+}
+
+/// FP16 GEMV for decode phase (M=1): y = W * x
+pub fn hgemv_fp16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
+    let qweight_shape = weight.shape();
+    let n = qweight_shape[0] as i32;
+    let k = qweight_shape[1] as i32;
+    let input_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
+    let weight_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
+    let output_ptr = output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    unsafe { hgemv_fp16_cu(input_ptr, weight_ptr, output_ptr, n, k, stream); }
+    Ok(())
+}
+
+/// FP16 GEMM via cublasLt
+pub fn hgemm_fp16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
+    let a_shape = input.shape();
+    let b_shape = weight.shape();
+    let m = a_shape[0];
+    let k = a_shape[1];
+    let n = b_shape[0];
+    let a_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
+    let b_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
+    let c_ptr = output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let cublaslt_handle = cuda_config.map_or(std::ptr::null_mut(), |config| config.cublaslt_handle);
+    let workspace = cuda_config.map_or(std::ptr::null_mut(), |config| config.workspace);
+    let workspace_size = cuda_config.map_or(0, |config| config.workspace_size);
+    unsafe {
+        gemm_cublaslt_fp16(a_ptr, b_ptr, c_ptr, m as i32, n as i32, k as i32,
+            stream, cublaslt_handle, workspace, workspace_size);
+    }
     Ok(())
 }
 
