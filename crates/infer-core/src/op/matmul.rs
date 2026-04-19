@@ -3,38 +3,29 @@ use crate::base::{DataType, DeviceType};
 use crate::op::{kernels, Op, OpContext};
 use crate::tensor::Tensor;
 
-/// Matmul 算子，执行 Y = W@X^T + B
-///
-/// 其中：
-/// - X 是输入张量
-/// - W 是权重矩阵
-/// - B 是可选的偏置向量
-///
-/// 支持三种模式：
-/// 1. 普通模式: weight 为 FP16/BF16/FP32 权重
-/// 2. AWQ 模式 (N-packed): weight 为 qweight_t [N/8, K], FP16 input/output
-/// 3. K-packed 模式 (compressed-tensors): weight 为 weight_packed [N, K/8], BF16 input/output
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum QuantFormat {
-    None,
-    AwqNpacked,    // AWQ: INT4 packed along N, AWQ_ORDER
-    Kpacked,       // compressed-tensors: INT4 packed along K, sequential
+/// 量化参数，封装不同量化格式所需的张量和超参数。
+/// 未来扩展 GPTQ / FP8 等格式只需在此 enum 增加变体。
+pub enum QuantParams {
+    /// AWQ INT4 量化 (K-packed 格式)
+    /// weight_packed: [N, K/8] I32 — 8 个连续 K 位置的 INT4 打包在一个 int32
+    /// zeros: [N/8, num_groups] I32 — 零点沿 N 方向打包
+    /// scales: [N, num_groups] BF16
+    Awq {
+        zeros: Tensor,
+        scales: Tensor,
+        group_size: usize,
+    },
 }
 
+/// Matmul 算子，执行 Y = W@X^T + B
+///
+/// 支持两种模式：
+/// 1. 普通模式: weight 为 FP16/BF16/FP32 权重，quant = None
+/// 2. INT4 量化模式: weight 为 weight_packed [N, K/8] I32，quant = Some(QuantParams::Int4 { ... })
 pub struct Matmul {
-    /// 权重矩阵 W，形状通常为 [out_features, in_features]
-    /// AWQ 模式下为 qweight (I32)，形状 [N/8, K]（加载时已转置，便于 GEMV coalesced 访问）
-    /// K-packed 模式下为 weight_packed (I32)，形状 [N, K/8]（原始布局即可）
     pub weight: Tensor,
-
-    /// 可选的偏置向量 B，形状通常为 [out_features]
     pub bias: Option<Tensor>,
-
-    // ---- 量化参数 (全部为 None 表示非量化的普通 Matmul) ----
-    pub qzeros: Option<Tensor>,
-    pub scales: Option<Tensor>,
-    pub group_size: Option<usize>,
-    pub quant_format: QuantFormat,
+    pub quant: Option<QuantParams>,
 }
 
 impl Matmul {
@@ -64,62 +55,28 @@ impl Matmul {
             None
         };
 
-        Ok(Self { weight, bias, qzeros: None, scales: None, group_size: None, quant_format: QuantFormat::None })
+        Ok(Self { weight, bias, quant: None })
     }
     pub fn from(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias, qzeros: None, scales: None, group_size: None, quant_format: QuantFormat::None }
+        Self { weight, bias, quant: None }
     }
 
-    /// 创建一个 AWQ 量化的 Matmul 算子 (N-packed format, FP16)。
-    /// qweight 会被转置为 [N/8, K] 以支持 GEMV coalesced 访问。
-    /// scales 会被转置为 [N, num_groups] 以匹配 qweight_t 的行优先遍历。
-    /// qzeros 会被转置为 [N/8, num_groups]。
+    /// 创建一个 AWQ 量化的 Matmul 算子。
+    /// weight_packed: [N, K/8] I32 — INT4 packed along K, sequential order
+    /// zeros: [N/8, num_groups] I32 — zero points packed along N
+    /// scales: [N, num_groups] BF16
     pub fn from_awq(
-        qweight: Tensor,
-        qzeros: Tensor,
-        scales: Tensor,
-        group_size: usize,
-        bias: Option<Tensor>,
-    ) -> Self {
-        Self {
-            weight: qweight,
-            bias,
-            qzeros: Some(qzeros),
-            scales: Some(scales),
-            group_size: Some(group_size),
-            quant_format: QuantFormat::AwqNpacked,
-        }
-    }
-
-    /// 创建一个 K-packed 量化的 Matmul 算子 (compressed-tensors format, BF16)。
-    /// weight_packed: [N, K/8] — INT4 packed along K, sequential order
-    /// weight_zero_point: [N/8, num_groups] — packed along N
-    /// weight_scale: [N, num_groups]
-    pub fn from_kpacked(
         weight_packed: Tensor,
-        weight_zero_point: Tensor,
-        weight_scale: Tensor,
+        zeros: Tensor,
+        scales: Tensor,
         group_size: usize,
         bias: Option<Tensor>,
     ) -> Self {
         Self {
             weight: weight_packed,
             bias,
-            qzeros: Some(weight_zero_point),
-            scales: Some(weight_scale),
-            group_size: Some(group_size),
-            quant_format: QuantFormat::Kpacked,
+            quant: Some(QuantParams::Awq { zeros, scales, group_size }),
         }
-    }
-
-    /// 该 Matmul 是否是量化模式 (AWQ 或 K-packed)
-    pub fn is_quantized(&self) -> bool {
-        self.quant_format != QuantFormat::None
-    }
-
-    /// 向后兼容：该 Matmul 是否是 AWQ 量化模式
-    pub fn is_awq(&self) -> bool {
-        self.quant_format != QuantFormat::None
     }
 }
 
@@ -148,14 +105,14 @@ impl Op for Matmul {
             return Err(Error::InvalidArgument("All tensors must be on the same device".into()).into());
         }
         // AWQ 模式下 weight 是 I32 (打包的 qweight)，跳过 weight dtype 检查
-        if !self.is_awq() {
+        if self.quant.is_none() {
             if output.dtype() != dtype || weight.dtype() != dtype {
                 return Err(Error::InvalidArgument("All tensors must have the same data type".into()).into());
             }
         } else {
             if output.dtype() != dtype {
                 return Err(Error::InvalidArgument(format!(
-                    "AWQ Matmul: output dtype {:?} != input dtype {:?}", output.dtype(), dtype
+                    "Quantized Matmul: output dtype {:?} != input dtype {:?}", output.dtype(), dtype
                 )).into());
             }
         }
@@ -178,7 +135,7 @@ impl Op for Matmul {
         // ==================== 2. 分派到内核 (对应 C++ 的 forward() 主体) ====================
         match device {
             DeviceType::Cpu => {
-                if self.is_quantized() {
+                if self.quant.is_some() {
                     return Err(Error::InvalidArgument(
                         "Quantized Matmul is only supported on CUDA devices".into()
                     ).into());
@@ -188,27 +145,12 @@ impl Op for Matmul {
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                if let (Some(qzeros), Some(scales), Some(group_size)) =
-                    (&self.qzeros, &self.scales, self.group_size)
-                {
-                    match self.quant_format {
-                        QuantFormat::AwqNpacked => {
-                            // ---- AWQ INT4 N-packed (FP16) ----
-                            if input.shape()[0] == 1 {
-                                kernels::cuda::awq_gemv(input, &self.weight, qzeros, scales, group_size, output, ctx.cuda_config)?;
-                            } else {
-                                kernels::cuda::awq_gemm(input, &self.weight, qzeros, scales, group_size, output, ctx.cuda_config)?;
-                            }
-                        }
-                        QuantFormat::Kpacked => {
-                            // ---- K-packed INT4 (compressed-tensors, BF16) ----
-                            if input.shape()[0] == 1 {
-                                kernels::cuda::kpack_gemv(input, &self.weight, qzeros, scales, group_size, output, ctx.cuda_config)?;
-                            } else {
-                                kernels::cuda::kpack_gemm(input, &self.weight, qzeros, scales, group_size, output, ctx.cuda_config)?;
-                            }
-                        }
-                        QuantFormat::None => unreachable!(),
+                if let Some(QuantParams::Awq { zeros, scales, group_size }) = &self.quant {
+                    // ---- AWQ INT4 量化路径 ----
+                    if input.shape()[0] == 1 {
+                        kernels::cuda::kpack_gemv(input, &self.weight, zeros, scales, *group_size, output, ctx.cuda_config)?;
+                    } else {
+                        kernels::cuda::kpack_gemm(input, &self.weight, zeros, scales, *group_size, output, ctx.cuda_config)?;
                     }
                 } else if input.dtype() == DataType::BF16{
                     let n = weight.shape()[0]; // output dimension
@@ -255,18 +197,17 @@ impl Op for Matmul {
 impl Matmul {
     /// Move Matmul internal parameters to CUDA device
     pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        // move weight (or qweight for AWQ)
         self.weight = self.weight.to_cuda(device_id)?;
-        // move bias if exists
         if let Some(b) = &self.bias {
             self.bias = Some(b.to_cuda(device_id)?);
         }
-        // move AWQ quantization tensors if present
-        if let Some(qz) = &self.qzeros {
-            self.qzeros = Some(qz.to_cuda(device_id)?);
-        }
-        if let Some(sc) = &self.scales {
-            self.scales = Some(sc.to_cuda(device_id)?);
+        if let Some(QuantParams::Awq { zeros, scales, .. }) = &self.quant {
+            let new_zeros = zeros.to_cuda(device_id)?;
+            let new_scales = scales.to_cuda(device_id)?;
+            if let Some(QuantParams::Awq { zeros: z, scales: s, .. }) = &mut self.quant {
+                *z = new_zeros;
+                *s = new_scales;
+            }
         }
         Ok(())
     }
