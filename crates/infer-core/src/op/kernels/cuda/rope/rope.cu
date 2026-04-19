@@ -254,30 +254,38 @@ __global__ void sin_cos_calc(int head_size, int max_seq_len, float rope_theta, f
 
 __global__ void sin_cos_calc_bf16(int head_size, int max_seq_len, float rope_theta,
                                   __nv_bfloat16* sin_cache,
-                                  __nv_bfloat16* cos_cache) {
-    // 每个线程处理一个“偶数维度对”的索引 k（k = 0, 1, ..., head_size/2 - 1）
+                                  __nv_bfloat16* cos_cache,
+                                  float factor, float low_freq_factor, float high_freq_factor,
+                                  float original_max_pos_emb) {
     int k = threadIdx.x + blockDim.x * blockIdx.x;
     int half_head = head_size / 2;
 
     if (k >= half_head) return;
 
-    // 对应的原始偶数维度索引：dim = 2 * k
     int dim = 2 * k;
-
-    float base = rope_theta;
     float exponent = (float)dim / (float)head_size;
-    float freq = 1.0f / powf(base, exponent);
+    float freq = 1.0f / powf(rope_theta, exponent);
 
-    // 遍历所有位置
+    // Apply llama3 rope scaling if factor > 1
+    if (factor > 1.0f) {
+        float old_context_len = original_max_pos_emb;
+        float low_freq_wavelen = old_context_len / low_freq_factor;
+        float high_freq_wavelen = old_context_len / high_freq_factor;
+        float wavelen = 2.0f * 3.14159265358979323846f / freq;
+
+        if (wavelen > low_freq_wavelen) {
+            freq = freq / factor;
+        } else if (wavelen >= high_freq_wavelen) {
+            float smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+            freq = (1.0f - smooth) * freq / factor + smooth * freq;
+        }
+    }
+
     for (int pos = 0; pos < max_seq_len; ++pos) {
         float val = (float)pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
-
-        // 写入压缩后的缓存：每个 pos 只占 half_head 个元素
         int cache_idx = pos * half_head + k;
-        sin_cache[cache_idx] = __float2bfloat16(fci);
-        cos_cache[cache_idx] = __float2bfloat16(fcr);
+        sin_cache[cache_idx] = __float2bfloat16(sinf(val));
+        cos_cache[cache_idx] = __float2bfloat16(cosf(val));
     }
 }
 
@@ -312,10 +320,10 @@ extern "C" void sin_cos_cache_calc_cu_bf16(
     float rope_theta,
     __nv_bfloat16* sin_cache,
     __nv_bfloat16* cos_cache,
+    float factor, float low_freq_factor, float high_freq_factor,
+    float original_max_pos_emb,
     cudaStream_t stream)
 {
-
-    // 启动配置：1 个 Block，head_size 个 Threads
     int threads = head_size;
 
     sin_cos_calc_bf16<<<1, threads, 0, stream>>>(
@@ -323,10 +331,10 @@ extern "C" void sin_cos_cache_calc_cu_bf16(
         max_seq_len,
         rope_theta,
         sin_cache,
-        cos_cache
+        cos_cache,
+        factor, low_freq_factor, high_freq_factor, original_max_pos_emb
     );
-    
-    // 检查核函数启动错误
+
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -435,30 +443,37 @@ extern "C" void rope_kernel_cu_fp16(
 
 __global__ void sin_cos_calc_fp16(int head_size, int max_seq_len, float rope_theta,
                                   __half* sin_cache,
-                                  __half* cos_cache) {
-    // 每个线程处理一个“偶数维度对”的索引 k（k = 0, 1, ..., head_size/2 - 1）
+                                  __half* cos_cache,
+                                  float factor, float low_freq_factor, float high_freq_factor,
+                                  float original_max_pos_emb) {
     int k = threadIdx.x + blockDim.x * blockIdx.x;
     int half_head = head_size / 2;
 
     if (k >= half_head) return;
 
-    // 对应的原始偶数维度索引：dim = 2 * k
     int dim = 2 * k;
-
-    float base = rope_theta;
     float exponent = (float)dim / (float)head_size;
-    float freq = 1.0f / powf(base, exponent);
+    float freq = 1.0f / powf(rope_theta, exponent);
 
-    // 遍历所有位置
+    if (factor > 1.0f) {
+        float old_context_len = original_max_pos_emb;
+        float low_freq_wavelen = old_context_len / low_freq_factor;
+        float high_freq_wavelen = old_context_len / high_freq_factor;
+        float wavelen = 2.0f * 3.14159265358979323846f / freq;
+
+        if (wavelen > low_freq_wavelen) {
+            freq = freq / factor;
+        } else if (wavelen >= high_freq_wavelen) {
+            float smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+            freq = (1.0f - smooth) * freq / factor + smooth * freq;
+        }
+    }
+
     for (int pos = 0; pos < max_seq_len; ++pos) {
         float val = (float)pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
-
-        // 写入压缩后的缓存：每个 pos 只占 half_head 个元素
         int cache_idx = pos * half_head + k;
-        sin_cache[cache_idx] = __float2half(fci);
-        cos_cache[cache_idx] = __float2half(fcr);
+        sin_cache[cache_idx] = __float2half(sinf(val));
+        cos_cache[cache_idx] = __float2half(cosf(val));
     }
 }
 
@@ -468,10 +483,10 @@ extern "C" void sin_cos_cache_calc_cu_fp16(
     float rope_theta,
     __half* sin_cache,
     __half* cos_cache,
+    float factor, float low_freq_factor, float high_freq_factor,
+    float original_max_pos_emb,
     cudaStream_t stream)
 {
-
-    // 启动配置：1 个 Block，head_size 个 Threads
     int threads = head_size;
 
     sin_cos_calc_fp16<<<1, threads, 0, stream>>>(
@@ -479,10 +494,10 @@ extern "C" void sin_cos_cache_calc_cu_fp16(
         max_seq_len,
         rope_theta,
         sin_cache,
-        cos_cache
+        cos_cache,
+        factor, low_freq_factor, high_freq_factor, original_max_pos_emb
     );
-    
-    // 检查核函数启动错误
+
     CUDA_CHECK(cudaGetLastError());
 }
 

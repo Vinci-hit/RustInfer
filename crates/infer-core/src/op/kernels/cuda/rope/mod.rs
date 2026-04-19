@@ -194,6 +194,10 @@ unsafe extern "C" {
         rope_theta: f32,
         sin_cache: *mut half::bf16,
         cos_cache: *mut half::bf16,
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_pos_emb: f32,
         stream: cuda::ffi::cudaStream_t,
     );
 
@@ -203,6 +207,10 @@ unsafe extern "C" {
         rope_theta: f32,
         sin_cache: *mut half::f16,
         cos_cache: *mut half::f16,
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_pos_emb: f32,
         stream: cuda::ffi::cudaStream_t,
     );
 }
@@ -221,6 +229,10 @@ pub fn sin_cos_cache_calc_cuda(
     rope_theta: f32,
     sin_cache: &mut Tensor,
     cos_cache: &mut Tensor,
+    factor: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+    original_max_pos_emb: f32,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     let dtype = sin_cache.dtype();
@@ -272,6 +284,10 @@ pub fn sin_cos_cache_calc_cuda(
                     rope_theta,
                     sin_ptr,
                     cos_ptr,
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_pos_emb,
                     stream,
                 );
             }
@@ -288,6 +304,10 @@ pub fn sin_cos_cache_calc_cuda(
                     rope_theta,
                     sin_ptr,
                     cos_ptr,
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_pos_emb,
                     stream,
                 );
             }

@@ -59,130 +59,41 @@ impl InferenceState {
 
         if let [Some(sin_cache), Some(cos_cache)] = caches {
             let target_device = sin_cache.device();
-            let target_dtype = sin_cache.dtype();
             let head_size = config.head_size;
             let max_seq_len = config.seq_len;
 
-            // 1. Compute inv_freq with optional llama3 scaling (always on CPU in f32)
-            let half_head = head_size / 2;
-            let rope_theta = config.rope_theta as f64;
-            let mut inv_freq = vec![0.0f64; half_head];
-            for k in 0..half_head {
-                let dim = 2 * k;
-                let exponent = dim as f64 / head_size as f64;
-                inv_freq[k] = 1.0 / rope_theta.powf(exponent);
-            }
-
-            // Apply llama3 rope scaling if configured
-            if let Some(ref scaling) = config.rope_scaling {
-                if scaling.rope_type == "llama3" {
-                    let factor = scaling.factor;
-                    let low_freq_factor = scaling.low_freq_factor.unwrap_or(1.0);
-                    let high_freq_factor = scaling.high_freq_factor.unwrap_or(4.0);
-                    let old_context_len = scaling.original_max_position_embeddings.unwrap_or(8192) as f64;
-
-                    let low_freq_wavelen = old_context_len / low_freq_factor;
-                    let high_freq_wavelen = old_context_len / high_freq_factor;
-
-                    for k in 0..half_head {
-                        let freq = inv_freq[k];
-                        let wavelen = 2.0 * std::f64::consts::PI / freq;
-
-                        if wavelen > low_freq_wavelen {
-                            // Low frequency: divide by factor
-                            inv_freq[k] = freq / factor;
-                        } else if wavelen >= high_freq_wavelen {
-                            // Medium frequency: smooth interpolation
-                            let smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
-                            let scaled = freq / factor;
-                            inv_freq[k] = (1.0 - smooth) * scaled / factor + smooth * scaled;
-                            // Actually the HF implementation is:
-                            // inv_freq_llama = where(wavelen > low_freq_wavelen, freq / factor, freq)
-                            // smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-                            // smoothed = (1 - smooth) * inv_freq_llama / factor + smooth * inv_freq_llama
-                            // But inv_freq_llama at this point (medium freq) equals freq (original, not divided)
-                            // because wavelen is NOT > low_freq_wavelen for medium freq
-                            inv_freq[k] = (1.0 - smooth) * freq / factor + smooth * freq;
-                        }
-                        // else: high frequency (wavelen < high_freq_wavelen): keep original
+            // Extract llama3 rope scaling params (factor=1.0 means no scaling)
+            let (factor, low_freq_factor, high_freq_factor, original_max_pos_emb) =
+                if let Some(ref scaling) = config.rope_scaling {
+                    if scaling.rope_type == "llama3" {
+                        (
+                            scaling.factor as f32,
+                            scaling.low_freq_factor.unwrap_or(1.0) as f32,
+                            scaling.high_freq_factor.unwrap_or(4.0) as f32,
+                            scaling.original_max_position_embeddings.unwrap_or(8192) as f32,
+                        )
+                    } else {
+                        (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
                     }
-                }
-            }
+                } else {
+                    (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
+                };
 
-            // 2. Compute sin/cos cache on CPU in F32
-            //    The BF16/FP16 CUDA kernels use [pos * half_head + k] layout
-            //    But workspace allocates [max_seq_len, head_size] — we fill half_head per row
-            //    We create matching-sized tensors and fill the first half_head columns per row
-            let cache_cols = half_head;  // The BF16/FP16 kernels only use half_head columns
-            let total = max_seq_len * cache_cols;
-            let mut sin_f32 = vec![0.0f32; total];
-            let mut cos_f32 = vec![0.0f32; total];
-
-            for pos in 0..max_seq_len {
-                for k in 0..half_head {
-                    let val = pos as f64 * inv_freq[k];
-                    let idx = pos * cache_cols + k;
-                    sin_f32[idx] = val.sin() as f32;
-                    cos_f32[idx] = val.cos() as f32;
-                }
-            }
-
-            // 3. Write to target cache (may be CPU or CUDA, F32/BF16/FP16)
-            //    The target tensor has shape [max_seq_len, head_size] but we only
-            //    fill the first half_head elements per row. For BF16/FP16 on CUDA,
-            //    we write directly into the GPU buffer which the kernel reads as
-            //    [pos * half_head + k] — the allocation is larger but contiguous
-            //    memory works because the kernel indexes as pos * half_head + k
-            //    and the total data fits in max_seq_len * half_head elements.
-            match (target_device, target_dtype) {
-                (DeviceType::Cpu, DataType::F32) => {
-                    // CPU F32 kernel uses [pos * head_size + dim] layout (full head_size)
-                    // Recalculate with the correct layout
-                    // Actually let's just fill it properly for F32 too with scaling
-                    let sin_slice = sin_cache.as_f32_mut()?.as_slice_mut()?;
-                    let cos_slice = cos_cache.as_f32_mut()?.as_slice_mut()?;
-                    for pos in 0..max_seq_len {
-                        for k in 0..half_head {
-                            let val = pos as f64 * inv_freq[k];
-                            let idx = pos * head_size + k;  // F32 uses head_size stride
-                            sin_slice[idx] = val.sin() as f32;
-                            cos_slice[idx] = val.cos() as f32;
-                        }
-                    }
+            match target_device {
+                DeviceType::Cpu => {
+                    // CPU path: use existing CPU kernel (no scaling support, fallback)
+                    crate::op::kernels::cpu::rope_sin_cos_cache_calc(
+                        head_size, max_seq_len, config.rope_theta,
+                        sin_cache, cos_cache,
+                    )?;
                 }
                 #[cfg(feature = "cuda")]
-                (DeviceType::Cuda(_), _) => {
-                    // Write directly into GPU memory. The GPU tensor has
-                    // max_seq_len * head_size elements but the BF16/FP16 kernel
-                    // only uses the first max_seq_len * half_head elements (packed).
-                    match target_dtype {
-                        DataType::F16 => {
-                            let data: Vec<half::f16> = sin_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-                            sin_cache.as_f16_mut()?.buffer_mut().copy_from_host(&data)?;
-                            let data: Vec<half::f16> = cos_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-                            cos_cache.as_f16_mut()?.buffer_mut().copy_from_host(&data)?;
-                        }
-                        DataType::BF16 => {
-                            let data: Vec<half::bf16> = sin_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
-                            sin_cache.as_bf16_mut()?.buffer_mut().copy_from_host(&data)?;
-                            let data: Vec<half::bf16> = cos_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
-                            cos_cache.as_bf16_mut()?.buffer_mut().copy_from_host(&data)?;
-                        }
-                        DataType::F32 => {
-                            sin_cache.as_f32_mut()?.buffer_mut().copy_from_host(&sin_f32)?;
-                            cos_cache.as_f32_mut()?.buffer_mut().copy_from_host(&cos_f32)?;
-                        }
-                        _ => return Err(Error::InvalidArgument(format!("Unsupported dtype for RoPE cache: {:?}", target_dtype)).into()),
-                    }
-                }
-                _ => {
-                    // Fallback: use original CPU calculation (no scaling)
-                    crate::op::kernels::cpu::rope_sin_cos_cache_calc(
-                        config.head_size,
-                        config.seq_len,
-                        config.rope_theta,
-                        sin_cache,
-                        cos_cache,
+                DeviceType::Cuda(_) => {
+                    crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
+                        head_size, max_seq_len, config.rope_theta,
+                        sin_cache, cos_cache,
+                        factor, low_freq_factor, high_freq_factor, original_max_pos_emb,
+                        None,
                     )?;
                 }
             }
