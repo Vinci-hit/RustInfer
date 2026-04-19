@@ -44,13 +44,10 @@ pub fn load_config_from_json<R: Read>(mut json_reader: R) -> Result<ModelFileCon
     }
 }
 
-/// AWQ / GPTQ / compressed-tensors 等量化方案在 config.json 中的 quantization_config 字段。
-/// 支持两种格式：
-/// 1. AWQ 格式: { quant_method: "awq", bits: 4, group_size: 128, zero_point: true }
-/// 2. compressed-tensors 格式: { quant_method: "compressed-tensors", config_groups: { group_0: { weights: { num_bits: 4, group_size: 128 } } } }
+/// compressed-tensors 量化方案在 config.json 中的 quantization_config 字段。
 #[derive(Debug, Clone)]
 pub struct QuantizationConfig {
-    pub quant_method: String,      // "awq", "compressed-tensors", ...
+    pub quant_method: String,      // "compressed-tensors"
     pub bits: usize,               // 4
     pub group_size: usize,         // 128
     pub zero_point: bool,          // true
@@ -60,12 +57,6 @@ pub struct QuantizationConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct RawQuantizationConfig {
     pub quant_method: String,
-    #[serde(default)]
-    pub bits: Option<usize>,
-    #[serde(default)]
-    pub group_size: Option<usize>,
-    #[serde(default)]
-    pub zero_point: Option<bool>,
     #[serde(default)]
     pub config_groups: Option<serde_json::Value>,
 }
@@ -77,53 +68,31 @@ impl<'de> serde::Deserialize<'de> for QuantizationConfig {
     {
         let raw = RawQuantizationConfig::deserialize(deserializer)?;
 
-        match raw.quant_method.as_str() {
-            "awq" | "gptq" => {
-                Ok(QuantizationConfig {
-                    quant_method: raw.quant_method,
-                    bits: raw.bits.unwrap_or(4),
-                    group_size: raw.group_size.unwrap_or(128),
-                    zero_point: raw.zero_point.unwrap_or(true),
-                })
-            }
-            "compressed-tensors" => {
-                // Extract from config_groups.group_0.weights
-                let mut bits = 4usize;
-                let mut group_size = 128usize;
-                let mut zero_point = false;
-                if let Some(cg) = &raw.config_groups {
-                    if let Some(g0) = cg.get("group_0") {
-                        if let Some(w) = g0.get("weights") {
-                            if let Some(nb) = w.get("num_bits").and_then(|v| v.as_u64()) {
-                                bits = nb as usize;
-                            }
-                            if let Some(gs) = w.get("group_size").and_then(|v| v.as_u64()) {
-                                group_size = gs as usize;
-                            }
-                            // symmetric: false means zero_point is used
-                            if let Some(sym) = w.get("symmetric").and_then(|v| v.as_bool()) {
-                                zero_point = !sym;
-                            }
-                        }
+        // Extract from config_groups.group_0.weights
+        let mut bits = 4usize;
+        let mut group_size = 128usize;
+        let mut zero_point = false;
+        if let Some(cg) = &raw.config_groups {
+            if let Some(g0) = cg.get("group_0") {
+                if let Some(w) = g0.get("weights") {
+                    if let Some(nb) = w.get("num_bits").and_then(|v| v.as_u64()) {
+                        bits = nb as usize;
+                    }
+                    if let Some(gs) = w.get("group_size").and_then(|v| v.as_u64()) {
+                        group_size = gs as usize;
+                    }
+                    if let Some(sym) = w.get("symmetric").and_then(|v| v.as_bool()) {
+                        zero_point = !sym;
                     }
                 }
-                Ok(QuantizationConfig {
-                    quant_method: raw.quant_method,
-                    bits,
-                    group_size,
-                    zero_point,
-                })
-            }
-            other => {
-                // Fallback: try to parse flat fields
-                Ok(QuantizationConfig {
-                    quant_method: other.to_string(),
-                    bits: raw.bits.unwrap_or(4),
-                    group_size: raw.group_size.unwrap_or(128),
-                    zero_point: raw.zero_point.unwrap_or(true),
-                })
             }
         }
+        Ok(QuantizationConfig {
+            quant_method: raw.quant_method,
+            bits,
+            group_size,
+            zero_point,
+        })
     }
 }
 

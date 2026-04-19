@@ -91,7 +91,7 @@ impl Llama3 {
         let mut w2_layers = Vec::with_capacity(layer_num);
 
         let is_awq = config.quant_config.as_ref().map_or(false, |q|
-            q.quant_method == "compressed-tensors" || q.quant_method == "awq");
+            q.quant_method == "compressed-tensors");
         let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
 
         for i in 0..layer_num {
