@@ -416,37 +416,32 @@ extern "C" void gemm_cublaslt_fp16(
 }
 
 // ============================================================================
-//  INT4 GEMV/GEMM — K-packed, FP16 magic dequant + half2 FMA pipeline
+//  INT4 GEMV/GEMM — K-packed, BF16 magic dequant + bf16x2 FMA pipeline
 //
 //  Weight layout (compressed-tensors / pack-quantized format):
 //    weight_packed:     [N, K/8]          (int32) — 8 consecutive K-position INT4 per int32
 //    weight_zero_point: [N/8, num_groups] (int32) — zero points packed along N
 //    weight_scale:      [N, num_groups]   (bf16)  — per-group scale factors
 //
-//  Dequant: FP16 magic number trick.
-//    0x6400 = fp16(1024.0). OR nibble → fp16(1024 + nibble).
-//    half2 sub(1024+zp) then mul(scale) → dequant in FP pipeline.
-//
-//  Accumulation: half2 FMA with bf16→fp16 input conversion.
-//    Magic dequant outputs 4 x half2 per word in interleaved order:
-//      (n0,n4), (n1,n5), (n2,n6), (n3,n7)
-//    Input bf16 is paired as (x0,x4), (x1,x5), (x2,x6), (x3,x7) to match.
-//    4 x hfma2 per word = 8 FMA in 4 instructions.
-//    Final half2 → float reduction for output precision.
+//  BF16 magic number dequant (zero bf16↔fp16 conversion):
+//    0x4300 = bf16(128.0). OR nibble → bf16(128 + nibble).
+//    bf16x2 sub(128+zp) then mul(scale) → dequant entirely in BF16 pipeline.
+//    Input is already BF16, pair directly → bf16x2 FMA accumulation.
+//    44 ops/word → 24 ops/word (45% reduction).
 // ============================================================================
 
-// Dequant 8 nibbles from one int32 → 4 x half2, FP16 magic number trick.
-// Output: (n0,n4), (n1,n5), (n2,n6), (n3,n7) — interleaved pair order.
-__device__ __forceinline__ void dequant_8xint4_magic(
+// BF16 magic dequant: extract 8 INT4 nibbles from one int32 → 4 x bf16x2.
+// Output order: (n0,n4), (n1,n5), (n2,n6), (n3,n7) — interleaved pairs.
+__device__ __forceinline__ void dequant_8xint4_bf16_magic(
     uint32_t word,
-    half2 magic_zp,  // half2(1024+zp, 1024+zp)
-    half2 scale_h2,  // half2(scale, scale)
-    half2 &out04,
-    half2 &out15,
-    half2 &out26,
-    half2 &out37
+    __nv_bfloat162 magic_zp,  // bf162(128+zp, 128+zp)
+    __nv_bfloat162 scale_bf2, // bf162(scale, scale)
+    __nv_bfloat162 &out04,
+    __nv_bfloat162 &out15,
+    __nv_bfloat162 &out26,
+    __nv_bfloat162 &out37
 ) {
-    static constexpr uint32_t MAGIC = 0x64006400u;
+    static constexpr uint32_t MAGIC = 0x43004300u;  // two bf16 128.0
     static constexpr uint32_t MASK  = 0x000F000Fu;
 
     uint32_t p04 = ((word      ) & MASK) | MAGIC;
@@ -454,18 +449,10 @@ __device__ __forceinline__ void dequant_8xint4_magic(
     uint32_t p26 = ((word >>  8) & MASK) | MAGIC;
     uint32_t p37 = ((word >> 12) & MASK) | MAGIC;
 
-    out04 = __hmul2(__hsub2(*reinterpret_cast<half2*>(&p04), magic_zp), scale_h2);
-    out15 = __hmul2(__hsub2(*reinterpret_cast<half2*>(&p15), magic_zp), scale_h2);
-    out26 = __hmul2(__hsub2(*reinterpret_cast<half2*>(&p26), magic_zp), scale_h2);
-    out37 = __hmul2(__hsub2(*reinterpret_cast<half2*>(&p37), magic_zp), scale_h2);
-}
-
-// Convert bf16 pair to half2: pack two non-adjacent bf16 elements.
-__device__ __forceinline__ half2 bf16_pair_to_half2(
-    __nv_bfloat16 a, __nv_bfloat16 b
-) {
-    return __halves2half2(__float2half(__bfloat162float(a)),
-                          __float2half(__bfloat162float(b)));
+    out04 = __hmul2(__hsub2(*reinterpret_cast<__nv_bfloat162*>(&p04), magic_zp), scale_bf2);
+    out15 = __hmul2(__hsub2(*reinterpret_cast<__nv_bfloat162*>(&p15), magic_zp), scale_bf2);
+    out26 = __hmul2(__hsub2(*reinterpret_cast<__nv_bfloat162*>(&p26), magic_zp), scale_bf2);
+    out37 = __hmul2(__hsub2(*reinterpret_cast<__nv_bfloat162*>(&p37), magic_zp), scale_bf2);
 }
 
 template <int WARPS_PER_BLOCK, bool GROUP_SIZE_IS_POW2>
@@ -496,9 +483,9 @@ kpack_gemv_kernel(
 
     const int4* input_i4 = reinterpret_cast<const int4*>(input);
 
-    // Accumulate in half2 pairs, convert to float at the end
-    half2 acc_h2 = __float2half2_rn(0.0f);
-    half2 acc_h2b = __float2half2_rn(0.0f);
+    // BF16x2 accumulators — two independent chains to avoid FMA dependency stall
+    __nv_bfloat162 acc_a = __float2bfloat162_rn(0.0f);
+    __nv_bfloat162 acc_b = __float2bfloat162_rn(0.0f);
 
     int kp = lane_id;
 
@@ -510,35 +497,37 @@ kpack_gemv_kernel(
             int k_base = kpu * 8;
             int g = GROUP_SIZE_IS_POW2 ? (k_base >> group_shift) : (k_base / group_size);
 
-            float scale_f = __bfloat162float(__ldg(&sc_row[g]));
+            // Load scale directly as bf16 (no conversion!)
+            __nv_bfloat16 scale_bf = __ldg(&sc_row[g]);
             int32_t zp_packed = __ldg(&zp_row[g]);
             int zero = (zp_packed >> zp_bit_offset) & 0xF;
 
-            half scale_h = __float2half(scale_f);
-            half2 scale_h2 = __half2half2(scale_h);
-            half2 magic_zp = __half2half2(__float2half(1024.0f + (float)zero));
+            // Build magic constants in BF16
+            __nv_bfloat16 magic_zp_val = __float2bfloat16(128.0f + (float)zero);
+            __nv_bfloat162 scale_bf2 = __halves2bfloat162(scale_bf, scale_bf);
+            __nv_bfloat162 magic_zp = __halves2bfloat162(magic_zp_val, magic_zp_val);
 
             int32_t word = __ldg(&wp_row[kpu]);
 
-            // Dequant → 4 x half2: (w0,w4), (w1,w5), (w2,w6), (w3,w7)
-            half2 d04, d15, d26, d37;
-            dequant_8xint4_magic(word, magic_zp, scale_h2, d04, d15, d26, d37);
+            // BF16 magic dequant → 4 x bf16x2
+            __nv_bfloat162 d04, d15, d26, d37;
+            dequant_8xint4_bf16_magic(word, magic_zp, scale_bf2, d04, d15, d26, d37);
 
-            // Load input: 8 bf16 values
+            // Load input as int4 (8 bf16 values) — already bf16, zero conversion!
             int4 in = __ldg(&input_i4[kpu]);
             const __nv_bfloat16* inp = reinterpret_cast<const __nv_bfloat16*>(&in);
 
-            // Pair input to match dequant order: (x0,x4), (x1,x5), (x2,x6), (x3,x7)
-            half2 x04 = bf16_pair_to_half2(inp[0], inp[4]);
-            half2 x15 = bf16_pair_to_half2(inp[1], inp[5]);
-            half2 x26 = bf16_pair_to_half2(inp[2], inp[6]);
-            half2 x37 = bf16_pair_to_half2(inp[3], inp[7]);
+            // Pair input to match dequant interleave: (x0,x4), (x1,x5), (x2,x6), (x3,x7)
+            __nv_bfloat162 x04 = __halves2bfloat162(inp[0], inp[4]);
+            __nv_bfloat162 x15 = __halves2bfloat162(inp[1], inp[5]);
+            __nv_bfloat162 x26 = __halves2bfloat162(inp[2], inp[6]);
+            __nv_bfloat162 x37 = __halves2bfloat162(inp[3], inp[7]);
 
-            // 4 x hfma2 = 8 FMA in 4 instructions
-            acc_h2  = __hfma2(d04, x04, acc_h2);
-            acc_h2b = __hfma2(d15, x15, acc_h2b);
-            acc_h2  = __hfma2(d26, x26, acc_h2);
-            acc_h2b = __hfma2(d37, x37, acc_h2b);
+            // 4 x bf16x2 FMA = 8 multiply-adds in 4 instructions
+            acc_a = __hfma2(d04, x04, acc_a);
+            acc_b = __hfma2(d15, x15, acc_b);
+            acc_a = __hfma2(d26, x26, acc_a);
+            acc_b = __hfma2(d37, x37, acc_b);
         }
     }
 
@@ -547,32 +536,33 @@ kpack_gemv_kernel(
         int k_base = kp * 8;
         int g = GROUP_SIZE_IS_POW2 ? (k_base >> group_shift) : (k_base / group_size);
 
-        float scale_f = __bfloat162float(__ldg(&sc_row[g]));
+        __nv_bfloat16 scale_bf = __ldg(&sc_row[g]);
         int32_t zp_packed = __ldg(&zp_row[g]);
         int zero = (zp_packed >> zp_bit_offset) & 0xF;
 
-        half scale_h = __float2half(scale_f);
-        half2 scale_h2 = __half2half2(scale_h);
-        half2 magic_zp = __half2half2(__float2half(1024.0f + (float)zero));
+        __nv_bfloat16 magic_zp_val = __float2bfloat16(128.0f + (float)zero);
+        __nv_bfloat162 scale_bf2 = __halves2bfloat162(scale_bf, scale_bf);
+        __nv_bfloat162 magic_zp = __halves2bfloat162(magic_zp_val, magic_zp_val);
 
         int32_t word = __ldg(&wp_row[kp]);
-        half2 d04, d15, d26, d37;
-        dequant_8xint4_magic(word, magic_zp, scale_h2, d04, d15, d26, d37);
+        __nv_bfloat162 d04, d15, d26, d37;
+        dequant_8xint4_bf16_magic(word, magic_zp, scale_bf2, d04, d15, d26, d37);
 
-        half2 x04 = bf16_pair_to_half2(__ldg(&input[k_base + 0]), __ldg(&input[k_base + 4]));
-        half2 x15 = bf16_pair_to_half2(__ldg(&input[k_base + 1]), __ldg(&input[k_base + 5]));
-        half2 x26 = bf16_pair_to_half2(__ldg(&input[k_base + 2]), __ldg(&input[k_base + 6]));
-        half2 x37 = bf16_pair_to_half2(__ldg(&input[k_base + 3]), __ldg(&input[k_base + 7]));
+        __nv_bfloat162 x04 = __halves2bfloat162(__ldg(&input[k_base+0]), __ldg(&input[k_base+4]));
+        __nv_bfloat162 x15 = __halves2bfloat162(__ldg(&input[k_base+1]), __ldg(&input[k_base+5]));
+        __nv_bfloat162 x26 = __halves2bfloat162(__ldg(&input[k_base+2]), __ldg(&input[k_base+6]));
+        __nv_bfloat162 x37 = __halves2bfloat162(__ldg(&input[k_base+3]), __ldg(&input[k_base+7]));
 
-        acc_h2  = __hfma2(d04, x04, acc_h2);
-        acc_h2b = __hfma2(d15, x15, acc_h2b);
-        acc_h2  = __hfma2(d26, x26, acc_h2);
-        acc_h2b = __hfma2(d37, x37, acc_h2b);
+        acc_a = __hfma2(d04, x04, acc_a);
+        acc_b = __hfma2(d15, x15, acc_b);
+        acc_a = __hfma2(d26, x26, acc_a);
+        acc_b = __hfma2(d37, x37, acc_b);
     }
 
-    // Merge two accumulators and reduce to float
-    acc_h2 = __hadd2(acc_h2, acc_h2b);
-    float acc = __half2float(__low2half(acc_h2)) + __half2float(__high2half(acc_h2));
+    // Merge bf16x2 accumulators → float for precise warp reduction
+    __nv_bfloat162 sum_bf2 = __hadd2(acc_a, acc_b);
+    float acc = __bfloat162float(__low2bfloat16(sum_bf2))
+              + __bfloat162float(__high2bfloat16(sum_bf2));
 
     acc = warp_reduce_sum_gemv(acc);
     if (lane_id == 0) {
@@ -581,7 +571,7 @@ kpack_gemv_kernel(
 }
 
 // ============================================================================
-//  INT4 GEMM (prefill, M>1) — K-packed, half2 FMA pipeline
+//  INT4 GEMM (prefill, M>1) — K-packed, BF16 magic dequant + bf16x2 FMA
 // ============================================================================
 #define INT4_GEMM_BX 16
 #define INT4_GEMM_BY 16
@@ -608,8 +598,8 @@ extern "C" __global__ void kpack_gemm_kernel(
     const int zp_bit_offset = (col & 7) * 4;
     const int32_t* zp_row = weight_zero_point + zp_col_packed * num_groups;
 
-    half2 acc_h2 = __float2half2_rn(0.0f);
-    half2 acc_h2b = __float2half2_rn(0.0f);
+    __nv_bfloat162 acc_a = __float2bfloat162_rn(0.0f);
+    __nv_bfloat162 acc_b = __float2bfloat162_rn(0.0f);
 
     const __nv_bfloat16* inp_row = input + row * K;
 
@@ -617,31 +607,32 @@ extern "C" __global__ void kpack_gemm_kernel(
         int k_base = kp * 8;
         int g = k_base / group_size;
 
-        float scale_f = __bfloat162float(sc_row[g]);
+        __nv_bfloat16 scale_bf = sc_row[g];
         int32_t zp_packed = zp_row[g];
         int zero = (zp_packed >> zp_bit_offset) & 0xF;
 
-        half scale_h = __float2half(scale_f);
-        half2 scale_h2 = __half2half2(scale_h);
-        half2 magic_zp = __half2half2(__float2half(1024.0f + (float)zero));
+        __nv_bfloat16 magic_zp_val = __float2bfloat16(128.0f + (float)zero);
+        __nv_bfloat162 scale_bf2 = __halves2bfloat162(scale_bf, scale_bf);
+        __nv_bfloat162 magic_zp = __halves2bfloat162(magic_zp_val, magic_zp_val);
 
         int32_t word = wp_row[kp];
-        half2 d04, d15, d26, d37;
-        dequant_8xint4_magic(word, magic_zp, scale_h2, d04, d15, d26, d37);
+        __nv_bfloat162 d04, d15, d26, d37;
+        dequant_8xint4_bf16_magic(word, magic_zp, scale_bf2, d04, d15, d26, d37);
 
-        half2 x04 = bf16_pair_to_half2(inp_row[k_base + 0], inp_row[k_base + 4]);
-        half2 x15 = bf16_pair_to_half2(inp_row[k_base + 1], inp_row[k_base + 5]);
-        half2 x26 = bf16_pair_to_half2(inp_row[k_base + 2], inp_row[k_base + 6]);
-        half2 x37 = bf16_pair_to_half2(inp_row[k_base + 3], inp_row[k_base + 7]);
+        __nv_bfloat162 x04 = __halves2bfloat162(inp_row[k_base+0], inp_row[k_base+4]);
+        __nv_bfloat162 x15 = __halves2bfloat162(inp_row[k_base+1], inp_row[k_base+5]);
+        __nv_bfloat162 x26 = __halves2bfloat162(inp_row[k_base+2], inp_row[k_base+6]);
+        __nv_bfloat162 x37 = __halves2bfloat162(inp_row[k_base+3], inp_row[k_base+7]);
 
-        acc_h2  = __hfma2(d04, x04, acc_h2);
-        acc_h2b = __hfma2(d15, x15, acc_h2b);
-        acc_h2  = __hfma2(d26, x26, acc_h2);
-        acc_h2b = __hfma2(d37, x37, acc_h2b);
+        acc_a = __hfma2(d04, x04, acc_a);
+        acc_b = __hfma2(d15, x15, acc_b);
+        acc_a = __hfma2(d26, x26, acc_a);
+        acc_b = __hfma2(d37, x37, acc_b);
     }
 
-    acc_h2 = __hadd2(acc_h2, acc_h2b);
-    float acc = __half2float(__low2half(acc_h2)) + __half2float(__high2half(acc_h2));
+    __nv_bfloat162 sum_bf2 = __hadd2(acc_a, acc_b);
+    float acc = __bfloat162float(__low2bfloat16(sum_bf2))
+              + __bfloat162float(__high2bfloat16(sum_bf2));
     output[row * N + col] = __float2bfloat16(acc);
 }
 
