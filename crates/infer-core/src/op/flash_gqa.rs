@@ -14,6 +14,12 @@ pub struct FlashAttnGQA {
 
 impl FlashAttnGQA {
     /// 创建一个新的 FlashAttnGQA 算子。
+    ///
+    /// Op 本身无状态。Decode 路径所需的 split-K workspace 由 `CudaConfig` 拥有，
+    /// 调用方（模型初始化代码）需要在 `capture_graph_begin` 之前调用
+    /// [`crate::cuda::CudaConfig::ensure_flash_decode_workspace`] 按实际
+    /// `(num_q_heads, head_dim)` 分配；否则本 op 的 forward 会在 decode 路径
+    /// 返回明确错误，而不会静默写坏显存。
     pub fn new(
         num_q_heads: usize,
         num_kv_heads: usize,
