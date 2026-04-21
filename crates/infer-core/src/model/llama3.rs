@@ -90,7 +90,7 @@ impl Llama3 {
         let mut w_gate_up_layers = Vec::with_capacity(layer_num);
         let mut w2_layers = Vec::with_capacity(layer_num);
 
-        let is_awq = config.quant_config.as_ref().map_or(false, |q|
+        let is_awq = config.quant_config.as_ref().is_some_and(|q|
             q.quant_method == "compressed-tensors");
         let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
 

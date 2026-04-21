@@ -72,19 +72,17 @@ impl<'de> serde::Deserialize<'de> for QuantizationConfig {
         let mut bits = 4usize;
         let mut group_size = 128usize;
         let mut zero_point = false;
-        if let Some(cg) = &raw.config_groups {
-            if let Some(g0) = cg.get("group_0") {
-                if let Some(w) = g0.get("weights") {
-                    if let Some(nb) = w.get("num_bits").and_then(|v| v.as_u64()) {
-                        bits = nb as usize;
-                    }
-                    if let Some(gs) = w.get("group_size").and_then(|v| v.as_u64()) {
-                        group_size = gs as usize;
-                    }
-                    if let Some(sym) = w.get("symmetric").and_then(|v| v.as_bool()) {
-                        zero_point = !sym;
-                    }
-                }
+        if let Some(cg) = &raw.config_groups
+            && let Some(g0) = cg.get("group_0")
+            && let Some(w) = g0.get("weights") {
+            if let Some(nb) = w.get("num_bits").and_then(|v| v.as_u64()) {
+                bits = nb as usize;
+            }
+            if let Some(gs) = w.get("group_size").and_then(|v| v.as_u64()) {
+                group_size = gs as usize;
+            }
+            if let Some(sym) = w.get("symmetric").and_then(|v| v.as_bool()) {
+                zero_point = !sym;
             }
         }
         Ok(QuantizationConfig {

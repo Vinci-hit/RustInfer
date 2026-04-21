@@ -30,4 +30,4 @@ mod scatter;
 pub use scatter::*;
 
 mod split_cols;
-pub use split_cols::*;
+pub(crate) use split_cols::*;

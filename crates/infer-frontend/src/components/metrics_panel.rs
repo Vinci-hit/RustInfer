@@ -5,7 +5,7 @@ use crate::state::metrics::SystemMetrics;
 #[component]
 pub fn MetricsPanel() -> Element {
     let mut metrics = use_signal(|| None::<SystemMetrics>);
-    let api_client = use_signal(|| ApiClient::new());
+    let api_client = use_signal(ApiClient::new);
 
     // Poll every 2 seconds
     use_future(move || async move {
