@@ -27,7 +27,7 @@ unsafe extern "C" {
 
 /// Split columns from a fused [rows, total_cols] BF16 tensor.
 /// Copies columns [col_offset, col_offset + dst_cols) into dst [rows, dst_cols].
-pub fn split_cols_bf16_tensor(
+pub(crate) fn split_cols_bf16_tensor(
     src: &Tensor,
     dst: &mut Tensor,
     rows: usize,
@@ -52,7 +52,7 @@ pub fn split_cols_bf16_tensor(
     Ok(())
 }
 
-pub fn split_cols_fp16_tensor(
+pub(crate) fn split_cols_fp16_tensor(
     src: &Tensor,
     dst: &mut Tensor,
     rows: usize,

@@ -106,7 +106,7 @@ impl Qwen3 {
         let mut w_gate_up_layers = Vec::with_capacity(layer_num);
         let mut w2_layers = Vec::with_capacity(layer_num);
 
-        let is_awq = config.quant_config.as_ref().map_or(false, |q|
+        let is_awq = config.quant_config.as_ref().is_some_and(|q|
             q.quant_method == "compressed-tensors");
         let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
 
@@ -157,11 +157,13 @@ impl Qwen3 {
         if w_gate_up_layers.len() != layer_num || w2_layers.len() != layer_num {
             return Err(InternalError("Incorrect number of FFN Matmul layers.".to_string()).into());
         }
-        if let Some(ref q) = has_qnorm.then_some(&qnorm_layers_opt) {
-            if q.len() != layer_num { return Err(InternalError("Incorrect number of Q-norm layers.".to_string()).into()); }
+        if let Some(q) = has_qnorm.then_some(&qnorm_layers_opt)
+            && q.len() != layer_num {
+            return Err(InternalError("Incorrect number of Q-norm layers.".to_string()).into());
         }
-        if let Some(ref k) = has_knorm.then_some(&knorm_layers_opt) {
-            if k.len() != layer_num { return Err(InternalError("Incorrect number of K-norm layers.".to_string()).into()); }
+        if let Some(k) = has_knorm.then_some(&knorm_layers_opt)
+            && k.len() != layer_num {
+            return Err(InternalError("Incorrect number of K-norm layers.".to_string()).into());
         }
         if mha_layers.len() != layer_num || rope_layers.len() != layer_num || swiglu_layers.len() != layer_num {
             return Err(InternalError("Incorrect number of non-parameterized layers.".to_string()).into());
@@ -448,8 +450,8 @@ impl Qwen3 {
             let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
             self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
 
-            let mut q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
-            let mut k_view = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
+            let q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
+            let k_view = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
             let v_view = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[1, self.config.kv_dim])?;
 
             // QK-norm (Qwen3-specific)

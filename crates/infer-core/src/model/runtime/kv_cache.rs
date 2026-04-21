@@ -1,5 +1,5 @@
 use crate::base::error::Result;
-use crate::base::{DataType, DeviceType};
+use crate::base::DeviceType;
 use crate::model::common::config::RuntimeModelConfig;
 use crate::tensor::Tensor;
 

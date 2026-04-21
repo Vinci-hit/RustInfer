@@ -38,7 +38,7 @@ fn main() {
         .flag("-w")
         .include(&cutlass_include)
         .flag("-std=c++17")
-        .flag(&format!("-arch={}", cuda_arch));
+        .flag(format!("-arch={}", cuda_arch));
 
         for path in &kernel_paths {
             build.file(path);
@@ -119,13 +119,12 @@ fn detect_cuda_arch() -> String {
         .args(["--query-gpu=compute_cap", "--format=csv,noheader,nounits", "-i", "0"])
         .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // cap 格式如 "9.0", "8.9", "8.0"
-            let sm = cap.replace('.', "");
-            return format!("sm_{}", sm);
-        }
+    if let Ok(output) = output
+        && output.status.success() {
+        let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // cap 格式如 "9.0", "8.9", "8.0"
+        let sm = cap.replace('.', "");
+        return format!("sm_{}", sm);
     }
 
     // 3. fallback

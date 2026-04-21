@@ -73,13 +73,14 @@ async fn main() -> Result<()> {
     tracing::info!("Loading model...");
     let model = match args.model_type.to_lowercase().as_str() {
         "llama3" | "llama" => {
-            let m = infer_core::model::llama3::Llama3::new(&args.model, device, false)?;
+            let m = infer_core::model::llama3::Llama3::new(&args.model, device)?;
             let state = m.create_state()?;
             ModelInstance::Llama3(m, state)
         }
         "qwen3" | "qwen" => {
-            let m = infer_core::model::qwen3::Qwen3::new(&args.model, device, false)?;
-            ModelInstance::Qwen3(m)
+            let m = infer_core::model::qwen3::Qwen3::new(&args.model, device)?;
+            let state = m.create_state()?;
+            ModelInstance::Qwen3(m, state)
         }
         _ => {
             anyhow::bail!(
