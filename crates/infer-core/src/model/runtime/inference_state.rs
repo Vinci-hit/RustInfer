@@ -33,7 +33,10 @@ impl InferenceState {
 
         #[cfg(feature = "cuda")]
         let cuda_config = {
-            let cfg = CudaConfig::new()?;
+            // 按当前模型实际形状一次性分配 split-K flash-decoding workspace。
+            // 必须在任何 `capture_graph_begin` 之前完成（这里在 init，显然满足）。
+            let cfg = CudaConfig::new()?
+                .with_flash_decode(config.head_num, config.head_size)?;
             Some(cfg)
         };
 
