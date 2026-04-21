@@ -1,40 +1,37 @@
 // ============================================================================
 // Flash Decoding BF16, head_dim = 128 — split-K across KV sequence
 //
-// Optimised version (see cuda-optimized-skill run_main, v2):
-//   - Grid = (num_q_heads, N_SPLIT) instead of (num_q_heads,) alone.  Each
-//     block does online softmax over its KV chunk and writes a partial
-//     (m, l, O) to a global workspace.
-//   - A small pass-2 kernel merges the N_SPLIT partials per query head using
-//     the standard log-sum-exp rule.
-//   - Intra-block group-merge scratch (`s_acc`) is stored in bf16 (not fp32)
-//     to cut per-block shared memory from 24.96 KB to 20.8 KB.  This takes
-//     the Block Limit SMEM from 3 to 4 blocks per SM on Ampere (SM_8x).
+// 优化要点（来自 cuda-optimized-skill run_main v2 winner）：
+//   1. Split-K: grid = (num_q_heads, N_SPLIT)。每 block 仅对 KV chunk 做
+//      online softmax，写部分 (m, l, O) 到调用方提供的 workspace；再由一个
+//      很小的 pass-2 kernel 做 log-sum-exp 合并。
+//   2. 块内 group-merge scratch 用 bf16 (不是 fp32) 存储，降 per-block SMEM
+//      从 24.96 KB 到 20.8 KB，Block Limit SMEM 在 Ampere 上 3 → 4，
+//      theoretical occupancy 50% → 67%。
 //
-// Measured on NVIDIA A10 (sm_86), head_dim=128, num_q_heads=32, num_kv_heads=8,
-// seq_len=2048 (decode phase, q_seq_len=1):
+// 在 NVIDIA A10 (sm_86)、head_dim=128、num_q_heads=32、num_kv_heads=8、
+// seq_len=2048 (decode, q_seq_len=1) 上实测：
+//   baseline (pre-split):   0.0589 ms
+//   v1 split-K N_SPLIT=8:   0.0303 ms  (1.94x)
+//   v2 + bf16 s_acc:        0.0255 ms  (2.31x)  ← 本文件
 //
-//   | Version               | Kernel median | Speedup vs baseline |
-//   | --------------------- | ------------- | ------------------- |
-//   | baseline (pre-split)  | 0.0589 ms     | 1.00x               |
-//   | v1 split-K N_SPLIT=8  | 0.0303 ms     | 1.94x               |
-//   | v2 + bf16 s_acc       | 0.0255 ms     | 2.31x  (this file)  |
+// Workspace 所有权：
+//   pass-1 → pass-2 的 (m, l, O) scratch 由 Rust 侧 `CudaConfig` 预分配并通过
+//   `workspace` 入参传入（详见 `cuda/config.rs::ensure_flash_decode_workspace`）。
+//   Kernel 内部无任何 static / cudaMalloc，保证完整 CUDA Graph 兼容。
 //
-//   - DRAM throughput:  20% -> 53% of peak (NCU)
-//   - Achieved occupancy: 17% -> 57%
-//   - L2 hit rate kept at ~75% via the split-K chunking
-//   - Full NCU report (pass-1 kernel) available under
-//     cuda-optimized-skill/flash_decoding_bf16_hdim128_opt/optimize_runs/run_main/iter_v2/full.ncu-rep
-//
-// Correctness verified against a bf16-quantised PyTorch reference
-// (atol=2e-2, rtol=2e-2, seq_len 2048): max |delta| ≈ 4.88e-4.
+//   Workspace 内存布局（单个 fp32 平板）：
+//     [0,                              num_q_heads * N_SPLIT)                 = M
+//     [num_q_heads * N_SPLIT,        2*num_q_heads * N_SPLIT)                 = L
+//     [2*num_q_heads * N_SPLIT,      (2 + head_dim) * num_q_heads * N_SPLIT)  = O
+//   总 fp32 数 = num_q_heads * N_SPLIT * (2 + head_dim)
+//   调用方保证 `workspace` 至少这么大。
 // ============================================================================
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <cstdint>
-#include <stdio.h>
 #include "flash_attn_gqa.h"
 
 // ----------------------------------------------------------------------------
@@ -48,30 +45,23 @@
 #define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)
 #define CP_ASYNC_WAIT_GROUP(n) asm volatile("cp.async.wait_group %0;\n" ::"n"(n))
 
-// head_dim = 128, 16 groups of 16 lanes per block = 256 threads
 #define HD128              128
 #define BN128              16     // tokens per KV micro-tile
 #define THREADS_PER_KEY128 16     // lanes per group (each lane owns 8 dims)
 #define NUM_GROUPS128      16     // 256 / 16
 #define N_SPLIT            8      // KV-axis partitions per q_head
+                                  // 与 cuda/config.rs::FLASH_DECODE_N_SPLIT 同步！
 
 // ============================================================================
 // PASS 1 — per-chunk online softmax
-//
-// grid = (num_q_heads, N_SPLIT)   block = 256
-// Each block computes the partial softmax over tokens
-// [blockIdx.y * chunk_size, min(seq_len, (blockIdx.y+1) * chunk_size) ).
-// Writes  M_g[q, s]               : running max
-//         L_g[q, s]               : running denominator (post-rescale)
-//         O_g[q, s, 0..127]       : un-normalised partial O (fp32)
 // ============================================================================
 __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
-    const __nv_bfloat16* __restrict__ Q,      // [num_q_heads, 128]
-    const __nv_bfloat16* __restrict__ K,      // [seq_len, num_kv_heads, 128]
-    const __nv_bfloat16* __restrict__ V,      // [seq_len, num_kv_heads, 128]
-    float*               __restrict__ M_g,    // [num_q_heads, N_SPLIT]
-    float*               __restrict__ L_g,    // [num_q_heads, N_SPLIT]
-    float*               __restrict__ O_g,    // [num_q_heads, N_SPLIT, 128]
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    float*               __restrict__ M_g,
+    float*               __restrict__ L_g,
+    float*               __restrict__ O_g,
     int32_t*             seq_len_ptr,
     int num_kv_heads,
     int group_size,
@@ -82,15 +72,12 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
     int split_idx   = blockIdx.y;
     int kv_head_idx = q_head_idx / group_size;
 
-    // Compute chunk_size on device so the host FFI does not need to know
-    // the true seq_len.  chunk_size is ceil(seq_len / N_SPLIT) rounded up
-    // to a multiple of BN128 so cp.async micro-tiles stay aligned.
+    // chunk_size 设备端动态计算，向上对齐到 BN128 保证 cp.async 对齐
     int per_split   = (seq_len + N_SPLIT - 1) / N_SPLIT;
     int chunk_size  = ((per_split + BN128 - 1) / BN128) * BN128;
 
     int chunk_begin = split_idx * chunk_size;
     if (chunk_begin >= seq_len) {
-        // Fully-empty chunk publishes identity (m=-inf, l=0, O=0) for pass-2 safety.
         if (threadIdx.x == 0) {
             int mo = q_head_idx * N_SPLIT + split_idx;
             M_g[mo] = -1e30f;
@@ -121,16 +108,14 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
     __nv_bfloat16* s_acc_bf  = reinterpret_cast<__nv_bfloat16*>(s_s + NUM_GROUPS128);
 
     int tid  = threadIdx.x;
-    int gid  = tid / THREADS_PER_KEY128;     // group (token-row) id
-    int lane = tid % THREADS_PER_KEY128;     // dim-chunk id (each owns 8 dims)
+    int gid  = tid / THREADS_PER_KEY128;
+    int lane = tid % THREADS_PER_KEY128;
 
-    // Q load (16 threads do 16 * float4 = 128 bf16).
     if (tid < 16) {
         reinterpret_cast<float4*>(s_q)[tid] =
             reinterpret_cast<const float4*>(Q + q_head_idx * HD128)[tid];
     }
 
-    // Per-thread online-softmax state.
     float row_max = -1e20f;
     float row_sum = 0.0f;
     float acc[8]  = {0.0f};
@@ -151,7 +136,6 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
         }
     };
 
-    // Prime the pipeline for the first micro-tile.
     fetch_kv(chunk_begin, 0);
     CP_ASYNC_COMMIT_GROUP();
 
@@ -171,7 +155,6 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
             __nv_bfloat16* sk_local = &s_k[(cur_stage * BN128 + gid) * HD128];
             __nv_bfloat16* sv_local = &s_v[(cur_stage * BN128 + gid) * HD128];
 
-            // Q · K (16 lanes * 8 dims = 128 bf16 dot-product).
             float4 q_vec = reinterpret_cast<float4*>(s_q)[lane];
             float4 k_vec = reinterpret_cast<float4*>(sk_local)[lane];
             __nv_bfloat162* q_p2 = reinterpret_cast<__nv_bfloat162*>(&q_vec);
@@ -183,21 +166,18 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
                 __nv_bfloat162 res = __hmul2(q_p2[j], k_p2[j]);
                 score += __low2float(res) + __high2float(res);
             }
-            // Intra-group reduction across the 16 lanes.
             #pragma unroll
             for (int offset = 8; offset > 0; offset >>= 1) {
                 score += __shfl_xor_sync(0xffff, score, offset);
             }
             score *= sm_scale;
 
-            // Online-softmax update.
             float old_max  = row_max;
             row_max        = fmaxf(row_max, score);
             float exp_scale = __expf(old_max - row_max);
             float p         = __expf(score - row_max);
             row_sum = row_sum * exp_scale + p;
 
-            // Accumulate V.
             float4 v_vec = reinterpret_cast<float4*>(sv_local)[lane];
             __nv_bfloat16* v_p = reinterpret_cast<__nv_bfloat16*>(&v_vec);
             #pragma unroll
@@ -207,7 +187,6 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
         }
     }
 
-    // Intra-block merge: publish per-group (m, l, acc_bf16) to SMEM.
     if (lane == 0) {
         s_m[gid] = row_max;
         s_s[gid] = row_sum;
@@ -222,7 +201,6 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
     }
     __syncthreads();
 
-    // First HD128 threads merge the 16 groups and publish the per-block partial.
     if (tid < HD128) {
         float block_max = -1e20f;
         #pragma unroll
@@ -237,8 +215,7 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
             block_sum += s_s[g] * w;
             block_acc += __bfloat162float(s_acc_bf[g * HD128 + tid]) * w;
         }
-        // Publish UN-NORMALIZED partial O (block_acc, NOT block_acc / block_sum):
-        // pass-2 needs the raw (m, l, o) tuple.
+        // UN-normalised partial O (pass-2 does the final divide).
         int gmem_o = (q_head_idx * N_SPLIT + split_idx) * HD128 + tid;
         O_g[gmem_o] = block_acc;
 
@@ -251,8 +228,7 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass1_kernel(
 }
 
 // ============================================================================
-// PASS 2 — merge N_SPLIT partials per q_head, normalise, write final bf16 O.
-// grid = (num_q_heads,)   block = HD128
+// PASS 2 — merge N_SPLIT partials per q_head, normalise, write bf16 O.
 // ============================================================================
 __global__ void flash_decode_bf16_hdim128_splitk_pass2_kernel(
     const float*         __restrict__ M_g,
@@ -288,44 +264,11 @@ __global__ void flash_decode_bf16_hdim128_splitk_pass2_kernel(
 }
 
 // ============================================================================
-// Cached workspace for pass-1 -> pass-2 communication.
+// 公共 FFI 入口
 //
-// Workspace size is O(num_q_heads * N_SPLIT * head_dim) and independent of
-// seq_len, so we allocate once per unique (num_q_heads, head_dim) and reuse
-// across calls.  Assumes all calls into this function within a process
-// either share the same config or see it grow monotonically (true for
-// RustInfer's per-model decode pipeline where the shape is fixed after init).
-// ============================================================================
-struct FlashDecodeSplitKWorkspace {
-    float*  m = nullptr;
-    float*  l = nullptr;
-    float*  o = nullptr;
-    int num_q_heads = 0;
-    int head_dim    = 0;
-};
-static FlashDecodeSplitKWorkspace g_ws;
-
-static void ensure_workspace(int num_q_heads, int head_dim, cudaStream_t stream) {
-    if (g_ws.num_q_heads == num_q_heads && g_ws.head_dim == head_dim) return;
-
-    if (g_ws.m) cudaFreeAsync(g_ws.m, stream);
-    if (g_ws.l) cudaFreeAsync(g_ws.l, stream);
-    if (g_ws.o) cudaFreeAsync(g_ws.o, stream);
-
-    size_t ml_bytes = (size_t)num_q_heads * N_SPLIT           * sizeof(float);
-    size_t o_bytes  = (size_t)num_q_heads * N_SPLIT * head_dim * sizeof(float);
-    cudaMallocAsync(&g_ws.m, ml_bytes, stream);
-    cudaMallocAsync(&g_ws.l, ml_bytes, stream);
-    cudaMallocAsync(&g_ws.o, o_bytes,  stream);
-
-    g_ws.num_q_heads = num_q_heads;
-    g_ws.head_dim    = head_dim;
-}
-
-// ============================================================================
-// Public FFI entry point — signature is preserved from the pre-optimisation
-// revision of this file so that crate/op/kernels/cuda/flash_attn_gqa/mod.rs
-// does NOT need to be re-linked.
+// `workspace` 是 Rust 侧 `CudaConfig::flash_decode_workspace` 指向的 fp32 平板，
+// 已按 num_q_heads * N_SPLIT * (2 + head_dim) 分配。调用方保证大小足够且指针非空。
+// 禁止在 graph capture 期间做 malloc/free，此函数内部仅 slice 指针 + launch kernel。
 // ============================================================================
 extern "C"
 void flash_decoding_cu_bf16_hdim128(
@@ -333,16 +276,24 @@ void flash_decoding_cu_bf16_hdim128(
     const __nv_bfloat16* k_ptr,
     const __nv_bfloat16* v_ptr,
     __nv_bfloat16* o_ptr,
+    float* workspace,
     int32_t* kv_seq_len,
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
     cudaStream_t stream)
 {
-    ensure_workspace(num_q_heads, head_dim, stream);
-
     const int   group_size = num_q_heads / num_kv_heads;
     const float sm_scale   = 1.0f / sqrtf((float)head_dim);
+
+    // Workspace slicing: [M | L | O]
+    //   M 长度 = num_q_heads * N_SPLIT
+    //   L 长度 = num_q_heads * N_SPLIT
+    //   O 长度 = num_q_heads * N_SPLIT * head_dim
+    const size_t ml_stride = (size_t)num_q_heads * N_SPLIT;
+    float* M_g = workspace;
+    float* L_g = workspace + ml_stride;
+    float* O_g = workspace + 2 * ml_stride;
 
     size_t smem_size = (HD128 * sizeof(__nv_bfloat16)) +
                        (2 * BN128 * HD128 * 2 * sizeof(__nv_bfloat16)) +
@@ -352,10 +303,10 @@ void flash_decoding_cu_bf16_hdim128(
     dim3 grid1(num_q_heads, N_SPLIT, 1);
     flash_decode_bf16_hdim128_splitk_pass1_kernel<<<grid1, 256, smem_size, stream>>>(
         q_ptr, k_ptr, v_ptr,
-        g_ws.m, g_ws.l, g_ws.o,
+        M_g, L_g, O_g,
         kv_seq_len,
         num_kv_heads, group_size, sm_scale);
 
     flash_decode_bf16_hdim128_splitk_pass2_kernel<<<num_q_heads, HD128, 0, stream>>>(
-        g_ws.m, g_ws.l, g_ws.o, o_ptr);
+        M_g, L_g, O_g, o_ptr);
 }
