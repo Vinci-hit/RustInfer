@@ -2,6 +2,27 @@
 
 RustInfer是一个用Rust语言实现的高性能大语言模型(LLM)推理引擎，手写CUDA算子，支持BF16与INT4(AWQ)量化推理，**单请求decode吞吐量超越vLLM**。
 
+## 🏗️ 核心架构
+
+<div align="center">
+
+![RustInfer Architecture](/apdcephfs_qy2/share_303432435/vinciiliu/RustInfer/assets/image-gen_2026-04-22_04-20-16.png)
+
+*高性能推理内核架构 - 从零成本抽象到显存优化*
+
+</div>
+
+RustInfer 采用**分层模块化架构**，核心包括：
+
+- **Model Runtime**: Llama3/Qwen3 模型加载和执行
+- **Base Foundation**: 内存管理、CUDA显存分配器、设备抽象
+- **Tensor Engine**: 零拷贝张量系统，Shape/Stride/Zero-Copy Slice Views
+- **Operator Fabric**: CPU/CUDA 融合算子库（Matmul、FlashAttnGQA、RoPE、RMSNorm 等）
+- **CUDA Acceleration Plane**: 手写 GEMV/GEMM、INT4 量化、CUDA Graph、BF16/INT4 AWQ 推理
+- **Workspace Reuse**: 推理循环内存预分配，零动态分配
+
+---
+
 ## 📊 性能对比：RustInfer vs vLLM
 
 > **测试环境**: H20, Batch Size=1, BF16, CUDA Graph enabled, vLLM compile disabled, temperature = 0, topk = None
