@@ -1,16 +1,38 @@
 use crate::base::error::Result;
-use crate::base::DeviceType; // 引入 DeviceType
-use crate::op::{kernels, Op, OpContext};
+use crate::base::DeviceType;
+
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
+use super::kernels;
 
 /// Add 算子，执行 C = A + B (按元素相加)。
-/// 这是一个无状态的算子，因此它是一个零大小的结构体。
 #[derive(Debug, Clone, Copy)]
 pub struct Add;
 
 impl Add {
-    /// 创建一个新的 Add 算子实例。
     pub fn new() -> Self {
         Add
+    }
+
+    /// 执行加法: output = a + b
+    pub fn forward(
+        &self,
+        a: &crate::tensor::Tensor,
+        b: &crate::tensor::Tensor,
+        output: &mut crate::tensor::Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
+        match a.device() {
+            DeviceType::Cpu => {
+                kernels::cpu::add(a, b, output)?;
+            }
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(_) => {
+                kernels::cuda::add(a, b, output, cuda_config)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -20,93 +42,8 @@ impl Default for Add {
     }
 }
 
-impl Op for Add {
-    fn name(&self) -> &'static str {
-        "Add"
-    }
-
-    /// 执行 Add 的前向计算。
-    ///
-    /// # Context
-    /// * `ctx.inputs[0]` (A): 第一个输入张量。
-    /// * `ctx.inputs[1]` (B): 第二个输入张量。
-    /// * `ctx.outputs[0]` (C): 输出张量。
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-    let output = &mut ctx.outputs[0];
-
-    // --- 核心修改：根据输入数量选择不同的逻辑路径 ---
-    if ctx.inputs.len() == 2 {
-        // ==================== 路径 A: 非原地加法 (output = a + b) ====================
-        let input_a = ctx.inputs[0];
-        let input_b = ctx.inputs[1];
-
-        // --- a. 检查 ---
-        if input_a.device() != input_b.device() || input_a.device() != output.device() {
-            return Err(anyhow::anyhow!("Device mismatch for non-inplace Add"));
-        }
-        if input_a.dtype() != input_b.dtype() || input_a.dtype() != output.dtype() {
-            return Err(anyhow::anyhow!("DType mismatch for non-inplace Add"));
-        }
-        if input_a.shape() != input_b.shape() || input_a.shape() != output.shape() {
-            return Err(anyhow::anyhow!("Shape mismatch for non-inplace Add"));
-        }
-
-        // --- b. 分派到内核 ---
-        // (这里的内核可以是 bf16 适配版本)
-        match input_a.device() {
-            DeviceType::Cpu => {
-                // 调用期望 `output` 是独立缓冲区的内核
-                kernels::cpu::add(input_a, input_b, output)?;
-            }
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                kernels::cuda::add(input_a, input_b, output, ctx.cuda_config)?;
-            }
-        }
-        
-    } else if ctx.inputs.len() == 1 {
-        // ==================== 路径 B: 原地加法 (output = output + a) ====================
-        let input_a = ctx.inputs[0];
-
-        // --- a. 检查 ---
-        // 此时，output 同时扮演了“输入B”和“输出”的角色
-        if input_a.device() != output.device() {
-            return Err(anyhow::anyhow!("Device mismatch for inplace Add"));
-        }
-        if input_a.dtype() != output.dtype() {
-            return Err(anyhow::anyhow!("DType mismatch for inplace Add"));
-        }
-        if input_a.shape() != output.shape() {
-            return Err(anyhow::anyhow!("Shape mismatch for inplace Add"));
-        }
-
-        // --- b. 分派到内核 ---
-        // **关键**: 我们将 `output` 同时作为第二个输入和输出传递给内核！
-        match input_a.device() {
-            DeviceType::Cpu => {
-                kernels::cpu::add_inplace(output, input_a)?;
-            }
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                kernels::cuda::add_inplace( output, input_a, ctx.cuda_config)?;
-            }
-        }
-
-    } else {
-        // --- 错误路径 ---
-        return Err(anyhow::anyhow!(
-            "Add operator expects 1 (inplace) or 2 (out-of-place) inputs, but got {}",
-            ctx.inputs.len()
-        ));
-    }
-
-    Ok(())
-}
-}
-
 #[cfg(feature = "cuda")]
 impl Add {
-    /// Add is stateless; nothing to move to CUDA.
     pub fn to_cuda(&mut self, _device_id: i32) -> Result<()> {
         Ok(())
     }
@@ -117,7 +54,7 @@ impl Add {
 // ============================================================================
 #[cfg(test)]
 mod tests {
-    use super::*; // 导入父模块 (add.rs) 的所有公共项
+    use super::*;
     use crate::tensor::Tensor;
     use crate::base::{DeviceType,DataType};
     use crate::base::error::Result;
@@ -157,7 +94,7 @@ mod tests {
         
         // 3. 创建算子和上下文，并执行 forward
         let add_op = Add::new();
-        add_op.forward(&mut OpContext::new(&[&t1, &t2], &mut [&mut output], None))?;
+        add_op.forward(&t1, &t2, &mut output, None)?;
 
         // 4. 将结果拷贝回 CPU 进行验证
         let result_tensor = output.to_cpu()?;
@@ -207,7 +144,7 @@ mod tests {
 
         // 3. 创建算子和上下文，这次传入 cuda_config
         let add_op = Add::new();
-        add_op.forward(&mut OpContext::new(&[&t1, &t2], &mut [&mut output], Some(&cuda_config)))?;
+        add_op.forward(&t1, &t2, &mut output, Some(&cuda_config))?;
         // 5. 将结果拷贝回 CPU 并验证
         let result_tensor = output.to_cpu()?;
         let result_slice = result_tensor.as_f32()?.as_slice()?;
@@ -266,7 +203,7 @@ mod tests {
 
             // Compute
             let add_op = Add::new();
-            add_op.forward(&mut OpContext::new(&[&input_a, &input_b], &mut [&mut output], None))?;
+            add_op.forward(&input_a, &input_b, &mut output, None)?;
 
             // Verify
             let result = output.as_bf16()?.as_slice()?;
@@ -314,7 +251,7 @@ mod tests {
             // Compute
             let add_op = Add::new();
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            add_op.forward(&mut OpContext::new(&[&input_a, &input_b], &mut [&mut output], Some(&cuda_config)))?;
+            add_op.forward(&input_a, &input_b, &mut output, Some(&cuda_config))?;
 
             // Copy result back
             let result_tensor = output.to_cpu()?;
@@ -362,9 +299,9 @@ mod tests {
             output.as_bf16_mut()?.buffer_mut().copy_from_host(&output_data)?;
 
             // Inplace add: output = output + input_a
-            let add_op = Add::new();
+            let add_inplace_op = crate::op::add_inplace::AddInplace::new();
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            add_op.forward(&mut OpContext::new(&[&input_a], &mut [&mut output], Some(&cuda_config)))?;
+            add_inplace_op.forward(&input_a, &mut output, Some(&cuda_config))?;
 
             // Verify
             let result_tensor = output.to_cpu()?;
@@ -410,7 +347,7 @@ mod tests {
 
             // CPU computation
             let add_op = Add::new();
-            add_op.forward(&mut OpContext::new(&[&input_a_cpu, &input_b_cpu], &mut [&mut output_cpu], None))?;
+            add_op.forward(&input_a_cpu, &input_b_cpu, &mut output_cpu, None)?;
             let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
 
             // GPU computation
@@ -422,7 +359,7 @@ mod tests {
             input_b_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&b_data)?;
 
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            add_op.forward(&mut OpContext::new(&[&input_a_gpu, &input_b_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+            add_op.forward(&input_a_gpu, &input_b_gpu, &mut output_gpu, Some(&cuda_config))?;
 
             let gpu_result_tensor = output_gpu.to_cpu()?;
             let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;

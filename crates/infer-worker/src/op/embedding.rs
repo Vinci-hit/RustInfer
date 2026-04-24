@@ -1,7 +1,11 @@
-use crate::base::error::{Error, Result};
+use crate::base::error::Result;
 use crate::base::{DataType, DeviceType};
-use crate::op::{kernels, Op, OpContext};
 use crate::tensor::Tensor;
+
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
+use super::kernels;
 
 /// Embedding 算子，根据输入的 token ID 从权重矩阵中查找嵌入向量。
 pub struct Embedding {
@@ -33,79 +37,24 @@ impl Embedding {
     }
 }
 
-impl Op for Embedding {
-    fn name(&self) -> &'static str {
-        "Embedding"
-    }
-
-    /// 执行 Embedding 的前向计算。
-    ///
-    /// # Context
-    /// * `ctx.inputs[0]`: 输入的 token ID 张量，1D，数据类型必须是 I32。
-    /// * `ctx.outputs[0]`: 输出的嵌入向量张量，2D，形状为 [token_len, dim]。
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        // ==================== 1. 检查逻辑 ====================
-
-        if ctx.inputs.len() != 1 || ctx.outputs.len() != 1 {
-            return Err(Error::InvalidArgument(
-                "Embedding operator expects 1 input and 1 output".into(),
-            ).into());
-        }
-
-        let input_tokens = &ctx.inputs[0];
-        let output = &mut ctx.outputs[0];
+impl Embedding {
+    /// 执行 Embedding 前向计算: 根据 token ID 从权重表中查找嵌入向量
+    pub fn forward(
+        &self,
+        input_tokens: &Tensor,
+        output: &mut Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
         let weight = &self.weight;
 
-        // --- a. 检查设备和数据类型 ---
-        if output.device() != weight.device() || weight.device() != input_tokens.device() {
-            return Err(Error::InvalidArgument("Output and weight tensors must be on the same device".into()).into());
-        }
-        // 输入的 token ID 可以在 CPU 上，而权重和输出在 GPU 上
-        if input_tokens.dtype() != DataType::I32 {
-            return Err(Error::InvalidArgument("Input tokens for Embedding must be of type I32".to_string()).into());
-        }
-        if output.dtype() != weight.dtype() {
-            return Err(Error::InvalidArgument(format!("Output and weight must have the same data type, Output:{:?}, weight{:?}",output.dtype(),weight.dtype())).into());
-        }
-
-        // --- b. 检查形状 ---
-        if input_tokens.shape().len() != 1 {
-            return Err(Error::InvalidArgument("Input tokens must be a 1D tensor.".into()).into());
-        }
-        let token_len = input_tokens.shape()[0];
-
-        if weight.shape() != [self.vocab_size, self.dim] {
-            return Err(Error::InvalidArgument(format!(
-                "Weight shape is incorrect. Expected [{}, {}], but got {:?}",
-                self.vocab_size, self.dim, weight.shape()
-            )).into());
-        }
-        
-        if output.shape() != [token_len, self.dim] {
-            return Err(Error::InvalidArgument(format!(
-                "Output shape is incorrect. Expected [{}, {}], but got {:?}",
-                token_len, self.dim, output.shape()
-            )).into());
-        }
-
-        // ==================== 2. 分派到内核 ====================
-        // Embedding 的内核通常需要在与权重相同的设备上执行
         match weight.device() {
             DeviceType::Cpu => {
-                    kernels::cpu::embedding(input_tokens, weight, output)?
+                kernels::cpu::embedding(input_tokens, weight, output)?
             }
-            
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                // --- CUDA 路径 ---
-                // CUDA 内核通常被设计为可以通过模板或运行时参数处理多种类型，
-                // 但如果您的设计是为每种类型提供一个 FFI 函数，这里的逻辑也类似。
-                //
-                // 假设您的 kernels::cuda::embedding 内部已经处理了 f32/bf16 的分发。
-                // 如果没有，这里的结构将和 CPU 路径完全一样。
-                kernels::cuda::embedding(input_tokens, weight, output, ctx.cuda_config)?
+                kernels::cuda::embedding(input_tokens, weight, output, cuda_config)?
             }
-            
         }
         Ok(())
     }
@@ -172,7 +121,7 @@ mod tests {
         // --- 4. 创建上下文并执行 forward ---
         let cuda_config = if use_stream { Some(crate::cuda::CudaConfig::new()?) } else { None };
 
-        embedding_op.forward(&mut OpContext::new(&[&input_tokens], &mut [&mut output], cuda_config.as_ref()))?;
+        embedding_op.forward(&input_tokens, &mut output, cuda_config.as_ref())?;
 
         // --- 5. 将结果拷贝回 CPU 进行验证 ---
         let result_tensor = output.to_cpu()?;
@@ -258,7 +207,7 @@ mod tests {
             let mut output = Tensor::new(&[token_len, dim], dtype, device)?;
 
             // Compute embedding
-            embedding_op.forward(&mut OpContext::new(&[&input_tokens], &mut [&mut output], None))?;
+            embedding_op.forward(&input_tokens, &mut output, None)?;
 
             // Verify results
             let result = output.as_bf16()?.as_slice()?;
@@ -310,7 +259,7 @@ mod tests {
 
             // Compute embedding with CUDA
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            embedding_op.forward(&mut OpContext::new(&[&input_tokens_gpu], &mut [&mut output], Some(&cuda_config)))?;
+            embedding_op.forward(&input_tokens_gpu, &mut output, Some(&cuda_config))?;
 
             // Copy result back and verify
             let result_tensor = output.to_cpu()?;
@@ -355,7 +304,7 @@ mod tests {
             input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&token_ids);
 
             let mut output_cpu = Tensor::new(&[token_len, dim], dtype, DeviceType::Cpu)?;
-            embedding_op_cpu.forward(&mut OpContext::new(&[&input_tokens_cpu], &mut [&mut output_cpu], None))?;
+            embedding_op_cpu.forward(&input_tokens_cpu, &mut output_cpu, None)?;
             let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
 
             // GPU computation
@@ -366,7 +315,7 @@ mod tests {
             let mut output_gpu = Tensor::new(&[token_len, dim], dtype, DeviceType::Cuda(0))?;
 
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            embedding_op_gpu.forward(&mut OpContext::new(&[&input_tokens_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+            embedding_op_gpu.forward(&input_tokens_gpu, &mut output_gpu, Some(&cuda_config))?;
 
             let gpu_result_tensor = output_gpu.to_cpu()?;
             let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
@@ -404,7 +353,7 @@ mod tests {
 
         let mut output = Tensor::new(&[token_len, dim], dtype, device)?;
 
-        embedding_op.forward(&mut OpContext::new(&[&input_tokens], &mut [&mut output], None))?;
+        embedding_op.forward(&input_tokens, &mut output, None)?;
 
         // Verify some specific tokens
         let result = output.as_bf16()?.as_slice()?;

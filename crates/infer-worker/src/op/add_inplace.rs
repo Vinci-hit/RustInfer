@@ -1,17 +1,37 @@
 use crate::base::error::Result;
 use crate::base::DeviceType;
-use crate::op::{kernels, Op, OpContext};
+
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
+use super::kernels;
 
 /// AddInplace 算子，执行原地加法 A = A + B。
-/// 第一个输入张量会被原地修改，第二个输入张量保持不变。
-/// 这是一个无状态的算子，因此它是一个零大小的结构体。
 #[derive(Debug, Clone, Copy)]
 pub struct AddInplace;
 
 impl AddInplace {
-    /// 创建一个新的 AddInplace 算子实例。
     pub fn new() -> Self {
         AddInplace
+    }
+
+    /// 执行原地加法: output = output + input
+    pub fn forward(
+        &self,
+        input: &crate::tensor::Tensor,
+        output: &mut crate::tensor::Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
+        match input.device() {
+            DeviceType::Cpu => {
+                kernels::cpu::add_inplace(output, input)?;
+            }
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(_) => {
+                kernels::cuda::add_inplace(output, input, cuda_config)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -21,51 +41,8 @@ impl Default for AddInplace {
     }
 }
 
-impl Op for AddInplace {
-    fn name(&self) -> &'static str {
-        "AddInplace"
-    }
-
-    /// 执行 AddInplace 的前向计算。
-    ///
-    /// # Context
-    /// * `ctx.inputs[0]` (B): 要加到输出张量上的输入张量。
-    /// * `ctx.outputs[0]` (A): 输入输出张量，会被原地修改为 A = A + B。
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        let input_b = ctx.inputs[0];
-        let output_a = &mut ctx.outputs[0];
-
-        // --- 检查 ---
-        if input_b.device() != output_a.device() {
-            return Err(anyhow::anyhow!("Device mismatch for AddInplace"));
-        }
-        if input_b.dtype() != output_a.dtype() {
-            return Err(anyhow::anyhow!("DType mismatch for AddInplace"));
-        }
-        if input_b.shape() != output_a.shape() {
-            return Err(anyhow::anyhow!("Shape mismatch for AddInplace"));
-        }
-
-        // --- 分派到内核 ---
-        match input_b.device() {
-            DeviceType::Cpu => {
-                // 调用 CPU 原地加法内核
-                kernels::cpu::add_inplace(output_a, input_b)?;
-            }
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                // 调用 CUDA 原地加法内核
-                kernels::cuda::add_inplace(output_a, input_b, ctx.cuda_config)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(feature = "cuda")]
 impl AddInplace {
-    /// AddInplace is stateless; nothing to move to CUDA.
     pub fn to_cuda(&mut self, _device_id: i32) -> Result<()> {
         Ok(())
     }
@@ -113,7 +90,7 @@ mod tests {
 
         // 执行原地加法
         let add_inplace_op = AddInplace::new();
-        add_inplace_op.forward(&mut OpContext::new(&[&t_b], &mut [&mut t_a], None))?;
+        add_inplace_op.forward(&t_b, &mut t_a, None)?;
 
         // 验证结果
         let result_slice = t_a.as_f32()?.as_slice()?;
@@ -145,7 +122,7 @@ mod tests {
 
         // 3. 执行原地加法
         let add_inplace_op = AddInplace::new();
-        add_inplace_op.forward(&mut OpContext::new(&[&t_b], &mut [&mut t_a], None))?;
+        add_inplace_op.forward(&t_b, &mut t_a, None)?;
 
         // 4. 将结果拷贝回 CPU 进行验证
         let result_tensor = t_a.to_cpu()?;
@@ -181,11 +158,7 @@ mod tests {
 
         // 3. 执行原地加法，传入 cuda_config
         let add_inplace_op = AddInplace::new();
-        add_inplace_op.forward(&mut OpContext::new(
-            &[&t_b],
-            &mut [&mut t_a],
-            Some(&cuda_config),
-        ))?;
+        add_inplace_op.forward(&t_b, &mut t_a, Some(&cuda_config))?;
 
         // 4. 显式同步设备以确保计算完成
         unsafe {
@@ -221,7 +194,7 @@ mod tests {
 
         // 3. 执行原地加法
         let add_inplace_op = AddInplace::new();
-        add_inplace_op.forward(&mut OpContext::new(&[&t_b], &mut [&mut t_a], None))?;
+        add_inplace_op.forward(&t_b, &mut t_a, None)?;
 
         // 4. 将结果拷贝回 CPU 并转换为 f32 进行验证
         let result_tensor = t_a.to_cpu()?;
@@ -255,7 +228,7 @@ mod tests {
         t_b.as_f16_mut()?.buffer_mut().copy_from_host(&host_b)?;
 
         let add_inplace_op = AddInplace::new();
-        add_inplace_op.forward(&mut OpContext::new(&[&t_b], &mut [&mut t_a], None))?;
+        add_inplace_op.forward(&t_b, &mut t_a, None)?;
 
         unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
 

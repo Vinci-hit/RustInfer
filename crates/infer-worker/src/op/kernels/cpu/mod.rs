@@ -35,3 +35,7 @@ pub use scatter::scatter_kv;
 
 mod split_cols;
 pub use split_cols::split_cols_tensor;
+
+mod scalar;
+pub use scalar::scalar_mul;
+pub use scalar::scalar_add;

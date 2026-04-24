@@ -76,3 +76,29 @@ pub fn split_cols_tensor(
         }
     }
 }
+
+/// Unified scalar_mul: dst[i] = src[i] * val
+pub fn scalar_mul(
+    src: &Tensor,
+    dst: &mut Tensor,
+    val: f32,
+) -> Result<()> {
+    match src.device() {
+        DeviceType::Cpu => cpu::scalar_mul(src, dst, val),
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => cuda::scalar_mul(src, dst, val, std::ptr::null_mut()),
+    }
+}
+
+/// Unified scalar_add: dst[i] = src[i] + val
+pub fn scalar_add(
+    src: &Tensor,
+    dst: &mut Tensor,
+    val: f32,
+) -> Result<()> {
+    match src.device() {
+        DeviceType::Cpu => cpu::scalar_add(src, dst, val),
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => cuda::scalar_add(src, dst, val, std::ptr::null_mut()),
+    }
+}

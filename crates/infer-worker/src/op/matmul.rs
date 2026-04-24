@@ -1,7 +1,11 @@
 use crate::base::error::{Result,Error} ;
 use crate::base::{DataType, DeviceType};
-use crate::op::{kernels, Op, OpContext};
 use crate::tensor::Tensor;
+
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
+use super::kernels;
 
 /// 量化参数，封装不同量化格式所需的张量和超参数。
 /// 未来扩展 GPTQ / FP8 等格式只需在此 enum 增加变体。
@@ -80,59 +84,17 @@ impl Matmul {
     }
 }
 
-impl Op for Matmul {
-    fn name(&self) -> &'static str {
-        "Matmul"
-    }
-
-    /// 执行 Matmul 的前向计算： Y = W@X + B
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        // ==================== 1. 检查逻辑 (对应 C++ 的 check()) ====================
-
-        // --- a. 检查输入输出数量 ---
-        if ctx.inputs.len() != 1 || ctx.outputs.len() != 1 {
-            return Err(Error::InvalidArgument("Matmul expects 1 input and 1 output".into()).into());
-        }
-
-        let input = &ctx.inputs[0];
-        let output = &mut ctx.outputs[0];
+impl Matmul {
+    /// 执行 Matmul 前向计算: output = weight @ input^T + bias
+    pub fn forward(
+        &self,
+        input: &Tensor,
+        output: &mut Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
         let weight = &self.weight;
-        // --- b. 检查设备和数据类型 ---
         let device = input.device();
-        let dtype = input.dtype();
 
-        if output.device() != device || weight.device() != device {
-            return Err(Error::InvalidArgument("All tensors must be on the same device".into()).into());
-        }
-        // AWQ 模式下 weight 是 I32 (打包的 qweight)，跳过 weight dtype 检查
-        if self.quant.is_none() {
-            if output.dtype() != dtype || weight.dtype() != dtype {
-                return Err(Error::InvalidArgument("All tensors must have the same data type".into()).into());
-            }
-        } else {
-            if output.dtype() != dtype {
-                return Err(Error::InvalidArgument(format!(
-                    "Quantized Matmul: output dtype {:?} != input dtype {:?}", output.dtype(), dtype
-                )).into());
-            }
-        }
-        if let Some(bias) = &self.bias
-            && (bias.device() != device || bias.dtype() != dtype)
-        {
-            return Err(Error::InvalidArgument("Bias tensor has mismatched device or dtype".into()).into());
-        }
-        
-        let weight_shape = weight.shape();
-
-        // 权重 W 必须是 2D 矩阵 [K, M]
-        if weight_shape.len() != 2 {
-            return Err(Error::InvalidArgument(format!(
-                "Weight must be a 2D matrix [out_features, in_features], but got shape {:?}",
-                weight_shape
-            )).into());
-        }
-        
-        // ==================== 2. 分派到内核 (对应 C++ 的 forward() 主体) ====================
         match device {
             DeviceType::Cpu => {
                 if self.quant.is_some() {
@@ -140,51 +102,46 @@ impl Op for Matmul {
                         "Quantized Matmul is only supported on CUDA devices".into()
                     ).into());
                 }
-                // 调用 CPU 内核函数Y = W@X^T + B
-                kernels::cpu::matmul(input,weight,output)?;
+                kernels::cpu::matmul(input, weight, output)?;
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
                 if let Some(QuantParams::Awq { zeros, scales, group_size }) = &self.quant {
-                    // ---- AWQ INT4 量化路径 ----
                     if input.shape()[0] == 1 {
-                        kernels::cuda::kpack_gemv(input, &self.weight, zeros, scales, *group_size, output, ctx.cuda_config)?;
+                        kernels::cuda::kpack_gemv(input, &self.weight, zeros, scales, *group_size, output, cuda_config)?;
                     } else {
-                        kernels::cuda::kpack_gemm(input, &self.weight, zeros, scales, *group_size, output, ctx.cuda_config)?;
+                        kernels::cuda::kpack_gemm(input, &self.weight, zeros, scales, *group_size, output, cuda_config)?;
                     }
-                } else if input.dtype() == DataType::BF16{
-                    let n = weight.shape()[0]; // output dimension
-                    if input.shape()[0] == 1 && n <= 16384 {
-                        kernels::cuda::hgemv_bf16(input, weight, output, ctx.cuda_config)?;
-                    } else {
-                        kernels::cuda::hgemm_bf16(input, weight, output, ctx.cuda_config)?;
-                    }
-                } else if input.dtype() == DataType::F16{
+                } else if input.dtype() == DataType::BF16 {
                     let n = weight.shape()[0];
                     if input.shape()[0] == 1 && n <= 16384 {
-                        kernels::cuda::hgemv_fp16(input, weight, output, ctx.cuda_config)?;
+                        kernels::cuda::hgemv_bf16(input, weight, output, cuda_config)?;
                     } else {
-                        kernels::cuda::hgemm_fp16(input, weight, output, ctx.cuda_config)?;
+                        kernels::cuda::hgemm_bf16(input, weight, output, cuda_config)?;
                     }
-                }else if input.shape()[0] == 1{
-                    kernels::cuda::sgemv(input, weight, output, ctx.cuda_config)?;
-                }else{
-                    kernels::cuda::sgemm(input, weight, output, ctx.cuda_config)?;
+                } else if input.dtype() == DataType::F16 {
+                    let n = weight.shape()[0];
+                    if input.shape()[0] == 1 && n <= 16384 {
+                        kernels::cuda::hgemv_fp16(input, weight, output, cuda_config)?;
+                    } else {
+                        kernels::cuda::hgemm_fp16(input, weight, output, cuda_config)?;
+                    }
+                } else if input.shape()[0] == 1 {
+                    kernels::cuda::sgemv(input, weight, output, cuda_config)?;
+                } else {
+                    kernels::cuda::sgemm(input, weight, output, cuda_config)?;
                 }
             }
         }
 
-        // --- b. 如果有偏置，执行加法 ---
         if let Some(bias) = &self.bias {
             match device {
                 DeviceType::Cpu => {
-                    // 调用 CPU 加法内核 (原地 add)
                     kernels::cpu::add_inplace(output, bias)?;
                 }
                 #[cfg(feature = "cuda")]
                 DeviceType::Cuda(_) => {
-                    // 调用 CUDA 加法内核 (原地 add)
-                    kernels::cuda::add_inplace(output,bias,None)?;
+                    kernels::cuda::add_inplace(output, bias, None)?;
                 }
             }
         }
@@ -276,7 +233,7 @@ mod tests {
         // 在 CPU 上计算黄金结果
         let output_shape = &[B, N];
         let mut output_cpu = Tensor::new(output_shape, dtype, cpu_device)?;
-        matmul_op_cpu.forward(&mut OpContext::new(&[&input_cpu], &mut [&mut output_cpu], None))?;
+        matmul_op_cpu.forward(&input_cpu, &mut output_cpu, None)?;
         let cpu_result_slice = output_cpu.as_f32()?.as_slice()?;
         println!("CPU Result:\n{:?}", cpu_result_slice.chunks_exact(N).collect::<Vec<_>>());
 
@@ -294,7 +251,7 @@ mod tests {
 
         // 执行 GPU 计算
         let cuda_config = CudaConfig::new()?;
-        matmul_op_gpu.forward(&mut OpContext::new(&[&input_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+        matmul_op_gpu.forward(&input_gpu, &mut output_gpu, Some(&cuda_config))?;
         
         // 等待 GPU 计算完成
         unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
@@ -359,7 +316,7 @@ mod tests {
             let mut output = Tensor::new(&[batch, out_features], dtype, device)?;
 
             // Execute matmul
-            matmul_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], None))?;
+            matmul_op.forward(&input, &mut output, None)?;
 
             // Verify output is finite
             let result = output.as_bf16()?.as_slice()?;
@@ -405,7 +362,7 @@ mod tests {
 
             // Execute matmul with CUDA
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            matmul_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], Some(&cuda_config)))?;
+            matmul_op.forward(&input, &mut output, Some(&cuda_config))?;
 
             // Copy result back and verify
             let result_tensor = output.to_cpu()?;
@@ -445,7 +402,7 @@ mod tests {
             input_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&input_data);
 
             let mut output_cpu = Tensor::new(&[batch, out_features], dtype, DeviceType::Cpu)?;
-            matmul_op_cpu.forward(&mut OpContext::new(&[&input_cpu], &mut [&mut output_cpu], None))?;
+            matmul_op_cpu.forward(&input_cpu, &mut output_cpu, None)?;
             let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
 
             // GPU computation
@@ -457,7 +414,7 @@ mod tests {
 
             let mut output_gpu = Tensor::new(&[batch, out_features], dtype, DeviceType::Cuda(0))?;
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            matmul_op_gpu.forward(&mut OpContext::new(&[&input_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+            matmul_op_gpu.forward(&input_gpu, &mut output_gpu, Some(&cuda_config))?;
 
             let gpu_result_tensor = output_gpu.to_cpu()?;
             let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;

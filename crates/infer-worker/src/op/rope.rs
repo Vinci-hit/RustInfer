@@ -2,8 +2,12 @@
 
 use crate::base::error::{Error, Result};
 use crate::base::{DataType, DeviceType};
-use crate::op::{kernels, Op, OpContext};
 use crate::tensor::Tensor;
+
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
+use super::kernels;
 
 /// Rotary Positional Embedding (RoPE) 算子。
 /// 
@@ -35,98 +39,27 @@ impl RoPEOp {
     }
 }
 
-impl Op for RoPEOp {
-    fn name(&self) -> &'static str {
-        "RoPEOp"
-    }
+impl RoPEOp {
+    /// 执行 RoPE 前向计算: 就地旋转 Q 和 K
+    pub fn forward(
+        &self,
+        input_pos: &Tensor,
+        sin_cache: &Tensor,
+        cos_cache: &Tensor,
+        q: &mut Tensor,
+        k: &mut Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
+        let device = q.device();
+        let seq_len = q.shape()[0];
 
-    /// 执行 RoPE 的前向计算：就地旋转 Q 和 K。
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        // ==================== 1. 检查逻辑 ====================
-
-        // 预期输入: [input_pos, sin_cache, cos_cache] (3个)
-        // 预期输出: [input_q, input_k] (2个，将被就地修改)
-        if ctx.inputs.len() != 3 || ctx.outputs.len() != 2 {
-            return Err(Error::InvalidArgument(
-                "RoPEOp expects 3 inputs (Pos, Sin, Cos) and 2 outputs (Q, K for in-place modification)".into()
-            ).into());
-        }
-
-        // 获取不可变的 Pos, Sin, Cos
-        let input_pos = &ctx.inputs[0]; 
-        let sin_cache = &ctx.inputs[1];
-        let cos_cache = &ctx.inputs[2];
-        
-        // --- 核心修复: 使用 split_at_mut 安全地获取两个不重叠的可变引用 ---
-        // 将 outputs 切片拆分为前两个元素 ([Q, K]) 和其余部分 (空)
-        let q_k_tensor_slice = ctx.outputs
-            .get_mut(0..2)
-            .ok_or_else(|| Error::InvalidArgument("Outputs must contain Q and K tensors (length >= 2)".to_string()))?;
-        
-        // 使用 split_at_mut(1) 将 [Q, K] 切片分成 [Q] 和 [K]
-        let (q_slice, k_slice) = q_k_tensor_slice.split_at_mut(1);
-        
-        // 安全地获取 Q 和 K 的可变引用
-        let input_q: &mut Tensor = q_slice[0];
-        let input_k: &mut Tensor = k_slice[0]; 
-        let seq_len  = input_q.shape()[0];
-        // --- c. 检查设备和数据类型 (使用 input_q/k 而非 inputs[0]/1) ---
-        let device = input_q.device();
-        let dtype = input_q.dtype();
-        
-        // 所有张量必须在同一个设备上
-        if input_k.device() != device || sin_cache.device() != device || cos_cache.device() != device {
-            return Err(Error::InvalidArgument(format!("RoPE: All tensors must be on the same device,input_q:{:?}, input_k:{:?}, sin_cache:{:?}, cos_cache:{:?}",device,input_k.device(),sin_cache.device(),cos_cache.device())).into());
-        }
-        
-        if input_k.dtype() != dtype || sin_cache.dtype() != dtype || cos_cache.dtype() != dtype {
-                return Err(Error::InvalidArgument(format!("RoPE: All tensors must have the same data type. input_q:{:?}, input_k:{:?}, sin_cache:{:?}, cos_cache:{:?}", dtype, input_k.dtype(), sin_cache.dtype(), cos_cache.dtype())).into());
-        }
-
-        // Pos 必须是 i32
-        if input_pos.dtype() != DataType::I32 {
-            return Err(Error::InvalidArgument("Pos tensor must be I32 type".into()).into());
-        }
-
-        // --- c. 检查形状 ---
-        // Q 和 K 向量长度必须至少为 self.dim 和 self.kv_dim
-        if input_q.shape()[1] < self.dim {
-            return Err(Error::InvalidArgument(format!(
-                "Input Q length ({}) must be at least RoPE dim ({})", input_q.shape()[0], self.dim
-            )).into());
-        }
-        if input_k.shape()[1] < self.kv_dim {
-            return Err(Error::InvalidArgument(format!(
-                "Input K length ({}) must be at least RoPE kv_dim ({})", input_k.shape()[0], self.kv_dim
-            )).into());
-        }
-        
-        // Pos 必须是 [1] 形状或长度为 1
-        if input_pos.shape()[0] != 1 {
-            return Err(Error::InvalidArgument("Input Pos must be a single element tensor".into()).into());
-        }
-
-
-        // ==================== 2. 分派到内核 (对应 C++ 的 forward() 主体) ====================
-        // RoPE 是就地操作，需要可变访问 Q 和 K 张量。
-        let input_q_mut: &mut Tensor = unsafe { 
-            // 假设我们有某种方式从上下文获取可变的 Q 和 K
-            let q_ptr = input_q as *const Tensor as *mut Tensor;
-            &mut *q_ptr
-        };
-        let input_k_mut: &mut Tensor = unsafe { 
-            let k_ptr = input_k as *const Tensor as *mut Tensor;
-            &mut *k_ptr
-        };
-        
         match device {
             DeviceType::Cpu => {
-                // 调用 CPU 内核函数 (F32版本)
                 kernels::cpu::rope_kernel_batch(
                     self.kv_dim,
                     self.head_size,
-                    input_q_mut, // 可变
-                    input_k_mut, // 可变
+                    q,
+                    k,
                     input_pos,
                     sin_cache,
                     cos_cache,
@@ -138,20 +71,15 @@ impl Op for RoPEOp {
                     self.dim,
                     self.kv_dim,
                     self.head_size,
-                    input_q_mut, // 可变
-                    input_k_mut, // 可变
+                    q,
+                    k,
                     input_pos,
                     seq_len as i32,
                     sin_cache,
                     cos_cache,
-                    ctx.cuda_config
+                    cuda_config
                 )?;
             }
-            // _ => {
-            //     return Err(Error::InvalidArgument(format!(
-            //         "Unsupported device/data type combination: {:?}/{:?}", device, dtype
-            //     )).into());
-            // }
         }
         Ok(())
     }
@@ -169,8 +97,8 @@ impl RoPEOp {
 mod tests {
     use super::*; // 导入 RoPEOp
     use crate::tensor::Tensor;
-    use crate::base::{DataType, DeviceType};
-    use crate::op::{Op, OpContext};
+use crate::base::DeviceType;
+    
     use crate::base::error::Result;
     
     // 引入 rand 相关的 trait
@@ -260,27 +188,17 @@ mod tests {
         
         // --- 3. F32 计算 ---
         let op_f32 = RoPEOp::new(dim, kv_dim, head_size)?;
-        let mut ctx_f32 = OpContext {
-            inputs: &[&input_pos, &sin_cache_f32, &cos_cache_f32],
-            outputs: &mut [&mut input_q_f32, &mut input_k_f32],
-            cuda_config: None,
-        };
-        op_f32.forward(&mut ctx_f32)?;
-        let q_result_f32 = ctx_f32.outputs[0].as_f32()?.as_slice()?.to_vec();
-        let k_result_f32 = ctx_f32.outputs[1].as_f32()?.as_slice()?.to_vec();
+        op_f32.forward(&input_pos, &sin_cache_f32, &cos_cache_f32, &mut input_q_f32, &mut input_k_f32, None)?;
+        let q_result_f32 = input_q_f32.as_f32()?.as_slice()?.to_vec();
+        let k_result_f32 = input_k_f32.as_f32()?.as_slice()?.to_vec();
         
         // --- 4. BF16 计算 ---
         let op_bf16 = RoPEOp::new(dim, kv_dim, head_size)?;
-        let mut ctx_bf16 = OpContext {
-            inputs: &[&input_pos, &sin_cache_bf16, &cos_cache_bf16],
-            outputs: &mut [&mut input_q_bf16, &mut input_k_bf16],
-            cuda_config: None,
-        };
-        op_bf16.forward(&mut ctx_bf16)?;
+        op_bf16.forward(&input_pos, &sin_cache_bf16, &cos_cache_bf16, &mut input_q_bf16, &mut input_k_bf16, None)?;
         
         // 将 BF16 结果转换为 F32 用于比较
-        let q_result_bf16: Vec<f32> = ctx_bf16.outputs[0].as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
-        let k_result_bf16: Vec<f32> = ctx_bf16.outputs[1].as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
+        let q_result_bf16: Vec<f32> = input_q_bf16.as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
+        let k_result_bf16: Vec<f32> = input_k_bf16.as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
         
         // --- 5. 对比结果 (容忍 BF16 精度损失) ---
         assert_close(&q_result_f32, &q_result_bf16, 2e-2); // BF16 precision is about 3-4 decimal places
@@ -342,7 +260,7 @@ mod tests {
 
             // Execute RoPE
             let op = RoPEOp::new(dim, kv_dim, head_size)?;
-            op.forward(&mut OpContext::new(&[&input_pos, &sin_cache, &cos_cache], &mut [&mut input_q, &mut input_k], None))?;
+            op.forward(&input_pos, &sin_cache, &cos_cache, &mut input_q, &mut input_k, None)?;
 
             // Verify output is finite
             let q_result = input_q.as_bf16()?.as_slice()?;
@@ -410,7 +328,7 @@ mod tests {
             // Execute RoPE with CUDA
             let op = RoPEOp::new(dim, kv_dim, head_size)?;
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            op.forward(&mut OpContext::new(&[&input_pos_gpu, &sin_cache, &cos_cache], &mut [&mut input_q, &mut input_k], Some(&cuda_config)))?;
+            op.forward(&input_pos_gpu, &sin_cache, &cos_cache, &mut input_q, &mut input_k, Some(&cuda_config))?;
 
             // Copy results back and verify
             let q_result_tensor = input_q.to_cpu()?;
