@@ -10,3 +10,6 @@ pub mod rope;
 pub mod encode;
 pub mod sampler;
 pub mod scatter;
+pub mod fused_add_rmsnorm;
+pub mod split_cols;
+pub mod scalar;

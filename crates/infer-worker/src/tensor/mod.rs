@@ -792,7 +792,7 @@ impl Mul<f32> for &Tensor {
     fn mul(self, rhs: f32) -> Tensor {
         let mut out = Tensor::new(self.shape(), self.dtype(), self.device())
             .expect("Tensor * f32: allocation failed");
-        crate::op::kernels::scalar_mul(self, &mut out, rhs)
+        crate::op::scalar::scalar_mul(self, &mut out, rhs)
             .expect("Tensor * f32: kernel failed");
         out
     }
@@ -823,7 +823,7 @@ impl Add<f32> for &Tensor {
     fn add(self, rhs: f32) -> Tensor {
         let mut out = Tensor::new(self.shape(), self.dtype(), self.device())
             .expect("Tensor + f32: allocation failed");
-        crate::op::kernels::scalar_add(self, &mut out, rhs)
+        crate::op::scalar::scalar_add(self, &mut out, rhs)
             .expect("Tensor + f32: kernel failed");
         out
     }

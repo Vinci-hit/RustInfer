@@ -479,7 +479,7 @@ impl Qwen3 {
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k_active, cuda_config_ref)?;
 
-            crate::op::kernels::scatter_kv(k_cache_full, &k_active, v_cache_full, &v_view, &state.input_pos, cuda_config_ref)?;
+            crate::op::scatter::scatter_kv(k_cache_full, &k_active, v_cache_full, &v_view, &state.input_pos, cuda_config_ref)?;
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
@@ -492,7 +492,7 @@ impl Qwen3 {
 
             let mut ffn_norm_out = attn_norm_out;
             if self.device_type.is_cuda() {
-                crate::op::kernels::fused_add_rmsnorm(
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut ffn_norm_out, &mut x, &wo_out,
                     &self.layers.rmsnorm_ffn_layers[i].weight,
                     self.config.rms_norm_eps, cuda_config_ref,
@@ -521,7 +521,7 @@ impl Qwen3 {
                 };
                 let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                 let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                crate::op::kernels::fused_add_rmsnorm(
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut next_out, &mut x, &w2_out,
                     next_norm_weight, self.config.rms_norm_eps, cuda_config_ref,
                 )?;
@@ -579,9 +579,9 @@ impl Qwen3 {
             let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
 
             let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
 
             // QK-norm (Qwen3-specific)
             if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
@@ -628,8 +628,8 @@ impl Qwen3 {
             let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, inter])?;
 
             let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
 
             self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
             let mut w2_out = ffn_norm_out;

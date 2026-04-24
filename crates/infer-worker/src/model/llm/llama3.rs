@@ -432,7 +432,7 @@ impl Llama3 {
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
             self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
 
-            crate::op::kernels::scatter_kv(k_cache_full, &k, v_cache_full, &v, &state.input_pos, cuda_config_ref)?;
+            crate::op::scatter::scatter_kv(k_cache_full, &k, v_cache_full, &v, &state.input_pos, cuda_config_ref)?;
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out;
@@ -442,7 +442,7 @@ impl Llama3 {
 
             let mut ffn_norm_out = attn_out;
             if self.device_type.is_cuda() {
-                crate::op::kernels::fused_add_rmsnorm(
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut ffn_norm_out,
                     &mut x,
                     &wo_out,
@@ -470,7 +470,7 @@ impl Llama3 {
                 if i + 1 < self.config.layer_num {
                     let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                     let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::fused_add_rmsnorm(
+                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                         &mut next_out,
                         &mut x,
                         &w2_out,
@@ -481,7 +481,7 @@ impl Llama3 {
                 } else {
                     let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                     let mut final_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::fused_add_rmsnorm(
+                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                         &mut final_out,
                         &mut x,
                         &w2_out,
@@ -544,9 +544,9 @@ impl Llama3 {
             let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
             self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
             let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
 
             let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
@@ -573,8 +573,8 @@ impl Llama3 {
             let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
             self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
             let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
             self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
 
             let mut w2_out = ffn_norm_out;
