@@ -14,7 +14,7 @@ use zmq_client::ZmqClient;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-server")]
-#[command(about = "RustInfer API Server - Connects to rustinfer-engine via ZMQ", long_about = None)]
+#[command(about = "RustInfer API Server - Connects to rustinfer-scheduler via ZMQ", long_about = None)]
 struct Args {
     /// Server host
     #[arg(long, default_value = "0.0.0.0", env = "HOST")]

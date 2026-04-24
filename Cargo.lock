@@ -1860,47 +1860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "infer-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bindgen",
- "cc",
- "dashmap 6.1.0",
- "half",
- "libc",
- "memmap2",
- "ndarray",
- "ndarray-linalg",
- "num-traits",
- "once_cell",
- "rand 0.9.2",
- "rayon",
- "safetensors",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "tokenizers",
- "walkdir",
-]
-
-[[package]]
-name = "infer-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "infer-core",
- "infer-protocol",
- "rmp-serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zmq",
-]
-
-[[package]]
 name = "infer-frontend"
 version = "0.1.0"
 dependencies = [
@@ -1928,6 +1887,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-scheduler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "infer-protocol",
+ "infer-worker",
+ "rmp-serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zmq",
+]
+
+[[package]]
 name = "infer-server"
 version = "0.1.0"
 dependencies = [
@@ -1936,8 +1911,8 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
- "infer-core",
  "infer-protocol",
+ "infer-worker",
  "nvml-wrapper",
  "rmp-serde",
  "serde",
@@ -1952,6 +1927,31 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zmq",
+]
+
+[[package]]
+name = "infer-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bindgen",
+ "cc",
+ "dashmap 6.1.0",
+ "half",
+ "libc",
+ "memmap2",
+ "ndarray",
+ "ndarray-linalg",
+ "num-traits",
+ "once_cell",
+ "rand 0.9.2",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokenizers",
+ "walkdir",
 ]
 
 [[package]]

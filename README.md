@@ -65,8 +65,8 @@ RustInfer 采用**分层模块化架构**，核心包括：
 RustInfer/
 ├── crates/
 │   ├── infer-protocol/    # 通信协议定义（MessagePack）
-│   ├── infer-engine/      # 独立推理引擎进程
-│   ├── infer-core/        # 核心推理库
+│   ├── infer-scheduler/      # 独立推理引擎进程
+│   ├── infer-worker/        # 核心推理库
 │   │   ├── base/          # 内存管理、分配器
 │   │   ├── tensor/        # 张量系统（零拷贝）
 │   │   ├── op/            # 算子库（CPU/CUDA）
@@ -129,7 +129,7 @@ uv run hf download unsloth/Llama-3.2-1B-Instruct --local-dir ./Llama-3.2-1B-Inst
 
 ```bash
 # 基础测试
-cd RustInfer/crates/infer-core
+cd RustInfer/crates/infer-worker
 cargo test
 
 # CUDA性能测试
@@ -231,7 +231,7 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 #### v0.4.0 - 架构升级
 **发布日期**: 2026-01
 
-- 进程分离架构（infer-engine + infer-server + infer-protocol）
+- 进程分离架构（infer-scheduler + infer-server + infer-protocol）
 - ZeroMQ IPC 通信（MessagePack，10-50µs 延迟）
 
 #### v0.3.0 - CUDA Graph优化
@@ -257,27 +257,27 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 
 ### 已实现的优化
 
-1. **CUDA内存池化** (`/crates/infer-core/src/base/allocator.rs`)
+1. **CUDA内存池化** (`/crates/infer-worker/src/base/allocator.rs`)
    - 分配延迟: 800µs → 1µs
    - 线程安全并发访问（DashMap）
    - 双层池策略（小块first-fit，大块best-fit）
 
-2. **零拷贝模型加载** (`/crates/infer-core/src/model/loader.rs`)
+2. **零拷贝模型加载** (`/crates/infer-worker/src/model/loader.rs`)
    - mmap直接映射文件
    - 无需反序列化（100x加速）
    - 安全的生命周期扩展
 
-3. **Workspace预分配** (`/crates/infer-core/src/model/llama3.rs`)
+3. **Workspace预分配** (`/crates/infer-worker/src/model/llama3.rs`)
    - 预分配最大尺寸缓冲区
    - 推理循环零内存分配
    - HashMap管理命名缓冲区
 
-4. **CUDA Graph捕获** (`/crates/infer-core/src/cuda/config.rs`)
+4. **CUDA Graph捕获** (`/crates/infer-worker/src/cuda/config.rs`)
    - 首次迭代捕获计算图
    - 后续迭代回放图（10-100x加速）
    - 消除kernel启动开销
 
-5. **Flash Attention** (`/crates/infer-core/src/op/kernels/cuda/flash_attn_gqa/`)
+5. **Flash Attention** (`/crates/infer-worker/src/op/kernels/cuda/flash_attn_gqa/`)
    - 分块注意力计算
    - 在线softmax
    - 减少3x内存访问
@@ -364,7 +364,7 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 
 ### 添加新模型
 
-参考 `/crates/infer-core/src/model/llama3.rs` 实现:
+参考 `/crates/infer-worker/src/model/llama3.rs` 实现:
 1. 定义配置结构
 2. 实现层组合
 3. Workspace管理
