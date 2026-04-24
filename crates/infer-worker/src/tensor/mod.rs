@@ -1008,4 +1008,66 @@ mod tests {
         assert_eq!(x_next.as_f32()?.as_slice()?, &[5.0, 11.0, 17.0]);
         Ok(())
     }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tensor_mul_scalar_cuda_f32() -> Result<()> {
+        let mut a = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let a_gpu = a.to_cuda(0)?;
+
+        let c_gpu = &a_gpu * 3.0;
+        let c = c_gpu.to_cpu()?;
+        assert_eq!(c.as_f32()?.as_slice()?, &[3.0, 6.0, 9.0, 12.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tensor_add_scalar_cuda_f32() -> Result<()> {
+        let mut a = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let a_gpu = a.to_cuda(0)?;
+
+        let c_gpu = &a_gpu + 10.0;
+        let c = c_gpu.to_cpu()?;
+        assert_eq!(c.as_f32()?.as_slice()?, &[11.0, 12.0, 13.0, 14.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tensor_neg_cuda_bf16() -> Result<()> {
+        use half::bf16;
+        let mut a = Tensor::new(&[4], DataType::BF16, DeviceType::Cpu)?;
+        a.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&[
+            bf16::from_f32(1.0), bf16::from_f32(-2.0), bf16::from_f32(3.0), bf16::from_f32(-4.0),
+        ]);
+        let a_gpu = a.to_cuda(0)?;
+
+        let c_gpu = -&a_gpu;
+        let c = c_gpu.to_cpu()?;
+        let result: Vec<f32> = c.as_bf16()?.as_slice()?.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(result, vec![-1.0, 2.0, -3.0, 4.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tensor_euler_step_cuda() -> Result<()> {
+        // x_next = x + dt * v  (全程 GPU)
+        let mut x_cpu = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        x_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[0.0, 1.0, 2.0, 3.0]);
+        let mut v_cpu = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        v_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 20.0, 30.0, 40.0]);
+
+        let x = x_cpu.to_cuda(0)?;
+        let v = v_cpu.to_cuda(0)?;
+        let dt = 0.5_f32;
+        let x_next = &x + &(&v * dt);
+
+        let result = x_next.to_cpu()?;
+        assert_eq!(result.as_f32()?.as_slice()?, &[5.0, 11.0, 17.0, 23.0]);
+        Ok(())
+    }
 }
