@@ -3,7 +3,7 @@ use half::{bf16, f16};
 use crate::base::allocator::{CpuAllocator, DeviceAllocator};
 use crate::base::buffer::Buffer;
 use crate::base::{DeviceType, error::{Error, Result}, DataType};
-use std::ops::{Index, IndexMut};
+use std::ops::{Add, AddAssign, Div, Index, IndexMut, Mul, Neg};
 use std::sync::Arc;
 use safetensors::tensor::TensorView;
 use safetensors::Dtype as SafetensorDtype;
@@ -751,6 +751,84 @@ impl IndexMut<usize> for Tensor {
     }
 }
 
+// --- 3. 运算符重载: + 和 += ---
+
+/// `&Tensor + &Tensor` → 新 `Tensor`，委托已有 Add Op（内含 device + dtype 分发）。
+impl Add<&Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: &Tensor) -> Tensor {
+        let mut out = Tensor::new(self.shape(), self.dtype(), self.device())
+            .expect("Tensor + Tensor: allocation failed");
+        crate::op::add::Add::new()
+            .forward(self, rhs, &mut out, None)
+            .expect("Tensor + Tensor: forward failed");
+        out
+    }
+}
+
+/// `Tensor += &Tensor`，委托已有 AddInplace Op（内含 device + dtype 分发）。
+impl AddAssign<&Tensor> for Tensor {
+    fn add_assign(&mut self, rhs: &Tensor) {
+        crate::op::add_inplace::AddInplace::new()
+            .forward(rhs, self, None)
+            .expect("Tensor += Tensor: forward failed");
+    }
+}
+
+/// `-&Tensor` → 逐元素取负，复用 `Mul<f32>`。
+impl Neg for &Tensor {
+    type Output = Tensor;
+
+    fn neg(self) -> Tensor {
+        self * (-1.0_f32)
+    }
+}
+
+/// `&Tensor * f32` → 逐元素乘标量，委托 `kernels::scalar_mul`（内含 device 分发）。
+impl Mul<f32> for &Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: f32) -> Tensor {
+        let mut out = Tensor::new(self.shape(), self.dtype(), self.device())
+            .expect("Tensor * f32: allocation failed");
+        crate::op::kernels::scalar_mul(self, &mut out, rhs)
+            .expect("Tensor * f32: kernel failed");
+        out
+    }
+}
+
+/// `f32 * &Tensor` → 交换律。
+impl Mul<&Tensor> for f32 {
+    type Output = Tensor;
+
+    fn mul(self, rhs: &Tensor) -> Tensor {
+        rhs * self
+    }
+}
+
+/// `&Tensor / f32` → 逐元素除标量，复用 `Mul<f32>`。
+impl Div<f32> for &Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: f32) -> Tensor {
+        self * (1.0 / rhs)
+    }
+}
+
+/// `&Tensor + f32` → 逐元素加标量，委托 `kernels::scalar_add`（内含 device 分发）。
+impl Add<f32> for &Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: f32) -> Tensor {
+        let mut out = Tensor::new(self.shape(), self.dtype(), self.device())
+            .expect("Tensor + f32: allocation failed");
+        crate::op::kernels::scalar_add(self, &mut out, rhs)
+            .expect("Tensor + f32: kernel failed");
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{base::{error::Result, DataType, DeviceType}, tensor::Tensor};
@@ -803,6 +881,131 @@ mod tests {
         let dst_slice = dst_cpu.as_f32()?.as_slice()?;
         assert_eq!(dst_slice, &[1.0, 2.0, 3.0, 4.0]);
         
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_add_operator_f32() -> Result<()> {
+        let mut a = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+        let mut b = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        b.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 20.0, 30.0, 40.0]);
+
+        let c = &a + &b;
+        assert_eq!(c.as_f32()?.as_slice()?, &[11.0, 22.0, 33.0, 44.0]);
+        // a 和 b 未被修改
+        assert_eq!(a.as_f32()?.as_slice()?, &[1.0, 2.0, 3.0, 4.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_add_assign_operator_f32() -> Result<()> {
+        let mut a = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0]);
+
+        let mut b = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        b.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[100.0, 200.0, 300.0]);
+
+        a += &b;
+        assert_eq!(a.as_f32()?.as_slice()?, &[101.0, 202.0, 303.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_add_operator_bf16() -> Result<()> {
+        use half::bf16;
+        let mut a = Tensor::new(&[3], DataType::BF16, DeviceType::Cpu)?;
+        a.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&[
+            bf16::from_f32(1.0), bf16::from_f32(2.0), bf16::from_f32(3.0),
+        ]);
+        let mut b = Tensor::new(&[3], DataType::BF16, DeviceType::Cpu)?;
+        b.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&[
+            bf16::from_f32(10.0), bf16::from_f32(20.0), bf16::from_f32(30.0),
+        ]);
+
+        let c = &a + &b;
+        let result: Vec<f32> = c.as_bf16()?.as_slice()?.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(result, vec![11.0, 22.0, 33.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_mul_scalar_f32() -> Result<()> {
+        let mut a = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+        let c = &a * 3.0;
+        assert_eq!(c.as_f32()?.as_slice()?, &[3.0, 6.0, 9.0, 12.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_scalar_mul_commutative() -> Result<()> {
+        let mut a = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[2.0, 4.0, 6.0]);
+
+        let c = 0.5_f32 * &a;
+        assert_eq!(c.as_f32()?.as_slice()?, &[1.0, 2.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_div_scalar_f32() -> Result<()> {
+        let mut a = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 20.0, 30.0]);
+
+        let c = &a / 10.0;
+        assert_eq!(c.as_f32()?.as_slice()?, &[1.0, 2.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_neg_f32() -> Result<()> {
+        let mut a = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, -2.0, 3.0]);
+
+        let c = -&a;
+        assert_eq!(c.as_f32()?.as_slice()?, &[-1.0, 2.0, -3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_add_scalar_f32() -> Result<()> {
+        let mut a = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        a.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0]);
+
+        let c = &a + 10.0;
+        assert_eq!(c.as_f32()?.as_slice()?, &[11.0, 12.0, 13.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_mul_scalar_bf16() -> Result<()> {
+        use half::bf16;
+        let mut a = Tensor::new(&[3], DataType::BF16, DeviceType::Cpu)?;
+        a.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&[
+            bf16::from_f32(2.0), bf16::from_f32(4.0), bf16::from_f32(6.0),
+        ]);
+
+        let c = &a * 3.0;
+        let result: Vec<f32> = c.as_bf16()?.as_slice()?.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(result, vec![6.0, 12.0, 18.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_euler_step() -> Result<()> {
+        // x_next = x + dt * v
+        let mut x = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        x.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[0.0, 1.0, 2.0]);
+
+        let mut v = Tensor::new(&[3], DataType::F32, DeviceType::Cpu)?;
+        v.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 20.0, 30.0]);
+
+        let dt = 0.5_f32;
+        let x_next = &x + &(&v * dt);
+        assert_eq!(x_next.as_f32()?.as_slice()?, &[5.0, 11.0, 17.0]);
         Ok(())
     }
 }

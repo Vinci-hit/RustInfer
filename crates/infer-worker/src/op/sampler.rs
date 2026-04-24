@@ -1,10 +1,8 @@
-// In src/model/sampler.rs
-
 use crate::tensor::Tensor;
 use crate::base::error::{Result, Error};
-use crate::base::DeviceType;
-use crate::op::{kernels, Op, OpContext}; // 引入内核模块和 OpContext
-use crate::cuda::CudaConfig; // 引入 CudaConfig
+use crate::base::{DataType, DeviceType};
+use super::kernels;
+use crate::cuda::CudaConfig;
 
 /// Sampler trait 定义了所有采样策略的通用接口。
 pub trait Sampler: Send + Sync {
@@ -58,68 +56,24 @@ impl Sampler for ArgmaxSampler {
     }
 }
 
-/// SamplerOp 算子，作为一个包装器，用于在 Op 调用链中执行采样逻辑。
-///
-/// 它本身不包含参数，而是持有一个实现了 Sampler trait 的具体采样器实例。
+/// SamplerOp 包装器，持有一个实现了 Sampler trait 的具体采样器实例。
 pub struct SamplerOp {
-    /// 内部持有的具体采样器，使用 Trait 对象实现动态分发。
     sampler: Box<dyn Sampler>,
 }
 
 impl SamplerOp {
-    /// 创建一个新的 SamplerOp 算子。
-    ///
-    /// # Arguments
-    /// * `sampler` - 一个已经创建好的、实现了 Sampler trait 的采样器实例。
     pub fn new(sampler: Box<dyn Sampler>) -> Self {
         Self { sampler }
     }
-}
 
-impl Op for SamplerOp {
-    fn name(&self) -> &'static str {
-        "SamplerOp"
-    }
-
-    /// 执行 SamplerOp 的前向计算。
-    ///
-    /// 这个方法会调用内部采样器的 `sample` 方法，并将结果写入输出张量。
-    /// - 输入: `logits` 张量，形状为 `[vocab_size]`。
-    /// - 输出: 标量张量（形状为 `[1]`），包含采样出的 `token_id`。
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        // ==================== 1. 检查逻辑 ====================
-
-        if ctx.inputs.len() != 1 || ctx.outputs.len() != 1 {
-            return Err(Error::InvalidArgument("SamplerOp expects 1 input (logits) and 1 output (token_id)".into()).into());
-        }
-
-        let logits = &ctx.inputs[0];
-        let output_token_id = &mut ctx.outputs[0];
-
-        if logits.shape().len() != 1 {
-            return Err(Error::InvalidArgument(format!(
-                "Input logits must be a 1D vector [vocab_size], but got shape {:?}",
-                logits.shape()
-            )).into());
-        }
-        if output_token_id.shape() != [1] {
-             return Err(Error::InvalidArgument(format!(
-                "Output must be a scalar tensor with shape [1], but got shape {:?}",
-                output_token_id.shape()
-            )).into());
-        }
-        if output_token_id.dtype() != crate::base::DataType::I32 {
-             return Err(Error::InvalidArgument(format!(
-                "Output tensor must have dtype I32, but got {:?}",
-                output_token_id.dtype()
-            )).into());
-        }
-
-        // ==================== 2. 分派到具体的 Sampler 实现 ====================
-        
-        self.sampler.sample(logits, output_token_id, ctx.cuda_config)?;
-
-        Ok(())
+    /// 执行采样: 从 logits 中采样出一个 token_id
+    pub fn forward(
+        &self,
+        logits: &Tensor,
+        output_token_id: &mut Tensor,
+        cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
+        self.sampler.sample(logits, output_token_id, cuda_config)
     }
 }
 
@@ -171,15 +125,11 @@ mod tests {
         // --- 2. 准备输出张量并执行 forward ---
         // 输出张量必须在 CPU 上，并且是 i32 类型
         let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        let mut ctx = OpContext {
-            inputs: &[&logits],
-            outputs: &mut [&mut output],
-            cuda_config: None,
-        };
-        sampler_op.forward(&mut ctx)?;
+        
+        sampler_op.forward(&logits, &mut output, None)?;
 
         // --- 3. 验证结果 ---
-        let result_slice = ctx.outputs[0].as_i32()?.as_slice()?;
+        let result_slice = output.as_i32()?.as_slice()?;
         assert_eq!(result_slice, &[max_index as i32]);
 
         Ok(())
@@ -215,7 +165,7 @@ mod tests {
 
             // Execute sampling
             let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            sampler_op.forward(&mut OpContext::new(&[&logits], &mut [&mut output], None))?;
+            sampler_op.forward(&logits, &mut output, None)?;
 
             // Verify result
             let result = output.as_i32()?.as_slice()?;
@@ -259,7 +209,7 @@ mod tests {
             // Execute sampling
             let mut output = Tensor::new(&[1], DataType::I32, DeviceType::Cuda(0))?;
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            sampler_op.forward(&mut OpContext::new(&[&logits], &mut [&mut output], Some(&cuda_config)))?;
+            sampler_op.forward(&logits, &mut output, Some(&cuda_config))?;
 
 
             assert_eq!(
@@ -298,7 +248,7 @@ mod tests {
             let sampler_op_cpu = SamplerOp::new(argmax_sampler_cpu);
 
             let mut output_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            sampler_op_cpu.forward(&mut OpContext::new(&[&logits_cpu], &mut [&mut output_cpu], None))?;
+            sampler_op_cpu.forward(&logits_cpu, &mut output_cpu, None)?;
             let cpu_result = output_cpu.as_i32()?.as_slice()?[0];
 
             // GPU computation
@@ -310,7 +260,7 @@ mod tests {
 
             let mut output_gpu = Tensor::new(&[1], DataType::I32, DeviceType::Cuda(0))?;
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            sampler_op_gpu.forward(&mut OpContext::new(&[&logits_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+            sampler_op_gpu.forward(&logits_gpu, &mut output_gpu, Some(&cuda_config))?;
             let gpu_result = output_gpu.to_cpu()?.as_i32()?.as_slice()?[0];
 
             // CPU and GPU results should match

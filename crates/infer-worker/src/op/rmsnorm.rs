@@ -1,9 +1,10 @@
-use crate::base::error::{Error, Result};
+use crate::base::error::Result;
 use crate::base::{DataType, DeviceType};
-use crate::op::{Op, OpContext};
 use crate::tensor::Tensor;
 
-// 引入我们即将创建的内核模块
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
 use super::kernels;
 
 /// RMSNorm 算子结构体，包含其配置和权重
@@ -25,89 +26,20 @@ impl RMSNorm {
     }
 }
 
-impl Op for RMSNorm {
-    fn name(&self) -> &'static str {
-        "RMSNorm"
-    }
+impl RMSNorm {
+    /// 执行 RMSNorm 前向计算: output = input * weight / rms(input)
+    pub fn forward(
+        &self,
+        input: &Tensor,
+        output: &mut Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
+        let weight = &self.weight;
 
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-         // --- 1. 检查输入输出数量 (基础契约) ---
-        if ctx.inputs.len() != 1 || ctx.outputs.len() != 1 {
-            return Err(Error::InvalidArgument(
-                "RMSNorm expects 1 input and 1 output".into(),
-            ).into());
-        }
-
-        let input = &ctx.inputs[0];
-        let output = &mut ctx.outputs[0];
-        let weight = &self.weight; // 从 self 中获取权重
-
-        // --- 2. 检查设备和数据类型的一致性 ---
-        let expected_device = input.device();
-        let expected_dtype = input.dtype();
-
-        if output.device() != expected_device || weight.device() != expected_device {
-            // 提供更详细的错误信息
-            return Err(Error::InvalidArgument(format!(
-                "Device mismatch in RMSNorm: input is on {:?}, output on {:?}, weight on {:?}",
-                expected_device, output.device(), weight.device()
-            )).into());
-        }
-
-        if output.dtype() != expected_dtype || weight.dtype() != expected_dtype {
-             return Err(Error::InvalidArgument(format!(
-                "Data type mismatch in RMSNorm: input is {:?}, output is {:?}, weight is {:?}",
-                expected_dtype, output.dtype(), weight.dtype()
-            )).into());
-        }
-
-        // --- 3. 检查形状 (Shape) 的正确性 ---
-        
-        // a) 输入和输出的形状必须完全匹配
-        if input.shape() != output.shape() {
-            return Err(Error::InvalidArgument(format!(
-                "Input and output shapes must match in RMSNorm, but got {:?} and {:?}",
-                input.shape(), output.shape()
-            )).into());
-        }
-
-        // b) 权重的形状必须是 [dim]
-        if weight.shape() != [self.dim] {
-             return Err(Error::InvalidArgument(format!(
-                "Weight shape mismatch in RMSNorm: expected [{:?}], but got {:?}",
-                self.dim, weight.shape()
-            )).into());
-        }
-
-        // c) 输入的最后一维必须等于 self.dim
-        //    我们使用 `if let` 来安全地获取最后一维
-        if let Some(last_dim) = input.shape().last() {
-            if *last_dim != self.dim {
-                return Err(Error::InvalidArgument(format!(
-                    "Input's last dimension ({}) does not match RMSNorm's normalization dim ({})",
-                    last_dim, self.dim
-                )).into());
-            }
-        } else {
-            // 处理输入是一维张量的情况（如果支持的话），或者零维张量
-            if input.shape().len() == 1 && input.shape()[0] != self.dim {
-                 return Err(Error::InvalidArgument(format!(
-                    "1D Input's dimension ({}) does not match RMSNorm's normalization dim ({})",
-                    input.shape()[0], self.dim
-                )).into());
-            }
-            // 如果输入是空 shape `[]`，可能需要特殊处理或报错
-            if input.shape().is_empty() {
-                 return Err(Error::InvalidArgument("RMSNorm does not support scalar (0-dim) input".into()).into());
-            }
-        }
-
-        // ==================== 检查逻辑结束 ====================
-        // --- 4. 分派到具体的内核实现 ---
         match input.device() {
             DeviceType::Cpu => kernels::cpu::rmsnorm(input, weight, output, self.eps),
             #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => kernels::cuda::rmsnorm(input, weight, output, self.eps, ctx.cuda_config),
+            DeviceType::Cuda(_) => kernels::cuda::rmsnorm(input, weight, output, self.eps, cuda_config),
         }
     }
 }
@@ -123,10 +55,10 @@ impl RMSNorm {
 
 #[cfg(test)]
 mod tests {
-    use super::*; // 导入父模块的 RMSNorm
-    use crate::op::{Op, OpContext};
+    use super::*;
+    
     use crate::tensor::Tensor;
-    use crate::base::{DataType, DeviceType};
+use crate::base::DeviceType;
     use rand::distr::Uniform;
     use rand::prelude::*;
 
@@ -144,7 +76,7 @@ mod tests {
         }
     }
 
-    /// 辅助函数，用于创建一个 RMSNorm Op 和它的 OpContext
+    /// 辅助函数，用于创建一个 RMSNorm Op
     fn setup(
         shape: &[usize],
         device: DeviceType,
@@ -175,13 +107,8 @@ mod tests {
         cpu_input.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.sample(dist));
         cpu_op.weight.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.sample(dist));
         
-        let mut cpu_ctx = OpContext {
-            inputs: &[&cpu_input],
-            outputs: &mut [&mut cpu_output],
-            cuda_config: None,
-        };
-        cpu_op.forward(&mut cpu_ctx)?;
-        let cpu_result = cpu_ctx.outputs[0].as_f32()?.as_slice()?.to_vec();
+        cpu_op.forward(&cpu_input, &mut cpu_output, None)?;
+        let cpu_result = cpu_output.as_f32()?.as_slice()?.to_vec();
 
         // --- 2. CUDA 计算 ---
         let (mut gpu_op, mut gpu_input, mut gpu_output) = setup(shape, DeviceType::Cuda(0))?;
@@ -189,14 +116,9 @@ mod tests {
         gpu_input.as_f32_mut()?.buffer_mut().copy_from_host(cpu_input.as_f32()?.as_slice()?)?;
         gpu_op.weight.as_f32_mut()?.buffer_mut().copy_from_host(cpu_op.weight.as_f32()?.as_slice()?)?;
 
-        let mut gpu_ctx = OpContext {
-            inputs: &[&gpu_input],
-            outputs: &mut [&mut gpu_output],
-            cuda_config: None,
-        };
-        gpu_op.forward(&mut gpu_ctx)?;
+        gpu_op.forward(&gpu_input, &mut gpu_output, None)?;
         // 将结果拷贝回 CPU
-        let gpu_result_tensor = gpu_ctx.outputs[0].to_cpu()?;
+        let gpu_result_tensor = gpu_output.to_cpu()?;
         let gpu_result = gpu_result_tensor.as_f32()?.as_slice()?;
 
         // --- 3. 对比结果 ---
@@ -222,27 +144,17 @@ mod tests {
         cpu_input.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.sample(dist));
         cpu_op.weight.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.sample(dist));
         
-        let mut cpu_ctx = OpContext {
-            inputs: &[&cpu_input],
-            outputs: &mut [&mut cpu_output],
-            cuda_config: None,
-        };
-        cpu_op.forward(&mut cpu_ctx)?;
-        let cpu_result = cpu_ctx.outputs[0].as_f32()?.as_slice()?.to_vec();
+        cpu_op.forward(&cpu_input, &mut cpu_output, None)?;
+        let cpu_result = cpu_output.as_f32()?.as_slice()?.to_vec();
         
         let (mut gpu_op, mut gpu_input, mut gpu_output) = setup(shape, DeviceType::Cuda(0))?;
         // (拷贝数据到 GPU，同上)
         gpu_input.as_f32_mut()?.buffer_mut().copy_from_host(cpu_input.as_f32()?.as_slice()?)?;
         gpu_op.weight.as_f32_mut()?.buffer_mut().copy_from_host(cpu_op.weight.as_f32()?.as_slice()?)?;
         
-        let mut gpu_ctx = OpContext {
-            inputs: &[&gpu_input],
-            outputs: &mut [&mut gpu_output],
-            cuda_config: None,
-        };
-        gpu_op.forward(&mut gpu_ctx)?;
+        gpu_op.forward(&gpu_input, &mut gpu_output, None)?;
         // 将结果拷贝回 CPU
-        let gpu_result_tensor = gpu_ctx.outputs[0].to_cpu()?;
+        let gpu_result_tensor = gpu_output.to_cpu()?;
         // to_cpu 内部的 cudaMemcpy 默认是同步的，所以这里已经保证了计算完成
         let gpu_result = gpu_result_tensor.as_f32()?.as_slice()?;
 
@@ -298,7 +210,7 @@ mod tests {
             rmsnorm_op.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
 
             // Compute
-            rmsnorm_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], None))?;
+            rmsnorm_op.forward(&input, &mut output, None)?;
 
             // Verify output is valid (not NaN or Inf)
             let result = output.as_bf16()?.as_slice()?;
@@ -366,7 +278,7 @@ mod tests {
 
             // Compute with CUDA
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            rmsnorm_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], Some(&cuda_config)))?;
+            rmsnorm_op.forward(&input, &mut output, Some(&cuda_config))?;
 
             // Copy result back
             let result_tensor = output.to_cpu()?;
@@ -428,7 +340,7 @@ mod tests {
             input_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&input_data);
             rmsnorm_op_cpu.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
 
-            rmsnorm_op_cpu.forward(&mut OpContext::new(&[&input_cpu], &mut [&mut output_cpu], None))?;
+            rmsnorm_op_cpu.forward(&input_cpu, &mut output_cpu, None)?;
             let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
 
             // GPU computation
@@ -440,7 +352,7 @@ mod tests {
             rmsnorm_op_gpu.weight.as_bf16_mut()?.buffer_mut().copy_from_host(&weight_data)?;
 
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            rmsnorm_op_gpu.forward(&mut OpContext::new(&[&input_gpu], &mut [&mut output_gpu], Some(&cuda_config)))?;
+            rmsnorm_op_gpu.forward(&input_gpu, &mut output_gpu, Some(&cuda_config))?;
 
             let gpu_result_tensor = output_gpu.to_cpu()?;
             let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
@@ -478,7 +390,7 @@ mod tests {
             rmsnorm_op.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
 
             // Compute
-            rmsnorm_op.forward(&mut OpContext::new(&[&input], &mut [&mut output], None))?;
+            rmsnorm_op.forward(&input, &mut output, None)?;
 
             // Verify
             let result = output.as_bf16()?.as_slice()?;

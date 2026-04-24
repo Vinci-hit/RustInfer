@@ -1,16 +1,39 @@
-use crate::base::error::{Error, Result};
+use crate::base::error::Result;
 use crate::base::DeviceType;
-use crate::op::{kernels, Op, OpContext};
+use crate::tensor::Tensor;
 
-/// SwiGLU 算子，执行 Output = (Input1 * sigmoid(Input1)) ⊙ Input2 (按元素)
-/// 这是一个无状态的算子。
+#[cfg(feature = "cuda")]
+use crate::cuda::config::CudaConfig;
+
+use super::kernels;
+
+/// SwiGLU 算子，执行 x = (x * SiLU(x)) ⊙ y (原地)
 #[derive(Debug, Clone, Copy)]
 pub struct SwiGLU;
 
 impl SwiGLU {
-    /// 创建一个新的 SwiGLU 算子实例。
     pub fn new() -> Self {
         SwiGLU
+    }
+
+    /// 原地执行 SwiGLU: x = (x * SiLU(x)) * y
+    pub fn forward(
+        &self,
+        y: &Tensor,
+        x: &mut Tensor,
+        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    ) -> Result<()> {
+        let device = y.device();
+
+        match device {
+            DeviceType::Cpu => {
+                kernels::cpu::swiglu(y, x)
+            }
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(_) => {
+                kernels::cuda::swiglu(y, x, cuda_config)
+            }
+        }
     }
 }
 
@@ -20,71 +43,8 @@ impl Default for SwiGLU {
     }
 }
 
-impl Op for SwiGLU {
-    fn name(&self) -> &'static str {
-        "SwiGLU"
-    }
-
-    /// (原地版本) 执行 SwiGLU 的前向计算。
-    ///
-    /// 计算 `x = (x * SiLU(x)) * y`
-    ///
-    /// # Context
-    /// * `ctx.inputs[0]` (Y): 只读的第二个输入张量。
-    /// * `ctx.outputs[0]` (X): 可读写的、同时作为第一个输入和输出的张量。
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        // ==================== 1. 检查逻辑 (适配原地操作) ====================
-
-        // --- a. 检查输入输出数量 ---
-        // **核心修改**: 现在我们期望 1 个输入和 1 个输出
-        if ctx.inputs.len() != 1 || ctx.outputs.len() != 1 {
-            return Err(Error::InvalidArgument(
-                "SwiGLU (in-place) operator expects 1 input (Y) and 1 output (X)".into(),
-            ).into());
-        }
-
-        // --- b. 重新解释输入和输出 ---
-        let input_y = ctx.inputs[0];
-        let input_output_x = &mut ctx.outputs[0];
-
-        // --- c. 检查设备和数据类型 ---
-        let device = input_y.device();
-        let dtype = input_y.dtype();
-
-        // `x` 和 `y` 的设备和类型必须一致
-        if input_output_x.device() != device {
-            return Err(Error::InvalidArgument("All tensors must be on the same device for SwiGLU.".into()).into());
-        }
-        if input_output_x.dtype() != dtype {
-            return Err(Error::InvalidArgument("All tensors must have the same data type for SwiGLU.".into()).into());
-        }
-        
-        // --- d. 检查形状 ---
-        if input_y.shape() != input_output_x.shape() {
-            return Err(Error::InvalidArgument(format!(
-                "Tensor shapes must be identical for SwiGLU. Got Y: {:?}, X: {:?}",
-                input_y.shape(), input_output_x.shape()
-            )).into());
-        }
-
-        // ==================== 2. 分派到原地内核 ====================
-        match device {
-            DeviceType::Cpu => {
-                kernels::cpu::swiglu(input_y, input_output_x)
-            }
-            
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                // **核心修改**: 调用我们之前实现的原地 CUDA 内核
-                kernels::cuda::swiglu(input_y, input_output_x, ctx.cuda_config)
-            }
-        }
-    }
-}
-
 #[cfg(feature = "cuda")]
 impl SwiGLU {
-    /// Stateless operator; nothing to move to CUDA.
     pub fn to_cuda(&mut self, _device_id: i32) -> Result<()> {
         Ok(())
     }
@@ -135,12 +95,7 @@ mod tests {
         input_x_gpu = input_x_gpu.to_cuda(0)?;
         // --- 2. 在 CPU 上计算黄金结果 ---
         let swiglu_op = SwiGLU::new();
-        let mut ctx_cpu = OpContext {
-            inputs: &[&input_y_cpu],
-            outputs: &mut [&mut input_x_cpu],
-            cuda_config:None,
-        };
-        swiglu_op.forward(&mut ctx_cpu)?;
+        swiglu_op.forward(&input_y_cpu, &mut input_x_cpu, None)?;
         let cpu_result_slice = input_x_cpu.as_f32()?.as_slice()?;
         
         // --- 3. 在 GPU 上执行相同计算 ---
@@ -151,16 +106,11 @@ mod tests {
         // Option<&T>
         let cuda_config_ref = cuda_config.as_ref();
         
-        let mut ctx_gpu = OpContext {
-            inputs: &[&input_y_gpu],
-            outputs: &mut [&mut input_x_gpu],
-            cuda_config: cuda_config_ref,
-        };
-        swiglu_op.forward(&mut ctx_gpu)?;
+        swiglu_op.forward(&input_y_gpu, &mut input_x_gpu, cuda_config_ref)?;
 
         // --- 4. 将 GPU 结果拷回并对比 ---
         // to_cpu() 内部的 cudaMemcpy 是同步的，它会等待 stream 上的计算完成
-        let gpu_result_tensor = ctx_gpu.outputs[0].to_cpu()?;
+        let gpu_result_tensor = input_x_gpu.to_cpu()?;
         let gpu_result_slice = gpu_result_tensor.as_f32()?.as_slice()?;
 
         println!("Running SwiGLU test with stream: {}", use_stream);
@@ -231,7 +181,7 @@ mod tests {
 
             // Compute: x = silu(x) * x * y
             let swiglu_op = SwiGLU::new();
-            swiglu_op.forward(&mut OpContext::new(&[&input_y], &mut [&mut input_x], None))?;
+            swiglu_op.forward(&input_y, &mut input_x, None)?;
 
             // Verify result is finite
             let result = input_x.as_bf16()?.as_slice()?;
@@ -281,7 +231,7 @@ mod tests {
             // Compute
             let swiglu_op = SwiGLU::new();
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            swiglu_op.forward(&mut OpContext::new(&[&input_y], &mut [&mut input_x], Some(&cuda_config)))?;
+            swiglu_op.forward(&input_y, &mut input_x, Some(&cuda_config))?;
 
             // Copy result back
             let result_tensor = input_x.to_cpu()?;
@@ -324,7 +274,7 @@ mod tests {
             input_y_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&y_data);
 
             let swiglu_op = SwiGLU::new();
-            swiglu_op.forward(&mut OpContext::new(&[&input_y_cpu], &mut [&mut input_x_cpu], None))?;
+            swiglu_op.forward(&input_y_cpu, &mut input_x_cpu, None)?;
             let cpu_result = input_x_cpu.as_bf16()?.as_slice()?.to_vec();
 
             // GPU computation
@@ -335,7 +285,7 @@ mod tests {
             input_y_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&y_data)?;
 
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            swiglu_op.forward(&mut OpContext::new(&[&input_y_gpu], &mut [&mut input_x_gpu], Some(&cuda_config)))?;
+            swiglu_op.forward(&input_y_gpu, &mut input_x_gpu, Some(&cuda_config))?;
 
             let gpu_result_tensor = input_x_gpu.to_cpu()?;
             let gpu_result = gpu_result_tensor.as_bf16()?.as_slice()?;
@@ -369,7 +319,7 @@ mod tests {
 
         // Compute SwiGLU
         let swiglu_op = SwiGLU::new();
-        swiglu_op.forward(&mut OpContext::new(&[&input_y], &mut [&mut input_x], None))?;
+        swiglu_op.forward(&input_y, &mut input_x, None)?;
 
         let result = input_x.as_bf16()?.as_slice()?;
 

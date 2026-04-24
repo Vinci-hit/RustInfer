@@ -31,3 +31,6 @@ pub use scatter::*;
 
 mod split_cols;
 pub(crate) use split_cols::*;
+
+mod scalar;
+pub use scalar::*;
