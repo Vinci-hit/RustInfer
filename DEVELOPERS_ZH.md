@@ -93,7 +93,7 @@ RustInfer 采用 **分离进程架构**，使用 ZeroMQ 进行进程间通信（
               │ ZeroMQ IPC + MessagePack
               │
 ┌─────────────▼───────────────────────────────────────────┐
-│                     infer-engine (推理引擎)              │
+│                     infer-scheduler (推理引擎)              │
 │  • 模型推理执行                                          │
 │  • 请求队列与调度                                        │
 │  • ZMQ 服务端 (ROUTER socket)                           │
@@ -101,7 +101,7 @@ RustInfer 采用 **分离进程架构**，使用 ZeroMQ 进行进程间通信（
               │ FFI
               │
 ┌─────────────▼───────────────────────────────────────────┐
-│                     infer-core (推理核心)                │
+│                     infer-worker (推理核心)                │
 │  • 张量系统                                              │
 │  • 算子实现                                              │
 │  • 内存管理                                              │
@@ -111,7 +111,7 @@ RustInfer 采用 **分离进程架构**，使用 ZeroMQ 进行进程间通信（
 
 **关键文件位置：**
 - 协议定义：`/crates/infer-protocol/src/lib.rs`
-- 引擎 ZMQ 实现：`/crates/infer-engine/src/zmq_server.rs`
+- 引擎 ZMQ 实现：`/crates/infer-scheduler/src/zmq_server.rs`
 - 服务端 ZMQ 实现：`/crates/infer-server/src/zmq_client.rs`
 
 ### 设计理由
@@ -137,11 +137,11 @@ RustInfer 采用 **分离进程架构**，使用 ZeroMQ 进行进程间通信（
 
 ## 核心组件深度解析
 
-### 1. 内存管理 (`infer-core/src/base/`)
+### 1. 内存管理 (`infer-worker/src/base/`)
 
 #### 缓冲区系统 (Buffer System)
 
-**位置**：`/crates/infer-core/src/base/buffer.rs`
+**位置**：`/crates/infer-worker/src/base/buffer.rs`
 
 `Buffer` 类型是 RustInfer 内存系统的基石：
 
@@ -192,7 +192,7 @@ pub fn copy_from(&mut self, src: &Buffer) {
 
 #### CUDA 内存分配器
 
-**位置**：`/crates/infer-core/src/base/allocator.rs`
+**位置**：`/crates/infer-worker/src/base/allocator.rs`
 
 `CachingCudaAllocator` 是至关重要的性能优化手段：
 
@@ -225,9 +225,9 @@ struct CudaMemoryChunk {
 **线程安全：**
 使用 `DashMap` 实现跨线程的无锁并发访问。
 
-### 2. 张量系统 (`infer-core/src/tensor/`)
+### 2. 张量系统 (`infer-worker/src/tensor/`)
 
-**位置**：`/crates/infer-core/src/tensor/mod.rs`
+**位置**：`/crates/infer-worker/src/tensor/mod.rs`
 
 #### 设计模式：内部带有类型化变体的类型擦除
 
@@ -256,9 +256,9 @@ pub enum Tensor {
 1. **Reshape**：仅更新形状/步长元数据。
 2. **Slice**：创建带有偏移指针的视图。
 
-### 3. 算子系统 (`infer-core/src/op/`)
+### 3. 算子系统 (`infer-worker/src/op/`)
 
-**位置**：`/crates/infer-core/src/op/mod.rs`
+**位置**：`/crates/infer-worker/src/op/mod.rs`
 
 #### 基于 Trait 的抽象
 
@@ -312,7 +312,7 @@ CUDA 图通过记录并重放一系列操作来消除内核启动（kernel launc
 
 ### 添加新算子
 
-1. 在 `infer-core/src/op/` 下创建新文件。
+1. 在 `infer-worker/src/op/` 下创建新文件。
 2. 实现 `Op` 特征。
 3. 提供 CPU (Rayon) 和 CUDA (FFI) 实现。
 4. 在 `build.rs` 中注册新的 CUDA 内核。

@@ -7,3 +7,7 @@
 /crates/infer-frontend/assets/output.css
 /crates/infer-frontend/dist
 /crates/infer-frontend/package-lock.json
+# Profiling artifacts
+*.nsys-rep
+*.sqlite
+*.nsys-rep.bak
