@@ -31,9 +31,9 @@ fi
 echo "[1/3] 构建项目..."
 cargo build --release
 
-# 启动Engine进程 (后台)
-echo "[2/3] 启动Engine进程..."
-./target/release/rustinfer-engine \
+# 启动Scheduler进程 (后台)
+echo "[2/3] 启动Scheduler进程..."
+./target/release/rustinfer-scheduler \
     --model "$MODEL_PATH" \
     --device cuda:0 \
     --zmq-endpoint "$ZMQ_ENDPOINT" \
@@ -42,10 +42,10 @@ echo "[2/3] 启动Engine进程..."
     &
 
 ENGINE_PID=$!
-echo "Engine进程PID: $ENGINE_PID"
+echo "Scheduler进程PID: $ENGINE_PID"
 
-# 等待Engine启动
-echo "等待Engine启动..."
+# 等待Scheduler启动
+echo "等待Scheduler启动..."
 sleep 5
 
 # 启动API Server
@@ -60,7 +60,7 @@ echo "API Server进程PID: $SERVER_PID"
 
 echo ""
 echo "✅ 启动完成!"
-echo "   Engine PID: $ENGINE_PID"
+echo "   Scheduler PID: $ENGINE_PID"
 echo "   Server PID: $SERVER_PID"
 echo ""
 echo "测试命令:"

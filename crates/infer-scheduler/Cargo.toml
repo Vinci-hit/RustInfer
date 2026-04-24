@@ -1,14 +1,14 @@
 [package]
-name = "infer-engine"
+name = "infer-scheduler"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "rustinfer-engine"
+name = "rustinfer-scheduler"
 path = "src/main.rs"
 
 [dependencies]
-infer-core = { path = "../infer-core" }
+infer-worker = { path = "../infer-worker" }
 infer-protocol = { path = "../infer-protocol" }
 
 tokio = { version = "1.49", features = ["full"] }
@@ -22,4 +22,4 @@ uuid = { version = "1.19", features = ["v4"] }
 
 [features]
 default = []
-cuda = ["infer-core/cuda"]
+cuda = ["infer-worker/cuda"]

@@ -7,11 +7,11 @@ mod scheduler;
 mod zmq_server;
 
 use engine::{InferenceEngine, ModelInstance};
-use infer_core::base::DeviceType;
+use infer_worker::base::DeviceType;
 
 #[derive(Parser, Debug)]
-#[command(name = "rustinfer-engine")]
-#[command(about = "RustInfer Engine - 专用推理进程", long_about = None)]
+#[command(name = "rustinfer-scheduler")]
+#[command(about = "RustInfer Scheduler - 调度与推理进程", long_about = None)]
 struct Args {
     /// 模型路径
     #[arg(short, long)]
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("🚀 RustInfer Engine starting...");
+    tracing::info!("🚀 RustInfer Scheduler starting...");
     tracing::info!("  Model: {}", args.model);
     tracing::info!("  Model Type: {}", args.model_type);
     tracing::info!("  Device: {}", args.device);
@@ -73,12 +73,12 @@ async fn main() -> Result<()> {
     tracing::info!("Loading model...");
     let model = match args.model_type.to_lowercase().as_str() {
         "llama3" | "llama" => {
-            let m = infer_core::model::llama3::Llama3::new(&args.model, device)?;
+            let m = infer_worker::model::llm::llama3::Llama3::new(&args.model, device)?;
             let state = m.create_state()?;
             ModelInstance::Llama3(m, state)
         }
         "qwen3" | "qwen" => {
-            let m = infer_core::model::qwen3::Qwen3::new(&args.model, device)?;
+            let m = infer_worker::model::llm::qwen3::Qwen3::new(&args.model, device)?;
             let state = m.create_state()?;
             ModelInstance::Qwen3(m, state)
         }
