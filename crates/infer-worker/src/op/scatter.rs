@@ -74,6 +74,23 @@ impl Scatter {
     }
 }
 
+/// 融合 scatter: 同时写入 K 和 V cache
+#[allow(unused_variables)]
+pub fn scatter_kv(
+    dst_k: &mut Tensor,
+    src_k: &Tensor,
+    dst_v: &mut Tensor,
+    src_v: &Tensor,
+    pos: &Tensor,
+    #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    match dst_k.device() {
+        DeviceType::Cpu => kernels::cpu::scatter_kv(dst_k, src_k, dst_v, src_v, pos),
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => kernels::cuda::scatter_kv(dst_k, src_k, dst_v, src_v, pos, cuda_config),
+    }
+}
+
 // ============================================================================
 //  Unit Tests
 // ============================================================================
