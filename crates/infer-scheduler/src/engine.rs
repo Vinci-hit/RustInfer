@@ -6,8 +6,8 @@ use anyhow::Result;
 
 /// 模型实例枚举，支持多种模型类型
 pub enum ModelInstance {
-    Llama3(infer_core::model::llama3::Llama3, infer_core::runtime::InferenceState),
-    Qwen3(infer_core::model::qwen3::Qwen3, infer_core::runtime::InferenceState),
+    Llama3(infer_worker::model::llm::llama3::Llama3, infer_worker::runtime::InferenceState),
+    Qwen3(infer_worker::model::llm::qwen3::Qwen3, infer_worker::runtime::InferenceState),
 }
 
 impl ModelInstance {

@@ -9,8 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Core inference
-infer-core = { path = "../infer-core", features = ["cuda"] }
-infer-protocol = { path = "../infer-protocol" }  # 新增：分离式通信协议
+infer-worker = { path = "../infer-worker", features = ["cuda"] }
+infer-protocol = { path = "../infer-protocol" }
 
 # Web framework
 axum = { version = "0.8.8", features = ["macros"] }
@@ -49,4 +49,4 @@ nvml-wrapper = { version = "0.10", optional = true }
 
 [features]
 default = ["cuda"]
-cuda = ["infer-core/cuda", "nvml-wrapper"]
+cuda = ["infer-worker/cuda", "nvml-wrapper"]
