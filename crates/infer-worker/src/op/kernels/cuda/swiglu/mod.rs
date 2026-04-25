@@ -39,7 +39,7 @@ pub fn swiglu(
 ) -> Result<()> {
     
     // --- 1. 获取 stream ---
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     
     // --- 2. 检查前置条件 ---
     let num_elements = input_output_x.num_elements();

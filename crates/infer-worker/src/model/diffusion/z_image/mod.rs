@@ -14,5 +14,6 @@
 
 pub mod pipeline;
 pub mod transformer;
+pub mod timestep_embedder;
 
 pub use pipeline::ZImagePipeline;

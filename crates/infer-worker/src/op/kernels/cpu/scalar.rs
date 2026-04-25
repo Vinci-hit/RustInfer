@@ -51,3 +51,25 @@ pub fn scalar_add(src: &Tensor, dst: &mut Tensor, val: f32) -> Result<()> {
     }
     Ok(())
 }
+
+/// 原地 SiLU: x[i] = x[i] * sigmoid(x[i])  where sigmoid(x) = 1/(1+exp(-x))
+pub fn silu_inplace(x: &mut Tensor) -> Result<()> {
+    #[inline]
+    fn silu_f32(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+
+    match x {
+        Tensor::F32(t) => {
+            t.as_slice_mut()?.iter_mut().for_each(|v| *v = silu_f32(*v));
+        }
+        Tensor::BF16(t) => {
+            t.as_slice_mut()?.iter_mut().for_each(|v| *v = bf16::from_f32(silu_f32(v.to_f32())));
+        }
+        Tensor::F16(t) => {
+            t.as_slice_mut()?.iter_mut().for_each(|v| *v = f16::from_f32(silu_f32(v.to_f32())));
+        }
+        _ => return Err(Error::InvalidArgument(format!(
+            "silu_inplace: unsupported dtype {:?}", x.dtype()
+        )).into()),
+    }
+    Ok(())
+}

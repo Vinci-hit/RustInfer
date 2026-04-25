@@ -161,6 +161,19 @@ unsafe impl Send for CudaConfig {}
 unsafe impl Sync for CudaConfig {}
 
 impl CudaConfig {
+    /// 从 `Option<&CudaConfig>` 中获取 stream。
+    /// - `Some(config)` → 用 config.stream
+    /// - `None` → fallback 到 thread-local current stream（仿 PyTorch 的 `at::cuda::getCurrentCUDAStream()`）
+    #[inline]
+    pub fn resolve_stream(cuda_config: Option<&CudaConfig>) -> super::ffi::cudaStream_t {
+        match cuda_config {
+            Some(config) => config.stream,
+            None => super::thread_stream::get_current_cuda_stream(),
+        }
+    }
+}
+
+impl CudaConfig {
     pub fn capture_graph_begin(&mut self) -> Result<()> {
         unsafe {
             crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?;

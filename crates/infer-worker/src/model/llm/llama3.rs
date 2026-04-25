@@ -3,6 +3,8 @@ use std::path::Path;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
+#[cfg(feature = "cuda")]
+use crate::cuda::CudaConfig;
 use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
 
@@ -543,7 +545,7 @@ impl Llama3 {
             let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
             self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
             crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
             crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
             crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
@@ -572,7 +574,7 @@ impl Llama3 {
             let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
             self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
             crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
             crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
             self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;

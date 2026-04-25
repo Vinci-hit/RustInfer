@@ -103,7 +103,7 @@ pub fn scatter(
         )).into());
     }
     // Get CUDA stream
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     // Dispatch based on data type
     match dtype {
@@ -187,7 +187,7 @@ pub fn scatter_kv(
 ) -> Result<()> {
     let kvdim = dst_k.shape()[1];
     let max_seq_len = dst_k.shape()[0];
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     let dtype = dst_k.dtype();
     let pos_ptr = pos.as_i32()?.buffer().as_ptr() as *const i32;
 

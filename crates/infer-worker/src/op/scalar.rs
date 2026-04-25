@@ -13,7 +13,9 @@ pub fn scalar_mul(
     match src.device() {
         DeviceType::Cpu => kernels::cpu::scalar_mul(src, dst, val),
         #[cfg(feature = "cuda")]
-        DeviceType::Cuda(_) => kernels::cuda::scalar_mul(src, dst, val, std::ptr::null_mut()),
+        DeviceType::Cuda(_) => kernels::cuda::scalar_mul(
+            src, dst, val, crate::cuda::get_current_cuda_stream(),
+        ),
     }
 }
 
@@ -26,6 +28,19 @@ pub fn scalar_add(
     match src.device() {
         DeviceType::Cpu => kernels::cpu::scalar_add(src, dst, val),
         #[cfg(feature = "cuda")]
-        DeviceType::Cuda(_) => kernels::cuda::scalar_add(src, dst, val, std::ptr::null_mut()),
+        DeviceType::Cuda(_) => kernels::cuda::scalar_add(
+            src, dst, val, crate::cuda::get_current_cuda_stream(),
+        ),
+    }
+}
+
+/// 原地 SiLU: x[i] = x[i] * sigmoid(x[i])
+pub fn silu_inplace(x: &mut Tensor) -> Result<()> {
+    match x.device() {
+        DeviceType::Cpu => kernels::cpu::silu_inplace(x),
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => kernels::cuda::silu_inplace(
+            x, crate::cuda::get_current_cuda_stream(),
+        ),
     }
 }
