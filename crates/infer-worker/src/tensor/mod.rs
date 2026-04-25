@@ -573,7 +573,130 @@ impl Tensor {
         }
         strides
     }
-    
+
+    /// 零拷贝 reshape：只改 shape，不动数据。要求新 shape 的总元素数不变。
+    ///
+    /// ```ignore
+    /// let t = Tensor::new(&[16, 1, 512, 512], ...)?;
+    /// let t2 = t.view(&[16, 1, 1, 256, 2, 256, 2])?; // 零拷贝
+    /// ```
+    pub fn view(&self, new_shape: &[usize]) -> Result<Self> {
+        let new_numel: usize = new_shape.iter().product();
+        if new_numel != self.num_elements() {
+            return Err(Error::InvalidArgument(format!(
+                "view: new shape {:?} has {} elements, but tensor has {}",
+                new_shape, new_numel, self.num_elements()
+            )).into());
+        }
+        // 共享 buffer，只改 dims
+        macro_rules! view_typed {
+            ($typed:expr) => {{
+                let mut t = $typed.clone();
+                t.dims = Arc::from(new_shape);
+                // num_elements 不变
+                t
+            }};
+        }
+        Ok(match self {
+            Tensor::F32(t) => Tensor::F32(view_typed!(t)),
+            Tensor::I32(t) => Tensor::I32(view_typed!(t)),
+            Tensor::I8(t) => Tensor::I8(view_typed!(t)),
+            Tensor::F16(t) => Tensor::F16(view_typed!(t)),
+            Tensor::BF16(t) => Tensor::BF16(view_typed!(t)),
+        })
+    }
+
+    /// Eager-copy permute：按指定轴顺序重新排列数据，返回新的 contiguous tensor。
+    ///
+    /// `perm[i]` 表示新 tensor 的第 i 维来自旧 tensor 的第 `perm[i]` 维。
+    ///
+    /// ```ignore
+    /// // [C, F, pF, H, pH, W, pW] → [F, H, W, pF, pH, pW, C]
+    /// let t2 = t.permute(&[1, 3, 5, 2, 4, 6, 0])?;
+    /// ```
+    pub fn permute(&self, perm: &[usize]) -> Result<Self> {
+        let old_shape = self.shape();
+        let ndim = old_shape.len();
+        if perm.len() != ndim {
+            return Err(Error::InvalidArgument(format!(
+                "permute: perm length {} != ndim {}", perm.len(), ndim
+            )).into());
+        }
+        // 验证 perm 是 0..ndim 的排列
+        let mut seen = vec![false; ndim];
+        for &p in perm {
+            if p >= ndim || seen[p] {
+                return Err(Error::InvalidArgument(format!(
+                    "permute: invalid permutation {:?}", perm
+                )).into());
+            }
+            seen[p] = true;
+        }
+
+        let new_shape: Vec<usize> = perm.iter().map(|&i| old_shape[i]).collect();
+        let old_strides = self.strides();
+        let n = self.num_elements();
+
+        // 新 tensor 的 strides（row-major）
+        let new_strides = {
+            let mut s = vec![1usize; ndim];
+            for i in (0..ndim.saturating_sub(1)).rev() {
+                s[i] = s[i + 1] * new_shape[i + 1];
+            }
+            s
+        };
+
+        let mut out = Tensor::new(&new_shape, self.dtype(), self.device())?;
+
+        // 通用的索引映射: new_flat → old_flat
+        // new 的第 j 维对应 old 的第 perm[j] 维
+        macro_rules! permute_copy {
+            ($src_slice:expr, $dst_slice:expr) => {{
+                for flat_new in 0..n {
+                    let mut old_flat = 0usize;
+                    let mut rem = flat_new;
+                    for j in 0..ndim {
+                        let coord = rem / new_strides[j];
+                        rem %= new_strides[j];
+                        old_flat += coord * old_strides[perm[j]];
+                    }
+                    $dst_slice[flat_new] = $src_slice[old_flat];
+                }
+            }};
+        }
+
+        match (self, &mut out) {
+            (Tensor::F32(s), Tensor::F32(d)) => {
+                let src = s.as_slice()?;
+                let dst = d.as_slice_mut()?;
+                permute_copy!(src, dst);
+            }
+            (Tensor::BF16(s), Tensor::BF16(d)) => {
+                let src = s.as_slice()?;
+                let dst = d.as_slice_mut()?;
+                permute_copy!(src, dst);
+            }
+            (Tensor::F16(s), Tensor::F16(d)) => {
+                let src = s.as_slice()?;
+                let dst = d.as_slice_mut()?;
+                permute_copy!(src, dst);
+            }
+            (Tensor::I32(s), Tensor::I32(d)) => {
+                let src = s.as_slice()?;
+                let dst = d.as_slice_mut()?;
+                permute_copy!(src, dst);
+            }
+            (Tensor::I8(s), Tensor::I8(d)) => {
+                let src = s.as_slice()?;
+                let dst = d.as_slice_mut()?;
+                permute_copy!(src, dst);
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(out)
+    }
+
     /// 从当前张量中创建一个零拷贝的切片（视图）。
     ///
     /// 此方法不会分配新的计算内存，返回的 `Tensor` 将共享原始 `Tensor` 的
