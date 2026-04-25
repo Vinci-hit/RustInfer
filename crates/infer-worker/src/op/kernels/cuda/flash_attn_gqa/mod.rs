@@ -16,6 +16,7 @@ unsafe extern "C" {
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
+        is_causal: i32,
         stream: cuda::ffi::cudaStream_t,
     );
     pub fn flash_decoding_cu(
@@ -63,6 +64,7 @@ unsafe extern "C" {
         kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
+        is_causal: i32,
         stream: cuda::ffi::cudaStream_t,
     );
     pub fn launch_flash_attn_cute_128x64x64_tile_fp16(
@@ -74,6 +76,7 @@ unsafe extern "C" {
         kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
+        is_causal: i32,
         stream: cuda::ffi::cudaStream_t,
     );
     pub fn flash_decoding_cu_bf16_hdim128(
@@ -109,6 +112,7 @@ unsafe extern "C" {
         kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
+        is_causal: i32,
         stream: cuda::ffi::cudaStream_t,
     );
 
@@ -121,6 +125,7 @@ unsafe extern "C" {
         kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
+        is_causal: i32,
         stream: cuda::ffi::cudaStream_t,
     );
 }
@@ -156,6 +161,7 @@ pub unsafe fn flash_attn_gqa(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    is_causal: bool,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     // --- 1. 数据类型校验 ---
@@ -182,6 +188,7 @@ pub unsafe fn flash_attn_gqa(
 
     // --- 3. 获取 CUDA stream ---
     let stream = CudaConfig::resolve_stream(cuda_config);
+    let is_causal_i32: i32 = if is_causal { 1 } else { 0 };
 
     // --- 4. 根据数据类型分发 ---
     match dtype {
@@ -215,6 +222,7 @@ pub unsafe fn flash_attn_gqa(
                         num_q_heads_i32,
                         num_kv_heads_i32,
                         head_dim_i32,
+                        is_causal_i32,
                         stream,
                     );
                 }
@@ -278,6 +286,7 @@ pub unsafe fn flash_attn_gqa(
                         current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
+                        is_causal_i32,
                         stream,
                     );
                 } else {
@@ -290,6 +299,7 @@ pub unsafe fn flash_attn_gqa(
                         current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
+                        is_causal_i32,
                         stream,
                     );
                 }
@@ -338,6 +348,7 @@ pub unsafe fn flash_attn_gqa(
                         current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
+                        is_causal_i32,
                         stream,
                     );
                 } else {
@@ -350,6 +361,7 @@ pub unsafe fn flash_attn_gqa(
                         current_kv_len_gpu,
                         num_q_heads_i32,
                         num_kv_heads_i32,
+                        is_causal_i32,
                         stream,
                     );
                 }

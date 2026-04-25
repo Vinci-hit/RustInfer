@@ -40,6 +40,7 @@ void flash_attn_gqa_cu(
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
+    int32_t is_causal,
     cudaStream_t stream
 );
 
@@ -71,6 +72,7 @@ void flash_decoding_cu_bf16(
 void launch_flash_attn_cute_128x64x64_tile(
     const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
     int seq_len, int* kv_len, int q_heads, int kv_heads,
+    int is_causal,
     cudaStream_t stream);
 
 // head_dim=128 decode kernel (Qwen3 等模型使用)
@@ -90,6 +92,7 @@ void flash_decoding_cu_bf16_hdim128(
 void launch_flash_attn_cute_bf16_hdim128(
     const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
     int seq_len, int* kv_len, int q_heads, int kv_heads,
+    int is_causal,
     cudaStream_t stream);
 
 #ifdef __cplusplus

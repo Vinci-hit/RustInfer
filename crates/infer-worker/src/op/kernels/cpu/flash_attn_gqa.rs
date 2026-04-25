@@ -26,6 +26,7 @@ pub fn flash_attn_gqa(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    is_causal: bool,
 ) -> Result<()> {
     // 根据数据类型自动分发到对应的实现
     match (input_q.dtype(), input_k_cache.dtype(), input_v_cache.dtype(), output_o.dtype()) {
@@ -45,6 +46,7 @@ pub fn flash_attn_gqa(
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
+                is_causal,
             )
         }
         (
@@ -63,6 +65,7 @@ pub fn flash_attn_gqa(
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
+                is_causal,
             )
         }
         _ => Err(Error::InvalidArgument(
@@ -83,6 +86,7 @@ fn flash_attn_gqa_f32(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    is_causal: bool,
 ) -> Result<()> {
     // --- 1. 获取数据切片 ---
     let q_slice = input_q.as_f32()?;
@@ -147,11 +151,13 @@ fn flash_attn_gqa_f32(
         // 逻辑: 对于 Q 的第 i 行 (绝对位置 current_kv_len + i)，
         // 只能看 K 的前 current_kv_len + i + 1 个元素。
         // 将 j > current_kv_len + i 的位置设为 -inf
+        if is_causal {
         for (i, mut row) in scores.outer_iter_mut().enumerate() {
             let valid_len = current_kv_len + i + 1;
             if valid_len < total_seq_len {
                 row.slice_mut(s![valid_len..]).fill(f32::NEG_INFINITY);
             }
+        }
         }
 
         // E. Standard Softmax (Vectorized)
@@ -195,6 +201,7 @@ fn flash_attn_gqa_bf16(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    is_causal: bool,
 ) -> Result<()> {
     // --- 1. 获取数据切片 ---
     let q_slice = input_q.as_bf16()?;
@@ -263,11 +270,13 @@ fn flash_attn_gqa_bf16(
         // 逻辑: 对于 Q 的第 i 行 (绝对位置 current_kv_len + i)，
         // 只能看 K 的前 current_kv_len + i + 1 个元素。
         // 将 j > current_kv_len + i 的位置设为 -inf
+        if is_causal {
         for (i, mut row) in scores.outer_iter_mut().enumerate() {
             let valid_len = current_kv_len + i + 1;
             if valid_len < total_seq_len {
                 row.slice_mut(s![valid_len..]).fill(f32::NEG_INFINITY);
             }
+        }
         }
 
         // E. Standard Softmax (Vectorized)
