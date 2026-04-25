@@ -216,3 +216,71 @@ void silu_inplace_f16_forward(__half* data, int n, cudaStream_t stream) {
     if (blocks < 1) blocks = 1;
     silu_inplace_f16_kernel<<<blocks, threads, 0, stream>>>(data, n);
 }
+
+// ===================== tanh_inplace kernels =====================
+
+__global__ void tanh_inplace_f32_kernel(float* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int n4 = n / 4;
+    for (int i = idx; i < n4; i += stride) {
+        float4 v = reinterpret_cast<float4*>(data)[i];
+        v.x = tanhf(v.x); v.y = tanhf(v.y); v.z = tanhf(v.z); v.w = tanhf(v.w);
+        reinterpret_cast<float4*>(data)[i] = v;
+    }
+    int base = n4 * 4;
+    for (int i = base + idx; i < n; i += stride) {
+        data[i] = tanhf(data[i]);
+    }
+}
+
+void tanh_inplace_f32_forward(float* data, int n, cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks = (n / 4 + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    tanh_inplace_f32_kernel<<<blocks, threads, 0, stream>>>(data, n);
+}
+
+__global__ void tanh_inplace_bf16_kernel(__nv_bfloat16* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int n2 = n / 2;
+    for (int i = idx; i < n2; i += stride) {
+        __nv_bfloat162 v = reinterpret_cast<__nv_bfloat162*>(data)[i];
+        v.x = __float2bfloat16(tanhf(__bfloat162float(v.x)));
+        v.y = __float2bfloat16(tanhf(__bfloat162float(v.y)));
+        reinterpret_cast<__nv_bfloat162*>(data)[i] = v;
+    }
+    if (n % 2 != 0 && idx == 0) {
+        data[n - 1] = __float2bfloat16(tanhf(__bfloat162float(data[n - 1])));
+    }
+}
+
+void tanh_inplace_bf16_forward(__nv_bfloat16* data, int n, cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks = (n / 2 + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    tanh_inplace_bf16_kernel<<<blocks, threads, 0, stream>>>(data, n);
+}
+
+__global__ void tanh_inplace_f16_kernel(__half* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int n2 = n / 2;
+    for (int i = idx; i < n2; i += stride) {
+        __half2 v = reinterpret_cast<__half2*>(data)[i];
+        v.x = __float2half(tanhf(__half2float(v.x)));
+        v.y = __float2half(tanhf(__half2float(v.y)));
+        reinterpret_cast<__half2*>(data)[i] = v;
+    }
+    if (n % 2 != 0 && idx == 0) {
+        data[n - 1] = __float2half(tanhf(__half2float(data[n - 1])));
+    }
+}
+
+void tanh_inplace_f16_forward(__half* data, int n, cudaStream_t stream) {
+    constexpr int threads = 256;
+    int blocks = (n / 2 + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    tanh_inplace_f16_kernel<<<blocks, threads, 0, stream>>>(data, n);
+}

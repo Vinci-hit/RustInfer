@@ -17,6 +17,10 @@ unsafe extern "C" {
     fn silu_inplace_f32_forward(data: *mut f32, n: i32, stream: cudaStream_t);
     fn silu_inplace_bf16_forward(data: *mut half::bf16, n: i32, stream: cudaStream_t);
     fn silu_inplace_f16_forward(data: *mut half::f16, n: i32, stream: cudaStream_t);
+
+    fn tanh_inplace_f32_forward(data: *mut f32, n: i32, stream: cudaStream_t);
+    fn tanh_inplace_bf16_forward(data: *mut half::bf16, n: i32, stream: cudaStream_t);
+    fn tanh_inplace_f16_forward(data: *mut half::f16, n: i32, stream: cudaStream_t);
 }
 
 /// dst[i] = src[i] * val  (CUDA)
@@ -92,6 +96,30 @@ pub fn silu_inplace(x: &mut Tensor, stream: cudaStream_t) -> Result<()> {
         }
         other => return Err(Error::InvalidArgument(format!(
             "CUDA silu_inplace: unsupported dtype {:?}", other
+        )).into()),
+    }
+    Ok(())
+}
+
+/// 原地 tanh: x[i] = tanh(x[i])  (CUDA)
+#[cfg(feature = "cuda")]
+pub fn tanh_inplace(x: &mut Tensor, stream: cudaStream_t) -> Result<()> {
+    let n = x.num_elements() as i32;
+    match x.dtype() {
+        crate::base::DataType::F32 => {
+            let p = x.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            unsafe { tanh_inplace_f32_forward(p, n, stream); }
+        }
+        crate::base::DataType::BF16 => {
+            let p = x.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            unsafe { tanh_inplace_bf16_forward(p, n, stream); }
+        }
+        crate::base::DataType::F16 => {
+            let p = x.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            unsafe { tanh_inplace_f16_forward(p, n, stream); }
+        }
+        other => return Err(Error::InvalidArgument(format!(
+            "CUDA tanh_inplace: unsupported dtype {:?}", other
         )).into()),
     }
     Ok(())

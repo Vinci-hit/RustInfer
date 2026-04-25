@@ -34,3 +34,9 @@ pub(crate) use split_cols::*;
 
 mod scalar;
 pub use scalar::*;
+
+mod broadcast_mul;
+pub use broadcast_mul::*;
+
+mod layernorm;
+pub use layernorm::*;

@@ -44,3 +44,14 @@ pub fn silu_inplace(x: &mut Tensor) -> Result<()> {
         ),
     }
 }
+
+/// 原地 tanh: x[i] = tanh(x[i])
+pub fn tanh_inplace(x: &mut Tensor) -> Result<()> {
+    match x.device() {
+        DeviceType::Cpu => kernels::cpu::tanh_inplace(x),
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => kernels::cuda::tanh_inplace(
+            x, crate::cuda::get_current_cuda_stream(),
+        ),
+    }
+}

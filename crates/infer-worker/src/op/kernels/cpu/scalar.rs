@@ -73,3 +73,22 @@ pub fn silu_inplace(x: &mut Tensor) -> Result<()> {
     }
     Ok(())
 }
+
+/// 原地 tanh: x[i] = tanh(x[i])
+pub fn tanh_inplace(x: &mut Tensor) -> Result<()> {
+    match x {
+        Tensor::F32(t) => {
+            t.as_slice_mut()?.iter_mut().for_each(|v| *v = v.tanh());
+        }
+        Tensor::BF16(t) => {
+            t.as_slice_mut()?.iter_mut().for_each(|v| *v = bf16::from_f32(v.to_f32().tanh()));
+        }
+        Tensor::F16(t) => {
+            t.as_slice_mut()?.iter_mut().for_each(|v| *v = f16::from_f32(v.to_f32().tanh()));
+        }
+        _ => return Err(Error::InvalidArgument(format!(
+            "tanh_inplace: unsupported dtype {:?}", x.dtype()
+        )).into()),
+    }
+    Ok(())
+}

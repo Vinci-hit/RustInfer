@@ -18,6 +18,10 @@ void silu_inplace_f32_forward(float* data, int n, cudaStream_t stream);
 void silu_inplace_bf16_forward(__nv_bfloat16* data, int n, cudaStream_t stream);
 void silu_inplace_f16_forward(__half* data, int n, cudaStream_t stream);
 
+void tanh_inplace_f32_forward(float* data, int n, cudaStream_t stream);
+void tanh_inplace_bf16_forward(__nv_bfloat16* data, int n, cudaStream_t stream);
+void tanh_inplace_f16_forward(__half* data, int n, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
