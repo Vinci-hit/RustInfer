@@ -40,3 +40,12 @@ pub use broadcast_mul::*;
 
 mod layernorm;
 pub use layernorm::*;
+
+mod conv2d;
+pub use conv2d::*;
+
+mod groupnorm;
+pub use groupnorm::*;
+
+mod upsample;
+pub use upsample::*;

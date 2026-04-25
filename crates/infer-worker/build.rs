@@ -14,9 +14,12 @@ fn main() {
             // return; // 如果你希望在这种情况下停止构建
         }
         println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+        println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
         println!("cargo:rustc-link-lib=cublas");
         // 对应 cublasLt.h
         println!("cargo:rustc-link-lib=cublasLt");
+        // cuDNN (Conv2d 等)
+        println!("cargo:rustc-link-lib=cudnn");
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         let root = PathBuf::from(manifest_dir);
         let cutlass_include = root.join("src/op/kernels/cuda/third_party");
@@ -55,6 +58,7 @@ fn main() {
             .header("src/cuda/wrapper.h")
             // 告诉 bindgen/libclang CUDA 头文件的位置
             .clang_arg(format!("-I{}/include", env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into())))
+            .clang_arg("-I/usr/include/x86_64-linux-gnu")
             // 明确告诉 bindgen 本次编译的目标架构
             .clang_arg(format!("--target={}", target))
             .clang_arg(format!("-I{}", cutlass_include.to_string_lossy()))
@@ -93,9 +97,46 @@ fn main() {
             .allowlist_function("cudaGraphDestroy")
             .allowlist_function("cudaGraphLaunch")
             .allowlist_function("cudaGraphExecDestroy")
+            // cuDNN types
+            .allowlist_type("cudnnHandle_t")
+            .allowlist_type("cudnnStatus_t")
+            .allowlist_type("cudnnTensorDescriptor_t")
+            .allowlist_type("cudnnFilterDescriptor_t")
+            .allowlist_type("cudnnConvolutionDescriptor_t")
+            .allowlist_type("cudnnConvolutionFwdAlgoPerf_t")
+            .allowlist_type("cudnnDataType_t")
+            .allowlist_type("cudnnTensorFormat_t")
+            .allowlist_type("cudnnConvolutionMode_t")
+            .allowlist_type("cudnnConvolutionFwdAlgo_t")
+            .allowlist_type("cudnnMathType_t")
+            // cuDNN functions
+            .allowlist_function("cudnnCreate")
+            .allowlist_function("cudnnDestroy")
+            .allowlist_function("cudnnSetStream")
+            .allowlist_function("cudnnGetErrorString")
+            .allowlist_function("cudnnCreateTensorDescriptor")
+            .allowlist_function("cudnnSetTensor4dDescriptor")
+            .allowlist_function("cudnnDestroyTensorDescriptor")
+            .allowlist_function("cudnnCreateFilterDescriptor")
+            .allowlist_function("cudnnSetFilter4dDescriptor")
+            .allowlist_function("cudnnDestroyFilterDescriptor")
+            .allowlist_function("cudnnCreateConvolutionDescriptor")
+            .allowlist_function("cudnnSetConvolution2dDescriptor")
+            .allowlist_function("cudnnSetConvolutionMathType")
+            .allowlist_function("cudnnDestroyConvolutionDescriptor")
+            .allowlist_function("cudnnGetConvolutionForwardWorkspaceSize")
+            .allowlist_function("cudnnConvolutionForward")
+            .allowlist_function("cudnnAddTensor")
+            .allowlist_function("cudnnGetConvolutionForwardAlgorithm_v7")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .rustified_enum("cudaError_t")
             .rustified_enum("cudaMemcpyKind")
+            .rustified_enum("cudnnStatus_t")
+            .rustified_enum("cudnnDataType_t")
+            .rustified_enum("cudnnTensorFormat_t")
+            .rustified_enum("cudnnConvolutionMode_t")
+            .rustified_enum("cudnnConvolutionFwdAlgo_t")
+            .rustified_enum("cudnnMathType_t")
             .generate()
             .expect("Unable to generate bindings");
         let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());

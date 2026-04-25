@@ -1544,4 +1544,157 @@ mod tests {
         }
         Ok(())
     }
+
+    // ==================== Conv2d tests ====================
+
+    #[test]
+    fn test_conv2d_cpu_basic() -> Result<()> {
+        // input: [1, 1, 4, 4], weight: [1, 1, 3, 3], stride=1, padding=1
+        // output: [1, 1, 4, 4]
+        let mut input = Tensor::new(&[1, 1, 4, 4], DataType::F32, DeviceType::Cpu)?;
+        input.as_f32_mut()?.as_slice_mut()?.fill(1.0);
+
+        let mut weight = Tensor::new(&[1, 1, 3, 3], DataType::F32, DeviceType::Cpu)?;
+        weight.as_f32_mut()?.as_slice_mut()?.fill(1.0);
+
+        let mut bias = Tensor::new(&[1], DataType::F32, DeviceType::Cpu)?;
+        bias.as_f32_mut()?.as_slice_mut()?[0] = 0.5;
+
+        let mut output = Tensor::new(&[1, 1, 4, 4], DataType::F32, DeviceType::Cpu)?;
+        crate::op::conv2d::conv2d(&input, &weight, Some(&bias), &mut output, 1, 1, None)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        // center pixel: 9*1 + 0.5 = 9.5
+        assert!((d[5] - 9.5).abs() < 1e-4, "center={}", d[5]);
+        // corner pixel (0,0): 4*1 + 0.5 = 4.5
+        assert!((d[0] - 4.5).abs() < 1e-4, "corner={}", d[0]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_conv2d_cuda_vs_cpu() -> Result<()> {
+        use crate::cuda::CudaConfig;
+
+        let mut input = Tensor::randn(&[1, 3, 8, 8], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let weight = Tensor::randn(&[16, 3, 3, 3], DataType::F32, DeviceType::Cpu, Some(7))?;
+        let bias = Tensor::randn(&[16], DataType::F32, DeviceType::Cpu, Some(13))?;
+
+        // CPU
+        let (h_out, w_out) = crate::op::conv2d::conv2d_output_size(8, 8, 3, 3, 1, 1);
+        let mut cpu_out = Tensor::new(&[1, 16, h_out, w_out], DataType::F32, DeviceType::Cpu)?;
+        crate::op::conv2d::conv2d(&input, &weight, Some(&bias), &mut cpu_out, 1, 1, None)?;
+
+        // CUDA
+        let gpu_input = input.to_cuda(0)?;
+        let gpu_weight = weight.to_cuda(0)?;
+        let gpu_bias = bias.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[1, 16, h_out, w_out], DataType::F32, DeviceType::Cuda(0))?;
+        let cfg = CudaConfig::new()?;
+        crate::op::conv2d::conv2d(&gpu_input, &gpu_weight, Some(&gpu_bias), &mut gpu_out, 1, 1, Some(&cfg))?;
+
+        let gpu_back = gpu_out.to_cpu()?;
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        let mut max_diff: f32 = 0.0;
+        for i in 0..cd.len() {
+            max_diff = max_diff.max((cd[i] - gd[i]).abs());
+        }
+        println!("Conv2d CPU vs CUDA max diff: {}", max_diff);
+        assert!(max_diff < 1e-3, "Conv2d max diff {} too large", max_diff);
+        Ok(())
+    }
+
+    // ==================== GroupNorm tests ====================
+
+    #[test]
+    fn test_groupnorm_cpu() -> Result<()> {
+        // [1, 4, 2, 2], 2 groups → channels_per_group=2
+        let mut input = Tensor::new(&[1, 4, 2, 2], DataType::F32, DeviceType::Cpu)?;
+        let d = input.as_f32_mut()?.as_slice_mut()?;
+        for i in 0..16 { d[i] = (i + 1) as f32; }
+
+        let mut weight = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        weight.as_f32_mut()?.as_slice_mut()?.fill(1.0);
+        let mut bias = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        bias.as_f32_mut()?.as_slice_mut()?.fill(0.0);
+
+        let mut output = Tensor::new(&[1, 4, 2, 2], DataType::F32, DeviceType::Cpu)?;
+        crate::op::groupnorm::groupnorm(&input, &weight, &bias, &mut output, 2, 1e-5)?;
+
+        let r = output.as_f32()?.as_slice()?;
+        // group 0 的均值应 ≈ 0
+        let group0_mean: f32 = r[0..8].iter().sum::<f32>() / 8.0;
+        assert!(group0_mean.abs() < 1e-4, "group0 mean: {}", group0_mean);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_groupnorm_cuda_vs_cpu() -> Result<()> {
+        let input = Tensor::randn(&[2, 32, 4, 4], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let weight = Tensor::randn(&[32], DataType::F32, DeviceType::Cpu, Some(7))?;
+        let bias = Tensor::randn(&[32], DataType::F32, DeviceType::Cpu, Some(13))?;
+
+        let mut cpu_out = Tensor::new(&[2, 32, 4, 4], DataType::F32, DeviceType::Cpu)?;
+        crate::op::groupnorm::groupnorm(&input, &weight, &bias, &mut cpu_out, 8, 1e-5)?;
+
+        let gpu_in = input.to_cuda(0)?;
+        let gpu_w = weight.to_cuda(0)?;
+        let gpu_b = bias.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[2, 32, 4, 4], DataType::F32, DeviceType::Cuda(0))?;
+        crate::op::groupnorm::groupnorm(&gpu_in, &gpu_w, &gpu_b, &mut gpu_out, 8, 1e-5)?;
+
+        let gpu_back = gpu_out.to_cpu()?;
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        let mut max_diff: f32 = 0.0;
+        for i in 0..cd.len() {
+            max_diff = max_diff.max((cd[i] - gd[i]).abs());
+        }
+        println!("GroupNorm CPU vs CUDA max diff: {}", max_diff);
+        assert!(max_diff < 1e-3, "GroupNorm max diff {} too large", max_diff);
+        Ok(())
+    }
+
+    // ==================== Upsample tests ====================
+
+    #[test]
+    fn test_upsample_nearest_2x_cpu() -> Result<()> {
+        let mut input = Tensor::new(&[1, 1, 2, 2], DataType::F32, DeviceType::Cpu)?;
+        input.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+        let mut output = Tensor::new(&[1, 1, 4, 4], DataType::F32, DeviceType::Cpu)?;
+        crate::op::upsample::upsample_nearest_2x(&input, &mut output)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        // [1,1,2,2] → [1,2,1,2, 3,3,4,4, 3,3,4,4]
+        assert_eq!(d[0], 1.0); assert_eq!(d[1], 1.0);
+        assert_eq!(d[2], 2.0); assert_eq!(d[3], 2.0);
+        assert_eq!(d[4], 1.0); assert_eq!(d[5], 1.0);
+        assert_eq!(d[8], 3.0); assert_eq!(d[10], 4.0);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_upsample_nearest_2x_cuda_vs_cpu() -> Result<()> {
+        let input = Tensor::randn(&[2, 16, 8, 8], DataType::F32, DeviceType::Cpu, Some(42))?;
+
+        let mut cpu_out = Tensor::new(&[2, 16, 16, 16], DataType::F32, DeviceType::Cpu)?;
+        crate::op::upsample::upsample_nearest_2x(&input, &mut cpu_out)?;
+
+        let gpu_in = input.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[2, 16, 16, 16], DataType::F32, DeviceType::Cuda(0))?;
+        crate::op::upsample::upsample_nearest_2x(&gpu_in, &mut gpu_out)?;
+
+        let gpu_back = gpu_out.to_cpu()?;
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        for i in 0..cd.len() {
+            assert!((cd[i] - gd[i]).abs() < 1e-6,
+                "upsample mismatch at {}: cpu={}, gpu={}", i, cd[i], gd[i]);
+        }
+        Ok(())
+    }
 }

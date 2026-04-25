@@ -47,3 +47,12 @@ pub use broadcast_mul::broadcast_mul;
 
 mod layernorm;
 pub use layernorm::layernorm;
+
+mod conv2d;
+pub use conv2d::conv2d;
+
+mod groupnorm;
+pub use groupnorm::groupnorm;
+
+mod upsample;
+pub use upsample::upsample_nearest_2x;

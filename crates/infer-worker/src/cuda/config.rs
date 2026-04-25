@@ -48,7 +48,8 @@ pub struct CudaConfig {
     pub flash_decode_workspace: *mut c_void,
     pub flash_decode_workspace_size: usize,
     pub cuda_graph: Option<CudaGraph>,
-    // pub cudnn_handle: cudnnHandle_t,   // (未来)
+    /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
+    pub cudnn_handle: ffi::cudnnHandle_t,
 }
 
 #[derive(Debug)]
@@ -83,6 +84,23 @@ impl CudaConfig {
         let workspace_size = DEFAULT_GEMM_WORKSPACE_SIZE;
         unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut workspace, workspace_size))? };
 
+        // cuDNN handle
+        let mut cudnn_handle: ffi::cudnnHandle_t = std::ptr::null_mut();
+        unsafe {
+            let status = ffi::cudnnCreate(&mut cudnn_handle);
+            if status != ffi::cudnnStatus_t::CUDNN_STATUS_SUCCESS {
+                return Err(crate::base::error::Error::InvalidArgument(
+                    format!("cudnnCreate failed: {:?}", status)
+                ).into());
+            }
+            let status = ffi::cudnnSetStream(cudnn_handle, stream);
+            if status != ffi::cudnnStatus_t::CUDNN_STATUS_SUCCESS {
+                return Err(crate::base::error::Error::InvalidArgument(
+                    format!("cudnnSetStream failed: {:?}", status)
+                ).into());
+            }
+        }
+
         Ok(Self {
             stream,
             cublaslt_handle,
@@ -92,6 +110,7 @@ impl CudaConfig {
             flash_decode_workspace: std::ptr::null_mut(),
             flash_decode_workspace_size: 0,
             cuda_graph: None,
+            cudnn_handle,
         })
     }
 
@@ -149,6 +168,11 @@ impl Drop for CudaConfig {
         if !self.flash_decode_workspace.is_null() {
             unsafe {
                 let _ = ffi::cudaFree(self.flash_decode_workspace);
+            }
+        }
+        if !self.cudnn_handle.is_null() {
+            unsafe {
+                let _ = ffi::cudnnDestroy(self.cudnn_handle);
             }
         }
         // cuda_graph 会自动在其 Drop 中释放
