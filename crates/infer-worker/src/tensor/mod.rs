@@ -1012,6 +1012,68 @@ impl Tensor {
         crate::op::scalar::silu_inplace(self)
             .expect("Tensor::silu_: kernel failed");
     }
+
+    /// 原地 tanh: self[i] = tanh(self[i])
+    pub fn tanh_(&mut self) {
+        crate::op::scalar::tanh_inplace(self)
+            .expect("Tensor::tanh_: kernel failed");
+    }
+
+    /// 沿最后一维切分为 n 段，返回 n 个 contiguous tensor。
+    /// 要求最后一维能被 n 整除。
+    pub fn chunk(&self, n: usize) -> Result<Vec<Tensor>> {
+        let shape = self.shape();
+        let last_dim = *shape.last().ok_or_else(|| Error::InvalidArgument("chunk: empty shape".into()))?;
+        if last_dim % n != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "chunk: last dim {} not divisible by {}", last_dim, n
+            )).into());
+        }
+        let chunk_size = last_dim / n;
+        let leading: usize = self.num_elements() / last_dim;
+
+        // 构造每段的新 shape
+        let mut new_shape: Vec<usize> = shape.to_vec();
+        *new_shape.last_mut().unwrap() = chunk_size;
+
+        let mut results = Vec::with_capacity(n);
+        for c in 0..n {
+            let mut out = Tensor::new(&new_shape, self.dtype(), self.device())?;
+            let src_offset = c * chunk_size;
+
+            macro_rules! chunk_copy {
+                ($src_typed:expr, $dst_typed:expr) => {{
+                    let s = $src_typed.as_slice()?;
+                    let d = $dst_typed.as_slice_mut()?;
+                    for row in 0..leading {
+                        let src_base = row * last_dim + src_offset;
+                        let dst_base = row * chunk_size;
+                        d[dst_base..dst_base + chunk_size]
+                            .copy_from_slice(&s[src_base..src_base + chunk_size]);
+                    }
+                }};
+            }
+
+            match (self, &mut out) {
+                (Tensor::F32(s), Tensor::F32(d)) => chunk_copy!(s, d),
+                (Tensor::BF16(s), Tensor::BF16(d)) => chunk_copy!(s, d),
+                (Tensor::F16(s), Tensor::F16(d)) => chunk_copy!(s, d),
+                (Tensor::I32(s), Tensor::I32(d)) => chunk_copy!(s, d),
+                (Tensor::I8(s), Tensor::I8(d)) => chunk_copy!(s, d),
+                _ => unreachable!(),
+            }
+            results.push(out);
+        }
+        Ok(results)
+    }
+
+    /// 广播逐元素乘法: self[..., j] * scale[j] → new tensor
+    /// self: [..., D], scale: [D]
+    pub fn broadcast_mul(&self, scale: &Tensor) -> Result<Tensor> {
+        let mut out = Tensor::new(self.shape(), self.dtype(), self.device())?;
+        crate::op::broadcast_mul::broadcast_mul(self, scale, &mut out)?;
+        out.view(self.shape())
+    }
 }
 
 #[cfg(test)]
@@ -1306,6 +1368,180 @@ mod tests {
         let data = cpu.as_f32()?.as_slice()?;
         let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
         assert!(mean.abs() < 0.02, "cuda randn mean = {mean}");
+        Ok(())
+    }
+
+    // ==================== tanh tests ====================
+
+    #[test]
+    fn test_tanh_cpu() -> Result<()> {
+        let mut t = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        t.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[0.0, 1.0, -1.0, 100.0]);
+        t.tanh_();
+        let d = t.as_f32()?.as_slice()?;
+        assert!((d[0] - 0.0).abs() < 1e-5);
+        assert!((d[1] - 0.7616).abs() < 1e-3);
+        assert!((d[2] - (-0.7616)).abs() < 1e-3);
+        assert!((d[3] - 1.0).abs() < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tanh_cuda_vs_cpu() -> Result<()> {
+        let n = 2048;
+        let mut cpu = Tensor::randn(&[n], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let mut gpu = cpu.to_cuda(0)?;
+        cpu.tanh_();
+        gpu.tanh_();
+        let gpu_back = gpu.to_cpu()?;
+        let cd = cpu.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        for i in 0..n {
+            assert!((cd[i] - gd[i]).abs() < 1e-5,
+                "tanh mismatch at {}: cpu={}, gpu={}", i, cd[i], gd[i]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tanh_cuda_vs_cpu_bf16() -> Result<()> {
+        let n = 1024;
+        let mut cpu = Tensor::randn(&[n], DataType::BF16, DeviceType::Cpu, Some(7))?;
+        let mut gpu = cpu.to_cuda(0)?;
+        cpu.tanh_();
+        gpu.tanh_();
+        let gpu_back = gpu.to_cpu()?;
+        let cd = cpu.as_bf16()?.as_slice()?;
+        let gd = gpu_back.as_bf16()?.as_slice()?;
+        for i in 0..n {
+            assert!((cd[i].to_f32() - gd[i].to_f32()).abs() < 0.02,
+                "bf16 tanh mismatch at {}", i);
+        }
+        Ok(())
+    }
+
+    // ==================== chunk tests ====================
+
+    #[test]
+    fn test_chunk_basic() -> Result<()> {
+        let mut t = Tensor::new(&[2, 8], DataType::F32, DeviceType::Cpu)?;
+        let d = t.as_f32_mut()?.as_slice_mut()?;
+        for i in 0..16 { d[i] = i as f32; }
+
+        let chunks = t.chunk(4)?;
+        assert_eq!(chunks.len(), 4);
+        for c in &chunks { assert_eq!(c.shape(), &[2, 2]); }
+
+        // row 0: [0,1,2,3,4,5,6,7] → chunks of 2: [0,1], [2,3], [4,5], [6,7]
+        assert_eq!(chunks[0].as_f32()?.as_slice()?, &[0.0, 1.0, 8.0, 9.0]);
+        assert_eq!(chunks[1].as_f32()?.as_slice()?, &[2.0, 3.0, 10.0, 11.0]);
+        Ok(())
+    }
+
+    // ==================== broadcast_mul tests ====================
+
+    #[test]
+    fn test_broadcast_mul_cpu() -> Result<()> {
+        // a: [3, 4], b: [4] → dst: [3, 4]
+        let mut a = Tensor::new(&[3, 4], DataType::F32, DeviceType::Cpu)?;
+        let ad = a.as_f32_mut()?.as_slice_mut()?;
+        for i in 0..12 { ad[i] = (i + 1) as f32; }
+
+        let mut b = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        b.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+        let result = a.broadcast_mul(&b)?;
+        let rd = result.as_f32()?.as_slice()?;
+        // row 0: 1*1, 2*2, 3*3, 4*4 = 1, 4, 9, 16
+        assert_eq!(&rd[0..4], &[1.0, 4.0, 9.0, 16.0]);
+        // row 1: 5*1, 6*2, 7*3, 8*4 = 5, 12, 21, 32
+        assert_eq!(&rd[4..8], &[5.0, 12.0, 21.0, 32.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_broadcast_mul_cuda_vs_cpu() -> Result<()> {
+        let mut a = Tensor::randn(&[64, 128], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let b = Tensor::randn(&[128], DataType::F32, DeviceType::Cpu, Some(7))?;
+
+        let cpu_out = a.broadcast_mul(&b)?;
+
+        let a_gpu = a.to_cuda(0)?;
+        let b_gpu = b.to_cuda(0)?;
+        let gpu_out = a_gpu.broadcast_mul(&b_gpu)?.to_cpu()?;
+
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_out.as_f32()?.as_slice()?;
+        for i in 0..cd.len() {
+            assert!((cd[i] - gd[i]).abs() < 1e-4,
+                "broadcast_mul mismatch at {}: cpu={}, gpu={}", i, cd[i], gd[i]);
+        }
+        Ok(())
+    }
+
+    // ==================== layernorm tests ====================
+
+    #[test]
+    fn test_layernorm_cpu() -> Result<()> {
+        // [2, 4] — each row normalized to mean≈0, var≈1
+        let mut input = Tensor::new(&[2, 4], DataType::F32, DeviceType::Cpu)?;
+        input.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+        let mut output = Tensor::new(&[2, 4], DataType::F32, DeviceType::Cpu)?;
+
+        crate::op::layernorm::layernorm(&input, &mut output, 1e-5)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        // row 0: mean=2.5, var=1.25, rstd=1/sqrt(1.25+1e-5) ≈ 0.8944
+        // (1-2.5)*0.8944 ≈ -1.3416
+        assert!((d[0] - (-1.3416)).abs() < 1e-3, "row 0 elem 0: {}", d[0]);
+        // row mean should be ≈ 0
+        let mean: f32 = d[0..4].iter().sum::<f32>() / 4.0;
+        assert!(mean.abs() < 1e-5, "row 0 mean: {}", mean);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_layernorm_cuda_vs_cpu() -> Result<()> {
+        let input = Tensor::randn(&[32, 256], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let mut cpu_out = Tensor::new(&[32, 256], DataType::F32, DeviceType::Cpu)?;
+        crate::op::layernorm::layernorm(&input, &mut cpu_out, 1e-5)?;
+
+        let gpu_in = input.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[32, 256], DataType::F32, DeviceType::Cuda(0))?;
+        crate::op::layernorm::layernorm(&gpu_in, &mut gpu_out, 1e-5)?;
+        let gpu_back = gpu_out.to_cpu()?;
+
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        for i in 0..cd.len() {
+            assert!((cd[i] - gd[i]).abs() < 1e-4,
+                "layernorm mismatch at {}: cpu={}, gpu={}", i, cd[i], gd[i]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_layernorm_cuda_vs_cpu_bf16() -> Result<()> {
+        let input = Tensor::randn(&[16, 128], DataType::BF16, DeviceType::Cpu, Some(7))?;
+        let mut cpu_out = Tensor::new(&[16, 128], DataType::BF16, DeviceType::Cpu)?;
+        crate::op::layernorm::layernorm(&input, &mut cpu_out, 1e-5)?;
+
+        let gpu_in = input.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[16, 128], DataType::BF16, DeviceType::Cuda(0))?;
+        crate::op::layernorm::layernorm(&gpu_in, &mut gpu_out, 1e-5)?;
+        let gpu_back = gpu_out.to_cpu()?;
+
+        let cd = cpu_out.as_bf16()?.as_slice()?;
+        let gd = gpu_back.as_bf16()?.as_slice()?;
+        for i in 0..cd.len() {
+            assert!((cd[i].to_f32() - gd[i].to_f32()).abs() < 0.05,
+                "bf16 layernorm mismatch at {}: cpu={}, gpu={}", i, cd[i].to_f32(), gd[i].to_f32());
+        }
         Ok(())
     }
 }
