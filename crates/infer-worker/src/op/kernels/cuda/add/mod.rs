@@ -96,7 +96,7 @@ pub fn add(
         }
     
     // 4. 获取 CUDA stream
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     // 5. 根据数据类型调用相应的 FFI 函数
     match dtype {
@@ -209,7 +209,7 @@ pub fn add_inplace(
         }
 
     // 4. 获取 CUDA stream
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     // 5. 根据数据类型调用相应的 FFI 函数
     match dtype {

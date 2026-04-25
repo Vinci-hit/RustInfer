@@ -181,7 +181,7 @@ pub unsafe fn flash_attn_gqa(
     }
 
     // --- 3. 获取 CUDA stream ---
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     // --- 4. 根据数据类型分发 ---
     match dtype {

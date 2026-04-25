@@ -49,7 +49,7 @@ pub fn embedding(
     let vocab_size = weight.shape()[0];
     let dim = weight.shape()[1];
     let token_len = input_tokens.shape()[0];
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     let tokens_ptr = tokens_typed.buffer().as_ptr() as *const i32;
     
     // --- 2. 数据类型分发 ---

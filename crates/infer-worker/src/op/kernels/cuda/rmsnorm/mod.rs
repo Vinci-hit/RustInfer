@@ -40,7 +40,7 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, c
     let rows = input.num_elements() / dim;
     
     // 获取 CUDA stream
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     // 根据输出数据类型进行分发
     let dtype = output.dtype();
     match dtype {

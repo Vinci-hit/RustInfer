@@ -4,6 +4,8 @@ use std::time::Instant;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
+#[cfg(feature = "cuda")]
+use crate::cuda::CudaConfig;
 use crate::base::error::Error::InternalError;
 use crate::model::BufferType;
 
@@ -578,7 +580,7 @@ impl Qwen3 {
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
             let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
 
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
             crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
             crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
             crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
@@ -627,7 +629,7 @@ impl Qwen3 {
             let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
             let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, inter])?;
 
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
             crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
             crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
 

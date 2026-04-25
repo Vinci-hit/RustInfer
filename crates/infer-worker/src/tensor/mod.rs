@@ -881,6 +881,16 @@ impl Add<f32> for &Tensor {
     }
 }
 
+// --- 4. 逐元素激活函数 ---
+
+impl Tensor {
+    /// 原地 SiLU 激活: self[i] = self[i] * sigmoid(self[i])
+    pub fn silu_(&mut self) {
+        crate::op::scalar::silu_inplace(self)
+            .expect("Tensor::silu_: kernel failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{base::{error::Result, DataType, DeviceType}, tensor::Tensor};
