@@ -1,6 +1,7 @@
 #include <cuda_runtime_api.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include <cudnn.h>
 #include "../op/kernels/cuda/total_head.h"
 
 #ifndef cublasCreate_v2

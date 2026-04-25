@@ -15,3 +15,6 @@ pub mod split_cols;
 pub mod scalar;
 pub mod broadcast_mul;
 pub mod layernorm;
+pub mod conv2d;
+pub mod groupnorm;
+pub mod upsample;
