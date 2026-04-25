@@ -151,6 +151,58 @@ impl Tensor {
             _ => unimplemented!()
         }
     }
+
+    /// 生成标准正态分布随机张量 N(0,1)。
+    /// - `seed`: Some(42) 可复现，None 随机
+    /// - 先在 CPU 生成 f32，再按 dtype 转换，如果 device 是 CUDA 则上传
+    pub fn randn(shape: &[usize], dtype: DataType, device: DeviceType, seed: Option<u64>) -> Result<Self> {
+        use rand::prelude::*;
+
+        let num_elements: usize = shape.iter().product();
+
+        // 1. 用 Box-Muller 变换生成 N(0,1) 随机数
+        let mut rng: Box<dyn RngCore> = match seed {
+            Some(s) => Box::new(rand::rngs::StdRng::seed_from_u64(s)),
+            None => Box::new(rand::rng()),
+        };
+        let mut f32_data = Vec::with_capacity(num_elements);
+        while f32_data.len() < num_elements {
+            let u1: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE); // 避免 log(0)
+            let u2: f32 = rng.random::<f32>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = std::f32::consts::TAU * u2;
+            f32_data.push(r * theta.cos());
+            if f32_data.len() < num_elements {
+                f32_data.push(r * theta.sin());
+            }
+        }
+
+        // 2. 创建 CPU tensor 并填充
+        let mut t = Tensor::new(shape, dtype, DeviceType::Cpu)?;
+        match &mut t {
+            Tensor::F32(typed) => {
+                typed.as_slice_mut()?.copy_from_slice(&f32_data);
+            }
+            Tensor::BF16(typed) => {
+                let bf16_data: Vec<bf16> = f32_data.iter().map(|&v| bf16::from_f32(v)).collect();
+                typed.as_slice_mut()?.copy_from_slice(&bf16_data);
+            }
+            Tensor::F16(typed) => {
+                let f16_data: Vec<f16> = f32_data.iter().map(|&v| f16::from_f32(v)).collect();
+                typed.as_slice_mut()?.copy_from_slice(&f16_data);
+            }
+            _ => return Err(Error::InvalidArgument(format!(
+                "randn: unsupported dtype {:?}", dtype
+            )).into()),
+        }
+
+        // 3. 如果目标是 CUDA，上传
+        match device {
+            DeviceType::Cpu => Ok(t),
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(id) => t.to_cuda(id),
+        }
+    }
     pub fn from_buffer(buffer: Buffer, shape: &[usize], dtype: DataType) -> Result<Self> {
         match dtype {
             DataType::F32 => Ok(Tensor::F32(TypedTensor::<f32>::from_buffer(buffer, shape)?)),
@@ -1068,6 +1120,59 @@ mod tests {
 
         let result = x_next.to_cpu()?;
         assert_eq!(result.as_f32()?.as_slice()?, &[5.0, 11.0, 17.0, 23.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_randn_shape_and_dtype() -> Result<()> {
+        let t = Tensor::randn(&[2, 3, 4], DataType::F32, DeviceType::Cpu, Some(42))?;
+        assert_eq!(t.shape(), &[2, 3, 4]);
+        assert_eq!(t.dtype(), DataType::F32);
+        assert_eq!(t.num_elements(), 24);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_randn_deterministic() -> Result<()> {
+        let a = Tensor::randn(&[100], DataType::F32, DeviceType::Cpu, Some(123))?;
+        let b = Tensor::randn(&[100], DataType::F32, DeviceType::Cpu, Some(123))?;
+        assert_eq!(a.as_f32()?.as_slice()?, b.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_randn_statistics() -> Result<()> {
+        let t = Tensor::randn(&[10000], DataType::F32, DeviceType::Cpu, Some(0))?;
+        let data = t.as_f32()?.as_slice()?;
+        let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
+        let var: f32 = data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / data.len() as f32;
+        // N(0,1): mean ≈ 0, var ≈ 1
+        assert!(mean.abs() < 0.05, "mean = {mean}, expected ~0");
+        assert!((var - 1.0).abs() < 0.1, "var = {var}, expected ~1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_tensor_randn_bf16() -> Result<()> {
+        let t = Tensor::randn(&[1000], DataType::BF16, DeviceType::Cpu, Some(7))?;
+        assert_eq!(t.dtype(), DataType::BF16);
+        let data = t.as_bf16()?.as_slice()?;
+        let mean: f32 = data.iter().map(|x| x.to_f32()).sum::<f32>() / data.len() as f32;
+        assert!(mean.abs() < 0.1, "bf16 mean = {mean}");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_tensor_randn_cuda() -> Result<()> {
+        let t = Tensor::randn(&[2, 16, 64, 64], DataType::F32, DeviceType::Cuda(0), Some(42))?;
+        assert_eq!(t.shape(), &[2, 16, 64, 64]);
+        assert_eq!(t.device(), DeviceType::Cuda(0));
+        // 拷回 CPU 验证统计量
+        let cpu = t.to_cpu()?;
+        let data = cpu.as_f32()?.as_slice()?;
+        let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
+        assert!(mean.abs() < 0.02, "cuda randn mean = {mean}");
         Ok(())
     }
 }
