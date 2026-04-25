@@ -219,7 +219,8 @@ __global__ void flash_attn_gqa_kernel_fp16_hdim128(
     const __half* __restrict__ q_ptr, QStride dQ, QSmemLayout sQ_layout, TiledCopyQ copy_q, S2RAtom s2r_atom,
     const __half* __restrict__ k_ptr, KStride dK, KVSmemLayout sKV_layout, TiledCopyK copy_kv, S2RAtomTrans s2r_atom_trans, SmemVTransNoSwi V_layout_trans_no_swi, SmemVTrans V_layout_trans,
     const __half* __restrict__ v_ptr, VStride dV,
-    __half* __restrict__ o_ptr, OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma)
+    __half* __restrict__ o_ptr, OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma,
+    int is_causal)
 {
     unsigned int q_head_idx = blockIdx.y;
     unsigned int block_m = blockIdx.x;
@@ -317,9 +318,14 @@ __global__ void flash_attn_gqa_kernel_fp16_hdim128(
 
     copy(s2r_copy_q, tXsQ, tXrQ);  // Q: smem → registers
 
-    int max_k_col = (block_m + 1) * 128 + (size<0>(kv_shape) - size<0>(q_shape));
-    int n_block_max = (max_k_col + 64 - 1) / 64;
-    n_block_max = min(n_block_max, (size<0>(kv_shape) + 64 - 1) / 64);
+    int n_block_max;
+    if (is_causal) {
+        int max_k_col = (block_m + 1) * 128 + (size<0>(kv_shape) - size<0>(q_shape));
+        n_block_max = (max_k_col + 64 - 1) / 64;
+        n_block_max = min(n_block_max, (size<0>(kv_shape) + 64 - 1) / 64);
+    } else {
+        n_block_max = (size<0>(kv_shape) + 64 - 1) / 64;
+    }
 
     // ===== Main loop over KV tiles =====
     for (int n_tile = 0; n_tile < n_block_max; ++n_tile)
@@ -340,10 +346,12 @@ __global__ void flash_attn_gqa_kernel_fp16_hdim128(
         cp_async_fence();
 
         // --- Causal mask ---
-        apply_mask_128(
-            rS, 64 * n_tile, block_m * 128 + (threadIdx.x / 32) * 16 + (threadIdx.x % 32) / 4,
-            16 * kNWarps_128, kv_len - q_len
-        );
+        if (is_causal) {
+            apply_mask_128(
+                rS, 64 * n_tile, block_m * 128 + (threadIdx.x / 32) * 16 + (threadIdx.x % 32) / 4,
+                16 * kNWarps_128, kv_len - q_len
+            );
+        }
 
         // --- Online softmax ---
         Tensor scores = make_tensor(rS.data(), convert_layout_acc_rowcol_128(rS.layout()));
@@ -438,6 +446,7 @@ __global__ void flash_attn_gqa_kernel_fp16_hdim128(
 extern "C" void launch_flash_attn_cute_fp16_hdim128(
     const __half* d_Q, const __half* d_K, const __half* d_V, __half* d_O,
     int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
+    int is_causal,
     cudaStream_t stream)
 {
     using namespace cute;
@@ -528,6 +537,7 @@ extern "C" void launch_flash_attn_cute_fp16_hdim128(
         d_Q, stride_Q, sQ, copy_q, S2RAtom{},
         d_K, stride_K, sKV, copy_kv, S2RAtom_trans{}, SmemLayoutVtransposedNoSwizzle{}, SmemLayoutVtransposed{},
         d_V, stride_V,
-        d_O, stride_O, sO, copy_o, mma
+        d_O, stride_O, sO, copy_o, mma,
+        is_causal
     );
 }

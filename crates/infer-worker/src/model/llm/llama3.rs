@@ -124,7 +124,7 @@ impl Llama3 {
 
         let layer_num = config.layer_num;
         let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
-            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size))
+            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size, true))
             .collect();
         let mha_layers = mha_layers?;
         let rope_layers: Result<Vec<RoPEOp>> = (0..layer_num)

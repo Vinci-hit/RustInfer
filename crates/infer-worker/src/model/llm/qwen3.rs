@@ -142,7 +142,7 @@ impl Qwen3 {
         };
 
         let mha_layers = (0..layer_num)
-            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size))
+            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size, true))
             .collect::<Result<Vec<_>>>()?;
         let rope_layers = (0..layer_num)
             .map(|_| RoPEOp::new(config.q_dim, config.kv_dim, config.head_size))
