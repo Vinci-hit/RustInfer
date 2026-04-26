@@ -81,8 +81,19 @@ pub fn materialize(t: &Tensor) -> Result<Tensor> {
 /// ND permute — 委托给 `Tensor::permute`，它会自动分发到 CPU 逻辑或 CUDA kernel。
 ///
 /// New shape: new_shape[j] = src_shape[perm[j]]
+///
+/// 这是分配路径的便利包装；零分配 hot path 请用 [`permute`]（dst-write）。
 pub fn permute_nd(src: &Tensor, perm: &[usize]) -> Result<Tensor> {
     src.permute(perm)
+}
+
+/// Dst-write permute: `dst = src.permute(perm)`，不分配。
+///
+/// `dst` 的 shape 必须提前准备为
+/// `[src.shape[perm[0]], ..., src.shape[perm[ndim-1]]]`；dtype / device 必须
+/// 与 `src` 相同。底层直接转调 [`Tensor::permute_into`]。
+pub fn permute(src: &Tensor, perm: &[usize], dst: &mut Tensor) -> Result<()> {
+    src.permute_into(perm, dst)
 }
 
 /// Element-wise multiply: dst = a * b (same shape). Device-agnostic.
@@ -288,17 +299,48 @@ pub fn apply_rope_interleaved_dev(
 }
 
 /// Cast a tensor to a new dtype. Device-agnostic.
+///
+/// 分配路径的便利包装；零分配 hot path 请用 [`cast_dtype_into`]（dst-write）。
 pub fn cast_dtype(src: &Tensor, new_dtype: DataType) -> Result<Tensor> {
     if src.dtype() == new_dtype { return clone_tensor(src); }
+    let mut dst = Tensor::new(src.shape(), new_dtype, src.device())?;
+    cast_dtype_into(src, &mut dst)?;
+    Ok(dst)
+}
+
+/// Dst-write dtype cast: `dst = src.cast(dst.dtype())`，不分配。
+///
+/// `dst` 必须预分配为与 `src` 相同 shape、相同 device、目标 dtype 的张量。
+/// 若 `src.dtype() == dst.dtype()`，退化为 `dst.copy_from(src)`。
+pub fn cast_dtype_into(src: &Tensor, dst: &mut Tensor) -> Result<()> {
+    if src.shape() != dst.shape() {
+        return Err(Error::InvalidArgument(format!(
+            "cast_dtype_into: shape mismatch src={:?} dst={:?}",
+            src.shape(), dst.shape())).into());
+    }
+    if src.device() != dst.device() {
+        return Err(Error::InvalidArgument(format!(
+            "cast_dtype_into: device mismatch src={:?} dst={:?}",
+            src.device(), dst.device())).into());
+    }
+
+    // identity fast path
+    if src.dtype() == dst.dtype() {
+        return dst.copy_from(src);
+    }
 
     match src.device() {
-        DeviceType::Cpu => src.to_dtype(new_dtype),
+        DeviceType::Cpu => {
+            // CPU 路径直接用 Tensor::to_dtype 语义 —— 分配一次中间再拷贝。
+            // CPU 不是 hot path，这样实现最简且保持与旧行为一致。
+            let tmp = src.to_dtype(dst.dtype())?;
+            dst.copy_from(&tmp)
+        }
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
-            let mut dst = Tensor::new(src.shape(), new_dtype, src.device())?;
             let n = src.num_elements() as i32;
             let stream = crate::cuda::get_current_cuda_stream();
-            match (src.dtype(), new_dtype) {
+            match (src.dtype(), dst.dtype()) {
                 (DataType::F32, DataType::BF16) => unsafe {
                     cast_f32_to_bf16_forward(
                         dst.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
@@ -320,62 +362,85 @@ pub fn cast_dtype(src: &Tensor, new_dtype: DataType) -> Result<Tensor> {
                         src.as_f16()?.buffer().as_ptr() as *const half::f16, n, stream);
                 }
                 (from, to) => return Err(Error::InvalidArgument(format!(
-                    "cast_dtype CUDA: unsupported {:?} → {:?}", from, to)).into()),
+                    "cast_dtype_into CUDA: unsupported {:?} → {:?}", from, to)).into()),
             }
-            Ok(dst)
+            Ok(())
         }
     }
 }
 
 /// Pad [n_src, D] by repeating the last row to [target_len, D]. Device-agnostic.
+///
+/// 分配路径的便利包装；零分配 hot path 请用 [`pad_last_row_into`]。
 pub fn pad_last_row(src: &Tensor, target_len: usize) -> Result<Tensor> {
     let shape = src.shape();
     if shape.len() != 2 {
         return Err(Error::InvalidArgument(format!(
             "pad_last_row: expected [N, D], got {:?}", shape)).into());
     }
+    let (_n, d) = (shape[0], shape[1]);
+    let mut dst = Tensor::new(&[target_len, d], src.dtype(), src.device())?;
+    pad_last_row_into(src, &mut dst)?;
+    Ok(dst)
+}
+
+/// Dst-write pad-last-row: writes into pre-allocated `dst` (shape
+/// `[target_len, D]`) without allocating.
+///
+/// `target_len` is inferred from `dst.shape()[0]`.
+pub fn pad_last_row_into(src: &Tensor, dst: &mut Tensor) -> Result<()> {
+    let shape = src.shape();
+    if shape.len() != 2 {
+        return Err(Error::InvalidArgument(format!(
+            "pad_last_row_into: expected [N, D], got {:?}", shape)).into());
+    }
     let (n, d) = (shape[0], shape[1]);
-    if target_len == n { return clone_tensor(src); }
+    if dst.shape().len() != 2 || dst.shape()[1] != d {
+        return Err(Error::InvalidArgument(format!(
+            "pad_last_row_into: dst shape {:?} incompatible with [target_len, {}]",
+            dst.shape(), d)).into());
+    }
+    let target_len = dst.shape()[0];
     if target_len < n {
         return Err(Error::InvalidArgument(format!(
-            "pad_last_row: target_len ({}) < n ({})", target_len, n)).into());
+            "pad_last_row_into: target_len ({}) < n ({})", target_len, n)).into());
+    }
+    if src.dtype() != dst.dtype() || src.device() != dst.device() {
+        return Err(Error::InvalidArgument(format!(
+            "pad_last_row_into: dtype/device mismatch").into()).into());
     }
 
-    let mut dst = Tensor::new(&[target_len, d], src.dtype(), src.device())?;
+    // Short-circuit: no padding needed.
+    if target_len == n {
+        return dst.copy_from(src);
+    }
 
-    // Copy first n rows verbatim via copy_from on a slice-equivalent.
-    // We memcpy raw bytes of first n rows.
     let bytes_per_row = d * src.dtype().size_in_bytes();
     let src_bytes = n * bytes_per_row;
 
     match src.device() {
-        DeviceType::Cpu => {
-            // Copy directly
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src.buffer().as_ptr(),
-                    dst.buffer_mut().as_mut_ptr(),
-                    src_bytes);
-                // For padding rows, repeat row n-1
-                let last_ptr = src.buffer().as_ptr().add((n - 1) * bytes_per_row);
-                for r in n..target_len {
-                    let dst_ptr = dst.buffer_mut().as_mut_ptr().add(r * bytes_per_row);
-                    std::ptr::copy_nonoverlapping(last_ptr, dst_ptr, bytes_per_row);
-                }
+        DeviceType::Cpu => unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.buffer().as_ptr(),
+                dst.buffer_mut().as_mut_ptr(),
+                src_bytes);
+            // For padding rows, repeat row n-1 (well-defined since target_len > n ⇒ n ≥ 1).
+            let last_ptr = src.buffer().as_ptr().add((n - 1) * bytes_per_row);
+            for r in n..target_len {
+                let dst_ptr = dst.buffer_mut().as_mut_ptr().add(r * bytes_per_row);
+                std::ptr::copy_nonoverlapping(last_ptr, dst_ptr, bytes_per_row);
             }
-            Ok(dst)
+            Ok(())
         }
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
             let stream = crate::cuda::get_current_cuda_stream();
-            // 1. Async D2D copy of the first n rows.
             unsafe {
                 d2d_memcpy_async(
                     dst.buffer_mut().as_mut_ptr() as *mut core::ffi::c_void,
                     src.buffer().as_ptr() as *const core::ffi::c_void,
                     src_bytes, stream)?;
             }
-            // 2. Kernel: fill rows [n..target_len] with row n-1.
             match src.dtype() {
                 DataType::BF16 => unsafe {
                     fill_repeat_last_row_bf16_forward(
@@ -388,57 +453,83 @@ pub fn pad_last_row(src: &Tensor, target_len: usize) -> Result<Tensor> {
                         n as i32, target_len as i32, d as i32, stream);
                 }
                 other => return Err(Error::InvalidArgument(format!(
-                    "pad_last_row CUDA: unsupported dtype {:?}", other)).into()),
+                    "pad_last_row_into CUDA: unsupported dtype {:?}", other)).into()),
             }
-            Ok(dst)
+            Ok(())
         }
     }
 }
 
 /// Pad [n_src, D] to [target_len, D], writing a broadcast single-row `pad_token` to positions [n_src..].
+///
+/// 分配路径的便利包装；零分配 hot path 请用 [`pad_with_token_into`]。
 pub fn pad_with_token(src: &Tensor, pad_token: &Tensor, target_len: usize) -> Result<Tensor> {
     let shape = src.shape();
     if shape.len() != 2 {
         return Err(Error::InvalidArgument(format!(
             "pad_with_token: expected [N, D], got {:?}", shape)).into());
     }
+    let d = shape[1];
+    let mut dst = Tensor::new(&[target_len, d], src.dtype(), src.device())?;
+    pad_with_token_into(src, pad_token, &mut dst)?;
+    Ok(dst)
+}
+
+/// Dst-write pad-with-token: `dst[..n_src] = src; dst[n_src..] = pad_token broadcasted`.
+///
+/// `target_len` is inferred from `dst.shape()[0]`.
+pub fn pad_with_token_into(
+    src: &Tensor, pad_token: &Tensor, dst: &mut Tensor,
+) -> Result<()> {
+    let shape = src.shape();
+    if shape.len() != 2 {
+        return Err(Error::InvalidArgument(format!(
+            "pad_with_token_into: expected [N, D], got {:?}", shape)).into());
+    }
     let (n, d) = (shape[0], shape[1]);
-    if target_len == n { return clone_tensor(src); }
+    if dst.shape().len() != 2 || dst.shape()[1] != d {
+        return Err(Error::InvalidArgument(format!(
+            "pad_with_token_into: dst shape {:?} incompatible with [target_len, {}]",
+            dst.shape(), d)).into());
+    }
+    let target_len = dst.shape()[0];
     if target_len < n {
         return Err(Error::InvalidArgument(format!(
-            "pad_with_token: target_len ({}) < n ({})", target_len, n)).into());
+            "pad_with_token_into: target_len ({}) < n ({})", target_len, n)).into());
     }
-
-    // pad_token expected shape [1, D] or [D]
-    let pad_numel = pad_token.num_elements();
-    if pad_numel != d {
+    if pad_token.num_elements() != d {
         return Err(Error::InvalidArgument(format!(
-            "pad_with_token: pad_token has {} elems, expected {}", pad_numel, d)).into());
+            "pad_with_token_into: pad_token has {} elems, expected {}",
+            pad_token.num_elements(), d)).into());
+    }
+    if src.dtype() != dst.dtype() || src.device() != dst.device() {
+        return Err(Error::InvalidArgument(format!(
+            "pad_with_token_into: dtype/device mismatch").into()).into());
     }
 
-    let mut dst = Tensor::new(&[target_len, d], src.dtype(), src.device())?;
+    if target_len == n {
+        return dst.copy_from(src);
+    }
+
     let bytes_per_row = d * src.dtype().size_in_bytes();
     let src_bytes = n * bytes_per_row;
 
     match src.device() {
-        DeviceType::Cpu => {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src.buffer().as_ptr(),
-                    dst.buffer_mut().as_mut_ptr(),
-                    src_bytes);
-                let pad_ptr = pad_token.buffer().as_ptr();
-                for r in n..target_len {
-                    let dst_ptr = dst.buffer_mut().as_mut_ptr().add(r * bytes_per_row);
-                    std::ptr::copy_nonoverlapping(pad_ptr, dst_ptr, bytes_per_row);
-                }
+        DeviceType::Cpu => unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.buffer().as_ptr(),
+                dst.buffer_mut().as_mut_ptr(),
+                src_bytes);
+            let pad_ptr = pad_token.buffer().as_ptr();
+            for r in n..target_len {
+                let dst_ptr = dst.buffer_mut().as_mut_ptr().add(r * bytes_per_row);
+                std::ptr::copy_nonoverlapping(pad_ptr, dst_ptr, bytes_per_row);
             }
-            Ok(dst)
+            Ok(())
         }
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
             let stream = crate::cuda::get_current_cuda_stream();
-            // Copy first n rows
             if src_bytes > 0 {
                 unsafe {
                     d2d_memcpy_async(
@@ -447,7 +538,6 @@ pub fn pad_with_token(src: &Tensor, pad_token: &Tensor, target_len: usize) -> Re
                         src_bytes, stream)?;
                 }
             }
-            // Broadcast pad_token into rows [n..target_len]
             let pad_rows = target_len - n;
             if pad_rows > 0 {
                 let offset_bytes = n * bytes_per_row;
@@ -463,34 +553,55 @@ pub fn pad_with_token(src: &Tensor, pad_token: &Tensor, target_len: usize) -> Re
                         broadcast_row_f32_forward(dst_ptr, pad_ptr, pad_rows as i32, d as i32, stream);
                     }
                     other => return Err(Error::InvalidArgument(format!(
-                        "pad_with_token CUDA: unsupported dtype {:?}", other)).into()),
+                        "pad_with_token_into CUDA: unsupported dtype {:?}", other)).into()),
                 }
             }
-            Ok(dst)
+            Ok(())
         }
     }
 }
 
-/// Overwrite rows [keep_prefix..N] of `x` with a broadcast of `pad_token`.
+/// Overwrite rows [keep_prefix..N] of `x` with a broadcast of `pad_token`
+/// and return a new tensor (legacy convenience). 原地版本请用
+/// [`overwrite_pad_tokens_inplace`]。
 pub fn overwrite_pad_tokens(x: &Tensor, pad_token: &Tensor, keep_prefix: usize) -> Result<Tensor> {
-    let shape = x.shape();
-    let (total, d) = (shape[0], shape[1]);
-    if keep_prefix == total { return clone_tensor(x); }
     let mut dst = clone_tensor(x)?;
+    overwrite_pad_tokens_inplace(&mut dst, pad_token, keep_prefix)?;
+    Ok(dst)
+}
+
+/// In-place overwrite: `x[keep_prefix.., :] = pad_token broadcasted`.
+pub fn overwrite_pad_tokens_inplace(
+    x: &mut Tensor, pad_token: &Tensor, keep_prefix: usize,
+) -> Result<()> {
+    let shape = x.shape();
+    if shape.len() != 2 {
+        return Err(Error::InvalidArgument(format!(
+            "overwrite_pad_tokens_inplace: expected [N, D], got {:?}", shape)).into());
+    }
+    let (total, d) = (shape[0], shape[1]);
+    if keep_prefix > total {
+        return Err(Error::InvalidArgument(format!(
+            "overwrite_pad_tokens_inplace: keep_prefix ({}) > total ({})",
+            keep_prefix, total)).into());
+    }
+    if pad_token.num_elements() != d {
+        return Err(Error::InvalidArgument(format!(
+            "overwrite_pad_tokens_inplace: pad_token has {} elems, expected {}",
+            pad_token.num_elements(), d)).into());
+    }
     let pad_rows = total - keep_prefix;
-    if pad_rows == 0 { return Ok(dst); }
+    if pad_rows == 0 { return Ok(()); }
 
     let bytes_per_row = d * x.dtype().size_in_bytes();
     let offset_bytes = keep_prefix * bytes_per_row;
 
     match x.device() {
-        DeviceType::Cpu => {
-            unsafe {
-                let pad_ptr = pad_token.buffer().as_ptr();
-                for r in keep_prefix..total {
-                    let dst_ptr = dst.buffer_mut().as_mut_ptr().add(r * bytes_per_row);
-                    std::ptr::copy_nonoverlapping(pad_ptr, dst_ptr, bytes_per_row);
-                }
+        DeviceType::Cpu => unsafe {
+            let pad_ptr = pad_token.buffer().as_ptr();
+            for r in keep_prefix..total {
+                let dst_ptr = x.buffer_mut().as_mut_ptr().add(r * bytes_per_row);
+                std::ptr::copy_nonoverlapping(pad_ptr, dst_ptr, bytes_per_row);
             }
         }
         #[cfg(feature = "cuda")]
@@ -498,25 +609,27 @@ pub fn overwrite_pad_tokens(x: &Tensor, pad_token: &Tensor, keep_prefix: usize) 
             let stream = crate::cuda::get_current_cuda_stream();
             match x.dtype() {
                 DataType::BF16 => unsafe {
-                    let dst_ptr = (dst.buffer_mut().as_mut_ptr().add(offset_bytes)) as *mut half::bf16;
+                    let dst_ptr = (x.buffer_mut().as_mut_ptr().add(offset_bytes)) as *mut half::bf16;
                     let pad_ptr = pad_token.buffer().as_ptr() as *const half::bf16;
                     broadcast_row_bf16_forward(dst_ptr, pad_ptr, pad_rows as i32, d as i32, stream);
                 }
                 DataType::F32 => unsafe {
-                    let dst_ptr = (dst.buffer_mut().as_mut_ptr().add(offset_bytes)) as *mut f32;
+                    let dst_ptr = (x.buffer_mut().as_mut_ptr().add(offset_bytes)) as *mut f32;
                     let pad_ptr = pad_token.buffer().as_ptr() as *const f32;
                     broadcast_row_f32_forward(dst_ptr, pad_ptr, pad_rows as i32, d as i32, stream);
                 }
                 other => return Err(Error::InvalidArgument(format!(
-                    "overwrite_pad_tokens CUDA: unsupported dtype {:?}", other)).into()),
+                    "overwrite_pad_tokens_inplace CUDA: unsupported dtype {:?}", other)).into()),
             }
         }
     }
-    Ok(dst)
+    Ok(())
 }
 
 /// Concat two 2D tensors along dim 0: [S_a, D] + [S_b, D] → [S_a + S_b, D].
 /// Device-agnostic.
+///
+/// 分配路径的便利包装；零分配 hot path 请用 [`concat_seq_into`]。
 pub fn concat_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.shape().len() != 2 || b.shape().len() != 2 {
         return Err(Error::InvalidArgument("concat_seq: expected 2D tensors".into()).into());
@@ -527,11 +640,34 @@ pub fn concat_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         return Err(Error::InvalidArgument(format!(
             "concat_seq: dim mismatch {} vs {}", d_a, d_b)).into());
     }
+    let mut dst = Tensor::new(&[s_a + s_b, d_a], a.dtype(), a.device())?;
+    concat_seq_into(a, b, &mut dst)?;
+    Ok(dst)
+}
+
+/// Dst-write concat: `dst[..s_a] = a; dst[s_a..] = b` along dim 0.
+pub fn concat_seq_into(a: &Tensor, b: &Tensor, dst: &mut Tensor) -> Result<()> {
+    if a.shape().len() != 2 || b.shape().len() != 2 {
+        return Err(Error::InvalidArgument("concat_seq_into: expected 2D tensors".into()).into());
+    }
+    let (s_a, d_a) = (a.shape()[0], a.shape()[1]);
+    let (s_b, d_b) = (b.shape()[0], b.shape()[1]);
+    if d_a != d_b {
+        return Err(Error::InvalidArgument(format!(
+            "concat_seq_into: dim mismatch {} vs {}", d_a, d_b)).into());
+    }
     if a.dtype() != b.dtype() || a.device() != b.device() {
-        return Err(Error::InvalidArgument("concat_seq: dtype/device mismatch".into()).into());
+        return Err(Error::InvalidArgument("concat_seq_into: dtype/device mismatch".into()).into());
+    }
+    if dst.shape() != [s_a + s_b, d_a].as_slice() {
+        return Err(Error::InvalidArgument(format!(
+            "concat_seq_into: dst shape {:?} incompatible with [{}, {}]",
+            dst.shape(), s_a + s_b, d_a)).into());
+    }
+    if dst.dtype() != a.dtype() || dst.device() != a.device() {
+        return Err(Error::InvalidArgument("concat_seq_into: dst dtype/device mismatch".into()).into());
     }
 
-    let mut dst = Tensor::new(&[s_a + s_b, d_a], a.dtype(), a.device())?;
     let bytes_per_row = d_a * a.dtype().size_in_bytes();
     let a_bytes = s_a * bytes_per_row;
     let b_bytes = s_b * bytes_per_row;
@@ -543,6 +679,7 @@ pub fn concat_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             std::ptr::copy_nonoverlapping(
                 b.buffer().as_ptr(),
                 dst.buffer_mut().as_mut_ptr().add(a_bytes), b_bytes);
+            Ok(())
         },
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
@@ -557,9 +694,9 @@ pub fn concat_seq(a: &Tensor, b: &Tensor) -> Result<Tensor> {
                     b.buffer().as_ptr() as *const core::ffi::c_void,
                     b_bytes, stream)?;
             }
+            Ok(())
         }
     }
-    Ok(dst)
 }
 
 // ─────────────────── Tests ───────────────────
@@ -965,6 +1102,192 @@ mod tests {
             to_f32_vec(&tmp)
         };
         assert_close(&r_cpu, &r_cuda, 1e-4, "ewise_mul f32 cpu vs cuda");
+        Ok(())
+    }
+
+    // ─── S2.3 dst-write equivalence tests ───
+    //
+    // For each `*_into` added in S2.3, assert byte-level equality against
+    // the legacy allocating API on both CPU and CUDA. This locks in the
+    // invariant that the dst-write path produces identical output to the
+    // old path.
+
+    #[test]
+    fn permute_into_matches_permute_nd_cpu_f32() -> Result<()> {
+        let mut src = Tensor::new(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+        for (i, v) in src.as_f32_mut()?.as_slice_mut()?.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        let legacy = permute_nd(&src, &[2, 0, 1])?;
+        let mut dst = Tensor::new(legacy.shape(), DataType::F32, DeviceType::Cpu)?;
+        permute(&src, &[2, 0, 1], &mut dst)?;
+        assert_eq!(legacy.as_f32()?.as_slice()?, dst.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn permute_into_matches_permute_nd_cuda_bf16() -> Result<()> {
+        let values: Vec<f32> = (0..24).map(|i| i as f32 * 0.25).collect();
+        let src = make_tensor(&[2, 3, 4], DataType::BF16, DeviceType::Cuda(0), &values);
+        let legacy = permute_nd(&src, &[2, 0, 1])?;
+        let mut dst = Tensor::new(legacy.shape(), DataType::BF16, DeviceType::Cuda(0))?;
+        permute(&src, &[2, 0, 1], &mut dst)?;
+
+        let a_cpu = legacy.to_cpu()?;
+        let b_cpu = dst.to_cpu()?;
+        assert_eq!(
+            a_cpu.as_bf16()?.as_slice()?,
+            b_cpu.as_bf16()?.as_slice()?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cast_dtype_into_matches_cast_dtype_cpu_f32_to_bf16() -> Result<()> {
+        let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.1 - 2.5).collect();
+        let src = make_tensor(&[64], DataType::F32, DeviceType::Cpu, &data);
+        let legacy = cast_dtype(&src, DataType::BF16)?;
+        let mut dst = Tensor::new(&[64], DataType::BF16, DeviceType::Cpu)?;
+        cast_dtype_into(&src, &mut dst)?;
+        assert_eq!(
+            legacy.as_bf16()?.as_slice()?,
+            dst.as_bf16()?.as_slice()?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn cast_dtype_into_matches_cast_dtype_cuda_f32_to_bf16() -> Result<()> {
+        let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.05 - 4.0).collect();
+        let src = make_tensor(&[256], DataType::F32, DeviceType::Cuda(0), &data);
+        let legacy = cast_dtype(&src, DataType::BF16)?;
+        let mut dst = Tensor::new(&[256], DataType::BF16, DeviceType::Cuda(0))?;
+        cast_dtype_into(&src, &mut dst)?;
+
+        let a = legacy.to_cpu()?;
+        let b = dst.to_cpu()?;
+        assert_eq!(a.as_bf16()?.as_slice()?, b.as_bf16()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    fn pad_last_row_into_matches_pad_last_row_cpu_f32() -> Result<()> {
+        let src = make_tensor(
+            &[3, 4], DataType::F32, DeviceType::Cpu,
+            &[1.0, 2.0, 3.0, 4.0,  5.0, 6.0, 7.0, 8.0,  9.0, 10.0, 11.0, 12.0]);
+        let legacy = pad_last_row(&src, 6)?;
+        let mut dst = Tensor::new(&[6, 4], DataType::F32, DeviceType::Cpu)?;
+        pad_last_row_into(&src, &mut dst)?;
+        assert_eq!(legacy.as_f32()?.as_slice()?, dst.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn pad_last_row_into_matches_pad_last_row_cuda_bf16() -> Result<()> {
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let src = make_tensor(&[3, 4], DataType::BF16, DeviceType::Cuda(0), &data);
+        let legacy = pad_last_row(&src, 6)?;
+        let mut dst = Tensor::new(&[6, 4], DataType::BF16, DeviceType::Cuda(0))?;
+        pad_last_row_into(&src, &mut dst)?;
+
+        let a = legacy.to_cpu()?;
+        let b = dst.to_cpu()?;
+        assert_eq!(a.as_bf16()?.as_slice()?, b.as_bf16()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    fn pad_with_token_into_matches_pad_with_token_cpu_f32() -> Result<()> {
+        let src = make_tensor(&[2, 3], DataType::F32, DeviceType::Cpu,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let pad = make_tensor(&[3], DataType::F32, DeviceType::Cpu, &[-1.0, -2.0, -3.0]);
+        let legacy = pad_with_token(&src, &pad, 5)?;
+        let mut dst = Tensor::new(&[5, 3], DataType::F32, DeviceType::Cpu)?;
+        pad_with_token_into(&src, &pad, &mut dst)?;
+        assert_eq!(legacy.as_f32()?.as_slice()?, dst.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn pad_with_token_into_matches_pad_with_token_cuda_bf16() -> Result<()> {
+        let src_data: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let pad_data: Vec<f32> = vec![-1.0, -2.0, -3.0];
+        let src = make_tensor(&[2, 3], DataType::BF16, DeviceType::Cuda(0), &src_data);
+        let pad = make_tensor(&[3], DataType::BF16, DeviceType::Cuda(0), &pad_data);
+        let legacy = pad_with_token(&src, &pad, 5)?;
+        let mut dst = Tensor::new(&[5, 3], DataType::BF16, DeviceType::Cuda(0))?;
+        pad_with_token_into(&src, &pad, &mut dst)?;
+        let a = legacy.to_cpu()?;
+        let b = dst.to_cpu()?;
+        assert_eq!(a.as_bf16()?.as_slice()?, b.as_bf16()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    fn overwrite_pad_tokens_inplace_matches_legacy_cpu() -> Result<()> {
+        let x = make_tensor(&[4, 3], DataType::F32, DeviceType::Cpu,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let pad = make_tensor(&[3], DataType::F32, DeviceType::Cpu, &[-1.0, -1.0, -1.0]);
+        let legacy = overwrite_pad_tokens(&x, &pad, 2)?;
+
+        let mut clone = Tensor::new(&[4, 3], DataType::F32, DeviceType::Cpu)?;
+        clone.copy_from(&x)?;
+        overwrite_pad_tokens_inplace(&mut clone, &pad, 2)?;
+
+        assert_eq!(legacy.as_f32()?.as_slice()?, clone.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn overwrite_pad_tokens_inplace_matches_legacy_cuda_bf16() -> Result<()> {
+        let data: Vec<f32> = (1..=12).map(|i| i as f32).collect();
+        let pad_data = vec![-1.0_f32; 3];
+        let x = make_tensor(&[4, 3], DataType::BF16, DeviceType::Cuda(0), &data);
+        let pad = make_tensor(&[3], DataType::BF16, DeviceType::Cuda(0), &pad_data);
+        let legacy = overwrite_pad_tokens(&x, &pad, 2)?;
+
+        let mut clone = Tensor::new(&[4, 3], DataType::BF16, DeviceType::Cuda(0))?;
+        clone.copy_from(&x)?;
+        overwrite_pad_tokens_inplace(&mut clone, &pad, 2)?;
+
+        let a = legacy.to_cpu()?;
+        let b = clone.to_cpu()?;
+        assert_eq!(a.as_bf16()?.as_slice()?, b.as_bf16()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    fn concat_seq_into_matches_concat_seq_cpu_f32() -> Result<()> {
+        let a = make_tensor(&[2, 3], DataType::F32, DeviceType::Cpu,
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = make_tensor(&[1, 3], DataType::F32, DeviceType::Cpu,
+            &[7.0, 8.0, 9.0]);
+        let legacy = concat_seq(&a, &b)?;
+        let mut dst = Tensor::new(&[3, 3], DataType::F32, DeviceType::Cpu)?;
+        concat_seq_into(&a, &b, &mut dst)?;
+        assert_eq!(legacy.as_f32()?.as_slice()?, dst.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn concat_seq_into_matches_concat_seq_cuda_bf16() -> Result<()> {
+        let a_data: Vec<f32> = (1..=12).map(|i| i as f32).collect();
+        let b_data: Vec<f32> = vec![-1.0, -2.0, -3.0, -4.0];
+        let a = make_tensor(&[3, 4], DataType::BF16, DeviceType::Cuda(0), &a_data);
+        let b = make_tensor(&[1, 4], DataType::BF16, DeviceType::Cuda(0), &b_data);
+        let legacy = concat_seq(&a, &b)?;
+        let mut dst = Tensor::new(&[4, 4], DataType::BF16, DeviceType::Cuda(0))?;
+        concat_seq_into(&a, &b, &mut dst)?;
+
+        let lc = legacy.to_cpu()?;
+        let dc = dst.to_cpu()?;
+        assert_eq!(lc.as_bf16()?.as_slice()?, dc.as_bf16()?.as_slice()?);
         Ok(())
     }
 }

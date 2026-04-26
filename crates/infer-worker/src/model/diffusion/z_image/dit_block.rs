@@ -15,14 +15,15 @@
 //!   x = x + norm2(FFN(norm1(x)))
 //! ```
 
-use crate::base::{DataType, DeviceType};
+use crate::OpConfig;
 use crate::base::error::{Error, Result};
 
+use crate::model::diffusion::buffer::DiffBufferType as BT;
+use crate::model::diffusion::z_image::state::DitState;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::sdpa::scaled_dot_product_attention;
-use crate::op::scalar;
-use crate::op::tensor_utils::{clone_tensor, materialize, apply_rope_interleaved_dev, ewise_mul_inplace, permute_nd};
+use crate::op::tensor_utils::permute_nd;
 use crate::tensor::Tensor;
 
 /// DiT transformer block (Z-Image style).
@@ -74,11 +75,17 @@ impl DiTBlock {
         Ok(())
     }
 
-    /// Forward pass.
+    /// Forward pass, writing the residual output into `dst` without
+    /// allocating any intermediate tensors.
     ///
-    /// - `x`: [S, dim]  (single-batch; outer loop handles batching)
-    /// - `cos`, `sin`: [S, head_dim/2] — precomputed 3D RoPE
-    /// - `adaln_c`: [adaln_embed_dim=256] or None (only used when modulation=True)
+    /// - `x`: `[S, dim]` input activations (read-only).
+    /// - `cos`, `sin`: `[S, head_dim/2]` precomputed 3D RoPE tables.
+    /// - `adaln_c`: `[ADALN_EMBED_DIM=256]` conditioning (required when
+    ///   `self.modulation == true`; ignored otherwise).
+    /// - `state`: transformer workspace. Every per-block tensor is
+    ///   sliced from its `Blk*` slot; no `Tensor::new` happens here.
+    /// - `dst`: `[S, dim]` output buffer. Must be a distinct state slot
+    ///   from the one backing `x` (caller ping-pongs between two slots).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -86,194 +93,189 @@ impl DiTBlock {
         cos: &Tensor,
         sin: &Tensor,
         adaln_c: Option<&Tensor>,
-        cuda_config: Option<&crate::OpConfig>,
-    ) -> Result<Tensor> {
-        let device = x.device();
-        let dtype = x.dtype();
+        state: &mut DitState,
+        dst: &mut Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
         let seq = x.shape()[0];
         let dim = self.dim;
 
-        // ---- Compute modulation params (if modulation=True) ----
+        // ── Modulation params (if modulation=True) ──
+        //
+        // The four [1, dim] chunks of BlkModOut are non-overlapping
+        // slices of the same buffer, so each can be mutated in place
+        // without clobbering the others — no cloning required.
         let (scale_msa, gate_msa, scale_mlp, gate_mlp) = if self.modulation {
-            let adaln = self.adaln_modulation.as_ref()
-                .ok_or_else(|| Error::InternalError("adaln_modulation is None but modulation=True".into()))?;
-            let c = adaln_c.ok_or_else(|| Error::InvalidArgument("adaln_c required when modulation=True".into()))?;
+            let adaln = self.adaln_modulation.as_ref().ok_or_else(|| {
+                Error::InternalError("adaln_modulation is None but modulation=True".into())
+            })?;
+            let c = adaln_c.ok_or_else(|| {
+                Error::InvalidArgument("adaln_c required when modulation=True".into())
+            })?;
 
-            // c: [256] → reshape to [1, 256], run Linear → [1, 4*dim]
             let c_2d = c.view(&[1, c.shape()[0]])?;
-            let mut mod_out = Tensor::new(&[1, 4 * dim], dtype, device)?;
+            let mut mod_out = state.slice_mut(BT::BlkModOut, &[1, 4 * dim])?;
             adaln.forward(&c_2d, &mut mod_out, cuda_config)?;
 
-            // Split into 4 chunks of size [1, dim]
-            let scale_msa_raw = mod_out.slice(&[0, 0], &[1, dim])?;
-            let gate_msa_raw = mod_out.slice(&[0, dim], &[1, dim])?;
-            let scale_mlp_raw = mod_out.slice(&[0, 2 * dim], &[1, dim])?;
-            let gate_mlp_raw = mod_out.slice(&[0, 3 * dim], &[1, dim])?;
+            let mut scale_msa = mod_out.slice(&[0, 0], &[1, dim])?;
+            let mut gate_msa = mod_out.slice(&[0, dim], &[1, dim])?;
+            let mut scale_mlp = mod_out.slice(&[0, 2 * dim], &[1, dim])?;
+            let mut gate_mlp = mod_out.slice(&[0, 3 * dim], &[1, dim])?;
 
-            // scale = 1 + scale (allocate fresh dst, no redundant clone)
-            let mut scale_msa = Tensor::new(&[1, dim], dtype, device)?;
-            scalar::scalar_add(&scale_msa_raw, &mut scale_msa, 1.0)?;
-            let mut scale_mlp = Tensor::new(&[1, dim], dtype, device)?;
-            scalar::scalar_add(&scale_mlp_raw, &mut scale_mlp, 1.0)?;
-
-            // gate = tanh(gate)
-            let mut gate_msa = clone_tensor(&gate_msa_raw)?;
-            scalar::tanh_inplace(&mut gate_msa)?;
-            let mut gate_mlp = clone_tensor(&gate_mlp_raw)?;
-            scalar::tanh_inplace(&mut gate_mlp)?;
+            scale_msa += 1.0_f32;
+            scale_mlp += 1.0_f32;
+            gate_msa.tanh()?;
+            gate_mlp.tanh()?;
 
             (Some(scale_msa), Some(gate_msa), Some(scale_mlp), Some(gate_mlp))
         } else {
             (None, None, None, None)
         };
 
-        // ========== Attention block ==========
-        let mut norm1_x = Tensor::new(&[seq, dim], dtype, device)?;
+        // ═══════════════════════ Attention block ═══════════════════════
+        let mut norm1_x = state.slice_mut(BT::BlkNorm1X, &[seq, dim])?;
         self.attention_norm1.forward(x, &mut norm1_x, cuda_config)?;
-
-        // Modulate: norm1_x *= scale_msa (broadcast [1,D] over [S,D])
         if let Some(ref s) = scale_msa {
-            broadcast_mul_rowvec(&mut norm1_x, s)?;
+            norm1_x.mul_row(s)?;
         }
 
-        // QKV projections: [S, dim]
-        let mut q = Tensor::new(&[seq, dim], dtype, device)?;
-        let mut k = Tensor::new(&[seq, dim], dtype, device)?;
-        let mut v = Tensor::new(&[seq, dim], dtype, device)?;
+        // QKV projections
+        let mut q = state.slice_mut(BT::BlkQ, &[seq, dim])?;
+        let mut k = state.slice_mut(BT::BlkK, &[seq, dim])?;
+        let mut v = state.slice_mut(BT::BlkV, &[seq, dim])?;
         self.to_q.forward(&norm1_x, &mut q, cuda_config)?;
         self.to_k.forward(&norm1_x, &mut k, cuda_config)?;
         self.to_v.forward(&norm1_x, &mut v, cuda_config)?;
 
-        // Reshape to [S, n_heads, head_dim] and apply per-head QK-norm
-        let q = q.view(&[seq, self.n_heads, self.head_dim])?;
-        let k = k.view(&[seq, self.n_heads, self.head_dim])?;
-        let mut q = apply_rmsnorm_per_head(
-            &self.norm_q, &q, seq, self.n_heads, self.head_dim, device, dtype, cuda_config,
+        // Per-head QK-norm + RoPE (all in place on BlkQ / BlkK).
+        self.per_head_rmsnorm(&self.norm_q, &mut q, BT::BlkQNormIn, BT::BlkQNormOut, state, cuda_config)?;
+        self.per_head_rmsnorm(&self.norm_k, &mut k, BT::BlkKNormIn, BT::BlkKNormOut, state, cuda_config)?;
+        {
+            let mut q_3d = q.view(&[seq, self.n_heads, self.head_dim])?;
+            let mut k_3d = k.view(&[seq, self.n_heads, self.head_dim])?;
+            q_3d.rope_interleaved(cos, sin, self.head_dim)?;
+            k_3d.rope_interleaved(cos, sin, self.head_dim)?;
+        }
+
+        // Reshape [S, H, D] → [1, H, S, D] into BlkQHsd / BlkKHsd / BlkVHsd.
+        let mut q_sdpa = self.to_bhsd(&q, BT::BlkQHsd, state)?;
+        let mut k_sdpa = self.to_bhsd(&k, BT::BlkKHsd, state)?;
+        let v_sdpa = self.to_bhsd(&v, BT::BlkVHsd, state)?;
+
+        // SDPA → BlkAttnSdpa
+        let mut attn_out_sdpa = state.slice_mut(
+            BT::BlkAttnSdpa, &[1, self.n_heads, seq, self.head_dim],
         )?;
-        let mut k = apply_rmsnorm_per_head(
-            &self.norm_k, &k, seq, self.n_heads, self.head_dim, device, dtype, cuda_config,
-        )?;
-
-        // Apply 3D RoPE
-        apply_rope_interleaved_dev(&mut q, cos, sin, self.head_dim)?;
-        apply_rope_interleaved_dev(&mut k, cos, sin, self.head_dim)?;
-
-        // sdpa expects [B, H, S, D]: reshape [S, H, D] → [1, H, S, D]
-        let q_sdpa = reshape_shd_to_bhsd(&q, seq, self.n_heads, self.head_dim)?;
-        let k_sdpa = reshape_shd_to_bhsd(&k, seq, self.n_heads, self.head_dim)?;
-        let v_shd = v.view(&[seq, self.n_heads, self.head_dim])?;
-        let v_hsd = permute_nd(&v_shd, &[1, 0, 2])?;
-        let v_sdpa = v_hsd.view(&[1, self.n_heads, seq, self.head_dim])?;
-        let v_sdpa = materialize(&v_sdpa)?;
-
-        let mut attn_out_sdpa = Tensor::new(&[1, self.n_heads, seq, self.head_dim], dtype, device)?;
         scaled_dot_product_attention(&q_sdpa, &k_sdpa, &v_sdpa, &mut attn_out_sdpa, cuda_config)?;
+        // Release the SDPA mutable slices so subsequent `state` borrows
+        // don't trip the checker when they slice sibling buffers.
+        drop(q_sdpa);
+        drop(k_sdpa);
 
-        // [1, H, S, D] → [S, H*D]
-        let attn_hsd = attn_out_sdpa.view(&[self.n_heads, seq, self.head_dim])?;
-        let attn_shd = permute_nd(&attn_hsd, &[1, 0, 2])?;
-        let attn_out = attn_shd.view(&[seq, dim])?;
-        let attn_out = materialize(&attn_out)?;
+        // [1, H, S, D] → [S, H*D] via permute + view → BlkAttnFlat
+        let mut attn_flat = state.slice_mut(BT::BlkAttnFlat, &[seq, dim])?;
+        {
+            let attn_hsd = attn_out_sdpa.view(&[self.n_heads, seq, self.head_dim])?;
+            let attn_shd = permute_nd(&attn_hsd, &[1, 0, 2])?;
+            attn_flat.copy_from(&attn_shd.view(&[seq, dim])?)?;
+        }
 
-        // to_out projection
-        let mut to_out_result = Tensor::new(&[seq, dim], dtype, device)?;
-        self.to_out.forward(&attn_out, &mut to_out_result, cuda_config)?;
+        // to_out projection + norm2(attn) + gate
+        let mut to_out_result = state.slice_mut(BT::BlkToOut, &[seq, dim])?;
+        self.to_out.forward(&attn_flat, &mut to_out_result, cuda_config)?;
 
-        // norm2(attn)
-        let mut norm2_attn = Tensor::new(&[seq, dim], dtype, device)?;
+        let mut norm2_attn = state.slice_mut(BT::BlkNorm2Attn, &[seq, dim])?;
         self.attention_norm2.forward(&to_out_result, &mut norm2_attn, cuda_config)?;
-
-        // gate_msa modulation
         if let Some(ref g) = gate_msa {
-            broadcast_mul_rowvec(&mut norm2_attn, g)?;
+            norm2_attn.mul_row(g)?;
         }
 
-        // Residual: x = x + norm2_attn
-        let mut x = clone_tensor(x)?;
-        tensor_add_inplace(&mut x, &norm2_attn)?;
+        // Residual: dst = x + norm2_attn
+        dst.copy_from(x)?;
+        *dst += &norm2_attn;
 
-        // ========== FFN block ==========
-        let mut norm1_ffn = Tensor::new(&[seq, dim], dtype, device)?;
-        self.ffn_norm1.forward(&x, &mut norm1_ffn, cuda_config)?;
-
+        // ══════════════════════════ FFN block ══════════════════════════
+        let mut norm1_ffn = state.slice_mut(BT::BlkNorm1Ffn, &[seq, dim])?;
+        self.ffn_norm1.forward(dst, &mut norm1_ffn, cuda_config)?;
         if let Some(ref s) = scale_mlp {
-            broadcast_mul_rowvec(&mut norm1_ffn, s)?;
+            norm1_ffn.mul_row(s)?;
         }
 
-        // w1(x), w3(x) → [S, hidden_dim]
         let hidden_dim = self.w1.weight.shape()[0];
-        let mut w1_out = Tensor::new(&[seq, hidden_dim], dtype, device)?;
-        let mut w3_out = Tensor::new(&[seq, hidden_dim], dtype, device)?;
+        let mut w1_out = state.slice_mut(BT::BlkW1Out, &[seq, hidden_dim])?;
+        let mut w3_out = state.slice_mut(BT::BlkW3Out, &[seq, hidden_dim])?;
         self.w1.forward(&norm1_ffn, &mut w1_out, cuda_config)?;
         self.w3.forward(&norm1_ffn, &mut w3_out, cuda_config)?;
 
         // SwiGLU: silu(w1) * w3
-        scalar::silu_inplace(&mut w1_out)?;
-        ewise_mul_inplace(&mut w1_out, &w3_out)?;
+        w1_out.silu()?;
+        w1_out *= &w3_out;
 
-        // w2 down-projection
-        let mut ffn_out = Tensor::new(&[seq, dim], dtype, device)?;
+        let mut ffn_out = state.slice_mut(BT::BlkFfnOut, &[seq, dim])?;
         self.w2.forward(&w1_out, &mut ffn_out, cuda_config)?;
 
-        // norm2(ffn)
-        let mut norm2_ffn = Tensor::new(&[seq, dim], dtype, device)?;
+        let mut norm2_ffn = state.slice_mut(BT::BlkNorm2Ffn, &[seq, dim])?;
         self.ffn_norm2.forward(&ffn_out, &mut norm2_ffn, cuda_config)?;
-
-        // gate_mlp modulation
         if let Some(ref g) = gate_mlp {
-            broadcast_mul_rowvec(&mut norm2_ffn, g)?;
+            norm2_ffn.mul_row(g)?;
         }
 
-        // Residual: x = x + norm2_ffn
-        tensor_add_inplace(&mut x, &norm2_ffn)?;
+        // Residual: dst += norm2_ffn
+        *dst += &norm2_ffn;
 
-        Ok(x)
+        Ok(())
     }
-}
 
-// ───────────────────────── Helpers ─────────────────────────
+    /// Apply per-head RMSNorm in place on `hd`, a `[S, dim]` state slice
+    /// viewed as `[S*H, D]`.
+    ///
+    /// RMSNorm needs a source tensor distinct from its destination, so
+    /// we shuttle the data through the `in_ty` / `out_ty` scratch slots
+    /// and then copy the result back on top of `hd`.
+    fn per_head_rmsnorm(
+        &self,
+        norm: &RMSNorm,
+        hd: &mut Tensor,
+        in_ty: BT,
+        out_ty: BT,
+        state: &mut DitState,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
+        debug_assert_eq!(hd.shape().len(), 2);
+        debug_assert_eq!(hd.shape()[1], self.dim);
+        let seq = hd.shape()[0];
+        let flat_shape = [seq * self.n_heads, self.head_dim];
 
-/// In-place add: `a[i] += b[i]`
-fn tensor_add_inplace(a: &mut Tensor, b: &Tensor) -> Result<()> {
-    use crate::op::add_inplace::AddInplace;
-    AddInplace::new().forward(b, a, None)
-}
+        let hd_flat = hd.view(&flat_shape)?;
+        let mut norm_in = state.slice_mut(in_ty, &flat_shape)?;
+        norm_in.copy_from(&hd_flat)?;
+        let mut norm_out = state.slice_mut(out_ty, &flat_shape)?;
+        norm.forward(&norm_in, &mut norm_out, cuda_config)?;
 
-/// Broadcast-multiply: `x[s, d] *= v[0, d]` for all s (v shape [1, D]).
-fn broadcast_mul_rowvec(x: &mut Tensor, v: &Tensor) -> Result<()> {
-    use crate::op::broadcast_mul::broadcast_mul;
-    let s = x.shape()[0];
-    let d = x.shape()[1];
-    let mut out = Tensor::new(&[s, d], x.dtype(), x.device())?;
-    broadcast_mul(x, v, &mut out)?;
-    x.copy_from(&out)?;
-    Ok(())
-}
+        let mut hd_flat_mut = hd.view(&flat_shape)?;
+        hd_flat_mut.copy_from(&norm_out)?;
+        Ok(())
+    }
 
-/// Apply per-head RMSNorm over [S, H, D] by reshaping to [S*H, D].
-#[allow(clippy::too_many_arguments)]
-fn apply_rmsnorm_per_head(
-    norm: &RMSNorm,
-    x: &Tensor,           // [S, H, D]
-    seq: usize, h: usize, d: usize,
-    device: DeviceType,
-    dtype: DataType,
-    cuda_config: Option<&crate::OpConfig>,
-) -> Result<Tensor> {
-    let x_flat = x.view(&[seq * h, d])?;
-    let x_flat_mat = materialize(&x_flat)?;
-    let mut out = Tensor::new(&[seq * h, d], dtype, device)?;
-    norm.forward(&x_flat_mat, &mut out, cuda_config)?;
-    let out_shd = out.view(&[seq, h, d])?;
-    materialize(&out_shd)
-}
+    /// Materialize `[S, H, D]` as `[1, H, S, D]` into `dst_ty`.
+    ///
+    /// SDPA expects BHSD layout; we permute on a temporary (view-only)
+    /// tensor and then copy the contiguous result into the state slot.
+    fn to_bhsd(
+        &self,
+        src: &Tensor,
+        dst_ty: BT,
+        state: &mut DitState,
+    ) -> Result<Tensor> {
+        let seq = src.shape()[0];
+        let shd = src.view(&[seq, self.n_heads, self.head_dim])?;
+        let hsd = permute_nd(&shd, &[1, 0, 2])?;
+        let bhsd_view = hsd.view(&[1, self.n_heads, seq, self.head_dim])?;
 
-/// Reshape [S, H, D] → [1, H, S, D] (contiguous) using a CUDA-native permute.
-fn reshape_shd_to_bhsd(
-    x: &Tensor, seq: usize, h: usize, d: usize,
-) -> Result<Tensor> {
-    let permuted = permute_nd(x, &[1, 0, 2])?;
-    permuted.view(&[1, h, seq, d]).and_then(|v| materialize(&v))
+        let mut dst = state.slice_mut(dst_ty, &[1, self.n_heads, seq, self.head_dim])?;
+        dst.copy_from(&bhsd_view)?;
+        Ok(dst)
+    }
 }
 
 // ───────────────────────── Tests ─────────────────────────
@@ -281,6 +283,7 @@ fn reshape_shd_to_bhsd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::{DataType, DeviceType};
     use crate::base::error::Result;
 
     /// Build a minimal DiTBlock with random weights for testing.
@@ -353,6 +356,38 @@ mod tests {
             max_diff, max_idx, a[max_idx], b[max_idx], tol);
     }
 
+    /// Build a minimally sized [`DitState`] big enough to run a single
+    /// DiTBlock with the given `(seq, dim, n_heads, hidden_dim)`.
+    fn make_state(
+        dim: usize, n_heads: usize, hidden_dim: usize,
+        dtype: DataType, device: DeviceType,
+    ) -> Result<DitState> {
+        use crate::model::diffusion::z_image::state::{DitShapeSpec, ZImageCapacity};
+        let head_dim = dim / n_heads;
+        // Small capacity so seq-wise slots cover at least 32 tokens
+        // (SEQ_MULTI_OF rounds 1 patch up to 32).
+        let capacity = ZImageCapacity {
+            max_height: 64,
+            max_width: 64,
+            max_cap_len: 8,
+        };
+        let spec = DitShapeSpec {
+            device,
+            dtype,
+            dim,
+            n_heads,
+            head_dim,
+            hidden_dim,
+            cap_feat_dim: 16,
+            patch_size: 1,
+            f_patch_size: 1,
+            patch_in_dim: 16,
+            final_out_dim: 16,
+            capacity,
+        };
+        DitState::new(spec)
+    }
+
     // ── CPU basic tests (no modulation) ──
 
     #[test]
@@ -366,7 +401,9 @@ mod tests {
         let cos = Tensor::randn(&[seq, head_dim / 2], DataType::F32, DeviceType::Cpu, Some(43))?;
         let sin = Tensor::randn(&[seq, head_dim / 2], DataType::F32, DeviceType::Cpu, Some(44))?;
 
-        let out = block.forward(&x, &cos, &sin, None, None)?;
+        let mut state = make_state(dim, heads, hidden, DataType::F32, DeviceType::Cpu)?;
+        let mut out = Tensor::new(&[seq, dim], DataType::F32, DeviceType::Cpu)?;
+        block.forward(&x, &cos, &sin, None, &mut state, &mut out, None)?;
         assert_eq!(out.shape(), &[seq, dim]);
         assert_finite(&out);
         Ok(())
@@ -386,7 +423,9 @@ mod tests {
         let sin = Tensor::randn(&[seq, head_dim / 2], DataType::F32, DeviceType::Cpu, Some(44))?;
         let adaln_c = Tensor::randn(&[256], DataType::F32, DeviceType::Cpu, Some(45))?;
 
-        let out = block.forward(&x, &cos, &sin, Some(&adaln_c), None)?;
+        let mut state = make_state(dim, heads, hidden, DataType::F32, DeviceType::Cpu)?;
+        let mut out = Tensor::new(&[seq, dim], DataType::F32, DeviceType::Cpu)?;
+        block.forward(&x, &cos, &sin, Some(&adaln_c), &mut state, &mut out, None)?;
         assert_eq!(out.shape(), &[seq, dim]);
         assert_finite(&out);
         Ok(())
@@ -407,7 +446,9 @@ mod tests {
 
         // CPU
         let block_cpu = make_dit_block(dim, heads, hidden, false, DeviceType::Cpu)?;
-        let out_cpu = block_cpu.forward(&x, &cos, &sin, None, None)?;
+        let mut state_cpu = make_state(dim, heads, hidden, DataType::F32, DeviceType::Cpu)?;
+        let mut out_cpu = Tensor::new(&[seq, dim], DataType::F32, DeviceType::Cpu)?;
+        block_cpu.forward(&x, &cos, &sin, None, &mut state_cpu, &mut out_cpu, None)?;
 
         // CUDA (same weights via same seeds)
         let mut block_gpu = make_dit_block(dim, heads, hidden, false, DeviceType::Cpu)?;
@@ -416,7 +457,9 @@ mod tests {
         let cos_gpu = cos.to_cuda(0)?;
         let sin_gpu = sin.to_cuda(0)?;
         let cuda_config = crate::cuda::CudaConfig::new()?;
-        let out_gpu = block_gpu.forward(&x_gpu, &cos_gpu, &sin_gpu, None, Some(&cuda_config))?;
+        let mut state_gpu = make_state(dim, heads, hidden, DataType::F32, DeviceType::Cuda(0))?;
+        let mut out_gpu = Tensor::new(&[seq, dim], DataType::F32, DeviceType::Cuda(0))?;
+        block_gpu.forward(&x_gpu, &cos_gpu, &sin_gpu, None, &mut state_gpu, &mut out_gpu, Some(&cuda_config))?;
         let out_gpu_cpu = out_gpu.to_cpu()?;
 
         let a = out_cpu.as_f32()?.as_slice()?;
@@ -441,7 +484,9 @@ mod tests {
 
         // CPU
         let block_cpu = make_dit_block(dim, heads, hidden, true, DeviceType::Cpu)?;
-        let out_cpu = block_cpu.forward(&x, &cos, &sin, Some(&adaln_c), None)?;
+        let mut state_cpu = make_state(dim, heads, hidden, DataType::F32, DeviceType::Cpu)?;
+        let mut out_cpu = Tensor::new(&[seq, dim], DataType::F32, DeviceType::Cpu)?;
+        block_cpu.forward(&x, &cos, &sin, Some(&adaln_c), &mut state_cpu, &mut out_cpu, None)?;
 
         // CUDA
         let mut block_gpu = make_dit_block(dim, heads, hidden, true, DeviceType::Cpu)?;
@@ -451,7 +496,9 @@ mod tests {
         let sin_gpu = sin.to_cuda(0)?;
         let adaln_c_gpu = adaln_c.to_cuda(0)?;
         let cuda_config = crate::cuda::CudaConfig::new()?;
-        let out_gpu = block_gpu.forward(&x_gpu, &cos_gpu, &sin_gpu, Some(&adaln_c_gpu), Some(&cuda_config))?;
+        let mut state_gpu = make_state(dim, heads, hidden, DataType::F32, DeviceType::Cuda(0))?;
+        let mut out_gpu = Tensor::new(&[seq, dim], DataType::F32, DeviceType::Cuda(0))?;
+        block_gpu.forward(&x_gpu, &cos_gpu, &sin_gpu, Some(&adaln_c_gpu), &mut state_gpu, &mut out_gpu, Some(&cuda_config))?;
         let out_gpu_cpu = out_gpu.to_cpu()?;
 
         let a = out_cpu.as_f32()?.as_slice()?;
