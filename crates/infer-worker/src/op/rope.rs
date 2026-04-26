@@ -3,9 +3,7 @@
 use crate::base::error::{Error, Result};
 use crate::base::{DataType, DeviceType};
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -48,7 +46,8 @@ impl RoPEOp {
         cos_cache: &Tensor,
         q: &mut Tensor,
         k: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        #[allow(unused_variables)]
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         let device = q.device();
         let seq_len = q.shape()[0];

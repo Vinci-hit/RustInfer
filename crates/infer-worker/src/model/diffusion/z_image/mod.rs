@@ -17,5 +17,8 @@ pub mod transformer;
 pub mod timestep_embedder;
 pub mod rope_embedder_3d;
 pub mod patchify;
+pub mod dit_block;
+pub mod text_encoder;
 
 pub use pipeline::ZImagePipeline;
+pub use text_encoder::Qwen3TextEncoder;

@@ -246,4 +246,125 @@ mod tests {
         assert_eq!(t2.as_f32()?.as_slice()?, t.as_f32()?.as_slice()?);
         Ok(())
     }
+
+    // ────────── Tensor::permute CUDA tests ──────────
+
+    /// 2D transpose: F32 CPU vs CUDA
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_permute_2d_cuda_f32() -> Result<()> {
+        let mut t_cpu = Tensor::new(&[2, 3], DataType::F32, DeviceType::Cpu)?;
+        t_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let cpu_result = t_cpu.permute(&[1, 0])?;
+
+        let t_gpu = t_cpu.to_cuda(0)?;
+        let gpu_result = t_gpu.permute(&[1, 0])?;
+        let gpu_cpu = gpu_result.to_cpu()?;
+
+        assert_eq!(gpu_result.shape(), &[3, 2]);
+        assert_eq!(cpu_result.as_f32()?.as_slice()?, gpu_cpu.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    /// 3D permute: F32 CPU vs CUDA
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_permute_3d_cuda_f32() -> Result<()> {
+        let mut t_cpu = Tensor::new(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+        let data = t_cpu.as_f32_mut()?.as_slice_mut()?;
+        for i in 0..24 { data[i] = i as f32; }
+
+        let cpu_result = t_cpu.permute(&[2, 0, 1])?;
+
+        let t_gpu = t_cpu.to_cuda(0)?;
+        let gpu_result = t_gpu.permute(&[2, 0, 1])?;
+        let gpu_cpu = gpu_result.to_cpu()?;
+
+        assert_eq!(gpu_result.shape(), &[4, 2, 3]);
+        assert_eq!(cpu_result.as_f32()?.as_slice()?, gpu_cpu.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    /// 3D permute: BF16 CPU vs CUDA
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_permute_3d_cuda_bf16() -> Result<()> {
+        let values: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let mut t_cpu = Tensor::new(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+        t_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&values);
+        let t_cpu = t_cpu.to_dtype(DataType::BF16)?;
+
+        let cpu_result = t_cpu.permute(&[1, 2, 0])?;
+
+        let t_gpu = t_cpu.to_cuda(0)?;
+        let gpu_result = t_gpu.permute(&[1, 2, 0])?;
+        let gpu_cpu = gpu_result.to_cpu()?;
+
+        assert_eq!(gpu_result.shape(), &[3, 4, 2]);
+        let a = cpu_result.as_bf16()?.as_slice()?;
+        let b = gpu_cpu.as_bf16()?.as_slice()?;
+        assert_eq!(a, b);
+        Ok(())
+    }
+
+    /// 7D permute (patchify pattern): F32 CPU vs CUDA
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_permute_7d_cuda_f32() -> Result<()> {
+        // Simulates patchify: [C, f_t, pF, h_t, pH, w_t, pW] → [f_t, h_t, w_t, pF, pH, pW, C]
+        let shape = [2, 3, 2, 4, 2, 4, 2]; // total = 768
+        let perm = [1, 3, 5, 2, 4, 6, 0];
+        let n: usize = shape.iter().product();
+
+        let mut t_cpu = Tensor::new(&shape, DataType::F32, DeviceType::Cpu)?;
+        let data = t_cpu.as_f32_mut()?.as_slice_mut()?;
+        for i in 0..n { data[i] = i as f32; }
+
+        let cpu_result = t_cpu.permute(&perm)?;
+
+        let t_gpu = t_cpu.to_cuda(0)?;
+        let gpu_result = t_gpu.permute(&perm)?;
+        let gpu_cpu = gpu_result.to_cpu()?;
+
+        let expected_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
+        assert_eq!(gpu_result.shape(), expected_shape.as_slice());
+        assert_eq!(cpu_result.as_f32()?.as_slice()?, gpu_cpu.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    /// I32 permute on CUDA
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_permute_2d_cuda_i32() -> Result<()> {
+        let mut t_cpu = Tensor::new(&[3, 4], DataType::I32, DeviceType::Cpu)?;
+        let data = t_cpu.as_i32_mut()?.as_slice_mut()?;
+        for i in 0..12 { data[i] = i as i32; }
+
+        let cpu_result = t_cpu.permute(&[1, 0])?;
+
+        let t_gpu = t_cpu.to_cuda(0)?;
+        let gpu_result = t_gpu.permute(&[1, 0])?;
+        let gpu_cpu = gpu_result.to_cpu()?;
+
+        assert_eq!(gpu_result.shape(), &[4, 3]);
+        assert_eq!(cpu_result.as_i32()?.as_slice()?, gpu_cpu.as_i32()?.as_slice()?);
+        Ok(())
+    }
+
+    /// Identity permute on CUDA (no-op check)
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_permute_identity_cuda() -> Result<()> {
+        let mut t_cpu = Tensor::new(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+        let data = t_cpu.as_f32_mut()?.as_slice_mut()?;
+        for i in 0..24 { data[i] = i as f32; }
+
+        let t_gpu = t_cpu.to_cuda(0)?;
+        let gpu_result = t_gpu.permute(&[0, 1, 2])?;
+        let gpu_cpu = gpu_result.to_cpu()?;
+
+        assert_eq!(t_cpu.as_f32()?.as_slice()?, gpu_cpu.as_f32()?.as_slice()?);
+        Ok(())
+    }
 }

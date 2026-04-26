@@ -1,9 +1,7 @@
 use crate::base::error::Result;
 use crate::base::DeviceType;
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -22,7 +20,8 @@ impl Scatter {
         src: &Tensor,
         pos: &Tensor,
         dst: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        #[allow(unused_variables)]
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         match src.device() {
             DeviceType::Cpu => {
@@ -82,7 +81,8 @@ pub fn scatter_kv(
     dst_v: &mut Tensor,
     src_v: &Tensor,
     pos: &Tensor,
-    #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    #[allow(unused_variables)]
+    cuda_config: Option<&OpConfig>,
 ) -> Result<()> {
     match dst_k.device() {
         DeviceType::Cpu => kernels::cpu::scatter_kv(dst_k, src_k, dst_v, src_v, pos),

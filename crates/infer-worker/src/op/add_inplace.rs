@@ -1,8 +1,6 @@
 use crate::base::error::Result;
 use crate::base::DeviceType;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -20,10 +18,11 @@ impl AddInplace {
         &self,
         input: &crate::tensor::Tensor,
         output: &mut crate::tensor::Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         match input.device() {
             DeviceType::Cpu => {
+                let _ = cuda_config;
                 kernels::cpu::add_inplace(output, input)?;
             }
             #[cfg(feature = "cuda")]

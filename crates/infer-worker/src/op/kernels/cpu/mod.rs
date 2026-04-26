@@ -56,3 +56,6 @@ pub use groupnorm::groupnorm;
 
 mod upsample;
 pub use upsample::upsample_nearest_2x;
+
+mod softmax;
+pub use softmax::softmax;

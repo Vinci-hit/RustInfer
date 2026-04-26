@@ -2,12 +2,12 @@ use crate::tensor::Tensor;
 use crate::base::error::{Result, Error};
 use crate::base::{DataType, DeviceType};
 use super::kernels;
-use crate::cuda::CudaConfig;
+use crate::OpConfig;
 
 /// Sampler trait 定义了所有采样策略的通用接口。
 pub trait Sampler: Send + Sync {
     /// 接收 logits 张量并分发到合适的内核来执行采样。
-    fn sample(&self, logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()>;
+    fn sample(&self, logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&OpConfig>) -> Result<()>;
 }
 
 // ------------------- Argmax Sampler (分发器) -------------------
@@ -24,7 +24,7 @@ impl ArgmaxSampler {
 
 impl Sampler for ArgmaxSampler {
     /// `sample` 方法现在是一个分发器。
-    fn sample(&self, logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
+    fn sample(&self, logits: &Tensor,output_token: &mut Tensor, cuda_config: Option<&OpConfig>) -> Result<()> {
         // ---- 1. 执行前置检查 ----
         if logits.shape().len() != 1 {
             return Err(Error::InvalidArgument(format!(
@@ -71,7 +71,7 @@ impl SamplerOp {
         &self,
         logits: &Tensor,
         output_token_id: &mut Tensor,
-        cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         self.sampler.sample(logits, output_token_id, cuda_config)
     }

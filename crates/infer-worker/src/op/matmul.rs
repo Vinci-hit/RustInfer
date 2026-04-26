@@ -1,6 +1,7 @@
 use crate::base::error::{Result,Error} ;
 use crate::base::{DataType, DeviceType};
 use crate::tensor::Tensor;
+use crate::OpConfig;
 
 #[cfg(feature = "cuda")]
 use crate::cuda::config::CudaConfig;
@@ -90,13 +91,14 @@ impl Matmul {
         &self,
         input: &Tensor,
         output: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         let weight = &self.weight;
         let device = input.device();
 
         match device {
             DeviceType::Cpu => {
+                let _ = cuda_config;
                 if self.quant.is_some() {
                     return Err(Error::InvalidArgument(
                         "Quantized Matmul is only supported on CUDA devices".into()
@@ -135,13 +137,95 @@ impl Matmul {
         }
 
         if let Some(bias) = &self.bias {
-            match device {
-                DeviceType::Cpu => {
-                    kernels::cpu::add_inplace(output, bias)?;
+            // bias is [N] but output is [B, N] (or higher-rank with last dim N).
+            // Use broadcast_mul-style row-wise broadcasted add.
+            let out_shape: Vec<usize> = output.shape().to_vec();
+            let last_dim = *out_shape.last().unwrap();
+            let outer = output.num_elements() / last_dim;
+            let bias_numel = bias.num_elements();
+
+            if bias_numel == last_dim && out_shape != vec![bias_numel] {
+                // Broadcast add: out[i, c] += bias[c]
+                // Reshape out as [outer, last_dim] (zero-copy view) and bias as [last_dim],
+                // then call broadcast-add. We use broadcast_mul's friend pattern via
+                // add_inplace on tiled bias.
+                //
+                // For simplicity, materialize bias as [outer, last_dim] once.
+                let mut bias_bc = crate::tensor::Tensor::new(
+                    &[outer, last_dim], bias.dtype(), bias.device())?;
+                // Broadcast bias row into every row of bias_bc.
+                match device {
+                    DeviceType::Cpu => {
+                        match bias.dtype() {
+                            DataType::F32 => {
+                                let src = bias.as_f32()?.as_slice()?;
+                                let dst = bias_bc.as_f32_mut()?.as_slice_mut()?;
+                                for r in 0..outer {
+                                    dst[r*last_dim..(r+1)*last_dim].copy_from_slice(src);
+                                }
+                            }
+                            DataType::BF16 => {
+                                let src = bias.as_bf16()?.as_slice()?;
+                                let dst = bias_bc.as_bf16_mut()?.as_slice_mut()?;
+                                for r in 0..outer {
+                                    dst[r*last_dim..(r+1)*last_dim].copy_from_slice(src);
+                                }
+                            }
+                            _ => return Err(Error::InvalidArgument(format!(
+                                "Matmul bias: unsupported dtype {:?}", bias.dtype())).into()),
+                        }
+                    }
+                    #[cfg(feature = "cuda")]
+                    DeviceType::Cuda(_) => {
+                        let stream = crate::cuda::get_current_cuda_stream();
+                        unsafe extern "C" {
+                            fn broadcast_row_bf16_forward(dst: *mut half::bf16, row: *const half::bf16, num_rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
+                            fn broadcast_row_f32_forward(dst: *mut f32, row: *const f32, num_rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
+                        }
+                        match bias.dtype() {
+                            DataType::F32 => unsafe {
+                                broadcast_row_f32_forward(
+                                    bias_bc.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
+                                    bias.as_f32()?.buffer().as_ptr() as *const f32,
+                                    outer as i32, last_dim as i32, stream);
+                            }
+                            DataType::BF16 => unsafe {
+                                broadcast_row_bf16_forward(
+                                    bias_bc.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
+                                    bias.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+                                    outer as i32, last_dim as i32, stream);
+                            }
+                            _ => return Err(Error::InvalidArgument(format!(
+                                "Matmul bias CUDA: unsupported dtype {:?}", bias.dtype())).into()),
+                        }
+                    }
                 }
-                #[cfg(feature = "cuda")]
-                DeviceType::Cuda(_) => {
-                    kernels::cuda::add_inplace(output, bias, None)?;
+                // Now add in-place. Reshape bias_bc to match output shape via view.
+                let bias_bc_matched = bias_bc.view(&out_shape)?;
+                let bias_bc_matched_mat = {
+                    let mut m = crate::tensor::Tensor::new(&out_shape, bias.dtype(), bias.device())?;
+                    m.copy_from(&bias_bc_matched)?;
+                    m
+                };
+                match device {
+                    DeviceType::Cpu => {
+                        kernels::cpu::add_inplace(output, &bias_bc_matched_mat)?;
+                    }
+                    #[cfg(feature = "cuda")]
+                    DeviceType::Cuda(_) => {
+                        kernels::cuda::add_inplace(output, &bias_bc_matched_mat, None)?;
+                    }
+                }
+            } else {
+                // Same shape fallback (legacy)
+                match device {
+                    DeviceType::Cpu => {
+                        kernels::cpu::add_inplace(output, bias)?;
+                    }
+                    #[cfg(feature = "cuda")]
+                    DeviceType::Cuda(_) => {
+                        kernels::cuda::add_inplace(output, bias, None)?;
+                    }
                 }
             }
         }
@@ -427,7 +511,131 @@ mod tests {
         Ok(())
     }
 
-    // NOTE: Bias addition test removed due to shape broadcasting limitation
-    // The add_inplace kernel doesn't support broadcasting 1D bias [N] to 2D output [B, N]
-    // TODO: Implement broadcasting support in add_inplace or create a separate broadcast_add kernel
+    // ========================================================================
+    // Bias broadcast tests: bias [N] + output [B, N]
+    // ========================================================================
+
+    /// 手工计算参考: output = input @ weight^T + bias
+    fn matmul_with_bias_ref(input: &[f32], weight: &[f32], bias: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += input[i * k + p] * weight[j * k + p]; // weight^T
+                }
+                out[i * n + j] = sum + bias[j];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_matmul_bias_broadcast_cpu_f32() -> Result<()> {
+        let (batch, in_f, out_f) = (4, 8, 16);
+        let device = DeviceType::Cpu;
+        let dtype = DataType::F32;
+
+        let mut matmul_op = Matmul::new(in_f, out_f, true, dtype, device)?;
+
+        // Fill weight and bias with known values
+        let w_data: Vec<f32> = (0..(out_f * in_f)).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
+        matmul_op.weight.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&w_data);
+
+        let b_data: Vec<f32> = (0..out_f).map(|i| (i as f32) * 0.5).collect();
+        matmul_op.bias.as_mut().unwrap().as_f32_mut()?.as_slice_mut()?.copy_from_slice(&b_data);
+
+        let mut input = Tensor::new(&[batch, in_f], dtype, device)?;
+        let in_data: Vec<f32> = (0..(batch * in_f)).map(|i| ((i * 3) % 11) as f32 * 0.1).collect();
+        input.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&in_data);
+
+        let mut output = Tensor::new(&[batch, out_f], dtype, device)?;
+        matmul_op.forward(&input, &mut output, None)?;
+
+        let result = output.as_f32()?.as_slice()?;
+        let expected = matmul_with_bias_ref(&in_data, &w_data, &b_data, batch, out_f, in_f);
+        assert_close(result, &expected, 1e-4);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_matmul_bias_broadcast_cuda_f32() -> Result<()> {
+        let (batch, in_f, out_f) = (4, 8, 16);
+        let dtype = DataType::F32;
+
+        // CPU reference
+        let mut matmul_cpu = Matmul::new(in_f, out_f, true, dtype, DeviceType::Cpu)?;
+        let w_data: Vec<f32> = (0..(out_f * in_f)).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
+        matmul_cpu.weight.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&w_data);
+        let b_data: Vec<f32> = (0..out_f).map(|i| (i as f32) * 0.5).collect();
+        matmul_cpu.bias.as_mut().unwrap().as_f32_mut()?.as_slice_mut()?.copy_from_slice(&b_data);
+
+        let mut input_cpu = Tensor::new(&[batch, in_f], dtype, DeviceType::Cpu)?;
+        let in_data: Vec<f32> = (0..(batch * in_f)).map(|i| ((i * 3) % 11) as f32 * 0.1).collect();
+        input_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&in_data);
+
+        let mut output_cpu = Tensor::new(&[batch, out_f], dtype, DeviceType::Cpu)?;
+        matmul_cpu.forward(&input_cpu, &mut output_cpu, None)?;
+        let cpu_result = output_cpu.as_f32()?.as_slice()?.to_vec();
+
+        // CUDA
+        let mut matmul_gpu = Matmul::new(in_f, out_f, true, dtype, DeviceType::Cuda(0))?;
+        matmul_gpu.weight.as_f32_mut()?.buffer_mut().copy_from_host(&w_data)?;
+        matmul_gpu.bias.as_mut().unwrap().as_f32_mut()?.buffer_mut().copy_from_host(&b_data)?;
+
+        let mut input_gpu = Tensor::new(&[batch, in_f], dtype, DeviceType::Cuda(0))?;
+        input_gpu.as_f32_mut()?.buffer_mut().copy_from_host(&in_data)?;
+
+        let mut output_gpu = Tensor::new(&[batch, out_f], dtype, DeviceType::Cuda(0))?;
+        let cuda_config = crate::cuda::CudaConfig::new()?;
+        matmul_gpu.forward(&input_gpu, &mut output_gpu, Some(&cuda_config))?;
+
+        let gpu_result_tensor = output_gpu.to_cpu()?;
+        let gpu_result = gpu_result_tensor.as_f32()?.as_slice()?;
+
+        assert_close(&cpu_result, gpu_result, 1e-3);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_matmul_bias_broadcast_bf16_cpu_vs_cuda() -> Result<()> {
+        let (batch, in_f, out_f) = (4, 64, 32);
+        let dtype = DataType::BF16;
+
+        let w_data: Vec<half::bf16> = (0..(out_f * in_f))
+            .map(|i| half::bf16::from_f32(((i * 13) % 100) as f32 * 0.01))
+            .collect();
+        let b_data: Vec<half::bf16> = (0..out_f)
+            .map(|i| half::bf16::from_f32((i as f32) * 0.1))
+            .collect();
+        let in_data: Vec<half::bf16> = (0..(batch * in_f))
+            .map(|i| half::bf16::from_f32(((i * 7) % 50) as f32 * 0.02))
+            .collect();
+
+        // CPU
+        let mut matmul_cpu = Matmul::new(in_f, out_f, true, dtype, DeviceType::Cpu)?;
+        matmul_cpu.weight.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&w_data);
+        matmul_cpu.bias.as_mut().unwrap().as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&b_data);
+        let mut input_cpu = Tensor::new(&[batch, in_f], dtype, DeviceType::Cpu)?;
+        input_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&in_data);
+        let mut output_cpu = Tensor::new(&[batch, out_f], dtype, DeviceType::Cpu)?;
+        matmul_cpu.forward(&input_cpu, &mut output_cpu, None)?;
+        let cpu_result = output_cpu.as_bf16()?.as_slice()?.to_vec();
+
+        // CUDA
+        let mut matmul_gpu = Matmul::new(in_f, out_f, true, dtype, DeviceType::Cuda(0))?;
+        matmul_gpu.weight.as_bf16_mut()?.buffer_mut().copy_from_host(&w_data)?;
+        matmul_gpu.bias.as_mut().unwrap().as_bf16_mut()?.buffer_mut().copy_from_host(&b_data)?;
+        let mut input_gpu = Tensor::new(&[batch, in_f], dtype, DeviceType::Cuda(0))?;
+        input_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&in_data)?;
+        let mut output_gpu = Tensor::new(&[batch, out_f], dtype, DeviceType::Cuda(0))?;
+        let cuda_config = crate::cuda::CudaConfig::new()?;
+        matmul_gpu.forward(&input_gpu, &mut output_gpu, Some(&cuda_config))?;
+        let gpu_result = output_gpu.to_cpu()?.as_bf16()?.as_slice()?.to_vec();
+
+        assert_bf16_close(&cpu_result, &gpu_result, 0.15);
+        Ok(())
+    }
 }

@@ -109,10 +109,14 @@ impl RopeEmbedder3D {
     /// 根据 position IDs 查表拼接出 cos/sin embedding.
     ///
     /// - `pos_ids`: shape [seq_len, 3], dtype I32, 每行 = [t, h, w]
+    /// - `target_device`: 输出张量放在哪个设备（查表在 CPU 做，完成后上传）
     /// - 返回: (cos, sin), 各 shape [seq_len, half_dim], dtype F32
     ///
     /// 拼接顺序: [temporal_freqs | height_freqs | width_freqs]
-    pub fn embed(&self, pos_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    ///
+    /// 注意: cos/sin cache 始终保持在 CPU（查表是标量索引操作，不适合 GPU），
+    /// pos_ids 也需要在 CPU 上读取。结果按 `target_device` 上传。
+    pub fn embed(&self, pos_ids: &Tensor, target_device: DeviceType) -> Result<(Tensor, Tensor)> {
         if pos_ids.shape().len() != 2 || pos_ids.shape()[1] != 3 {
             return Err(Error::InvalidArgument(format!(
                 "RopeEmbedder3D::embed: pos_ids must be [seq_len, 3], got {:?}",
@@ -122,7 +126,14 @@ impl RopeEmbedder3D {
 
         let seq_len = pos_ids.shape()[0];
         let half_dim = self.half_dim();
-        let ids = pos_ids.as_i32()?.as_slice()?;
+
+        // pos_ids 需要在 CPU 上读取
+        let pos_cpu = if pos_ids.device() != DeviceType::Cpu {
+            pos_ids.to_cpu()?
+        } else {
+            pos_ids.clone()
+        };
+        let ids = pos_cpu.as_i32()?.as_slice()?;
 
         let mut cos_out = Tensor::new(&[seq_len, half_dim], DataType::F32, DeviceType::Cpu)?;
         let mut sin_out = Tensor::new(&[seq_len, half_dim], DataType::F32, DeviceType::Cpu)?;
@@ -136,6 +147,7 @@ impl RopeEmbedder3D {
         for axis in 0..3usize {
             let half_d = self.axes_dims[axis] / 2;
             let offset = offsets[axis];
+            // cache 始终在 CPU，直接读
             let cos_cache = self.cos_cached[axis].as_f32()?.as_slice()?;
             let sin_cache = self.sin_cached[axis].as_f32()?.as_slice()?;
 
@@ -154,18 +166,12 @@ impl RopeEmbedder3D {
             }
         }
 
+        // 上传到目标设备
+        let cos_out = cos_out.to_device(target_device)?;
+        let sin_out = sin_out.to_device(target_device)?;
         Ok((cos_out, sin_out))
     }
 
-    /// 将 cache 搬到 CUDA 设备（用于后续 GPU embed）。
-    #[cfg(feature = "cuda")]
-    pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        for i in 0..3 {
-            self.cos_cached[i] = self.cos_cached[i].to_cuda(device_id)?;
-            self.sin_cached[i] = self.sin_cached[i].to_cuda(device_id)?;
-        }
-        Ok(())
-    }
 }
 
 /// 原地 interleaved RoPE 旋转（GPT-J 风格）。
@@ -317,7 +323,7 @@ mod tests {
         ids[6] = 3; ids[7] = 0; ids[8] = 0;   // token 2
         ids[9] = 4; ids[10] = 0; ids[11] = 0;  // token 3
 
-        let (cos, sin) = rope.embed(&pos_ids)?;
+        let (cos, sin) = rope.embed(&pos_ids, DeviceType::Cpu)?;
         assert_eq!(cos.shape(), &[4, 64]);
         assert_eq!(sin.shape(), &[4, 64]);
 
@@ -362,7 +368,7 @@ mod tests {
         ids[6] = 10; ids[7] = 1; ids[8] = 0;
         ids[9] = 10; ids[10] = 1; ids[11] = 1;
 
-        let (cos, _sin) = rope.embed(&pos_ids)?;
+        let (cos, _sin) = rope.embed(&pos_ids, DeviceType::Cpu)?;
         let data = cos.as_f32()?.as_slice()?;
 
         // token 0 和 1: same t, same h, different w → temporal 和 height 部分相同, width 不同
@@ -499,7 +505,7 @@ mod tests {
         ids[0] = 0; ids[1] = 0; ids[2] = 0;
         ids[3] = 1; ids[4] = 2; ids[5] = 3;
 
-        let (cos, sin) = rope.embed(&pos_ids)?;
+        let (cos, sin) = rope.embed(&pos_ids, DeviceType::Cpu)?;
         assert_eq!(cos.shape(), &[2, 6]); // half_dim = 2+2+2 = 6
 
         // Q tensor [2, 24] = [seq=2, n_heads * head_dim = 2*12]

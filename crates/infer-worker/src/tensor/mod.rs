@@ -101,7 +101,7 @@ impl<T: Dtype> TypedTensor<T> {
             return Err(Error::DeviceMismatch {
                 expected: DeviceType::Cpu,
                 actual: self.buffer.device(),
-                in_method: "as_slice".to_string()
+                in_method: "as_slice_mut".to_string()
             }.into());
         }
         let num_elements = self.dims.iter().product();
@@ -559,8 +559,7 @@ impl Tensor {
     /// 其步长为 [D2*D3, D3, 1]。
     ///
     /// # 返回
-    /// - `Vec<usize>`: 包含每个维度步长的向量。
-    fn strides(&self) -> Vec<usize> {
+    pub fn strides(&self) -> Vec<usize> {
         let shape = self.shape();
         if shape.is_empty() {
             return vec![];
@@ -633,6 +632,12 @@ impl Tensor {
             seen[p] = true;
         }
 
+        // CUDA: 使用原生 CUDA permute kernel（支持 F32/BF16/F16/I32）
+        #[cfg(feature = "cuda")]
+        if self.device() != DeviceType::Cpu {
+            return self.permute_cuda(perm);
+        }
+
         let new_shape: Vec<usize> = perm.iter().map(|&i| old_shape[i]).collect();
         let old_strides = self.strides();
         let n = self.num_elements();
@@ -695,6 +700,93 @@ impl Tensor {
         }
 
         Ok(out)
+    }
+
+    /// CUDA permute: 直接调用 CUDA kernel，不绕道 CPU。
+    #[cfg(feature = "cuda")]
+    fn permute_cuda(&self, perm: &[usize]) -> Result<Self> {
+        use crate::cuda::ffi::cudaStream_t;
+
+        unsafe extern "C" {
+            fn permute_f32_forward(dst: *mut f32, src: *const f32,
+                ndim: i32, new_shape: *const i64, new_strides: *const i64,
+                old_strides: *const i64, perm: *const i32,
+                num_elements: i64, stream: cudaStream_t);
+            fn permute_bf16_forward(dst: *mut half::bf16, src: *const half::bf16,
+                ndim: i32, new_shape: *const i64, new_strides: *const i64,
+                old_strides: *const i64, perm: *const i32,
+                num_elements: i64, stream: cudaStream_t);
+            fn permute_f16_forward(dst: *mut half::f16, src: *const half::f16,
+                ndim: i32, new_shape: *const i64, new_strides: *const i64,
+                old_strides: *const i64, perm: *const i32,
+                num_elements: i64, stream: cudaStream_t);
+            fn permute_i32_forward(dst: *mut i32, src: *const i32,
+                ndim: i32, new_shape: *const i64, new_strides: *const i64,
+                old_strides: *const i64, perm: *const i32,
+                num_elements: i64, stream: cudaStream_t);
+        }
+
+        let src_shape = self.shape();
+        let ndim = src_shape.len();
+
+        // I8 等不支持的 dtype fallback 到 CPU round-trip
+        if !matches!(self.dtype(), DataType::F32 | DataType::BF16 | DataType::F16 | DataType::I32) {
+            let cpu_tensor = self.to_cpu()?;
+            let permuted_cpu = cpu_tensor.permute(perm)?;
+            return permuted_cpu.to_device(self.device());
+        }
+
+        let old_strides: Vec<i64> = self.strides().iter().map(|&s| s as i64).collect();
+        let new_shape: Vec<i64> = perm.iter().map(|&i| src_shape[i] as i64).collect();
+        let mut new_strides: Vec<i64> = vec![1; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            new_strides[i] = new_strides[i + 1] * new_shape[i + 1];
+        }
+        let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
+
+        let new_shape_usize: Vec<usize> = new_shape.iter().map(|&x| x as usize).collect();
+        let mut dst = Tensor::new(&new_shape_usize, self.dtype(), self.device())?;
+
+        let num_elements = self.num_elements() as i64;
+        let stream = crate::cuda::get_current_cuda_stream();
+
+        match self.dtype() {
+            DataType::F32 => unsafe {
+                permute_f32_forward(
+                    dst.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
+                    self.as_f32()?.buffer().as_ptr() as *const f32,
+                    ndim as i32, new_shape.as_ptr(), new_strides.as_ptr(),
+                    old_strides.as_ptr(), perm_i32.as_ptr(), num_elements, stream,
+                );
+            }
+            DataType::BF16 => unsafe {
+                permute_bf16_forward(
+                    dst.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
+                    self.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+                    ndim as i32, new_shape.as_ptr(), new_strides.as_ptr(),
+                    old_strides.as_ptr(), perm_i32.as_ptr(), num_elements, stream,
+                );
+            }
+            DataType::F16 => unsafe {
+                permute_f16_forward(
+                    dst.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16,
+                    self.as_f16()?.buffer().as_ptr() as *const half::f16,
+                    ndim as i32, new_shape.as_ptr(), new_strides.as_ptr(),
+                    old_strides.as_ptr(), perm_i32.as_ptr(), num_elements, stream,
+                );
+            }
+            DataType::I32 => unsafe {
+                permute_i32_forward(
+                    dst.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
+                    self.as_i32()?.buffer().as_ptr() as *const i32,
+                    ndim as i32, new_shape.as_ptr(), new_strides.as_ptr(),
+                    old_strides.as_ptr(), perm_i32.as_ptr(), num_elements, stream,
+                );
+            }
+            _ => unreachable!(), // guarded by matches! above
+        }
+
+        Ok(dst)
     }
 
     /// 从当前张量中创建一个零拷贝的切片（视图）。
@@ -1695,6 +1787,134 @@ mod tests {
             assert!((cd[i] - gd[i]).abs() < 1e-6,
                 "upsample mismatch at {}: cpu={}, gpu={}", i, cd[i], gd[i]);
         }
+        Ok(())
+    }
+
+    // ==================== Softmax tests ====================
+
+    #[test]
+    fn test_softmax_cpu() -> Result<()> {
+        let mut input = Tensor::new(&[2, 4], DataType::F32, DeviceType::Cpu)?;
+        input.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
+
+        let mut output = Tensor::new(&[2, 4], DataType::F32, DeviceType::Cpu)?;
+        crate::op::softmax::softmax(&input, &mut output)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        // row 0 sum should be 1.0
+        let sum0: f32 = d[0..4].iter().sum();
+        assert!((sum0 - 1.0).abs() < 1e-5, "row0 sum: {}", sum0);
+        // row 1: uniform → all 0.25
+        assert!((d[4] - 0.25).abs() < 1e-5, "uniform: {}", d[4]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_softmax_cuda_vs_cpu() -> Result<()> {
+        let input = Tensor::randn(&[32, 64], DataType::F32, DeviceType::Cpu, Some(42))?;
+
+        let mut cpu_out = Tensor::new(&[32, 64], DataType::F32, DeviceType::Cpu)?;
+        crate::op::softmax::softmax(&input, &mut cpu_out)?;
+
+        let gpu_in = input.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[32, 64], DataType::F32, DeviceType::Cuda(0))?;
+        crate::op::softmax::softmax(&gpu_in, &mut gpu_out)?;
+
+        let gpu_back = gpu_out.to_cpu()?;
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        let mut max_diff: f32 = 0.0;
+        for i in 0..cd.len() {
+            max_diff = max_diff.max((cd[i] - gd[i]).abs());
+        }
+        println!("Softmax CPU vs CUDA max diff: {}", max_diff);
+        assert!(max_diff < 1e-5, "Softmax max diff {} too large", max_diff);
+        Ok(())
+    }
+
+    // ==================== SDPA tests ====================
+
+    #[test]
+    fn test_sdpa_cpu_basic() -> Result<()> {
+        // B=1, heads=1, S=4, D=8
+        let q = Tensor::randn(&[1, 1, 4, 8], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let k = Tensor::randn(&[1, 1, 4, 8], DataType::F32, DeviceType::Cpu, Some(7))?;
+        let v = Tensor::randn(&[1, 1, 4, 8], DataType::F32, DeviceType::Cpu, Some(13))?;
+        let mut output = Tensor::new(&[1, 1, 4, 8], DataType::F32, DeviceType::Cpu)?;
+
+        crate::op::sdpa::scaled_dot_product_attention(&q, &k, &v, &mut output, None)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        // output 应该是有限值，不是 NaN/Inf
+        for &val in d {
+            assert!(val.is_finite(), "sdpa output contains non-finite: {}", val);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sdpa_cpu_large_head_dim() -> Result<()> {
+        // VAE 场景: B=1, heads=1, S=16, D=512
+        let q = Tensor::randn(&[1, 1, 16, 512], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let k = Tensor::randn(&[1, 1, 16, 512], DataType::F32, DeviceType::Cpu, Some(7))?;
+        let v = Tensor::randn(&[1, 1, 16, 512], DataType::F32, DeviceType::Cpu, Some(13))?;
+        let mut output = Tensor::new(&[1, 1, 16, 512], DataType::F32, DeviceType::Cpu)?;
+
+        crate::op::sdpa::scaled_dot_product_attention(&q, &k, &v, &mut output, None)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        for &val in d {
+            assert!(val.is_finite(), "sdpa output non-finite: {}", val);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sdpa_cpu_multi_head() -> Result<()> {
+        // B=2, heads=4, S=8, D=64
+        let q = Tensor::randn(&[2, 4, 8, 64], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let k = Tensor::randn(&[2, 4, 8, 64], DataType::F32, DeviceType::Cpu, Some(7))?;
+        let v = Tensor::randn(&[2, 4, 8, 64], DataType::F32, DeviceType::Cpu, Some(13))?;
+        let mut output = Tensor::new(&[2, 4, 8, 64], DataType::F32, DeviceType::Cpu)?;
+
+        crate::op::sdpa::scaled_dot_product_attention(&q, &k, &v, &mut output, None)?;
+
+        let d = output.as_f32()?.as_slice()?;
+        for &val in d {
+            assert!(val.is_finite(), "sdpa output non-finite: {}", val);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_sdpa_cuda_vs_cpu() -> Result<()> {
+        // B=1, heads=2, S=16, D=32
+        let q = Tensor::randn(&[1, 2, 16, 32], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let k = Tensor::randn(&[1, 2, 16, 32], DataType::F32, DeviceType::Cpu, Some(7))?;
+        let v = Tensor::randn(&[1, 2, 16, 32], DataType::F32, DeviceType::Cpu, Some(13))?;
+
+        // CPU
+        let mut cpu_out = Tensor::new(&[1, 2, 16, 32], DataType::F32, DeviceType::Cpu)?;
+        crate::op::sdpa::scaled_dot_product_attention(&q, &k, &v, &mut cpu_out, None)?;
+
+        // CUDA
+        let q_gpu = q.to_cuda(0)?;
+        let k_gpu = k.to_cuda(0)?;
+        let v_gpu = v.to_cuda(0)?;
+        let mut gpu_out = Tensor::new(&[1, 2, 16, 32], DataType::F32, DeviceType::Cuda(0))?;
+        crate::op::sdpa::scaled_dot_product_attention(&q_gpu, &k_gpu, &v_gpu, &mut gpu_out, None)?;
+
+        let gpu_back = gpu_out.to_cpu()?;
+        let cd = cpu_out.as_f32()?.as_slice()?;
+        let gd = gpu_back.as_f32()?.as_slice()?;
+        let mut max_diff: f32 = 0.0;
+        for i in 0..cd.len() {
+            max_diff = max_diff.max((cd[i] - gd[i]).abs());
+        }
+        println!("SDPA CPU vs CUDA max diff: {}", max_diff);
+        assert!(max_diff < 1e-3, "SDPA max diff {} too large", max_diff);
         Ok(())
     }
 }

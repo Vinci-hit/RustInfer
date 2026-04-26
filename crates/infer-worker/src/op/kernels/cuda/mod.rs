@@ -49,3 +49,6 @@ pub use groupnorm::*;
 
 mod upsample;
 pub use upsample::*;
+
+mod softmax;
+pub use softmax::*;
