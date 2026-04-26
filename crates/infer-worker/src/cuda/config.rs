@@ -1,4 +1,5 @@
 use std::os::raw::c_void;
+use std::sync::Mutex;
 
 use crate::base::error::Result;
 
@@ -50,6 +51,11 @@ pub struct CudaConfig {
     pub cuda_graph: Option<CudaGraph>,
     /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
     pub cudnn_handle: ffi::cudnnHandle_t,
+    /// Descriptor / algorithm / workspace cache shared across every
+    /// `conv2d_cudnn` invocation that runs against this handle. Eliminates
+    /// per-call `cudnnCreate*` / `cudnnGetAlgorithm` / `cudaMalloc`
+    /// overhead once the cache is warm.
+    pub conv2d_cache: Mutex<crate::op::kernels::cuda::Conv2dCache>,
 }
 
 #[derive(Debug)]
@@ -111,6 +117,9 @@ impl CudaConfig {
             flash_decode_workspace_size: 0,
             cuda_graph: None,
             cudnn_handle,
+            conv2d_cache: Mutex::new(
+                crate::op::kernels::cuda::Conv2dCache::default(),
+            ),
         })
     }
 

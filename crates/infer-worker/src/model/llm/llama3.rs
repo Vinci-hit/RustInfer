@@ -623,6 +623,37 @@ mod tests {
         Ok((text, start.elapsed().as_millis() as u64, n_tok, prefill_ms, decode_ms, decode_iter))
     }
 
+    /// Pre-run a tiny `generate()` on the same state the benchmark will
+    /// use, so the real call sees a hot CUDA context:
+    ///
+    /// - kernel module load / PTX→SASS JIT for every prefill + decode
+    ///   kernel (embedding, rmsnorm, qkv, rope, scatter_kv, flash-attn,
+    ///   wo, silu, sampler, …).
+    /// - cuBLASLt algorithm heuristics for every `(M,N,K)` shape hit.
+    /// - the decode-path CUDA Graph: captured here, replayed for free
+    ///   from the real benchmark's first decode step onward.
+    ///
+    /// After warmup returns, the real `generate(prompt, N)` call
+    /// unconditionally overwrites `kv_cache[..prompt_len]` from pos=0
+    /// (see [`Llama3::generate`]), so warmup has no correctness impact.
+    ///
+    /// ## Why the filler prompt
+    ///
+    /// The flash-attention prefill kernel processes the sequence in
+    /// fixed-size tiles (~64 tokens). Feeding it a prompt of 1–2 tokens
+    /// causes out-of-range reads inside the tile, putting the CUDA
+    /// context into a sticky-error state that surfaces later as
+    /// `CUBLAS_STATUS_EXECUTION_FAILED (13)` on the next cuBLASLt call.
+    /// We pick a ~10-token filler string to stay above that floor while
+    /// keeping the warmup cheap.
+    fn warmup(model: &Llama3, state: &mut InferenceState) -> Result<()> {
+        // ~10 tokens after BPE — safely above the flash-attn prefill
+        // tile floor. A few decode steps also capture the CUDA Graph.
+        let prompt = "The quick brown fox jumps over the lazy dog.";
+        let _ = model.generate(state, prompt, 4, false)?;
+        Ok(())
+    }
+
     #[test]
     #[ignore = "Long running test"]
     fn test_llama3_cpu_loading_and_generation() -> Result<()> {
@@ -654,6 +685,7 @@ mod tests {
 
         let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
+        warmup(&model, &mut state)?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
@@ -684,6 +716,7 @@ mod tests {
 
         let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
+        warmup(&model, &mut state)?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         let (text, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;

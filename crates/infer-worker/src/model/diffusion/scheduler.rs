@@ -28,8 +28,19 @@ pub trait Scheduler: Send {
 
     /// Perform a single Euler denoising step and advance the internal counter.
     ///
-    /// `prev_sample = sample + (sigma_next - sigma_cur) * model_output`
-    fn step(&mut self, model_output: &Tensor, sample: &Tensor) -> Result<Tensor>;
+    /// Writes `dst = sample + (sigma_next - sigma_cur) * model_output`.
+    ///
+    /// **Destructive**: `model_output` is mutated in place (scaled by
+    /// `dt`) so the step can run without any scratch allocation. Callers
+    /// that still need the original velocity must copy it before calling.
+    /// `sample` and `dst` must be distinct tensors (no aliasing) — the
+    /// typical pattern is a ping-pong between two pipeline-owned buffers.
+    fn step(
+        &mut self,
+        model_output: &mut Tensor,
+        sample: &Tensor,
+        dst: &mut Tensor,
+    ) -> Result<()>;
 }
 
 // ──────────────────────── Flow Match Euler Discrete ──────────────────────────
@@ -82,16 +93,26 @@ impl Scheduler for FlowMatchEulerScheduler {
         self.step_index = 0;
     }
 
-    fn step(&mut self, model_output: &Tensor, sample: &Tensor) -> Result<Tensor> {
+    fn step(
+        &mut self,
+        model_output: &mut Tensor,
+        sample: &Tensor,
+        dst: &mut Tensor,
+    ) -> Result<()> {
         let sigma = self.sigmas[self.step_index];
         let sigma_next = self.sigmas[self.step_index + 1];
         let dt = sigma_next - sigma;
 
-        // prev_sample = sample + dt * model_output
-        let prev_sample = sample + &(model_output * dt);
+        // dst = sample + dt * model_output
+        //   1) model_output *= dt      (in-place scale, no alloc)
+        //   2) dst = sample            (copy; ping-pong target differs from sample)
+        //   3) dst += model_output     (in-place add)
+        *model_output *= dt;
+        dst.copy_from(sample)?;
+        *dst += &*model_output;
 
         self.step_index += 1;
-        Ok(prev_sample)
+        Ok(())
     }
 }
 
@@ -147,15 +168,21 @@ mod tests {
         let mut velocity = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
         velocity.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 10.0, 10.0, 10.0]);
 
+        let mut dst_a = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        let mut dst_b = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+
         // Step 0: prev = [1,2,3,4] + (-0.7) * [10,10,10,10] = [-6, -5, -4, -3]
-        let s1 = sched.step(&velocity, &sample)?;
-        let r1 = s1.as_f32()?.as_slice()?;
+        sched.step(&mut velocity, &sample, &mut dst_a)?;
+        let r1 = dst_a.as_f32()?.as_slice()?;
         assert!((r1[0] - (-6.0)).abs() < 1e-5);
         assert!((r1[1] - (-5.0)).abs() < 1e-5);
 
+        // Reset velocity to original value since step() mutates it.
+        velocity.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 10.0, 10.0, 10.0]);
+
         // Step 1: prev = [-6,-5,-4,-3] + (-0.3) * [10,10,10,10] = [-9, -8, -7, -6]
-        let s2 = sched.step(&velocity, &s1)?;
-        let r2 = s2.as_f32()?.as_slice()?;
+        sched.step(&mut velocity, &dst_a, &mut dst_b)?;
+        let r2 = dst_b.as_f32()?.as_slice()?;
         assert!((r2[0] - (-9.0)).abs() < 1e-5);
         assert!((r2[3] - (-6.0)).abs() < 1e-5);
 
@@ -164,18 +191,20 @@ mod tests {
 
     #[test]
     fn test_euler_step_full_denoise() -> Result<()> {
-        // 验证：从纯噪声 sigma=1 去噪到 sigma=0，如果 velocity = -sample，
-        // 则最终结果应为 0
+        // 验证：从纯噪声 sigma=1 去噪到 sigma=0，如果 velocity = sample，
+        // 则最终结果应为 0 (dt = -1, prev = noise - noise = 0).
         let mut sched = FlowMatchEulerScheduler::new(1000, 3.0);
         sched.set_timesteps_from_sigmas(&[1.0]); // 单步: sigma 1→0, dt = -1
 
         let mut noise = Tensor::new(&[8], DataType::F32, DeviceType::Cpu)?;
         noise.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]);
 
-        // velocity = sample (flow matching: v predicts direction from noise to clean)
-        // prev = noise + (0 - 1) * noise = noise - noise = 0
-        let result = sched.step(&noise, &noise)?;
-        let r = result.as_f32()?.as_slice()?;
+        // velocity = a copy of noise (since step() will mutate velocity).
+        let mut velocity = crate::op::tensor_utils::clone_tensor(&noise)?;
+
+        let mut dst = Tensor::new(&[8], DataType::F32, DeviceType::Cpu)?;
+        sched.step(&mut velocity, &noise, &mut dst)?;
+        let r = dst.as_f32()?.as_slice()?;
         for &v in r {
             assert!(v.abs() < 1e-6, "expected 0, got {v}");
         }
@@ -215,10 +244,11 @@ mod tests {
 
         let mut vel_cpu = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
         vel_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[10.0, 10.0, 10.0, 10.0]);
-        let velocity = vel_cpu.to_cuda(0)?;
+        let mut velocity = vel_cpu.to_cuda(0)?;
 
-        let s1 = sched.step(&velocity, &sample)?;
-        let r = s1.to_cpu()?;
+        let mut dst = Tensor::new(&[4], DataType::F32, DeviceType::Cuda(0))?;
+        sched.step(&mut velocity, &sample, &mut dst)?;
+        let r = dst.to_cpu()?;
         let r1 = r.as_f32()?.as_slice()?;
         // dt = 0.3 - 1.0 = -0.7, prev = [1,2,3,4] + (-0.7)*[10,10,10,10]
         assert!((r1[0] - (-6.0)).abs() < 1e-5);

@@ -10,7 +10,6 @@ use crate::model::diffusion::diffusers_loader::DiffusersLoader;
 use crate::op::conv2d::conv2d;
 use crate::op::groupnorm::groupnorm;
 use crate::op::matmul::Matmul;
-use crate::op::scalar;
 use crate::op::sdpa::scaled_dot_product_attention;
 use crate::op::tensor_utils::{clone_tensor as tu_clone, materialize as tu_materialize, permute_nd};
 use crate::op::upsample::upsample_nearest_2x;
@@ -78,7 +77,7 @@ impl ResnetBlock {
         // norm1 + silu
         let mut h1 = Tensor::new(&[b, self.in_ch, h, w], x.dtype(), x.device())?;
         groupnorm(x, &self.norm1_w, &self.norm1_b, &mut h1, NORM_GROUPS, EPS)?;
-        scalar::silu_inplace(&mut h1)?;
+        h1.silu()?;
 
         // conv1
         let mut h2 = Tensor::new(&[b, self.out_ch, h, w], x.dtype(), x.device())?;
@@ -87,7 +86,7 @@ impl ResnetBlock {
         // norm2 + silu
         let mut h3 = Tensor::new(&[b, self.out_ch, h, w], x.dtype(), x.device())?;
         groupnorm(&h2, &self.norm2_w, &self.norm2_b, &mut h3, NORM_GROUPS, EPS)?;
-        scalar::silu_inplace(&mut h3)?;
+        h3.silu()?;
 
         // conv2
         let mut h4 = Tensor::new(&[b, self.out_ch, h, w], x.dtype(), x.device())?;
@@ -103,7 +102,7 @@ impl ResnetBlock {
         };
 
         // h4 += residual
-        tensor_add_inplace(&mut h4, &residual)?;
+        h4 += &residual;
         Ok(h4)
     }
 
@@ -194,7 +193,7 @@ impl AttnBlock {
 
         // Add residual
         let mut out = clone_tensor(x)?;
-        tensor_add_inplace(&mut out, &bchw)?;
+        out += &bchw;
         Ok(out)
     }
 
@@ -376,7 +375,7 @@ impl VaeDecoder {
         let out_shape: Vec<usize> = x.shape().to_vec();
         let mut h2 = Tensor::new(out_shape.as_slice(), dtype, x.device())?;
         groupnorm(&x, &self.conv_norm_out_w, &self.conv_norm_out_b, &mut h2, NORM_GROUPS, EPS)?;
-        scalar::silu_inplace(&mut h2)?;
+        h2.silu()?;
 
         let mut out = Tensor::new(&[out_shape[0], self.config.out_channels, out_shape[2], out_shape[3]],
             dtype, x.device())?;
@@ -484,13 +483,6 @@ fn load_attn(
 
 fn clone_tensor(t: &Tensor) -> Result<Tensor> { tu_clone(t) }
 fn materialize(t: &Tensor) -> Result<Tensor> { tu_materialize(t) }
-
-fn tensor_add_inplace(a: &mut Tensor, b: &Tensor) -> Result<()> {
-    use crate::op::add_inplace::AddInplace;
-    let op = AddInplace::new();
-    op.forward(b, a, None)?;
-    Ok(())
-}
 
 // ───────────────────────── Tests ─────────────────────────
 

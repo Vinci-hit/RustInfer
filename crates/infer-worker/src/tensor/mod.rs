@@ -632,29 +632,71 @@ impl Tensor {
             seen[p] = true;
         }
 
+        let new_shape: Vec<usize> = perm.iter().map(|&i| old_shape[i]).collect();
+        let mut out = Tensor::new(&new_shape, self.dtype(), self.device())?;
+        self.permute_into(perm, &mut out)?;
+        Ok(out)
+    }
+
+    /// Dst-write permute: writes `src.permute(perm)` into `dst` without
+    /// allocating. `dst` must already have shape
+    /// `[src.shape[perm[0]], ..., src.shape[perm[ndim-1]]]`, matching dtype
+    /// and device.
+    ///
+    /// This is the zero-allocation entry point used by the diffusion
+    /// hot path; `Tensor::permute` is a convenience wrapper around it.
+    pub fn permute_into(&self, perm: &[usize], dst: &mut Tensor) -> Result<()> {
+        let old_shape = self.shape();
+        let ndim = old_shape.len();
+        if perm.len() != ndim {
+            return Err(Error::InvalidArgument(format!(
+                "permute_into: perm length {} != ndim {}", perm.len(), ndim
+            )).into());
+        }
+        // 验证 perm 是 0..ndim 的排列
+        let mut seen = vec![false; ndim];
+        for &p in perm {
+            if p >= ndim || seen[p] {
+                return Err(Error::InvalidArgument(format!(
+                    "permute_into: invalid permutation {:?}", perm
+                )).into());
+            }
+            seen[p] = true;
+        }
+        let expected_shape: Vec<usize> = perm.iter().map(|&i| old_shape[i]).collect();
+        if dst.shape() != expected_shape.as_slice() {
+            return Err(Error::InvalidArgument(format!(
+                "permute_into: dst shape {:?} does not match permuted shape {:?}",
+                dst.shape(), expected_shape
+            )).into());
+        }
+        if dst.dtype() != self.dtype() {
+            return Err(Error::InvalidArgument(format!(
+                "permute_into: dtype mismatch src={:?} dst={:?}", self.dtype(), dst.dtype()
+            )).into());
+        }
+        if dst.device() != self.device() {
+            return Err(Error::InvalidArgument(format!(
+                "permute_into: device mismatch src={:?} dst={:?}", self.device(), dst.device()
+            )).into());
+        }
+
         // CUDA: 使用原生 CUDA permute kernel（支持 F32/BF16/F16/I32）
         #[cfg(feature = "cuda")]
         if self.device() != DeviceType::Cpu {
-            return self.permute_cuda(perm);
+            return self.permute_into_cuda(perm, dst);
         }
 
-        let new_shape: Vec<usize> = perm.iter().map(|&i| old_shape[i]).collect();
         let old_strides = self.strides();
         let n = self.num_elements();
-
-        // 新 tensor 的 strides（row-major）
         let new_strides = {
             let mut s = vec![1usize; ndim];
             for i in (0..ndim.saturating_sub(1)).rev() {
-                s[i] = s[i + 1] * new_shape[i + 1];
+                s[i] = s[i + 1] * expected_shape[i + 1];
             }
             s
         };
 
-        let mut out = Tensor::new(&new_shape, self.dtype(), self.device())?;
-
-        // 通用的索引映射: new_flat → old_flat
-        // new 的第 j 维对应 old 的第 perm[j] 维
         macro_rules! permute_copy {
             ($src_slice:expr, $dst_slice:expr) => {{
                 for flat_new in 0..n {
@@ -670,7 +712,7 @@ impl Tensor {
             }};
         }
 
-        match (self, &mut out) {
+        match (self, dst) {
             (Tensor::F32(s), Tensor::F32(d)) => {
                 let src = s.as_slice()?;
                 let dst = d.as_slice_mut()?;
@@ -698,13 +740,12 @@ impl Tensor {
             }
             _ => unreachable!(),
         }
-
-        Ok(out)
+        Ok(())
     }
 
     /// CUDA permute: 直接调用 CUDA kernel，不绕道 CPU。
     #[cfg(feature = "cuda")]
-    fn permute_cuda(&self, perm: &[usize]) -> Result<Self> {
+    fn permute_into_cuda(&self, perm: &[usize], dst: &mut Tensor) -> Result<()> {
         use crate::cuda::ffi::cudaStream_t;
 
         unsafe extern "C" {
@@ -729,11 +770,14 @@ impl Tensor {
         let src_shape = self.shape();
         let ndim = src_shape.len();
 
-        // I8 等不支持的 dtype fallback 到 CPU round-trip
+        // I8 等不支持的 dtype fallback 到 CPU round-trip（走分配路径，
+        // 调用方已知这是慢路径）
         if !matches!(self.dtype(), DataType::F32 | DataType::BF16 | DataType::F16 | DataType::I32) {
             let cpu_tensor = self.to_cpu()?;
             let permuted_cpu = cpu_tensor.permute(perm)?;
-            return permuted_cpu.to_device(self.device());
+            let uploaded = permuted_cpu.to_device(self.device())?;
+            dst.copy_from(&uploaded)?;
+            return Ok(());
         }
 
         let old_strides: Vec<i64> = self.strides().iter().map(|&s| s as i64).collect();
@@ -743,9 +787,6 @@ impl Tensor {
             new_strides[i] = new_strides[i + 1] * new_shape[i + 1];
         }
         let perm_i32: Vec<i32> = perm.iter().map(|&p| p as i32).collect();
-
-        let new_shape_usize: Vec<usize> = new_shape.iter().map(|&x| x as usize).collect();
-        let mut dst = Tensor::new(&new_shape_usize, self.dtype(), self.device())?;
 
         let num_elements = self.num_elements() as i64;
         let stream = crate::cuda::get_current_cuda_stream();
@@ -786,7 +827,7 @@ impl Tensor {
             _ => unreachable!(), // guarded by matches! above
         }
 
-        Ok(dst)
+        Ok(())
     }
 
     /// 从当前张量中创建一个零拷贝的切片（视图）。
@@ -1166,11 +1207,168 @@ impl Tensor {
         crate::op::broadcast_mul::broadcast_mul(self, scale, &mut out)?;
         out.view(self.shape())
     }
+
+    // ──────────────────────── In-place method API ────────────────────────
+    //
+    // Ergonomic wrappers around the underlying `*_inplace` kernels. All of
+    // these overwrite `self` in place and return `Result` so invalid
+    // shapes / dtypes surface as recoverable errors (unlike the `*Assign`
+    // operator overloads below, which panic on mismatch).
+
+    /// `self[i] = silu(self[i])`
+    pub fn silu(&mut self) -> Result<()> {
+        crate::op::scalar::silu_inplace(self)
+    }
+
+    /// `self[i] = tanh(self[i])`
+    pub fn tanh(&mut self) -> Result<()> {
+        crate::op::scalar::tanh_inplace(self)
+    }
+
+    /// `self[i, j] *= row[j]` with `row.shape == [D]` matching the last dim.
+    pub fn mul_row(&mut self, row: &Tensor) -> Result<()> {
+        crate::op::broadcast_mul::broadcast_mul_inplace(self, row)
+    }
+
+    /// Interleaved RoPE applied in place.
+    ///
+    /// - `self`: `[seq, n_heads, head_dim]` (dtype F32 or BF16 on device)
+    /// - `cos`, `sin`: `[seq, head_dim/2]` F32
+    pub fn rope_interleaved(&mut self, cos: &Tensor, sin: &Tensor, head_dim: usize) -> Result<()> {
+        crate::op::tensor_utils::apply_rope_interleaved_dev(self, cos, sin, head_dim)
+    }
+}
+
+// ─────────────────────── In-place operator overloads ────────────────────
+//
+// Rust's `+=`, `*=` correspond to the `*Assign` traits, which take
+// `&mut self` and return `()`. That matches the semantics we want for
+// in-place tensor math without allocating.
+//
+// Shape / dtype / device mismatches **panic** here — operator overloads
+// cannot return `Result`. Callers that need graceful error handling must
+// invoke the free functions (`scalar_add_inplace`, `AddInplace::forward`,
+// …) directly. Diffusion hot paths feed only state-resident buffers with
+// statically-matched shapes, so panics are reserved for actual bugs.
+//
+// Note: `AddAssign<&Tensor>` is declared above (legacy), so only the
+// missing variants (`+= f32`, `*= &Tensor`, `*= f32`) are added here.
+
+impl std::ops::AddAssign<f32> for Tensor {
+    /// Scalar broadcast `self += rhs`.
+    fn add_assign(&mut self, rhs: f32) {
+        crate::op::scalar::scalar_add_inplace(self, rhs)
+            .expect("Tensor += f32: kernel failed");
+    }
+}
+
+impl std::ops::MulAssign<&Tensor> for Tensor {
+    /// Element-wise `self *= rhs`. Shapes must match.
+    fn mul_assign(&mut self, rhs: &Tensor) {
+        crate::op::tensor_utils::ewise_mul_inplace(self, rhs)
+            .expect("Tensor *= &Tensor: kernel failed");
+    }
+}
+
+impl std::ops::MulAssign<f32> for Tensor {
+    /// Scalar broadcast `self *= rhs`. Also the canonical idiom for
+    /// negation: `x *= -1.0`.
+    fn mul_assign(&mut self, rhs: f32) {
+        crate::op::scalar::scalar_mul_inplace(self, rhs)
+            .expect("Tensor *= f32: kernel failed");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{base::{error::Result, DataType, DeviceType}, tensor::Tensor};
+
+    // ──────────── In-place operator overloads ────────────
+
+    fn make_f32_cpu(data: &[f32]) -> Result<Tensor> {
+        let mut t = Tensor::new(&[data.len()], DataType::F32, DeviceType::Cpu)?;
+        t.as_f32_mut()?.as_slice_mut()?.copy_from_slice(data);
+        Ok(t)
+    }
+
+    #[test]
+    fn op_add_assign_scalar_cpu() -> Result<()> {
+        let mut x = make_f32_cpu(&[1.0, 2.0, 3.0, 4.0])?;
+        x += 1.5;
+        assert_eq!(x.as_f32()?.as_slice()?, &[2.5, 3.5, 4.5, 5.5]);
+        Ok(())
+    }
+
+    #[test]
+    fn op_mul_assign_scalar_cpu_negate() -> Result<()> {
+        // `x *= -1.0` is the canonical way to negate.
+        let mut x = make_f32_cpu(&[1.0, -2.0, 3.0, -4.0])?;
+        x *= -1.0;
+        assert_eq!(x.as_f32()?.as_slice()?, &[-1.0, 2.0, -3.0, 4.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn op_mul_assign_tensor_cpu() -> Result<()> {
+        let mut a = make_f32_cpu(&[1.0, 2.0, 3.0, 4.0])?;
+        let b = make_f32_cpu(&[2.0, 3.0, 4.0, 5.0])?;
+        a *= &b;
+        assert_eq!(a.as_f32()?.as_slice()?, &[2.0, 6.0, 12.0, 20.0]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn op_add_assign_scalar_cuda() -> Result<()> {
+        let mut x = make_f32_cpu(&[1.0, 2.0, 3.0, 4.0])?.to_cuda(0)?;
+        x += 1.5;
+        let x_cpu = x.to_cpu()?;
+        assert_eq!(x_cpu.as_f32()?.as_slice()?, &[2.5, 3.5, 4.5, 5.5]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn op_mul_assign_tensor_cuda() -> Result<()> {
+        let mut a = make_f32_cpu(&[1.0, 2.0, 3.0, 4.0])?.to_cuda(0)?;
+        let b = make_f32_cpu(&[2.0, 3.0, 4.0, 5.0])?.to_cuda(0)?;
+        a *= &b;
+        let a_cpu = a.to_cpu()?;
+        assert_eq!(a_cpu.as_f32()?.as_slice()?, &[2.0, 6.0, 12.0, 20.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn method_mul_row_matches_broadcast_mul_cpu() -> Result<()> {
+        // x: [2, 4], v: [4]
+        let mut x = Tensor::new(&[2, 4], DataType::F32, DeviceType::Cpu)?;
+        x.as_f32_mut()?.as_slice_mut()?.copy_from_slice(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let mut v = Tensor::new(&[4], DataType::F32, DeviceType::Cpu)?;
+        v.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[0.5, 1.0, 2.0, 4.0]);
+
+        x.mul_row(&v)?;
+        assert_eq!(
+            x.as_f32()?.as_slice()?,
+            &[0.5, 2.0, 6.0, 16.0, 2.5, 6.0, 14.0, 32.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn method_silu_matches_scalar_silu_inplace_cpu() -> Result<()> {
+        let data = vec![-2.0f32, -0.5, 0.0, 0.5, 2.0];
+        let mut via_method = make_f32_cpu(&data)?;
+        via_method.silu()?;
+
+        let mut via_fn = make_f32_cpu(&data)?;
+        crate::op::scalar::silu_inplace(&mut via_fn)?;
+
+        assert_eq!(via_method.as_f32()?.as_slice()?, via_fn.as_f32()?.as_slice()?);
+        Ok(())
+    }
+
+    // ────────────── existing tests below ──────────────
 
     #[test]
     fn test_tensor_copy_from_cpu_to_cpu() -> Result<()> {

@@ -19,6 +19,8 @@ pub mod rope_embedder_3d;
 pub mod patchify;
 pub mod dit_block;
 pub mod text_encoder;
+pub mod state;
 
 pub use pipeline::ZImagePipeline;
 pub use text_encoder::Qwen3TextEncoder;
+pub use state::{DitShapeSpec, DitState, PipelineState, ZImageCapacity};

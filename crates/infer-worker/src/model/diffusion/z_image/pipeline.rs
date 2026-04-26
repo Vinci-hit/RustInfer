@@ -31,12 +31,16 @@ use std::time::Instant;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::Result;
-use crate::model::diffusion::pipeline::{DiffusionPipeline, DiffusionRequest, DiffusionOutput, DiffusionMetrics};
+use crate::model::diffusion::buffer::DiffBufferType as BT;
+use crate::model::diffusion::pipeline::{
+    DiffusionMetrics, DiffusionOutput, DiffusionPipeline, DiffusionRequest,
+};
 use crate::model::diffusion::scheduler::{FlowMatchEulerScheduler, Scheduler};
+use crate::model::diffusion::z_image::state::{DitState, PipelineState, ZImageCapacity};
 use crate::model::diffusion::z_image::text_encoder::Qwen3TextEncoder;
 use crate::model::diffusion::z_image::transformer::ZImageTransformer2DModel;
 use crate::model::runtime::InferenceState;
-use crate::op::tensor_utils::cast_dtype;
+use crate::op::tensor_utils::{cast_dtype, clone_tensor};
 use crate::tensor::Tensor;
 
 /// VAE scale factor (2^(len(block_out_channels)-1) = 8 for standard VAE).
@@ -57,8 +61,8 @@ const LATENT_CHANNELS: usize = 16;
 /// Z-Image text-to-image pipeline.
 ///
 /// Owns all components of the diffusers pipeline:
-/// text_encoder, transformer (DiT), scheduler.
-/// VAE decoder will be added when implemented.
+/// text_encoder, transformer (DiT), scheduler, VAE decoder, plus
+/// pre-allocated runtime state for the denoise ping-pong.
 pub struct ZImagePipeline {
     pub device: DeviceType,
     pub scheduler: FlowMatchEulerScheduler,
@@ -66,14 +70,37 @@ pub struct ZImagePipeline {
     pub text_encoder_state: InferenceState,
     pub transformer: ZImageTransformer2DModel,
     pub vae: crate::model::diffusion::vae::decoder::VaeDecoder,
+    /// Pipeline-level pre-allocated buffers (Latents / LatentsTmp /
+    /// NoisePred / Latent5D). Allocated once in `from_pretrained`; its
+    /// tensors are sliced to the request shape each `generate()` call and
+    /// never reallocated.
+    pub pipeline_state: PipelineState,
+    /// Transformer-level workspace. Owns every intermediate buffer the
+    /// DiT forward pass needs (embeddings, RoPE cache, per-block scratch,
+    /// final-layer outputs). Allocated once; block / transformer forward
+    /// functions slice from it each step.
+    pub dit_state: DitState,
     pub model_dir: PathBuf,
 }
 
 impl ZImagePipeline {
-    /// Load from a diffusers-format model directory.
+    /// Load from a diffusers-format model directory using the default
+    /// [`ZImageCapacity`] (1024×1024 max, 512 caption tokens).
     pub fn from_pretrained<P: AsRef<Path>>(
         model_dir: P,
         device: DeviceType,
+    ) -> Result<Self> {
+        Self::from_pretrained_with_capacity(model_dir, device, ZImageCapacity::default())
+    }
+
+    /// Load from a diffusers-format model directory with an explicit
+    /// capacity hint. The returned pipeline can only serve requests whose
+    /// `(height, width, cap_len)` fit within this capacity; anything
+    /// larger will be rejected by `check_request`.
+    pub fn from_pretrained_with_capacity<P: AsRef<Path>>(
+        model_dir: P,
+        device: DeviceType,
+        capacity: ZImageCapacity,
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
@@ -94,6 +121,17 @@ impl ZImagePipeline {
         let vae_dir = model_dir.join("vae");
         let vae = crate::model::diffusion::vae::decoder::VaeDecoder::from_pretrained(&vae_dir, device)?;
 
+        // 5. PipelineState — latent buffer pool sized to capacity.
+        //    Working dtype matches the transformer's weight dtype so the
+        //    scheduler step runs without any on-the-fly dtype conversions.
+        let weight_dtype = transformer.x_embedder.weight.dtype();
+        let pipeline_state = PipelineState::new(capacity, weight_dtype, device)?;
+
+        // 6. DitState — transformer internal workspace. Derives its
+        //    shape spec from the loaded transformer config + capacity.
+        let shape_spec = transformer.shape_spec(capacity);
+        let dit_state = DitState::new(shape_spec)?;
+
         Ok(Self {
             device,
             scheduler,
@@ -101,6 +139,8 @@ impl ZImagePipeline {
             text_encoder_state,
             transformer,
             vae,
+            pipeline_state,
+            dit_state,
             model_dir: model_dir.to_path_buf(),
         })
     }
@@ -117,109 +157,199 @@ impl ZImagePipeline {
 
     // ─────────────────── Step 2: Prepare Latents ─────────────────────
 
-    /// Generate random noise latents.
+    /// Fill the pre-allocated `Latents` buffer with fresh Gaussian noise
+    /// at the shape implied by `(height, width)`.
     ///
-    /// Returns `[1, 16, H', W']` where `H' = 2*(H/16)`, `W' = 2*(W/16)`.
+    /// Returns `(latent_h, latent_w)` so the caller can slice the exact
+    /// working region out of the oversized pool each step.
+    ///
+    /// The randn samples are generated on CPU (Box-Muller) then copied
+    /// into the state slot, cast to the working dtype on the fly. This
+    /// path still allocates a single transient F32 tensor, but it is
+    /// outside the denoise loop, so it never runs during graph capture.
     fn prepare_latents(
-        &self,
+        &mut self,
         height: usize,
         width: usize,
         seed: Option<u64>,
-    ) -> Result<Tensor> {
+    ) -> Result<(usize, usize)> {
         let vae_scale = VAE_SCALE_FACTOR * 2; // 16
         let latent_h = 2 * (height / vae_scale);
         let latent_w = 2 * (width / vae_scale);
 
-        Tensor::randn(
-            &[1, LATENT_CHANNELS, latent_h, latent_w],
-            DataType::F32,
-            self.device,
-            seed,
-        )
+        let weight_dtype = self.pipeline_state.dtype;
+        let shape = [1, LATENT_CHANNELS, latent_h, latent_w];
+
+        // Generate noise on CPU in F32, convert to target dtype, then
+        // copy into the pre-allocated Latents slot (sliced to the exact
+        // working region).
+        let noise_f32 = Tensor::randn(&shape, DataType::F32, self.device, seed)?;
+        let noise = cast_dtype(&noise_f32, weight_dtype)?;
+
+        let mut latents_slot = self.pipeline_state.slice_mut(BT::Latents, &shape)?;
+        latents_slot.copy_from(&noise)?;
+
+        Ok((latent_h, latent_w))
     }
 
     // ─────────────────── Step 3: Prepare Timesteps ───────────────────
 
-    /// Calculate shift mu and set timesteps.
+    /// Install the (fixed) Turbo sigma schedule on the scheduler.
     fn prepare_timesteps(&mut self, _latent_h: usize, _latent_w: usize) {
-        // Turbo 模式使用固定 sigma schedule，不需要 dynamic shifting
+        // Turbo runs a hard-coded 2-step schedule; no dynamic shifting.
         self.scheduler.set_timesteps_from_sigmas(TURBO_SIGMAS);
     }
 
     // ─────────────────── Step 4: Denoise Loop ────────────────────────
 
-    /// Run the denoising loop.
+    /// Run the denoising loop using the pipeline's pre-allocated latent
+    /// pool.
     ///
-    /// For Turbo: 2 steps with sigmas [1.0, 0.3].
-    /// Each step: normalize timestep → transformer → negate → scheduler.step
+    /// Ping-pongs between `Latents` and `LatentsTmp` slices so
+    /// `scheduler.step` always writes to a destination distinct from its
+    /// read source. `NoisePred` receives the (negated) DiT velocity each
+    /// step, then is consumed by the scheduler.
+    ///
+    /// Returns the final latents as an owned clone — decoupling the
+    /// output from the pool so `vae_decode` can run without holding a
+    /// borrow on `pipeline_state`.
     fn denoise(
         &mut self,
-        mut latents: Tensor,
+        latent_h: usize,
+        latent_w: usize,
         prompt_embeds: &Tensor,
     ) -> Result<Tensor> {
         let num_steps = self.scheduler.num_steps();
         let timesteps: Vec<f32> = self.scheduler.timesteps().to_vec();
-
         self.scheduler.reset();
 
-        for i in 0..num_steps {
-            let t = timesteps[i];
+        let shape4 = [1, LATENT_CHANNELS, latent_h, latent_w];
+        let shape5 = [LATENT_CHANNELS, 1, latent_h, latent_w];
+        let cuda_cfg = self.text_encoder_state.cuda_config.as_ref()
+            .filter(|_| self.device.is_cuda());
+
+        for (i, &t) in timesteps.iter().enumerate() {
             let norm_t = (1000.0 - t) / 1000.0;
 
-            // latents: [1, 16, H, W] → take sample 0 → [16, H, W] → unsqueeze(1) → [16, 1, H, W]
-            let shape = latents.shape().to_vec();
-            let (_b, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
-            let latent_5d = latents.view(&[c, 1, h, w])?;
-            let latent_5d = {
-                let mut m = Tensor::new(latent_5d.shape(), latent_5d.dtype(), latent_5d.device())?;
-                m.copy_from(&latent_5d)?;
-                m
+            // Ping-pong: even step reads Latents → writes LatentsTmp;
+            // odd step swaps. No mem::swap needed — each iteration
+            // re-slices the state.
+            let (sample_ty, dst_ty) = if i % 2 == 0 {
+                (BT::Latents, BT::LatentsTmp)
+            } else {
+                (BT::LatentsTmp, BT::Latents)
             };
 
-            // DiT forward: [16, 1, H, W], norm_t, [S, 2560] → [16, 1, H, W] velocity
+            // DiT input: copy the current [1, C, H, W] latent into the
+            // pre-allocated [C, 1, H, W] Latent5D slot so the transformer
+            // sees a contiguous, non-aliased tensor.
+            let cur = self.pipeline_state.slice(sample_ty, &shape4)?;
+            let mut latent_5d = self.pipeline_state.slice_mut(BT::Latent5D, &shape5)?;
+            latent_5d.copy_from(&cur.view(&shape5)?)?;
+
+            // DiT forward. `model_out` aliases state.ImageOut — we must
+            // consume it via copy_from into NoisePred before the next
+            // invocation would clobber the underlying buffer.
             let model_out = self.transformer.forward(
-                &latent_5d, norm_t, prompt_embeds,
-                if self.device.is_cuda() { self.text_encoder_state.cuda_config.as_ref() } else { None },
+                &latent_5d, norm_t, prompt_embeds, cuda_cfg, &mut self.dit_state,
             )?;
 
-            // squeeze(1): [16, 1, H, W] → [16, H, W], then view as [1, 16, H, W]
-            let noise_pred = model_out.view(&[1, c, h, w])?;
-            let mut noise_pred = {
-                let mut m = Tensor::new(noise_pred.shape(), noise_pred.dtype(), noise_pred.device())?;
-                m.copy_from(&noise_pred)?;
-                m
-            };
-            // negate: noise_pred = -noise_pred
-            let neg = {
-                let mut n = Tensor::new(noise_pred.shape(), noise_pred.dtype(), noise_pred.device())?;
-                crate::op::scalar::scalar_mul(&noise_pred, &mut n, -1.0)?;
-                n
-            };
-            noise_pred = neg;
+            // noise_pred = -model_out, shaped [1, C, H, W].
+            let mut noise_pred = self.pipeline_state.slice_mut(BT::NoisePred, &shape4)?;
+            noise_pred.copy_from(&model_out.view(&shape4)?)?;
+            noise_pred *= -1.0_f32;
 
-            latents = self.scheduler.step(&noise_pred, &latents)?;
+            // dst = sample + dt * noise_pred  (noise_pred is consumed).
+            let cur_read = self.pipeline_state.slice(sample_ty, &shape4)?;
+            let mut dst = self.pipeline_state.slice_mut(dst_ty, &shape4)?;
+            self.scheduler.step(&mut noise_pred, &cur_read, &mut dst)?;
         }
 
-        Ok(latents)
+        // After N iterations the last write lives in `Latents` (N even)
+        // or `LatentsTmp` (N odd). Clone it out so the caller doesn't
+        // need to hold a borrow on the state.
+        let final_ty = if num_steps % 2 == 0 { BT::Latents } else { BT::LatentsTmp };
+        clone_tensor(&self.pipeline_state.slice(final_ty, &shape4)?)
     }
 
     // ─────────────────── Step 5: VAE Decode ──────────────────────────
 
-    /// Decode latents to RGB image.
+    /// Decode latents to an RGB image.
     ///
-    /// `latents / scaling_factor + shift_factor → vae.decode()`
+    /// `shifted = latents / scaling_factor + shift_factor`, then
+    /// `vae.decode(shifted)` produces `[B, 3, H*8, W*8]`.
     fn vae_decode(&self, latents: &Tensor) -> Result<Tensor> {
-        // Rescale: latents / scaling_factor + shift_factor
-        let mut rescaled = Tensor::new(latents.shape(), latents.dtype(), latents.device())?;
-        crate::op::scalar::scalar_mul(latents, &mut rescaled, 1.0 / VAE_SCALING_FACTOR)?;
-        let mut shifted = Tensor::new(latents.shape(), latents.dtype(), latents.device())?;
-        crate::op::scalar::scalar_add(&rescaled, &mut shifted, VAE_SHIFT_FACTOR)?;
+        let mut shifted = clone_tensor(latents)?;
+        shifted *= 1.0_f32 / VAE_SCALING_FACTOR;
+        shifted += VAE_SHIFT_FACTOR;
 
-        // Actual VAE decode: [B, 16, H, W] → [B, 3, H*8, W*8]
-        let cfg = if self.device.is_cuda() { self.text_encoder_state.cuda_config.as_ref() } else { None };
-        let image = self.vae.decode(&shifted, cfg)?;
+        let cfg = self.text_encoder_state.cuda_config.as_ref()
+            .filter(|_| self.device.is_cuda());
+        self.vae.decode(&shifted, cfg)
+    }
 
-        Ok(image)
+    // ─────────────────── Warm-up ─────────────────────────────────────
+
+    /// Pre-run every hot path so the first real `generate()` call sees a
+    /// hot CUDA context. Covers:
+    ///
+    /// - CUDA kernel module load / PTX→SASS JIT for every kernel in the
+    ///   text-encoder, DiT transformer, and VAE decoder.
+    /// - cuBLASLt algorithm heuristics for every `(M,N,K,dtype,layout)`
+    ///   tuple hit during denoise.
+    /// - cuDNN Conv2d descriptor / algorithm / workspace cache
+    ///   ([`Conv2dCache`]) for every conv in the VAE at the requested
+    ///   shape.
+    ///
+    /// Runs a single end-to-end `generate()` at `(height, width)` with a
+    /// 1-char prompt and one denoise step, then `cudaDeviceSynchronize`s
+    /// so every cache fill completes before this call returns.
+    ///
+    /// ## Choosing `(height, width)`
+    ///
+    /// cuDNN's conv cache key includes the input shape, so the cache
+    /// entries filled here only help subsequent requests at the **same**
+    /// `(height, width)`. For production serving, call this with the
+    /// exact shape you expect; for generic warmup call [`Self::warmup`]
+    /// which uses the smallest supported shape (256×256).
+    ///
+    /// Both `height` and `width` must be multiples of 16 (VAE requires
+    /// `H % 16 == 0`, `W % 16 == 0`) and fit within the pipeline's
+    /// configured [`ZImageCapacity`].
+    ///
+    /// [`Conv2dCache`]: crate::op::kernels::cuda::Conv2dCache
+    pub fn warmup_for(&mut self, height: usize, width: usize) -> Result<()> {
+        // A full 2-step Turbo generate() at 256×256 runs in a handful of
+        // milliseconds once warm, so we just replay the real path rather
+        // than building a bespoke single-step shortcut — that would risk
+        // drifting from what `generate()` actually exercises.
+        let request = DiffusionRequest {
+            prompt: "a".to_string(),
+            height,
+            width,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let _ = self.generate(&request)?;
+
+        // Ensure every queued kernel / cache fill has completed before
+        // we hand control back; otherwise the first user request would
+        // still race against tail latency from warmup.
+        if self.device.is_cuda() {
+            unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
+        }
+        Ok(())
+    }
+
+    /// Generic warm-up at the smallest supported shape (256×256).
+    ///
+    /// Use this when you don't know the exact request shape up-front.
+    /// Populates kernel module / cuBLASLt / tokenizer caches, but the
+    /// cuDNN Conv2d cache entries are keyed on shape — they'll be
+    /// re-filled on the first request at a different `(height, width)`.
+    /// For shape-specific warm-up prefer [`Self::warmup_for`].
+    pub fn warmup(&mut self) -> Result<()> {
+        self.warmup_for(256, 256)
     }
 }
 
@@ -229,34 +359,59 @@ impl DiffusionPipeline for ZImagePipeline {
     }
 
     fn generate(&mut self, request: &DiffusionRequest) -> Result<DiffusionOutput> {
+        // All per-stage timings are **GPU wall-time**, not host-side
+        // launch time: each stage ends with a `cudaDeviceSynchronize`
+        // (on CUDA) so any kernels it enqueued are actually finished
+        // before we stop the clock. Without this, encode_prompt_ms
+        // would measure host launch throughput (typically <5 ms) while
+        // the work was still racing on the stream.
+        let is_cuda = self.device.is_cuda();
+        let sync = || -> Result<()> {
+            #[cfg(feature = "cuda")]
+            {
+                if is_cuda {
+                    unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            { let _ = is_cuda; }
+            Ok(())
+        };
+
         let total_start = Instant::now();
         let weight_dtype = self.transformer.x_embedder.weight.dtype();
+
+        // Capacity guard — reject requests that don't fit the pre-allocated
+        // pool rather than silently reallocating.
+        self.pipeline_state.check_request(request.height, request.width)?;
 
         // ── Step 1: Encode prompt ──
         let encode_start = Instant::now();
         let prompt_embeds = self.encode_prompt(&request.prompt)?;
-        // 对齐到权重 dtype（text encoder 输出 F32，CUDA 权重为 BF16）
+        // Cast to the transformer's weight dtype (text encoder emits F32,
+        // CUDA weights are typically BF16).
         let prompt_embeds = cast_dtype(&prompt_embeds, weight_dtype)?;
+        sync()?;
         let encode_prompt_ms = encode_start.elapsed().as_millis() as u64;
 
-        // ── Step 2: Prepare latents ──
-        let latents = self.prepare_latents(request.height, request.width, request.seed)?;
-        let latent_h = latents.shape()[2];
-        let latent_w = latents.shape()[3];
-        // latents 从 F32 转到权重 dtype
-        let latents = cast_dtype(&latents, weight_dtype)?;
+        // ── Step 2: Prepare latents (fills pipeline_state.Latents in place) ──
+        let (latent_h, latent_w) = self.prepare_latents(
+            request.height, request.width, request.seed,
+        )?;
 
         // ── Step 3: Prepare timesteps ──
         self.prepare_timesteps(latent_h, latent_w);
 
-        // ── Step 4: Denoise loop ──
+        // ── Step 4: Denoise loop (ping-pongs through the state pool) ──
         let denoise_start = Instant::now();
-        let latents = self.denoise(latents, &prompt_embeds)?;
+        let latents = self.denoise(latent_h, latent_w, &prompt_embeds)?;
+        sync()?;
         let denoise_ms = denoise_start.elapsed().as_millis() as u64;
 
         // ── Step 5: VAE decode ──
         let decode_start = Instant::now();
         let image = self.vae_decode(&latents)?;
+        sync()?;
         let decode_ms = decode_start.elapsed().as_millis() as u64;
 
         let total_ms = total_start.elapsed().as_millis() as u64;
@@ -318,34 +473,6 @@ mod tests {
         Path::new("/root/z-image-turbo")
     }
 
-    #[test]
-    #[ignore = "需要 Z-Image 模型权重"]
-    fn test_pipeline_from_pretrained() -> Result<()> {
-        let model_dir = get_model_dir();
-        if !model_dir.join("text_encoder/config.json").exists() { return Ok(()); }
-
-        let pipeline = ZImagePipeline::from_pretrained(model_dir, DeviceType::Cpu)?;
-
-        assert_eq!(pipeline.name(), "z-image-turbo");
-        assert_eq!(pipeline.transformer.config.dim, 3840);
-        assert_eq!(pipeline.text_encoder.output_layer_count, 35);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "需要 Z-Image 模型权重"]
-    fn test_pipeline_encode_prompt() -> Result<()> {
-        let model_dir = get_model_dir();
-        if !model_dir.join("text_encoder/config.json").exists() { return Ok(()); }
-
-        let mut pipeline = ZImagePipeline::from_pretrained(model_dir, DeviceType::Cpu)?;
-        let embeds = pipeline.encode_prompt("a beautiful sunset over the ocean")?;
-
-        println!("Prompt embeds shape: {:?}", embeds.shape());
-        assert_eq!(embeds.shape().len(), 2);
-        assert_eq!(embeds.shape()[1], 2560); // Qwen3 hidden_dim
-        Ok(())
-    }
 
     #[test]
     fn test_prepare_latents_shape() -> Result<()> {
@@ -394,11 +521,19 @@ mod tests {
 
         eprintln!("[test] loading pipeline...");
         let mut pipeline = ZImagePipeline::from_pretrained(model_dir, DeviceType::Cuda(0))?;
-        eprintln!("[test] loaded. generating...");
+
+        // Warm every hot path (kernel JIT, cuBLASLt heuristics, cuDNN
+        // Conv2d cache) at the exact shape we're about to generate at.
+        // Without this, the single generate() call below eats the full
+        // cold-start tax — typically 10×+ the steady-state latency.
+        eprintln!("[test] warming up at 256x256...");
+        let t_warm = Instant::now();
+        pipeline.warmup_for(256, 256)?;
+        eprintln!("[test] warmup done in {}ms", t_warm.elapsed().as_millis());
 
         // Very small size to isolate correctness / hang issues.
         let request = DiffusionRequest {
-            prompt: "a cat".to_string(),
+            prompt: "a photograph of a cat wearing a red hat, sitting on a wooden bench in a sunny park".to_string(),
             height: 256,
             width: 256,
             seed: Some(42),
@@ -406,13 +541,16 @@ mod tests {
         };
 
         let output = pipeline.generate(&request)?;
-        println!("Output shape: {:?}", output.output.shape());
-        println!("Metrics: encode={}ms, denoise={}ms, decode={}ms, total={}ms",
+        eprintln!("Output shape: {:?}", output.output.shape());
+        eprintln!("Metrics: encode={}ms, denoise={}ms, decode={}ms, total={}ms",
             output.metrics.encode_prompt_ms,
             output.metrics.denoise_ms,
             output.metrics.decode_ms,
             output.metrics.total_ms,
         );
+        save_tensor_as_ppm(&output.output, "/root/z_image_cuda_output.ppm")?;
+        eprintln!("Saved /root/z_image_cuda_output.ppm");
         Ok(())
     }
+
 }

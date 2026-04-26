@@ -33,7 +33,7 @@ impl DeviceType {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     UnKnown,
     F32,
