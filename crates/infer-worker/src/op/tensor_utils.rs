@@ -67,14 +67,14 @@ unsafe fn d2d_memcpy_async(dst: *mut core::ffi::c_void, src: *const core::ffi::c
 /// Deep-copy a tensor. Handles any dtype/device.
 pub fn clone_tensor(t: &Tensor) -> Result<Tensor> {
     let mut out = Tensor::new(t.shape(), t.dtype(), t.device())?;
-    out.copy_from(t)?;
+    out.copy_from_on_current_stream(t)?;
     Ok(out)
 }
 
 /// Materialize a possibly non-contiguous view into a contiguous tensor.
 pub fn materialize(t: &Tensor) -> Result<Tensor> {
     let mut out = Tensor::new(t.shape(), t.dtype(), t.device())?;
-    out.copy_from(t)?;
+    out.copy_from_on_current_stream(t)?;
     Ok(out)
 }
 
@@ -326,7 +326,7 @@ pub fn cast_dtype_into(src: &Tensor, dst: &mut Tensor) -> Result<()> {
 
     // identity fast path
     if src.dtype() == dst.dtype() {
-        return dst.copy_from(src);
+        return dst.copy_from_on_current_stream(src);
     }
 
     match src.device() {
@@ -334,7 +334,7 @@ pub fn cast_dtype_into(src: &Tensor, dst: &mut Tensor) -> Result<()> {
             // CPU 路径直接用 Tensor::to_dtype 语义 —— 分配一次中间再拷贝。
             // CPU 不是 hot path，这样实现最简且保持与旧行为一致。
             let tmp = src.to_dtype(dst.dtype())?;
-            dst.copy_from(&tmp)
+            dst.copy_from_on_current_stream(&tmp)
         }
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
@@ -412,7 +412,7 @@ pub fn pad_last_row_into(src: &Tensor, dst: &mut Tensor) -> Result<()> {
 
     // Short-circuit: no padding needed.
     if target_len == n {
-        return dst.copy_from(src);
+        return dst.copy_from_on_current_stream(src);
     }
 
     let bytes_per_row = d * src.dtype().size_in_bytes();
@@ -508,7 +508,7 @@ pub fn pad_with_token_into(
     }
 
     if target_len == n {
-        return dst.copy_from(src);
+        return dst.copy_from_on_current_stream(src);
     }
 
     let bytes_per_row = d * src.dtype().size_in_bytes();

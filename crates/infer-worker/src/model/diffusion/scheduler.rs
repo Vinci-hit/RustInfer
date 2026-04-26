@@ -11,8 +11,27 @@ use crate::tensor::Tensor;
 
 /// Scheduler controls the noise schedule and single-step denoising.
 pub trait Scheduler: Send {
-    /// Prepare timesteps from explicit sigma values (used by Turbo models).
+    /// Prepare timesteps from explicit sigma values (used by Turbo models
+    /// or whenever a caller wants to override the default schedule).
+    ///
+    /// Length is the number of denoising steps; `set_timesteps_from_sigmas`
+    /// will append a trailing 0 internally so the final destination is
+    /// exactly zero noise.
     fn set_timesteps_from_sigmas(&mut self, sigmas: &[f32]);
+
+    /// Prepare timesteps using the scheduler's **built-in default**
+    /// schedule — i.e. the one the original reference pipeline would
+    /// pick when the user only says "I want N inference steps".
+    ///
+    /// Implementations that need extra context (e.g. image sequence
+    /// length for Flow-Match dynamic shifting) accept it via
+    /// `image_seq_len`; schedulers that ignore it (e.g. DDPM) simply
+    /// drop the argument.
+    fn set_timesteps_default(
+        &mut self,
+        num_inference_steps: usize,
+        image_seq_len: Option<usize>,
+    );
 
     /// Return the current timestep schedule.
     fn timesteps(&self) -> &[f32];
@@ -81,6 +100,70 @@ impl Scheduler for FlowMatchEulerScheduler {
         self.step_index = 0;
     }
 
+    /// Build the **default** Flow-Match sigma schedule for a given
+    /// inference-step count. Mirrors `diffusers.FlowMatchEulerDiscreteScheduler.set_timesteps`:
+    ///
+    /// 1. `sigmas = linspace(1.0, 1/num_train_timesteps, N)` — even
+    ///    distribution in t-space (we collapse diffusers' `_sigma_to_t`
+    ///    round-trip since it's the identity for Flow-Match).
+    /// 2. If `image_seq_len` is provided, compute the adaptive
+    ///    `mu = calculate_shift(seq_len, 256, 4096, 0.5, 1.15)`
+    ///    (Z-Image / Flux / SD3 defaults) and apply **dynamic shifting**:
+    ///      `sigmas = exp(mu) / (exp(mu) + (1/sigma - 1))`.
+    /// 3. Otherwise apply **static shifting** with `self.shift`:
+    ///      `sigmas = shift * sigma / (1 + (shift - 1) * sigma)`.
+    ///
+    /// A trailing `0.0` is appended so the last Euler step integrates
+    /// all the way to zero noise.
+    fn set_timesteps_default(
+        &mut self,
+        num_inference_steps: usize,
+        image_seq_len: Option<usize>,
+    ) {
+        assert!(num_inference_steps > 0, "num_inference_steps must be >= 1");
+        let n = num_inference_steps;
+        let sigma_min = 1.0_f32 / self.num_train_timesteps as f32;
+
+        // Linear sigma schedule from 1.0 → sigma_min in N steps.
+        let mut sigmas: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+                1.0 + t * (sigma_min - 1.0)
+            })
+            .collect();
+
+        // Apply shift. Dynamic if image_seq_len given (Z-Image / Flux
+        // convention), otherwise static with the stored `self.shift`.
+        match image_seq_len {
+            Some(seq_len) => {
+                let mu = calculate_shift(seq_len, 256, 4096, 0.5, 1.15);
+                let emu = mu.exp();
+                for s in sigmas.iter_mut() {
+                    // dynamic shift: σ' = e^μ / (e^μ + (1/σ − 1))
+                    *s = emu / (emu + (1.0 / *s - 1.0));
+                }
+            }
+            None => {
+                let shift = self.shift;
+                for s in sigmas.iter_mut() {
+                    // static shift: σ' = shift·σ / (1 + (shift−1)·σ)
+                    *s = shift * *s / (1.0 + (shift - 1.0) * *s);
+                }
+            }
+        }
+
+        // Timesteps are sigmas mapped back to [0, num_train_timesteps].
+        self.timesteps = sigmas
+            .iter()
+            .map(|&s| s * self.num_train_timesteps as f32)
+            .collect();
+
+        // Finalise sigma list with trailing zero.
+        sigmas.push(0.0);
+        self.sigmas = sigmas;
+        self.step_index = 0;
+    }
+
     fn timesteps(&self) -> &[f32] {
         &self.timesteps
     }
@@ -105,10 +188,10 @@ impl Scheduler for FlowMatchEulerScheduler {
 
         // dst = sample + dt * model_output
         //   1) model_output *= dt      (in-place scale, no alloc)
-        //   2) dst = sample            (copy; ping-pong target differs from sample)
+        //   2) dst = sample            (stream-ordered async copy)
         //   3) dst += model_output     (in-place add)
         *model_output *= dt;
-        dst.copy_from(sample)?;
+        dst.copy_from_on_current_stream(sample)?;
         *dst += &*model_output;
 
         self.step_index += 1;

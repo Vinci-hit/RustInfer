@@ -194,10 +194,35 @@ impl ZImagePipeline {
 
     // ─────────────────── Step 3: Prepare Timesteps ───────────────────
 
-    /// Install the (fixed) Turbo sigma schedule on the scheduler.
-    fn prepare_timesteps(&mut self, _latent_h: usize, _latent_w: usize) {
-        // Turbo runs a hard-coded 2-step schedule; no dynamic shifting.
-        self.scheduler.set_timesteps_from_sigmas(TURBO_SIGMAS);
+    /// Install a sigma schedule on the scheduler.
+    ///
+    /// - If the request supplies an explicit `sigmas` list, those sigmas
+    ///   are used verbatim (length = number of denoising steps).
+    /// - Otherwise the scheduler generates its official default
+    ///   schedule for `num_inference_steps`, applying dynamic shifting
+    ///   based on the latent sequence length (matching
+    ///   `diffusers.FlowMatchEulerDiscreteScheduler` on Z-Image / Flux /
+    ///   SD3).
+    fn prepare_timesteps(
+        &mut self,
+        request: &DiffusionRequest,
+        latent_h: usize,
+        latent_w: usize,
+    ) {
+        match request.sigmas.as_deref() {
+            Some(sigmas) => {
+                self.scheduler.set_timesteps_from_sigmas(sigmas);
+            }
+            None => {
+                // image_seq_len = number of DiT tokens after patchify.
+                let patch = self.transformer.patch_size;
+                let image_seq_len = (latent_h / patch) * (latent_w / patch);
+                self.scheduler.set_timesteps_default(
+                    request.num_inference_steps,
+                    Some(image_seq_len),
+                );
+            }
+        }
     }
 
     // ─────────────────── Step 4: Denoise Loop ────────────────────────
@@ -245,7 +270,7 @@ impl ZImagePipeline {
             // sees a contiguous, non-aliased tensor.
             let cur = self.pipeline_state.slice(sample_ty, &shape4)?;
             let mut latent_5d = self.pipeline_state.slice_mut(BT::Latent5D, &shape5)?;
-            latent_5d.copy_from(&cur.view(&shape5)?)?;
+            latent_5d.copy_from_on_current_stream(&cur.view(&shape5)?)?;
 
             // DiT forward. `model_out` aliases state.ImageOut — we must
             // consume it via copy_from into NoisePred before the next
@@ -256,7 +281,7 @@ impl ZImagePipeline {
 
             // noise_pred = -model_out, shaped [1, C, H, W].
             let mut noise_pred = self.pipeline_state.slice_mut(BT::NoisePred, &shape4)?;
-            noise_pred.copy_from(&model_out.view(&shape4)?)?;
+            noise_pred.copy_from_on_current_stream(&model_out.view(&shape4)?)?;
             noise_pred *= -1.0_f32;
 
             // dst = sample + dt * noise_pred  (noise_pred is consumed).
@@ -327,6 +352,11 @@ impl ZImagePipeline {
             prompt: "a".to_string(),
             height,
             width,
+            // Use the cheapest schedule (2-step Turbo) regardless of
+            // what the user will eventually request — warmup only
+            // cares about populating kernel / cuBLASLt / cuDNN caches,
+            // not about image quality.
+            sigmas: Some(TURBO_SIGMAS.to_vec()),
             seed: Some(0),
             ..Default::default()
         };
@@ -400,7 +430,7 @@ impl DiffusionPipeline for ZImagePipeline {
         )?;
 
         // ── Step 3: Prepare timesteps ──
-        self.prepare_timesteps(latent_h, latent_w);
+        self.prepare_timesteps(request, latent_h, latent_w);
 
         // ── Step 4: Denoise loop (ping-pongs through the state pool) ──
         let denoise_start = Instant::now();
@@ -536,6 +566,11 @@ mod tests {
             prompt: "a photograph of a cat wearing a red hat, sitting on a wooden bench in a sunny park".to_string(),
             height: 256,
             width: 256,
+            // Keep the original 2-step Turbo schedule so this test
+            // stays comparable to previous runs. Use
+            // `test_pipeline_bench_cuda_9step` to measure the 9-step
+            // official schedule instead.
+            sigmas: Some(TURBO_SIGMAS.to_vec()),
             seed: Some(42),
             ..Default::default()
         };
@@ -550,6 +585,73 @@ mod tests {
         );
         save_tensor_as_ppm(&output.output, "/root/z_image_cuda_output.ppm")?;
         eprintln!("Saved /root/z_image_cuda_output.ppm");
+        Ok(())
+    }
+
+    // ─────────────────── Steady-state benches ────────────────────────
+
+    /// Run `N_ITER` back-to-back generations at 256×256 on the 2-step
+    /// **Turbo** schedule. Prints per-iteration stage timings so the
+    /// steady-state cost (iter ≥ 1, after warmup fills every cache)
+    /// can be read straight off.
+    #[test]
+    #[ignore = "需要 Z-Image 模型权重 + CUDA"]
+    #[cfg(feature = "cuda")]
+    fn test_pipeline_bench_cuda() -> Result<()> {
+        bench_pipeline_with_schedule("turbo-2step", Some(TURBO_SIGMAS.to_vec()), 0)
+    }
+
+    /// Same bench at 256×256, but on the **official 9-step** schedule
+    /// (linear sigmas + dynamic shifting, matching the full-quality
+    /// Z-Image pipeline rather than Turbo).
+    ///
+    /// Useful to compare denoise-loop throughput against the vllm-omni
+    /// server's 9-step default.
+    #[test]
+    #[ignore = "需要 Z-Image 模型权重 + CUDA"]
+    #[cfg(feature = "cuda")]
+    fn test_pipeline_bench_cuda_9step() -> Result<()> {
+        bench_pipeline_with_schedule("official-9step", None, 9)
+    }
+
+    /// Shared bench harness. When `sigmas.is_some()`, the explicit
+    /// schedule is used (e.g. Turbo). Otherwise the pipeline falls
+    /// back to the scheduler's built-in default for
+    /// `num_inference_steps`.
+    #[cfg(feature = "cuda")]
+    fn bench_pipeline_with_schedule(
+        label: &str,
+        sigmas: Option<Vec<f32>>,
+        num_inference_steps: usize,
+    ) -> Result<()> {
+        let model_dir = get_model_dir();
+        if !model_dir.join("text_encoder/config.json").exists() { return Ok(()); }
+
+        let mut pipeline = ZImagePipeline::from_pretrained(model_dir, DeviceType::Cuda(0))?;
+        eprintln!("[bench:{label}] warming up at 256x256...");
+        let t_warm = Instant::now();
+        pipeline.warmup_for(256, 256)?;
+        eprintln!("[bench:{label}] warmup done in {}ms", t_warm.elapsed().as_millis());
+
+        let request = DiffusionRequest {
+            prompt: "a photograph of a cat wearing a red hat, sitting on a wooden bench in a sunny park".to_string(),
+            height: 256,
+            width: 256,
+            sigmas,
+            num_inference_steps,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        const N_ITER: usize = 5;
+        eprintln!("[bench:{label}] {:>4}  {:>8}  {:>8}  {:>8}  {:>8}",
+            "iter", "encode", "denoise", "decode", "total");
+        for i in 0..N_ITER {
+            let out = pipeline.generate(&request)?;
+            let m = &out.metrics;
+            eprintln!("[bench:{label}] {:>4}  {:>6}ms  {:>6}ms  {:>6}ms  {:>6}ms",
+                i, m.encode_prompt_ms, m.denoise_ms, m.decode_ms, m.total_ms);
+        }
         Ok(())
     }
 

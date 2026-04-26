@@ -204,7 +204,7 @@ impl Matmul {
                 let bias_bc_matched = bias_bc.view(&out_shape)?;
                 let bias_bc_matched_mat = {
                     let mut m = crate::tensor::Tensor::new(&out_shape, bias.dtype(), bias.device())?;
-                    m.copy_from(&bias_bc_matched)?;
+                    m.copy_from_on_current_stream(&bias_bc_matched)?;
                     m
                 };
                 match device {

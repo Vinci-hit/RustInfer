@@ -305,7 +305,7 @@ impl ZImageTransformer2DModel {
         let adaln_input_2d = self.t_embedder.forward(&t_tensor, cuda_config)?;
         let adaln_input_view = adaln_input_2d.view(&[ADALN_EMBED_DIM])?;
         let mut adaln_input = state.slice_mut(BT::AdalnInput, &[ADALN_EMBED_DIM])?;
-        adaln_input.copy_from(&adaln_input_view)?;
+        adaln_input.copy_from_on_current_stream(&adaln_input_view)?;
 
         // ── Patchify & embed image ──
         let image_shape = image.shape();
@@ -316,7 +316,7 @@ impl ZImageTransformer2DModel {
 
         // Materialize patches into the reserved Patches slot (dst-write).
         let mut patches = state.slice_mut(BT::Patches, &[n, patch_in_dim])?;
-        patches.copy_from(&patches_view)?;
+        patches.copy_from_on_current_stream(&patches_view)?;
 
         // x_emb = x_embedder(patches): [n, dim]
         let mut x_emb = state.slice_mut(BT::XEmb, &[n, self.config.dim])?;
@@ -351,7 +351,7 @@ impl ZImageTransformer2DModel {
 
         // overwrite_pad_tokens → CapPadded slot (copy then stamp)
         let mut cap_padded = state.slice_mut(BT::CapPadded, &[cap_padded_len, self.config.dim])?;
-        cap_padded.copy_from(&cap_emb)?;
+        cap_padded.copy_from_on_current_stream(&cap_emb)?;
         overwrite_pad_tokens_inplace(&mut cap_padded, &self.cap_pad_token, cap_ori_len)?;
 
         // ── Build position ids ──
@@ -431,7 +431,7 @@ impl ZImageTransformer2DModel {
         let mut image_out = state.slice_mut(
             BT::ImageOut, &[self.config.in_channels, f, h, w],
         )?;
-        image_out.copy_from(&image_out_view)?;
+        image_out.copy_from_on_current_stream(&image_out_view)?;
         Ok(image_out)
     }
 
@@ -484,7 +484,7 @@ impl ZImageTransformer2DModel {
 
         // scale = 1 + adaLN_modulation(silu(c))
         let mut c_silu = state.slice_mut(BT::AdalnSilu, &[ADALN_EMBED_DIM])?;
-        c_silu.copy_from(c)?;
+        c_silu.copy_from_on_current_stream(c)?;
         c_silu.silu()?;
         let c_silu_2d = c_silu.view(&[1, ADALN_EMBED_DIM])?;
 

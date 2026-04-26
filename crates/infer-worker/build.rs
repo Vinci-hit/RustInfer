@@ -72,6 +72,7 @@ fn main() {
             .allowlist_function("cudaMemcpy")
             .allowlist_function("cudaMemcpyAsync")
             .allowlist_function("cudaMemset")
+            .allowlist_function("cudaMemsetAsync")
             .allowlist_function("cudaGetErrorString")
             .allowlist_function("cudaGetErrorName")
             .allowlist_function("cudaGetDevice")

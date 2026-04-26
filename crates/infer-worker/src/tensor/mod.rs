@@ -938,6 +938,60 @@ impl Tensor {
 
         Ok(())
     }
+
+    /// Stream-ordered async 版本的 [`Tensor::copy_from`]。
+    ///
+    /// 把拷贝排到 `stream` 上并立即返回，host 不阻塞。跨阶段的
+    /// 正确性依赖于调用方在适当的位置做 `cudaStreamSynchronize`
+    /// / `cudaDeviceSynchronize`（本工程 `generate()` 每个阶段末尾
+    /// 已经有 sync）。
+    ///
+    /// CPU→CPU 的场景 stream 被忽略，语义与 `copy_from` 一致。
+    #[cfg(feature = "cuda")]
+    pub fn copy_from_async(
+        &mut self,
+        src: &Tensor,
+        stream: crate::cuda::ffi::cudaStream_t,
+    ) -> Result<()> {
+        if self.shape().iter().product::<usize>() != src.shape().iter().product::<usize>() {
+            anyhow::bail!(
+                "Tensor shape mismatch for copy_from_async: dst {:?}, src {:?}",
+                self.shape(),
+                src.shape()
+            );
+        }
+        if self.dtype() != src.dtype() {
+            return Err(Error::InvalidArgument(format!(
+                "Tensor dtype mismatch for copy_from_async: dst {:?}, src {:?}",
+                self.dtype(),
+                src.dtype()
+            )).into());
+        }
+        let dst_buffer = self.buffer_mut();
+        let src_buffer = src.buffer();
+        dst_buffer.copy_from_async(src_buffer, stream)?;
+        Ok(())
+    }
+
+    /// 自动在"当前线程的 CUDA stream"上做 async 拷贝；CPU tensor
+    /// 或未启用 cuda feature 时退化为同步 `copy_from`。
+    ///
+    /// 这是 diffusion 热路径的首选调用方式：调用点一行替换即可
+    /// 把同步 `cudaMemcpy` 变成 stream-ordered `cudaMemcpyAsync`。
+    #[inline]
+    pub fn copy_from_on_current_stream(&mut self, src: &Tensor) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            // 只要任意一端在 CUDA 上，就走 async 路径。两端都在 CPU
+            // 时 buffer 层会忽略 stream，语义等同。
+            if self.device().is_cuda() || src.device().is_cuda() {
+                let stream = crate::cuda::get_current_cuda_stream();
+                return self.copy_from_async(src, stream);
+            }
+        }
+        self.copy_from(src)
+    }
+
     pub fn from_view_on_cpu(view: &TensorView) -> Result<Self> {
         // from_view 已经可以将数据加载到 CPU 上了，我们只需要确保它这样做
         Tensor::from_view(view, DeviceType::Cpu)

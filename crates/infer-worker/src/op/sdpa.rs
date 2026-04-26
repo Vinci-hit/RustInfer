@@ -184,7 +184,7 @@ fn sdpa_cuda(
         // 写回 output 的第 i 个 head
         let mut out_slice = output_3d.slice(&[i, 0, 0], &[1, s_q, head_dim])?
             .view(&[s_q, head_dim])?;
-        out_slice.copy_from(&out_i)?;
+        out_slice.copy_from_on_current_stream(&out_i)?;
     }
 
     Ok(())

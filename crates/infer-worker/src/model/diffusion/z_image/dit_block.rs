@@ -177,7 +177,7 @@ impl DiTBlock {
         {
             let attn_hsd = attn_out_sdpa.view(&[self.n_heads, seq, self.head_dim])?;
             let attn_shd = permute_nd(&attn_hsd, &[1, 0, 2])?;
-            attn_flat.copy_from(&attn_shd.view(&[seq, dim])?)?;
+            attn_flat.copy_from_on_current_stream(&attn_shd.view(&[seq, dim])?)?;
         }
 
         // to_out projection + norm2(attn) + gate
@@ -191,7 +191,7 @@ impl DiTBlock {
         }
 
         // Residual: dst = x + norm2_attn
-        dst.copy_from(x)?;
+        dst.copy_from_on_current_stream(x)?;
         *dst += &norm2_attn;
 
         // ══════════════════════════ FFN block ══════════════════════════
@@ -248,12 +248,12 @@ impl DiTBlock {
 
         let hd_flat = hd.view(&flat_shape)?;
         let mut norm_in = state.slice_mut(in_ty, &flat_shape)?;
-        norm_in.copy_from(&hd_flat)?;
+        norm_in.copy_from_on_current_stream(&hd_flat)?;
         let mut norm_out = state.slice_mut(out_ty, &flat_shape)?;
         norm.forward(&norm_in, &mut norm_out, cuda_config)?;
 
         let mut hd_flat_mut = hd.view(&flat_shape)?;
-        hd_flat_mut.copy_from(&norm_out)?;
+        hd_flat_mut.copy_from_on_current_stream(&norm_out)?;
         Ok(())
     }
 
@@ -273,7 +273,7 @@ impl DiTBlock {
         let bhsd_view = hsd.view(&[1, self.n_heads, seq, self.head_dim])?;
 
         let mut dst = state.slice_mut(dst_ty, &[1, self.n_heads, seq, self.head_dim])?;
-        dst.copy_from(&bhsd_view)?;
+        dst.copy_from_on_current_stream(&bhsd_view)?;
         Ok(dst)
     }
 }
