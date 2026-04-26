@@ -50,26 +50,31 @@ impl Qwen3TextEncoder {
         let tok_dir = tokenizer_dir.as_ref();
 
         // Qwen3::new expects tokenizer.json inside model_dir.
-        // Create symlink if not present.
+        // Create a symlink if it isn't there yet. This is idempotent
+        // under concurrent test execution: if another thread wins the
+        // race and creates the symlink first, we swallow the EEXIST
+        // and move on.
+        //
+        // We **don't** remove the symlink afterwards — it's cheap,
+        // harmless (points into the immutable model dir), and removing
+        // it would race with any other `Qwen3TextEncoder::new` running
+        // in parallel.
         let tokenizer_json_in_te = te_dir.join("tokenizer.json");
         let tokenizer_json_src = tok_dir.join("tokenizer.json");
-        let created_symlink = if !tokenizer_json_in_te.exists() && tokenizer_json_src.exists() {
-            std::os::unix::fs::symlink(&tokenizer_json_src, &tokenizer_json_in_te)
-                .map_err(|e| Error::InternalError(format!(
-                    "Failed to symlink tokenizer.json into text_encoder dir: {}", e
-                )))?;
-            true
-        } else {
-            false
-        };
+        if !tokenizer_json_in_te.exists() && tokenizer_json_src.exists() {
+            match std::os::unix::fs::symlink(&tokenizer_json_src, &tokenizer_json_in_te) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(Error::InternalError(format!(
+                        "Failed to symlink tokenizer.json into text_encoder dir: {}", e
+                    )).into());
+                }
+            }
+        }
 
         let model = Qwen3::new(te_dir, device_type)?;
         let output_layer_count = model.config.layer_num.saturating_sub(1);
-
-        // Clean up symlink if we created it
-        if created_symlink {
-            let _ = std::fs::remove_file(&tokenizer_json_in_te);
-        }
 
         Ok(Self { model, output_layer_count })
     }

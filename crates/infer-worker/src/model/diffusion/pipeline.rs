@@ -25,7 +25,15 @@ pub struct DiffusionRequest {
     pub width: usize,
 
     // Sampling control
+    /// Number of denoising steps. Ignored when `sigmas` is `Some` (the
+    /// length of the provided sigma list takes precedence).
     pub num_inference_steps: usize,
+    /// Optional user-supplied sigma schedule. When `Some`, the pipeline
+    /// runs these exact sigmas (length = number of steps); when `None`,
+    /// the pipeline falls back to the scheduler's **official default
+    /// schedule** for `num_inference_steps` (with dynamic shifting
+    /// derived from image resolution when applicable).
+    pub sigmas: Option<Vec<f32>>,
     pub guidance_scale: f32,
     pub seed: Option<u64>,
 }
@@ -38,6 +46,7 @@ impl Default for DiffusionRequest {
             height: 1024,
             width: 1024,
             num_inference_steps: 8,
+            sigmas: None,
             guidance_scale: 0.0,
             seed: None,
         }
