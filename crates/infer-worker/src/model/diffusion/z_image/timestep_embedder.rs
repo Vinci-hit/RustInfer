@@ -11,9 +11,7 @@ use crate::base::{DataType, DeviceType};
 use crate::base::error::Result;
 use crate::op::matmul::Matmul;
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 /// Sinusoidal timestep embedding → 2-layer MLP.
 ///
@@ -31,8 +29,9 @@ impl TimestepEmbedder {
     /// Sinusoidal positional encoding for timesteps.
     ///
     /// `t`: [B] f32 tensor on any device  
-    /// Returns: [B, dim] f32 tensor (same device as t)
-    pub fn timestep_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
+    /// `target_dtype`: 输出的 dtype（sin/cos 内部用 f32 计算后转换）
+    /// Returns: [B, dim] tensor (same device as t)
+    pub fn timestep_embedding(t: &Tensor, dim: usize, target_dtype: DataType) -> Result<Tensor> {
         let device = t.device();
         let b = t.shape()[0];
         let half = dim / 2;
@@ -62,6 +61,11 @@ impl TimestepEmbedder {
             }
         }
 
+        // 转到目标 dtype
+        let emb = if target_dtype != DataType::F32 {
+            emb.to_dtype(target_dtype)?
+        } else { emb };
+
         // Move to original device if needed
         match device {
             DeviceType::Cpu => Ok(emb),
@@ -77,22 +81,24 @@ impl TimestepEmbedder {
     pub fn forward(
         &self,
         t: &Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&crate::OpConfig>,
     ) -> Result<Tensor> {
-        // 1. Sinusoidal frequency encoding: [B] → [B, freq_dim]
-        let t_freq = Self::timestep_embedding(t, self.frequency_embedding_size)?;
+        let weight_dtype = self.mlp1.weight.dtype();
+
+        // 1. Sinusoidal frequency encoding: [B] → [B, freq_dim]，直接输出权重 dtype
+        let t_freq = Self::timestep_embedding(t, self.frequency_embedding_size, weight_dtype)?;
 
         // 2. MLP: Linear1 → SiLU → Linear2
         let b = t.shape()[0];
         let mid_size = self.mlp1.weight.shape()[0];
         let out_size = self.mlp2.weight.shape()[0];
 
-        let mut hidden = Tensor::new(&[b, mid_size], t_freq.dtype(), t_freq.device())?;
+        let mut hidden = Tensor::new(&[b, mid_size], weight_dtype, t_freq.device())?;
         self.mlp1.forward(&t_freq, &mut hidden, cuda_config)?;
 
         hidden.silu_();
 
-        let mut output = Tensor::new(&[b, out_size], hidden.dtype(), hidden.device())?;
+        let mut output = Tensor::new(&[b, out_size], weight_dtype, hidden.device())?;
         self.mlp2.forward(&hidden, &mut output, cuda_config)?;
 
         Ok(output)
@@ -109,7 +115,7 @@ mod tests {
         let mut t = Tensor::new(&[2], DataType::F32, DeviceType::Cpu)?;
         t.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[0.5, 1.0]);
 
-        let emb = TimestepEmbedder::timestep_embedding(&t, 256)?;
+        let emb = TimestepEmbedder::timestep_embedding(&t, 256, DataType::F32)?;
         assert_eq!(emb.shape(), &[2, 256]);
         assert_eq!(emb.dtype(), DataType::F32);
         Ok(())
@@ -120,7 +126,7 @@ mod tests {
         let mut t = Tensor::new(&[1], DataType::F32, DeviceType::Cpu)?;
         t.as_f32_mut()?.as_slice_mut()?[0] = 500.0; // typical scaled timestep
 
-        let emb = TimestepEmbedder::timestep_embedding(&t, 256)?;
+        let emb = TimestepEmbedder::timestep_embedding(&t, 256, DataType::F32)?;
         let data = emb.as_f32()?.as_slice()?;
 
         // First 128 values are cos, next 128 are sin
@@ -191,7 +197,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn test_silu_cuda_vs_cpu_f32() -> Result<()> {
         let n = 1024;
         let mut cpu = Tensor::randn(&[n], DataType::F32, DeviceType::Cpu, Some(42))?;
@@ -213,7 +218,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn test_silu_cuda_vs_cpu_bf16() -> Result<()> {
         use half::bf16;
         let n = 1024;
@@ -238,7 +242,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn test_silu_cuda_vs_cpu_f16() -> Result<()> {
         use half::f16;
         let n = 1024;
@@ -263,7 +266,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn test_silu_cuda_odd_length() -> Result<()> {
         // 奇数长度测试 tail 处理
         let n = 1023;

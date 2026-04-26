@@ -16,10 +16,10 @@ pub fn conv2d(
     output: &mut Tensor,
     stride: usize,
     padding: usize,
-    #[cfg(feature = "cuda")] cuda_config: Option<&crate::cuda::CudaConfig>,
+    cuda_config: Option<&crate::OpConfig>,
 ) -> Result<()> {
     match input.device() {
-        DeviceType::Cpu => kernels::cpu::conv2d(input, weight, bias, output, stride, padding),
+        DeviceType::Cpu => { let _ = cuda_config; kernels::cpu::conv2d(input, weight, bias, output, stride, padding) }
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
             let cfg = cuda_config.ok_or_else(|| crate::base::error::Error::InvalidArgument(

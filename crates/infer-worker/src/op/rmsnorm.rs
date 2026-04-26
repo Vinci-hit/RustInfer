@@ -1,9 +1,7 @@
 use crate::base::error::Result;
 use crate::base::{DataType, DeviceType};
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -32,12 +30,12 @@ impl RMSNorm {
         &self,
         input: &Tensor,
         output: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         let weight = &self.weight;
 
         match input.device() {
-            DeviceType::Cpu => kernels::cpu::rmsnorm(input, weight, output, self.eps),
+            DeviceType::Cpu => { let _ = cuda_config; kernels::cpu::rmsnorm(input, weight, output, self.eps) }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => kernels::cuda::rmsnorm(input, weight, output, self.eps, cuda_config),
         }

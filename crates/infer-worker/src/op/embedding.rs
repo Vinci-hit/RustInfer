@@ -1,9 +1,7 @@
 use crate::base::error::Result;
 use crate::base::{DataType, DeviceType};
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -43,12 +41,13 @@ impl Embedding {
         &self,
         input_tokens: &Tensor,
         output: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         let weight = &self.weight;
 
         match weight.device() {
             DeviceType::Cpu => {
+                let _ = cuda_config;
                 kernels::cpu::embedding(input_tokens, weight, output)?
             }
             #[cfg(feature = "cuda")]

@@ -1,6 +1,7 @@
 use crate::base::error::{Result, Error};
 use crate::base::{DataType, DeviceType};
 use crate::tensor::Tensor;
+use crate::OpConfig;
 
 #[cfg(feature = "cuda")]
 use crate::cuda::config::CudaConfig;
@@ -58,13 +59,14 @@ impl FlashAttnGQA {
         input_v_cache: &Tensor,
         input_kv_len: &Tensor,
         output_o: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         let device = input_q.device();
         let q_seq_len = input_q.shape()[0];
 
         match device {
             DeviceType::Cpu => {
+                let _ = cuda_config;
                 let current_kv_len = input_kv_len.as_i32()?.as_slice()?[0] as usize;
                 kernels::cpu::flash_attn_gqa(
                     input_q,

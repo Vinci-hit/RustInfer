@@ -1,9 +1,7 @@
 use crate::base::DeviceType;
 use crate::base::error::Result;
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -15,7 +13,7 @@ pub fn fused_add_rmsnorm(
     input: &Tensor,
     weight: &Tensor,
     eps: f32,
-    #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+    cuda_config: Option<&OpConfig>,
 ) -> Result<()> {
     match residual.device() {
         DeviceType::Cpu => kernels::cpu::fused_add_rmsnorm(norm_output, residual, input, weight, eps),

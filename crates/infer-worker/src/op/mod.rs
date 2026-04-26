@@ -18,3 +18,6 @@ pub mod layernorm;
 pub mod conv2d;
 pub mod groupnorm;
 pub mod upsample;
+pub mod softmax;
+pub mod sdpa;
+pub mod tensor_utils;

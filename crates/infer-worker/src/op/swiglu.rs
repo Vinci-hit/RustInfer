@@ -1,9 +1,7 @@
 use crate::base::error::Result;
 use crate::base::DeviceType;
 use crate::tensor::Tensor;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -21,7 +19,8 @@ impl SwiGLU {
         &self,
         y: &Tensor,
         x: &mut Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        #[allow(unused_variables)]
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         let device = y.device();
 

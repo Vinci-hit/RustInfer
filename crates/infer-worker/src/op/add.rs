@@ -1,8 +1,6 @@
 use crate::base::error::Result;
 use crate::base::DeviceType;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
+use crate::OpConfig;
 
 use super::kernels;
 
@@ -21,10 +19,11 @@ impl Add {
         a: &crate::tensor::Tensor,
         b: &crate::tensor::Tensor,
         output: &mut crate::tensor::Tensor,
-        #[cfg(feature = "cuda")] cuda_config: Option<&CudaConfig>,
+        cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         match a.device() {
             DeviceType::Cpu => {
+                let _ = cuda_config;
                 kernels::cpu::add(a, b, output)?;
             }
             #[cfg(feature = "cuda")]
