@@ -1,7 +1,9 @@
 // src/op/rope.rs
 
 use crate::base::error::{Error, Result};
-use crate::base::{DataType, DeviceType};
+use crate::base::DeviceType;
+#[cfg(test)]
+use crate::base::DataType;
 use crate::tensor::Tensor;
 use crate::OpConfig;
 

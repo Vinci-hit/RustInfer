@@ -11,7 +11,6 @@ use crate::base::{DataType, DeviceType};
 use crate::base::error::Result;
 use crate::op::matmul::Matmul;
 use crate::tensor::Tensor;
-use crate::OpConfig;
 
 /// Sinusoidal timestep embedding → 2-layer MLP.
 ///
@@ -219,7 +218,6 @@ mod tests {
 
     #[test]
     fn test_silu_cuda_vs_cpu_bf16() -> Result<()> {
-        use half::bf16;
         let n = 1024;
         let mut cpu = Tensor::randn(&[n], DataType::BF16, DeviceType::Cpu, Some(7))?;
         let mut gpu = cpu.to_cuda(0)?;
@@ -243,7 +241,6 @@ mod tests {
 
     #[test]
     fn test_silu_cuda_vs_cpu_f16() -> Result<()> {
-        use half::f16;
         let n = 1024;
         let mut cpu = Tensor::randn(&[n], DataType::F16, DeviceType::Cpu, Some(99))?;
         let mut gpu = cpu.to_cuda(0)?;

@@ -9,9 +9,11 @@ use super::kernels;
 pub struct Embedding {
     /// 权重矩阵 (查询表), 形状为 [vocab_size, dim]。
     pub weight: Tensor,
-    
-    // 配置信息
+
+    // 配置信息（保留仅用于调试/未来扩展）
+    #[allow(dead_code)]
     vocab_size: usize,
+    #[allow(dead_code)]
     dim: usize,
 }
 

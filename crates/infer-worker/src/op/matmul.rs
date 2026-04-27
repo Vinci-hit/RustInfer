@@ -3,9 +3,6 @@ use crate::base::{DataType, DeviceType};
 use crate::tensor::Tensor;
 use crate::OpConfig;
 
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
-
 use super::kernels;
 
 /// 量化参数，封装不同量化格式所需的张量和超参数。

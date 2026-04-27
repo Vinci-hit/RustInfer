@@ -719,7 +719,7 @@ mod tests {
         warmup(&model, &mut state)?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let (text, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
+        let (_text, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;
