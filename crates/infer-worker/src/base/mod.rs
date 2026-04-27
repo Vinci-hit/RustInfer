@@ -30,6 +30,26 @@ impl DeviceType {
             false
         }
     }
+
+    /// Synchronize the current backend queue.
+    ///
+    /// CUDA: calls `cudaDeviceSynchronize`.
+    /// CPU: no-op.
+    pub fn sync(&self) -> crate::base::error::Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.is_cuda() {
+                unsafe {
+                    crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?;
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = self;
+        }
+        Ok(())
+    }
 }
 
 

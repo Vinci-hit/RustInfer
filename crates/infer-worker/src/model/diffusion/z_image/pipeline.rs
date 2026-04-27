@@ -276,7 +276,7 @@ impl ZImagePipeline {
     ///    - Upload the per-step `t_value(i)` and Euler `dt(i)`
     ///      schedules into [`TValueDevVec`] / [`DtValueDevVec`] with
     ///      one HtoD each.
-    /// 2. **Capture or replay**: if `cfg.denoise_graph` is empty,
+    /// 2. **Capture or replay**: if `cfg.cuda_graph` is empty,
     ///    `begin → for i in 0..N { step_body(i) } → end → launch`.
     ///    Otherwise just `launch`. The step body is dst-write-only
     ///    against state slots and reads all per-step scalars from
@@ -625,9 +625,7 @@ impl ZImagePipeline {
         // Ensure every queued kernel / cache fill has completed before
         // we hand control back; otherwise the first user request would
         // still race against tail latency from warmup.
-        if self.device.is_cuda() {
-            unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
-        }
+        self.device.sync()?;
         Ok(())
     }
 
@@ -649,25 +647,6 @@ impl DiffusionPipeline for ZImagePipeline {
     }
 
     fn generate(&mut self, request: &DiffusionRequest) -> Result<DiffusionOutput> {
-        // All per-stage timings are **GPU wall-time**, not host-side
-        // launch time: each stage ends with a `cudaDeviceSynchronize`
-        // (on CUDA) so any kernels it enqueued are actually finished
-        // before we stop the clock. Without this, encode_prompt_ms
-        // would measure host launch throughput (typically <5 ms) while
-        // the work was still racing on the stream.
-        let is_cuda = self.device.is_cuda();
-        let sync = || -> Result<()> {
-            #[cfg(feature = "cuda")]
-            {
-                if is_cuda {
-                    unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            { let _ = is_cuda; }
-            Ok(())
-        };
-
         let total_start = Instant::now();
         let weight_dtype = self.transformer.x_embedder.weight.dtype();
 
@@ -681,7 +660,7 @@ impl DiffusionPipeline for ZImagePipeline {
         // Cast to the transformer's weight dtype (text encoder emits F32,
         // CUDA weights are typically BF16).
         let prompt_embeds = cast_dtype(&prompt_embeds, weight_dtype)?;
-        sync()?;
+        self.device.sync()?;
         let encode_prompt_ms = encode_start.elapsed().as_millis() as u64;
 
         // ── Step 2: Prepare latents (fills pipeline_state.Latents in place) ──
@@ -695,13 +674,13 @@ impl DiffusionPipeline for ZImagePipeline {
         // ── Step 4: Denoise loop (ping-pongs through the state pool) ──
         let denoise_start = Instant::now();
         let latents = self.denoise(latent_h, latent_w, &prompt_embeds)?;
-        sync()?;
+        self.device.sync()?;
         let denoise_ms = denoise_start.elapsed().as_millis() as u64;
 
         // ── Step 5: VAE decode ──
         let decode_start = Instant::now();
         let image = self.vae_decode(&latents)?;
-        sync()?;
+        self.device.sync()?;
         let decode_ms = decode_start.elapsed().as_millis() as u64;
 
         let total_ms = total_start.elapsed().as_millis() as u64;
