@@ -30,7 +30,7 @@ use crate::tensor::Tensor;
 
 /// Sequence length rounding used by the transformer (must match the
 /// `SEQ_MULTI_OF` constant in `transformer.rs`).
-const SEQ_MULTI_OF: usize = 32;
+const SEQ_MULTI_OF: usize = 128;
 
 /// AdaLN conditioning embedding dim — compile-time constant in the model.
 const ADALN_EMBED_DIM: usize = 256;
@@ -460,22 +460,6 @@ impl DitState {
             Tensor::new(&[s_tot * n_heads, head_dim], dtype, device)?,
         );
         m.insert(
-            DiffBufferType::BlkQHsd,
-            Tensor::new(&[1, n_heads, s_tot, head_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkKHsd,
-            Tensor::new(&[1, n_heads, s_tot, head_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkVHsd,
-            Tensor::new(&[1, n_heads, s_tot, head_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkAttnSdpa,
-            Tensor::new(&[1, n_heads, s_tot, head_dim], dtype, device)?,
-        );
-        m.insert(
             DiffBufferType::BlkAttnFlat,
             Tensor::new(&[s_tot, dim], dtype, device)?,
         );
@@ -572,11 +556,11 @@ mod tests {
     #[test]
     fn shape_spec_derives_seq_lens() {
         let spec = make_spec();
-        // latent 32×32, patch=2 → 16×16 = 256 patches (already multiple of 32)
+        // latent 32×32, patch=2 → 16×16 = 256 patches (already multiple of 128)
         assert_eq!(spec.n_patches_max(), 256);
         assert_eq!(spec.s_img_max(), 256);
-        assert_eq!(spec.s_cap_max(), 64);   // 64 is already % 32 == 0
-        assert_eq!(spec.s_total_max(), 320);
+        assert_eq!(spec.s_cap_max(), 128);  // 64 rounds up to SEQ_MULTI_OF=128
+        assert_eq!(spec.s_total_max(), 384);
     }
 
     #[test]
@@ -626,8 +610,8 @@ mod tests {
             &[s_tot, spec.hidden_dim]
         );
         assert_eq!(
-            st.buffers[&DiffBufferType::BlkQHsd].shape(),
-            &[1, spec.n_heads, s_tot, spec.head_dim]
+            st.buffers[&DiffBufferType::BlkAttnFlat].shape(),
+            &[s_tot, spec.dim]
         );
         assert_eq!(st.buffers[&DiffBufferType::TValueDev].shape(), &[1]);
         assert_eq!(
@@ -720,10 +704,6 @@ mod tests {
             DiffBufferType::BlkQNormOut,
             DiffBufferType::BlkKNormIn,
             DiffBufferType::BlkKNormOut,
-            DiffBufferType::BlkQHsd,
-            DiffBufferType::BlkKHsd,
-            DiffBufferType::BlkVHsd,
-            DiffBufferType::BlkAttnSdpa,
             DiffBufferType::BlkAttnFlat,
             DiffBufferType::BlkToOut,
             DiffBufferType::BlkNorm2Attn,

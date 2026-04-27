@@ -22,8 +22,7 @@ use crate::model::diffusion::buffer::DiffBufferType as BT;
 use crate::model::diffusion::z_image::state::DitState;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
-use crate::op::sdpa::scaled_dot_product_attention;
-use crate::op::tensor_utils::permute_nd;
+use crate::op::sdpa::dit_sdpa;
 use crate::tensor::Tensor;
 
 /// DiT transformer block (Z-Image style).
@@ -157,27 +156,24 @@ impl DiTBlock {
             k_3d.rope_interleaved(cos, sin, self.head_dim)?;
         }
 
-        // Reshape [S, H, D] → [1, H, S, D] into BlkQHsd / BlkKHsd / BlkVHsd.
-        let q_sdpa = self.to_bhsd(&q, BT::BlkQHsd, state)?;
-        let k_sdpa = self.to_bhsd(&k, BT::BlkKHsd, state)?;
-        let v_sdpa = self.to_bhsd(&v, BT::BlkVHsd, state)?;
-
-        // SDPA → BlkAttnSdpa
-        let mut attn_out_sdpa = state.slice_mut(
-            BT::BlkAttnSdpa, &[1, self.n_heads, seq, self.head_dim],
-        )?;
-        scaled_dot_product_attention(&q_sdpa, &k_sdpa, &v_sdpa, &mut attn_out_sdpa, cuda_config)?;
-        // Release the SDPA mutable slices so subsequent `state` borrows
-        // don't trip the checker when they slice sibling buffers.
-        drop(q_sdpa);
-        drop(k_sdpa);
-
-        // [1, H, S, D] → [S, H*D] via permute + view → BlkAttnFlat
-        let mut attn_flat = state.slice_mut(BT::BlkAttnFlat, &[seq, dim])?;
+        // ── Self-attention in native SHD layout ──
+        //
+        // Q/K/V already live in `BlkQ/BlkK/BlkV` as `[seq, dim]`, which is
+        // byte-equivalent to `[seq, n_heads, head_dim]` (SHD). `dit_sdpa`
+        // takes SHD directly and writes the result into `BlkAttnFlat` also
+        // viewed as SHD — no permute/copy before or after attention. On the
+        // `(BF16, head_dim=128, seq%128==0)` fast path this collapses the
+        // entire attention into a single CUTLASS flash-attention launch.
+        let q_shd = q.view(&[seq, self.n_heads, self.head_dim])?;
+        let k_shd = k.view(&[seq, self.n_heads, self.head_dim])?;
+        let v_shd = v.view(&[seq, self.n_heads, self.head_dim])?;
+        let attn_flat = state.slice_mut(BT::BlkAttnFlat, &[seq, dim])?;
         {
-            let attn_hsd = attn_out_sdpa.view(&[self.n_heads, seq, self.head_dim])?;
-            let attn_shd = permute_nd(&attn_hsd, &[1, 0, 2])?;
-            attn_flat.copy_from_on_current_stream(&attn_shd.view(&[seq, dim])?)?;
+            let mut attn_shd = attn_flat.view(&[seq, self.n_heads, self.head_dim])?;
+            dit_sdpa(
+                &q_shd, &k_shd, &v_shd, &mut attn_shd,
+                self.n_heads, self.head_dim, cuda_config,
+            )?;
         }
 
         // to_out projection + norm2(attn) + gate
@@ -255,26 +251,6 @@ impl DiTBlock {
         let mut hd_flat_mut = hd.view(&flat_shape)?;
         hd_flat_mut.copy_from_on_current_stream(&norm_out)?;
         Ok(())
-    }
-
-    /// Materialize `[S, H, D]` as `[1, H, S, D]` into `dst_ty`.
-    ///
-    /// SDPA expects BHSD layout; we permute on a temporary (view-only)
-    /// tensor and then copy the contiguous result into the state slot.
-    fn to_bhsd(
-        &self,
-        src: &Tensor,
-        dst_ty: BT,
-        state: &mut DitState,
-    ) -> Result<Tensor> {
-        let seq = src.shape()[0];
-        let shd = src.view(&[seq, self.n_heads, self.head_dim])?;
-        let hsd = permute_nd(&shd, &[1, 0, 2])?;
-        let bhsd_view = hsd.view(&[1, self.n_heads, seq, self.head_dim])?;
-
-        let mut dst = state.slice_mut(dst_ty, &[1, self.n_heads, seq, self.head_dim])?;
-        dst.copy_from_on_current_stream(&bhsd_view)?;
-        Ok(dst)
     }
 }
 
