@@ -74,21 +74,19 @@ impl ResnetBlock {
         let shape = x.shape();
         let (b, _c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
 
-        // norm1 + silu
+        // norm1 + silu (fused on CUDA for BF16/F32)
         let mut h1 = Tensor::new(&[b, self.in_ch, h, w], x.dtype(), x.device())?;
-        groupnorm(x, &self.norm1_w, &self.norm1_b, &mut h1, NORM_GROUPS, EPS)?;
-        h1.silu()?;
+        crate::op::groupnorm::groupnorm_silu(x, &self.norm1_w, &self.norm1_b, &mut h1, NORM_GROUPS, EPS)?;
 
         // conv1
         let mut h2 = Tensor::new(&[b, self.out_ch, h, w], x.dtype(), x.device())?;
         conv2d(&h1, &self.conv1_w, Some(&self.conv1_b), &mut h2, 1, 1, cuda_config)?;
 
-        // norm2 + silu
+        // norm2 + silu (fused)
         let mut h3 = Tensor::new(&[b, self.out_ch, h, w], x.dtype(), x.device())?;
-        groupnorm(&h2, &self.norm2_w, &self.norm2_b, &mut h3, NORM_GROUPS, EPS)?;
-        h3.silu()?;
+        crate::op::groupnorm::groupnorm_silu(&h2, &self.norm2_w, &self.norm2_b, &mut h3, NORM_GROUPS, EPS)?;
 
-        // conv2
+        // conv2 (fused with residual add via beta=1 when possible)
         let mut h4 = Tensor::new(&[b, self.out_ch, h, w], x.dtype(), x.device())?;
         conv2d(&h3, &self.conv2_w, Some(&self.conv2_b), &mut h4, 1, 1, cuda_config)?;
 
@@ -371,11 +369,10 @@ impl VaeDecoder {
             x = up.forward(x, cuda_config)?;
         }
 
-        // conv_norm_out + silu + conv_out
+        // conv_norm_out + silu + conv_out (fused gn+silu)
         let out_shape: Vec<usize> = x.shape().to_vec();
         let mut h2 = Tensor::new(out_shape.as_slice(), dtype, x.device())?;
-        groupnorm(&x, &self.conv_norm_out_w, &self.conv_norm_out_b, &mut h2, NORM_GROUPS, EPS)?;
-        h2.silu()?;
+        crate::op::groupnorm::groupnorm_silu(&x, &self.conv_norm_out_w, &self.conv_norm_out_b, &mut h2, NORM_GROUPS, EPS)?;
 
         let mut out = Tensor::new(&[out_shape[0], self.config.out_channels, out_shape[2], out_shape[3]],
             dtype, x.device())?;

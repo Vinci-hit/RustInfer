@@ -23,3 +23,32 @@ pub fn groupnorm(
         }
     }
 }
+
+/// Fused GroupNorm + SiLU: `output = silu(groupnorm(input, w, b))`.
+///
+/// Saves one full output tensor read+write compared with running SiLU as a
+/// separate kernel after GroupNorm — dominant bandwidth bottleneck for the
+/// VAE decoder's late (256×256, 128 ch) stages.
+///
+/// On CPU this degrades gracefully to `groupnorm` followed by `silu_inplace`.
+#[allow(clippy::too_many_arguments)]
+pub fn groupnorm_silu(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    output: &mut Tensor,
+    num_groups: usize,
+    eps: f32,
+) -> Result<()> {
+    match input.device() {
+        DeviceType::Cpu => {
+            kernels::cpu::groupnorm(input, weight, bias, output, num_groups, eps)?;
+            output.silu()
+        }
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => {
+            let stream = crate::cuda::get_current_cuda_stream();
+            kernels::cuda::groupnorm_silu(input, weight, bias, output, num_groups, eps, stream)
+        }
+    }
+}
