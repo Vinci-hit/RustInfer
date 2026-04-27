@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     #[cfg(feature = "cuda")]
     fn test_broadcast_mul_cuda_vs_cpu() -> Result<()> {
-        let mut a = Tensor::randn(&[64, 128], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let a = Tensor::randn(&[64, 128], DataType::F32, DeviceType::Cpu, Some(42))?;
         let b = Tensor::randn(&[128], DataType::F32, DeviceType::Cpu, Some(7))?;
 
         let cpu_out = a.broadcast_mul(&b)?;
@@ -1920,7 +1920,7 @@ mod tests {
     fn test_conv2d_cuda_vs_cpu() -> Result<()> {
         use crate::cuda::CudaConfig;
 
-        let mut input = Tensor::randn(&[1, 3, 8, 8], DataType::F32, DeviceType::Cpu, Some(42))?;
+        let input = Tensor::randn(&[1, 3, 8, 8], DataType::F32, DeviceType::Cpu, Some(42))?;
         let weight = Tensor::randn(&[16, 3, 3, 3], DataType::F32, DeviceType::Cpu, Some(7))?;
         let bias = Tensor::randn(&[16], DataType::F32, DeviceType::Cpu, Some(13))?;
 

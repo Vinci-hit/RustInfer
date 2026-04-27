@@ -1,6 +1,6 @@
 use crate::tensor::Tensor;
 use crate::base::error::{Result, Error};
-use crate::base::{DataType, DeviceType};
+use crate::base::DeviceType;
 use super::kernels;
 use crate::OpConfig;
 

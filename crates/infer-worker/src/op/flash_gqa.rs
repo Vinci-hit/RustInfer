@@ -1,10 +1,7 @@
 use crate::base::error::{Result, Error};
-use crate::base::{DataType, DeviceType};
+use crate::base::DeviceType;
 use crate::tensor::Tensor;
 use crate::OpConfig;
-
-#[cfg(feature = "cuda")]
-use crate::cuda::config::CudaConfig;
 
 use super::kernels;
 

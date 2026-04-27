@@ -8,6 +8,7 @@ use super::kernels;
 /// RMSNorm 算子结构体，包含其配置和权重
 pub struct RMSNorm {
     pub weight: Tensor,
+    #[allow(dead_code)] // 仅用于调试/未来扩展
     dim: usize,
     eps: f32,
 }

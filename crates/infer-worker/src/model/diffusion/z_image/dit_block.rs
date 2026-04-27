@@ -158,8 +158,8 @@ impl DiTBlock {
         }
 
         // Reshape [S, H, D] → [1, H, S, D] into BlkQHsd / BlkKHsd / BlkVHsd.
-        let mut q_sdpa = self.to_bhsd(&q, BT::BlkQHsd, state)?;
-        let mut k_sdpa = self.to_bhsd(&k, BT::BlkKHsd, state)?;
+        let q_sdpa = self.to_bhsd(&q, BT::BlkQHsd, state)?;
+        let k_sdpa = self.to_bhsd(&k, BT::BlkKHsd, state)?;
         let v_sdpa = self.to_bhsd(&v, BT::BlkVHsd, state)?;
 
         // SDPA → BlkAttnSdpa

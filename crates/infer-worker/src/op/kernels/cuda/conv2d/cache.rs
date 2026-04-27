@@ -91,6 +91,7 @@ impl Default for Conv2dCache {
 }
 
 impl Conv2dCache {
+    #[allow(dead_code)] // constructor 别名，留给未来使用；当前仅通过 Default::default() 创建
     pub(super) fn new() -> Self {
         Self::default()
     }
