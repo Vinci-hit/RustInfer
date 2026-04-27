@@ -300,29 +300,6 @@ impl Buffer {
         })
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  Stream-ordered async variants
-    // ══════════════════════════════════════════════════════════════════
-    //
-    // 动机：`copy_from` / `zero_out` 在 CUDA 路径下走的是同步 `cudaMemcpy`
-    // / `cudaMemset`，每次调用都会在 host 端阻塞直到 GPU 完成。对于
-    // diffusion denoise 这种每步几百次 D2D 搬运的热路径，这会把 host
-    // 线程的时间吃掉 ~26 ms（profile 数据）。下面两个 `*_async` 版本
-    // 把操作排到指定 stream 上立即返回，把 host 时间让给真正的 kernel
-    // launch。
-    //
-    // 使用契约：
-    //   - **D→D**：双方 `Buffer` 的 `Arc<BufferInner>` 必须一直存活到
-    //     stream sync；本工程 `PipelineState` / `DitState` 的 buffer
-    //     都是 pipeline 级别长寿的，天然满足。
-    //   - **H→D / D→H**：host 侧内存必须一直存活到 sync。若 host 端
-    //     是普通 Rust `Vec`（pageable），`cudaMemcpyAsync` 对它会退化
-    //     为同步，但调用语义仍然正确。真正想拿到 overlap 收益的 H2D
-    //     需要 pinned memory（留给后续 PR）。
-    //   - CPU→CPU：stream 不参与，退化为 `std::ptr::copy_nonoverlapping`。
-    //
-    // `copy_from` / `zero_out` 同步版本保持不变，作为稳妥的默认选项。
-
     /// Stream-ordered async 版本的 [`Buffer::copy_from`]。
     ///
     /// 把拷贝排到 `stream` 上并立即返回，host 不阻塞。完成保证由
