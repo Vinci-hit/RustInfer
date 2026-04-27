@@ -32,7 +32,24 @@ use crate::op::tensor_utils::{
 use crate::tensor::Tensor;
 
 const ADALN_EMBED_DIM: usize = 256;
-const SEQ_MULTI_OF: usize = 32;
+/// Sequence-length padding multiple.
+///
+/// Fixed at **128** to match the block-M tile of the CUTLASS flash-attention
+/// kernel used for self-attention in [`DiTBlock::forward`]:
+///
+/// - Q tiles are [M=128, K=head_dim]; the kernel issues unpredicated
+///   `cp_async` loads that read a full tile even on the trailing block,
+///   so the sequence length must be a multiple of 128 for the loads to stay
+///   in-bounds and for the result to be mathematically correct.
+/// - KV tiles are [N=64, K=head_dim]; 128 is automatically a multiple of 64
+///   so the KV side is trivially safe as well.
+///
+/// The extra padded rows are filled with the learned `x_pad_token` /
+/// `cap_pad_token`, so correctness is unchanged — they just participate in
+/// attention like any other real token. The marginal FFN / projection cost
+/// of the extra tokens is far smaller than what flash-attention saves
+/// versus the per-head loop fallback.
+const SEQ_MULTI_OF: usize = 128;
 
 // ───────────────────────── Config ─────────────────────────
 

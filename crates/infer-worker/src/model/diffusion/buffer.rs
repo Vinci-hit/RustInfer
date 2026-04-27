@@ -165,15 +165,10 @@ pub enum DiffBufferType {
     BlkKNormIn,
     /// `[S_total_max * n_heads, head_dim]` — K per-head RMSNorm output.
     BlkKNormOut,
-    /// `[1, n_heads, S_total_max, head_dim]` — Q in SDPA layout (B,H,S,D).
-    BlkQHsd,
-    /// `[1, n_heads, S_total_max, head_dim]` — K in SDPA layout.
-    BlkKHsd,
-    /// `[1, n_heads, S_total_max, head_dim]` — V in SDPA layout.
-    BlkVHsd,
-    /// `[1, n_heads, S_total_max, head_dim]` — SDPA output.
-    BlkAttnSdpa,
-    /// `[S_total_max, dim]` — attention output permuted back to `[S, H*D]`.
+    /// `[S_total_max, dim]` — attention output, laid out as
+    /// `[seq, n_heads, head_dim]` (SHD) when viewed 3D. Written directly
+    /// by [`crate::op::sdpa::dit_sdpa`] (flash-attn fast path or BHSD
+    /// fallback) and consumed as-is by the `to_out` projection.
     BlkAttnFlat,
     /// `[S_total_max, dim]` — `to_out` projection output.
     BlkToOut,

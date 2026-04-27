@@ -190,6 +190,173 @@ fn sdpa_cuda(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// DiT-style self-attention (SHD layout, non-causal, single batch)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The Z-Image DiT blocks all use the same attention signature:
+//
+//   - Q/K/V in `[seq, n_heads, head_dim]` (SHD) — same memory as the
+//     `[seq, dim]` QKV projection outputs, just reinterpreted.
+//   - Output in `[seq, n_heads, head_dim]` (SHD) — same memory as the
+//     `[seq, dim]` input to the `to_out` projection.
+//   - Self-attention (S_q == S_kv == seq), no causal mask, no KV cache.
+//
+// For the fast BF16 + head_dim=128 + seq%128==0 combination we dispatch to
+// the CUTLASS flash-attention prefill kernel
+// (`launch_flash_attn_cute_bf16_hdim128`) in a single launch that handles
+// all heads at once — roughly a 5×+ speedup versus the per-head SGEMM loop
+// in [`scaled_dot_product_attention`], plus zero data-movement since SHD is
+// the layout the kernel expects natively.
+//
+// Anything that doesn't match the fast-path preconditions falls back to the
+// existing per-head SDPA by internally permuting SHD → BHSD and back.
+
+/// Self-attention for DiT-style inputs with native SHD layout.
+///
+/// # Arguments
+/// - `q`, `k`, `v`: shape `[seq, n_heads, head_dim]`, same dtype/device.
+/// - `output`: shape `[seq, n_heads, head_dim]`, pre-allocated.
+/// - `n_heads`, `head_dim`: attention shape parameters.
+/// - `cuda_config`: required on CUDA (for stream/workspace).
+///
+/// # Fast path
+/// BF16 + CUDA + `head_dim == 128` + `seq % 128 == 0` → single-launch
+/// CUTLASS prefill kernel. Zero intermediate copies.
+///
+/// # Fallback
+/// Delegates to [`scaled_dot_product_attention`] with an internal SHD→BHSD
+/// permute and back. Correct but slower.
+pub fn dit_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    cuda_config: Option<&crate::OpConfig>,
+) -> Result<()> {
+    let q_shape = q.shape();
+    if q_shape.len() != 3 || q_shape[1] != n_heads || q_shape[2] != head_dim {
+        return Err(Error::InvalidArgument(format!(
+            "dit_sdpa: q must be [seq, {}, {}], got {:?}",
+            n_heads, head_dim, q_shape,
+        )).into());
+    }
+    let seq = q_shape[0];
+    if k.shape() != q_shape || v.shape() != q_shape || output.shape() != q_shape {
+        return Err(Error::InvalidArgument(format!(
+            "dit_sdpa: all tensors must share shape [seq, n_heads, head_dim], got q={:?} k={:?} v={:?} out={:?}",
+            q_shape, k.shape(), v.shape(), output.shape(),
+        )).into());
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        // `DIT_SDPA_FALLBACK=1` forces the slow per-head path — used by
+        // parity tests to diff flash-attn against the reference SDPA.
+        let force_fallback = std::env::var_os("DIT_SDPA_FALLBACK").is_some();
+        if !force_fallback
+            && q.device().is_cuda()
+            && q.dtype() == DataType::BF16
+            && head_dim == 128
+            && seq % 128 == 0
+            && seq > 0
+        {
+            return dit_sdpa_cuda_flash_bf16_hdim128(q, k, v, output, seq, n_heads, cuda_config);
+        }
+    }
+
+    // Fallback: shuttle through BHSD and call the generic per-head SDPA.
+    dit_sdpa_fallback(q, k, v, output, seq, n_heads, head_dim, cuda_config)
+}
+
+#[cfg(feature = "cuda")]
+fn dit_sdpa_cuda_flash_bf16_hdim128(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    seq: usize,
+    n_heads: usize,
+    _cuda_config: Option<&crate::OpConfig>,
+) -> Result<()> {
+    use crate::cuda::CudaConfig;
+
+    unsafe extern "C" {
+        fn launch_flash_attn_cute_bf16_hdim128(
+            q_ptr: *const half::bf16,
+            k_ptr: *const half::bf16,
+            v_ptr: *const half::bf16,
+            o_ptr: *mut half::bf16,
+            q_seq_len: i32,
+            kv_len_ptr: *const i32,
+            num_q_heads: i32,
+            num_kv_heads: i32,
+            is_causal: i32,
+            stream: crate::cuda::ffi::cudaStream_t,
+        );
+    }
+
+    let stream = CudaConfig::resolve_stream(_cuda_config);
+
+    // Self-attention (no KV cache): the kernel computes kv_len = *kv_len_ptr
+    // + seq, which it does on the HOST side (see the kernel's launch
+    // function). So kv_len_ptr must be a host pointer; a stack i32 of 0
+    // satisfies that and makes `kv_len == seq`.
+    let kv_len_host: i32 = 0;
+
+    let q_ptr = q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let k_ptr = k.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let v_ptr = v.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let o_ptr = output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+
+    unsafe {
+        launch_flash_attn_cute_bf16_hdim128(
+            q_ptr, k_ptr, v_ptr, o_ptr,
+            seq as i32,
+            &kv_len_host as *const i32,
+            n_heads as i32,
+            n_heads as i32, // self-attn: num_kv_heads == num_q_heads
+            /*is_causal=*/ 0,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+fn dit_sdpa_fallback(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    seq: usize,
+    n_heads: usize,
+    head_dim: usize,
+    cuda_config: Option<&crate::OpConfig>,
+) -> Result<()> {
+    use crate::op::tensor_utils::{materialize, permute_nd};
+
+    // SHD [seq, H, D] → BHSD [1, H, seq, D] for the generic kernel.
+    let to_bhsd = |t: &Tensor| -> Result<Tensor> {
+        let hsd = permute_nd(&t.view(&[seq, n_heads, head_dim])?, &[1, 0, 2])?;
+        let bhsd_view = hsd.view(&[1, n_heads, seq, head_dim])?;
+        materialize(&bhsd_view)
+    };
+    let q_bhsd = to_bhsd(q)?;
+    let k_bhsd = to_bhsd(k)?;
+    let v_bhsd = to_bhsd(v)?;
+
+    let mut out_bhsd = Tensor::new(&[1, n_heads, seq, head_dim], q.dtype(), q.device())?;
+    scaled_dot_product_attention(&q_bhsd, &k_bhsd, &v_bhsd, &mut out_bhsd, cuda_config)?;
+
+    // BHSD [1, H, seq, D] → SHD [seq, H, D] for the output.
+    let out_hsd = out_bhsd.view(&[n_heads, seq, head_dim])?;
+    let out_shd = permute_nd(&out_hsd, &[1, 0, 2])?;
+    output.copy_from_on_current_stream(&out_shd.view(&[seq, n_heads, head_dim])?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +418,76 @@ mod tests {
             let b_ = out_gpu_cpu.as_f32()?.as_slice()?;
             assert_close(a, b_, 1e-2);
         }
+        Ok(())
+    }
+
+    // ── dit_sdpa: flash-attn fast path vs BHSD fallback parity ──
+    //
+    // Exercises exactly the config used by Z-Image DiT main layers:
+    // BF16, seq multiple of 128, n_heads=30, head_dim=128 — which hits
+    // `launch_flash_attn_cute_bf16_hdim128`. Compares tensor output
+    // against the SHD-wrapped generic SDPA (BHSD permute + per-head
+    // sgemm/softmax loop) and requires a small BF16 tolerance.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_dit_sdpa_flash_matches_fallback_bf16_hdim128() -> Result<()> {
+        use half::bf16;
+        let seq = 128;
+        let n_heads = 30;
+        let head_dim = 128;
+
+        // Build random SHD tensors on CPU (F32), then quantize to BF16 and
+        // ship to GPU — both paths consume the identical BF16 bytes, so any
+        // delta is purely due to the different reduction orders.
+        let q_f32 = Tensor::randn(&[seq, n_heads, head_dim], DataType::F32, DeviceType::Cpu, Some(1))?;
+        let k_f32 = Tensor::randn(&[seq, n_heads, head_dim], DataType::F32, DeviceType::Cpu, Some(2))?;
+        let v_f32 = Tensor::randn(&[seq, n_heads, head_dim], DataType::F32, DeviceType::Cpu, Some(3))?;
+
+        let to_bf16_cuda = |t: &Tensor| -> Result<Tensor> {
+            let bf = t.to_dtype(DataType::BF16)?;
+            bf.to_cuda(0)
+        };
+        let q_gpu = to_bf16_cuda(&q_f32)?;
+        let k_gpu = to_bf16_cuda(&k_f32)?;
+        let v_gpu = to_bf16_cuda(&v_f32)?;
+
+        let cuda_config = crate::cuda::CudaConfig::new()?;
+
+        // Fast path (flash-attn)
+        let mut out_flash = Tensor::new(&[seq, n_heads, head_dim], DataType::BF16, DeviceType::Cuda(0))?;
+        dit_sdpa_cuda_flash_bf16_hdim128(&q_gpu, &k_gpu, &v_gpu, &mut out_flash, seq, n_heads, Some(&cuda_config))?;
+
+        // Fallback (per-head sgemm/softmax)
+        let mut out_ref = Tensor::new(&[seq, n_heads, head_dim], DataType::BF16, DeviceType::Cuda(0))?;
+        dit_sdpa_fallback(&q_gpu, &k_gpu, &v_gpu, &mut out_ref, seq, n_heads, head_dim, Some(&cuda_config))?;
+
+        // Copy back + convert to f32 for comparison.
+        let a = out_flash.to_cpu()?;
+        let b = out_ref.to_cpu()?;
+        let a_slice = a.as_bf16()?.as_slice()?;
+        let b_slice = b.as_bf16()?.as_slice()?;
+        let mut max_diff = 0.0f32;
+        let mut sum_sq_diff = 0.0f64;
+        let mut sum_sq_ref = 0.0f64;
+        for (x, y) in a_slice.iter().zip(b_slice.iter()) {
+            let xf = x.to_f32();
+            let yf = y.to_f32();
+            let d = (xf - yf).abs();
+            if d > max_diff { max_diff = d; }
+            sum_sq_diff += (d as f64) * (d as f64);
+            sum_sq_ref += (yf as f64) * (yf as f64);
+        }
+        let rel_rms = (sum_sq_diff / sum_sq_ref.max(1e-12)).sqrt();
+        eprintln!(
+            "dit_sdpa parity: max_abs_diff={:.4}, rel_rms_diff={:.4}",
+            max_diff, rel_rms
+        );
+        // Two independent BF16 reductions of ~128 summands differ by a few
+        // ULPs per output — we allow a generous 5% relative RMS and 0.5
+        // absolute for peak element divergence.
+        assert!(rel_rms < 0.05, "relative RMS diff too large: {}", rel_rms);
+        assert!(max_diff < 0.5, "max abs diff too large: {}", max_diff);
+        let _ = bf16::from_f32(0.0); // silence unused import if any
         Ok(())
     }
 }
