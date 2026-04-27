@@ -199,6 +199,33 @@ impl Scheduler for FlowMatchEulerScheduler {
     }
 }
 
+impl FlowMatchEulerScheduler {
+    /// CUDA Graph-friendly variant of [`Scheduler::step`]: the `dt`
+    /// coefficient is read from **device** memory rather than passed as
+    /// a kernel-parameter `f32`. This keeps all per-step-varying data
+    /// outside the graph's kernel arguments — the caller writes
+    /// `d_dt[0]` via `cudaMemcpyAsync` before each replay, everything
+    /// else is captured once.
+    ///
+    /// `d_dt` must be a `[1] f32` tensor on the same device as the
+    /// sample tensors. The scheduler's internal `step_index` is not
+    /// advanced: the caller drives which element of its pre-computed
+    /// `DtValueDevVec` each step reads.
+    #[cfg(feature = "cuda")]
+    pub fn step_from_dev(
+        &mut self,
+        model_output: &mut Tensor,
+        sample: &Tensor,
+        dst: &mut Tensor,
+        d_dt: &Tensor,
+    ) -> Result<()> {
+        crate::op::scalar::scalar_mul_inplace_from_dev(model_output, d_dt)?;
+        dst.copy_from_on_current_stream(sample)?;
+        *dst += &*model_output;
+        Ok(())
+    }
+}
+
 // ───────────────────────────── Helpers ────────────────────────────────────────
 
 /// Compute adaptive shift `mu` based on image sequence length.

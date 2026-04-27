@@ -349,3 +349,70 @@ pub fn kpack_gemm(
 
     Ok(())
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::base::DeviceType;
+
+    /// Microbench: compare three separate BF16 GEMMs vs one fused (3x N)
+    /// at Z-Image DiT qkv shapes (M=seq, K=3840, per-GEMM N=3840).
+    /// Not a correctness test — prints timings only. Run with:
+    ///   cargo test --features cuda -p infer-worker qkv_gemm_microbench \
+    ///       --release -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "microbench, wall-clock only"]
+    fn qkv_gemm_microbench() -> Result<()> {
+        let cfg = CudaConfig::new()?;
+        let m = 384;
+        let k = 3840;
+        let n_single = 3840;
+
+        let a = Tensor::randn(&[m, k], DataType::BF16, DeviceType::Cuda(0), Some(1))?;
+        // Three separate weights + outputs
+        let wq = Tensor::randn(&[n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(2))?;
+        let wk = Tensor::randn(&[n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(3))?;
+        let wv = Tensor::randn(&[n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(4))?;
+        let mut oq = Tensor::new(&[m, n_single], DataType::BF16, DeviceType::Cuda(0))?;
+        let mut ok = Tensor::new(&[m, n_single], DataType::BF16, DeviceType::Cuda(0))?;
+        let mut ov = Tensor::new(&[m, n_single], DataType::BF16, DeviceType::Cuda(0))?;
+
+        // Fused
+        let wqkv = Tensor::randn(&[3 * n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(5))?;
+        let mut oqkv = Tensor::new(&[m, 3 * n_single], DataType::BF16, DeviceType::Cuda(0))?;
+
+        // Warmup
+        for _ in 0..5 {
+            hgemm_bf16(&a, &wq, &mut oq, Some(&cfg))?;
+            hgemm_bf16(&a, &wk, &mut ok, Some(&cfg))?;
+            hgemm_bf16(&a, &wv, &mut ov, Some(&cfg))?;
+            hgemm_bf16(&a, &wqkv, &mut oqkv, Some(&cfg))?;
+        }
+        cfg.sync_stream()?;
+
+        let niter = 50;
+        // 3 separate
+        let t0 = std::time::Instant::now();
+        for _ in 0..niter {
+            hgemm_bf16(&a, &wq, &mut oq, Some(&cfg))?;
+            hgemm_bf16(&a, &wk, &mut ok, Some(&cfg))?;
+            hgemm_bf16(&a, &wv, &mut ov, Some(&cfg))?;
+        }
+        cfg.sync_stream()?;
+        let us_separate = t0.elapsed().as_micros() as f64 / niter as f64;
+
+        // 1 fused
+        let t0 = std::time::Instant::now();
+        for _ in 0..niter {
+            hgemm_bf16(&a, &wqkv, &mut oqkv, Some(&cfg))?;
+        }
+        cfg.sync_stream()?;
+        let us_fused = t0.elapsed().as_micros() as f64 / niter as f64;
+
+        eprintln!(
+            "qkv_gemm_microbench M={} K={} N(single)={}: 3x separate = {:.1} us/call, fused = {:.1} us/call",
+            m, k, n_single, us_separate, us_fused,
+        );
+        Ok(())
+    }
+}

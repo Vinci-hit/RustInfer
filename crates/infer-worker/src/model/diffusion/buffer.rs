@@ -55,11 +55,27 @@ pub enum DiffBufferType {
     /// input the DiT expects. Populated via a DtoD copy each step.
     Latent5D,
 
+    /// `[cap_len_max, cap_feat_dim]` weight-dtype — persistent slot for
+    /// the text encoder's output, written **once per request** (outside
+    /// the denoise CUDA Graph capture) so the graph can read it from a
+    /// stable device pointer.
+    PromptEmbedsPadded,
+
     // ─────────────────────── Transformer scope ─────────────────────
     /// `[1]` f32 on **device** — holds `norm_t × t_scale`. Written via
     /// `cudaMemcpyAsync` **outside** any CUDA Graph capture region so
     /// replays read a fresh scalar.
     TValueDev,
+    /// `[N_MAX]` f32 on **device** — pre-uploaded per-step `t_value *
+    /// t_scale` schedule. Under CUDA Graph capture the timestep
+    /// embedding kernel reads `&TValueDevVec[i]` (constant pointer)
+    /// each step; the actual value changes per replay via a single HtoD
+    /// upload of the whole vector before each generate.
+    TValueDevVec,
+    /// `[N_MAX]` f32 on **device** — pre-uploaded per-step Euler `dt`
+    /// coefficients. Paired with `TValueDevVec` for graph-safe
+    /// execution.
+    DtValueDevVec,
     /// `[1, 256]` f32 — sinusoidal frequency encoding (device memory).
     TFreq,
     /// `[1, mid_size]` weight-dtype — timestep MLP layer-1 output.
@@ -151,20 +167,22 @@ pub enum DiffBufferType {
     BlkModOut,
     /// `[S_total_max, dim]` — `attention_norm1(x)`.
     BlkNorm1X,
-    /// `[S_total_max, dim]` — Q projection.
+    /// `[S_total_max, 3*dim]` — fused QKV projection output. A single
+    /// GEMM of `norm1_x @ to_qkv.weight^T` writes Q / K / V here as
+    /// three contiguous column slabs (cols `[0..dim)` = Q,
+    /// `[dim..2*dim)` = K, `[2*dim..3*dim)` = V). Three independent
+    /// `split_cols` kernel launches then copy each slab into the
+    /// contiguous [`BlkQ`] / [`BlkK`] / [`BlkV`] buffers for downstream
+    /// QK-norm, RoPE, and SDPA. This mirrors the LLM-side
+    /// `QkvOutput → Q/K/V` split used in `Llama3` / `Qwen3`.
+    BlkQkvOut,
+    /// `[S_total_max, dim]` — Q projection (contiguous slab copied out
+    /// of [`BlkQkvOut`] by `split_cols`).
     BlkQ,
     /// `[S_total_max, dim]` — K projection.
     BlkK,
     /// `[S_total_max, dim]` — V projection.
     BlkV,
-    /// `[S_total_max * n_heads, head_dim]` — Q flattened for per-head RMSNorm input.
-    BlkQNormIn,
-    /// `[S_total_max * n_heads, head_dim]` — Q per-head RMSNorm output.
-    BlkQNormOut,
-    /// `[S_total_max * n_heads, head_dim]` — K flattened for per-head RMSNorm input.
-    BlkKNormIn,
-    /// `[S_total_max * n_heads, head_dim]` — K per-head RMSNorm output.
-    BlkKNormOut,
     /// `[S_total_max, dim]` — attention output, laid out as
     /// `[seq, n_heads, head_dim]` (SHD) when viewed 3D. Written directly
     /// by [`crate::op::sdpa::dit_sdpa`] (flash-attn fast path or BHSD

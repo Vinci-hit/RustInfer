@@ -28,6 +28,15 @@ use crate::base::{DataType, DeviceType};
 use crate::model::diffusion::buffer::{DiffBufferType, DiffWorkspace};
 use crate::tensor::Tensor;
 
+/// Maximum number of denoising steps the state pre-allocates scratch for.
+///
+/// Stored in [`DiffBufferType::TValueDevVec`] / [`DiffBufferType::DtValueDevVec`]
+/// so a single `[N_MAX] f32` upload per `generate()` hands the entire
+/// schedule to the denoise CUDA Graph. Z-Image turbo uses 2 steps, the
+/// official schedule 9; 16 is comfortable with zero meaningful cost
+/// (64 B × 2 slots).
+pub const N_MAX_STEPS: usize = 16;
+
 /// Sequence length rounding used by the transformer (must match the
 /// `SEQ_MULTI_OF` constant in `transformer.rs`).
 const SEQ_MULTI_OF: usize = 128;
@@ -192,10 +201,10 @@ impl PipelineState {
             DiffBufferType::NoisePred,
             Tensor::new(&[1, LATENT_CHANNELS, lh, lw], dtype, device)?,
         );
-        buffers.insert(
-            DiffBufferType::Latent5D,
-            Tensor::new(&[LATENT_CHANNELS, 1, lh, lw], dtype, device)?,
-        );
+        // NOTE: `Latent5D` used to live here but has moved to `DitState`
+        // so the transformer's `forward_denoise_step` can read it from a
+        // single state handle (and so the denoise CUDA Graph can bind to
+        // one DitState slot).
 
         Ok(Self { device, dtype, capacity, buffers })
     }
@@ -253,6 +262,28 @@ impl PipelineState {
 pub struct DitState {
     pub spec: DitShapeSpec,
     pub buffers: DiffWorkspace,
+
+    // ─────────────────────── Host staging buffers ───────────────────────
+    //
+    // Persistent CPU-side scratch tensors used by the zero-allocation
+    // forward path to stage data for a single `cudaMemcpyAsync` into a
+    // pre-allocated device slot. Allocated once in `DitState::new`, never
+    // re-homed. All of these are plain Host memory (non-pinned) — the
+    // memcpy is already fully overlapped with GPU work by the current
+    // stream and these payloads are small (≤ few MB).
+
+    /// `[1, T_FREQ_DIM]` weight-dtype CPU — sinusoidal timestep embedding
+    /// assembled host-side, uploaded into [`DiffBufferType::TFreq`].
+    pub t_freq_host_stage: Tensor,
+    /// `[s_img_max, head_dim/2]` F32 CPU — image RoPE cos assembled
+    /// host-side, uploaded into [`DiffBufferType::XCos`].
+    pub x_cos_host_stage: Tensor,
+    /// `[s_img_max, head_dim/2]` F32 CPU — image RoPE sin.
+    pub x_sin_host_stage: Tensor,
+    /// `[s_cap_max, head_dim/2]` F32 CPU — caption RoPE cos.
+    pub cap_cos_host_stage: Tensor,
+    /// `[s_cap_max, head_dim/2]` F32 CPU — caption RoPE sin.
+    pub cap_sin_host_stage: Tensor,
 }
 
 impl DitState {
@@ -266,7 +297,7 @@ impl DitState {
             device,
             dtype,
             dim,
-            n_heads,
+            n_heads: _,
             head_dim,
             hidden_dim,
             cap_feat_dim,
@@ -296,9 +327,12 @@ impl DitState {
             DiffBufferType::TValueDev,
             Tensor::new(&[1], DataType::F32, device)?,
         );
+        // TFreq holds the sinusoidal timestep embedding that feeds mlp1.
+        // It must be in the transformer's weight dtype (typically BF16)
+        // so mlp1 can be called directly without an intermediate cast.
         m.insert(
             DiffBufferType::TFreq,
-            Tensor::new(&[1, T_FREQ_DIM], DataType::F32, device)?,
+            Tensor::new(&[1, T_FREQ_DIM], dtype, device)?,
         );
         m.insert(
             DiffBufferType::TEmbHidden,
@@ -432,6 +466,10 @@ impl DitState {
             Tensor::new(&[s_tot, dim], dtype, device)?,
         );
         m.insert(
+            DiffBufferType::BlkQkvOut,
+            Tensor::new(&[s_tot, 3 * dim], dtype, device)?,
+        );
+        m.insert(
             DiffBufferType::BlkQ,
             Tensor::new(&[s_tot, dim], dtype, device)?,
         );
@@ -442,22 +480,6 @@ impl DitState {
         m.insert(
             DiffBufferType::BlkV,
             Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkQNormIn,
-            Tensor::new(&[s_tot * n_heads, head_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkQNormOut,
-            Tensor::new(&[s_tot * n_heads, head_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkKNormIn,
-            Tensor::new(&[s_tot * n_heads, head_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkKNormOut,
-            Tensor::new(&[s_tot * n_heads, head_dim], dtype, device)?,
         );
         m.insert(
             DiffBufferType::BlkAttnFlat,
@@ -492,7 +514,58 @@ impl DitState {
             Tensor::new(&[s_tot, dim], dtype, device)?,
         );
 
-        Ok(Self { spec, buffers: m })
+        // ─────────────── CUDA Graph-friendly scratch slots ───────────────
+        // Per-step timestep / dt schedules, pre-uploaded once per
+        // generate() so the denoise graph can index into them with a
+        // fixed pointer (only the bytes change across replays).
+        m.insert(
+            DiffBufferType::TValueDevVec,
+            Tensor::new(&[N_MAX_STEPS], DataType::F32, device)?,
+        );
+        m.insert(
+            DiffBufferType::DtValueDevVec,
+            Tensor::new(&[N_MAX_STEPS], DataType::F32, device)?,
+        );
+        // Stable device-side home for the text encoder's output. Written
+        // once per generate() from the (possibly freshly-allocated)
+        // `prompt_embeds` tensor, then the denoise graph reads from this
+        // fixed pointer.
+        m.insert(
+            DiffBufferType::PromptEmbedsPadded,
+            Tensor::new(&[s_cap, cap_feat_dim], dtype, device)?,
+        );
+        // DiT input view of the current latents. The pipeline copies
+        // `[1, C, H, W]` Latents → `[C, 1, H, W]` Latent5D each step.
+        // Lives in DitState so the transformer can read it through a
+        // single state handle during CUDA Graph capture/replay.
+        m.insert(
+            DiffBufferType::Latent5D,
+            Tensor::new(&[LATENT_CHANNELS, 1, lh, lw], dtype, device)?,
+        );
+
+        // ─────────────── Host staging buffers ───────────────
+        // Allocated once; written every forward in-place, then HtoD
+        // uploaded into the corresponding device slot.
+        let t_freq_host_stage =
+            Tensor::new(&[1, T_FREQ_DIM], dtype, DeviceType::Cpu)?;
+        let x_cos_host_stage =
+            Tensor::new(&[s_img, half_d], DataType::F32, DeviceType::Cpu)?;
+        let x_sin_host_stage =
+            Tensor::new(&[s_img, half_d], DataType::F32, DeviceType::Cpu)?;
+        let cap_cos_host_stage =
+            Tensor::new(&[s_cap, half_d], DataType::F32, DeviceType::Cpu)?;
+        let cap_sin_host_stage =
+            Tensor::new(&[s_cap, half_d], DataType::F32, DeviceType::Cpu)?;
+
+        Ok(Self {
+            spec,
+            buffers: m,
+            t_freq_host_stage,
+            x_cos_host_stage,
+            x_sin_host_stage,
+            cap_cos_host_stage,
+            cap_sin_host_stage,
+        })
     }
 
     /// Zero-copy slice of a pre-allocated buffer, sized at `shape`.
@@ -570,15 +643,13 @@ mod tests {
         assert!(st.buffers.contains_key(&DiffBufferType::Latents));
         assert!(st.buffers.contains_key(&DiffBufferType::LatentsTmp));
         assert!(st.buffers.contains_key(&DiffBufferType::NoisePred));
-        assert!(st.buffers.contains_key(&DiffBufferType::Latent5D));
-        assert_eq!(st.buffers.len(), 4);
+        assert_eq!(st.buffers.len(), 3);
 
         let lh = cap.max_latent_h();
         let lw = cap.max_latent_w();
         assert_eq!(st.buffers[&DiffBufferType::Latents].shape(), &[1, 16, lh, lw]);
         assert_eq!(st.buffers[&DiffBufferType::LatentsTmp].shape(), &[1, 16, lh, lw]);
         assert_eq!(st.buffers[&DiffBufferType::NoisePred].shape(), &[1, 16, lh, lw]);
-        assert_eq!(st.buffers[&DiffBufferType::Latent5D].shape(), &[16, 1, lh, lw]);
         Ok(())
     }
 
@@ -636,7 +707,7 @@ mod tests {
         let st = DitState::new(spec)?;
         // Ask for a sub-sequence half the max; `Tensor::slice` should succeed
         // and report the new shape.
-        let sub = st.slice(DiffBufferType::BlkQ, &[spec.s_img_max(), spec.dim])?;
+        let sub = st.slice(DiffBufferType::BlkNorm1X, &[spec.s_img_max(), spec.dim])?;
         assert_eq!(sub.shape(), &[spec.s_img_max(), spec.dim]);
         Ok(())
     }
@@ -647,7 +718,7 @@ mod tests {
         let st = DitState::new(spec)?;
         // Buffer is [s_tot, dim] — asking for [s_tot+32, dim] must fail.
         let oversize = st.slice(
-            DiffBufferType::BlkQ,
+            DiffBufferType::BlkNorm1X,
             &[spec.s_total_max() + 32, spec.dim],
         );
         assert!(oversize.is_err());
@@ -667,6 +738,10 @@ mod tests {
         // variants are deliberately excluded — they live in other states.
         let dit_scope = [
             DiffBufferType::TValueDev,
+            DiffBufferType::TValueDevVec,
+            DiffBufferType::DtValueDevVec,
+            DiffBufferType::PromptEmbedsPadded,
+            DiffBufferType::Latent5D,
             DiffBufferType::TFreq,
             DiffBufferType::TEmbHidden,
             DiffBufferType::TEmbOut,
@@ -697,13 +772,10 @@ mod tests {
             DiffBufferType::ImageOut,
             DiffBufferType::BlkModOut,
             DiffBufferType::BlkNorm1X,
+            DiffBufferType::BlkQkvOut,
             DiffBufferType::BlkQ,
             DiffBufferType::BlkK,
             DiffBufferType::BlkV,
-            DiffBufferType::BlkQNormIn,
-            DiffBufferType::BlkQNormOut,
-            DiffBufferType::BlkKNormIn,
-            DiffBufferType::BlkKNormOut,
             DiffBufferType::BlkAttnFlat,
             DiffBufferType::BlkToOut,
             DiffBufferType::BlkNorm2Attn,

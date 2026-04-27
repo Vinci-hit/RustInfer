@@ -129,3 +129,67 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, c
 
     Ok(())
 }
+
+/// In-place variant of [`rmsnorm`]: `x = rmsnorm(x, weight, eps)`.
+///
+/// Uses the exact same CUDA kernels as [`rmsnorm`]; the kernels are
+/// safe to invoke with `output == input` because each thread loads
+/// `input[i]` into a register (via `float4`) *before* writing
+/// `output[i]`, and the block reduction that computes the RMS scale
+/// has already completed (with a `__syncthreads()`) by the time any
+/// thread issues its store. No cross-thread read-after-write hazard
+/// exists since each element is touched by exactly one thread on the
+/// write pass.
+pub fn rmsnorm_inplace(
+    x: &mut Tensor,
+    weight: &Tensor,
+    eps: f32,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    let dim = weight.shape()[0];
+    let rows = x.num_elements() / dim;
+
+    if !dim.is_multiple_of(16) {
+        return Err(Error::InvalidArgument(
+            "RMSNorm in-place kernel requires dimension to be multiple of 16".to_string(),
+        ).into());
+    }
+
+    let stream = CudaConfig::resolve_stream(cuda_config);
+    let dtype = x.dtype();
+    match dtype {
+        crate::base::DataType::F32 => {
+            let x_typed: &mut TypedTensor<f32> = x.as_f32_mut()?;
+            let w_typed = weight.as_f32()?;
+            let ptr = x_typed.buffer_mut().as_mut_ptr() as *mut f32;
+            let w_ptr = w_typed.buffer().as_ptr() as *const f32;
+            unsafe {
+                rmsnorm_kernel_cu_dim(ptr, ptr as *const f32, w_ptr, rows as i32, dim as i32, eps, stream);
+            }
+        }
+        crate::base::DataType::BF16 => {
+            let x_typed: &mut TypedTensor<half::bf16> = x.as_bf16_mut()?;
+            let w_typed = weight.as_bf16()?;
+            let ptr = x_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let w_ptr = w_typed.buffer().as_ptr() as *const half::bf16;
+            unsafe {
+                rmsnorm_kernel_cu_bf16x8(ptr, ptr as *const half::bf16, w_ptr, rows as i32, dim as i32, eps, stream);
+            }
+        }
+        crate::base::DataType::F16 => {
+            let x_typed: &mut TypedTensor<half::f16> = x.as_f16_mut()?;
+            let w_typed = weight.as_f16()?;
+            let ptr = x_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let w_ptr = w_typed.buffer().as_ptr() as *const half::f16;
+            unsafe {
+                rmsnorm_kernel_cu_fp16x8(ptr, ptr as *const half::f16, w_ptr, rows as i32, dim as i32, eps, stream);
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported data type for RMSNorm CUDA in-place kernel: {:?}", dtype
+            )).into());
+        }
+    }
+    Ok(())
+}

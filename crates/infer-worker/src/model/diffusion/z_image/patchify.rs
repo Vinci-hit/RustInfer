@@ -83,6 +83,82 @@ pub fn unpatchify(
 }
 
 
+/// 将图像 latent 拆成 patch token 序列（零分配 dst-write 版）。
+///
+/// 等价于 [`patchify`]，但把 permute 的结果直接写入调用方预分配的
+/// `[num_tokens, patch_flat]` 缓冲区（`Patches` slot），不再 `Tensor::new`。
+pub fn patchify_into(
+    image: &Tensor,
+    patch_size: usize,
+    f_patch_size: usize,
+    dst: &mut Tensor,
+) -> Result<()> {
+    let shape = image.shape();
+    if shape.len() != 4 {
+        return Err(Error::InvalidArgument(format!(
+            "patchify_into: expected [C, F, H, W], got {:?}", shape
+        )).into());
+    }
+    let (c, f, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+    let (p_f, p_h, p_w) = (f_patch_size, patch_size, patch_size);
+
+    if f % p_f != 0 || h % p_h != 0 || w % p_w != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "patchify_into: (F={}, H={}, W={}) not divisible by (pF={}, pH={}, pW={})",
+            f, h, w, p_f, p_h, p_w
+        )).into());
+    }
+    let (f_t, h_t, w_t) = (f / p_f, h / p_h, w / p_w);
+    let num_tokens = f_t * h_t * w_t;
+    let patch_flat = p_f * p_h * p_w * c;
+    if dst.shape() != [num_tokens, patch_flat].as_slice() {
+        return Err(Error::InvalidArgument(format!(
+            "patchify_into: dst shape {:?} != [{}, {}]",
+            dst.shape(), num_tokens, patch_flat
+        )).into());
+    }
+
+    // [C, F, H, W] → [C, f_t, pF, h_t, pH, w_t, pW]
+    let src_view = image.view(&[c, f_t, p_f, h_t, p_h, w_t, p_w])?;
+    // permute_into expects dst shape [f_t, h_t, w_t, pF, pH, pW, C]
+    let mut dst_7d = dst.view(&[f_t, h_t, w_t, p_f, p_h, p_w, c])?;
+    src_view.permute_into(&[1, 3, 5, 2, 4, 6, 0], &mut dst_7d)?;
+    Ok(())
+}
+
+/// 将 patch token 序列还原为图像 latent（零分配 dst-write 版）。
+///
+/// 等价于 [`unpatchify`]，把 permute 的结果直接写进调用方预分配的
+/// `[C, F, H, W]` 缓冲区（`ImageOut` slot）。
+pub fn unpatchify_into(
+    tokens: &Tensor,
+    f: usize,
+    h: usize,
+    w: usize,
+    out_channels: usize,
+    patch_size: usize,
+    f_patch_size: usize,
+    dst: &mut Tensor,
+) -> Result<()> {
+    let (p_f, p_h, p_w) = (f_patch_size, patch_size, patch_size);
+    let (f_t, h_t, w_t) = (f / p_f, h / p_h, w / p_w);
+
+    if dst.shape() != [out_channels, f, h, w].as_slice() {
+        return Err(Error::InvalidArgument(format!(
+            "unpatchify_into: dst shape {:?} != [{}, {}, {}, {}]",
+            dst.shape(), out_channels, f, h, w
+        )).into());
+    }
+
+    // tokens viewed as [f_t, h_t, w_t, pF, pH, pW, C]
+    let src_view = tokens.view(&[f_t, h_t, w_t, p_f, p_h, p_w, out_channels])?;
+    // dst viewed as [C, f_t, pF, h_t, pH, w_t, pW]
+    let mut dst_7d = dst.view(&[out_channels, f_t, p_f, h_t, p_h, w_t, p_w])?;
+    src_view.permute_into(&[6, 0, 3, 1, 4, 2, 5], &mut dst_7d)?;
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

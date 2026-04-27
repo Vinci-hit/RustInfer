@@ -23,6 +23,13 @@ impl RMSNorm {
         let dim = weight.shape()[0];
         Self { weight, dim, eps }
     }
+
+    /// Expose the RMSNorm epsilon for callers that need it (e.g. to
+    /// parameterize a fused kernel such as `fused_add_rmsnorm`).
+    #[inline]
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
 }
 
 impl RMSNorm {
@@ -39,6 +46,28 @@ impl RMSNorm {
             DeviceType::Cpu => { let _ = cuda_config; kernels::cpu::rmsnorm(input, weight, output, self.eps) }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => kernels::cuda::rmsnorm(input, weight, output, self.eps, cuda_config),
+        }
+    }
+
+    /// In-place RMSNorm: `x = rmsnorm(x, self.weight, self.eps)`.
+    ///
+    /// Avoids the scratch buffer and the two extra copies that the
+    /// out-of-place [`Self::forward`] otherwise forces at call sites
+    /// that don't already have a distinct destination slot. The
+    /// underlying CUDA kernels are in-place safe (per-element
+    /// register-loaded read-before-write, see the kernel source);
+    /// the CPU path processes each row chunk exclusively inside a
+    /// single rayon task so the in-place update is data-race free.
+    pub fn forward_inplace(
+        &self,
+        x: &mut Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
+        let weight = &self.weight;
+        match x.device() {
+            DeviceType::Cpu => { let _ = cuda_config; kernels::cpu::rmsnorm_inplace(x, weight, self.eps) }
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(_) => kernels::cuda::rmsnorm_inplace(x, weight, self.eps, cuda_config),
         }
     }
 }

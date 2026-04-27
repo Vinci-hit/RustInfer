@@ -102,6 +102,124 @@ impl TimestepEmbedder {
 
         Ok(output)
     }
+
+    /// Zero-allocation variant of [`Self::forward`] for the diffusion hot
+    /// path.
+    ///
+    /// The caller pre-allocates three device-side slots matching the
+    /// transformer's weight dtype:
+    ///
+    /// - `t_freq_slot`   : `[1, frequency_embedding_size]` — receives the
+    ///                     sinusoidal encoding (dtype-cast from F32).
+    /// - `t_hidden_slot` : `[1, mlp1.out_features]` — mlp1 output.
+    /// - `t_out_slot`    : `[1, mlp2.out_features]` — mlp2 output (this is
+    ///                     the returned `adaln_input` tensor).
+    ///
+    /// `t_value_scaled` is the already-scaled scalar timestep (host side).
+    /// `host_staging` is a **persistent** `[1, frequency_embedding_size]`
+    /// CPU tensor in the weight dtype that the caller owns for the
+    /// lifetime of the pipeline — we compute the sinusoid into it and
+    /// then do a single HtoD `copy_from_on_current_stream` to
+    /// `t_freq_slot`. This avoids any `Tensor::new` on the hot path.
+    ///
+    /// Nothing here allocates; everything runs on the caller's current
+    /// CUDA stream.
+    pub fn forward_into(
+        &self,
+        t_value_scaled: f32,
+        t_freq_slot: &mut Tensor,
+        t_hidden_slot: &mut Tensor,
+        t_out_slot: &mut Tensor,
+        host_staging: &mut Tensor,
+        cuda_config: Option<&crate::OpConfig>,
+    ) -> Result<()> {
+        let weight_dtype = self.mlp1.weight.dtype();
+        let dim = self.frequency_embedding_size;
+        let half = dim / 2;
+
+        // Shape / dtype sanity — these are programmer errors, so panic
+        // with a descriptive message instead of bubbling up.
+        debug_assert_eq!(host_staging.shape(), &[1, dim]);
+        debug_assert_eq!(host_staging.dtype(), weight_dtype);
+        debug_assert_eq!(host_staging.device(), DeviceType::Cpu);
+        debug_assert_eq!(t_freq_slot.shape(), &[1, dim]);
+        debug_assert_eq!(t_freq_slot.dtype(), weight_dtype);
+
+        // freqs = exp(-ln(10000) * arange(0, half) / half) — stack-local,
+        // no heap alloc; `half = 128` for the standard Z-Image config.
+        let log_max_period = (10000.0_f64).ln();
+
+        // Write the sinusoid straight into the persistent host staging
+        // buffer (dtype-casted inline). `[cos(args) | sin(args)]`.
+        match weight_dtype {
+            DataType::F32 => {
+                let dst = host_staging.as_f32_mut()?.as_slice_mut()?;
+                for i in 0..half {
+                    let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
+                    let arg = t_value_scaled * freq;
+                    dst[i] = arg.cos();
+                    dst[half + i] = arg.sin();
+                }
+            }
+            DataType::BF16 => {
+                let dst = host_staging.as_bf16_mut()?.as_slice_mut()?;
+                for i in 0..half {
+                    let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
+                    let arg = t_value_scaled * freq;
+                    dst[i]         = half::bf16::from_f32(arg.cos());
+                    dst[half + i]  = half::bf16::from_f32(arg.sin());
+                }
+            }
+            DataType::F16 => {
+                let dst = host_staging.as_f16_mut()?.as_slice_mut()?;
+                for i in 0..half {
+                    let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
+                    let arg = t_value_scaled * freq;
+                    dst[i]         = half::f16::from_f32(arg.cos());
+                    dst[half + i]  = half::f16::from_f32(arg.sin());
+                }
+            }
+            other => {
+                return Err(crate::base::error::Error::InvalidArgument(format!(
+                    "TimestepEmbedder::forward_into: unsupported weight dtype {:?}",
+                    other,
+                )).into());
+            }
+        }
+
+        // HtoD upload into the pre-allocated TFreq slot, stream-ordered.
+        t_freq_slot.copy_from_on_current_stream(host_staging)?;
+
+        // MLP: Linear1 → SiLU → Linear2, all writing into pre-allocated slots.
+        self.mlp1.forward(t_freq_slot, t_hidden_slot, cuda_config)?;
+        t_hidden_slot.silu()?;
+        self.mlp2.forward(t_hidden_slot, t_out_slot, cuda_config)?;
+        Ok(())
+    }
+
+    /// Zero-alloc, **graph-safe** variant: the scalar timestep is read
+    /// from device memory (`d_t_scaled`, `[1] f32` holding `t_value *
+    /// t_scale` written by the host before each graph replay). All
+    /// compute happens on-device; nothing here uses a per-replay host
+    /// scalar, so this is safe to include inside `cudaStreamBeginCapture`
+    /// / `cudaStreamEndCapture`.
+    #[cfg(feature = "cuda")]
+    pub fn forward_from_dev(
+        &self,
+        d_t_scaled: &Tensor,
+        t_freq_slot: &mut Tensor,
+        t_hidden_slot: &mut Tensor,
+        t_out_slot: &mut Tensor,
+        cuda_config: Option<&crate::OpConfig>,
+    ) -> Result<()> {
+        // 1. Sinusoid into TFreq slot (directly in weight dtype).
+        crate::op::scalar::sinusoid_embedding_from_dev(t_freq_slot, d_t_scaled)?;
+        // 2. mlp1 → silu → mlp2, all dst-write into pre-allocated slots.
+        self.mlp1.forward(t_freq_slot, t_hidden_slot, cuda_config)?;
+        t_hidden_slot.silu()?;
+        self.mlp2.forward(t_hidden_slot, t_out_slot, cuda_config)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
