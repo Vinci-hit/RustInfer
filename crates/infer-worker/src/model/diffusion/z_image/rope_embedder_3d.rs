@@ -172,6 +172,83 @@ impl RopeEmbedder3D {
         Ok((cos_out, sin_out))
     }
 
+    /// Zero-allocation variant of [`Self::embed`].
+    ///
+    /// Writes cos/sin directly into pre-allocated device slots and uses a
+    /// caller-owned **persistent** CPU staging buffer for the table
+    /// lookup. The caller must pass:
+    ///
+    /// - `pos_ids_cpu`   : `[seq_len, 3]` I32 CPU — already populated.
+    /// - `cos_dst`       : `[seq_len, half_dim]` F32 on target device.
+    /// - `sin_dst`       : `[seq_len, half_dim]` F32 on target device.
+    /// - `cos_host_stage`: `[seq_len, half_dim]` F32 CPU (persistent).
+    /// - `sin_host_stage`: `[seq_len, half_dim]` F32 CPU (persistent).
+    ///
+    /// The host-side tables are assembled into the two staging buffers,
+    /// then each is uploaded to its device slot with a single
+    /// stream-ordered `copy_from` — no `Tensor::new` on this path.
+    pub fn embed_into(
+        &self,
+        pos_ids_cpu: &Tensor,
+        cos_dst: &mut Tensor,
+        sin_dst: &mut Tensor,
+        cos_host_stage: &mut Tensor,
+        sin_host_stage: &mut Tensor,
+    ) -> Result<()> {
+        if pos_ids_cpu.shape().len() != 2 || pos_ids_cpu.shape()[1] != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "RopeEmbedder3D::embed_into: pos_ids must be [seq_len, 3], got {:?}",
+                pos_ids_cpu.shape()
+            )).into());
+        }
+        let seq_len = pos_ids_cpu.shape()[0];
+        let half_dim = self.half_dim();
+
+        debug_assert_eq!(pos_ids_cpu.device(), DeviceType::Cpu);
+        debug_assert_eq!(cos_host_stage.shape(), &[seq_len, half_dim]);
+        debug_assert_eq!(sin_host_stage.shape(), &[seq_len, half_dim]);
+        debug_assert_eq!(cos_dst.shape(), &[seq_len, half_dim]);
+        debug_assert_eq!(sin_dst.shape(), &[seq_len, half_dim]);
+
+        let ids = pos_ids_cpu.as_i32()?.as_slice()?;
+
+        let cos_out_slice = cos_host_stage.as_f32_mut()?.as_slice_mut()?;
+        let sin_out_slice = sin_host_stage.as_f32_mut()?.as_slice_mut()?;
+
+        let offsets = [
+            0,
+            self.axes_dims[0] / 2,
+            self.axes_dims[0] / 2 + self.axes_dims[1] / 2,
+        ];
+
+        for axis in 0..3usize {
+            let half_d = self.axes_dims[axis] / 2;
+            let offset = offsets[axis];
+            let cos_cache = self.cos_cached[axis].as_f32()?.as_slice()?;
+            let sin_cache = self.sin_cached[axis].as_f32()?.as_slice()?;
+
+            for token in 0..seq_len {
+                let pos = ids[token * 3 + axis] as usize;
+                debug_assert!(
+                    pos < self.axes_lens[axis],
+                    "axis {} pos {} >= max {}", axis, pos, self.axes_lens[axis],
+                );
+                let cache_base = pos * half_d;
+                let out_base = token * half_dim + offset;
+
+                cos_out_slice[out_base..out_base + half_d]
+                    .copy_from_slice(&cos_cache[cache_base..cache_base + half_d]);
+                sin_out_slice[out_base..out_base + half_d]
+                    .copy_from_slice(&sin_cache[cache_base..cache_base + half_d]);
+            }
+        }
+
+        // Upload both staging buffers on the current stream.
+        cos_dst.copy_from_on_current_stream(cos_host_stage)?;
+        sin_dst.copy_from_on_current_stream(sin_host_stage)?;
+        Ok(())
+    }
+
 }
 
 /// 原地 interleaved RoPE 旋转（GPT-J 风格）。

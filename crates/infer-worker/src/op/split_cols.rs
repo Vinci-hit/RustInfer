@@ -22,8 +22,9 @@ pub fn split_cols_tensor(
             match src.dtype() {
                 DataType::BF16 => kernels::cuda::split_cols_bf16_tensor(src, dst, rows, total_cols, col_offset, dst_cols, cuda_stream),
                 DataType::F16 => kernels::cuda::split_cols_fp16_tensor(src, dst, rows, total_cols, col_offset, dst_cols, cuda_stream),
+                DataType::F32 => kernels::cuda::split_cols_f32_tensor(src, dst, rows, total_cols, col_offset, dst_cols, cuda_stream),
                 other => Err(Error::InvalidArgument(format!(
-                    "CUDA split_cols supports BF16/F16 only, got {:?}", other
+                    "CUDA split_cols supports BF16/F16/F32 only, got {:?}", other
                 )).into()),
             }
         }

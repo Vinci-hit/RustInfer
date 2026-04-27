@@ -177,6 +177,43 @@ pub fn tanh_inplace(x: &mut Tensor) -> Result<()> {
     }
 }
 
+// ───────────────── Device-scalar variants (CUDA only) ────────────────────
+//
+// Used by the Z-Image denoise CUDA Graph: the only per-step-varying values
+// are two f32 scalars (`t_value` and `dt`), pre-uploaded to small device
+// tensors before capture. The kernels below read them via pointer deref
+// instead of accepting an `f32` kernel parameter, which is what makes them
+// safe to reuse across graph replays with different scalar values.
+
+/// 原地标量乘，系数从 device `[1] f32` 读取：`x *= *d_scalar`。
+#[cfg(feature = "cuda")]
+pub fn scalar_mul_inplace_from_dev(x: &mut Tensor, d_scalar: &Tensor) -> Result<()> {
+    match x.device() {
+        DeviceType::Cuda(_) => kernels::cuda::scalar_mul_inplace_from_dev(
+            x, d_scalar, crate::cuda::get_current_cuda_stream(),
+        ),
+        other => Err(Error::InvalidArgument(format!(
+            "scalar_mul_inplace_from_dev: only CUDA is supported, got {:?}", other
+        )).into()),
+    }
+}
+
+/// Sinusoidal timestep embedding with the scalar t read from device memory.
+///
+/// `out`: `[1, dim]` target slot (dtype determines precision).
+/// `d_t`: `[1]` F32 device — `t_value * t_scale` (already scaled).
+#[cfg(feature = "cuda")]
+pub fn sinusoid_embedding_from_dev(out: &mut Tensor, d_t: &Tensor) -> Result<()> {
+    match out.device() {
+        DeviceType::Cuda(_) => kernels::cuda::sinusoid_embedding_from_dev(
+            out, d_t, crate::cuda::get_current_cuda_stream(),
+        ),
+        other => Err(Error::InvalidArgument(format!(
+            "sinusoid_embedding_from_dev: only CUDA is supported, got {:?}", other
+        )).into()),
+    }
+}
+
 // ───────────────────────────── Tests ────────────────────────────────────
 
 #[cfg(test)]

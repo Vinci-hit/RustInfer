@@ -19,14 +19,13 @@ use crate::base::error::{Error, Result};
 use crate::model::diffusion::buffer::DiffBufferType as BT;
 use crate::model::diffusion::diffusers_loader::DiffusersLoader;
 use crate::model::diffusion::z_image::dit_block::DiTBlock;
-use crate::model::diffusion::z_image::patchify::{patchify, unpatchify};
 use crate::model::diffusion::z_image::rope_embedder_3d::RopeEmbedder3D;
 use crate::model::diffusion::z_image::state::{DitShapeSpec, DitState, ZImageCapacity};
 use crate::model::diffusion::z_image::timestep_embedder::TimestepEmbedder;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::tensor_utils::{
-    concat_seq_into, materialize, overwrite_pad_tokens_inplace,
+    concat_seq_into, overwrite_pad_tokens_inplace,
     pad_last_row_into, pad_with_token_into,
 };
 use crate::tensor::Tensor;
@@ -120,6 +119,24 @@ impl ZImageTransformerConfig {
 }
 
 // ───────────────────────── Model ─────────────────────────
+
+/// Shape bundle returned by [`ZImageTransformer2DModel::prepare_denoise_constants`]
+/// and consumed by [`ZImageTransformer2DModel::forward_denoise_step`] to
+/// slice the state.
+///
+/// These dimensions are a pure function of the request shape
+/// `(f, h, w)` + `cap_feats.shape()[0]`, so they are identical for
+/// every step of a single generate().
+#[derive(Clone, Copy, Debug)]
+pub struct DenoiseShapes {
+    pub f: usize,
+    pub h: usize,
+    pub w: usize,
+    pub n_patches: usize,
+    pub x_padded_len: usize,
+    pub cap_padded_len: usize,
+    pub cap_ori_len: usize,
+}
 
 pub struct ZImageTransformer2DModel {
     pub config: ZImageTransformerConfig,
@@ -311,29 +328,52 @@ impl ZImageTransformer2DModel {
         cuda_config: Option<&OpConfig>,
         state: &mut DitState,
     ) -> Result<Tensor> {
-        let device = self.device;
-
-        // ── Timestep embedding ──
-        // The scalar timestep lives on CPU; a single tiny HtoD upload is
-        // needed per step. This runs outside any CUDA-Graph capture region.
-        let mut t_cpu = Tensor::new(&[1], DataType::F32, DeviceType::Cpu)?;
-        t_cpu.as_f32_mut()?.as_slice_mut()?[0] = t_value * self.config.t_scale;
-        let t_tensor = t_cpu.to_device(device)?;
-        let adaln_input_2d = self.t_embedder.forward(&t_tensor, cuda_config)?;
-        let adaln_input_view = adaln_input_2d.view(&[ADALN_EMBED_DIM])?;
+        // ── Timestep embedding (zero-alloc) ──
+        // The scalar timestep scaling happens here on host; sinusoid is
+        // assembled into `state.t_freq_host_stage`, uploaded once into
+        // the pre-allocated TFreq slot, then fed through mlp1 / silu /
+        // mlp2, each writing into pre-allocated state slots.
+        let scaled_t = t_value * self.config.t_scale;
+        {
+            // Scope the borrows so `state` can be re-borrowed below.
+            let (t_freq_slot_ptr, t_hidden_ptr, t_out_ptr) = {
+                let t_freq = state.slice_mut(BT::TFreq, &[1, 256])?;
+                let t_hidden = state.slice_mut(BT::TEmbHidden, &[1, self.t_embedder.mlp1.weight.shape()[0]])?;
+                let t_out = state.slice_mut(BT::TEmbOut, &[1, ADALN_EMBED_DIM])?;
+                (t_freq, t_hidden, t_out)
+            };
+            // The three views above share `Arc<Buffer>` with the state
+            // slots — mutations through them persist in the state.
+            let mut t_freq = t_freq_slot_ptr;
+            let mut t_hidden = t_hidden_ptr;
+            let mut t_out = t_out_ptr;
+            self.t_embedder.forward_into(
+                scaled_t,
+                &mut t_freq,
+                &mut t_hidden,
+                &mut t_out,
+                &mut state.t_freq_host_stage,
+                cuda_config,
+            )?;
+        }
+        let adaln_input_view = state.slice(BT::TEmbOut, &[1, ADALN_EMBED_DIM])?
+            .view(&[ADALN_EMBED_DIM])?;
         let mut adaln_input = state.slice_mut(BT::AdalnInput, &[ADALN_EMBED_DIM])?;
         adaln_input.copy_from_on_current_stream(&adaln_input_view)?;
 
-        // ── Patchify & embed image ──
+        // ── Patchify & embed image (zero-alloc) ──
         let image_shape = image.shape();
         let (_c, f, h, w) = (image_shape[0], image_shape[1], image_shape[2], image_shape[3]);
-        let patches_view = patchify(image, self.patch_size, self.f_patch_size)?;
-        let n = patches_view.shape()[0];
-        let patch_in_dim = patches_view.shape()[1];
+        let p = self.patch_size;
+        let pf = self.f_patch_size;
+        let n = (f / pf) * (h / p) * (w / p);
+        let patch_in_dim = pf * p * p * self.config.in_channels;
 
-        // Materialize patches into the reserved Patches slot (dst-write).
+        // Write patchify result directly into the pre-allocated Patches slot.
         let mut patches = state.slice_mut(BT::Patches, &[n, patch_in_dim])?;
-        patches.copy_from_on_current_stream(&patches_view)?;
+        crate::model::diffusion::z_image::patchify::patchify_into(
+            image, p, pf, &mut patches,
+        )?;
 
         // x_emb = x_embedder(patches): [n, dim]
         let mut x_emb = state.slice_mut(BT::XEmb, &[n, self.config.dim])?;
@@ -345,7 +385,7 @@ impl ZImageTransformer2DModel {
         let mut x_padded = state.slice_mut(BT::XPadded, &[x_padded_len, self.config.dim])?;
         pad_with_token_into(&x_emb, &self.x_pad_token, &mut x_padded)?;
 
-        // ── Cap embed ──
+        // ── Cap embed (zero-alloc except existing helpers) ──
         let cap_ori_len = cap_feats.shape()[0];
         let cap_pad = (SEQ_MULTI_OF - cap_ori_len % SEQ_MULTI_OF) % SEQ_MULTI_OF;
         let cap_padded_len = cap_ori_len + cap_pad;
@@ -371,20 +411,64 @@ impl ZImageTransformer2DModel {
         cap_padded.copy_from_on_current_stream(&cap_emb)?;
         overwrite_pad_tokens_inplace(&mut cap_padded, &self.cap_pad_token, cap_ori_len)?;
 
-        // ── Build position ids ──
-        let cap_pos_ids = build_cap_pos_ids(cap_padded_len, device)?;
+        // ── Build position ids into pre-allocated CPU slots, compute
+        // RoPE cos/sin into pre-allocated device slots — all zero-alloc. ──
         let f_t = f / self.f_patch_size;
         let h_t = h / self.patch_size;
         let w_t = w / self.patch_size;
-        let x_pos_ids = build_image_pos_ids(
-            f_t, h_t, w_t, cap_padded_len + 1, x_padded_len - n, device,
-        )?;
 
-        // ── Compute RoPE cos/sin ──
-        // `embed()` still allocates per call; a dst-write variant that
-        // writes directly into XCos/XSin/CapCos/CapSin is future work.
-        let (x_cos, x_sin) = self.rope_embedder.embed(&x_pos_ids, device)?;
-        let (cap_cos, cap_sin) = self.rope_embedder.embed(&cap_pos_ids, device)?;
+        let half_d = self.config.dim / self.config.n_heads / 2;
+
+        // Cap pos ids → XPosIds/CapPosIds live on CPU per DitState::new.
+        {
+            let mut cap_pos_ids = state.slice_mut(BT::CapPosIds, &[cap_padded_len, 3])?;
+            fill_cap_pos_ids(&mut cap_pos_ids, cap_padded_len)?;
+        }
+        {
+            let mut x_pos_ids = state.slice_mut(BT::XPosIds, &[x_padded_len, 3])?;
+            fill_image_pos_ids(
+                &mut x_pos_ids,
+                f_t, h_t, w_t,
+                cap_padded_len + 1,
+                x_padded_len - n,
+            )?;
+        }
+
+        // RoPE embed into pre-allocated XCos/XSin/CapCos/CapSin slots.
+        {
+            let x_pos_ids = state.slice(BT::XPosIds, &[x_padded_len, 3])?;
+            let mut x_cos = state.slice_mut(BT::XCos, &[x_padded_len, half_d])?;
+            let mut x_sin = state.slice_mut(BT::XSin, &[x_padded_len, half_d])?;
+            let x_cos_stage = state.x_cos_host_stage
+                .slice(&[0, 0], &[x_padded_len, half_d])?;
+            let x_sin_stage = state.x_sin_host_stage
+                .slice(&[0, 0], &[x_padded_len, half_d])?;
+            let mut x_cos_stage = x_cos_stage;
+            let mut x_sin_stage = x_sin_stage;
+            self.rope_embedder.embed_into(
+                &x_pos_ids,
+                &mut x_cos, &mut x_sin,
+                &mut x_cos_stage, &mut x_sin_stage,
+            )?;
+        }
+        {
+            let cap_pos_ids = state.slice(BT::CapPosIds, &[cap_padded_len, 3])?;
+            let mut cap_cos = state.slice_mut(BT::CapCos, &[cap_padded_len, half_d])?;
+            let mut cap_sin = state.slice_mut(BT::CapSin, &[cap_padded_len, half_d])?;
+            let mut cap_cos_stage = state.cap_cos_host_stage
+                .slice(&[0, 0], &[cap_padded_len, half_d])?;
+            let mut cap_sin_stage = state.cap_sin_host_stage
+                .slice(&[0, 0], &[cap_padded_len, half_d])?;
+            self.rope_embedder.embed_into(
+                &cap_pos_ids,
+                &mut cap_cos, &mut cap_sin,
+                &mut cap_cos_stage, &mut cap_sin_stage,
+            )?;
+        }
+        let x_cos = state.slice(BT::XCos, &[x_padded_len, half_d])?;
+        let x_sin = state.slice(BT::XSin, &[x_padded_len, half_d])?;
+        let cap_cos = state.slice(BT::CapCos, &[cap_padded_len, half_d])?;
+        let cap_sin = state.slice(BT::CapSin, &[cap_padded_len, half_d])?;
 
         // ── noise_refiner on x (ping-pong XPadded ↔ XPaddedTmp) ──
         let x_final_ty = self.run_block_chain(
@@ -406,7 +490,6 @@ impl ZImageTransformer2DModel {
 
         // ── Unified concat: [x | cap] ──
         let s_tot = x_padded_len + cap_padded_len;
-        let half_d = self.config.dim / self.config.n_heads / 2;
 
         {
             let x_final = state.slice(x_final_ty, &[x_padded_len, self.config.dim])?;
@@ -429,26 +512,284 @@ impl ZImageTransformer2DModel {
         )?;
 
         // ── Final layer (image-part only; cap tail is discarded) ──
-        // Operates on the first `x_padded_len` rows of the unified stream
-        // so the FinalNormed / FinalOut buffers can be sized at S_img_max
-        // rather than S_total_max.
         {
             let unified_final = state.slice(unified_final_ty, &[s_tot, self.config.dim])?;
             let image_prefix = unified_final.slice(&[0, 0], &[x_padded_len, self.config.dim])?;
             self.final_layer_forward(&image_prefix, &adaln_input, state, cuda_config)?;
         }
-        // FinalOut now holds [x_padded_len, final_out_dim]. Trim to the
-        // pre-pad token count `n` for unpatchify.
-        let out = state.slice(BT::FinalOut, &[x_padded_len, self.final_out_dim()])?;
-        let out_x = out.slice(&[0, 0], &[n, out.shape()[1]])?;
-        let out_x = materialize(&out_x)?;
 
-        // ── Unpatchify into ImageOut slot ──
-        let image_out_view = unpatchify(&out_x, f, h, w, self.config.in_channels, self.patch_size, self.f_patch_size)?;
+        // ── Unpatchify into ImageOut slot (zero-alloc). ──
+        //
+        // FinalOut currently holds [x_padded_len, final_out_dim]; we
+        // only want the first `n` token rows. The head slice is a
+        // contiguous prefix of FinalOut so `unpatchify_into` can read
+        // it directly without materializing an intermediate tensor.
+        let final_out = state.slice(BT::FinalOut, &[x_padded_len, self.final_out_dim()])?;
+        let out_x = final_out.slice(&[0, 0], &[n, self.final_out_dim()])?;
         let mut image_out = state.slice_mut(
             BT::ImageOut, &[self.config.in_channels, f, h, w],
         )?;
-        image_out.copy_from_on_current_stream(&image_out_view)?;
+        crate::model::diffusion::z_image::patchify::unpatchify_into(
+            &out_x, f, h, w,
+            self.config.in_channels, self.patch_size, self.f_patch_size,
+            &mut image_out,
+        )?;
+        Ok(image_out)
+    }
+
+    // ───────────────── CUDA-Graph-friendly denoise split ─────────────────
+    //
+    // Normally `forward` does *everything* each step. That's fine for
+    // eager execution, but it makes the step uncapturable because each
+    // step re-runs `cap_embedder`, `rope.embed_into`, `concat` etc. —
+    // all of which work on shape-fixed inputs and therefore don't need
+    // to happen inside the graph.
+    //
+    // `prepare_denoise_constants` runs every shape-fixed computation
+    // **once** per generate() (outside capture); `forward_denoise_step`
+    // runs only the per-step work (inside capture). The boundary lives
+    // entirely in the workspace: every tensor the step reads without
+    // writing is pre-populated by `prepare_denoise_constants` into a
+    // slot with a stable device pointer.
+
+    /// Per-request, shape-fixed precomputation. Called **once** per
+    /// generate(), **before** the denoise CUDA Graph capture region.
+    ///
+    /// Populates: `CapFeatsPadded / CapNormed / CapEmb / CapPadded`
+    /// (after `context_refiner`), `XPosIds / CapPosIds`,
+    /// `XCos / XSin / CapCos / CapSin`, and `UnifiedCos / UnifiedSin`.
+    /// Every per-step tensor that is a pure function of request shape
+    /// is resolved here so the denoise step can work against fixed
+    /// device pointers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_denoise_constants(
+        &self,
+        cap_feats: &Tensor,
+        f: usize, h: usize, w: usize,
+        state: &mut DitState,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<DenoiseShapes> {
+        let dim = self.config.dim;
+        let half_d = dim / self.config.n_heads / 2;
+        let p = self.patch_size;
+        let pf = self.f_patch_size;
+
+        let f_t = f / pf;
+        let h_t = h / p;
+        let w_t = w / p;
+        let n = f_t * h_t * w_t;
+        let x_pad = (SEQ_MULTI_OF - n % SEQ_MULTI_OF) % SEQ_MULTI_OF;
+        let x_padded_len = n + x_pad;
+
+        let cap_ori_len = cap_feats.shape()[0];
+        let cap_pad = (SEQ_MULTI_OF - cap_ori_len % SEQ_MULTI_OF) % SEQ_MULTI_OF;
+        let cap_padded_len = cap_ori_len + cap_pad;
+
+        // ── Cap side: pad → norm → linear → stamp pad_tokens ──
+        let mut cap_feats_padded = state.slice_mut(
+            BT::CapFeatsPadded, &[cap_padded_len, self.config.cap_feat_dim],
+        )?;
+        pad_last_row_into(cap_feats, &mut cap_feats_padded)?;
+
+        let mut cap_normed = state.slice_mut(
+            BT::CapNormed, &[cap_padded_len, self.config.cap_feat_dim],
+        )?;
+        self.cap_embedder_norm.forward(&cap_feats_padded, &mut cap_normed, cuda_config)?;
+
+        let mut cap_emb = state.slice_mut(BT::CapEmb, &[cap_padded_len, dim])?;
+        self.cap_embedder_linear.forward(&cap_normed, &mut cap_emb, cuda_config)?;
+
+        let mut cap_padded = state.slice_mut(BT::CapPadded, &[cap_padded_len, dim])?;
+        cap_padded.copy_from_on_current_stream(&cap_emb)?;
+        overwrite_pad_tokens_inplace(&mut cap_padded, &self.cap_pad_token, cap_ori_len)?;
+
+        // ── Position ids into CPU slots ──
+        {
+            let mut cap_pos_ids = state.slice_mut(BT::CapPosIds, &[cap_padded_len, 3])?;
+            fill_cap_pos_ids(&mut cap_pos_ids, cap_padded_len)?;
+        }
+        {
+            let mut x_pos_ids = state.slice_mut(BT::XPosIds, &[x_padded_len, 3])?;
+            fill_image_pos_ids(
+                &mut x_pos_ids, f_t, h_t, w_t, cap_padded_len + 1, x_padded_len - n,
+            )?;
+        }
+
+        // ── Rope embed into XCos / XSin / CapCos / CapSin (device) ──
+        {
+            let x_pos_ids = state.slice(BT::XPosIds, &[x_padded_len, 3])?;
+            let mut x_cos = state.slice_mut(BT::XCos, &[x_padded_len, half_d])?;
+            let mut x_sin = state.slice_mut(BT::XSin, &[x_padded_len, half_d])?;
+            let mut x_cos_stage = state.x_cos_host_stage.slice(&[0, 0], &[x_padded_len, half_d])?;
+            let mut x_sin_stage = state.x_sin_host_stage.slice(&[0, 0], &[x_padded_len, half_d])?;
+            self.rope_embedder.embed_into(
+                &x_pos_ids, &mut x_cos, &mut x_sin,
+                &mut x_cos_stage, &mut x_sin_stage,
+            )?;
+        }
+        {
+            let cap_pos_ids = state.slice(BT::CapPosIds, &[cap_padded_len, 3])?;
+            let mut cap_cos = state.slice_mut(BT::CapCos, &[cap_padded_len, half_d])?;
+            let mut cap_sin = state.slice_mut(BT::CapSin, &[cap_padded_len, half_d])?;
+            let mut cap_cos_stage = state.cap_cos_host_stage.slice(&[0, 0], &[cap_padded_len, half_d])?;
+            let mut cap_sin_stage = state.cap_sin_host_stage.slice(&[0, 0], &[cap_padded_len, half_d])?;
+            self.rope_embedder.embed_into(
+                &cap_pos_ids, &mut cap_cos, &mut cap_sin,
+                &mut cap_cos_stage, &mut cap_sin_stage,
+            )?;
+        }
+
+        // ── context_refiner on cap (ping-pong CapPadded ↔ CapPaddedTmp);
+        //    normalize result back to CapPadded so the denoise step can
+        //    always read from a single, stable slot. ──
+        let cap_final_ty = self.run_block_chain(
+            &self.context_refiner,
+            (BT::CapPadded, BT::CapPaddedTmp),
+            &[cap_padded_len, dim],
+            &state.slice(BT::CapCos, &[cap_padded_len, half_d])?,
+            &state.slice(BT::CapSin, &[cap_padded_len, half_d])?,
+            None,
+            state, cuda_config,
+        )?;
+        if cap_final_ty != BT::CapPadded {
+            let tmp = state.slice(BT::CapPaddedTmp, &[cap_padded_len, dim])?;
+            let mut dst = state.slice_mut(BT::CapPadded, &[cap_padded_len, dim])?;
+            dst.copy_from_on_current_stream(&tmp)?;
+        }
+
+        // ── Unified cos/sin (shape-fixed; concat once for the denoise step) ──
+        let s_tot = x_padded_len + cap_padded_len;
+        let x_cos = state.slice(BT::XCos, &[x_padded_len, half_d])?;
+        let x_sin = state.slice(BT::XSin, &[x_padded_len, half_d])?;
+        let cap_cos = state.slice(BT::CapCos, &[cap_padded_len, half_d])?;
+        let cap_sin = state.slice(BT::CapSin, &[cap_padded_len, half_d])?;
+        let mut unified_cos = state.slice_mut(BT::UnifiedCos, &[s_tot, half_d])?;
+        concat_seq_into(&x_cos, &cap_cos, &mut unified_cos)?;
+        let mut unified_sin = state.slice_mut(BT::UnifiedSin, &[s_tot, half_d])?;
+        concat_seq_into(&x_sin, &cap_sin, &mut unified_sin)?;
+
+        Ok(DenoiseShapes {
+            f, h, w,
+            n_patches: n,
+            x_padded_len, cap_padded_len, cap_ori_len,
+        })
+    }
+
+    /// Per-step denoise body, designed to be captured into a CUDA Graph.
+    ///
+    /// Reads:
+    ///   - `d_t_scaled` : `[1]` F32 device, `t_value(i) * t_scale`
+    ///   - `Latent5D` (populated from `Latents` by the caller before
+    ///                 calling us)
+    ///   - `CapPadded`, `XCos`, `XSin`, `UnifiedCos`, `UnifiedSin` —
+    ///     all filled by `prepare_denoise_constants`
+    /// Writes:
+    ///   - Returns a view into `ImageOut` holding the predicted velocity.
+    ///
+    /// Every intermediate lives in a pre-allocated state slot; no
+    /// `Tensor::new` runs on this path, and no host-originating data
+    /// (other than compile-time constants baked into kernel launches)
+    /// is written on the stream, so the entire body is graph-capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_denoise_step(
+        &self,
+        d_t_scaled: &Tensor,
+        shapes: DenoiseShapes,
+        state: &mut DitState,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<Tensor> {
+        let DenoiseShapes {
+            f, h, w, n_patches: n,
+            x_padded_len, cap_padded_len, cap_ori_len: _,
+        } = shapes;
+        let dim = self.config.dim;
+        let half_d = dim / self.config.n_heads / 2;
+        let p = self.patch_size;
+        let pf = self.f_patch_size;
+
+        // ── Timestep embedding (device-scalar → sinusoid → mlp) ──
+        {
+            let mut t_freq = state.slice_mut(BT::TFreq, &[1, 256])?;
+            let mut t_hidden = state.slice_mut(
+                BT::TEmbHidden, &[1, self.t_embedder.mlp1.weight.shape()[0]],
+            )?;
+            let mut t_out = state.slice_mut(BT::TEmbOut, &[1, ADALN_EMBED_DIM])?;
+            self.t_embedder.forward_from_dev(
+                d_t_scaled, &mut t_freq, &mut t_hidden, &mut t_out, cuda_config,
+            )?;
+        }
+        let adaln_input_view = state.slice(BT::TEmbOut, &[1, ADALN_EMBED_DIM])?
+            .view(&[ADALN_EMBED_DIM])?;
+        let mut adaln_input = state.slice_mut(BT::AdalnInput, &[ADALN_EMBED_DIM])?;
+        adaln_input.copy_from_on_current_stream(&adaln_input_view)?;
+
+        // ── Patchify current latent (caller has already populated Latent5D) ──
+        let patch_in_dim = pf * p * p * self.config.in_channels;
+        let latent_5d = state.slice(BT::Latent5D, &[self.config.in_channels, f, h, w])?;
+        let mut patches = state.slice_mut(BT::Patches, &[n, patch_in_dim])?;
+        crate::model::diffusion::z_image::patchify::patchify_into(
+            &latent_5d, p, pf, &mut patches,
+        )?;
+
+        let mut x_emb = state.slice_mut(BT::XEmb, &[n, dim])?;
+        self.x_embedder.forward(&patches, &mut x_emb, cuda_config)?;
+
+        let mut x_padded = state.slice_mut(BT::XPadded, &[x_padded_len, dim])?;
+        pad_with_token_into(&x_emb, &self.x_pad_token, &mut x_padded)?;
+
+        // Pre-computed cos/sin for image tokens.
+        let x_cos = state.slice(BT::XCos, &[x_padded_len, half_d])?;
+        let x_sin = state.slice(BT::XSin, &[x_padded_len, half_d])?;
+
+        // ── noise_refiner on x (ping-pong XPadded ↔ XPaddedTmp) ──
+        let x_final_ty = self.run_block_chain(
+            &self.noise_refiner,
+            (BT::XPadded, BT::XPaddedTmp),
+            &[x_padded_len, dim],
+            &x_cos, &x_sin, Some(&adaln_input),
+            state, cuda_config,
+        )?;
+
+        // ── Unified concat: [x_final | cap_padded (already refined)] ──
+        let s_tot = x_padded_len + cap_padded_len;
+        {
+            let x_final = state.slice(x_final_ty, &[x_padded_len, dim])?;
+            let cap_final = state.slice(BT::CapPadded, &[cap_padded_len, dim])?;
+            let mut unified = state.slice_mut(BT::Unified, &[s_tot, dim])?;
+            concat_seq_into(&x_final, &cap_final, &mut unified)?;
+        }
+
+        // Pre-computed unified cos/sin.
+        let unified_cos = state.slice(BT::UnifiedCos, &[s_tot, half_d])?;
+        let unified_sin = state.slice(BT::UnifiedSin, &[s_tot, half_d])?;
+
+        // ── Main layers (ping-pong Unified ↔ UnifiedTmp) ──
+        let unified_final_ty = self.run_block_chain(
+            &self.layers,
+            (BT::Unified, BT::UnifiedTmp),
+            &[s_tot, dim],
+            &unified_cos, &unified_sin, Some(&adaln_input),
+            state, cuda_config,
+        )?;
+
+        // ── Final layer ──
+        {
+            let unified_final = state.slice(unified_final_ty, &[s_tot, dim])?;
+            let image_prefix = unified_final.slice(&[0, 0], &[x_padded_len, dim])?;
+            self.final_layer_forward(&image_prefix, &adaln_input, state, cuda_config)?;
+        }
+
+        // ── Unpatchify into ImageOut ──
+        let final_out = state.slice(BT::FinalOut, &[x_padded_len, self.final_out_dim()])?;
+        let out_x = final_out.slice(&[0, 0], &[n, self.final_out_dim()])?;
+        let mut image_out = state.slice_mut(
+            BT::ImageOut, &[self.config.in_channels, f, h, w],
+        )?;
+        crate::model::diffusion::z_image::patchify::unpatchify_into(
+            &out_x, f, h, w,
+            self.config.in_channels, self.patch_size, self.f_patch_size,
+            &mut image_out,
+        )?;
         Ok(image_out)
     }
 
@@ -574,6 +915,123 @@ fn load_linear(
     Ok(Matmul::from(w, bias))
 }
 
+/// Load and fuse the per-block `to_q / to_k / to_v` weights into a single
+/// `[3*dim, dim]` matmul.
+///
+/// Z-Image checkpoints ship Q/K/V as three separate `[dim, dim]` weights, but
+/// the three projections share the same input (`norm1_x`) so they can be
+/// collapsed into one GEMM of shape `[seq, dim] @ [3*dim, dim]^T → [seq,
+/// 3*dim]`. Compared with three independent GEMMs this:
+///
+/// - replaces three kernel launches with one (saving ~15-20 µs/block of host
+///   overhead on the 30-block main stack);
+/// - reads `norm1_x` from HBM exactly once (~2.2 MB at seq=384 BF16) instead
+///   of three times;
+/// - gives cuBLASLt a larger N dimension to pick better tiling heuristics.
+///
+/// The output's columns split naturally as Q=cols[0..dim), K=cols[dim..2*dim),
+/// V=cols[2*dim..3*dim). Downstream code runs three `split_cols` kernel
+/// launches to copy each column slab into the contiguous `BlkQ` / `BlkK` /
+/// `BlkV` buffers, mirroring the LLM-side `Llama3` / `Qwen3` pipeline.
+///
+/// These checkpoints never ship a bias on Q/K/V; we refuse if one appears so
+/// we don't silently drop it.
+fn load_fused_qkv_linear(
+    loader: &DiffusersLoader,
+    prefix: &str,
+    dim: usize,
+    device: DeviceType,
+) -> Result<Matmul> {
+    let names = [
+        format!("{}.attention.to_q.weight", prefix),
+        format!("{}.attention.to_k.weight", prefix),
+        format!("{}.attention.to_v.weight", prefix),
+    ];
+    // Guard: no bias expected on Z-Image attention projections.
+    for kind in ["to_q", "to_k", "to_v"] {
+        let b = format!("{}.attention.{}.bias", prefix, kind);
+        if loader.has_tensor(&b) {
+            return Err(Error::InvalidArgument(format!(
+                "load_fused_qkv_linear: unexpected bias on {} — refusing to silently drop it",
+                b,
+            )).into());
+        }
+    }
+
+    // Stage each weight on CPU first so we can memcpy the three [dim, dim]
+    // slabs into a single [3*dim, dim] buffer without needing a
+    // cross-device concat kernel. The resulting fused tensor is uploaded
+    // to the target device in one go.
+    let load_cpu = |name: &str| -> Result<Tensor> {
+        let view = loader.get_tensor(name)?;
+        Tensor::from_view_on_cpu(&view)
+    };
+    let w_q = load_cpu(&names[0])?;
+    let w_k = load_cpu(&names[1])?;
+    let w_v = load_cpu(&names[2])?;
+    for (w, name) in [(&w_q, &names[0]), (&w_k, &names[1]), (&w_v, &names[2])] {
+        if w.shape() != [dim, dim] {
+            return Err(Error::InvalidArgument(format!(
+                "load_fused_qkv_linear: {} has shape {:?}, expected [{}, {}]",
+                name, w.shape(), dim, dim,
+            )).into());
+        }
+    }
+
+    // All three weights share a dtype (checkpoint BF16 / F16 / F32).
+    let src_dtype = w_q.dtype();
+    if w_k.dtype() != src_dtype || w_v.dtype() != src_dtype {
+        return Err(Error::InvalidArgument(format!(
+            "load_fused_qkv_linear: dtype mismatch q={:?} k={:?} v={:?}",
+            w_q.dtype(), w_k.dtype(), w_v.dtype(),
+        )).into());
+    }
+
+    // For CPU execution the pipeline normalises to F32; for CUDA we keep
+    // the checkpoint's native dtype (typically BF16).
+    let target_dtype = if device.is_cpu() && src_dtype != DataType::F32 {
+        DataType::F32
+    } else {
+        src_dtype
+    };
+    let w_q = if w_q.dtype() != target_dtype { w_q.to_dtype(target_dtype)? } else { w_q };
+    let w_k = if w_k.dtype() != target_dtype { w_k.to_dtype(target_dtype)? } else { w_k };
+    let w_v = if w_v.dtype() != target_dtype { w_v.to_dtype(target_dtype)? } else { w_v };
+
+    // Concatenate along dim 0: [Wq; Wk; Wv] → [3*dim, dim]. Memory order
+    // matches the native [out_features, in_features] weight layout so the
+    // GEMM output's cols naturally split as [Q | K | V].
+    let mut fused = Tensor::new(&[3 * dim, dim], target_dtype, DeviceType::Cpu)?;
+    let row_bytes = dim * target_dtype.size_in_bytes();
+    match target_dtype {
+        DataType::F32 => {
+            let dst = fused.as_f32_mut()?.as_slice_mut()?;
+            dst[0..dim * dim].copy_from_slice(w_q.as_f32()?.as_slice()?);
+            dst[dim * dim..2 * dim * dim].copy_from_slice(w_k.as_f32()?.as_slice()?);
+            dst[2 * dim * dim..3 * dim * dim].copy_from_slice(w_v.as_f32()?.as_slice()?);
+        }
+        DataType::BF16 => {
+            let dst = fused.as_bf16_mut()?.as_slice_mut()?;
+            dst[0..dim * dim].copy_from_slice(w_q.as_bf16()?.as_slice()?);
+            dst[dim * dim..2 * dim * dim].copy_from_slice(w_k.as_bf16()?.as_slice()?);
+            dst[2 * dim * dim..3 * dim * dim].copy_from_slice(w_v.as_bf16()?.as_slice()?);
+        }
+        DataType::F16 => {
+            let dst = fused.as_f16_mut()?.as_slice_mut()?;
+            dst[0..dim * dim].copy_from_slice(w_q.as_f16()?.as_slice()?);
+            dst[dim * dim..2 * dim * dim].copy_from_slice(w_k.as_f16()?.as_slice()?);
+            dst[2 * dim * dim..3 * dim * dim].copy_from_slice(w_v.as_f16()?.as_slice()?);
+        }
+        other => return Err(Error::InvalidArgument(format!(
+            "load_fused_qkv_linear: unsupported dtype {:?}", other,
+        )).into()),
+    }
+    let _ = row_bytes; // kept for clarity / future stride-aware variants
+
+    let fused = fused.to_device(device)?;
+    Ok(Matmul::from(fused, None))
+}
+
 fn load_timestep_embedder(
     loader: &DiffusersLoader,
     freq_dim: usize,
@@ -606,9 +1064,7 @@ fn load_dit_block(
     let ffn_norm1 = RMSNorm::from(load_tensor(loader, &format!("{}.ffn_norm1.weight", prefix), device)?, eps);
     let ffn_norm2 = RMSNorm::from(load_tensor(loader, &format!("{}.ffn_norm2.weight", prefix), device)?, eps);
 
-    let to_q = load_linear(loader, &format!("{}.attention.to_q", prefix), dim, dim, false, device)?;
-    let to_k = load_linear(loader, &format!("{}.attention.to_k", prefix), dim, dim, false, device)?;
-    let to_v = load_linear(loader, &format!("{}.attention.to_v", prefix), dim, dim, false, device)?;
+    let to_qkv = load_fused_qkv_linear(loader, prefix, dim, device)?;
     let to_out = load_linear(loader, &format!("{}.attention.to_out.0", prefix), dim, dim, false, device)?;
 
     let norm_q = RMSNorm::from(load_tensor(loader, &format!("{}.attention.norm_q.weight", prefix), device)?, eps);
@@ -626,7 +1082,7 @@ fn load_dit_block(
 
     Ok(DiTBlock {
         attention_norm1, attention_norm2, ffn_norm1, ffn_norm2,
-        to_q, to_k, to_v, to_out,
+        to_qkv, to_out,
         norm_q, norm_k,
         w1, w3, w2,
         adaln_modulation,
@@ -637,29 +1093,33 @@ fn load_dit_block(
 
 // ───────────────────────── Tensor helpers ─────────────────────────
 
-/// Build caption pos ids [cap_len, 3] on CPU, then upload to device.
-fn build_cap_pos_ids(cap_len: usize, device: DeviceType) -> Result<Tensor> {
-    let mut ids = Tensor::new(&[cap_len, 3], DataType::I32, DeviceType::Cpu)?;
-    let data = ids.as_i32_mut()?.as_slice_mut()?;
+/// Write caption pos ids into a pre-allocated [cap_len, 3] I32 CPU slot.
+fn fill_cap_pos_ids(dst: &mut Tensor, cap_len: usize) -> Result<()> {
+    debug_assert_eq!(dst.device(), DeviceType::Cpu);
+    debug_assert_eq!(dst.dtype(), DataType::I32);
+    debug_assert_eq!(dst.shape(), &[cap_len, 3]);
+    let data = dst.as_i32_mut()?.as_slice_mut()?;
     for i in 0..cap_len {
         data[i * 3] = (i + 1) as i32;
         data[i * 3 + 1] = 0;
         data[i * 3 + 2] = 0;
     }
-    ids.to_device(device)
+    Ok(())
 }
 
-/// Build image pos ids [n + pad_len, 3] on CPU, then upload to device.
-fn build_image_pos_ids(
+/// Write image pos ids into a pre-allocated [n+pad_len, 3] I32 CPU slot.
+fn fill_image_pos_ids(
+    dst: &mut Tensor,
     f_t: usize, h_t: usize, w_t: usize,
     t_base: usize,
     pad_len: usize,
-    device: DeviceType,
-) -> Result<Tensor> {
+) -> Result<()> {
     let n = f_t * h_t * w_t;
     let total = n + pad_len;
-    let mut ids = Tensor::new(&[total, 3], DataType::I32, DeviceType::Cpu)?;
-    let data = ids.as_i32_mut()?.as_slice_mut()?;
+    debug_assert_eq!(dst.device(), DeviceType::Cpu);
+    debug_assert_eq!(dst.dtype(), DataType::I32);
+    debug_assert_eq!(dst.shape(), &[total, 3]);
+    let data = dst.as_i32_mut()?.as_slice_mut()?;
     let mut idx = 0;
     for fi in 0..f_t {
         for hi in 0..h_t {
@@ -676,5 +1136,5 @@ fn build_image_pos_ids(
         data[i * 3 + 1] = 0;
         data[i * 3 + 2] = 0;
     }
-    ids.to_device(device)
+    Ok(())
 }

@@ -46,6 +46,30 @@ use crate::tensor::Tensor;
 /// VAE scale factor (2^(len(block_out_channels)-1) = 8 for standard VAE).
 const VAE_SCALE_FACTOR: usize = 8;
 
+/// Small HtoD helper used once per `generate()` to upload the per-step
+/// `t_value` / `dt` schedule (≤ `N_MAX_STEPS` floats, so ≤ 64 B per
+/// call) into a pre-allocated `[N_MAX_STEPS]` F32 device slot.
+///
+/// Prefers a raw stream-ordered `cudaMemcpyAsync` to avoid allocating a
+/// transient CPU `Tensor`. `src.len()` must be `<= dst.num_elements()`.
+#[cfg(feature = "cuda")]
+fn upload_f32_slice_into(dst: &mut Tensor, src: &[f32]) -> Result<()> {
+    use crate::cuda::ffi;
+    debug_assert!(dst.dtype() == DataType::F32);
+    debug_assert!(src.len() <= dst.num_elements());
+    let stream = crate::cuda::get_current_cuda_stream();
+    let dptr = dst.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut std::ffi::c_void;
+    let sptr = src.as_ptr() as *const std::ffi::c_void;
+    let n_bytes = src.len() * std::mem::size_of::<f32>();
+    unsafe {
+        crate::cuda_check!(ffi::cudaMemcpyAsync(
+            dptr, sptr, n_bytes,
+            ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            stream,
+        ))?;
+    }
+    Ok(())
+}
 /// VAE scaling_factor (from vae/config.json).
 const VAE_SCALING_FACTOR: f32 = 0.3611;
 
@@ -81,6 +105,14 @@ pub struct ZImagePipeline {
     /// functions slice from it each step.
     pub dit_state: DitState,
     pub model_dir: PathBuf,
+    /// When true, skip the denoise CUDA-Graph path and run the eager
+    /// denoise loop. Used by `warmup_for` to let cuBLASLt / cuDNN fill
+    /// their algorithm / workspace caches *before* we try to capture —
+    /// capturing an un-warm cuBLASLt call trips
+    /// `cudaErrorStreamCaptureUnsupported` because the library makes
+    /// synchronous queries the first time it sees a new `(M, N, K,
+    /// dtype, layout)` tuple.
+    pub force_eager_denoise: bool,
 }
 
 impl ZImagePipeline {
@@ -142,6 +174,7 @@ impl ZImagePipeline {
             pipeline_state,
             dit_state,
             model_dir: model_dir.to_path_buf(),
+            force_eager_denoise: false,
         })
     }
 
@@ -228,17 +261,245 @@ impl ZImagePipeline {
     // ─────────────────── Step 4: Denoise Loop ────────────────────────
 
     /// Run the denoising loop using the pipeline's pre-allocated latent
-    /// pool.
+    /// pool, captured once into a CUDA Graph and replayed on every
+    /// subsequent generate() with the same `(latent_h, latent_w,
+    /// cap_padded_len, num_steps)` shape key.
     ///
-    /// Ping-pongs between `Latents` and `LatentsTmp` slices so
-    /// `scheduler.step` always writes to a destination distinct from its
-    /// read source. `NoisePred` receives the (negated) DiT velocity each
-    /// step, then is consumed by the scheduler.
+    /// Layout:
+    ///
+    /// 1. **Per-request prep, outside capture**:
+    ///    - Stage `prompt_embeds` into the pre-allocated
+    ///      [`PromptEmbedsPadded`] slot (+ pad to `cap_padded_len`).
+    ///    - Call `transformer.prepare_denoise_constants` to populate
+    ///      every shape-fixed tensor (cap-side refine, pos_ids, rope
+    ///      cos/sin, unified cos/sin).
+    ///    - Upload the per-step `t_value(i)` and Euler `dt(i)`
+    ///      schedules into [`TValueDevVec`] / [`DtValueDevVec`] with
+    ///      one HtoD each.
+    /// 2. **Capture or replay**: if `cfg.denoise_graph` is empty,
+    ///    `begin → for i in 0..N { step_body(i) } → end → launch`.
+    ///    Otherwise just `launch`. The step body is dst-write-only
+    ///    against state slots and reads all per-step scalars from
+    ///    `TValueDevVec`/`DtValueDevVec` via device-pointer kernels, so
+    ///    it is capture-safe and replay-stable.
+    /// 3. **"Plan B" ping-pong**: every step reads from [`Latents`] and
+    ///    writes to [`LatentsTmp`], then a trailing DtoD copy moves
+    ///    [`LatentsTmp`] back to [`Latents`]. This keeps the graph
+    ///    simple (one fixed direction) at the cost of a cheap
+    ///    per-step memcpy.
     ///
     /// Returns the final latents as an owned clone — decoupling the
     /// output from the pool so `vae_decode` can run without holding a
     /// borrow on `pipeline_state`.
     fn denoise(
+        &mut self,
+        latent_h: usize,
+        latent_w: usize,
+        prompt_embeds: &Tensor,
+    ) -> Result<Tensor> {
+        let num_steps = self.scheduler.num_steps();
+        if num_steps == 0 {
+            return Err(crate::base::error::Error::InvalidArgument(
+                "denoise: scheduler has 0 steps".into(),
+            ).into());
+        }
+        if num_steps > crate::model::diffusion::z_image::state::N_MAX_STEPS {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "denoise: num_steps ({}) exceeds compiled N_MAX_STEPS ({})",
+                num_steps,
+                crate::model::diffusion::z_image::state::N_MAX_STEPS,
+            )).into());
+        }
+
+        #[cfg(feature = "cuda")]
+        let use_cuda_graph = self.device.is_cuda() && !self.force_eager_denoise;
+        #[cfg(not(feature = "cuda"))]
+        let use_cuda_graph = false;
+
+        // ─── CPU / eager fallback — identical to the previous denoise ───
+        if !use_cuda_graph {
+            return self.denoise_eager(latent_h, latent_w, prompt_embeds);
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use crate::cuda::with_cuda_stream;
+            use crate::model::diffusion::buffer::DiffBufferType as BT;
+
+            let shape4 = [1, LATENT_CHANNELS, latent_h, latent_w];
+            let shape5 = [LATENT_CHANNELS, 1, latent_h, latent_w];
+            let (f, h, w) = (1usize, latent_h, latent_w);
+
+            // ── Stage prompt_embeds into the persistent slot ──
+            // We always read cap features from PromptEmbedsPadded going
+            // forward, so the denoise step body can bind to a stable
+            // device pointer inside the captured graph.
+            let cap_ori_len = prompt_embeds.shape()[0];
+            let cap_feat_dim = prompt_embeds.shape()[1];
+            {
+                let mut ps = self.dit_state.slice_mut(
+                    BT::PromptEmbedsPadded, &[cap_ori_len, cap_feat_dim],
+                )?;
+                ps.copy_from_on_current_stream(prompt_embeds)?;
+            }
+            // Use the persistent slot (same bytes, stable pointer).
+            let cap_feats = self.dit_state.slice(
+                BT::PromptEmbedsPadded, &[cap_ori_len, cap_feat_dim],
+            )?;
+
+            // ── Per-request shape-fixed precomputation (outside capture) ──
+            let shapes = {
+                let cuda_cfg = self.text_encoder_state.cuda_config.as_ref();
+                self.transformer.prepare_denoise_constants(
+                    &cap_feats, f, h, w, &mut self.dit_state, cuda_cfg,
+                )?
+            };
+
+            // ── Upload per-step t_value + dt schedule ──
+            // TValueDevVec[i] = (1000 - timestep[i]) / 1000 * t_scale
+            // DtValueDevVec[i] = sigmas[i+1] - sigmas[i]
+            let t_scale = self.transformer.config.t_scale;
+            let timesteps: Vec<f32> = self.scheduler.timesteps().to_vec();
+            let sigmas: Vec<f32> = self.scheduler.sigmas().to_vec();
+            debug_assert_eq!(sigmas.len(), num_steps + 1);
+            let mut t_value_host = vec![0.0_f32; num_steps];
+            let mut dt_host = vec![0.0_f32; num_steps];
+            for i in 0..num_steps {
+                let norm_t = (1000.0 - timesteps[i]) / 1000.0;
+                t_value_host[i] = norm_t * t_scale;
+                dt_host[i] = sigmas[i + 1] - sigmas[i];
+            }
+            self.scheduler.reset();
+            // Two tiny HtoD uploads (num_steps × 4 B each, ≤ 64 B).
+            upload_f32_slice_into(
+                &mut self.dit_state.slice_mut(
+                    BT::TValueDevVec, &[num_steps],
+                )?,
+                &t_value_host,
+            )?;
+            upload_f32_slice_into(
+                &mut self.dit_state.slice_mut(
+                    BT::DtValueDevVec, &[num_steps],
+                )?,
+                &dt_host,
+            )?;
+
+            // ── Make sure every queued prep HtoD has landed on the
+            //    stream before we start capturing. Capture mode doesn't
+            //    tolerate in-flight pageable HtoDs. ──
+            {
+                let cfg = self.text_encoder_state.cuda_config.as_ref()
+                    .expect("CUDA requires CudaConfig");
+                cfg.sync_stream()?;
+            }
+
+            // ── Capture-or-replay loop ──
+            let stream_copy = {
+                let cfg = self.text_encoder_state.cuda_config.as_ref().unwrap();
+                cfg.stream
+            };
+            with_cuda_stream(stream_copy, || -> Result<()> {
+                let graph_ready = self.text_encoder_state
+                    .cuda_config.as_ref().unwrap()
+                    .denoise_graph_is_ready();
+                if !graph_ready {
+                    // Begin capture (immutable borrow, drops before body).
+                    self.text_encoder_state.cuda_config.as_ref().unwrap()
+                        .denoise_capture_begin()?;
+
+                    // Body — N denoise steps. Everything is dst-write
+                    // into state slots; no Tensor::new, no HtoD.
+                    self.run_denoise_step_chain(
+                        num_steps, shapes, &shape4, &shape5,
+                    )?;
+
+                    // End capture (mutable borrow).
+                    self.text_encoder_state.cuda_config.as_mut().unwrap()
+                        .denoise_capture_end()?;
+                }
+
+                // Whether we just captured or were already hot, launch
+                // the graph once. (Capture alone does NOT execute the
+                // kernels.)
+                self.text_encoder_state.cuda_config.as_ref().unwrap()
+                    .denoise_graph_launch()?;
+                self.text_encoder_state.cuda_config.as_ref().unwrap()
+                    .sync_stream()?;
+                Ok(())
+            })?;
+
+            // ── Output: Plan-B ping-pong always leaves the answer in
+            //    `Latents`, so we can clone straight from it. ──
+            clone_tensor(&self.pipeline_state.slice(BT::Latents, &shape4)?)
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_denoise_step_chain(
+        &mut self,
+        num_steps: usize,
+        shapes: crate::model::diffusion::z_image::transformer::DenoiseShapes,
+        shape4: &[usize; 4],
+        shape5: &[usize; 4],
+    ) -> Result<()> {
+        use crate::model::diffusion::buffer::DiffBufferType as BT;
+        let cuda_cfg = self.text_encoder_state.cuda_config.as_ref();
+        for i in 0..num_steps {
+            // Slice a single-element device scalar out of TValueDevVec /
+            // DtValueDevVec. These are distinct device pointers per
+            // step i — each step becomes its own kernel node in the
+            // captured graph, and replay reads whatever host wrote into
+            // those bytes before `graph_launch`.
+            let d_t = self.dit_state.buffers
+                .get(&BT::TValueDevVec).unwrap()
+                .slice(&[i], &[1])?;
+            let d_dt = self.dit_state.buffers
+                .get(&BT::DtValueDevVec).unwrap()
+                .slice(&[i], &[1])?;
+
+            // ── Copy current Latents ([1,C,H,W]) into Latent5D ([C,1,H,W]). ──
+            {
+                let cur = self.pipeline_state.slice(BT::Latents, shape4)?;
+                let cur_5d = cur.view(shape5)?;
+                let mut latent_5d = self.dit_state.slice_mut(BT::Latent5D, shape5)?;
+                latent_5d.copy_from_on_current_stream(&cur_5d)?;
+            }
+
+            // ── Transformer forward for this step → ImageOut slot. ──
+            let model_out = self.transformer.forward_denoise_step(
+                &d_t, shapes, &mut self.dit_state, cuda_cfg,
+            )?;
+
+            // ── noise_pred = -model_out (shape [1,C,H,W]). ──
+            {
+                let mut noise_pred = self.pipeline_state.slice_mut(BT::NoisePred, shape4)?;
+                noise_pred.copy_from_on_current_stream(&model_out.view(shape4)?)?;
+                noise_pred *= -1.0_f32; // literal kernel arg — constant across replays
+            }
+
+            // ── Euler step with dt read from device memory. ──
+            //    LatentsTmp = Latents + (d_dt) * NoisePred
+            {
+                let mut noise_pred = self.pipeline_state.slice_mut(BT::NoisePred, shape4)?;
+                let cur = self.pipeline_state.slice(BT::Latents, shape4)?;
+                let mut dst = self.pipeline_state.slice_mut(BT::LatentsTmp, shape4)?;
+                self.scheduler.step_from_dev(&mut noise_pred, &cur, &mut dst, &d_dt)?;
+            }
+
+            // ── Plan-B: copy LatentsTmp back to Latents so next step
+            //    (or VAE after the loop) always reads from Latents. ──
+            {
+                let src = self.pipeline_state.slice(BT::LatentsTmp, shape4)?;
+                let mut dst = self.pipeline_state.slice_mut(BT::Latents, shape4)?;
+                dst.copy_from_on_current_stream(&src)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Eager (non-graph) denoise. Used only when CUDA is disabled; same
+    /// logic as the previous implementation minus CPU-specific bits.
+    fn denoise_eager(
         &mut self,
         latent_h: usize,
         latent_w: usize,
@@ -255,45 +516,36 @@ impl ZImagePipeline {
 
         for (i, &t) in timesteps.iter().enumerate() {
             let norm_t = (1000.0 - t) / 1000.0;
-
-            // Ping-pong: even step reads Latents → writes LatentsTmp;
-            // odd step swaps. No mem::swap needed — each iteration
-            // re-slices the state.
             let (sample_ty, dst_ty) = if i % 2 == 0 {
-                (BT::Latents, BT::LatentsTmp)
+                (crate::model::diffusion::buffer::DiffBufferType::Latents,
+                 crate::model::diffusion::buffer::DiffBufferType::LatentsTmp)
             } else {
-                (BT::LatentsTmp, BT::Latents)
+                (crate::model::diffusion::buffer::DiffBufferType::LatentsTmp,
+                 crate::model::diffusion::buffer::DiffBufferType::Latents)
             };
-
-            // DiT input: copy the current [1, C, H, W] latent into the
-            // pre-allocated [C, 1, H, W] Latent5D slot so the transformer
-            // sees a contiguous, non-aliased tensor.
             let cur = self.pipeline_state.slice(sample_ty, &shape4)?;
-            let mut latent_5d = self.pipeline_state.slice_mut(BT::Latent5D, &shape5)?;
+            let mut latent_5d = self.dit_state.slice_mut(
+                crate::model::diffusion::buffer::DiffBufferType::Latent5D, &shape5,
+            )?;
             latent_5d.copy_from_on_current_stream(&cur.view(&shape5)?)?;
 
-            // DiT forward. `model_out` aliases state.ImageOut — we must
-            // consume it via copy_from into NoisePred before the next
-            // invocation would clobber the underlying buffer.
             let model_out = self.transformer.forward(
                 &latent_5d, norm_t, prompt_embeds, cuda_cfg, &mut self.dit_state,
             )?;
-
-            // noise_pred = -model_out, shaped [1, C, H, W].
-            let mut noise_pred = self.pipeline_state.slice_mut(BT::NoisePred, &shape4)?;
+            let mut noise_pred = self.pipeline_state.slice_mut(
+                crate::model::diffusion::buffer::DiffBufferType::NoisePred, &shape4,
+            )?;
             noise_pred.copy_from_on_current_stream(&model_out.view(&shape4)?)?;
             noise_pred *= -1.0_f32;
-
-            // dst = sample + dt * noise_pred  (noise_pred is consumed).
             let cur_read = self.pipeline_state.slice(sample_ty, &shape4)?;
             let mut dst = self.pipeline_state.slice_mut(dst_ty, &shape4)?;
             self.scheduler.step(&mut noise_pred, &cur_read, &mut dst)?;
         }
-
-        // After N iterations the last write lives in `Latents` (N even)
-        // or `LatentsTmp` (N odd). Clone it out so the caller doesn't
-        // need to hold a borrow on the state.
-        let final_ty = if num_steps % 2 == 0 { BT::Latents } else { BT::LatentsTmp };
+        let final_ty = if num_steps % 2 == 0 {
+            crate::model::diffusion::buffer::DiffBufferType::Latents
+        } else {
+            crate::model::diffusion::buffer::DiffBufferType::LatentsTmp
+        };
         clone_tensor(&self.pipeline_state.slice(final_ty, &shape4)?)
     }
 
@@ -360,7 +612,15 @@ impl ZImagePipeline {
             seed: Some(0),
             ..Default::default()
         };
-        let _ = self.generate(&request)?;
+        // Force the eager denoise loop for warmup so cuBLASLt / cuDNN
+        // fill their heuristic caches without stream capture being
+        // active — capturing a first-time cuBLASLt call trips
+        // `cudaErrorStreamCaptureUnsupported`.
+        let prev = self.force_eager_denoise;
+        self.force_eager_denoise = true;
+        let result = self.generate(&request);
+        self.force_eager_denoise = prev;
+        let _ = result?;
 
         // Ensure every queued kernel / cache fill has completed before
         // we hand control back; otherwise the first user request would
@@ -577,7 +837,16 @@ mod tests {
 
         let output = pipeline.generate(&request)?;
         eprintln!("Output shape: {:?}", output.output.shape());
-        eprintln!("Metrics: encode={}ms, denoise={}ms, decode={}ms, total={}ms",
+        eprintln!("Metrics (1st, includes capture): encode={}ms, denoise={}ms, decode={}ms, total={}ms",
+            output.metrics.encode_prompt_ms,
+            output.metrics.denoise_ms,
+            output.metrics.decode_ms,
+            output.metrics.total_ms,
+        );
+
+        // Second run — graph replay only, no capture. Represents steady-state latency.
+        let output = pipeline.generate(&request)?;
+        eprintln!("Metrics (2nd, replay):         encode={}ms, denoise={}ms, decode={}ms, total={}ms",
             output.metrics.encode_prompt_ms,
             output.metrics.denoise_ms,
             output.metrics.decode_ms,

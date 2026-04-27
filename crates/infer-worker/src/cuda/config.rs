@@ -7,10 +7,14 @@ use super::ffi;
 
 /// cuBLASLt 默认 workspace 大小（字节）。
 ///
-/// 32 MB 是 NVIDIA 建议的最低 workspace（GEMM 规模小时 heuristic 能选到足够的算法）。
-/// 对 600B 级别大模型、大 batch 场景，当前版本**暂未**提供扩容接口，
-/// 需要时可在 [`CudaConfig::new`] 里直接把这个常量调大重编译。
-const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+/// 128 MB 是 NVIDIA 对 Hopper (sm_90) BF16/FP16 GEMM 的推荐最低值——
+/// 某些 split-K 大 tile 在 workspace < 64 MB 时会被 heuristic 淘汰。
+/// Z-Image 2-step diffusion 实测：workspace 在 40 MB ~ 1 GB 之间
+/// denoise 延迟完全一致（`nvjet_tst_80x128_64x8_2x1_v_bz_TNN` 218 µs/call
+/// 已是最优 tile）。这里选 128 MB 是为把 600B 级别 LLM、大 batch /
+/// 大 seq 场景（例如 512×512 分辨率 seq≈4096）统一在一个不会退化的
+/// 水位，同时 HBM 占用仍可忽略（每 CudaConfig 多消耗 ~96 MB）。
+const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Split-K flash-decoding 用的 N_SPLIT 常量。
 /// 必须与 `.cu` 内 `N_SPLIT` / `N_SPLIT_1B` 保持一致；改常量需三处同步。
@@ -49,6 +53,15 @@ pub struct CudaConfig {
     pub flash_decode_workspace: *mut c_void,
     pub flash_decode_workspace_size: usize,
     pub cuda_graph: Option<CudaGraph>,
+    /// Dedicated CUDA Graph slot for the Z-Image diffusion denoise loop.
+    ///
+    /// Held here rather than reusing `cuda_graph` because the same
+    /// `CudaConfig` is shared between the Qwen3 text encoder (whose
+    /// decode path uses `cuda_graph`) and the diffusion pipeline — if
+    /// both tried to reuse one slot they'd overwrite each other's
+    /// captured graph. This slot is captured in `denoise_capture_end`
+    /// and replayed in `denoise_graph_launch`.
+    pub denoise_graph: Option<CudaGraph>,
     /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
     pub cudnn_handle: ffi::cudnnHandle_t,
     /// Descriptor / algorithm / workspace cache shared across every
@@ -116,6 +129,7 @@ impl CudaConfig {
             flash_decode_workspace: std::ptr::null_mut(),
             flash_decode_workspace_size: 0,
             cuda_graph: None,
+            denoise_graph: None,
             cudnn_handle,
             conv2d_cache: Mutex::new(
                 crate::op::kernels::cuda::Conv2dCache::default(),
@@ -241,6 +255,50 @@ impl CudaConfig {
     pub fn sync_stream(&self) -> Result<()> {
         unsafe {
             crate::cuda_check!(ffi::cudaStreamSynchronize(self.stream))?;
+        }
+        Ok(())
+    }
+
+    // ─────────────────── Denoise-dedicated graph API ───────────────────
+    //
+    // The Z-Image denoise loop captures its own graph independent of the
+    // `cuda_graph` slot (which is used by the LLM decode path). These
+    // helpers just wrap Begin/EndCapture + Instantiate on the same
+    // stream, writing into `self.denoise_graph`.
+
+    pub fn denoise_graph_is_ready(&self) -> bool {
+        self.denoise_graph.is_some()
+    }
+
+    /// Begin stream capture on `self.stream`. Requires only `&self`
+    /// because `cudaStream_t` is a `Copy` handle — the graph-state
+    /// write happens in `denoise_capture_end` which takes `&mut self`.
+    pub fn denoise_capture_begin(&self) -> Result<()> {
+        unsafe {
+            crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?;
+        }
+        Ok(())
+    }
+
+    pub fn denoise_capture_end(&mut self) -> Result<()> {
+        unsafe {
+            let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
+            crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
+            let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
+            crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
+            self.denoise_graph = Some(CudaGraph { graph, exec });
+        }
+        Ok(())
+    }
+
+    pub fn denoise_graph_launch(&self) -> Result<()> {
+        let g = self.denoise_graph.as_ref().ok_or_else(|| {
+            crate::base::error::Error::InvalidArgument(
+                "denoise_graph_launch called before capture".into(),
+            )
+        })?;
+        unsafe {
+            crate::cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream))?;
         }
         Ok(())
     }

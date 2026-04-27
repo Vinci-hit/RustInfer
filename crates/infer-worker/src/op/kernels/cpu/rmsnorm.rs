@@ -25,6 +25,24 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) -
     }
 }
 
+/// In-place CPU RMSNorm: `x = rmsnorm(x, weight, eps)`.
+///
+/// Each row is independent and processed inside a single `par_chunks_mut`
+/// closure: we first read `x[row]` twice to compute the L2 norm → rsqrt,
+/// then rewrite `x[row]` with `weight * x[row] * rsqrt`. Because each
+/// row chunk is owned exclusively by one rayon task, the in-place update
+/// is data-race free.
+pub fn rmsnorm_inplace(x: &mut Tensor, weight: &Tensor, eps: f32) -> Result<()> {
+    match (x.dtype(), weight.dtype()) {
+        (crate::base::DataType::F32, crate::base::DataType::F32) => rmsnorm_inplace_f32(x, weight, eps),
+        (crate::base::DataType::BF16, crate::base::DataType::BF16) => rmsnorm_inplace_bf16(x, weight, eps),
+        (xd, wd) => Err(Error::InvalidArgument(format!(
+            "Unsupported data type combination for rmsnorm_inplace: x={:?}, weight={:?}",
+            xd, wd
+        )).into()),
+    }
+}
+
 /// F32版本的RMSNorm实现
 fn rmsnorm_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) -> Result<()> {
     // --- 1. 获取 Rust slice ---
@@ -55,6 +73,30 @@ fn rmsnorm_f32(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) -
             output_row_view.assign(&(&weight_view * (&input_row_view * rsqrt)));
         });
     
+    Ok(())
+}
+
+fn rmsnorm_inplace_f32(x: &mut Tensor, weight: &Tensor, eps: f32) -> Result<()> {
+    let weight_slice = weight.as_f32()?.as_slice()?;
+    let x_slice = x.as_f32_mut()?.as_slice_mut()?;
+
+    let dim = weight_slice.len();
+    let dim_sqrt = (dim as f32).sqrt();
+    let weight_view = ArrayView1::from(weight_slice);
+
+    x_slice
+        .par_chunks_mut(dim)
+        .for_each(|row| {
+            // Pass 1: read only — compute rsqrt from the row's L2 norm.
+            let row_view = ArrayView1::from(&*row);
+            let norm = row_view.norm_l2();
+            let rms = norm / dim_sqrt;
+            let rsqrt = (rms * rms + eps).sqrt().recip();
+            // Pass 2: overwrite row in place.
+            let mut row_mut = ArrayViewMut1::from(row);
+            let scaled = &weight_view * rsqrt;
+            row_mut *= &scaled;
+        });
     Ok(())
 }
 
@@ -98,5 +140,34 @@ fn rmsnorm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32) 
             output_chunk.copy_from_slice(&result);
         });
     
+    Ok(())
+}
+
+fn rmsnorm_inplace_bf16(x: &mut Tensor, weight: &Tensor, eps: f32) -> Result<()> {
+    let weight_slice = weight.as_bf16()?.as_slice()?;
+    let x_slice = x.as_bf16_mut()?.as_slice_mut()?;
+
+    let dim = weight_slice.len();
+    let dim_sqrt = (dim as f32).sqrt();
+    let weight_f32: Vec<f32> = weight_slice.iter().map(|&w| w.to_f32()).collect();
+
+    x_slice
+        .par_chunks_mut(dim)
+        .for_each(|row| {
+            // Pass 1: read-only norm computation in f32 for precision.
+            let mut sum_sq = 0.0f32;
+            for &v in row.iter() {
+                let f = v.to_f32();
+                sum_sq += f * f;
+            }
+            let rms = (sum_sq / dim as f32).sqrt();
+            let rsqrt = (rms * rms + eps).sqrt().recip();
+            // Pass 2: in-place overwrite.
+            for (v, &w) in row.iter_mut().zip(weight_f32.iter()) {
+                let f = v.to_f32() * rsqrt * w;
+                *v = bf16::from_f32(f);
+            }
+            let _ = dim_sqrt; // silence unused (kept for API symmetry)
+        });
     Ok(())
 }

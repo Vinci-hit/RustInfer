@@ -32,9 +32,15 @@ pub struct DiTBlock {
     pub ffn_norm1: RMSNorm,
     pub ffn_norm2: RMSNorm,
 
-    pub to_q: Matmul,
-    pub to_k: Matmul,
-    pub to_v: Matmul,
+    /// Fused `[to_q; to_k; to_v]` projection — weight shape `[3*dim, dim]`,
+    /// bias-less (Z-Image convention).
+    ///
+    /// A single GEMM writes `[seq, 3*dim]` into `BlkQkvOut`. Three
+    /// independent `split_cols` kernel launches then copy the three
+    /// `[seq, dim]` column slabs into the contiguous `BlkQ` / `BlkK` /
+    /// `BlkV` buffers — mirroring the LLM-side pattern used in
+    /// `Llama3::forward_prefill` and `Qwen3::forward_prefill`.
+    pub to_qkv: Matmul,
     pub to_out: Matmul,
 
     pub norm_q: RMSNorm,
@@ -59,9 +65,7 @@ impl DiTBlock {
         self.attention_norm2.to_cuda(device_id)?;
         self.ffn_norm1.to_cuda(device_id)?;
         self.ffn_norm2.to_cuda(device_id)?;
-        self.to_q.to_cuda(device_id)?;
-        self.to_k.to_cuda(device_id)?;
-        self.to_v.to_cuda(device_id)?;
+        self.to_qkv.to_cuda(device_id)?;
         self.to_out.to_cuda(device_id)?;
         self.norm_q.to_cuda(device_id)?;
         self.norm_k.to_cuda(device_id)?;
@@ -138,17 +142,46 @@ impl DiTBlock {
             norm1_x.mul_row(s)?;
         }
 
-        // QKV projections
+        // ── Fused QKV projection + column split ──
+        //
+        // 1. One GEMM of `[seq, dim] @ [3*dim, dim]^T → [seq, 3*dim]`
+        //    writes Q / K / V as three contiguous column slabs in
+        //    `BlkQkvOut` (cols `[0..dim)`=Q, `[dim..2*dim)`=K,
+        //    `[2*dim..3*dim)`=V).
+        // 2. Three independent `split_cols` launches copy each slab into
+        //    the `[seq, dim]` `BlkQ` / `BlkK` / `BlkV` buffers — same
+        //    pattern used by `Llama3::forward_prefill`.
+        //
+        // `q` / `k` / `v` are owned views sharing the underlying `Arc<Buffer>`
+        // of the `Blk*` slots, so they don't borrow `state` — grabbing
+        // `BlkQkvOut` via `state.slice_mut` in the inner block is free
+        // to re-borrow.
         let mut q = state.slice_mut(BT::BlkQ, &[seq, dim])?;
         let mut k = state.slice_mut(BT::BlkK, &[seq, dim])?;
         let mut v = state.slice_mut(BT::BlkV, &[seq, dim])?;
-        self.to_q.forward(&norm1_x, &mut q, cuda_config)?;
-        self.to_k.forward(&norm1_x, &mut k, cuda_config)?;
-        self.to_v.forward(&norm1_x, &mut v, cuda_config)?;
+        {
+            let mut qkv_out = state.slice_mut(BT::BlkQkvOut, &[seq, 3 * dim])?;
+            self.to_qkv.forward(&norm1_x, &mut qkv_out, cuda_config)?;
 
-        // Per-head QK-norm + RoPE (all in place on BlkQ / BlkK).
-        self.per_head_rmsnorm(&self.norm_q, &mut q, BT::BlkQNormIn, BT::BlkQNormOut, state, cuda_config)?;
-        self.per_head_rmsnorm(&self.norm_k, &mut k, BT::BlkKNormIn, BT::BlkKNormOut, state, cuda_config)?;
+            #[cfg(feature = "cuda")]
+            let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config);
+            #[cfg(feature = "cuda")]
+            {
+                crate::op::split_cols::split_cols_tensor(&qkv_out, &mut q, seq, 3 * dim, 0,         dim, stream)?;
+                crate::op::split_cols::split_cols_tensor(&qkv_out, &mut k, seq, 3 * dim, dim,       dim, stream)?;
+                crate::op::split_cols::split_cols_tensor(&qkv_out, &mut v, seq, 3 * dim, 2 * dim,   dim, stream)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                crate::op::split_cols::split_cols_tensor(&qkv_out, &mut q, seq, 3 * dim, 0,         dim)?;
+                crate::op::split_cols::split_cols_tensor(&qkv_out, &mut k, seq, 3 * dim, dim,       dim)?;
+                crate::op::split_cols::split_cols_tensor(&qkv_out, &mut v, seq, 3 * dim, 2 * dim,   dim)?;
+            }
+        }
+
+        // Per-head QK-norm + RoPE (all in place on Q / K slabs).
+        self.per_head_rmsnorm(&self.norm_q, &mut q, cuda_config)?;
+        self.per_head_rmsnorm(&self.norm_k, &mut k, cuda_config)?;
         {
             let mut q_3d = q.view(&[seq, self.n_heads, self.head_dim])?;
             let mut k_3d = k.view(&[seq, self.n_heads, self.head_dim])?;
@@ -158,10 +191,11 @@ impl DiTBlock {
 
         // ── Self-attention in native SHD layout ──
         //
-        // Q/K/V already live in `BlkQ/BlkK/BlkV` as `[seq, dim]`, which is
-        // byte-equivalent to `[seq, n_heads, head_dim]` (SHD). `dit_sdpa`
-        // takes SHD directly and writes the result into `BlkAttnFlat` also
-        // viewed as SHD — no permute/copy before or after attention. On the
+        // Q/K/V already live in the `BlkQ` / `BlkK` / `BlkV` slabs as
+        // `[seq, dim]`, which is byte-equivalent to
+        // `[seq, n_heads, head_dim]` (SHD). `dit_sdpa` takes SHD directly
+        // and writes the result into `BlkAttnFlat` also viewed as SHD —
+        // no permute/copy before or after attention. On the
         // `(BF16, head_dim=128, seq%128==0)` fast path this collapses the
         // entire attention into a single CUTLASS flash-attention launch.
         let q_shd = q.view(&[seq, self.n_heads, self.head_dim])?;
@@ -186,13 +220,43 @@ impl DiTBlock {
             norm2_attn.mul_row(g)?;
         }
 
-        // Residual: dst = x + norm2_attn
+        // Residual + next-norm fusion (FFN side):
+        //
+        //   dst         = x + norm2_attn          (residual add)
+        //   norm1_ffn   = ffn_norm1(dst)          (RMSNorm)
+        //
+        // On CUDA these two ops fuse into a single kernel
+        // (`fused_add_rmsnorm`): it reads `dst` (post-copy-from-x) plus
+        // `norm2_attn`, writes back the summed residual into `dst`, and
+        // simultaneously emits `rmsnorm(dst, ffn_norm1.weight)` into
+        // `norm1_ffn`. Saves one `add_inplace` + one `rmsnorm` launch
+        // per block × 2 norm types across the 34 DiT blocks.
         dst.copy_from_on_current_stream(x)?;
-        *dst += &norm2_attn;
+        let mut norm1_ffn = state.slice_mut(BT::BlkNorm1Ffn, &[seq, dim])?;
+        // fused_add_rmsnorm currently ships only BF16/F16 kernels — fall
+        // back to the two-op sequence on CPU or when running CUDA tests
+        // in F32 (the production diffusion pipeline is always BF16).
+        #[cfg(feature = "cuda")]
+        let use_fused = dst.device().is_cuda()
+            && matches!(dst.dtype(), crate::base::DataType::BF16 | crate::base::DataType::F16);
+        #[cfg(not(feature = "cuda"))]
+        let use_fused = false;
+        if use_fused {
+            #[cfg(feature = "cuda")]
+            crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
+                &mut norm1_ffn,
+                dst,
+                &norm2_attn,
+                &self.ffn_norm1.weight,
+                self.ffn_norm1.eps(),
+                cuda_config,
+            )?;
+        } else {
+            *dst += &norm2_attn;
+            self.ffn_norm1.forward(dst, &mut norm1_ffn, cuda_config)?;
+        }
 
         // ══════════════════════════ FFN block ══════════════════════════
-        let mut norm1_ffn = state.slice_mut(BT::BlkNorm1Ffn, &[seq, dim])?;
-        self.ffn_norm1.forward(dst, &mut norm1_ffn, cuda_config)?;
         if let Some(ref s) = scale_mlp {
             norm1_ffn.mul_row(s)?;
         }
@@ -203,9 +267,12 @@ impl DiTBlock {
         self.w1.forward(&norm1_ffn, &mut w1_out, cuda_config)?;
         self.w3.forward(&norm1_ffn, &mut w3_out, cuda_config)?;
 
-        // SwiGLU: silu(w1) * w3
-        w1_out.silu()?;
-        w1_out *= &w3_out;
+        // SwiGLU: w1_out = silu(w1_out) * w3_out (single fused kernel).
+        // Saves one silu_inplace + one ewise_mul launch (plus the
+        // intermediate DRAM round-trip of w1_out) versus the two-op
+        // sequence `w1_out.silu(); w1_out *= &w3_out;`.
+        crate::op::swiglu::SwiGLU::new()
+            .forward(&w3_out, &mut w1_out, cuda_config)?;
 
         let mut ffn_out = state.slice_mut(BT::BlkFfnOut, &[seq, dim])?;
         self.w2.forward(&w1_out, &mut ffn_out, cuda_config)?;
@@ -225,16 +292,12 @@ impl DiTBlock {
     /// Apply per-head RMSNorm in place on `hd`, a `[S, dim]` state slice
     /// viewed as `[S*H, D]`.
     ///
-    /// RMSNorm needs a source tensor distinct from its destination, so
-    /// we shuttle the data through the `in_ty` / `out_ty` scratch slots
-    /// and then copy the result back on top of `hd`.
+    /// Uses [`RMSNorm::forward_inplace`]: `hd = rmsnorm(hd, weight, eps)`
+    /// directly — no scratch buffer, no surrounding copies.
     fn per_head_rmsnorm(
         &self,
         norm: &RMSNorm,
         hd: &mut Tensor,
-        in_ty: BT,
-        out_ty: BT,
-        state: &mut DitState,
         cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
         debug_assert_eq!(hd.shape().len(), 2);
@@ -242,14 +305,8 @@ impl DiTBlock {
         let seq = hd.shape()[0];
         let flat_shape = [seq * self.n_heads, self.head_dim];
 
-        let hd_flat = hd.view(&flat_shape)?;
-        let mut norm_in = state.slice_mut(in_ty, &flat_shape)?;
-        norm_in.copy_from_on_current_stream(&hd_flat)?;
-        let mut norm_out = state.slice_mut(out_ty, &flat_shape)?;
-        norm.forward(&norm_in, &mut norm_out, cuda_config)?;
-
-        let mut hd_flat_mut = hd.view(&flat_shape)?;
-        hd_flat_mut.copy_from_on_current_stream(&norm_out)?;
+        let mut hd_flat = hd.view(&flat_shape)?;
+        norm.forward_inplace(&mut hd_flat, cuda_config)?;
         Ok(())
     }
 }
@@ -290,9 +347,11 @@ mod tests {
             attention_norm2: make_rmsnorm(dim, dtype, device)?,
             ffn_norm1: make_rmsnorm(dim, dtype, device)?,
             ffn_norm2: make_rmsnorm(dim, dtype, device)?,
-            to_q: randn_matmul(dim, dim, true, dtype, device, 10)?,
-            to_k: randn_matmul(dim, dim, true, dtype, device, 20)?,
-            to_v: randn_matmul(dim, dim, true, dtype, device, 30)?,
+            // Fused QKV weight: `[3*dim, dim]`, mirrors what
+            // `load_fused_qkv_linear` produces from the three separate
+            // checkpoint tensors. Deterministic seed so CPU and CUDA
+            // instances built with the same seed match bit-for-bit.
+            to_qkv: randn_matmul(dim, 3 * dim, false, dtype, device, 10)?,
             to_out: randn_matmul(dim, dim, true, dtype, device, 40)?,
             norm_q: make_rmsnorm(head_dim, dtype, device)?,
             norm_k: make_rmsnorm(head_dim, dtype, device)?,
