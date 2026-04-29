@@ -38,11 +38,14 @@ use crate::tensor::Tensor;
 pub const N_MAX_STEPS: usize = 16;
 
 /// Sequence length rounding used by the transformer (must match the
-/// `SEQ_MULTI_OF` constant in `transformer.rs`).
-const SEQ_MULTI_OF: usize = 128;
+/// `SEQ_MULTI_OF` constant used in `transformer.rs`).
+///
+/// Fixed at **128** to match the block-M tile of the CUTLASS flash-attention
+/// kernel: Q tiles are `[M=128, K=head_dim]`.
+pub const SEQ_MULTI_OF: usize = 128;
 
 /// AdaLN conditioning embedding dim — compile-time constant in the model.
-const ADALN_EMBED_DIM: usize = 256;
+pub const ADALN_EMBED_DIM: usize = 256;
 
 /// Sinusoidal frequency dim used by the timestep embedder input.
 const T_FREQ_DIM: usize = 256;
@@ -51,7 +54,7 @@ const T_FREQ_DIM: usize = 256;
 const T_EMBEDDER_MID: usize = 1024;
 
 /// Number of latent channels (matches `LATENT_CHANNELS` in `pipeline.rs`).
-const LATENT_CHANNELS: usize = 16;
+pub const LATENT_CHANNELS: usize = 16;
 
 // ─────────────────────────── Capacity & Spec ───────────────────────────
 
@@ -230,16 +233,16 @@ impl PipelineState {
     #[inline]
     pub fn slice(&self, ty: DiffBufferType, shape: &[usize]) -> Result<Tensor> {
         let buf = crate::model::diffusion::buffer::must_get(&self.buffers, ty);
-        let zeros = vec![0usize; shape.len()];
-        buf.slice(&zeros, shape)
+        let zeros = [0usize; 8];
+        buf.slice(&zeros[..shape.len()], shape)
     }
 
     /// Mutable variant of [`Self::slice`].
     #[inline]
     pub fn slice_mut(&mut self, ty: DiffBufferType, shape: &[usize]) -> Result<Tensor> {
         let buf = crate::model::diffusion::buffer::must_get_mut(&mut self.buffers, ty);
-        let zeros = vec![0usize; shape.len()];
-        buf.slice(&zeros, shape)
+        let zeros = [0usize; 8];
+        buf.slice(&zeros[..shape.len()], shape)
     }
 }
 
@@ -575,20 +578,16 @@ impl DitState {
     #[inline]
     pub fn slice(&self, ty: DiffBufferType, shape: &[usize]) -> Result<Tensor> {
         let buf = crate::model::diffusion::buffer::must_get(&self.buffers, ty);
-        let zeros = vec![0usize; shape.len()];
-        buf.slice(&zeros, shape)
+        let zeros = [0usize; 8];
+        buf.slice(&zeros[..shape.len()], shape)
     }
 
     /// Mutable variant of [`Self::slice`].
-    ///
-    /// Note: `Tensor::slice` returns an owned `Tensor` that shares the
-    /// underlying `Arc<Buffer>` — the `&mut self` here is only needed to
-    /// enforce exclusive access while a downstream op writes through it.
     #[inline]
     pub fn slice_mut(&mut self, ty: DiffBufferType, shape: &[usize]) -> Result<Tensor> {
         let buf = crate::model::diffusion::buffer::must_get_mut(&mut self.buffers, ty);
-        let zeros = vec![0usize; shape.len()];
-        buf.slice(&zeros, shape)
+        let zeros = [0usize; 8];
+        buf.slice(&zeros[..shape.len()], shape)
     }
 }
 

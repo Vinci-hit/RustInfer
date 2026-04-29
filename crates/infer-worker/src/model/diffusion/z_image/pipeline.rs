@@ -36,7 +36,7 @@ use crate::model::diffusion::pipeline::{
     DiffusionMetrics, DiffusionOutput, DiffusionPipeline, DiffusionRequest,
 };
 use crate::model::diffusion::scheduler::{FlowMatchEulerScheduler, Scheduler};
-use crate::model::diffusion::z_image::state::{DitState, PipelineState, ZImageCapacity};
+use crate::model::diffusion::z_image::state::{DitState, PipelineState, ZImageCapacity, LATENT_CHANNELS};
 use crate::model::diffusion::z_image::text_encoder::Qwen3TextEncoder;
 use crate::model::diffusion::z_image::transformer::ZImageTransformer2DModel;
 use crate::model::runtime::InferenceState;
@@ -78,9 +78,6 @@ const VAE_SHIFT_FACTOR: f32 = 0.1159;
 
 /// Turbo sigmas — fixed 2-step schedule.
 const TURBO_SIGMAS: &[f32] = &[1.0, 0.3];
-
-/// Number of latent channels.
-const LATENT_CHANNELS: usize = 16;
 
 /// Z-Image text-to-image pipeline.
 ///
@@ -362,8 +359,8 @@ impl ZImagePipeline {
             // DtValueDevVec[i] = sigmas[i+1] - sigmas[i]
             let _t_sched = Instant::now();
             let t_scale = self.transformer.config.t_scale;
-            let timesteps: Vec<f32> = self.scheduler.timesteps().to_vec();
-            let sigmas: Vec<f32> = self.scheduler.sigmas().to_vec();
+            let timesteps = self.scheduler.timesteps();
+            let sigmas = self.scheduler.sigmas();
             debug_assert_eq!(sigmas.len(), num_steps + 1);
             let mut t_value_host = vec![0.0_f32; num_steps];
             let mut dt_host = vec![0.0_f32; num_steps];
@@ -826,7 +823,7 @@ mod tests {
 
         // Very small size to isolate correctness / hang issues.
         let request = DiffusionRequest {
-            prompt: "a photograph of a cat wearing a red hat, sitting on a wooden bench in a sunny park".to_string(),
+            prompt: "一只小猫在炒菜".to_string(),
             height: 256,
             width: 256,
             // Keep the original 2-step Turbo schedule so this test
@@ -857,73 +854,6 @@ mod tests {
         );
         save_tensor_as_ppm(&output.output, "/root/z_image_cuda_output.ppm")?;
         eprintln!("Saved /root/z_image_cuda_output.ppm");
-        Ok(())
-    }
-
-    // ─────────────────── Steady-state benches ────────────────────────
-
-    /// Run `N_ITER` back-to-back generations at 256×256 on the 2-step
-    /// **Turbo** schedule. Prints per-iteration stage timings so the
-    /// steady-state cost (iter ≥ 1, after warmup fills every cache)
-    /// can be read straight off.
-    #[test]
-    #[ignore = "需要 Z-Image 模型权重 + CUDA"]
-    #[cfg(feature = "cuda")]
-    fn test_pipeline_bench_cuda() -> Result<()> {
-        bench_pipeline_with_schedule("turbo-2step", Some(TURBO_SIGMAS.to_vec()), 0)
-    }
-
-    /// Same bench at 256×256, but on the **official 9-step** schedule
-    /// (linear sigmas + dynamic shifting, matching the full-quality
-    /// Z-Image pipeline rather than Turbo).
-    ///
-    /// Useful to compare denoise-loop throughput against the vllm-omni
-    /// server's 9-step default.
-    #[test]
-    #[ignore = "需要 Z-Image 模型权重 + CUDA"]
-    #[cfg(feature = "cuda")]
-    fn test_pipeline_bench_cuda_9step() -> Result<()> {
-        bench_pipeline_with_schedule("official-9step", None, 9)
-    }
-
-    /// Shared bench harness. When `sigmas.is_some()`, the explicit
-    /// schedule is used (e.g. Turbo). Otherwise the pipeline falls
-    /// back to the scheduler's built-in default for
-    /// `num_inference_steps`.
-    #[cfg(feature = "cuda")]
-    fn bench_pipeline_with_schedule(
-        label: &str,
-        sigmas: Option<Vec<f32>>,
-        num_inference_steps: usize,
-    ) -> Result<()> {
-        let model_dir = get_model_dir();
-        if !model_dir.join("text_encoder/config.json").exists() { return Ok(()); }
-
-        let mut pipeline = ZImagePipeline::from_pretrained(model_dir, DeviceType::Cuda(0))?;
-        eprintln!("[bench:{label}] warming up at 256x256...");
-        let t_warm = Instant::now();
-        pipeline.warmup_for(256, 256)?;
-        eprintln!("[bench:{label}] warmup done in {}ms", t_warm.elapsed().as_millis());
-
-        let request = DiffusionRequest {
-            prompt: "a photograph of a cat wearing a red hat, sitting on a wooden bench in a sunny park".to_string(),
-            height: 256,
-            width: 256,
-            sigmas,
-            num_inference_steps,
-            seed: Some(42),
-            ..Default::default()
-        };
-
-        const N_ITER: usize = 5;
-        eprintln!("[bench:{label}] {:>4}  {:>8}  {:>8}  {:>8}  {:>8}",
-            "iter", "encode", "denoise", "decode", "total");
-        for i in 0..N_ITER {
-            let out = pipeline.generate(&request)?;
-            let m = &out.metrics;
-            eprintln!("[bench:{label}] {:>4}  {:>6}ms  {:>6}ms  {:>6}ms  {:>6}ms",
-                i, m.encode_prompt_ms, m.denoise_ms, m.decode_ms, m.total_ms);
-        }
         Ok(())
     }
 

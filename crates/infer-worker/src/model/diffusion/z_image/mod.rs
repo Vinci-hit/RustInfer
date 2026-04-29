@@ -4,13 +4,16 @@
 //!
 //! ```text
 //! z_image/
-//! ├── mod.rs           ← you are here
-//! ├── pipeline.rs      ← ZImagePipeline: full encode → denoise → decode flow
-//! └── transformer.rs   ← ZImageTransformer2DModel (S3-DiT): the denoising backbone
+//! ├── mod.rs              ← you are here
+//! ├── pipeline.rs         ← ZImagePipeline: full encode → denoise → decode flow
+//! ├── transformer.rs      ← ZImageTransformer2DModel (S3-DiT): denoising backbone
+//! ├── dit_block.rs        ← Single DiT transformer block
+//! ├── state.rs            ← Pre-allocated DitState / PipelineState
+//! ├── text_encoder.rs     ← Qwen3-based text encoder wrapper
+//! ├── timestep_embedder.rs← Sinusoidal timestep → MLP embedding
+//! ├── rope_embedder_3d.rs ← 3D Rotary Position Embedding
+//! └── patchify.rs         ← Patchify / Unpatchify (zero-alloc _into variants)
 //! ```
-//!
-//! Mirrors the vllm-omni structure:
-//! `diffusion/models/z_image/{pipeline_z_image.py, z_image_transformer.py}`
 
 pub mod pipeline;
 pub mod transformer;
