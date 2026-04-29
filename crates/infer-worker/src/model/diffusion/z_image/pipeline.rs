@@ -348,16 +348,19 @@ impl ZImagePipeline {
             )?;
 
             // ── Per-request shape-fixed precomputation (outside capture) ──
+            let _t_prep = Instant::now();
             let shapes = {
                 let cuda_cfg = self.text_encoder_state.cuda_config.as_ref();
                 self.transformer.prepare_denoise_constants(
                     &cap_feats, f, h, w, &mut self.dit_state, cuda_cfg,
                 )?
             };
+            let _prep_cpu_ms = _t_prep.elapsed().as_micros() as f64 / 1000.0;
 
             // ── Upload per-step t_value + dt schedule ──
             // TValueDevVec[i] = (1000 - timestep[i]) / 1000 * t_scale
             // DtValueDevVec[i] = sigmas[i+1] - sigmas[i]
+            let _t_sched = Instant::now();
             let t_scale = self.transformer.config.t_scale;
             let timesteps: Vec<f32> = self.scheduler.timesteps().to_vec();
             let sigmas: Vec<f32> = self.scheduler.sigmas().to_vec();
@@ -383,21 +386,27 @@ impl ZImagePipeline {
                 )?,
                 &dt_host,
             )?;
+            let _sched_cpu_ms = _t_sched.elapsed().as_micros() as f64 / 1000.0;
 
             // ── Make sure every queued prep HtoD has landed on the
             //    stream before we start capturing. Capture mode doesn't
             //    tolerate in-flight pageable HtoDs. ──
+            let _t_prep_sync = Instant::now();
             {
                 let cfg = self.text_encoder_state.cuda_config.as_ref()
                     .expect("CUDA requires CudaConfig");
                 cfg.sync_stream()?;
             }
+            let _prep_sync_ms = _t_prep_sync.elapsed().as_micros() as f64 / 1000.0;
 
             // ── Capture-or-replay loop ──
             let stream_copy = {
                 let cfg = self.text_encoder_state.cuda_config.as_ref().unwrap();
                 cfg.stream
             };
+            let _t_graph = Instant::now();
+            let mut _t_launch_ms = 0.0_f64;
+            let mut _t_sync_ms = 0.0_f64;
             with_cuda_stream(stream_copy, || -> Result<()> {
                 let graph_ready = self.text_encoder_state
                     .cuda_config.as_ref().unwrap()
@@ -421,16 +430,31 @@ impl ZImagePipeline {
                 // Whether we just captured or were already hot, launch
                 // the graph once. (Capture alone does NOT execute the
                 // kernels.)
+                let _t_l = Instant::now();
                 self.text_encoder_state.cuda_config.as_ref().unwrap()
                     .denoise_graph_launch()?;
+                _t_launch_ms = _t_l.elapsed().as_micros() as f64 / 1000.0;
+                let _t_s = Instant::now();
                 self.text_encoder_state.cuda_config.as_ref().unwrap()
                     .sync_stream()?;
+                _t_sync_ms = _t_s.elapsed().as_micros() as f64 / 1000.0;
                 Ok(())
             })?;
+            let _graph_total_ms = _t_graph.elapsed().as_micros() as f64 / 1000.0;
 
+            let _t_clone = Instant::now();
             // ── Output: Plan-B ping-pong always leaves the answer in
             //    `Latents`, so we can clone straight from it. ──
-            clone_tensor(&self.pipeline_state.slice(BT::Latents, &shape4)?)
+            let out_latents = clone_tensor(&self.pipeline_state.slice(BT::Latents, &shape4)?)?;
+            let _clone_ms = _t_clone.elapsed().as_micros() as f64 / 1000.0;
+
+            if std::env::var_os("RUSTINFER_DENOISE_BREAKDOWN").is_some() {
+                eprintln!(
+                    "[denoise-breakdown] prep_cpu={:.2}ms sched_cpu={:.2}ms prep_sync={:.2}ms graph_total={:.2}ms (launch={:.2}ms sync={:.2}ms) clone={:.2}ms",
+                    _prep_cpu_ms, _sched_cpu_ms, _prep_sync_ms, _graph_total_ms, _t_launch_ms, _t_sync_ms, _clone_ms,
+                );
+            }
+            Ok(out_latents)
         }
     }
 
