@@ -16,6 +16,7 @@
 //! ```
 
 use crate::OpConfig;
+use crate::base::DataType;
 use crate::base::error::{Error, Result};
 
 use crate::model::diffusion::buffer::DiffBufferType as BT;
@@ -162,31 +163,80 @@ impl DiTBlock {
         {
             let mut qkv_out = state.slice_mut(BT::BlkQkvOut, &[seq, 3 * dim])?;
             self.to_qkv.forward(&norm1_x, &mut qkv_out, cuda_config)?;
+        }
 
-            #[cfg(feature = "cuda")]
-            let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config);
+        // Per-head QK-norm + RoPE (all in place on Q / K slabs).
+        //
+        // On CUDA + BF16 with the common Z-Image head_dim=128 case we
+        // merge split_cols×3 + rmsnorm×2 + rope×2 into a single kernel
+        // `zimage_fused_qkv_split_head_rmsnorm_rope_interleaved_bf16`.
+        // For anything outside that fast path (CPU / F32 tests / unusual
+        // head_dim), fall back to the original 7-kernel path.
+        #[cfg(feature = "cuda")]
+        let used_fused_qkv = {
+            let cfg = cuda_config;
+            let cos_dtype_ok = cos.dtype() == DataType::F32 && cos.device().is_cuda();
+            let sin_dtype_ok = sin.dtype() == DataType::F32 && sin.device().is_cuda();
+            let bf16_ok = x.dtype() == DataType::BF16
+                && self.norm_q.weight.dtype() == DataType::BF16
+                && self.norm_k.weight.dtype() == DataType::BF16;
+            let hd_ok = self.head_dim == 128 || self.head_dim == 64;
+            let enabled = std::env::var_os(
+                "RUSTINFER_DISABLE_FUSED_QKV_SPLIT_NORM_ROPE_BF16",
+            ).is_none();
+            if enabled && bf16_ok && cos_dtype_ok && sin_dtype_ok && hd_ok {
+                // We still need qkv_out populated by the GEMM above; take
+                // a fresh read-only slice of it.
+                let qkv_out = state.slice(BT::BlkQkvOut, &[seq, 3 * dim])?;
+                crate::op::kernels::cuda::zimage_fused_qkv_split_head_rmsnorm_rope_interleaved_bf16(
+                    &qkv_out,
+                    &self.norm_q.weight,
+                    &self.norm_k.weight,
+                    cos,
+                    sin,
+                    &mut q,
+                    &mut k,
+                    &mut v,
+                    seq,
+                    self.n_heads,
+                    self.head_dim,
+                    self.norm_q.eps(),
+                    cfg,
+                )?;
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let used_fused_qkv = false;
+
+        if !used_fused_qkv {
+            // Fallback: separate split + rmsnorm + rope kernels (also the
+            // CPU path and any dtype we don't have a fused kernel for).
             #[cfg(feature = "cuda")]
             {
+                let qkv_out = state.slice(BT::BlkQkvOut, &[seq, 3 * dim])?;
+                let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config);
                 crate::op::split_cols::split_cols_tensor(&qkv_out, &mut q, seq, 3 * dim, 0,         dim, stream)?;
                 crate::op::split_cols::split_cols_tensor(&qkv_out, &mut k, seq, 3 * dim, dim,       dim, stream)?;
                 crate::op::split_cols::split_cols_tensor(&qkv_out, &mut v, seq, 3 * dim, 2 * dim,   dim, stream)?;
             }
             #[cfg(not(feature = "cuda"))]
             {
+                let qkv_out = state.slice(BT::BlkQkvOut, &[seq, 3 * dim])?;
                 crate::op::split_cols::split_cols_tensor(&qkv_out, &mut q, seq, 3 * dim, 0,         dim)?;
                 crate::op::split_cols::split_cols_tensor(&qkv_out, &mut k, seq, 3 * dim, dim,       dim)?;
                 crate::op::split_cols::split_cols_tensor(&qkv_out, &mut v, seq, 3 * dim, 2 * dim,   dim)?;
             }
-        }
-
-        // Per-head QK-norm + RoPE (all in place on Q / K slabs).
-        self.per_head_rmsnorm(&self.norm_q, &mut q, cuda_config)?;
-        self.per_head_rmsnorm(&self.norm_k, &mut k, cuda_config)?;
-        {
-            let mut q_3d = q.view(&[seq, self.n_heads, self.head_dim])?;
-            let mut k_3d = k.view(&[seq, self.n_heads, self.head_dim])?;
-            q_3d.rope_interleaved(cos, sin, self.head_dim)?;
-            k_3d.rope_interleaved(cos, sin, self.head_dim)?;
+            self.per_head_rmsnorm(&self.norm_q, &mut q, cuda_config)?;
+            self.per_head_rmsnorm(&self.norm_k, &mut k, cuda_config)?;
+            {
+                let mut q_3d = q.view(&[seq, self.n_heads, self.head_dim])?;
+                let mut k_3d = k.view(&[seq, self.n_heads, self.head_dim])?;
+                q_3d.rope_interleaved(cos, sin, self.head_dim)?;
+                k_3d.rope_interleaved(cos, sin, self.head_dim)?;
+            }
         }
 
         // ── Self-attention in native SHD layout ──

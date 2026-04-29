@@ -53,3 +53,6 @@ pub use upsample::*;
 
 mod softmax;
 pub use softmax::*;
+
+mod dit_block_bf16_fusions;
+pub use dit_block_bf16_fusions::*;
