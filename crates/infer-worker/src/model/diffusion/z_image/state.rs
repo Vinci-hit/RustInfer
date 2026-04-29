@@ -16,10 +16,7 @@
 //!
 //! Because tensor pointers are stable for the state's lifetime, any
 //! forward computation run against these states is graph-capture
-//! friendly. The one scalar that is *written* between replays is
-//! [`DiffBufferType::TValueDev`], a single-element f32 device tensor
-//! that holds the current `norm_t * t_scale`; the capturing caller is
-//! expected to issue a `cudaMemcpyAsync` into it before each replay.
+//! friendly.
 
 use std::collections::HashMap;
 
@@ -323,16 +320,6 @@ impl DitState {
         let mut m: DiffWorkspace = HashMap::new();
 
         // ── timestep ──
-        // `TValueDev` is the one slot we *write* between graph replays.
-        // Keeping it at [1] (f32, device) means a single cudaMemcpyAsync
-        // before each launch is all the host does.
-        m.insert(
-            DiffBufferType::TValueDev,
-            Tensor::new(&[1], DataType::F32, device)?,
-        );
-        // TFreq holds the sinusoidal timestep embedding that feeds mlp1.
-        // It must be in the transformer's weight dtype (typically BF16)
-        // so mlp1 can be called directly without an intermediate cast.
         m.insert(
             DiffBufferType::TFreq,
             Tensor::new(&[1, T_FREQ_DIM], dtype, device)?,
@@ -460,62 +447,37 @@ impl DitState {
         );
 
         // ── DiTBlock scratch pool (shared across all blocks) ──
+        //
+        // Several buffers have non-overlapping lifetimes within a single
+        // block forward and share the same allocation:
+        //   BlkNorm1X  ↔ BlkAttnFlat  (both [s_tot, dim])
+        //   BlkToOut   ↔ BlkNorm1Ffn  (both [s_tot, dim])
+        //   BlkNorm2Attn ↔ BlkFfnOut  (both [s_tot, dim])
+        //   BlkQkvOut  (dead after fused kernel, but shape differs from W1/W3)
         m.insert(
             DiffBufferType::BlkModOut,
             Tensor::new(&[1, 4 * dim], dtype, device)?,
         );
-        m.insert(
-            DiffBufferType::BlkNorm1X,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkQkvOut,
-            Tensor::new(&[s_tot, 3 * dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkQ,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkK,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkV,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkAttnFlat,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkToOut,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkNorm2Attn,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkNorm1Ffn,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkW1Out,
-            Tensor::new(&[s_tot, hidden_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkW3Out,
-            Tensor::new(&[s_tot, hidden_dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkFfnOut,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
-        m.insert(
-            DiffBufferType::BlkNorm2Ffn,
-            Tensor::new(&[s_tot, dim], dtype, device)?,
-        );
+        let blk_norm1x = Tensor::new(&[s_tot, dim], dtype, device)?;
+        m.insert(DiffBufferType::BlkNorm1X, blk_norm1x.clone());
+        m.insert(DiffBufferType::BlkAttnFlat, blk_norm1x);
+
+        m.insert(DiffBufferType::BlkQkvOut, Tensor::new(&[s_tot, 3 * dim], dtype, device)?);
+        m.insert(DiffBufferType::BlkQ, Tensor::new(&[s_tot, dim], dtype, device)?);
+        m.insert(DiffBufferType::BlkK, Tensor::new(&[s_tot, dim], dtype, device)?);
+        m.insert(DiffBufferType::BlkV, Tensor::new(&[s_tot, dim], dtype, device)?);
+
+        let blk_toout = Tensor::new(&[s_tot, dim], dtype, device)?;
+        m.insert(DiffBufferType::BlkToOut, blk_toout.clone());
+        m.insert(DiffBufferType::BlkNorm1Ffn, blk_toout);
+
+        let blk_norm2attn = Tensor::new(&[s_tot, dim], dtype, device)?;
+        m.insert(DiffBufferType::BlkNorm2Attn, blk_norm2attn.clone());
+        m.insert(DiffBufferType::BlkFfnOut, blk_norm2attn);
+
+        m.insert(DiffBufferType::BlkW1Out, Tensor::new(&[s_tot, hidden_dim], dtype, device)?);
+        m.insert(DiffBufferType::BlkW3Out, Tensor::new(&[s_tot, hidden_dim], dtype, device)?);
+        m.insert(DiffBufferType::BlkNorm2Ffn, Tensor::new(&[s_tot, dim], dtype, device)?);
 
         // ─────────────── CUDA Graph-friendly scratch slots ───────────────
         // Per-step timestep / dt schedules, pre-uploaded once per
@@ -683,7 +645,6 @@ mod tests {
             st.buffers[&DiffBufferType::BlkAttnFlat].shape(),
             &[s_tot, spec.dim]
         );
-        assert_eq!(st.buffers[&DiffBufferType::TValueDev].shape(), &[1]);
         assert_eq!(
             st.buffers[&DiffBufferType::FinalOut].shape(),
             &[s_img, spec.final_out_dim]
@@ -736,7 +697,6 @@ mod tests {
         // Pipeline-scope (Latents/NoisePred/Latent5D) and VAE-scope
         // variants are deliberately excluded — they live in other states.
         let dit_scope = [
-            DiffBufferType::TValueDev,
             DiffBufferType::TValueDevVec,
             DiffBufferType::DtValueDevVec,
             DiffBufferType::PromptEmbedsPadded,
