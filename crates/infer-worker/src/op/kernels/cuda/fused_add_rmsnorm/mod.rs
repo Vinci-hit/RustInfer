@@ -39,7 +39,7 @@ pub fn fused_add_rmsnorm(
 ) -> Result<()> {
     let dim = weight.shape()[0];
     let rows = input.num_elements() / dim;
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     let dtype = input.dtype();
 
     match dtype {

@@ -145,8 +145,8 @@ impl DeviceAllocator for &CachingCudaAllocator {
             let chunk = &mut pool_for_device[idx];
             chunk.is_busy = true;
             // 如果之前是空闲的，现在要从 GC 计数器中减去
-            if !size > BIG_BUFFER_THRESHOLD && let Some(mut idle_bytes) = self.state.idle_bytes.get_mut(&device_id) {
-                *idle_bytes -= chunk.size_bytes;
+            if size <= BIG_BUFFER_THRESHOLD && let Some(mut idle_bytes) = self.state.idle_bytes.get_mut(&device_id) {
+                *idle_bytes = idle_bytes.saturating_sub(chunk.size_bytes);
             }
             Ok(chunk.ptr.0)
         }else{

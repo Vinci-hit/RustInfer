@@ -10,7 +10,7 @@ pub enum Error {
     #[error("Allocation failed: {0}")]
     AllocationFailed(String),
 
-    #[error("Device mismatch: expected {expected:?}, got {actual:?}")]
+    #[error("Device mismatch: expected {expected:?}, got {actual:?} in {in_method}")]
     DeviceMismatch {
         expected: DeviceType,
         actual: DeviceType,

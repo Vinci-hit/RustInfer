@@ -3,9 +3,11 @@ use std::path::Path;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
+#[cfg(feature = "cuda")]
+use crate::cuda::CudaConfig;
 use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
-use crate::op::{Op, OpContext};
+
 use crate::model::common::config::RuntimeModelConfig;
 use crate::model::ModelLoader;
 use crate::tensor::Tensor;
@@ -122,7 +124,7 @@ impl Llama3 {
 
         let layer_num = config.layer_num;
         let mha_layers: Result<Vec<FlashAttnGQA>> = (0..layer_num)
-            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size))
+            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size, true))
             .collect();
         let mha_layers = mha_layers?;
         let rope_layers: Result<Vec<RoPEOp>> = (0..layer_num)
@@ -409,19 +411,19 @@ impl Llama3 {
 
         let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.embedding_layer.forward(&mut OpContext::new(&[input_tokens_view], &mut [&mut x], cuda_config_ref))?;
+        self.layers.embedding_layer.forward(input_tokens_view, &mut x, cuda_config_ref)?;
 
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
             if i == 0 || !self.device_type.is_cuda() {
-                self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+                self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
             }
 
             let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
             let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
+            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
 
             let mut q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
             let mut k = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
@@ -430,19 +432,19 @@ impl Llama3 {
 
             let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&state.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
+            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
 
-            crate::op::kernels::scatter_kv(k_cache_full, &k, v_cache_full, &v, &state.input_pos, cuda_config_ref)?;
+            crate::op::scatter::scatter_kv(k_cache_full, &k, v_cache_full, &v, &state.input_pos, cuda_config_ref)?;
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out;
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, &state.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &state.input_pos, &mut attn_out, cuda_config_ref)?;
             let mut wo_out = q;
-            self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
+            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
 
             let mut ffn_norm_out = attn_out;
             if self.device_type.is_cuda() {
-                crate::op::kernels::fused_add_rmsnorm(
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut ffn_norm_out,
                     &mut x,
                     &wo_out,
@@ -451,26 +453,26 @@ impl Llama3 {
                     cuda_config_ref,
                 )?;
             } else {
-                self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
-                self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
+                self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
+                self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
             }
 
             let inter = self.config.intermediate_size;
             let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[1, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
+            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
             let mut w1_out = gate_up.slice(&[0, 0], &[1, inter])?;
             let w3_out = gate_up.slice(&[0, inter], &[1, inter])?;
-            self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
+            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
 
             let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
+            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
 
             if self.device_type.is_cuda() {
                 if i + 1 < self.config.layer_num {
                     let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                     let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::fused_add_rmsnorm(
+                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                         &mut next_out,
                         &mut x,
                         &w2_out,
@@ -481,7 +483,7 @@ impl Llama3 {
                 } else {
                     let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                     let mut final_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::kernels::fused_add_rmsnorm(
+                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                         &mut final_out,
                         &mut x,
                         &w2_out,
@@ -491,18 +493,18 @@ impl Llama3 {
                     )?;
                 }
             } else {
-                self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+                self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
             }
         }
 
         let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         if !self.device_type.is_cuda() {
-            self.layers.rmsnorm_final_layer.forward(&mut OpContext::new(&[&x], &mut [&mut final_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_out, cuda_config_ref)?;
         }
 
         let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
         let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
@@ -528,12 +530,12 @@ impl Llama3 {
 
         let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-        self.layers.embedding_layer.forward(&mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref))?;
+        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
 
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
 
             let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
@@ -542,27 +544,27 @@ impl Llama3 {
             let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
             let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
 
             let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&state.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
+            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out;
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, pos_cpu, &mut attn_out, cuda_config_ref)?;
             let mut wo_out = q;
-            self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
+            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
 
-            self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
+            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
 
             // FFN
             let mut ffn_norm_out = attn_out;
-            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
             let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
             let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
             let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
@@ -571,16 +573,16 @@ impl Llama3 {
             let inter = self.config.intermediate_size;
             let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
-            self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
+            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
+            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
 
             let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
+            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
 
-            self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
         }
 
         // Extract last token
@@ -591,10 +593,10 @@ impl Llama3 {
 
         let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.rmsnorm_final_layer.forward(&mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref))?;
+        self.layers.rmsnorm_final_layer.forward(&final_norm_input, &mut final_norm_out, cuda_config_ref)?;
 
         let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
 
         let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
@@ -619,6 +621,37 @@ mod tests {
         let start = Instant::now();
         let (text, n_tok, prefill_ms, decode_ms, decode_iter) = model.generate(state, prompt, max_tokens, verbose)?;
         Ok((text, start.elapsed().as_millis() as u64, n_tok, prefill_ms, decode_ms, decode_iter))
+    }
+
+    /// Pre-run a tiny `generate()` on the same state the benchmark will
+    /// use, so the real call sees a hot CUDA context:
+    ///
+    /// - kernel module load / PTX→SASS JIT for every prefill + decode
+    ///   kernel (embedding, rmsnorm, qkv, rope, scatter_kv, flash-attn,
+    ///   wo, silu, sampler, …).
+    /// - cuBLASLt algorithm heuristics for every `(M,N,K)` shape hit.
+    /// - the decode-path CUDA Graph: captured here, replayed for free
+    ///   from the real benchmark's first decode step onward.
+    ///
+    /// After warmup returns, the real `generate(prompt, N)` call
+    /// unconditionally overwrites `kv_cache[..prompt_len]` from pos=0
+    /// (see [`Llama3::generate`]), so warmup has no correctness impact.
+    ///
+    /// ## Why the filler prompt
+    ///
+    /// The flash-attention prefill kernel processes the sequence in
+    /// fixed-size tiles (~64 tokens). Feeding it a prompt of 1–2 tokens
+    /// causes out-of-range reads inside the tile, putting the CUDA
+    /// context into a sticky-error state that surfaces later as
+    /// `CUBLAS_STATUS_EXECUTION_FAILED (13)` on the next cuBLASLt call.
+    /// We pick a ~10-token filler string to stay above that floor while
+    /// keeping the warmup cheap.
+    fn warmup(model: &Llama3, state: &mut InferenceState) -> Result<()> {
+        // ~10 tokens after BPE — safely above the flash-attn prefill
+        // tile floor. A few decode steps also capture the CUDA Graph.
+        let prompt = "The quick brown fox jumps over the lazy dog.";
+        let _ = model.generate(state, prompt, 4, false)?;
+        Ok(())
     }
 
     #[test]
@@ -652,6 +685,7 @@ mod tests {
 
         let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
+        warmup(&model, &mut state)?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n你是算法糕手，写一段C++代码，实现一个简单的中序遍历函数。<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
         let (_, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
@@ -682,9 +716,10 @@ mod tests {
 
         let model = Llama3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
+        warmup(&model, &mut state)?;
 
         let prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 14 Dec 2025\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello, who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
-        let (text, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
+        let (_text, _, n_tok, prefill_ms, decode_ms, decode_iter) = generate_and_measure(&model, &mut state, prompt, 2000, false)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
         let total_ms = (prefill_ms + decode_ms) as f64;

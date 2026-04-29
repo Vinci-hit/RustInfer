@@ -1,6 +1,9 @@
 use crate::base::error::{Result, Error};
 use crate::base::DeviceType;
-use crate::op::{kernels, Op, OpContext};
+use crate::tensor::Tensor;
+use crate::OpConfig;
+
+use super::kernels;
 
 /// Flash Attention (高性能注意力机制) 的 GQA (Grouped-Query Attention) 算子。
 pub struct FlashAttnGQA {
@@ -10,6 +13,8 @@ pub struct FlashAttnGQA {
     pub num_kv_heads: usize,
     /// 单个 Attention Head 的维度
     pub head_dim: usize,
+    /// 是否使用因果掩码 (LLM=true, DiT=false)
+    pub causal: bool,
 }
 
 impl FlashAttnGQA {
@@ -24,6 +29,7 @@ impl FlashAttnGQA {
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        causal: bool,
     ) -> Result<Self> {
         if !num_q_heads.is_multiple_of(num_kv_heads) {
             return Err(Error::InvalidArgument(format!(
@@ -35,121 +41,64 @@ impl FlashAttnGQA {
             num_q_heads,
             num_kv_heads,
             head_dim,
+            causal,
         })
     }
 }
 
 
-impl Op for FlashAttnGQA {
-    fn name(&self) -> &'static str {
-        "FlashAttnGQA"
-    }
-
-    /// 执行 Flash Attention GQA 的前向计算： 要求输入维度是2D：[seq_len,hidden_dim]
-    /// 
-    /// **新的输入约定 (4个输入):**
-    /// 0. Q_tensor: [Q_SeqLen, Q_HiddenDim]
-    /// 1. K_cache: [Max_SeqLen, KV_HiddenDim] (K Cache 的全部内存)
-    /// 2. V_cache: [Max_SeqLen, KV_HiddenDim] (V Cache 的全部内存)
-    /// 3. KV_Len_tensor: [1] I32 存着当前 K/V Cache 的有效长度 (S_KV_len)
-    fn forward(&self, ctx: &mut OpContext) -> Result<()> {
-        // ==================== 1. 检查逻辑 ====================
-
-        // --- a. 检查输入输出数量 (4 输入，1 输出) ---
-        if ctx.inputs.len() != 4 || ctx.outputs.len() != 1 {
-            return Err(Error::InvalidArgument(
-                "FlashAttnGQA expects 4 inputs (Q, K_Cache, V_Cache, KV_Len) and 1 output (O)".into()
-            ).into());
-        }
-
-        let input_q = &ctx.inputs[0];
-        let input_k_cache = &ctx.inputs[1];
-        let input_v_cache = &ctx.inputs[2];
-        let input_kv_len = &ctx.inputs[3]; // KV Cache 的当前有效长度 S_KV_len
-        let output_o = &mut ctx.outputs[0];
-
-        // --- b. 检查设备和数据类型 ---
-        // ... (设备和数据类型检查保持不变，但要检查 input_kv_len 是 I32) ...
+impl FlashAttnGQA {
+    /// 执行 Flash Attention GQA 前向计算
+    pub fn forward(
+        &self,
+        input_q: &Tensor,
+        input_k_cache: &Tensor,
+        input_v_cache: &Tensor,
+        input_kv_len: &Tensor,
+        output_o: &mut Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
         let device = input_q.device();
+        let q_seq_len = input_q.shape()[0];
 
-        // --- c. 检查形状 ---
-        let q_shape = input_q.shape();
-        let k_shape = input_k_cache.shape();
-        let v_shape = input_v_cache.shape();
-        let o_shape = output_o.shape();
-
-        // 1. 检查维度数量是 2D [SeqLen, Dim]
-        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2 || o_shape.len() != 2 {
-            return Err(Error::InvalidArgument("FlashAttnGQA inputs/output must be 2D [SeqLen, Dim].".into()).into());
-        }
-
-        // 2. 检查隐藏层维度
-        let expected_q_dim = self.num_q_heads * self.head_dim;
-        let expected_kv_dim = self.num_kv_heads * self.head_dim;
-
-        if q_shape[1] != expected_q_dim || o_shape[1] != expected_q_dim {
-            return Err(Error::InvalidArgument(format!(
-                "Q/O last dimension mismatch. Expected {} (NQ*DH), got Q {} and O {}.",
-                expected_q_dim, q_shape[1], o_shape[1]
-            )).into());
-        }
-        if k_shape[1] != expected_kv_dim || v_shape[1] != expected_kv_dim {
-            return Err(Error::InvalidArgument(format!(
-                "K/V Cache last dimension mismatch. Expected {} (NKV*DH), got K {} and V {}.",
-                expected_kv_dim, k_shape[1], v_shape[1]
-            )).into());
-        }
-
-        // 3. 提取 SeqLen 和判断模式
-        let q_seq_len = q_shape[0];
-        let _max_kv_seq_len = k_shape[0]; // K/V 缓存的最大容量
-
-        // --- 从 KV_Len 张量中获取当前有效长度 ---
-        
-        
-        // 4. 检查序列长度的一致性和有效性
-        if output_o.shape()[0] != q_seq_len {
-            return Err(Error::InvalidArgument("O SeqLen must match Q SeqLen.".into()).into());
-        }
-
-        // ==================== 2. 分派到内核 ====================
         match device {
             DeviceType::Cpu => {
-                // 调用 CPU 黄金标准 (需要支持 Prefill 和 Decode 逻辑)
+                let _ = cuda_config;
                 let current_kv_len = input_kv_len.as_i32()?.as_slice()?[0] as usize;
                 kernels::cpu::flash_attn_gqa(
-                    input_q, 
-                    input_k_cache, // K/V 缓存的全部内存
-                    input_v_cache, 
+                    input_q,
+                    input_k_cache,
+                    input_v_cache,
                     output_o,
-                    q_seq_len,      // Q 的长度
-                    current_kv_len, // KV Cache 的当前有效长度 (S_KV)
+                    q_seq_len,
+                    current_kv_len,
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,
+                    self.causal,
                 )?;
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                let current_kv_len_ptr = input_kv_len.as_i32()?.buffer().as_ptr() as *const i32; // 只有decoding阶段是指向GPU
-                // 假设有一个统一的 CUDA KV Cache Kernel
+                let current_kv_len_ptr = input_kv_len.as_i32()?.buffer().as_ptr() as *const i32;
                 unsafe {
                     kernels::cuda::flash_attn_gqa(
                         input_q,
-                        input_k_cache, // K/V 缓存的全部内存
+                        input_k_cache,
                         input_v_cache,
                         output_o,
-                        q_seq_len,      // Q 的长度
-                        current_kv_len_ptr, // KV Cache 的当前有效长度 (S_KV)
+                        q_seq_len,
+                        current_kv_len_ptr,
                         self.num_q_heads,
                         self.num_kv_heads,
                         self.head_dim,
-                        ctx.cuda_config,
+                        self.causal,
+                        cuda_config,
                     )?;
                 }
             }
             #[cfg(not(feature = "cuda"))]
-            _ => Err(Error::Unimplemented("Device type not supported.".into())),
+            _ => return Err(Error::Unimplemented("Device type not supported.".into())),
         }
 
         Ok(())
@@ -169,7 +118,7 @@ mod tests {
     use super::*;
     use crate::tensor::Tensor;
     use crate::base::{DataType, DeviceType};
-    use crate::op::{Op, OpContext};
+    
     use crate::base::error::Result;
     #[cfg(feature = "cuda")]
     use crate::cuda::CudaConfig;
@@ -263,7 +212,7 @@ mod tests {
         let kv_dim = num_kv_heads * head_dim;
 
         // --- 1. 准备 Op 和张量 ---
-        let op = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
+        let op = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
         let (q_in, k_cache, v_cache, mut o_out) = setup_tensors(q_seq_len,max_seq_len, q_dim, kv_dim, device)?;
         
         // --- 2. 准备 KV_Len 张量 (CPU) ---
@@ -284,12 +233,8 @@ mod tests {
         v_cache_gold.as_f32_mut()?.as_slice_mut()?[0..q_seq_len * kv_dim].copy_from_slice(&new_v_data);
 
         // --- 4. 运行 Op ---
-        let mut ctx = OpContext {
-            inputs: &[&q_in, &k_cache_gold, &v_cache_gold, &input_kv_len],
-            outputs: &mut [&mut o_out],
-            cuda_config: None,
-        };
-        op.forward(&mut ctx)?;
+        
+        op.forward(&q_in, &k_cache_gold, &v_cache_gold, &input_kv_len, &mut o_out, None)?;
         let expected_o = [0.4141, 0.9579, 0.5411, 0.6051, 0.2205, 0.6257, 0.5716, 0.1848, 0.0596,
         0.6044, 0.7637, 0.5234, 0.2268, 0.6665, 0.0801, 0.4418, 0.4141, 0.9579,
         0.5411, 0.6051, 0.2205, 0.6257, 0.5716, 0.1848, 0.0596, 0.6044, 0.7637,
@@ -320,7 +265,7 @@ mod tests {
         0.3140, 0.4983, 0.6451, 0.8040, 0.4283, 0.4795, 0.6888, 0.2389, 0.3583,
         0.3531, 0.4856, 0.4383, 0.6099];
         // --- 5. 验证 (这里需要一个单独的黄金标准函数来验证输出 O) ---
-        assert_close(ctx.outputs[0].as_f32()?.as_slice()?, &expected_o, 1e-3);
+        assert_close(o_out.as_f32()?.as_slice()?, &expected_o, 1e-3);
 
         Ok(())
     }
@@ -392,14 +337,9 @@ mod tests {
         v_cache_gold_cpu.as_f32_mut()?.as_slice_mut()?[0..q_seq_len * kv_dim].copy_from_slice(&new_v_slice);
 
         // 创建 CPU 端算子并执行
-        let flash_attn_cpu = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
-        let mut ctx_cpu = OpContext {
-            inputs: &[&q_in_cpu.clone(), &k_cache_gold_cpu, &v_cache_gold_cpu, &input_kv_len_cpu.clone()],
-            outputs: &mut [&mut output_cpu],
-            cuda_config: None,
-        };
-        flash_attn_cpu.forward(&mut ctx_cpu)?;
-        let cpu_result_slice = ctx_cpu.outputs[0].as_f32()?.as_slice()?;
+        let flash_attn_cpu = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+        flash_attn_cpu.forward(&q_in_cpu.clone(), &k_cache_gold_cpu, &v_cache_gold_cpu, &input_kv_len_cpu.clone(), &mut output_cpu, None)?;
+        let cpu_result_slice = output_cpu.as_f32()?.as_slice()?;
 
         // --------------------------
         // 3. GPU 执行相同计算（显式创建 GPU 张量）
@@ -415,14 +355,9 @@ mod tests {
         let mut output_gpu = Tensor::new(&[q_seq_len, q_dim], dtype, gpu_device)?;
 
         // 创建 GPU 端算子并执行
-        let flash_attn_gpu = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
-        let cuda_config = CudaConfig::new()?; // 复用参考代码的 CUDA 配置
-        let mut ctx_gpu = OpContext {
-            inputs: &[&q_in_gpu, &k_cache_gpu, &v_cache_gpu, &input_kv_len_gpu],
-            outputs: &mut [&mut output_gpu],
-            cuda_config: Some(&cuda_config),
-        };
-        flash_attn_gpu.forward(&mut ctx_gpu)?;
+        let flash_attn_gpu = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+        let cuda_config = CudaConfig::new()?;
+        flash_attn_gpu.forward(&q_in_gpu, &k_cache_gpu, &v_cache_gpu, &input_kv_len_gpu, &mut output_gpu, Some(&cuda_config))?;
 
         // GPU 同步，确保计算完成
         unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
@@ -431,7 +366,7 @@ mod tests {
         // 4. GPU 结果拷回 CPU 并对比
         // --------------------------
         println!("GPU 结果拷回 CPU，验证正确性...");
-        let gpu_result_tensor = ctx_gpu.outputs[0].to_cpu()?;
+        let gpu_result_tensor = output_gpu.to_cpu()?;
         let gpu_result_slice = gpu_result_tensor.as_f32()?.as_slice()?;
 
         // 打印前 10 个元素便于调试
@@ -494,12 +429,8 @@ mod tests {
             let mut output = Tensor::new(&[q_seq_len, q_dim], dtype, device)?;
 
             // Execute FlashAttention
-            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
-            flash_attn.forward(&mut OpContext::new(
-                &[&q_in, &k_cache, &v_cache, &input_kv_len],
-                &mut [&mut output],
-                None,
-            ))?;
+            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+            flash_attn.forward(&q_in, &k_cache, &v_cache, &input_kv_len, &mut output, None)?;
 
             // Verify output is finite
             let result = output.as_bf16()?.as_slice()?;
@@ -560,13 +491,9 @@ mod tests {
             let mut output = Tensor::new(&[q_seq_len, q_dim], dtype, device)?;
 
             // Execute FlashAttention with CUDA
-            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
+            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
             let cuda_config = CudaConfig::new()?;
-            flash_attn.forward(&mut OpContext::new(
-                &[&q_in, &k_cache, &v_cache, &input_kv_len],
-                &mut [&mut output],
-                Some(&cuda_config),
-            ))?;
+            flash_attn.forward(&q_in, &k_cache, &v_cache, &input_kv_len, &mut output, Some(&cuda_config))?;
 
             // Copy result back and verify
             let result_tensor = output.to_cpu()?;
@@ -627,12 +554,8 @@ mod tests {
             let mut output = Tensor::new(&[q_seq_len, q_dim], dtype, device)?;
 
             // Execute FlashAttention
-            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
-            flash_attn.forward(&mut OpContext::new(
-                &[&q_in, &k_cache, &v_cache, &input_kv_len],
-                &mut [&mut output],
-                None,
-            ))?;
+            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+            flash_attn.forward(&q_in, &k_cache, &v_cache, &input_kv_len, &mut output, None)?;
 
             // Verify result
             let result = output.as_bf16()?.as_slice()?;
@@ -677,12 +600,8 @@ mod tests {
 
             let mut output = Tensor::new(&[q_seq_len, q_dim], dtype, device)?;
 
-            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim)?;
-            flash_attn.forward(&mut OpContext::new(
-                &[&q_in, &k_cache, &v_cache, &input_kv_len],
-                &mut [&mut output],
-                None,
-            ))?;
+            let flash_attn = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+            flash_attn.forward(&q_in, &k_cache, &v_cache, &input_kv_len, &mut output, None)?;
 
             // Verify result
             let result = output.as_bf16()?.as_slice()?;
@@ -696,6 +615,115 @@ mod tests {
             assert_eq!(output.shape(), &[q_seq_len, q_dim]);
         }
 
+        Ok(())
+    }
+
+    /// 非 causal 模式测试：所有 token 互相可见（DiT 场景）
+    #[test]
+    fn test_flash_attn_non_causal_cpu() -> Result<()> {
+        let device = DeviceType::Cpu;
+        let num_q_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 16;
+        let max_seq_len = 64;
+        let q_seq_len = 8;
+        let current_kv_len: i32 = 0;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let op_non_causal = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, false)?;
+        let op_causal = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+
+        let mut q_in = Tensor::new(&[q_seq_len, q_dim], DataType::F32, device)?;
+        let mut k_cache = Tensor::new(&[max_seq_len, kv_dim], DataType::F32, device)?;
+        let mut v_cache = Tensor::new(&[max_seq_len, kv_dim], DataType::F32, device)?;
+
+        let q_data: Vec<f32> = (0..q_seq_len * q_dim).map(|i| ((i * 7 + 3) % 100) as f32 * 0.01).collect();
+        let k_data: Vec<f32> = (0..max_seq_len * kv_dim).map(|i| ((i * 13 + 5) % 100) as f32 * 0.01).collect();
+        let v_data: Vec<f32> = (0..max_seq_len * kv_dim).map(|i| ((i * 11 + 7) % 100) as f32 * 0.01).collect();
+        q_in.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&q_data);
+        k_cache.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&k_data);
+        v_cache.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&v_data);
+
+        let mut input_kv_len = Tensor::new(&[1], DataType::I32, device)?;
+        input_kv_len.as_i32_mut()?.as_slice_mut()?[0] = current_kv_len;
+
+        let mut o_nc = Tensor::new(&[q_seq_len, q_dim], DataType::F32, device)?;
+        op_non_causal.forward(&q_in, &k_cache, &v_cache, &input_kv_len, &mut o_nc, None)?;
+
+        let mut o_c = Tensor::new(&[q_seq_len, q_dim], DataType::F32, device)?;
+        op_causal.forward(&q_in, &k_cache, &v_cache, &input_kv_len, &mut o_c, None)?;
+
+        let nc_data = o_nc.as_f32()?.as_slice()?;
+        let c_data = o_c.as_f32()?.as_slice()?;
+
+        // Non-causal 和 causal 对于 seq_len > 1 应产生不同结果
+        let mut has_diff = false;
+        for i in 0..q_seq_len * q_dim {
+            if (nc_data[i] - c_data[i]).abs() > 1e-5 {
+                has_diff = true;
+                break;
+            }
+        }
+        assert!(has_diff, "Non-causal and causal should produce different results for seq_len > 1");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_flash_attn_non_causal_cuda_vs_cpu() -> Result<()> {
+        use crate::cuda::CudaConfig;
+
+        let num_q_heads = 8;
+        let num_kv_heads = 4;
+        let head_dim = 64;
+        let max_seq_len = 128;
+        let q_seq_len = 32;
+        let current_kv_len: i32 = 0;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let op = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, false)?;
+
+        let mut q_cpu = Tensor::new(&[q_seq_len, q_dim], DataType::BF16, DeviceType::Cpu)?;
+        let mut k_cpu = Tensor::new(&[max_seq_len, kv_dim], DataType::BF16, DeviceType::Cpu)?;
+        let mut v_cpu = Tensor::new(&[max_seq_len, kv_dim], DataType::BF16, DeviceType::Cpu)?;
+
+        let q_data: Vec<half::bf16> = (0..q_seq_len * q_dim).map(|i| half::bf16::from_f32(((i * 7 + 3) % 100) as f32 * 0.01)).collect();
+        let k_data: Vec<half::bf16> = (0..max_seq_len * kv_dim).map(|i| half::bf16::from_f32(((i * 13 + 5) % 100) as f32 * 0.01)).collect();
+        let v_data: Vec<half::bf16> = (0..max_seq_len * kv_dim).map(|i| half::bf16::from_f32(((i * 11 + 7) % 100) as f32 * 0.01)).collect();
+        q_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&q_data);
+        k_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&k_data);
+        v_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&v_data);
+
+        let mut kv_len_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        kv_len_cpu.as_i32_mut()?.as_slice_mut()?[0] = current_kv_len;
+
+        let mut o_cpu = Tensor::new(&[q_seq_len, q_dim], DataType::BF16, DeviceType::Cpu)?;
+        op.forward(&q_cpu, &k_cpu, &v_cpu, &kv_len_cpu, &mut o_cpu, None)?;
+
+        let q_gpu = q_cpu.to_cuda(0)?;
+        let k_gpu = k_cpu.to_cuda(0)?;
+        let v_gpu = v_cpu.to_cuda(0)?;
+        let mut o_gpu = Tensor::new(&[q_seq_len, q_dim], DataType::BF16, DeviceType::Cuda(0))?;
+
+        let cuda_config = CudaConfig::new()?;
+        op.forward(&q_gpu, &k_gpu, &v_gpu, &kv_len_cpu, &mut o_gpu,
+            Some(&cuda_config))?;
+
+        let o_gpu_back = o_gpu.to_cpu()?;
+        let cpu_data = o_cpu.as_bf16()?.as_slice()?;
+        let gpu_data = o_gpu_back.as_bf16()?.as_slice()?;
+
+        let mut max_diff: f32 = 0.0;
+        for i in 0..cpu_data.len() {
+            let diff = (cpu_data[i].to_f32() - gpu_data[i].to_f32()).abs();
+            max_diff = max_diff.max(diff);
+        }
+        println!("Non-causal BF16 CPU vs CUDA max diff: {}", max_diff);
+        assert!(max_diff < 0.1, "Non-causal BF16 CPU vs CUDA max diff {} too large", max_diff);
         Ok(())
     }
 }

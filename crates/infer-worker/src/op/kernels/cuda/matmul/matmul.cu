@@ -126,81 +126,250 @@ extern "C" void sgemm_naive_f32_cu(
         a, b, c, M, N, K
     );
 }
+// ============================================================================
+// gemm_cublasLt_AxBT_RowMajor_bf16
+//
+// Row-major `C = A @ B^T` where A is [M, K], B is [N, K], C is [M, N].
+//
+// Per (M, N, K) we cache:
+//   - operationDesc / Adesc / Bdesc / Cdesc       (layout, stateless)
+//   - selected cublasLtMatmulAlgo_t               (stateless handle)
+//
+// Selection strategy (first time a shape is seen):
+//   1. Ask the heuristic for up to 32 candidates.
+//   2. Benchmark the candidates whose workspace fits our budget, on a
+//      private cuBLASLt handle + stream so nothing can pollute the
+//      caller's stream (including an active CUDA-Graph capture).
+//   3. Keep the fastest.
+//
+// NB: we never destroy the cached descriptors — the process keeps them
+// for its whole lifetime (~10 shapes × ~100 bytes each).
+// ============================================================================
+
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+struct ZimageBf16GemmKey {
+    int M, N, K;
+    bool operator==(const ZimageBf16GemmKey& o) const noexcept {
+        return M == o.M && N == o.N && K == o.K;
+    }
+};
+struct ZimageBf16GemmKeyHash {
+    size_t operator()(const ZimageBf16GemmKey& k) const noexcept {
+        return (size_t(k.M) * 1315423911u) ^ (size_t(k.N) * 2654435761u) ^ (size_t(k.K) * 40503u);
+    }
+};
+struct ZimageBf16GemmEntry {
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t A = nullptr;
+    cublasLtMatrixLayout_t B = nullptr;
+    cublasLtMatrixLayout_t C = nullptr;
+    cublasLtMatmulAlgo_t algo;
+    size_t algo_ws = 0;
+    bool valid = false;
+};
+
+static std::mutex g_zimage_bf16_gemm_cache_mu;
+static std::unordered_map<ZimageBf16GemmKey, ZimageBf16GemmEntry, ZimageBf16GemmKeyHash>
+    g_zimage_bf16_gemm_cache;
+
+static bool zimage_bf16_gemm_bench_disabled()
+{
+    static int cached = -1;
+    if (cached == -1) {
+        const char* s = getenv("RUSTINFER_DISABLE_CUBLASLT_BF16_BENCH");
+        cached = (s != nullptr && s[0] != '\0' && s[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
+    int M, int N, int K, size_t workspaceSize,
+    // scratch buffers from the caller — we reuse these for the benchmark
+    // to avoid a costly cudaMalloc of up to ~300 MiB on large FFN shapes
+    // (which can race with the text encoder's allocations).
+    const __nv_bfloat16* bench_A,
+    const __nv_bfloat16* bench_B,
+    __nv_bfloat16*       bench_C,
+    void*                bench_ws)
+{
+    // Interpretation trick: we want row-major C[M,N] = A[M,K] @ B[N,K]^T.
+    // cuBLASLt is column-major, so we ask for col-major [N,M] = [N,K]*[K,M],
+    // which corresponds to transA=T, transB=N with swapped inputs.
+    const int m_g = N, n_g = M, k_g = K;
+
+    cublasOperation_t opA = CUBLAS_OP_T;
+    cublasOperation_t opB = CUBLAS_OP_N;
+
+    ZimageBf16GemmEntry e;
+    CHECK_CUBLAS(cublasLtMatmulDescCreate(&e.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(e.op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.A, CUDA_R_16BF, k_g, m_g, k_g));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.B, CUDA_R_16BF, k_g, n_g, k_g));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.C, CUDA_R_16BF, m_g, n_g, m_g));
+
+    cublasLtMatmulPreference_t pref = nullptr;
+    CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
+    CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspaceSize, sizeof(workspaceSize)));
+
+    constexpr int kRequested = 32;
+    std::vector<cublasLtMatmulHeuristicResult_t> hres(kRequested);
+    int returned = 0;
+
+    // Use a private temporary cuBLASLt handle to run the heuristic. This
+    // avoids touching the caller's handle (which may be mid-graph-capture).
+    {
+        cublasLtHandle_t tmp_h;
+        cublasLtCreate(&tmp_h);
+        cublasLtMatmulAlgoGetHeuristic(
+            tmp_h, e.op, e.A, e.B, e.C, e.C,
+            pref, kRequested, hres.data(), &returned);
+        cublasLtDestroy(tmp_h);
+    }
+
+    cublasLtMatmulPreferenceDestroy(pref);
+
+    if (returned == 0) {
+        printf("cuBLASLt BF16: no algo for M=%d N=%d K=%d\n", M, N, K);
+        return e;
+    }
+
+    int best = -1;
+    float best_ms = 1e30f;
+
+    if (!zimage_bf16_gemm_bench_disabled()) {
+        // Real benchmark on a private handle + stream. We reuse the
+        // caller's A/B/C/workspace buffers rather than cudaMalloc'ing our
+        // own ~300 MiB of scratch (which would race with the text encoder
+        // allocations that happen around the first DiT layer).
+        cublasLtHandle_t bench_h = nullptr;
+        cudaStream_t bench_s = nullptr;
+        cublasLtCreate(&bench_h);
+        cudaStreamCreate(&bench_s);
+
+        // Make sure any pending work on the default stream / caller stream
+        // has landed before we start measuring.
+        cudaDeviceSynchronize();
+
+        float alpha = 1.0f, beta = 0.0f;
+        cudaEvent_t t0, t1;
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+
+        for (int i = 0; i < returned; ++i) {
+            if (hres[i].state != CUBLAS_STATUS_SUCCESS) continue;
+            if (hres[i].workspaceSize > workspaceSize) continue;
+
+            // Warm up; if the algo errors out, skip it.
+            cublasStatus_t s = cublasLtMatmul(
+                bench_h, e.op, &alpha,
+                bench_B, e.A, bench_A, e.B, &beta,
+                bench_C, e.C, bench_C, e.C,
+                &hres[i].algo, bench_ws, workspaceSize, bench_s);
+            if (s != CUBLAS_STATUS_SUCCESS) continue;
+            if (cudaStreamSynchronize(bench_s) != cudaSuccess) continue;
+
+            bool ok = true;
+            cudaEventRecord(t0, bench_s);
+            for (int r = 0; r < 5; ++r) {
+                if (cublasLtMatmul(
+                        bench_h, e.op, &alpha,
+                        bench_B, e.A, bench_A, e.B, &beta,
+                        bench_C, e.C, bench_C, e.C,
+                        &hres[i].algo, bench_ws, workspaceSize, bench_s) != CUBLAS_STATUS_SUCCESS) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+            cudaEventRecord(t1, bench_s);
+            if (cudaEventSynchronize(t1) != cudaSuccess) continue;
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, t0, t1);
+            // Sanity-check: drop pathological results that indicate the
+            // event clocks got corrupted by some algo state issue.
+            if (ms <= 0.0f || ms > 1000.0f) continue;
+            if (ms < best_ms) {
+                best_ms = ms;
+                best = i;
+            }
+        }
+
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+        cudaStreamDestroy(bench_s);
+        cublasLtDestroy(bench_h);
+    }
+
+    if (best < 0) {
+        // No bench — take the first viable heuristic result.
+        for (int i = 0; i < returned; ++i) {
+            if (hres[i].state == CUBLAS_STATUS_SUCCESS
+                && hres[i].workspaceSize <= workspaceSize) {
+                best = i;
+                break;
+            }
+        }
+        if (best < 0) best = 0;
+    }
+
+    e.algo = hres[best].algo;
+    e.algo_ws = hres[best].workspaceSize;
+    e.valid = true;
+
+    if (!zimage_bf16_gemm_bench_disabled() && getenv("RUSTINFER_CUBLASLT_BF16_BENCH_VERBOSE")) {
+        printf("[cublasLt-bf16-cache] M=%d N=%d K=%d picked idx=%d bench_us=%.1f ws=%zu (of %d algos)\n",
+               M, N, K, best, best < 0 ? -1.0f : best_ms * 200.0f,
+               e.algo_ws, returned);
+    }
+    return e;
+}
+
 void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtHandle_t ltHandle,
     int M, int N, int K,
     const __nv_bfloat16 *d_A, // shape: [M, K]
     const __nv_bfloat16 *d_B, // shape: [N, K]
-    __nv_bfloat16 *d_C,       // shape: [M, N] output
+    __nv_bfloat16 *d_C,       // shape: [M, N]
     void *workspace,
     size_t workspaceSize,
     cudaStream_t stream)
 {
-    int m_gemm = N;
-    int n_gemm = M;
-    int k_gemm = K;
+    ZimageBf16GemmKey key{M, N, K};
+    ZimageBf16GemmEntry entry;
+    {
+        std::lock_guard<std::mutex> lk(g_zimage_bf16_gemm_cache_mu);
+        auto it = g_zimage_bf16_gemm_cache.find(key);
+        if (it == g_zimage_bf16_gemm_cache.end()) {
+            entry = zimage_build_bf16_gemm_entry(
+                M, N, K, workspaceSize, d_A, d_B, d_C, workspace);
+            if (entry.valid) {
+                g_zimage_bf16_gemm_cache.emplace(key, entry);
+            }
+        } else {
+            entry = it->second;
+        }
+    }
 
-    cublasOperation_t transA = CUBLAS_OP_T;
-    cublasOperation_t transB = CUBLAS_OP_N;
-
-    cublasLtMatmulDesc_t operationDesc = NULL;
-    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA));
-    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB));
-
-    // Matrix Layouts
-    // Arg1 (B): 物理内存看作 ColMajor [K, N], leading dim = K
-    cublasLtMatrixLayout_t Adesc = NULL;
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16BF, k_gemm, m_gemm, k_gemm));
-
-    // Arg2 (A): 物理内存看作 ColMajor [K, M], leading dim = K
-    cublasLtMatrixLayout_t Bdesc = NULL;
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16BF, k_gemm, n_gemm, k_gemm));
-
-    // Result (C): 物理内存看作 ColMajor [N, M], leading dim = N
-    cublasLtMatrixLayout_t Cdesc = NULL;
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, m_gemm, n_gemm, m_gemm));
-
-    // Preference
-    cublasLtMatmulPreference_t preference = NULL;
-    CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&preference));
-    CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
-
-    // Heuristic
-    cublasLtMatmulHeuristicResult_t heuristicResult = {};
-    int returnedResults = 0;
-    // 参数顺序：Handle, Desc, Mat1(Left), Mat2(Right), C, D, Pref, Count, Result, ResultCount
-    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
-
-    if (returnedResults == 0) {
-        printf("cuBLASLt: No algorithm found!\n");
-        exit(1);
+    if (!entry.valid) {
+        printf("gemm_cublasLt_AxBT_RowMajor_bf16: no valid entry for M=%d N=%d K=%d\n", M, N, K);
+        return;
     }
 
     float alpha = 1.0f;
     float beta = 0.0f;
-
-    // Execute
-    // Inputs swapped: A_param = d_B, B_param = d_A
-    CHECK_CUBLAS(cublasLtMatmul(ltHandle,
-                                operationDesc,
-                                &alpha,
-                                d_B, Adesc,
-                                d_A, Bdesc,
-                                &beta,
-                                d_C, Cdesc,
-                                d_C, Cdesc,
-                                &heuristicResult.algo,
-                                workspace,
-                                workspaceSize,
-                                stream));
-
-    // Cleanup
-    cublasLtMatmulPreferenceDestroy(preference);
-    cublasLtMatrixLayoutDestroy(Adesc);
-    cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
-    cublasLtMatmulDescDestroy(operationDesc);
+    // Inputs swapped so that output is column-major [N,M] == row-major [M,N].
+    CHECK_CUBLAS(cublasLtMatmul(
+        ltHandle, entry.op, &alpha,
+        d_B, entry.A, d_A, entry.B, &beta,
+        d_C, entry.C, d_C, entry.C,
+        &entry.algo, workspace, workspaceSize, stream));
 }
 // ============================================================================
 // BF16 GEMV kernel v3 for decode phase (M=1)

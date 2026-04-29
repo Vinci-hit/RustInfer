@@ -111,7 +111,7 @@ pub fn hgemv_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let input_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
     let weight_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
     let output_ptr = output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     unsafe {
         hgemv_bf16_cu(
@@ -144,7 +144,7 @@ pub fn hgemm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     // 这里我们假设 weight 就是 B，而不是 W。
     let b_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
     let c_ptr = output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     let cublaslt_handle = cuda_config.map_or(std::ptr::null_mut(), |config| config.cublaslt_handle);
     let workspace = cuda_config.map_or(std::ptr::null_mut(), |config| config.workspace);
     let workspace_size = cuda_config.map_or(0, |config| config.workspace_size);
@@ -175,7 +175,7 @@ pub fn hgemv_fp16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let input_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
     let weight_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
     let output_ptr = output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     unsafe { hgemv_fp16_cu(input_ptr, weight_ptr, output_ptr, n, k, stream); }
     Ok(())
 }
@@ -190,7 +190,7 @@ pub fn hgemm_fp16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let a_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
     let b_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
     let c_ptr = output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     let cublaslt_handle = cuda_config.map_or(std::ptr::null_mut(), |config| config.cublaslt_handle);
     let workspace = cuda_config.map_or(std::ptr::null_mut(), |config| config.workspace);
     let workspace_size = cuda_config.map_or(0, |config| config.workspace_size);
@@ -226,7 +226,7 @@ pub fn sgemv(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config:O
     }
 
     // --- 3. 获取 CUDA stream ---
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |config| config.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     // --- 4. 调用 FFI 函数 ---
     unsafe {
@@ -250,7 +250,7 @@ pub fn sgemm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config: 
     if input.dtype() == DataType::BF16 {
         return hgemm_bf16(input, weight, output, cuda_config);
     }
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |c| c.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
     let a_shape = input.shape();
     let b_shape = weight.shape();
 
@@ -291,7 +291,7 @@ pub fn kpack_gemv(
     let n = wp_shape[0] as i32;
     let k = (wp_shape[1] * 8) as i32;
 
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |c| c.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     unsafe {
         kpack_gemv_cu(
@@ -330,7 +330,7 @@ pub fn kpack_gemm(
     let n = wp_shape[0] as i32;
     let k = (wp_shape[1] * 8) as i32;
 
-    let stream = cuda_config.map_or(std::ptr::null_mut(), |c| c.stream);
+    let stream = CudaConfig::resolve_stream(cuda_config);
 
     unsafe {
         kpack_gemm_cu(
@@ -348,4 +348,71 @@ pub fn kpack_gemm(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::base::DeviceType;
+
+    /// Microbench: compare three separate BF16 GEMMs vs one fused (3x N)
+    /// at Z-Image DiT qkv shapes (M=seq, K=3840, per-GEMM N=3840).
+    /// Not a correctness test — prints timings only. Run with:
+    ///   cargo test --features cuda -p infer-worker qkv_gemm_microbench \
+    ///       --release -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "microbench, wall-clock only"]
+    fn qkv_gemm_microbench() -> Result<()> {
+        let cfg = CudaConfig::new()?;
+        let m = 384;
+        let k = 3840;
+        let n_single = 3840;
+
+        let a = Tensor::randn(&[m, k], DataType::BF16, DeviceType::Cuda(0), Some(1))?;
+        // Three separate weights + outputs
+        let wq = Tensor::randn(&[n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(2))?;
+        let wk = Tensor::randn(&[n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(3))?;
+        let wv = Tensor::randn(&[n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(4))?;
+        let mut oq = Tensor::new(&[m, n_single], DataType::BF16, DeviceType::Cuda(0))?;
+        let mut ok = Tensor::new(&[m, n_single], DataType::BF16, DeviceType::Cuda(0))?;
+        let mut ov = Tensor::new(&[m, n_single], DataType::BF16, DeviceType::Cuda(0))?;
+
+        // Fused
+        let wqkv = Tensor::randn(&[3 * n_single, k], DataType::BF16, DeviceType::Cuda(0), Some(5))?;
+        let mut oqkv = Tensor::new(&[m, 3 * n_single], DataType::BF16, DeviceType::Cuda(0))?;
+
+        // Warmup
+        for _ in 0..5 {
+            hgemm_bf16(&a, &wq, &mut oq, Some(&cfg))?;
+            hgemm_bf16(&a, &wk, &mut ok, Some(&cfg))?;
+            hgemm_bf16(&a, &wv, &mut ov, Some(&cfg))?;
+            hgemm_bf16(&a, &wqkv, &mut oqkv, Some(&cfg))?;
+        }
+        cfg.sync_stream()?;
+
+        let niter = 50;
+        // 3 separate
+        let t0 = std::time::Instant::now();
+        for _ in 0..niter {
+            hgemm_bf16(&a, &wq, &mut oq, Some(&cfg))?;
+            hgemm_bf16(&a, &wk, &mut ok, Some(&cfg))?;
+            hgemm_bf16(&a, &wv, &mut ov, Some(&cfg))?;
+        }
+        cfg.sync_stream()?;
+        let us_separate = t0.elapsed().as_micros() as f64 / niter as f64;
+
+        // 1 fused
+        let t0 = std::time::Instant::now();
+        for _ in 0..niter {
+            hgemm_bf16(&a, &wqkv, &mut oqkv, Some(&cfg))?;
+        }
+        cfg.sync_stream()?;
+        let us_fused = t0.elapsed().as_micros() as f64 / niter as f64;
+
+        eprintln!(
+            "qkv_gemm_microbench M={} K={} N(single)={}: 3x separate = {:.1} us/call, fused = {:.1} us/call",
+            m, k, n_single, us_separate, us_fused,
+        );
+        Ok(())
+    }
 }

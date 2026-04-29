@@ -1,6 +1,7 @@
 mod rmsnorm;
 
 pub use rmsnorm::rmsnorm;
+pub use rmsnorm::rmsnorm_inplace;
 mod fused_add_rmsnorm;
 pub use fused_add_rmsnorm::fused_add_rmsnorm;
 
@@ -31,3 +32,27 @@ pub use scatter::*;
 
 mod split_cols;
 pub(crate) use split_cols::*;
+
+mod scalar;
+pub use scalar::*;
+
+mod broadcast_mul;
+pub use broadcast_mul::*;
+
+mod layernorm;
+pub use layernorm::*;
+
+mod conv2d;
+pub use conv2d::*;
+
+mod groupnorm;
+pub use groupnorm::*;
+
+mod upsample;
+pub use upsample::*;
+
+mod softmax;
+pub use softmax::*;
+
+mod dit_block_bf16_fusions;
+pub use dit_block_bf16_fusions::*;

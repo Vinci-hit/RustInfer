@@ -1,5 +1,6 @@
 mod rmsnorm;
 pub use rmsnorm::rmsnorm;
+pub use rmsnorm::rmsnorm_inplace;
 mod fused_add_rmsnorm;
 pub use fused_add_rmsnorm::fused_add_rmsnorm;
 mod add;
@@ -35,3 +36,27 @@ pub use scatter::scatter_kv;
 
 mod split_cols;
 pub use split_cols::split_cols_tensor;
+
+mod scalar;
+pub use scalar::scalar_mul;
+pub use scalar::scalar_add;
+pub use scalar::silu_inplace;
+pub use scalar::tanh_inplace;
+
+mod broadcast_mul;
+pub use broadcast_mul::broadcast_mul;
+
+mod layernorm;
+pub use layernorm::layernorm;
+
+mod conv2d;
+pub use conv2d::conv2d;
+
+mod groupnorm;
+pub use groupnorm::groupnorm;
+
+mod upsample;
+pub use upsample::upsample_nearest_2x;
+
+mod softmax;
+pub use softmax::softmax;

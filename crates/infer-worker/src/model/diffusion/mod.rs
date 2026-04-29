@@ -17,3 +17,6 @@
 pub mod scheduler;
 pub mod pipeline;
 pub mod z_image;
+pub mod diffusers_loader;
+pub mod vae;
+pub mod buffer;

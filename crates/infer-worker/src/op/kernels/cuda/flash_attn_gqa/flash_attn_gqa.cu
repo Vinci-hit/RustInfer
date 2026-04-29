@@ -47,7 +47,8 @@ __global__ void flash_attn_gqa_kernel(
     int kv_seq_len,
     int num_q_heads,
     int num_kv_heads,
-    int head_dim)
+    int head_dim,
+    int is_causal)
 {
     const unsigned Q_tile_id = blockIdx.x; // 处理某个Q的块。
     const unsigned q_head_idx = blockIdx.y; //第几个头，索引形式为q_ptr[seq_len][head_idx][head_dim]
@@ -200,8 +201,8 @@ __global__ void flash_attn_gqa_kernel(
 #pragma unroll
         for (int i = 0; i < valid_row_id; ++i) {
             const unsigned q_abs_pos = kv_seq_len + Q_tile_id * Br + i + tid / 32 * 8;
-            // Causal Mask
-            if (k_row_id > q_abs_pos) {
+            // Causal Mask (only when is_causal is set)
+            if (is_causal && k_row_id > q_abs_pos) {
                 R_S[i] = -INFINITY; // 掩盖 (设为极小负数)
             } else {
                 R_S[i] *= scale;
@@ -279,6 +280,7 @@ void flash_attn_gqa_cu(
     int32_t num_q_heads,
     int32_t num_kv_heads,
     int32_t head_dim,
+    int32_t is_causal,
     cudaStream_t stream)
 {
     // 1. 确定启动参数
@@ -306,7 +308,8 @@ void flash_attn_gqa_cu(
         kv_seq_len,
         num_q_heads,
         num_kv_heads,
-        head_dim
+        head_dim,
+        is_causal
     );
     // 4. 检查是否有核函数启动错误
     CUDA_CHECK(cudaGetLastError());

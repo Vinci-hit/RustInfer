@@ -1,15 +1,12 @@
 use std::os::raw::c_void;
+use std::sync::Mutex;
 
 use crate::base::error::Result;
 
 use super::ffi;
 
 /// cuBLASLt 默认 workspace 大小（字节）。
-///
-/// 32 MB 是 NVIDIA 建议的最低 workspace（GEMM 规模小时 heuristic 能选到足够的算法）。
-/// 对 600B 级别大模型、大 batch 场景，当前版本**暂未**提供扩容接口，
-/// 需要时可在 [`CudaConfig::new`] 里直接把这个常量调大重编译。
-const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Split-K flash-decoding 用的 N_SPLIT 常量。
 /// 必须与 `.cu` 内 `N_SPLIT` / `N_SPLIT_1B` 保持一致；改常量需三处同步。
@@ -21,7 +18,7 @@ pub const FLASH_DECODE_N_SPLIT: usize = 8;
 ///
 /// # Workspace 约定
 ///
-/// - [`Self::workspace`] (32 MB) 给 cuBLASLt 用，[`Self::new`] 里默认分配。
+/// - [`Self::workspace`] (128 MB) 给 cuBLASLt 用，[`Self::new`] 里默认分配。
 ///
 /// - [`Self::flash_decode_workspace`] 给 split-K flash-decoding (pass-1 → pass-2) 用。
 ///   **默认不分配** (null)；在要跑 bf16 decode 的模型 init 时显式链式调用
@@ -40,7 +37,7 @@ pub struct CudaConfig {
     pub stream: ffi::cudaStream_t,
     pub cublaslt_handle: ffi::cublasLtHandle_t,
     pub cublas_handle_v2: ffi::cublasHandle_t,
-    /// cuBLASLt 算法选择 workspace（32 MB，构造时分配）。
+    /// cuBLASLt 算法选择 workspace（128 MB，构造时分配）。
     pub workspace: *mut c_void,
     pub workspace_size: usize,
     /// Split-K flash-decoding (pass-1 → pass-2) 所需的 fp32 scratch。
@@ -48,7 +45,13 @@ pub struct CudaConfig {
     pub flash_decode_workspace: *mut c_void,
     pub flash_decode_workspace_size: usize,
     pub cuda_graph: Option<CudaGraph>,
-    // pub cudnn_handle: cudnnHandle_t,   // (未来)
+    /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
+    pub cudnn_handle: ffi::cudnnHandle_t,
+    /// Descriptor / algorithm / workspace cache shared across every
+    /// `conv2d_cudnn` invocation that runs against this handle. Eliminates
+    /// per-call `cudnnCreate*` / `cudnnGetAlgorithm` / `cudaMalloc`
+    /// overhead once the cache is warm.
+    pub conv2d_cache: Mutex<crate::op::kernels::cuda::Conv2dCache>,
 }
 
 #[derive(Debug)]
@@ -83,6 +86,23 @@ impl CudaConfig {
         let workspace_size = DEFAULT_GEMM_WORKSPACE_SIZE;
         unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut workspace, workspace_size))? };
 
+        // cuDNN handle
+        let mut cudnn_handle: ffi::cudnnHandle_t = std::ptr::null_mut();
+        unsafe {
+            let status = ffi::cudnnCreate(&mut cudnn_handle);
+            if status != ffi::cudnnStatus_t::CUDNN_STATUS_SUCCESS {
+                return Err(crate::base::error::Error::InvalidArgument(
+                    format!("cudnnCreate failed: {:?}", status)
+                ).into());
+            }
+            let status = ffi::cudnnSetStream(cudnn_handle, stream);
+            if status != ffi::cudnnStatus_t::CUDNN_STATUS_SUCCESS {
+                return Err(crate::base::error::Error::InvalidArgument(
+                    format!("cudnnSetStream failed: {:?}", status)
+                ).into());
+            }
+        }
+
         Ok(Self {
             stream,
             cublaslt_handle,
@@ -92,6 +112,10 @@ impl CudaConfig {
             flash_decode_workspace: std::ptr::null_mut(),
             flash_decode_workspace_size: 0,
             cuda_graph: None,
+            cudnn_handle,
+            conv2d_cache: Mutex::new(
+                crate::op::kernels::cuda::Conv2dCache::default(),
+            ),
         })
     }
 
@@ -151,6 +175,11 @@ impl Drop for CudaConfig {
                 let _ = ffi::cudaFree(self.flash_decode_workspace);
             }
         }
+        if !self.cudnn_handle.is_null() {
+            unsafe {
+                let _ = ffi::cudnnDestroy(self.cudnn_handle);
+            }
+        }
         // cuda_graph 会自动在其 Drop 中释放
     }
 }
@@ -159,6 +188,19 @@ impl Drop for CudaConfig {
 // Raw pointers prevent automatic Send/Sync, but CUDA handles synchronization
 unsafe impl Send for CudaConfig {}
 unsafe impl Sync for CudaConfig {}
+
+impl CudaConfig {
+    /// 从 `Option<&CudaConfig>` 中获取 stream。
+    /// - `Some(config)` → 用 config.stream
+    /// - `None` → fallback 到 thread-local current stream（仿 PyTorch 的 `at::cuda::getCurrentCUDAStream()`）
+    #[inline]
+    pub fn resolve_stream(cuda_config: Option<&CudaConfig>) -> super::ffi::cudaStream_t {
+        match cuda_config {
+            Some(config) => config.stream,
+            None => super::thread_stream::get_current_cuda_stream(),
+        }
+    }
+}
 
 impl CudaConfig {
     pub fn capture_graph_begin(&mut self) -> Result<()> {
@@ -195,6 +237,47 @@ impl CudaConfig {
     pub fn sync_stream(&self) -> Result<()> {
         unsafe {
             crate::cuda_check!(ffi::cudaStreamSynchronize(self.stream))?;
+        }
+        Ok(())
+    }
+
+    // ─────────────────── Denoise graph API ───────────────────
+    //
+    // Denoise path shares the same `cuda_graph` slot.
+
+    pub fn denoise_graph_is_ready(&self) -> bool {
+        self.cuda_graph.is_some()
+    }
+
+    /// Begin stream capture on `self.stream`. Requires only `&self`
+    /// because `cudaStream_t` is a `Copy` handle — the graph-state
+    /// write happens in `denoise_capture_end` which takes `&mut self`.
+    pub fn denoise_capture_begin(&self) -> Result<()> {
+        unsafe {
+            crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?;
+        }
+        Ok(())
+    }
+
+    pub fn denoise_capture_end(&mut self) -> Result<()> {
+        unsafe {
+            let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
+            crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
+            let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
+            crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
+            self.cuda_graph = Some(CudaGraph { graph, exec });
+        }
+        Ok(())
+    }
+
+    pub fn denoise_graph_launch(&self) -> Result<()> {
+        let g = self.cuda_graph.as_ref().ok_or_else(|| {
+            crate::base::error::Error::InvalidArgument(
+                "denoise_graph_launch called before capture".into(),
+            )
+        })?;
+        unsafe {
+            crate::cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream))?;
         }
         Ok(())
     }

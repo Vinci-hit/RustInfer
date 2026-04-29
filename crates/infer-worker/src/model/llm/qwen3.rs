@@ -4,9 +4,11 @@ use std::time::Instant;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
+#[cfg(feature = "cuda")]
+use crate::cuda::CudaConfig;
 use crate::base::error::Error::InternalError;
 use crate::model::BufferType;
-use crate::op::{Op, OpContext};
+
 use crate::op::add_inplace::AddInplace;
 use crate::op::embedding::Embedding;
 use crate::op::flash_gqa::FlashAttnGQA;
@@ -140,7 +142,7 @@ impl Qwen3 {
         };
 
         let mha_layers = (0..layer_num)
-            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size))
+            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size, true))
             .collect::<Result<Vec<_>>>()?;
         let rope_layers = (0..layer_num)
             .map(|_| RoPEOp::new(config.q_dim, config.kv_dim, config.head_size))
@@ -436,19 +438,19 @@ impl Qwen3 {
 
         let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.embedding_layer.forward(&mut OpContext::new(&[&state.output_token], &mut [&mut x], cuda_config_ref))?;
+        self.layers.embedding_layer.forward(&state.output_token, &mut x, cuda_config_ref)?;
 
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
             if i == 0 || !self.device_type.is_cuda() {
-                self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+                self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
             }
 
             let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
             let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
+            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
 
             let q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
             let k_view = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
@@ -459,7 +461,7 @@ impl Qwen3 {
                 let q_reshaped = q.reshape(&[self.config.head_num, self.config.head_size])?;
                 let qnorm_buffer = state.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
                 let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[self.config.head_num, self.config.head_size])?;
-                qnorm_layers[i].forward(&mut OpContext::new(&[&q_reshaped], &mut [&mut qnorm_out], cuda_config_ref))?;
+                qnorm_layers[i].forward(&q_reshaped, &mut qnorm_out, cuda_config_ref)?;
                 qnorm_out.reshape(&[1, self.config.q_dim])?
             } else {
                 q
@@ -468,7 +470,7 @@ impl Qwen3 {
                 let k_reshaped = k_view.reshape(&[self.config.kv_head_num, self.config.head_size])?;
                 let knorm_buffer = state.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
                 let mut knorm_out = knorm_buffer.slice(&[0, 0], &[self.config.kv_head_num, self.config.head_size])?;
-                knorm_layers[i].forward(&mut OpContext::new(&[&k_reshaped], &mut [&mut knorm_out], cuda_config_ref))?;
+                knorm_layers[i].forward(&k_reshaped, &mut knorm_out, cuda_config_ref)?;
                 knorm_out.reshape(&[1, self.config.kv_dim])?
             } else {
                 k_view.reshape(&[1, self.config.kv_dim])?
@@ -477,41 +479,41 @@ impl Qwen3 {
             let (k_cache_full, v_cache_full) = state.kv_cache.get_mut(i)?;
             let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&state.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k_active], cuda_config_ref))?;
+            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k_active, cuda_config_ref)?;
 
-            crate::op::kernels::scatter_kv(k_cache_full, &k_active, v_cache_full, &v_view, &state.input_pos, cuda_config_ref)?;
+            crate::op::scatter::scatter_kv(k_cache_full, &k_active, v_cache_full, &v_view, &state.input_pos, cuda_config_ref)?;
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
             let mut attn_out = attn_out_buffer.slice(&[0, 0], &[1, self.config.q_dim])?;
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, &state.input_pos], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &state.input_pos, &mut attn_out, cuda_config_ref)?;
 
             let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
             let mut wo_out = wo_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
+            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
 
             let mut ffn_norm_out = attn_norm_out;
             if self.device_type.is_cuda() {
-                crate::op::kernels::fused_add_rmsnorm(
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut ffn_norm_out, &mut x, &wo_out,
                     &self.layers.rmsnorm_ffn_layers[i].weight,
                     self.config.rms_norm_eps, cuda_config_ref,
                 )?;
             } else {
-                self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
-                self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
+                self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
+                self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
             }
 
             let inter = self.config.intermediate_size;
             let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[1, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
+            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
             let mut w1_out = gate_up.slice(&[0, 0], &[1, inter])?;
             let w3_out = gate_up.slice(&[0, inter], &[1, inter])?;
-            self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
+            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
 
             let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
+            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
 
             if self.device_type.is_cuda() {
                 let next_norm_weight = if i + 1 < self.config.layer_num {
@@ -521,23 +523,23 @@ impl Qwen3 {
                 };
                 let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
                 let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                crate::op::kernels::fused_add_rmsnorm(
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut next_out, &mut x, &w2_out,
                     next_norm_weight, self.config.rms_norm_eps, cuda_config_ref,
                 )?;
             } else {
-                self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+                self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
             }
         }
 
         let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
         if !self.device_type.is_cuda() {
-            self.layers.rmsnorm_final_layer.forward(&mut OpContext::new(&[&x], &mut [&mut final_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_out, cuda_config_ref)?;
         }
 
         let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
         let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
@@ -562,79 +564,79 @@ impl Qwen3 {
 
         let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-        self.layers.embedding_layer.forward(&mut OpContext::new(&[&input_tokens_view], &mut [&mut x], cuda_config_ref))?;
+        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
 
         for i in 0..self.config.layer_num {
             let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut attn_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
 
             let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
             let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
             let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&mut OpContext::new(&[&attn_norm_out], &mut [&mut qkv], cuda_config_ref))?;
+            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
 
             let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
             let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
             let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
 
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::kernels::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
 
             // QK-norm (Qwen3-specific)
             if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
                 let q_reshaped = q.reshape(&[seq_len * self.config.head_num, self.config.head_size])?;
                 let qnorm_buffer = state.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
                 let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[seq_len * self.config.head_num, self.config.head_size])?;
-                qnorm_layers[i].forward(&mut OpContext::new(&[&q_reshaped], &mut [&mut qnorm_out], cuda_config_ref))?;
+                qnorm_layers[i].forward(&q_reshaped, &mut qnorm_out, cuda_config_ref)?;
                 q.copy_from(&qnorm_out.reshape(&[seq_len, self.config.q_dim])?)?;
             }
             if let Some(ref knorm_layers) = self.layers.knorm_layers {
                 let k_reshaped = k.reshape(&[seq_len * self.config.kv_head_num, self.config.head_size])?;
                 let knorm_buffer = state.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
                 let mut knorm_out = knorm_buffer.slice(&[0, 0], &[seq_len * self.config.kv_head_num, self.config.head_size])?;
-                knorm_layers[i].forward(&mut OpContext::new(&[&k_reshaped], &mut [&mut knorm_out], cuda_config_ref))?;
+                knorm_layers[i].forward(&k_reshaped, &mut knorm_out, cuda_config_ref)?;
                 k.copy_from(&knorm_out.reshape(&[seq_len, self.config.kv_dim])?)?;
             }
 
             let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
             let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&mut OpContext::new(&[&state.input_pos, sin_cache, cos_cache], &mut [&mut q, &mut k], cuda_config_ref))?;
+            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
             let mut attn_out = attn_out_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            self.layers.mha_layers[i].forward(&mut OpContext::new(&[&q, k_hist, v_hist, pos_cpu], &mut [&mut attn_out], cuda_config_ref))?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, pos_cpu, &mut attn_out, cuda_config_ref)?;
 
             let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
             let mut wo_out = wo_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.wo_layers[i].forward(&mut OpContext::new(&[&attn_out], &mut [&mut wo_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&wo_out], &mut [&mut x], cuda_config_ref))?;
+            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
+            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
 
             let ffn_norm_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
             let mut ffn_norm_out = ffn_norm_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_ffn_layers[i].forward(&mut OpContext::new(&[&x], &mut [&mut ffn_norm_out], cuda_config_ref))?;
+            self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
 
             let inter = self.config.intermediate_size;
             let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
             let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&mut OpContext::new(&[&ffn_norm_out], &mut [&mut gate_up], cuda_config_ref))?;
+            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
 
             let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
             let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, inter])?;
             let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
             let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, inter])?;
 
-            let stream = cuda_config_ref.map_or(std::ptr::null_mut(), |c| c.stream);
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::kernels::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
 
-            self.layers.swiglu_layers[i].forward(&mut OpContext::new(&[&w3_out], &mut [&mut w1_out], cuda_config_ref))?;
+            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
             let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&mut OpContext::new(&[&w1_out], &mut [&mut w2_out], cuda_config_ref))?;
-            self.layers.add_layers.forward(&mut OpContext::new(&[&w2_out], &mut [&mut x], cuda_config_ref))?;
+            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
+            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
         }
 
         // Extract last token
@@ -645,15 +647,123 @@ impl Qwen3 {
 
         let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
         let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.rmsnorm_final_layer.forward(&mut OpContext::new(&[&final_norm_input], &mut [&mut final_norm_out], cuda_config_ref))?;
+        self.layers.rmsnorm_final_layer.forward(&final_norm_input, &mut final_norm_out, cuda_config_ref)?;
 
         let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&mut OpContext::new(&[&final_norm_out], &mut [logits], cuda_config_ref))?;
+        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
         let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
         let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
         state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
 
         Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
+    }
+
+    /// Run prefill for `num_layers` transformer layers and return the
+    /// **full-sequence hidden states** `[seq_len, dim]`.
+    ///
+    /// This is the core reuse point for the TextEncoder:
+    /// - `num_layers = layer_num - 1` → hidden_states[-2]
+    /// - No final RMSNorm / lm_head / sampling
+    /// - Uses the existing KV cache in `InferenceState` (pos should be 0)
+    pub fn forward_prefill_hidden_states(
+        &self,
+        state: &mut InferenceState,
+        tokens: &Tensor,
+        seq_len: usize,
+        num_layers: usize,
+    ) -> Result<Tensor> {
+        // pos = 0 for text encoder (no prior KV cache)
+        let mut pos_cpu_mut = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        pos_cpu_mut.as_i32_mut()?.as_slice_mut()?[0] = 0;
+
+        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
+        state.input_pos.copy_from(&pos_cpu_mut)?;
+
+        let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
+        let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
+        input_tokens_view.copy_from(tokens)?;
+
+        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
+        let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
+        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
+
+        let layers_to_run = num_layers.min(self.config.layer_num);
+        for i in 0..layers_to_run {
+            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
+            self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
+
+            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
+            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
+            let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
+            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
+
+            let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
+            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
+            let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, 0, seq_len, self.config.kv_dim)?;
+
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
+
+            if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
+                let q_reshaped = q.reshape(&[seq_len * self.config.head_num, self.config.head_size])?;
+                let qnorm_buffer = state.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
+                let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[seq_len * self.config.head_num, self.config.head_size])?;
+                qnorm_layers[i].forward(&q_reshaped, &mut qnorm_out, cuda_config_ref)?;
+                q.copy_from(&qnorm_out.reshape(&[seq_len, self.config.q_dim])?)?;
+            }
+            if let Some(ref knorm_layers) = self.layers.knorm_layers {
+                let k_reshaped = k.reshape(&[seq_len * self.config.kv_head_num, self.config.head_size])?;
+                let knorm_buffer = state.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
+                let mut knorm_out = knorm_buffer.slice(&[0, 0], &[seq_len * self.config.kv_head_num, self.config.head_size])?;
+                knorm_layers[i].forward(&k_reshaped, &mut knorm_out, cuda_config_ref)?;
+                k.copy_from(&knorm_out.reshape(&[seq_len, self.config.kv_dim])?)?;
+            }
+
+            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
+            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
+            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
+
+            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
+            let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
+            let mut attn_out = attn_out_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &pos_cpu_mut, &mut attn_out, cuda_config_ref)?;
+
+            let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
+            let mut wo_out = wo_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
+            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
+            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
+
+            let ffn_norm_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
+            let mut ffn_norm_out = ffn_norm_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
+            self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
+
+            let inter = self.config.intermediate_size;
+            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
+            let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
+            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
+
+            let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
+            let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, inter])?;
+            let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
+            let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, inter])?;
+
+            let stream = CudaConfig::resolve_stream(cuda_config_ref);
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
+
+            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
+            let mut w2_out = ffn_norm_out;
+            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
+            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
+        }
+
+        // Return full-sequence hidden states (copy out of workspace)
+        let mut output = Tensor::new(&[seq_len, self.config.dim], x.dtype(), self.device_type)?;
+        output.copy_from(&x)?;
+        Ok(output)
     }
 }
 
@@ -706,6 +816,37 @@ mod tests {
         Ok((text, start.elapsed().as_millis() as u64, n_tok, prefill_ms, decode_ms, decode_iter))
     }
 
+    /// Pre-run a tiny `generate()` on the same state the benchmark will
+    /// use, so the real call sees a hot CUDA context:
+    ///
+    /// - kernel module load / PTX→SASS JIT for every prefill + decode
+    ///   kernel (embedding, rmsnorm, qkv, rope, scatter_kv, flash-attn,
+    ///   wo, silu, sampler, …).
+    /// - cuBLASLt algorithm heuristics for every `(M,N,K)` shape hit.
+    /// - the decode-path CUDA Graph: captured here, replayed for free
+    ///   from the real benchmark's first decode step onward.
+    ///
+    /// After warmup returns, the real `generate(prompt, N)` call
+    /// unconditionally overwrites `kv_cache[..prompt_len]` from pos=0
+    /// (see [`Qwen3::generate`]), so warmup has no correctness impact.
+    ///
+    /// ## Why the filler prompt
+    ///
+    /// The flash-attention prefill kernel processes the sequence in
+    /// fixed-size tiles (~64 tokens). Feeding it a prompt of 1–2 tokens
+    /// causes out-of-range reads inside the tile, putting the CUDA
+    /// context into a sticky-error state that surfaces later as
+    /// `CUBLAS_STATUS_EXECUTION_FAILED (13)` on the next cuBLASLt call.
+    /// We pick a ~10-token filler string to stay above that floor while
+    /// keeping the warmup cheap.
+    fn warmup(model: &Qwen3, state: &mut InferenceState) -> Result<()> {
+        // ~10 tokens after BPE — safely above the flash-attn prefill
+        // tile floor. A few decode steps also capture the CUDA Graph.
+        let prompt = "The quick brown fox jumps over the lazy dog.";
+        let _ = model.generate(state, prompt, 4, false)?;
+        Ok(())
+    }
+
     fn get_qwen3_model_path() -> &'static Path {
         Path::new("/root/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c")
     }
@@ -721,6 +862,7 @@ mod tests {
 
         let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
+        warmup(&model, &mut state)?;
         let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
             generate_and_measure(&model, &mut state, prompt, 2000, false)?;
 
@@ -730,86 +872,6 @@ mod tests {
             n_tok, total_ms,
             (prompt_len + n_tok as f64) / (total_ms / 1000.0),
             if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
-        Ok(())
-    }
-
-    // ========================================================================
-    // Batch Decode 测试
-    // ========================================================================
-
-    /// 测试：验证 forward_decoding 在 batch_size=1 时的逐步行为
-    /// 用两个独立的 state 分别跑同一个 prompt，对比逐步 decode 的 token 是否一致。
-    /// 这是所有 batch 化改造的回归基线。
-    #[test]
-    #[ignore = "需要 Qwen3 模型权重，请单独运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_qwen3_cuda_batch_decode_baseline() -> Result<()> {
-        let model_path = get_qwen3_model_path();
-        assert!(model_path.exists(), "Qwen3 model directory not found at {:?}", model_path);
-
-        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 1+1?<|im_end|>\n<|im_start|>assistant\n";
-
-        let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
-
-        // ---- Run 1: 用 state1 生成 N 个 tokens ----
-        let mut state1 = model.create_state()?;
-        let prompt_tokens = model.tokenizer.encode(prompt)?;
-        let prompt_len = prompt_tokens.len();
-
-        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
-        let mut input_tokens_cpu = Tensor::new(&[prompt_len], DataType::I32, DeviceType::Cpu)?;
-        input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
-
-        let first_token = model.forward_prefill(&mut state1, &input_tokens_cpu, &input_pos, prompt_len)?;
-
-        let n_decode_steps = 20;
-        let mut tokens_run1 = vec![first_token];
-        let mut current_token = first_token;
-        let mut input_token_1 = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-
-        for step in 0..n_decode_steps {
-            let pos = prompt_len + step;
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-            input_token_1.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = model.forward_decoding(&mut state1, &input_token_1, &input_pos)?;
-            tokens_run1.push(next_token);
-            current_token = next_token;
-            if model.tokenizer.is_eos(next_token) { break; }
-        }
-
-        // ---- Run 2: 用 state2 跑完全同样的流程 ----
-        let mut state2 = model.create_state()?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
-        let first_token_2 = model.forward_prefill(&mut state2, &input_tokens_cpu, &input_pos, prompt_len)?;
-        assert_eq!(first_token, first_token_2, "Prefill token mismatch between run1 and run2");
-
-        let mut tokens_run2 = vec![first_token_2];
-        let mut current_token = first_token_2;
-        let mut input_token_2 = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-
-        for step in 0..n_decode_steps {
-            let pos = prompt_len + step;
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-            input_token_2.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = model.forward_decoding(&mut state2, &input_token_2, &input_pos)?;
-            tokens_run2.push(next_token);
-            current_token = next_token;
-            if model.tokenizer.is_eos(next_token) { break; }
-        }
-
-        // ---- 对比 ----
-        println!("Run1 tokens ({} total): {:?}", tokens_run1.len(), &tokens_run1);
-        println!("Run2 tokens ({} total): {:?}", tokens_run2.len(), &tokens_run2);
-
-        assert_eq!(tokens_run1.len(), tokens_run2.len(), "Token count mismatch");
-        for (i, (&t1, &t2)) in tokens_run1.iter().zip(tokens_run2.iter()).enumerate() {
-            assert_eq!(t1, t2, "Token mismatch at step {}: run1={}, run2={}", i, t1, t2);
-        }
-
-        let text = model.tokenizer.decode(&tokens_run1)?;
-        println!("Decoded output: {}", text);
-        println!("test_qwen3_cuda_batch_decode_baseline PASSED ✓");
         Ok(())
     }
 
@@ -850,6 +912,7 @@ mod tests {
 
         let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
+        warmup(&model, &mut state)?;
         let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
             generate_and_measure(&model, &mut state, prompt, 2000, true)?;
 

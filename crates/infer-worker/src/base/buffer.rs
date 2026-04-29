@@ -299,6 +299,101 @@ impl Buffer {
             device: self.device,
         })
     }
+
+    /// Stream-ordered async 版本的 [`Buffer::copy_from`]。
+    ///
+    /// 把拷贝排到 `stream` 上并立即返回，host 不阻塞。完成保证由
+    /// 调用者在合适位置 `cudaStreamSynchronize` / `cudaDeviceSynchronize`。
+    #[cfg(feature = "cuda")]
+    pub fn copy_from_async(
+        &mut self,
+        src: &Buffer,
+        stream: crate::cuda::ffi::cudaStream_t,
+    ) -> Result<()> {
+        if self.len_bytes() != src.len_bytes() {
+            return Err(Error::InvalidArgument(format!(
+                "Buffer size mismatch: dst has {} bytes, src has {} bytes",
+                self.len_bytes(),
+                src.len_bytes()
+            )).into());
+        }
+        if self.len_bytes() == 0 {
+            return Ok(());
+        }
+
+        use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
+        match (src.device(), self.device()) {
+            (DeviceType::Cpu, DeviceType::Cpu) => {
+                // stream 不适用，直接做同步 memcpy，语义与 `copy_from` 一致。
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr(),
+                        self.as_mut_ptr(),
+                        self.len_bytes(),
+                    );
+                }
+            }
+            (DeviceType::Cpu, DeviceType::Cuda(_)) => unsafe {
+                crate::cuda_check!(cudaMemcpyAsync(
+                    self.as_mut_ptr() as *mut _,
+                    src.as_ptr() as *const _,
+                    self.len_bytes(),
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream,
+                ))?;
+            },
+            (DeviceType::Cuda(_), DeviceType::Cpu) => unsafe {
+                crate::cuda_check!(cudaMemcpyAsync(
+                    self.as_mut_ptr() as *mut _,
+                    src.as_ptr() as *const _,
+                    self.len_bytes(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    stream,
+                ))?;
+            },
+            (DeviceType::Cuda(_), DeviceType::Cuda(_)) => unsafe {
+                crate::cuda_check!(cudaMemcpyAsync(
+                    self.as_mut_ptr() as *mut _,
+                    src.as_ptr() as *const _,
+                    self.len_bytes(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                    stream,
+                ))?;
+            },
+        }
+        Ok(())
+    }
+
+    /// Stream-ordered async 版本的 [`Buffer::zero_out`]。
+    ///
+    /// CUDA 路径走 `cudaMemsetAsync`；CPU 路径忽略 stream 参数，
+    /// 和 `zero_out` 一致。
+    #[cfg(feature = "cuda")]
+    pub fn zero_out_async(
+        &mut self,
+        stream: crate::cuda::ffi::cudaStream_t,
+    ) -> Result<()> {
+        if self.len_bytes() == 0 {
+            return Ok(());
+        }
+        match self.device() {
+            DeviceType::Cpu => {
+                let slice = unsafe {
+                    std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len_bytes())
+                };
+                slice.fill(0);
+            }
+            DeviceType::Cuda(_) => unsafe {
+                crate::cuda_check!(crate::cuda::ffi::cudaMemsetAsync(
+                    self.as_mut_ptr() as *mut _,
+                    0,
+                    self.len_bytes(),
+                    stream,
+                ))?;
+            },
+        }
+        Ok(())
+    }
 }
 
 // ======================= RAII 的核心在这里 =======================
@@ -465,6 +560,62 @@ mod tests {
 
         assert_eq!(result_slice, &host_data[..]);
 
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_buffer_copy_from_async_d2d() -> Result<()> {
+        // 验证 stream-ordered async D2D 拷贝的正确性：
+        //   gpu1 ← gpu2 (async)
+        //   cpu ← gpu1 (sync, 隐式等 stream)
+        use crate::base::allocator::CachingCudaAllocator;
+
+        let size = 64;
+        let byte_size = size * std::mem::size_of::<f32>();
+        let allocator_cu = Arc::new(CachingCudaAllocator::instance());
+
+        let mut gpu1 = Buffer::new(byte_size, allocator_cu.clone())?;
+        let mut gpu2 = Buffer::new(byte_size, allocator_cu.clone())?;
+
+        let host_data: Vec<f32> = (0..size).map(|i| i as f32 * 1.5).collect();
+        gpu2.copy_from_host(&host_data)?;
+
+        // async D2D on the current thread's stream (null → default stream)
+        let stream = crate::cuda::get_current_cuda_stream();
+        gpu1.copy_from_async(&gpu2, stream)?;
+
+        // 拿回 CPU 校验（copy_from 走同步 memcpy，会等 stream 完成）
+        let mut verify = Buffer::new(byte_size, Arc::new(CpuAllocator))?;
+        verify.copy_from(&gpu1)?;
+        let got = unsafe {
+            std::slice::from_raw_parts(verify.as_ptr() as *const f32, size)
+        };
+        assert_eq!(got, &host_data[..]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_buffer_zero_out_async() -> Result<()> {
+        use crate::base::allocator::CachingCudaAllocator;
+
+        let size = 16;
+        let byte_size = size * std::mem::size_of::<f32>();
+        let allocator_cu = Arc::new(CachingCudaAllocator::instance());
+
+        let mut gpu = Buffer::new(byte_size, allocator_cu)?;
+        gpu.copy_from_host(&vec![7.0f32; size])?;
+
+        let stream = crate::cuda::get_current_cuda_stream();
+        gpu.zero_out_async(stream)?;
+
+        let mut verify = Buffer::new(byte_size, Arc::new(CpuAllocator))?;
+        verify.copy_from(&gpu)?;
+        let got = unsafe {
+            std::slice::from_raw_parts(verify.as_ptr() as *const f32, size)
+        };
+        assert!(got.iter().all(|&x| x == 0.0), "expected all zeros, got {:?}", &got[..4]);
         Ok(())
     }
 
