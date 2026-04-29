@@ -30,25 +30,7 @@ use crate::op::tensor_utils::{
 };
 use crate::tensor::Tensor;
 
-const ADALN_EMBED_DIM: usize = 256;
-/// Sequence-length padding multiple.
-///
-/// Fixed at **128** to match the block-M tile of the CUTLASS flash-attention
-/// kernel used for self-attention in [`DiTBlock::forward`]:
-///
-/// - Q tiles are [M=128, K=head_dim]; the kernel issues unpredicated
-///   `cp_async` loads that read a full tile even on the trailing block,
-///   so the sequence length must be a multiple of 128 for the loads to stay
-///   in-bounds and for the result to be mathematically correct.
-/// - KV tiles are [N=64, K=head_dim]; 128 is automatically a multiple of 64
-///   so the KV side is trivially safe as well.
-///
-/// The extra padded rows are filled with the learned `x_pad_token` /
-/// `cap_pad_token`, so correctness is unchanged — they just participate in
-/// attention like any other real token. The marginal FFN / projection cost
-/// of the extra tokens is far smaller than what flash-attention saves
-/// versus the per-head loop fallback.
-const SEQ_MULTI_OF: usize = 128;
+use super::state::{ADALN_EMBED_DIM, SEQ_MULTI_OF};
 
 // ───────────────────────── Config ─────────────────────────
 
@@ -1002,7 +984,6 @@ fn load_fused_qkv_linear(
     // matches the native [out_features, in_features] weight layout so the
     // GEMM output's cols naturally split as [Q | K | V].
     let mut fused = Tensor::new(&[3 * dim, dim], target_dtype, DeviceType::Cpu)?;
-    let row_bytes = dim * target_dtype.size_in_bytes();
     match target_dtype {
         DataType::F32 => {
             let dst = fused.as_f32_mut()?.as_slice_mut()?;
@@ -1026,7 +1007,6 @@ fn load_fused_qkv_linear(
             "load_fused_qkv_linear: unsupported dtype {:?}", other,
         )).into()),
     }
-    let _ = row_bytes; // kept for clarity / future stride-aware variants
 
     let fused = fused.to_device(device)?;
     Ok(Matmul::from(fused, None))
@@ -1086,8 +1066,7 @@ fn load_dit_block(
         norm_q, norm_k,
         w1, w3, w2,
         adaln_modulation,
-        dim, n_heads, head_dim,
-        modulation,
+        dim, n_heads, head_dim, modulation,
     })
 }
 
