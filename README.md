@@ -59,6 +59,109 @@ RustInfer 采用**分层模块化架构**，核心包括：
 
 ---
 
+## 🎨 文生图（Text-to-Image）
+
+RustInfer 支持 **Z-Image** 系列模型进行高质量文生图推理，完全使用 Rust + CUDA 实现，无需 Python 依赖。
+
+### 支持的模型
+
+| 模型 | 推理步数 | 1024×1024 耗时 | 特点 |
+|------|----------|----------------|------|
+| [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | 2 步 | **1.1 秒** | 蒸馏加速版，极速生成 |
+| [Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image) | 50 步 | 24 秒 | 完整版，更高质量 |
+
+> **测试环境**: H20 GPU, BF16 精度, CUDA Graph 优化
+
+### 效果展示
+
+**Prompt**: *一只可爱的橘色小猫咪，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格*
+
+<div align="center">
+<table>
+<tr>
+<td align="center"><b>Z-Image-Turbo (2步, 1.1秒)</b></td>
+<td align="center"><b>Z-Image (50步, 24秒)</b></td>
+</tr>
+<tr>
+<td><img src="assets/z_image_turbo_demo.png" width="400"/></td>
+<td><img src="assets/z_image_full_demo.png" width="400"/></td>
+</tr>
+</table>
+</div>
+
+### 快速使用
+
+**1. 下载模型**
+
+```bash
+# Z-Image-Turbo（推荐，极速生成）
+huggingface-cli download Tongyi-MAI/Z-Image-Turbo --local-dir ./Z-Image-Turbo
+
+# Z-Image（完整版，更高质量）
+huggingface-cli download Tongyi-MAI/Z-Image --local-dir ./Z-Image
+```
+
+**2. Rust 代码示例**
+
+```rust
+use infer_worker::model::diffusion::z_image::{ZImagePipeline, DiffusionRequest};
+use infer_worker::base::device::DeviceType;
+
+// 加载模型
+let mut pipeline = ZImagePipeline::from_pretrained(
+    "/path/to/Z-Image-Turbo",
+    DeviceType::Cuda(0)
+)?;
+
+// Warmup（首次运行，预热 CUDA kernel）
+pipeline.warmup_for(1024, 1024)?;
+
+// 生成图片
+let request = DiffusionRequest {
+    prompt: "一只可爱的橘猫在厨房做饭，皮克斯风格".to_string(),
+    height: 1024,
+    width: 1024,
+    num_inference_steps: 2,   // Turbo 用 2 步，Full 用 28-50 步
+    guidance_scale: 1.0,      // Turbo 用 1.0，Full 用 4.5
+    seed: Some(42),
+    ..Default::default()
+};
+
+let output = pipeline.generate(&request)?;
+// output.output: [1, 3, H, W] 的 RGB 张量，值域 [0, 255]
+```
+
+**3. 运行测试**
+
+```bash
+# Z-Image-Turbo 测试
+cargo test --lib model::diffusion::z_image::pipeline::tests::test_pipeline_generate_cuda \
+    --release -- --nocapture --ignored
+
+# Z-Image 完整版测试
+cargo test --lib model::diffusion::z_image::pipeline::tests::test_pipeline_z_image_full_cuda \
+    --release -- --nocapture --ignored
+```
+
+### 参数说明
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `prompt` | String | 文本描述，支持中英文 |
+| `height` / `width` | u32 | 图片尺寸，建议 512-1024 |
+| `num_inference_steps` | u32 | 去噪步数，Turbo=2，Full=28-50 |
+| `guidance_scale` | f32 | CFG 强度，Turbo=1.0，Full=4.5 |
+| `seed` | Option<u64> | 随机种子，固定可复现结果 |
+
+### 技术特性
+
+- **FlowMatch Euler Scheduler**: 支持可配置的 shift 参数（Turbo=3.0, Full=6.0）
+- **BF16 精度**: 模型权重原生 BF16，减少显存占用
+- **CUDA Graph 加速**: Warmup 后去噪循环高度优化
+- **灵活参数**: 支持自定义分辨率、推理步数、CFG guidance scale、seed 等
+
+---
+
 ### 项目结构
 
 ```
@@ -326,6 +429,7 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 - [x] 手写 BF16 GEMV kernel（decode M=1）
 - [x] 融合 scatter_kv（K/V cache 单次写入）
 - [x] INT4 AWQ 量化推理（compressed-tensors K-packed）
+- [x] **文生图（Z-Image / Z-Image-Turbo）**: 1024×1024 图片 1.1 秒生成
 
 ### 待实现 🔄
 
