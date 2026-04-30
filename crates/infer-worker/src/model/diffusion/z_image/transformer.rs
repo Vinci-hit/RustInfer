@@ -868,9 +868,14 @@ impl ZImageTransformer2DModel {
 fn load_tensor(loader: &DiffusersLoader, name: &str, device: DeviceType) -> Result<Tensor> {
     let view = loader.get_tensor(name)?;
     let t = Tensor::from_view_on_cpu(&view)?;
-    let t = if device.is_cpu() && t.dtype() != DataType::F32 {
-        t.to_dtype(DataType::F32)?
-    } else { t };
+    // CPU: convert to F32 for compatibility.
+    // CUDA: convert to BF16 for efficiency (matches vllm-omni default).
+    let t = if device.is_cpu() {
+        if t.dtype() != DataType::F32 { t.to_dtype(DataType::F32)? } else { t }
+    } else {
+        // CUDA: always use BF16 for transformer weights
+        if t.dtype() != DataType::BF16 { t.to_dtype(DataType::BF16)? } else { t }
+    };
     t.to_device(device)
 }
 
@@ -969,12 +974,12 @@ fn load_fused_qkv_linear(
         )).into());
     }
 
-    // For CPU execution the pipeline normalises to F32; for CUDA we keep
-    // the checkpoint's native dtype (typically BF16).
-    let target_dtype = if device.is_cpu() && src_dtype != DataType::F32 {
+    // For CPU execution the pipeline normalises to F32; for CUDA we always
+    // use BF16 for efficiency (matches vllm-omni default).
+    let target_dtype = if device.is_cpu() {
         DataType::F32
     } else {
-        src_dtype
+        DataType::BF16
     };
     let w_q = if w_q.dtype() != target_dtype { w_q.to_dtype(target_dtype)? } else { w_q };
     let w_k = if w_k.dtype() != target_dtype { w_k.to_dtype(target_dtype)? } else { w_k };
