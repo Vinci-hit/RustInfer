@@ -29,10 +29,10 @@ use crate::tensor::Tensor;
 ///
 /// Stored in [`DiffBufferType::TValueDevVec`] / [`DiffBufferType::DtValueDevVec`]
 /// so a single `[N_MAX] f32` upload per `generate()` hands the entire
-/// schedule to the denoise CUDA Graph. Z-Image turbo uses 2 steps, the
-/// official schedule 9; 16 is comfortable with zero meaningful cost
-/// (64 B × 2 slots).
-pub const N_MAX_STEPS: usize = 16;
+/// schedule to the denoise CUDA Graph. The actual step count is passed
+/// as a runtime parameter; this only caps the pre-allocated scratch size
+/// (50 × 4 B × 2 slots = 400 B, negligible).
+pub const N_MAX_STEPS: usize = 50;
 
 /// Sequence length rounding used by the transformer (must match the
 /// `SEQ_MULTI_OF` constant used in `transformer.rs`).
