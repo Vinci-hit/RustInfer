@@ -16,6 +16,9 @@ struct DecodeSeq {
     /// 已生成 token 数
     generated_count: usize,
     max_tokens: usize,
+    /// 采样参数。Phase-1 sampler 走 greedy，没有读这个字段；
+    /// 保留给后续接入 top_p / temperature。
+    #[allow(dead_code)]
     sampling: SamplingParams,
 }
 
@@ -27,6 +30,9 @@ pub struct WorkerServer {
     zmq_out: zmq::Socket,
     /// 共享显存
     shared: Arc<SharedBuffers>,
+    /// 当前 Worker 绑定的 GPU 设备号。目前 single-GPU 模式下只用来打日志；
+    /// 多卡 scheduler 引入后会用于选择 CUDA context。
+    #[allow(dead_code)]
     device_id: i32,
     eos_token_id: i32,
     /// 活跃 decode 序列
@@ -206,20 +212,21 @@ impl WorkerServer {
         }
         q_start_loc.push(offset); // 末尾哨兵
 
-        // H2D copy 到共享 buffer
-        // q_start_loc 需要从 u32 转为 i32 (GPU buffer 统一 i32)
+        // 写共享 CPU 交换区。安全性来自 SharedBuffers 的信号协议：
+        // 调用 write_input_buffer 时 input_meta.ready == 0，Runner 不会读 input。
         let q_start_loc_i32: Vec<i32> = q_start_loc.iter().map(|&v| v as i32).collect();
-
-        self.shared.write_input_i32(&self.shared.input_token_ids, &token_ids, total_tokens)
-            .expect("Failed to write input_token_ids");
-        self.shared.write_input_i32(&self.shared.input_positions, &positions, total_tokens)
-            .expect("Failed to write input_positions");
-        self.shared.write_input_i32(&self.shared.input_q_start_loc, &q_start_loc_i32, num_seqs + 1)
-            .expect("Failed to write input_q_start_loc");
-        self.shared.write_input_i32(&self.shared.input_context_lens, &context_lens, num_seqs)
-            .expect("Failed to write input_context_lens");
-        self.shared.write_input_i32(&self.shared.input_slot_indices, &slot_indices, num_seqs)
-            .expect("Failed to write input_slot_indices");
+        unsafe {
+            self.shared.input_token_ids.as_mut_slice(total_tokens)
+                .copy_from_slice(&token_ids);
+            self.shared.input_positions.as_mut_slice(total_tokens)
+                .copy_from_slice(&positions);
+            self.shared.input_q_start_loc.as_mut_slice(num_seqs + 1)
+                .copy_from_slice(&q_start_loc_i32);
+            self.shared.input_context_lens.as_mut_slice(num_seqs)
+                .copy_from_slice(&context_lens);
+            self.shared.input_slot_indices.as_mut_slice(num_seqs)
+                .copy_from_slice(&slot_indices);
+        }
 
         // 写元信息, ready 最后 store
         let batch_type: u8 = if num_prefill_seqs == 0 { 0 } else { 1 };
@@ -302,9 +309,11 @@ impl WorkerServer {
         }
     }
 
-    /// D2H copy output tokens
+    /// 读 Runner 写好的 output tokens。
     fn read_output_tokens(&self, num_seqs: usize) -> Vec<i32> {
-        self.shared.read_output_i32(&self.shared.output_token_ids, num_seqs)
-            .expect("Failed to read output_token_ids")
+        // SAFETY: 调用点保证 output_meta.ready > 0，Runner 不再写 output_token_ids。
+        unsafe {
+            self.shared.output_token_ids.as_slice(num_seqs).to_vec()
+        }
     }
 }

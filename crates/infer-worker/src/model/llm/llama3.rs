@@ -344,21 +344,17 @@ impl Llama3 {
             stdout.flush()?;
         }
 
-        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
         let prompt_tokens = self.tokenizer.encode(prompt)?;
         if prompt_tokens.is_empty() {
             return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
         }
-        let mut input_tokens_cpu = Tensor::new(&[prompt_tokens.len()], DataType::I32, DeviceType::Cpu)?;
-        input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
 
         // Prefill
         let prefill_start = Instant::now();
-        let mut current_token = self.forward_prefill(state, &input_tokens_cpu, &input_pos, prompt_tokens.len())?;
+        let first_token = self.forward_prefill(state, &prompt_tokens, 0, prompt_tokens.len())?;
         let prefill_ms = prefill_start.elapsed().as_millis() as u64;
 
-        let mut generated_tokens = vec![current_token];
+        let mut generated_tokens = vec![first_token];
         let mut printed_len = 0usize;
         if print_output {
             let decoded = self.tokenizer.decode(&generated_tokens)?;
@@ -370,16 +366,12 @@ impl Llama3 {
         // Decode
         let decode_start = Instant::now();
         let mut decode_iterations = 0;
-        let mut input_tokens_cpu = input_tokens_cpu.slice(&[0], &[1])?;
         for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-            input_tokens_cpu.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = self.forward_decoding(state, &input_tokens_cpu, &input_pos)?;
+            let next_token = self.forward_decoding(state, pos as i32)?;
 
             if self.tokenizer.is_eos(next_token) { break; }
 
             generated_tokens.push(next_token);
-            current_token = next_token;
             decode_iterations += 1;
 
             if print_output {
@@ -401,12 +393,15 @@ impl Llama3 {
         Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
 
-    pub fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
+    /// 单步 decode（B=1）。
+    ///
+    /// * `pos` — 当前待生成 token 的绝对位置（**不是** 上一步生成的 token 的 pos）。
+    ///
+    /// 输入 token 隐含为 `state.output_token`（graph 自闭环：上一步 sampler 写入，本步 embedding 读）；
+    /// 调用方需确保 state 已完成 prefill 且 `state.output_token` 持有正确值。
+    pub fn forward_decoding(&self, state: &mut InferenceState, pos: i32) -> Result<i32> {
         // state.input_pos 容量 [max_seq_len]，decode 只写前 1 个元素
-        {
-            let mut dst = state.input_pos.slice(&[0], &[1])?;
-            dst.copy_from(pos_cpu)?;
-        }
+        state.input_pos.write_from_i32_host(&[pos], 1)?;
         let input_tokens_view = &state.output_token;
 
         // CUDA Graph
@@ -539,28 +534,30 @@ impl Llama3 {
         Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
     }
 
-    pub fn forward_prefill(&self, state: &mut InferenceState, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
-        let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
+    /// 一段 prefill，把 `tokens[0..seq_len]` 投喂模型并一次性生成（采样）下一个 token。
+    ///
+    /// * `tokens`   — host 侧 i32 token 数组，长度 ≥ seq_len；内部做 H2D
+    /// * `start_pos`— `tokens[0]` 对应的 KV cache 绝对位置（continuation 场景可 > 0）
+    pub fn forward_prefill(&self, state: &mut InferenceState, tokens: &[i32], start_pos: i32, seq_len: usize) -> Result<i32> {
+        assert!(tokens.len() >= seq_len, "tokens slice shorter than seq_len");
+        let pos = start_pos as usize;
 
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
 
         // 把本段 prefill 的 seq_len 个绝对位置 [pos, pos+1, ..., pos+seq_len-1]
         // 写到 state.input_pos 前 seq_len 个元素，供 RoPE 按 per-row 语义消费。
         let positions_host: Vec<i32> = (0..seq_len).map(|i| (pos + i) as i32).collect();
-        match state.input_pos.device() {
-            crate::base::DeviceType::Cpu => {
-                let dst = state.input_pos.as_i32_mut()?.as_slice_mut()?;
-                dst[..seq_len].copy_from_slice(&positions_host);
-            }
-            #[cfg(feature = "cuda")]
-            crate::base::DeviceType::Cuda(_) => {
-                state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
-            }
-        }
+        state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
 
+        // MHA.forward 的 kv_len 参数：prefill 场景下为 start_pos（历史长度），
+        // 存在一个 host 侧单元素 tensor 中。
+        let mut kv_len_tensor = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        kv_len_tensor.as_i32_mut()?.as_slice_mut()?[0] = start_pos;
+
+        // tokens H2D 到 InputTokens buffer 的前 seq_len 个元素
         let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
-        let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
-        input_tokens_view.copy_from(tokens)?;
+        input_tokens_buffer.write_from_i32_host(tokens, seq_len)?;
+        let input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
 
         let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
         let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
@@ -590,7 +587,7 @@ impl Llama3 {
 
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let mut attn_out = attn_norm_out;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, pos_cpu, &mut attn_out, cuda_config_ref)?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &kv_len_tensor, &mut attn_out, cuda_config_ref)?;
             let mut wo_out = q;
             self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
 
@@ -677,12 +674,7 @@ impl Llama3 {
         // 性能最优。batch 路径的 "_batch" kernel 族只在 B>1 时才有必要。
         #[cfg(feature = "cuda")]
         if batch_size == 1 && self.device_type.is_cuda() {
-            // 构造 pos 的 CPU tensor (单元素)
-            let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = positions[0];
-            // tokens 在 forward_decoding 里内部用 state.output_token，这里传一个 placeholder
-            let placeholder = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            let tok = self.forward_decoding(&mut *states[0], &placeholder, &pos_cpu)?;
+            let tok = self.forward_decoding(&mut *states[0], positions[0])?;
             return Ok(vec![tok]);
         }
 
@@ -1318,5 +1310,61 @@ mod tests {
             (prompt_len + n_tok as f64) / (total_ms / 1000.0),
             if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
         Ok(())
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// LlmModel trait 实现
+// ══════════════════════════════════════════════════════════════════
+
+impl crate::model::llm::LlmModel for Llama3 {
+    fn config(&self) -> &crate::model::common::config::RuntimeModelConfig {
+        Llama3::config(self)
+    }
+
+    fn tokenizer(&self) -> &dyn crate::model::common::tokenizer::Tokenizer {
+        Llama3::tokenizer(self)
+    }
+
+    fn create_state(&self) -> Result<crate::model::runtime::InferenceState> {
+        Llama3::create_state(self)
+    }
+
+    fn forward_prefill(
+        &self,
+        state: &mut crate::model::runtime::InferenceState,
+        tokens: &[i32],
+        start_pos: i32,
+        seq_len: usize,
+    ) -> Result<i32> {
+        Llama3::forward_prefill(self, state, tokens, start_pos, seq_len)
+    }
+
+    fn forward_decoding(
+        &self,
+        state: &mut crate::model::runtime::InferenceState,
+        pos: i32,
+    ) -> Result<i32> {
+        Llama3::forward_decoding(self, state, pos)
+    }
+
+    fn forward_batch_decode(
+        &self,
+        states: &mut [&mut crate::model::runtime::InferenceState],
+        workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
+        positions: &[i32],
+        cuda_config: Option<&crate::OpConfig>,
+    ) -> Result<Vec<i32>> {
+        Llama3::forward_batch_decode(self, states, workspace, positions, cuda_config)
+    }
+
+    fn fill_rope_cache(
+        &self,
+        dst_sin: &mut Tensor,
+        dst_cos: &mut Tensor,
+    ) -> Result<()> {
+        crate::model::runtime::compute_rope_cache(
+            Llama3::config(self), dst_sin, dst_cos,
+        )
     }
 }

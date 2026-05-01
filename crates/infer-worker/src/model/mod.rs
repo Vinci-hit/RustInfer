@@ -16,38 +16,11 @@ use std::path::{Path, PathBuf};
 // 引入我们自己的模块和统一的错误处理
 use crate::base::error::{Error, Result};
 use safetensors::tensor::TensorView;
-use crate::{base::DeviceType, tensor::Tensor};
+use crate::tensor::Tensor;
 
-pub trait Model {
-    /// 初始化模型，包括创建层、加载权重等。
-    fn init(&mut self, device_type: DeviceType) -> Result<()>;
-
-    /// 执行一次完整的前向传播，并返回下一个 token 的 logits。
-    fn forward(&mut self, input: &Tensor, pos: &Tensor) -> Result<Tensor>;
-    /// 获取模型内部持有的 Tokenizer 的引用。
-    fn tokenizer(&self) -> &dyn Tokenizer;
-
-    /// 委托给内部的 Tokenizer 进行编码。
-    fn encode(&self, text: &str) -> Result<Vec<i32>> {
-        self.tokenizer().encode(text)
-    }
-
-    /// 委托给内部的 Tokenizer 进行解码。
-    fn decode(&self, ids: &[i32]) -> Result<String> {
-        self.tokenizer().decode(ids)
-    }
-
-    /// 判断给定的 token ID 是否为句末符 (end-of-sentence)。
-    /// 这个逻辑与 Tokenizer 紧密相关。
-    fn is_eos_token(&self, token_id: u32) -> bool;
-
-    // === KV Cache 管理 ===
-    // 含义：为了支持上下文切换或更复杂的采样策略，需要能从 KV Cache 中切片。
-    // 在 Rust 中，我们返回一个元组 `(Tensor, Tensor)`，分别代表 K 和 V Cache。
-    // `layer_idx`: 要操作的层索引。
-    // `start_pos`, `end_pos`: 要切片的位置范围。
-    fn slice_kv_cache(&self, layer_idx: usize, start_pos: usize, end_pos: usize) -> Result<(Tensor, Tensor)>;
-}
+// 注：原 `Model` trait 已删除。LLM 场景请实现 [`crate::model::llm::LlmModel`]
+// （由 `ModelRunner` 驱动）；Diffusion 场景实现
+// [`crate::model::diffusion::pipeline::DiffusionPipeline`]。
 
 #[derive(Debug)]
 pub struct TensorInfo {

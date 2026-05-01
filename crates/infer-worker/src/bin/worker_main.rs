@@ -81,7 +81,7 @@ fn main() {
     tracing::info!("Created {} inference states", states.len());
 
     // 预分配共享 buffer
-    let shared = SharedBuffers::new(args.max_batch_tokens, args.max_num_seqs, device)
+    let shared = SharedBuffers::new(args.max_batch_tokens, args.max_num_seqs)
         .expect("Failed to allocate shared buffers");
     tracing::info!("Shared buffers allocated");
 

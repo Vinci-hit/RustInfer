@@ -64,46 +64,7 @@ impl InferenceState {
         ]);
 
         if let [Some(sin_cache), Some(cos_cache)] = caches {
-            let target_device = sin_cache.device();
-            let head_size = config.head_size;
-            let max_seq_len = config.seq_len;
-
-            // Extract llama3 rope scaling params (factor=1.0 means no scaling)
-            let (factor, low_freq_factor, high_freq_factor, original_max_pos_emb) =
-                if let Some(ref scaling) = config.rope_scaling {
-                    if scaling.rope_type == "llama3" {
-                        (
-                            scaling.factor as f32,
-                            scaling.low_freq_factor.unwrap_or(1.0) as f32,
-                            scaling.high_freq_factor.unwrap_or(4.0) as f32,
-                            scaling.original_max_position_embeddings.unwrap_or(8192) as f32,
-                        )
-                    } else {
-                        (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
-                    }
-                } else {
-                    (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
-                };
-
-            match target_device {
-                DeviceType::Cpu => {
-                    // CPU path: use existing CPU kernel (no scaling support, fallback)
-                    crate::op::kernels::cpu::rope_sin_cos_cache_calc(
-                        head_size, max_seq_len, config.rope_theta,
-                        sin_cache, cos_cache,
-                    )?;
-                }
-                #[cfg(feature = "cuda")]
-                DeviceType::Cuda(_) => {
-                    crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
-                        head_size, max_seq_len, config.rope_theta,
-                        sin_cache, cos_cache,
-                        factor, low_freq_factor, high_freq_factor, original_max_pos_emb,
-                        None,
-                    )?;
-                }
-            }
-            Ok(())
+            compute_rope_cache(config, sin_cache, cos_cache)
         } else {
             Err(Error::InternalError("SinCache or CosCache not found in workspace".to_string()).into())
         }
@@ -138,4 +99,54 @@ impl InferenceState {
 
         Ok(buffers)
     }
+}
+
+/// 按 `config` 的 RoPE 超参（theta + Llama3 scaling）把 `dst_sin` / `dst_cos` 填满。
+/// 两个 tensor 形状都必须是 `[max_seq_len, head_size]`，device 可以是 CPU 或 CUDA。
+///
+/// Runner 的 `BatchWorkspace::{sin_cache, cos_cache}` 也通过这个函数初始化，
+/// 因此不再需要从某个 `InferenceState` 里借拷贝。
+pub fn compute_rope_cache(
+    config: &RuntimeModelConfig,
+    dst_sin: &mut Tensor,
+    dst_cos: &mut Tensor,
+) -> Result<()> {
+    let head_size = config.head_size;
+    let max_seq_len = config.seq_len;
+
+    // Llama3 rope scaling（factor=1.0 等同无 scaling）
+    let (factor, low_freq_factor, high_freq_factor, original_max_pos_emb) =
+        if let Some(ref scaling) = config.rope_scaling {
+            if scaling.rope_type == "llama3" {
+                (
+                    scaling.factor as f32,
+                    scaling.low_freq_factor.unwrap_or(1.0) as f32,
+                    scaling.high_freq_factor.unwrap_or(4.0) as f32,
+                    scaling.original_max_position_embeddings.unwrap_or(8192) as f32,
+                )
+            } else {
+                (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
+            }
+        } else {
+            (1.0f32, 1.0f32, 4.0f32, 8192.0f32)
+        };
+
+    match dst_sin.device() {
+        DeviceType::Cpu => {
+            crate::op::kernels::cpu::rope_sin_cos_cache_calc(
+                head_size, max_seq_len, config.rope_theta,
+                dst_sin, dst_cos,
+            )?;
+        }
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => {
+            crate::op::kernels::cuda::rope_sin_cos_cache_calc_cuda(
+                head_size, max_seq_len, config.rope_theta,
+                dst_sin, dst_cos,
+                factor, low_freq_factor, high_freq_factor, original_max_pos_emb,
+                None,
+            )?;
+        }
+    }
+    Ok(())
 }

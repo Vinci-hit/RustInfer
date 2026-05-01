@@ -43,8 +43,7 @@ fn test_worker_pipeline_cpu() {
     scheduler_pull.set_rcvtimeo(5000).unwrap(); // 5s timeout
 
     // 共享 buffer (CPU device)
-    let device = DeviceType::Cpu;
-    let shared = SharedBuffers::new(2048, 64, device).unwrap();
+    let shared = SharedBuffers::new(2048, 64).unwrap();
 
     // EOS token = 128009 (llama3), 我们用 dummy token 42, 不会触发 EOS
     // 但 max_tokens = 3, 所以第 3 步会 finished=true
@@ -142,8 +141,7 @@ fn test_worker_multi_request_batch() {
     scheduler_pull.connect(zmq_out_endpoint).unwrap();
     scheduler_pull.set_rcvtimeo(5000).unwrap();
 
-    let device = DeviceType::Cpu;
-    let shared = SharedBuffers::new(2048, 64, device).unwrap();
+    let shared = SharedBuffers::new(2048, 64).unwrap();
     let eos_token_id = 128009;
 
     let runner_shared = Arc::clone(&shared);
@@ -240,32 +238,17 @@ fn test_worker_with_llama3() {
     // 重新 generate 获取 token ids (generate 只返回 text)
     // 手动做 prefill + decode 收集 token ids
     let mut state2 = model_baseline.create_state().expect("create state2");
-    let mut input_tokens_t = infer_worker::tensor::Tensor::new(
-        &[prompt_tokens.len()], infer_worker::base::DataType::I32, DeviceType::Cpu,
-    ).unwrap();
-    input_tokens_t.as_i32_mut().unwrap().as_slice_mut().unwrap()
-        .copy_from_slice(&prompt_tokens);
-    let mut pos_t = infer_worker::tensor::Tensor::new(
-        &[1], infer_worker::base::DataType::I32, DeviceType::Cpu,
-    ).unwrap();
-    pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-
     let first_tok = model_baseline.forward_prefill(
-        &mut state2, &input_tokens_t, &pos_t, prompt_tokens.len(),
+        &mut state2, &prompt_tokens, 0, prompt_tokens.len(),
     ).expect("baseline prefill");
 
     let mut baseline_tokens = vec![first_tok];
     let mut current_token = first_tok;
-    let mut input_1 = infer_worker::tensor::Tensor::new(
-        &[1], infer_worker::base::DataType::I32, DeviceType::Cpu,
-    ).unwrap();
 
     for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_gen) {
         if current_token == eos_token_id { break; }
-        pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = pos as i32;
-        input_1.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = current_token;
         let next = model_baseline.forward_decoding(
-            &mut state2, &input_1, &pos_t,
+            &mut state2, pos as i32,
         ).expect("baseline decode");
         baseline_tokens.push(next);
         current_token = next;
@@ -281,7 +264,7 @@ fn test_worker_with_llama3() {
         states.push(model_worker.create_state().expect("create_state"));
     }
 
-    let shared = SharedBuffers::new(2048, max_num_seqs, device).unwrap();
+    let shared = SharedBuffers::new(2048, max_num_seqs).unwrap();
 
     let zmq_ctx = zmq::Context::new();
     let zmq_in_ep = "inproc://test-llama-in";

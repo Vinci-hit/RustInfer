@@ -1,5 +1,5 @@
 mod kv_cache;
-mod inference_state;
+pub mod inference_state;
 
 pub use kv_cache::KvCache;
-pub use inference_state::InferenceState;
+pub use inference_state::{InferenceState, compute_rope_cache};

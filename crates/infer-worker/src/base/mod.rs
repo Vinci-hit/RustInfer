@@ -1,6 +1,7 @@
 pub mod error;
 pub mod allocator;
 pub mod buffer;
+pub mod slice_utils;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {

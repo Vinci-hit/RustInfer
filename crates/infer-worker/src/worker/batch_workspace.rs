@@ -71,9 +71,12 @@ pub struct BatchWorkspace {
     pub k_cache_ptrs_dev: *mut u64,
     #[cfg(feature = "cuda")]
     pub v_cache_ptrs_dev: *mut u64,
-    /// 指针数组是否已经被填充过（按 (states, layer_num) 一次性填充，之后 graph replay 复用）
+    /// 指针数组是否已经被填充过（按 (states, layer_num) 一次性填充，之后 graph replay 复用）。
+    ///
+    /// Runner 不要直接写这个字段；改 batch 组合时请调用
+    /// [`BatchWorkspace::invalidate_batch_member_cache`] 语义更清晰。
     #[cfg(feature = "cuda")]
-    pub cache_ptrs_filled: bool,
+    pub(crate) cache_ptrs_filled: bool,
     /// layer_num（初始化时由模型 config 传入）
     pub layer_num: usize,
 
@@ -162,6 +165,17 @@ impl BatchWorkspace {
             max_batch_tokens,
             max_batch_seqs,
         })
+    }
+
+    /// 通知 workspace "下一次 `forward_batch_decode` 的 batch 成员已变化"，
+    /// 清掉所有依赖于 "具体 state 集合" 的缓存（目前是 K/V cache 指针数组）。
+    ///
+    /// Runner 在检测到 decode 组的 slot 集合变化时调用。
+    pub fn invalidate_batch_member_cache(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            self.cache_ptrs_filled = false;
+        }
     }
 }
 

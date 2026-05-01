@@ -1,41 +1,116 @@
-use std::sync::atomic::{AtomicU8, AtomicU32};
+//! 进程内共享的 Server ↔ Runner 交换区 + 同步协议。
+//!
+//! # 设计约定
+//! - 所有 i32 metadata 都在 **CPU** 堆上，通过 `SyncBuf<T>` 零拷贝读写；
+//!   Runner / Server 使用原生 `&[i32]` / `&mut [i32]`，没有 cudaMemcpy / Vec 分配。
+//! - 唯一的跨线程同步机制是 `input_meta` / `output_meta` 里的原子信号：
+//!
+//! ```text
+//! Server 写 input ─────────────► store(input.ready, total_tokens)      [Release]
+//! Runner   load(input.ready)  ─► 读 input → 执行 → 写 output
+//!          store(input.ready, 0)            [Release]
+//!          store(output.ready, num_seqs)    [Release]
+//! Server   load(output.ready) ─► 读 output
+//!          store(output.ready, 0)           [Release]
+//!          写下一步 input  (此时 input.ready == 0，安全)
+//! ```
+//!
+//! 有了这个协议，`SyncBuf` 的 `&self` 读写方法在内部用 `UnsafeCell`，不走锁。
+
+use std::cell::UnsafeCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32};
 
 use crate::base::error::Result;
-use crate::base::{DataType, DeviceType};
-use crate::tensor::Tensor;
 
-/// 预分配的共享 GPU buffer，Server 和 Runner 通过它交换数据。
+/// CPU 上的固定容量 buffer，跨线程通过外部 atomic 信号保证独占访问。
 ///
-/// 同步协议:
-///   - Server 写 input buffer → store(input_ready, total_tokens) [Release]
-///   - Runner load(input_ready) [Acquire] → 读 input → 执行 → 写 output
-///     → store(input_ready, 0) [Release] → store(output_ready, num_seqs) [Release]
-///   - Server load(output_ready) [Acquire] → 读 output → store(output_ready, 0)
-///     → 写下一步 input (此时 input_ready==0，安全)
+/// # Safety invariant
+/// 调用者负责通过 [`InputMeta::ready`] / [`OutputMeta::ready`] 等原子信号，
+/// 保证任意时刻对同一 `SyncBuf` 的读/写访问不会重叠：
+/// - 仅当 `input.ready == 0` 时 Server 能写 input 类 buffer；
+/// - 仅当 `input.ready > 0` 且 `output.ready == 0` 时 Runner 能读 input / 写 output；
+/// - 仅当 `output.ready > 0` 时 Server 能读 output。
+pub struct SyncBuf<T> {
+    cell: UnsafeCell<Box<[T]>>,
+}
+
+// SAFETY: SyncBuf 的所有访问都经过外部同步协议（见类型文档）。
+unsafe impl<T: Send> Send for SyncBuf<T> {}
+unsafe impl<T: Send> Sync for SyncBuf<T> {}
+
+impl<T: Copy + Default> SyncBuf<T> {
+    pub fn new(capacity: usize) -> Self {
+        let v = vec![T::default(); capacity].into_boxed_slice();
+        Self { cell: UnsafeCell::new(v) }
+    }
+}
+
+impl<T> SyncBuf<T> {
+    /// 容量（元素数，不是字节）。
+    pub fn capacity(&self) -> usize {
+        // 从 raw pointer 拿长度而不产生对内部的 alias 借用：用 addr_of! 读 Box fat pointer 的 len 字。
+        // Box<[T]> 的内存布局是 (data_ptr, len)；直接投成 &[*mut T, usize] 拿 len。
+        // 更简单：UnsafeCell::get 后直接 read fat ptr 的两字，但那会 move Box —— 所以还是
+        // 在 unsafe 块内用 (&*raw_ptr).len()，并在函数签名上加 allow。
+        unsafe {
+            let ptr = self.cell.get();
+            #[allow(clippy::borrow_as_ptr)]
+            let b: &Box<[T]> = &*ptr;
+            b.len()
+        }
+    }
+
+    /// 读视图。
+    ///
+    /// # Safety
+    /// 调用方保证此时没有任何其他线程持有 `&mut` 视图。
+    #[inline]
+    pub unsafe fn as_slice(&self, len: usize) -> &[T] {
+        debug_assert!(len <= self.capacity());
+        // SAFETY: UnsafeCell 保证通过 &self 能拿 &mut 内部；
+        //         外部同步协议保证此时无 overlapping borrow。
+        let ptr: *const T = unsafe { (*self.cell.get()).as_ptr() };
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
+    /// 可写视图。
+    ///
+    /// # Safety
+    /// 调用方保证此时没有任何其他线程持有视图（读或写）。
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn as_mut_slice(&self, len: usize) -> &mut [T] {
+        debug_assert!(len <= self.capacity());
+        let ptr: *mut T = unsafe { (*self.cell.get()).as_mut_ptr() };
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+}
+
+/// 预分配的 Server ↔ Runner 交换区。
 pub struct SharedBuffers {
-    // ═══ Input (Server 写, Runner 读) ═══
-    pub input_token_ids: Tensor,
-    pub input_positions: Tensor,
-    pub input_q_start_loc: Tensor,
-    pub input_context_lens: Tensor,
-    pub input_slot_indices: Tensor,
+    // ── Input（Server 写，Runner 读）──
+    pub input_token_ids: SyncBuf<i32>,
+    pub input_positions: SyncBuf<i32>,
+    pub input_q_start_loc: SyncBuf<i32>,
+    pub input_context_lens: SyncBuf<i32>,
+    pub input_slot_indices: SyncBuf<i32>,
 
-    // ═══ Output (Runner 写, Server 读) ═══
-    pub output_token_ids: Tensor,
+    // ── Output（Runner 写，Server 读）──
+    pub output_token_ids: SyncBuf<i32>,
 
-    // ═══ 同步信号 ═══
+    // ── 同步信号 ──
     pub input_meta: InputMeta,
     pub output_meta: OutputMeta,
 
-    // ═══ 容量上限 ═══
+    // ── 容量上限 ──
     pub max_batch_tokens: usize,
     pub max_seqs: usize,
 }
 
-/// Server → Runner 同步信号 (CPU 原子变量)
+/// Server → Runner 同步信号。
 pub struct InputMeta {
-    /// 0 = 无输入; >0 = 输入就绪, 值 = total_tokens
+    /// 0 = 无输入；>0 = 输入就绪，值 = total_tokens
     pub ready: AtomicU32,
     /// 0 = DecodeOnly, 1 = MixedBatch
     pub batch_type: AtomicU8,
@@ -47,36 +122,24 @@ pub struct InputMeta {
     pub num_prefill_tokens: AtomicU32,
 }
 
-/// Runner → Server 同步信号
+/// Runner → Server 同步信号。
 pub struct OutputMeta {
-    /// 0 = 无输出; >0 = 输出就绪, 值 = num_seqs
+    /// 0 = 无输出；>0 = 输出就绪，值 = num_seqs
     pub ready: AtomicU32,
 }
 
 impl SharedBuffers {
-    /// 预分配所有共享 buffer
+    /// 按 `(max_batch_tokens, max_seqs)` 预分配所有 CPU 侧交换区。
     ///
-    /// # Arguments
-    /// * `max_batch_tokens` - 单步最大 token 数 (如 2048)
-    /// * `max_seqs` - 最大并发序列数 (如 64)
-    /// * `_device` - GPU 设备（保留参数；当前所有 metadata 放 CPU，无需 H2D/D2H）
-    ///
-    /// # Design note
-    /// 所有 5 个 input buffer + output token buffer 都放在 **CPU**：
-    ///   - Scheduler 的 metadata 本就在 host 上构造；
-    ///   - Runner 读出来也是 host 侧使用（分组、slot 取 state、构造 tokens_cpu/pos_cpu）；
-    ///   - 真正进 GPU 的只有 `forward_batch_decode` / `forward_prefill` 内部自行 H2D 的 `input_pos`
-    ///     等 kernel 参数（这些用 `cudaMemcpyAsync` 在模型 stream 上异步拷贝）。
-    /// 放在 CPU 可以省掉 Server↔Runner 之间 6 次同步 `cudaMemcpy`（~50 us/step）。
-    pub fn new(max_batch_tokens: usize, max_seqs: usize, _device: DeviceType) -> Result<Arc<Self>> {
-        let cpu = DeviceType::Cpu;
+    /// `device` 参数保留为未来可能的 pinned memory / GPU 镜像设计（当前未使用）。
+    pub fn new(max_batch_tokens: usize, max_seqs: usize) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            input_token_ids: Tensor::new(&[max_batch_tokens], DataType::I32, cpu)?,
-            input_positions: Tensor::new(&[max_batch_tokens], DataType::I32, cpu)?,
-            input_q_start_loc: Tensor::new(&[max_seqs + 1], DataType::I32, cpu)?,
-            input_context_lens: Tensor::new(&[max_seqs], DataType::I32, cpu)?,
-            input_slot_indices: Tensor::new(&[max_seqs], DataType::I32, cpu)?,
-            output_token_ids: Tensor::new(&[max_seqs], DataType::I32, cpu)?,
+            input_token_ids: SyncBuf::new(max_batch_tokens),
+            input_positions: SyncBuf::new(max_batch_tokens),
+            input_q_start_loc: SyncBuf::new(max_seqs + 1),
+            input_context_lens: SyncBuf::new(max_seqs),
+            input_slot_indices: SyncBuf::new(max_seqs),
+            output_token_ids: SyncBuf::new(max_seqs),
             input_meta: InputMeta {
                 ready: AtomicU32::new(0),
                 batch_type: AtomicU8::new(0),
@@ -90,88 +153,5 @@ impl SharedBuffers {
             max_batch_tokens,
             max_seqs,
         }))
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // H2D / D2H 方法
-    //
-    // Safety 说明:
-    //   这些方法通过 &self 调用却写入 GPU buffer。这在 Rust 的借用规则下
-    //   看起来违反了 &mut 要求,但实际上是安全的:
-    //   1. GPU memory 的写入是通过 cudaMemcpy 完成的,不受 Rust 内存模型管辖
-    //   2. 同步协议(input_ready / output_ready 原子信号)保证了:
-    //      - Server 写 input 时 Runner 不会读 input (input_ready == 0)
-    //      - Server 读 output 时 Runner 不会写 output (output_ready > 0)
-    //   3. 这与 UnsafeCell 的语义类似: 外部同步保证独占
-    // ═══════════════════════════════════════════════════════════
-
-    /// 将 CPU i32 slice 写入指定 GPU tensor 的前 count 个元素。
-    ///
-    /// # Safety guarantee
-    /// 调用者必须通过 input_ready == 0 确保 Runner 不在读此 buffer。
-    pub fn write_input_i32(&self, tensor: &Tensor, src: &[i32], count: usize) -> Result<()> {
-        debug_assert!(count <= src.len());
-        let elem_size = std::mem::size_of::<i32>();
-        let copy_bytes = count * elem_size;
-        debug_assert!(copy_bytes <= tensor.buffer().len_bytes());
-
-        let dst_ptr = tensor.buffer().as_ptr() as *mut u8;
-        let src_ptr = src.as_ptr() as *const u8;
-
-        #[cfg(feature = "cuda")]
-        {
-            if tensor.device().is_cuda() {
-                unsafe {
-                    crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
-                        dst_ptr as *mut _,
-                        src_ptr as *const _,
-                        copy_bytes,
-                        crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                    ))?;
-                }
-                return Ok(());
-            }
-        }
-
-        // CPU fallback
-        unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
-        }
-        Ok(())
-    }
-
-    /// 从 GPU tensor 的前 count 个 i32 元素 D2H copy 到 CPU Vec。
-    ///
-    /// # Safety guarantee
-    /// 调用者必须通过 output_ready > 0 确保 Runner 不在写此 buffer。
-    pub fn read_output_i32(&self, tensor: &Tensor, count: usize) -> Result<Vec<i32>> {
-        let elem_size = std::mem::size_of::<i32>();
-        let copy_bytes = count * elem_size;
-        debug_assert!(copy_bytes <= tensor.buffer().len_bytes());
-
-        let mut result = vec![0i32; count];
-        let src_ptr = tensor.buffer().as_ptr() as *const u8;
-        let dst_ptr = result.as_mut_ptr() as *mut u8;
-
-        #[cfg(feature = "cuda")]
-        {
-            if tensor.device().is_cuda() {
-                unsafe {
-                    crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
-                        dst_ptr as *mut _,
-                        src_ptr as *const _,
-                        copy_bytes,
-                        crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                    ))?;
-                }
-                return Ok(result);
-            }
-        }
-
-        // CPU fallback
-        unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_bytes);
-        }
-        Ok(result)
     }
 }

@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use infer_worker::base::{DataType, DeviceType};
+use infer_worker::base::DeviceType;
 use infer_worker::model::llm::llama3::Llama3;
-use infer_worker::tensor::Tensor;
 use infer_worker::worker::{
     BatchWorkspace, ModelRunner, SharedBuffers, WorkerServer,
 };
@@ -66,21 +65,14 @@ fn bench_worker_e2e_vs_direct() {
             (0..batch_size).map(|_| model.create_state().unwrap()).collect();
 
         for state in states.iter_mut() {
-            let mut input_tokens_t = Tensor::new(&[prompt_len], DataType::I32, DeviceType::Cpu).unwrap();
-            input_tokens_t.as_i32_mut().unwrap().as_slice_mut().unwrap()
-                .copy_from_slice(prompt_tokens);
-            let mut pos_t = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-            pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-            let _ = model.forward_prefill(state, &input_tokens_t, &pos_t, prompt_len).unwrap();
+            let _ = model.forward_prefill(state, prompt_tokens, 0, prompt_len).unwrap();
         }
 
         let mut workspace = BatchWorkspace::new(model.config(), 64, batch_size, device).unwrap();
-        workspace.sin_cache.copy_from(
-            states[0].workspace.get(&infer_worker::model::BufferType::SinCache).unwrap()
-        ).unwrap();
-        workspace.cos_cache.copy_from(
-            states[0].workspace.get(&infer_worker::model::BufferType::CosCache).unwrap()
-        ).unwrap();
+        {
+            use infer_worker::model::llm::LlmModel;
+            model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache).unwrap();
+        }
 
         let cuda_cfg = infer_worker::cuda::CudaConfig::new()
             .and_then(|c| c.with_flash_decode(
@@ -123,7 +115,7 @@ fn bench_worker_e2e_vs_direct() {
         let max_num_seqs = batch_size.max(1);
         let states: Vec<_> = (0..max_num_seqs).map(|_| model.create_state().unwrap()).collect();
 
-        let shared = SharedBuffers::new(2048, max_num_seqs, device).unwrap();
+        let shared = SharedBuffers::new(2048, max_num_seqs).unwrap();
 
         // ZMQ endpoints 用 inproc（同进程内）；唯一化避免多次 run_worker 冲突
         let tag = format!(

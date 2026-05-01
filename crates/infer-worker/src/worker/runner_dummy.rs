@@ -32,10 +32,13 @@ impl DummyModelRunner {
             let num_seqs = num_decode + num_prefill;
 
             // 写 dummy output
-            let dummy_tokens = vec![42i32; num_seqs];
-            self.shared
-                .write_input_i32(&self.shared.output_token_ids, &dummy_tokens, num_seqs)
-                .expect("write output");
+            // SAFETY: output_meta.ready==0 阶段由主循环同步协议保证 Server 不读 output。
+            unsafe {
+                let out = self.shared.output_token_ids.as_mut_slice(num_seqs);
+                for slot in out.iter_mut() {
+                    *slot = 42;
+                }
+            }
 
             // signal
             self.shared.input_meta.ready.store(0, Release);

@@ -799,36 +799,6 @@ impl Qwen3 {
 }
 
 // ============================================================================
-//  Model trait
-// ============================================================================
-use crate::model::Model;
-
-impl Model for Qwen3 {
-    fn init(&mut self, _device_type: DeviceType) -> Result<()> {
-        if let DeviceType::Cuda(device_id) = _device_type {
-            self.layers.to_cuda(device_id)?;
-        }
-        Ok(())
-    }
-
-    fn forward(&mut self, _input: &Tensor, _pos: &Tensor) -> Result<Tensor> {
-        Err(Error::InvalidArgument("forward not yet implemented for Qwen3".to_string()).into())
-    }
-
-    fn tokenizer(&self) -> &dyn Tokenizer {
-        self.tokenizer.as_ref()
-    }
-
-    fn is_eos_token(&self, token_id: u32) -> bool {
-        self.tokenizer.is_eos(token_id as i32)
-    }
-
-    fn slice_kv_cache(&self, _layer_idx: usize, _start_pos: usize, _end_pos: usize) -> Result<(Tensor, Tensor)> {
-        Err(Error::InvalidArgument("slice_kv_cache not yet implemented for Qwen3".to_string()).into())
-    }
-}
-
-// ============================================================================
 //  Tests
 // ============================================================================
 #[cfg(test)]

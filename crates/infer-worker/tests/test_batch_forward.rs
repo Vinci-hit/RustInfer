@@ -1,9 +1,7 @@
 //! 测试 batch forward 与串行 forward 输出一致性
 
 use infer_worker::base::DeviceType;
-use infer_worker::base::DataType;
 use infer_worker::model::llm::llama3::Llama3;
-use infer_worker::tensor::Tensor;
 use infer_worker::worker::BatchWorkspace;
 
 const MODEL_PATH: &str = "/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b";
@@ -29,20 +27,13 @@ fn test_batch_decode_matches_serial() {
     tracing::info!("Prompt '{}' → {:?}", prompt, &prompt_tokens);
 
     // Prefill
-    let mut input_tokens_t = Tensor::new(&[prompt_tokens.len()], DataType::I32, DeviceType::Cpu).unwrap();
-    input_tokens_t.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&prompt_tokens);
-    let mut pos_t = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-    pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-    let first_tok = model.forward_prefill(&mut state_serial, &input_tokens_t, &pos_t, prompt_tokens.len()).unwrap();
+    let first_tok = model.forward_prefill(&mut state_serial, &prompt_tokens, 0, prompt_tokens.len()).unwrap();
 
     // Decode
     let mut serial_tokens = vec![first_tok];
-    let mut input_1 = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
     for step in 0..num_decode_steps {
         let pos = (prompt_tokens.len() + step) as i32;
-        pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = pos;
-        input_1.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = serial_tokens.last().copied().unwrap();
-        let tok = model.forward_decoding(&mut state_serial, &input_1, &pos_t).unwrap();
+        let tok = model.forward_decoding(&mut state_serial, pos).unwrap();
         serial_tokens.push(tok);
     }
     tracing::info!("Serial tokens: {:?}", &serial_tokens);
@@ -51,18 +42,16 @@ fn test_batch_decode_matches_serial() {
     let mut state_batch = model.create_state().expect("create state");
 
     // 先做 prefill (用串行接口)
-    let mut input_tokens_t2 = Tensor::new(&[prompt_tokens.len()], DataType::I32, DeviceType::Cpu).unwrap();
-    input_tokens_t2.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&prompt_tokens);
-    pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-    let first_tok_batch = model.forward_prefill(&mut state_batch, &input_tokens_t2, &pos_t, prompt_tokens.len()).unwrap();
+    let first_tok_batch = model.forward_prefill(&mut state_batch, &prompt_tokens, 0, prompt_tokens.len()).unwrap();
     assert_eq!(first_tok_batch, first_tok, "Prefill output should match");
 
     // 创建 batch workspace
     let mut workspace = BatchWorkspace::new(model.config(), 64, 4, device).expect("create workspace");
-
-    // 复制 sin/cos cache 从 state 到 workspace
-    workspace.sin_cache.copy_from(state_batch.workspace.get(&infer_worker::model::BufferType::SinCache).unwrap()).unwrap();
-    workspace.cos_cache.copy_from(state_batch.workspace.get(&infer_worker::model::BufferType::CosCache).unwrap()).unwrap();
+    // RoPE cache 从 config 计算（不再从 state 里借）
+    {
+        use infer_worker::model::llm::LlmModel;
+        model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache).unwrap();
+    }
 
     // Batch decode
     let mut batch_tokens = vec![first_tok_batch];
@@ -112,31 +101,21 @@ fn test_batch_decode_two_seqs() {
     // ═══ 串行 baseline for prompt A ═══
     let mut state_a_serial = model.create_state().unwrap();
     let tokens_a = model.tokenizer().encode(prompt_a).unwrap();
-    let mut inp = Tensor::new(&[tokens_a.len()], DataType::I32, DeviceType::Cpu).unwrap();
-    inp.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&tokens_a);
-    let mut pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-    pos.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-    let first_a = model.forward_prefill(&mut state_a_serial, &inp, &pos, tokens_a.len()).unwrap();
+    let first_a = model.forward_prefill(&mut state_a_serial, &tokens_a, 0, tokens_a.len()).unwrap();
     let mut serial_a = vec![first_a];
-    let mut inp1 = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
     for step in 0..num_decode_steps {
-        pos.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = (tokens_a.len() + step) as i32;
-        inp1.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = *serial_a.last().unwrap();
-        serial_a.push(model.forward_decoding(&mut state_a_serial, &inp1, &pos).unwrap());
+        let p = (tokens_a.len() + step) as i32;
+        serial_a.push(model.forward_decoding(&mut state_a_serial, p).unwrap());
     }
 
     // ═══ 串行 baseline for prompt B ═══
     let mut state_b_serial = model.create_state().unwrap();
     let tokens_b = model.tokenizer().encode(prompt_b).unwrap();
-    let mut inp_b = Tensor::new(&[tokens_b.len()], DataType::I32, DeviceType::Cpu).unwrap();
-    inp_b.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&tokens_b);
-    pos.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-    let first_b = model.forward_prefill(&mut state_b_serial, &inp_b, &pos, tokens_b.len()).unwrap();
+    let first_b = model.forward_prefill(&mut state_b_serial, &tokens_b, 0, tokens_b.len()).unwrap();
     let mut serial_b = vec![first_b];
     for step in 0..num_decode_steps {
-        pos.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = (tokens_b.len() + step) as i32;
-        inp1.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = *serial_b.last().unwrap();
-        serial_b.push(model.forward_decoding(&mut state_b_serial, &inp1, &pos).unwrap());
+        let p = (tokens_b.len() + step) as i32;
+        serial_b.push(model.forward_decoding(&mut state_b_serial, p).unwrap());
     }
 
     tracing::info!("Serial A: {:?}", &serial_a);
@@ -147,22 +126,17 @@ fn test_batch_decode_two_seqs() {
     let mut state_b = model.create_state().unwrap();
 
     // Prefill (串行，因为 seq_len 不同)
-    let mut inp_a2 = Tensor::new(&[tokens_a.len()], DataType::I32, DeviceType::Cpu).unwrap();
-    inp_a2.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&tokens_a);
-    pos.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-    let first_a2 = model.forward_prefill(&mut state_a, &inp_a2, &pos, tokens_a.len()).unwrap();
-
-    let mut inp_b2 = Tensor::new(&[tokens_b.len()], DataType::I32, DeviceType::Cpu).unwrap();
-    inp_b2.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&tokens_b);
-    pos.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-    let first_b2 = model.forward_prefill(&mut state_b, &inp_b2, &pos, tokens_b.len()).unwrap();
+    let first_a2 = model.forward_prefill(&mut state_a, &tokens_a, 0, tokens_a.len()).unwrap();
+    let first_b2 = model.forward_prefill(&mut state_b, &tokens_b, 0, tokens_b.len()).unwrap();
 
     assert_eq!(first_a2, first_a);
     assert_eq!(first_b2, first_b);
 
     let mut workspace = BatchWorkspace::new(model.config(), 64, 4, device).unwrap();
-    workspace.sin_cache.copy_from(state_a.workspace.get(&infer_worker::model::BufferType::SinCache).unwrap()).unwrap();
-    workspace.cos_cache.copy_from(state_a.workspace.get(&infer_worker::model::BufferType::CosCache).unwrap()).unwrap();
+    {
+        use infer_worker::model::llm::LlmModel;
+        model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache).unwrap();
+    }
 
     let mut batch_a = vec![first_a2];
     let mut batch_b = vec![first_b2];
@@ -233,20 +207,14 @@ fn bench_batch_throughput() {
 
         // 对每个 state 做 prefill
         for state in states.iter_mut() {
-            let mut input_tokens_t = Tensor::new(&[prompt_len], DataType::I32, DeviceType::Cpu).unwrap();
-            input_tokens_t.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&prompt_tokens);
-            let mut pos_t = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-            pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-            let _first = model.forward_prefill(state, &input_tokens_t, &pos_t, prompt_len).unwrap();
+            let _first = model.forward_prefill(state, &prompt_tokens, 0, prompt_len).unwrap();
         }
 
         let mut workspace = BatchWorkspace::new(model.config(), 64, batch_size, device).unwrap();
-        workspace.sin_cache.copy_from(
-            states[0].workspace.get(&infer_worker::model::BufferType::SinCache).unwrap()
-        ).unwrap();
-        workspace.cos_cache.copy_from(
-            states[0].workspace.get(&infer_worker::model::BufferType::CosCache).unwrap()
-        ).unwrap();
+        {
+            use infer_worker::model::llm::LlmModel;
+            model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache).unwrap();
+        }
 
         let cuda_cfg = infer_worker::cuda::CudaConfig::new()
             .and_then(|c| c.with_flash_decode(
@@ -292,28 +260,18 @@ fn bench_batch_throughput() {
     // 顺便跟 serial forward_decoding 的 CUDA Graph 路径做对比（只对 B=1 有意义）
     let run_serial = || -> (f64, f64) {
         let mut state = model.create_state().unwrap();
-        let mut input_tokens_t = Tensor::new(&[prompt_len], DataType::I32, DeviceType::Cpu).unwrap();
-        input_tokens_t.as_i32_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&prompt_tokens);
-        let mut pos_t = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-        pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
-        let mut last = model.forward_prefill(&mut state, &input_tokens_t, &pos_t, prompt_len).unwrap();
+        let _last = model.forward_prefill(&mut state, &prompt_tokens, 0, prompt_len).unwrap();
 
         // warmup
         for step in 0..warmup_steps {
             let pos = (prompt_len + step) as i32;
-            pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = pos;
-            let mut inp = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-            inp.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = last;
-            last = model.forward_decoding(&mut state, &inp, &pos_t).unwrap();
+            model.forward_decoding(&mut state, pos).unwrap();
         }
 
         let start = std::time::Instant::now();
         for step in 0..bench_steps {
             let pos = (prompt_len + warmup_steps + step) as i32;
-            pos_t.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = pos;
-            let mut inp = Tensor::new(&[1], DataType::I32, DeviceType::Cpu).unwrap();
-            inp.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = last;
-            last = model.forward_decoding(&mut state, &inp, &pos_t).unwrap();
+            model.forward_decoding(&mut state, pos).unwrap();
         }
         let elapsed = start.elapsed();
         let per_step_us = elapsed.as_secs_f64() * 1e6 / bench_steps as f64;
