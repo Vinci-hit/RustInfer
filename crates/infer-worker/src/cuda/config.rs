@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::Mutex;
 
@@ -11,6 +12,29 @@ const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
 /// Split-K flash-decoding 用的 N_SPLIT 常量。
 /// 必须与 `.cu` 内 `N_SPLIT` / `N_SPLIT_1B` 保持一致；改常量需三处同步。
 pub const FLASH_DECODE_N_SPLIT: usize = 8;
+
+/// CUDA Graph 的用途分桶。一个 [`CudaConfig`] 可以同时 cache 多张不同用途/不同 batch
+/// 形状的 graph；同一 key 里只保存一张 graph（后 capture 的覆盖前一张）。
+///
+/// 当前 / 未来使用点：
+/// - [`GraphSlot::LlmDecode(batch_size)`] — **DecodeOnly** 路径：`forward_decoding` 传 1，
+///   `forward_batch_decode` 传实际 B。整个 forward 一次 capture。
+/// - [`GraphSlot::LlmMixedPreAttn(total_tokens)`] — **MixedBatch** 路径 attention 之前的部分
+///   （embedding / RMSNorm / wqkv / RoPE / scatter_kv）。attention 自身因 cu_seqlens 每步
+///   变化不进 graph；mixed batch 把 forward 拆成 pre-attn + attn(不入图) + post-attn 三段。
+/// - [`GraphSlot::LlmMixedPostAttn(total_tokens)`] — MixedBatch 路径 attention 之后的部分
+///   （wo / FFN / 最后的 rmsnorm + cls + sampler）。
+/// - [`GraphSlot::Denoise`] — 扩散模型 denoise step（Z-Image 等）。
+///
+/// 现在 llama3 还没实现 MixedBatch，MixedPre/Post 暂未使用，但 key 空间先留好；
+/// MixedBatch 落地时直接用，不再动 `CudaConfig` 的 API。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GraphSlot {
+    LlmDecode(usize),
+    LlmMixedPreAttn(usize),
+    LlmMixedPostAttn(usize),
+    Denoise,
+}
 
 /// CudaConfig 包含了执行 CUDA 内核所需的上下文信息。
 /// 例如 CUDA stream, cuBLAS handle, cuDNN handle 等。
@@ -44,10 +68,12 @@ pub struct CudaConfig {
     /// 默认 null；由 [`Self::with_flash_decode`] 按模型实际 shape 分配。
     pub flash_decode_workspace: *mut c_void,
     pub flash_decode_workspace_size: usize,
-    pub cuda_graph: Option<CudaGraph>,
-    /// Graph slot 专用于 `Llama3::forward_batch_decode` 的 batched decode 路径。
-    /// 与 `cuda_graph`（serial forward_decoding 使用）独立，互不干扰。
-    pub batch_graph: Option<CudaGraph>,
+    /// 按用途/shape 分桶 cache 的 CUDA Graph。key 见 [`GraphSlot`]。
+    /// 典型用法：
+    /// - LLM decode(B=1) → `LlmDecode`
+    /// - LLM batch decode → `LlmBatchDecode(batch_size)`（不同 B 独立 cache）
+    /// - 扩散 denoise → `Denoise`
+    pub graphs: HashMap<GraphSlot, CudaGraph>,
     /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
     pub cudnn_handle: ffi::cudnnHandle_t,
     /// Descriptor / algorithm / workspace cache shared across every
@@ -114,8 +140,7 @@ impl CudaConfig {
             workspace_size,
             flash_decode_workspace: std::ptr::null_mut(),
             flash_decode_workspace_size: 0,
-            cuda_graph: None,
-            batch_graph: None,
+            graphs: HashMap::new(),
             cudnn_handle,
             conv2d_cache: Mutex::new(
                 crate::op::kernels::cuda::Conv2dCache::default(),
@@ -228,109 +253,60 @@ impl CudaConfig {
 }
 
 impl CudaConfig {
-    pub fn capture_graph_begin(&mut self) -> Result<()> {
-        unsafe {
-            crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?;
-        }
-        Ok(())
+    // ─────────────────── Graph capture / replay API ───────────────────
+    //
+    // 所有调用方（LLM decode / LLM batch decode / diffusion denoise 等）都走这套；
+    // 用 `GraphSlot` 区分用途与 shape（对 LlmDecode 还带 batch_size 细分）。
+    //
+    // 使用范式（首次 capture + 之后 replay）：
+    //     let slot = GraphSlot::LlmDecode(batch_size);
+    //     if !cfg.graph_ready(slot) {
+    //         cfg.capture_begin()?;              // 开 stream capture
+    //         run_forward_once_in_capture(...)?; // 只记录、不执行
+    //         cfg.capture_end(slot)?;            // 结束 + instantiate，塞进 graphs[slot]
+    //         cfg.launch(slot)?;                 // 立刻 replay 一次，让本步真正算出来
+    //     } else {
+    //         cfg.launch(slot)?;                 // 直接 replay
+    //     }
+
+    /// 判断某 slot 是否已有 capture 好的 graph。
+    pub fn graph_ready(&self, slot: GraphSlot) -> bool {
+        self.graphs.contains_key(&slot)
     }
 
-    pub fn capture_graph_end(&mut self) -> Result<()> {
-        unsafe {
-            let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
-            crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
-
-            let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
-            crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
-
-            self.cuda_graph = Some(CudaGraph { graph, exec });
-        }
-        Ok(())
-    }
-
-    pub fn launch_graph(&self) -> Result<()> {
-        if let Some(cuda_graph) = &self.cuda_graph {
-            unsafe {
-                crate::cuda_check!(ffi::cudaGraphLaunch(cuda_graph.exec, self.stream))?;
-            }
-            Ok(())
-        } else {
-            Err(crate::base::error::Error::InvalidArgument("CUDA graph not captured".to_string()).into())
-        }
-    }
-
-    // ─────────────────── Batch-decode graph API ───────────────────
-    // 与 serial decode 的 cuda_graph 独立。
-    pub fn capture_batch_graph_begin(&mut self) -> Result<()> {
+    /// 开始 stream capture。`&self` 即可（capture state 由 CUDA driver 内部管理，
+    /// 实际把 graph 写入 HashMap 的动作在 `capture_end` 里，需 `&mut self`）。
+    pub fn capture_begin(&self) -> Result<()> {
         unsafe { crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?; }
         Ok(())
     }
-    pub fn capture_batch_graph_end(&mut self) -> Result<()> {
+
+    /// 结束 capture，instantiate 成可 replay 的 exec graph，并放到 `graphs[slot]`。
+    /// 如果该 slot 已存在旧 graph，会被覆盖（旧 graph 的 Drop 会 destroy）。
+    pub fn capture_end(&mut self, slot: GraphSlot) -> Result<()> {
         unsafe {
             let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
             crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
             let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
             crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
-            self.batch_graph = Some(CudaGraph { graph, exec });
-        }
-        Ok(())
-    }
-    pub fn launch_batch_graph(&self) -> Result<()> {
-        if let Some(g) = &self.batch_graph {
-            unsafe { crate::cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream))?; }
-            Ok(())
-        } else {
-            Err(crate::base::error::Error::InvalidArgument(
-                "batch CUDA graph not captured".to_string()).into())
-        }
-    }
-    pub fn batch_graph_ready(&self) -> bool { self.batch_graph.is_some() }
-
-    pub fn sync_stream(&self) -> Result<()> {
-        unsafe {
-            crate::cuda_check!(ffi::cudaStreamSynchronize(self.stream))?;
+            self.graphs.insert(slot, CudaGraph { graph, exec });
         }
         Ok(())
     }
 
-    // ─────────────────── Denoise graph API ───────────────────
-    //
-    // Denoise path shares the same `cuda_graph` slot.
-
-    pub fn denoise_graph_is_ready(&self) -> bool {
-        self.cuda_graph.is_some()
-    }
-
-    /// Begin stream capture on `self.stream`. Requires only `&self`
-    /// because `cudaStream_t` is a `Copy` handle — the graph-state
-    /// write happens in `denoise_capture_end` which takes `&mut self`.
-    pub fn denoise_capture_begin(&self) -> Result<()> {
-        unsafe {
-            crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?;
-        }
-        Ok(())
-    }
-
-    pub fn denoise_capture_end(&mut self) -> Result<()> {
-        unsafe {
-            let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
-            crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
-            let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
-            crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
-            self.cuda_graph = Some(CudaGraph { graph, exec });
-        }
-        Ok(())
-    }
-
-    pub fn denoise_graph_launch(&self) -> Result<()> {
-        let g = self.cuda_graph.as_ref().ok_or_else(|| {
+    /// Replay slot 里的 graph；如未 capture 返回错误。
+    pub fn launch(&self, slot: GraphSlot) -> Result<()> {
+        let g = self.graphs.get(&slot).ok_or_else(|| {
             crate::base::error::Error::InvalidArgument(
-                "denoise_graph_launch called before capture".into(),
+                format!("CUDA graph not captured for slot {:?}", slot)
             )
         })?;
-        unsafe {
-            crate::cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream))?;
-        }
+        unsafe { crate::cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream))?; }
+        Ok(())
+    }
+
+    pub fn sync_stream(&self) -> Result<()> {
+        unsafe { crate::cuda_check!(ffi::cudaStreamSynchronize(self.stream))?; }
         Ok(())
     }
 }

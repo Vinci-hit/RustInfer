@@ -425,12 +425,13 @@ impl Qwen3 {
         // CUDA Graph
         if self.device_type.is_cuda() {
             let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if cfg.cuda_graph.is_none() {
-                cfg.capture_graph_begin()?;
-            } else {
-                cfg.launch_graph()?;
+            let slot = crate::cuda::GraphSlot::LlmDecode(1);
+            if cfg.graph_ready(slot) {
+                cfg.launch(slot)?;
                 cfg.sync_stream()?;
                 return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
+            } else {
+                cfg.capture_begin()?;
             }
         }
 
@@ -546,7 +547,13 @@ impl Qwen3 {
 
         if self.device_type.is_cuda() {
             let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if cfg.cuda_graph.is_none() { cfg.capture_graph_end()?; }
+            let slot = crate::cuda::GraphSlot::LlmDecode(1);
+            if !cfg.graph_ready(slot) {
+                cfg.capture_end(slot)?;
+                // capture 期间 kernel 不执行，首次必须立刻 launch 一次。
+                cfg.launch(slot)?;
+                cfg.sync_stream()?;
+            }
         }
 
         Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])

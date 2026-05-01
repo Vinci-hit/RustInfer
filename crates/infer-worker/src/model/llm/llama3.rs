@@ -408,12 +408,13 @@ impl Llama3 {
         // CUDA Graph
         if self.device_type.is_cuda() {
             let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if cfg.cuda_graph.is_none() {
-                cfg.capture_graph_begin()?;
-            } else {
-                cfg.launch_graph()?;
+            let slot = crate::cuda::GraphSlot::LlmDecode(1);
+            if cfg.graph_ready(slot) {
+                cfg.launch(slot)?;
                 cfg.sync_stream()?;
                 return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
+            } else {
+                cfg.capture_begin()?;
             }
         }
 
@@ -521,11 +522,12 @@ impl Llama3 {
 
         if self.device_type.is_cuda() {
             let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            if cfg.cuda_graph.is_none() {
-                cfg.capture_graph_end()?;
+            let slot = crate::cuda::GraphSlot::LlmDecode(1);
+            if !cfg.graph_ready(slot) {
+                cfg.capture_end(slot)?;
                 // capture 期间 kernel 只被记录不被执行，所以 step 0 必须手动 launch
                 // 一次，否则 state.output_token 仍是上一步（prefill 最后一次）的值。
-                cfg.launch_graph()?;
+                cfg.launch(slot)?;
                 cfg.sync_stream()?;
             }
         }
@@ -793,9 +795,12 @@ impl Llama3 {
                     "forward_batch_decode graph path requires CudaConfig".into()
                 ))?;
 
-            if cuda_cfg.batch_graph_ready() {
+            // 按实际 batch_size 分桶 cache graph
+            let slot = crate::cuda::GraphSlot::LlmDecode(batch_size);
+
+            if cuda_cfg.graph_ready(slot) {
                 // Fast path: replay
-                cuda_cfg.launch_batch_graph()?;
+                cuda_cfg.launch(slot)?;
                 cuda_cfg.sync_stream()?;
             } else {
                 // Slow path:
@@ -803,7 +808,7 @@ impl Llama3 {
                 //   2) warmup 会把 sampler 新输出写到 workspace.output_tokens，把它重置回
                 //      每个 state.output_token 的原始值（= prefill/上一步 forward 的真实 input）
                 //   3) begin_capture → 第二次 forward (这次仅被记录) → end_capture
-                //   4) 立即 launch_batch_graph 一次，让本次 caller step 真正执行并返回正确 token
+                //   4) 立即 launch 一次，让本次 caller step 真正执行并返回正确 token
                 //
                 // KV cache 会被写两次（同 pos），第二次覆盖第一次 — 不影响正确性。
                 self.forward_batch_decode_capture(
@@ -829,13 +834,13 @@ impl Llama3 {
 
                 let cfg_ptr = cuda_cfg as *const crate::cuda::CudaConfig
                     as *mut crate::cuda::CudaConfig;
-                unsafe { (*cfg_ptr).capture_batch_graph_begin()?; }
+                cuda_cfg.capture_begin()?;
                 self.forward_batch_decode_capture(
                     states, workspace, batch_size, dim, q_dim, kv_dim, inter, qkv_cols,
                     cuda_config_ref,
                 )?;
-                unsafe { (*cfg_ptr).capture_batch_graph_end()?; }
-                cuda_cfg.launch_batch_graph()?;
+                unsafe { (*cfg_ptr).capture_end(slot)?; }
+                cuda_cfg.launch(slot)?;
                 cuda_cfg.sync_stream()?;
             }
         } else {

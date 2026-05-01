@@ -405,13 +405,14 @@ impl ZImagePipeline {
             let mut _t_launch_ms = 0.0_f64;
             let mut _t_sync_ms = 0.0_f64;
             with_cuda_stream(stream_copy, || -> Result<()> {
+                let slot = crate::cuda::GraphSlot::Denoise;
                 let graph_ready = self.text_encoder_state
                     .cuda_config.as_ref().unwrap()
-                    .denoise_graph_is_ready();
+                    .graph_ready(slot);
                 if !graph_ready {
                     // Begin capture (immutable borrow, drops before body).
                     self.text_encoder_state.cuda_config.as_ref().unwrap()
-                        .denoise_capture_begin()?;
+                        .capture_begin()?;
 
                     // Body — N denoise steps. Everything is dst-write
                     // into state slots; no Tensor::new, no HtoD.
@@ -421,7 +422,7 @@ impl ZImagePipeline {
 
                     // End capture (mutable borrow).
                     self.text_encoder_state.cuda_config.as_mut().unwrap()
-                        .denoise_capture_end()?;
+                        .capture_end(slot)?;
                 }
 
                 // Whether we just captured or were already hot, launch
@@ -429,7 +430,7 @@ impl ZImagePipeline {
                 // kernels.)
                 let _t_l = Instant::now();
                 self.text_encoder_state.cuda_config.as_ref().unwrap()
-                    .denoise_graph_launch()?;
+                    .launch(slot)?;
                 _t_launch_ms = _t_l.elapsed().as_micros() as f64 / 1000.0;
                 let _t_s = Instant::now();
                 self.text_encoder_state.cuda_config.as_ref().unwrap()
