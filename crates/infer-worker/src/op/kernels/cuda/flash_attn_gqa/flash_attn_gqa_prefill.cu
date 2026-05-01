@@ -1,3 +1,6 @@
+// flash_attn_gqa_prefill_kernel.cu
+// 泛型化的 Flash Attention GQA prefill kernel (head_dim=64)。
+// 一份模板代码，同时实例化 BF16 / FP16 两个 extern "C" 入口。
 #include <iostream>
 #include <vector>
 #include <random>
@@ -7,8 +10,18 @@
 #include "flash_attn_gqa.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_conversion.h>
+
+// 用 Elem 元素类型选择对应的 SM80 MMA atom。
+template <class Elem> struct ElementMmaAtom;
+template <> struct ElementMmaAtom<__nv_bfloat16> {
+    using type = cute::SM80_16x8x16_F32BF16BF16F32_TN;
+};
+template <> struct ElementMmaAtom<__half> {
+    using type = cute::SM80_16x8x16_F32F16F16F32_TN;
+};
 template <class ElementType, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV>
 struct SharedStorage {
     cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutQ>> smem_q;
@@ -210,17 +223,18 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     }
 }
 const int kNWarps = 4;
-template <class QShape, class KVShape,
+template <class Elem,
+          class QShape, class KVShape,
           class QStride, class QSmemLayout, class TiledCopyQ, class S2RAtom,
           class KStride, class KVSmemLayout, class TiledCopyK, class S2RAtomTrans, class SmemVTransNoSwi, class SmemVTrans,
           class VStride,
           class OStride, class OSmemLayout, class TiledCopyO, class TiledMma>
-__global__ void flash_attn_gqa_kernel_bf16_test(
+__global__ void flash_attn_gqa_kernel(
     QShape q_shape, KVShape kv_shape,
-    const __nv_bfloat16* __restrict__ q_ptr, QStride dQ, QSmemLayout sQ_layout, TiledCopyQ copy_q, S2RAtom s2r_atom,
-    const __nv_bfloat16* __restrict__ k_ptr, KStride dK, KVSmemLayout sKV_layout, TiledCopyK copy_kv, S2RAtomTrans s2r_atom_trans, SmemVTransNoSwi V_layout_trans_no_swi,SmemVTrans V_layout_trans,
-    const __nv_bfloat16* __restrict__ v_ptr, VStride dV,
-    __nv_bfloat16* __restrict__ o_ptr,OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma,
+    const Elem* __restrict__ q_ptr, QStride dQ, QSmemLayout sQ_layout, TiledCopyQ copy_q, S2RAtom s2r_atom,
+    const Elem* __restrict__ k_ptr, KStride dK, KVSmemLayout sKV_layout, TiledCopyK copy_kv, S2RAtomTrans s2r_atom_trans, SmemVTransNoSwi V_layout_trans_no_swi,SmemVTrans V_layout_trans,
+    const Elem* __restrict__ v_ptr, VStride dV,
+    Elem* __restrict__ o_ptr,OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma,
     int is_causal)
 {
     unsigned int q_head_idx = blockIdx.y;
@@ -235,9 +249,9 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     Tensor gK = local_tile(K(_,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0)); // 把第0个维度堆叠起来，变成（64,64，N/64）
     Tensor gV = local_tile(V(_,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0));
     Tensor gO = local_tile(O(_,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0));
-    extern __shared__ __nv_bfloat16 shared_memory[];
-    using SharedStorage = SharedStorage<__nv_bfloat16, QSmemLayout, KVSmemLayout,KVSmemLayout>;
-    SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+    extern __shared__ __align__(16) unsigned char flash_attn_gqa_shared_memory_bytes[];
+    using SharedStorage = SharedStorage<Elem, QSmemLayout, KVSmemLayout,KVSmemLayout>;
+    SharedStorage& smem = *reinterpret_cast<SharedStorage*>(flash_attn_gqa_shared_memory_bytes);
     Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.begin()), sQ_layout);
     Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.begin()), sKV_layout);
     Tensor sV = make_tensor(make_smem_ptr(smem.smem_v.begin()), sKV_layout);
@@ -361,7 +375,7 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
             reduce_sum</*zero_init=*/false>(scores, row_sum);
         }
 
-         Tensor rP = convert_type<__nv_bfloat16>(rS);
+         Tensor rP = convert_type<Elem>(rS);
          Tensor tOrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMma>(rP.layout()));
          gemm_rs(acc_o, tOrP, rVt, tOsVt, mma, s2r_copy_v, s2r_thr_copy_v);
      }
@@ -383,13 +397,13 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     }
 
     // Convert acc_o from fp32 to fp16/bf16
-    Tensor rO = convert_type<__nv_bfloat16>(acc_o);
+    Tensor rO = convert_type<Elem>(acc_o);
     // sO 复用 sQ 的 Shared Memory 空间 (节省显存)
     Tensor sO = make_tensor(sQ.data(), sO_layout);
 
     // 定义 Smem -> Reg 的拷贝策略 (用于 Output)
     // 这里的 Atom 必须支持向量化写入，且要配合 MMA 的布局
-    using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, __nv_bfloat16>;
+    using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Elem>;
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(threadIdx.x);
 
@@ -413,7 +427,7 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
 
     // 创建寄存器中转站 (用于谓词 Masking 拷贝)
-    Tensor tOrO = make_tensor<__nv_bfloat16>(shape(tOgO));
+    Tensor tOrO = make_tensor<Elem>(shape(tOgO));
 
     // 从 Smem 读到寄存器
     cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
@@ -446,8 +460,9 @@ __global__ void flash_attn_gqa_kernel_bf16_test(
     }
 }
 
-void launch_flash_attn_cute_128x64x64_tile(
-    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+template <class Elem>
+static void launch_flash_attn_cute_128x64x64_tile_impl(
+    const Elem* d_Q, const Elem* d_K, const Elem* d_V, Elem* d_O,
     int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
     int is_causal,
     cudaStream_t stream)
@@ -482,7 +497,7 @@ void launch_flash_attn_cute_128x64x64_tile(
     auto sKV = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockN>{}, Int<kHeadDim>{}));
 
     auto sO = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
-    using AtomGMEM = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, __nv_bfloat16>;
+    using AtomGMEM = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, Elem>;
 
     auto copy_q = make_tiled_copy(
         AtomGMEM{},
@@ -494,7 +509,7 @@ void launch_flash_attn_cute_128x64x64_tile(
         Layout<Shape<_16,_8>,Stride<_8,_1>>{},
         Layout<Shape< _1,_8>>{});
 
-    using AtomGMEM_Out = Copy_Atom<UniversalCopy<cute::uint128_t>, __nv_bfloat16>;
+    using AtomGMEM_Out = Copy_Atom<UniversalCopy<cute::uint128_t>, Elem>;
     auto copy_o = make_tiled_copy(
         AtomGMEM_Out{},
         make_layout(Shape<Int<128>, Int<1>>{}),
@@ -507,23 +522,24 @@ void launch_flash_attn_cute_128x64x64_tile(
     // M=128, N=64, K=64
     auto tile_shape = make_tile(Int<16 * kNWarps>{}, Int<64>{}, Int<64>{});
 
-    // 生成 MMA
+    // 生成 MMA: 依据 Elem 选择 BF16/FP16 版本的 atom
+    using MmaAtom = typename ElementMmaAtom<Elem>::type;
     auto mma = make_tiled_mma(
-        SM80_16x8x16_F32BF16BF16F32_TN{}, // Atom
+        MmaAtom{},                        // Atom（BF16 / FP16 自动分派）
         warp_layout,                      // Warp Layout (4x1x1)
         tile_shape                        // Tile Shape
     );
-    using S2RAtom = Copy_Atom<SM75_U32x4_LDSM_N, __nv_bfloat16>;
-    using S2RAtom_trans = Copy_Atom<SM75_U16x8_LDSM_T, __nv_bfloat16>;
+    using S2RAtom = Copy_Atom<SM75_U32x4_LDSM_N, Elem>;
+    using S2RAtom_trans = Copy_Atom<SM75_U16x8_LDSM_T, Elem>;
     // 6. Launch Config
     dim3 dimGrid(size(ceil_div(seq_len, Int<kBlockM>{})),
                size(q_heads));
     dim3 block(size(mma));
 
-    int smem_size = int(sizeof(SharedStorage<__nv_bfloat16, decltype(sQ), decltype(sKV), decltype(sKV)>));
+    int smem_size = int(sizeof(SharedStorage<Elem, decltype(sQ), decltype(sKV), decltype(sKV)>));
     
     // 8. 启动 Kernel
-    flash_attn_gqa_kernel_bf16_test<<<dimGrid, block, smem_size, stream>>>(
+    flash_attn_gqa_kernel<Elem><<<dimGrid, block, smem_size, stream>>>(
         q_shape, kv_shape,
         d_Q, stride_Q, sQ, copy_q, S2RAtom{},
         d_K, stride_K, sKV, copy_kv, S2RAtom_trans{},SmemLayoutVtransposedNoSwizzle{},SmemLayoutVtransposed{},
@@ -532,4 +548,27 @@ void launch_flash_attn_cute_128x64x64_tile(
         is_causal
     );
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- extern "C" 入口 ----
+// BF16: 名字与 flash_attn_gqa.h 声明保持一致（自带 C 链接）
+void launch_flash_attn_cute_128x64x64_tile(
+    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
+    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
+    int is_causal,
+    cudaStream_t stream)
+{
+    launch_flash_attn_cute_128x64x64_tile_impl<__nv_bfloat16>(
+        d_Q, d_K, d_V, d_O, seq_len, kv_len_ptr, q_heads, kv_heads, is_causal, stream);
+}
+
+// FP16: 与原 flash_attn_gqa_fp16.cu 保持相同签名
+extern "C" void launch_flash_attn_cute_128x64x64_tile_fp16(
+    const __half* d_Q, const __half* d_K, const __half* d_V, __half* d_O,
+    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
+    int is_causal,
+    cudaStream_t stream)
+{
+    launch_flash_attn_cute_128x64x64_tile_impl<__half>(
+        d_Q, d_K, d_V, d_O, seq_len, kv_len_ptr, q_heads, kv_heads, is_causal, stream);
 }
