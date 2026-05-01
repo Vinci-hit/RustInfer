@@ -7,6 +7,7 @@
 extern "C" {
 #endif
 
+// ---- F32 RoPE (z-image 等用，保留旧 pos_offset + seq_idx 语义) -----
 void rope_kernel_cu(
     int32_t dim,
     int32_t kv_dim,
@@ -17,8 +18,7 @@ void rope_kernel_cu(
     int32_t seq_len,
     const float* sin_cache,
     const float* cos_cache,
-    cudaStream_t stream
-);
+    cudaStream_t stream);
 
 void sin_cos_cache_calc_cu(
     int32_t head_size,
@@ -28,16 +28,38 @@ void sin_cos_cache_calc_cu(
     float* cos_cache,
     cudaStream_t stream);
 
+// ---- BF16 / FP16 RoPE：per-row pos，唯一版本 ----
+//
+// positions[i] 给第 i 行的绝对位置。prefill 时 caller 把 [p, p+1, ..., p+seq_len-1]
+// 写入；decode / batch decode 时 caller 按每 seq 的实际 pos 填。
+// q_row_stride / k_row_stride 允许 input 非连续（比如从 fused qkv slice 出来的
+// q/k 段），单位都是元素数（bf16/fp16）。
 void rope_kernel_cu_bf16(
     int32_t dim,
     int32_t kv_dim,
     int32_t head_size,
     __nv_bfloat16* input_q,
     __nv_bfloat16* input_k,
-    int32_t* input_pos,
+    const int32_t* positions,      // [seq_len]
     int32_t seq_len,
+    int32_t q_row_stride,
+    int32_t k_row_stride,
     __nv_bfloat16* sin_cache,
     __nv_bfloat16* cos_cache,
+    cudaStream_t stream);
+
+void rope_kernel_cu_fp16(
+    int32_t dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    __half* input_q,
+    __half* input_k,
+    const int32_t* positions,
+    int32_t seq_len,
+    int32_t q_row_stride,
+    int32_t k_row_stride,
+    __half* sin_cache,
+    __half* cos_cache,
     cudaStream_t stream);
 
 void sin_cos_cache_calc_cu_bf16(
@@ -52,18 +74,6 @@ void sin_cos_cache_calc_cu_bf16(
     float original_max_pos_emb,
     cudaStream_t stream);
 
-void rope_kernel_cu_fp16(
-    int32_t dim,
-    int32_t kv_dim,
-    int32_t head_size,
-    __half* input_q,
-    __half* input_k,
-    int32_t* input_pos,
-    int32_t seq_len,
-    __half* sin_cache,
-    __half* cos_cache,
-    cudaStream_t stream);
-
 void sin_cos_cache_calc_cu_fp16(
     int32_t head_size,
     int32_t max_seq_len,
@@ -74,35 +84,6 @@ void sin_cos_cache_calc_cu_fp16(
     float low_freq_factor,
     float high_freq_factor,
     float original_max_pos_emb,
-    cudaStream_t stream);
-
-// Batch decode：每行用 positions[i] 作为绝对位置
-void rope_kernel_cu_bf16_batch(
-    int32_t dim,
-    int32_t kv_dim,
-    int32_t head_size,
-    __nv_bfloat16* input_q,       // [B, q_row_stride] (至少前 num_q_heads*head_size 元素有效)
-    __nv_bfloat16* input_k,       // [B, k_row_stride]
-    const int32_t* positions,     // [B]
-    int32_t batch_size,
-    int32_t q_row_stride,         // elements per row in input_q
-    int32_t k_row_stride,         // elements per row in input_k
-    __nv_bfloat16* sin_cache,
-    __nv_bfloat16* cos_cache,
-    cudaStream_t stream);
-
-void rope_kernel_cu_fp16_batch(
-    int32_t dim,
-    int32_t kv_dim,
-    int32_t head_size,
-    __half* input_q,
-    __half* input_k,
-    const int32_t* positions,
-    int32_t batch_size,
-    int32_t q_row_stride,
-    int32_t k_row_stride,
-    __half* sin_cache,
-    __half* cos_cache,
     cudaStream_t stream);
 
 #ifdef __cplusplus

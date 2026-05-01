@@ -40,55 +40,14 @@ impl RoPEOp {
 }
 
 impl RoPEOp {
-    /// 执行 RoPE 前向计算: 就地旋转 Q 和 K
+    /// 就地对 Q / K 做 RoPE 旋转。**唯一入口**：
+    ///
+    /// - `positions` 是 I32 tensor，长度 == `q.shape()[0]`（= seq_len / batch_size /
+    ///   mixed batch 的 total_tokens），第 i 行的绝对位置由 `positions[i]` 决定。
+    /// - prefill 一段：caller 提前把 `[start, start+1, ..., start+seq_len-1]` 写进去。
+    /// - decode 单步：`positions = [p]`。
+    /// - batch decode：`positions = [p_0, p_1, ..., p_{B-1}]`。
     pub fn forward(
-        &self,
-        input_pos: &Tensor,
-        sin_cache: &Tensor,
-        cos_cache: &Tensor,
-        q: &mut Tensor,
-        k: &mut Tensor,
-        #[allow(unused_variables)]
-        cuda_config: Option<&OpConfig>,
-    ) -> Result<()> {
-        let device = q.device();
-        let seq_len = q.shape()[0];
-
-        match device {
-            DeviceType::Cpu => {
-                kernels::cpu::rope_kernel_batch(
-                    self.kv_dim,
-                    self.head_size,
-                    q,
-                    k,
-                    input_pos,
-                    sin_cache,
-                    cos_cache,
-                )?;
-            }
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                kernels::cuda::rope(
-                    self.dim,
-                    self.kv_dim,
-                    self.head_size,
-                    q,
-                    k,
-                    input_pos,
-                    seq_len as i32,
-                    sin_cache,
-                    cos_cache,
-                    cuda_config
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Batch decode 版本：每行 i 使用 positions[i] 作为绝对位置（不再是
-    /// positions[0] + i）。适用于 batch decode：q = [B, dim], k = [B, kv_dim],
-    /// positions = [B] (I32, device)。
-    pub fn forward_batch(
         &self,
         positions: &Tensor,
         sin_cache: &Tensor,
@@ -100,27 +59,21 @@ impl RoPEOp {
     ) -> Result<()> {
         match q.device() {
             DeviceType::Cpu => {
-                kernels::cpu::rope_kernel_batch_per_row(
+                kernels::cpu::rope_kernel_batch(
                     self.kv_dim,
                     self.head_size,
-                    q,
-                    k,
+                    q, k,
                     positions,
-                    sin_cache,
-                    cos_cache,
+                    sin_cache, cos_cache,
                 )?;
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                kernels::cuda::rope_batch(
-                    self.dim,
-                    self.kv_dim,
-                    self.head_size,
-                    q,
-                    k,
+                kernels::cuda::rope(
+                    self.dim, self.kv_dim, self.head_size,
+                    q, k,
                     positions,
-                    sin_cache,
-                    cos_cache,
+                    sin_cache, cos_cache,
                     cuda_config,
                 )?;
             }
@@ -187,9 +140,15 @@ use crate::base::DeviceType;
         let mut input_k_f32 = Tensor::new(&[seq_len, kv_dim], dtype_f32, DeviceType::Cpu)?;
         input_k_f32.as_f32_mut()?.as_slice_mut()?.iter_mut().for_each(|x| *x = rng.random_range(0.0f32..1.0f32));
         
-        // Pos 张量
+        // Pos 张量：F32 kernel 仍用 "start_pos + seq_idx" 语义，input_pos 长度 1；
+        // BF16 / FP16 kernel 是 per-row 语义，用 input_positions 长度 seq_len。
         let mut input_pos = Tensor::new(&[1], pos_dtype, DeviceType::Cpu)?;
         input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos;
+        let mut input_positions = Tensor::new(&[seq_len], pos_dtype, DeviceType::Cpu)?;
+        {
+            let dst = input_positions.as_i32_mut()?.as_slice_mut()?;
+            for i in 0..seq_len { dst[i] = pos + i as i32; }
+        }
         
         // Sin/Cos 缓存 (F32)
         let mut sin_cache_f32 = Tensor::new(&[max_seq_len, head_size], dtype_f32, DeviceType::Cpu)?;
@@ -232,13 +191,13 @@ use crate::base::DeviceType;
         
         // --- 3. F32 计算 ---
         let op_f32 = RoPEOp::new(dim, kv_dim, head_size)?;
-        op_f32.forward(&input_pos, &sin_cache_f32, &cos_cache_f32, &mut input_q_f32, &mut input_k_f32, None)?;
+        op_f32.forward(&input_positions, &sin_cache_f32, &cos_cache_f32, &mut input_q_f32, &mut input_k_f32, None)?;
         let q_result_f32 = input_q_f32.as_f32()?.as_slice()?.to_vec();
         let k_result_f32 = input_k_f32.as_f32()?.as_slice()?.to_vec();
         
         // --- 4. BF16 计算 ---
         let op_bf16 = RoPEOp::new(dim, kv_dim, head_size)?;
-        op_bf16.forward(&input_pos, &sin_cache_bf16, &cos_cache_bf16, &mut input_q_bf16, &mut input_k_bf16, None)?;
+        op_bf16.forward(&input_positions, &sin_cache_bf16, &cos_cache_bf16, &mut input_q_bf16, &mut input_k_bf16, None)?;
         
         // 将 BF16 结果转换为 F32 用于比较
         let q_result_bf16: Vec<f32> = input_q_bf16.as_bf16()?.as_slice()?.iter().map(|&x| x.to_f32()).collect();
@@ -282,9 +241,12 @@ use crate::base::DeviceType;
             input_q.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&q_data);
             input_k.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&k_data);
 
-            // Prepare position tensor
-            let mut input_pos = Tensor::new(&[1], pos_dtype, device)?;
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos_value;
+            // per-row positions: [pos_value, pos_value+1, ..., pos_value+seq_len-1]
+            let mut input_pos = Tensor::new(&[seq_len], pos_dtype, device)?;
+            {
+                let dst = input_pos.as_i32_mut()?.as_slice_mut()?;
+                for i in 0..seq_len { dst[i] = pos_value + i as i32; }
+            }
 
             // Prepare sin/cos cache
             let max_seq_len = pos_value as usize + 100;
@@ -345,9 +307,12 @@ use crate::base::DeviceType;
             input_q.as_bf16_mut()?.buffer_mut().copy_from_host(&q_data)?;
             input_k.as_bf16_mut()?.buffer_mut().copy_from_host(&k_data)?;
 
-            // Prepare position tensor on CPU
-            let mut input_pos = Tensor::new(&[1], pos_dtype, DeviceType::Cpu)?;
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos_value;
+            // per-row positions: [pos_value, pos_value+1, ..., pos_value+seq_len-1]
+            let mut input_pos = Tensor::new(&[seq_len], pos_dtype, DeviceType::Cpu)?;
+            {
+                let dst = input_pos.as_i32_mut()?.as_slice_mut()?;
+                for i in 0..seq_len { dst[i] = pos_value + i as i32; }
+            }
             let input_pos_gpu = input_pos.to_cuda(0)?;
 
             // Prepare sin/cos cache on GPU
@@ -441,7 +406,7 @@ use crate::base::DeviceType;
         let mut pos_t = Tensor::new(&[batch], crate::base::DataType::I32, device)?;
         pos_t.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&positions);
         let op = RoPEOp::new(dim, kv_dim, head_size)?;
-        op.forward_batch(&pos_t, &sin_cache, &cos_cache, &mut q_a, &mut k_a, None)?;
+        op.forward(&pos_t, &sin_cache, &cos_cache, &mut q_a, &mut k_a, None)?;
 
         // --- B. 按 seq 循环调用 forward_batch (每次 B=1) ---
         let mut q_b = Tensor::new(&[batch, dim], dtype, device)?;
@@ -453,7 +418,7 @@ use crate::base::DeviceType;
             let mut k_row = k_b.slice(&[i, 0], &[1, kv_dim])?;
             let mut pos1 = Tensor::new(&[1], crate::base::DataType::I32, device)?;
             pos1.as_i32_mut()?.as_slice_mut()?[0] = positions[i];
-            op.forward_batch(&pos1, &sin_cache, &cos_cache, &mut q_row, &mut k_row, None)?;
+            op.forward(&pos1, &sin_cache, &cos_cache, &mut q_row, &mut k_row, None)?;
         }
 
         // --- 比对 ---
@@ -502,7 +467,7 @@ use crate::base::DeviceType;
         let mut pos_cpu_t = Tensor::new(&[batch], crate::base::DataType::I32, DeviceType::Cpu)?;
         pos_cpu_t.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&positions);
         let pos_gpu = pos_cpu_t.to_cuda(0)?;
-        op.forward_batch(&pos_gpu, &sin_gpu, &cos_gpu, &mut q_a, &mut k_a, Some(&cuda_cfg))?;
+        op.forward(&pos_gpu, &sin_gpu, &cos_gpu, &mut q_a, &mut k_a, Some(&cuda_cfg))?;
         cuda_cfg.sync_stream()?;
 
         // --- B. 循环每个 seq 调用原单 seq kernel ---

@@ -402,7 +402,11 @@ impl Llama3 {
     }
 
     pub fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
-        state.input_pos.copy_from(pos_cpu)?;
+        // state.input_pos 容量 [max_seq_len]，decode 只写前 1 个元素
+        {
+            let mut dst = state.input_pos.slice(&[0], &[1])?;
+            dst.copy_from(pos_cpu)?;
+        }
         let input_tokens_view = &state.output_token;
 
         // CUDA Graph
@@ -540,7 +544,19 @@ impl Llama3 {
 
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
 
-        state.input_pos.copy_from(pos_cpu)?;
+        // 把本段 prefill 的 seq_len 个绝对位置 [pos, pos+1, ..., pos+seq_len-1]
+        // 写到 state.input_pos 前 seq_len 个元素，供 RoPE 按 per-row 语义消费。
+        let positions_host: Vec<i32> = (0..seq_len).map(|i| (pos + i) as i32).collect();
+        match state.input_pos.device() {
+            crate::base::DeviceType::Cpu => {
+                let dst = state.input_pos.as_i32_mut()?.as_slice_mut()?;
+                dst[..seq_len].copy_from_slice(&positions_host);
+            }
+            #[cfg(feature = "cuda")]
+            crate::base::DeviceType::Cuda(_) => {
+                state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
+            }
+        }
 
         let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
@@ -907,16 +923,17 @@ impl Llama3 {
             #[cfg(feature = "cuda")]
             let split_stream = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
 
-            // RoPE batched (strided)：直接从 qkv 的 q/k 段寻址，不做 split_cols
+            // RoPE (strided)：直接从 qkv 的 q/k 段寻址，不做 split_cols
             #[cfg(feature = "cuda")]
             if self.device_type.is_cuda() && qkv.dtype() == DataType::BF16 {
-                crate::op::kernels::cuda::rope_batch_strided(
+                crate::op::kernels::cuda::rope_strided(
                     dim, kv_dim, self.config.head_size,
                     &mut qkv, &mut workspace.qkv_out, // k 也写在 qkv 上（同一块内存）
                     qkv_cols, qkv_cols,
+                    0, q_dim,                          // q_col_offset, k_col_offset
                     &input_pos_view,
                     &workspace.sin_cache, &workspace.cos_cache,
-                    batch_size, 0, q_dim,
+                    batch_size,
                     cuda_config_ref,
                 )?;
             }
@@ -932,17 +949,10 @@ impl Llama3 {
                 crate::op::split_cols::split_cols_tensor(
                     &qkv, &mut k, batch_size, qkv_cols, q_dim, kv_dim,
                 )?;
-                self.layers.rope_layers[layer_idx].forward_batch(
+                self.layers.rope_layers[layer_idx].forward(
                     &input_pos_view, &workspace.sin_cache, &workspace.cos_cache,
                     &mut q, &mut k, cuda_config_ref,
                 )?;
-                // 写回（CPU 不走 strided scatter / flash，下面会用独立 k/v）
-                // 注意：CPU 路径下 qkv 不再和后续对齐；但 CPU 通常不走这条 hot path
-                // （CPU 集成测试里 forward_batch_decode 也走这里）
-                // 为简化，保留 CPU 旧路径：从 qkv split k,v 传给 scatter/attn
-                // 这里提前把 k,v 分出来供后续使用
-                let _ = k; // k 已被 rope 改过, 但我们需要把它从 rope 后的 q 读回来
-                // 实际上 rope 改的是 q/k 本身。后面我们仍需 k/v split 给 CPU mha
             }
 
             // scatter_kv_batch (strided)：从 qkv 的 k/v 段直接寻址

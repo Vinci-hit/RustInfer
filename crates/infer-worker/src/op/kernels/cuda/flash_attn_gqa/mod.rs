@@ -254,14 +254,15 @@ pub unsafe fn flash_attn_gqa(
             unsafe {
                 if q_seq_len == 1 {
                     // Decode 路径走 split-K。调用方 CudaConfig 必须已经用
-                    // `.with_flash_decode(num_q_heads, head_dim)` 分配了 workspace。
+                    // `.with_flash_decode(num_q_heads, head_dim, max_batch_size)` 分配了 workspace。
                     let cfg = cuda_config.ok_or_else(|| Error::InvalidArgument(
                         "flash_attn_gqa BF16 decode path requires CudaConfig".into()
                     ))?;
                     if cfg.flash_decode_workspace.is_null() {
                         return Err(Error::InvalidArgument(
                             "CudaConfig.flash_decode_workspace not initialized; \
-                             construct the config as `CudaConfig::new()?.with_flash_decode(num_q_heads, head_dim)?`".into()
+                             construct the config as \
+                             `CudaConfig::new()?.with_flash_decode(num_q_heads, head_dim, max_batch_size)?`".into()
                         ).into());
                     }
                     let workspace_ptr = cfg.flash_decode_workspace as *mut f32;
@@ -398,9 +399,8 @@ pub unsafe fn flash_attn_gqa(
 /// - `kv_lens_dev` : [B] i32 device tensor，每 seq 的有效 kv 长度 - 1（kernel 内部会 +1）
 /// - `k_ptrs_dev` / `v_ptrs_dev` : 预分配的 device 指针数组 buffer（容量 ≥ B*8 bytes）
 ///
-/// `cuda_config` 必须满足 `with_flash_decode(num_q_heads, head_dim)`——
-/// 但 workspace 大小需要覆盖 B 段，调用方需使用 `flash_decode_workspace_size_batch` 辅助
-/// 函数或自行检查。
+/// `cuda_config` 必须已用 `with_flash_decode(num_q_heads, head_dim, max_batch_size)`
+/// 预分配了足够覆盖 B 段的 workspace；否则本函数会返回 workspace too small 错误。
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn flash_decoding_batch_bf16(
     q: &Tensor,

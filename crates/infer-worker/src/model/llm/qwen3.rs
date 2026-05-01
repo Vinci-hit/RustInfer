@@ -420,7 +420,10 @@ impl Qwen3 {
     }
 
     fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
-        state.input_pos.copy_from(pos_cpu)?;
+        {
+            let mut dst = state.input_pos.slice(&[0], &[1])?;
+            dst.copy_from(pos_cpu)?;
+        }
 
         // CUDA Graph
         if self.device_type.is_cuda() {
@@ -563,7 +566,18 @@ impl Qwen3 {
         let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
 
-        state.input_pos.copy_from(pos_cpu)?;
+        // 把本段 prefill 的 seq_len 个绝对位置写到 state.input_pos 前 seq_len 个元素。
+        let positions_host: Vec<i32> = (0..seq_len).map(|i| (pos + i) as i32).collect();
+        match state.input_pos.device() {
+            crate::base::DeviceType::Cpu => {
+                let dst = state.input_pos.as_i32_mut()?.as_slice_mut()?;
+                dst[..seq_len].copy_from_slice(&positions_host);
+            }
+            #[cfg(feature = "cuda")]
+            crate::base::DeviceType::Cuda(_) => {
+                state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
+            }
+        }
 
         let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
@@ -679,12 +693,22 @@ impl Qwen3 {
         seq_len: usize,
         num_layers: usize,
     ) -> Result<Tensor> {
-        // pos = 0 for text encoder (no prior KV cache)
+        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
+        // pos = 0 起步：text encoder 没有先前的 KV cache
+        let positions_host: Vec<i32> = (0..seq_len as i32).collect();
+        match state.input_pos.device() {
+            crate::base::DeviceType::Cpu => {
+                let dst = state.input_pos.as_i32_mut()?.as_slice_mut()?;
+                dst[..seq_len].copy_from_slice(&positions_host);
+            }
+            #[cfg(feature = "cuda")]
+            crate::base::DeviceType::Cuda(_) => {
+                state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
+            }
+        }
+        // MHA.forward 仍需要 [1] 的 kv_len tensor (值 = 0，表示之前没有 KV 历史)
         let mut pos_cpu_mut = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
         pos_cpu_mut.as_i32_mut()?.as_slice_mut()?[0] = 0;
-
-        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
-        state.input_pos.copy_from(&pos_cpu_mut)?;
 
         let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
         let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;

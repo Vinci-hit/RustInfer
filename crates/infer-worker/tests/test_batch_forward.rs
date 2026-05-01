@@ -68,7 +68,7 @@ fn test_batch_decode_matches_serial() {
     let mut batch_tokens = vec![first_tok_batch];
     let mut states = [state_batch];
     let cuda_cfg = infer_worker::cuda::CudaConfig::new()
-        .and_then(|c| c.with_flash_decode_batch(model.config().head_num, model.config().head_size, 1))
+        .and_then(|c| c.with_flash_decode(model.config().head_num, model.config().head_size, 1))
         .expect("create cuda config");
     for step in 0..num_decode_steps {
         let pos = (prompt_tokens.len() + step) as i32;
@@ -167,7 +167,7 @@ fn test_batch_decode_two_seqs() {
     let mut batch_b = vec![first_b2];
     let mut states = [state_a, state_b];
     let cuda_cfg = infer_worker::cuda::CudaConfig::new()
-        .and_then(|c| c.with_flash_decode_batch(model.config().head_num, model.config().head_size, 2))
+        .and_then(|c| c.with_flash_decode(model.config().head_num, model.config().head_size, 2))
         .expect("create cuda config");
 
     for step in 0..num_decode_steps {
@@ -247,7 +247,7 @@ fn bench_batch_throughput() {
         ).unwrap();
 
         let cuda_cfg = infer_worker::cuda::CudaConfig::new()
-            .and_then(|c| c.with_flash_decode_batch(
+            .and_then(|c| c.with_flash_decode(
                 model.config().head_num,
                 model.config().head_size,
                 batch_size,

@@ -72,128 +72,16 @@ __global__ void rope_rotate_kernel(
 }
 
 
-// --- CUDA Kernel (BF16版本) ---
-/**
- * @brief RoPE 核心旋转操作的 CUDA 核函数 (BF16版本)。
- * 
- * 每个线程处理一个维度对 (i, i+1)，即旋转向量的一个元素对。
- * 我们假设这个 kernel 是针对 Batch size=1, Sequence length=1 的单个向量调用的。
- * 如果要处理更大的 Batch 或 Sequence，需要修改启动配置和索引逻辑。
- *
- * @param dim Q/K 向量的总旋转维度。
- * @param kv_dim K 向量旋转的维度。
- * @param head_size Attention Head 的大小。
- * @param input_q Q 张量的设备指针 (可读写)。
- * @param input_k K 张量的设备指针 (可读写)。
- * @param pos 当前位置索引 (单个 i32)。
- * @param sin_cache 正弦缓存 (只读)。
- * @param cos_cache 余弦缓存 (只读)。
- */
-__global__ void rope_rotate_kernel_llama3_bf16(
-    __nv_bfloat16* __restrict__ input_q,      // [seq_len, num_heads, head_size]
-    __nv_bfloat16* __restrict__ input_k,      // [seq_len, num_kv_heads, head_size]
-    const __nv_bfloat16* __restrict__ sin_cache, // [max_seq_len, head_size / 2]
-    const __nv_bfloat16* __restrict__ cos_cache, // [max_seq_len, head_size / 2]
-    const int num_heads,
-    const int num_kv_heads,
-    const int head_size,
-    const int* pos_offset,                     // 当前 batch 的起始位置偏移
-    const int seq_len                         // 当前处理的序列长度
-) {
-    // 1. 维度计算
-    const int tid = threadIdx.x;              // 0 -> half_head - 1
-    const int q_head_idx = blockIdx.x;        // 当前是第几个 Q head
-    const int seq_idx = blockIdx.y;           // 当前是序列中的第几个 token
-    const int half_head = head_size / 2;
-    const int group_size = num_heads / num_kv_heads; // GQA 分组大小
-
-    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= seq_len) {
-        return;
-    }
-
-    // 2. 计算 RoPE Cache 的绝对位置索引
-    // Llama 3 通常预计算好了 sin/cos，形状为 [max_seq, half_head]
-    int abs_pos = *pos_offset + seq_idx;
-    float sin_val = __bfloat162float(sin_cache[abs_pos * half_head + tid]);
-    float cos_val = __bfloat162float(cos_cache[abs_pos * half_head + tid]);
-
-    // 3. 处理 Query (Q)
-    // 计算当前线程对应的 Q 的两个分量位置
-    // 数据布局假设为: [seq, num_heads, head_size]
-    int q_base = (seq_idx * num_heads + q_head_idx) * head_size;
-    int idx_1 = q_base + tid;
-    int idx_2 = q_base + tid + half_head;
-
-    float q1 = __bfloat162float(input_q[idx_1]);
-    float q2 = __bfloat162float(input_q[idx_2]);
-
-    // RoPE 核心旋转公式
-    input_q[idx_1] = __float2bfloat16(q1 * cos_val - q2 * sin_val);
-    input_q[idx_2] = __float2bfloat16(q1 * sin_val + q2 * cos_val);
-
-    // 4. 处理 Key (K) - GQA 逻辑
-    // 只有当当前的 Q head 索引是一个组的第一个时，才处理 K，防止重复计算
-    if (q_head_idx % group_size == 0) {
-        int kv_head_idx = q_head_idx / group_size;
-        int k_base = (seq_idx * num_kv_heads + kv_head_idx) * head_size;
-        
-        int k_idx_1 = k_base + tid;
-        int k_idx_2 = k_base + tid + half_head;
-
-        float k1 = __bfloat162float(input_k[k_idx_1]);
-        float k2 = __bfloat162float(input_k[k_idx_2]);
-
-        input_k[k_idx_1] = __float2bfloat16(k1 * cos_val - k2 * sin_val);
-        input_k[k_idx_2] = __float2bfloat16(k1 * sin_val + k2 * cos_val);
-    }
-}
-
-void rope_kernel_cu_bf16(
-    int32_t dim,
-    int32_t kv_dim,
-    int32_t head_size,
-    __nv_bfloat16* input_q,
-    __nv_bfloat16* input_k,
-    int32_t* input_pos,
-    int32_t seq_len,
-    __nv_bfloat16* sin_cache,
-    __nv_bfloat16* cos_cache,
-    cudaStream_t stream)
-{
-    // 每个线程处理一对元素，所以 Block 大小为 head_size / 2
-    // 假设 head_size = 128 (Llama-3), threads = 64，一个 Warp 也就搞定了，效率很高
-    int threads_per_block = head_size / 2;
-    
-    // Grid.x = Head 的数量
-    int num_heads = dim / head_size; 
-    
-    // Grid.y = Sequence Length
-    dim3 grid(num_heads, seq_len);
-    rope_rotate_kernel_llama3_bf16<<<grid, threads_per_block, 0, stream>>>(
-        input_q,
-        input_k,
-        sin_cache,
-        cos_cache,
-        num_heads,
-        kv_dim / head_size,
-        head_size,
-        input_pos,
-        seq_len
-    );
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("RoPE Kernel Failed: %s\n", cudaGetErrorString(err));
-    }
-}
-
-// --- BF16 per-row pos 批量版本 (decode batching) ---
-// 与 rope_rotate_kernel_llama3_bf16 的唯一区别：
-//   abs_pos = positions[seq_idx]     (而非 pos_offset[0] + seq_idx)
+// --- CUDA Kernel (BF16 版本) ---
+//
+// RoPE 的唯一 BF16 内核：按"每行一个绝对位置"语义运行。
+//
+//   abs_pos = positions[seq_idx]
 //   q_row_stride / k_row_stride 用于支持非连续输入（如 qkv.slice 的 q、k 段）
-// 适用于 batch decode：每个 seq 各自 q/k 只有 1 行，但对应的绝对位置
-// positions[i] 完全独立。
-__global__ void rope_rotate_kernel_llama3_bf16_batch(
+//
+// 所有 caller（不管是 prefill 的 seq_len 行还是 decode 的 1/B 行）都走这条路径；
+// prefill 的 caller 负责在 host 上把 [p, p+1, ..., p+seq_len-1] 写到 positions[]。
+__global__ void rope_rotate_kernel_llama3_bf16(
     __nv_bfloat16* __restrict__ input_q,
     __nv_bfloat16* __restrict__ input_k,
     const __nv_bfloat16* __restrict__ sin_cache,
@@ -201,18 +89,18 @@ __global__ void rope_rotate_kernel_llama3_bf16_batch(
     const int num_heads,
     const int num_kv_heads,
     const int head_size,
-    const int* __restrict__ positions, // [batch_size], 每行绝对位置
-    const int batch_size,
+    const int* __restrict__ positions, // [seq_len]，每行绝对位置
+    const int seq_len,
     const int q_row_stride,            // elements (bf16) per row in input_q
     const int k_row_stride             // elements (bf16) per row in input_k
 ) {
     const int tid = threadIdx.x;
     const int q_head_idx = blockIdx.x;
-    const int seq_idx = blockIdx.y; // 行号 == batch 内 seq 下标
+    const int seq_idx = blockIdx.y;
     const int half_head = head_size / 2;
     const int group_size = num_heads / num_kv_heads;
 
-    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= batch_size) {
+    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= seq_len) {
         return;
     }
 
@@ -233,7 +121,6 @@ __global__ void rope_rotate_kernel_llama3_bf16_batch(
     if (q_head_idx % group_size == 0) {
         int kv_head_idx = q_head_idx / group_size;
         int k_base = seq_idx * k_row_stride + kv_head_idx * head_size;
-
         int k_idx_1 = k_base + tid;
         int k_idx_2 = k_base + tid + half_head;
 
@@ -245,14 +132,14 @@ __global__ void rope_rotate_kernel_llama3_bf16_batch(
     }
 }
 
-extern "C" void rope_kernel_cu_bf16_batch(
+extern "C" void rope_kernel_cu_bf16(
     int32_t dim,
     int32_t kv_dim,
     int32_t head_size,
     __nv_bfloat16* input_q,
     __nv_bfloat16* input_k,
     const int32_t* positions,
-    int32_t batch_size,
+    int32_t seq_len,
     int32_t q_row_stride,
     int32_t k_row_stride,
     __nv_bfloat16* sin_cache,
@@ -261,20 +148,12 @@ extern "C" void rope_kernel_cu_bf16_batch(
 {
     int threads_per_block = head_size / 2;
     int num_heads = dim / head_size;
-    dim3 grid(num_heads, batch_size);
+    dim3 grid(num_heads, seq_len);
 
-    rope_rotate_kernel_llama3_bf16_batch<<<grid, threads_per_block, 0, stream>>>(
-        input_q,
-        input_k,
-        sin_cache,
-        cos_cache,
-        num_heads,
-        kv_dim / head_size,
-        head_size,
-        positions,
-        batch_size,
-        q_row_stride,
-        k_row_stride
+    rope_rotate_kernel_llama3_bf16<<<grid, threads_per_block, 0, stream>>>(
+        input_q, input_k, sin_cache, cos_cache,
+        num_heads, kv_dim / head_size, head_size,
+        positions, seq_len, q_row_stride, k_row_stride
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -433,108 +312,9 @@ extern "C" void sin_cos_cache_calc_cu_bf16(
 
 
 
-// ============= FP16 variants (auto-generated from BF16) =============
+// ============= FP16 variants =============
 
 __global__ void rope_rotate_kernel_llama3_fp16(
-    __half* __restrict__ input_q,      // [seq_len, num_heads, head_size]
-    __half* __restrict__ input_k,      // [seq_len, num_kv_heads, head_size]
-    const __half* __restrict__ sin_cache, // [max_seq_len, head_size / 2]
-    const __half* __restrict__ cos_cache, // [max_seq_len, head_size / 2]
-    const int num_heads,
-    const int num_kv_heads,
-    const int head_size,
-    const int* pos_offset,                     // 当前 batch 的起始位置偏移
-    const int seq_len                         // 当前处理的序列长度
-) {
-    // 1. 维度计算
-    const int tid = threadIdx.x;              // 0 -> half_head - 1
-    const int q_head_idx = blockIdx.x;        // 当前是第几个 Q head
-    const int seq_idx = blockIdx.y;           // 当前是序列中的第几个 token
-    const int half_head = head_size / 2;
-    const int group_size = num_heads / num_kv_heads; // GQA 分组大小
-
-    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= seq_len) {
-        return;
-    }
-
-    // 2. 计算 RoPE Cache 的绝对位置索引
-    // Llama 3 通常预计算好了 sin/cos，形状为 [max_seq, half_head]
-    int abs_pos = *pos_offset + seq_idx;
-    float sin_val = __half2float(sin_cache[abs_pos * half_head + tid]);
-    float cos_val = __half2float(cos_cache[abs_pos * half_head + tid]);
-
-    // 3. 处理 Query (Q)
-    // 计算当前线程对应的 Q 的两个分量位置
-    // 数据布局假设为: [seq, num_heads, head_size]
-    int q_base = (seq_idx * num_heads + q_head_idx) * head_size;
-    int idx_1 = q_base + tid;
-    int idx_2 = q_base + tid + half_head;
-
-    float q1 = __half2float(input_q[idx_1]);
-    float q2 = __half2float(input_q[idx_2]);
-
-    // RoPE 核心旋转公式
-    input_q[idx_1] = __float2half(q1 * cos_val - q2 * sin_val);
-    input_q[idx_2] = __float2half(q1 * sin_val + q2 * cos_val);
-
-    // 4. 处理 Key (K) - GQA 逻辑
-    // 只有当当前的 Q head 索引是一个组的第一个时，才处理 K，防止重复计算
-    if (q_head_idx % group_size == 0) {
-        int kv_head_idx = q_head_idx / group_size;
-        int k_base = (seq_idx * num_kv_heads + kv_head_idx) * head_size;
-        
-        int k_idx_1 = k_base + tid;
-        int k_idx_2 = k_base + tid + half_head;
-
-        float k1 = __half2float(input_k[k_idx_1]);
-        float k2 = __half2float(input_k[k_idx_2]);
-
-        input_k[k_idx_1] = __float2half(k1 * cos_val - k2 * sin_val);
-        input_k[k_idx_2] = __float2half(k1 * sin_val + k2 * cos_val);
-    }
-}
-
-extern "C" void rope_kernel_cu_fp16(
-    int32_t dim,
-    int32_t kv_dim,
-    int32_t head_size,
-    __half* input_q,
-    __half* input_k,
-    int32_t* input_pos,
-    int32_t seq_len,
-    __half* sin_cache,
-    __half* cos_cache,
-    cudaStream_t stream)
-{
-    // 每个线程处理一对元素，所以 Block 大小为 head_size / 2
-    // 假设 head_size = 128 (Llama-3), threads = 64，一个 Warp 也就搞定了，效率很高
-    int threads_per_block = head_size / 2;
-    
-    // Grid.x = Head 的数量
-    int num_heads = dim / head_size; 
-    
-    // Grid.y = Sequence Length
-    dim3 grid(num_heads, seq_len);
-    rope_rotate_kernel_llama3_fp16<<<grid, threads_per_block, 0, stream>>>(
-        input_q,
-        input_k,
-        sin_cache,
-        cos_cache,
-        num_heads,
-        kv_dim / head_size,
-        head_size,
-        input_pos,
-        seq_len
-    );
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("RoPE Kernel Failed: %s\n", cudaGetErrorString(err));
-    }
-}
-
-// --- FP16 per-row pos 批量版本 ---
-__global__ void rope_rotate_kernel_llama3_fp16_batch(
     __half* __restrict__ input_q,
     __half* __restrict__ input_k,
     const __half* __restrict__ sin_cache,
@@ -543,7 +323,7 @@ __global__ void rope_rotate_kernel_llama3_fp16_batch(
     const int num_kv_heads,
     const int head_size,
     const int* __restrict__ positions,
-    const int batch_size,
+    const int seq_len,
     const int q_row_stride,
     const int k_row_stride
 ) {
@@ -553,7 +333,7 @@ __global__ void rope_rotate_kernel_llama3_fp16_batch(
     const int half_head = head_size / 2;
     const int group_size = num_heads / num_kv_heads;
 
-    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= batch_size) {
+    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= seq_len) {
         return;
     }
 
@@ -585,14 +365,14 @@ __global__ void rope_rotate_kernel_llama3_fp16_batch(
     }
 }
 
-extern "C" void rope_kernel_cu_fp16_batch(
+extern "C" void rope_kernel_cu_fp16(
     int32_t dim,
     int32_t kv_dim,
     int32_t head_size,
     __half* input_q,
     __half* input_k,
     const int32_t* positions,
-    int32_t batch_size,
+    int32_t seq_len,
     int32_t q_row_stride,
     int32_t k_row_stride,
     __half* sin_cache,
@@ -601,20 +381,12 @@ extern "C" void rope_kernel_cu_fp16_batch(
 {
     int threads_per_block = head_size / 2;
     int num_heads = dim / head_size;
-    dim3 grid(num_heads, batch_size);
+    dim3 grid(num_heads, seq_len);
 
-    rope_rotate_kernel_llama3_fp16_batch<<<grid, threads_per_block, 0, stream>>>(
-        input_q,
-        input_k,
-        sin_cache,
-        cos_cache,
-        num_heads,
-        kv_dim / head_size,
-        head_size,
-        positions,
-        batch_size,
-        q_row_stride,
-        k_row_stride
+    rope_rotate_kernel_llama3_fp16<<<grid, threads_per_block, 0, stream>>>(
+        input_q, input_k, sin_cache, cos_cache,
+        num_heads, kv_dim / head_size, head_size,
+        positions, seq_len, q_row_stride, k_row_stride
     );
     CUDA_CHECK(cudaGetLastError());
 }

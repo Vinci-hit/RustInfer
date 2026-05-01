@@ -27,16 +27,19 @@ impl InferenceState {
         let mut workspace = Self::init_workspace(config, &device_type)?;
         let sampler = Box::new(ArgmaxSampler::new(device_type));
         let output_token = Tensor::new(&[1], DataType::I32, device_type)?;
-        let input_pos = Tensor::new(&[1], DataType::I32, device_type)?;
+        // input_pos 长度 = max_seq_len，支持 prefill 一次填 seq_len 个绝对位置；
+        // decode 单步只填前 1 个元素。具体 caller 按 slice(&[0], &[seq_len]) 取视图。
+        let input_pos = Tensor::new(&[config.seq_len], DataType::I32, device_type)?;
 
         Self::calculate_rope_cache(config, &mut workspace)?;
 
         #[cfg(feature = "cuda")]
         let cuda_config = {
             // 按当前模型实际形状一次性分配 split-K flash-decoding workspace。
-            // 必须在任何 `capture_graph_begin` 之前完成（这里在 init，显然满足）。
+            // 必须在任何 graph capture 之前完成（这里在 init，显然满足）。
+            // 单 seq decode：max_batch_size = 1。
             let cfg = CudaConfig::new()?
-                .with_flash_decode(config.head_num, config.head_size)?;
+                .with_flash_decode(config.head_num, config.head_size, 1)?;
             Some(cfg)
         };
 

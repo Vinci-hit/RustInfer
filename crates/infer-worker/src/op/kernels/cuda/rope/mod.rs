@@ -3,8 +3,8 @@ use crate::tensor::Tensor;
 use crate::cuda::{self, CudaConfig};
 
 // --- FFI 声明 ---
-// 假设 C/C++ 端的 CUDA kernel 签名如下：
 unsafe extern "C" {
+    // F32 RoPE —— 保留旧 pos_offset+seq_idx 语义（z_image 等用）
     pub fn rope_kernel_cu(
         dim: i32,
         kv_dim: i32,
@@ -12,21 +12,24 @@ unsafe extern "C" {
         input_q: *mut f32,
         input_k: *mut f32,
         input_pos: *const i32,
-        seq_len:i32,
+        seq_len: i32,
         sin_cache: *const f32,
         cos_cache: *const f32,
         stream: cuda::ffi::cudaStream_t,
     );
-    
-    // BF16版本的ROPE CUDA kernel
+
+    // BF16 / FP16 RoPE —— **唯一** API，per-row pos 语义
+    //   positions[i] 是第 i 行的绝对位置，长度 == seq_len
     pub fn rope_kernel_cu_bf16(
         dim: i32,
         kv_dim: i32,
         head_size: i32,
         input_q: *mut half::bf16,
         input_k: *mut half::bf16,
-        input_pos: *const i32,
+        positions: *const i32,
         seq_len: i32,
+        q_row_stride: i32,
+        k_row_stride: i32,
         sin_cache: *const half::bf16,
         cos_cache: *const half::bf16,
         stream: cuda::ffi::cudaStream_t,
@@ -38,37 +41,8 @@ unsafe extern "C" {
         head_size: i32,
         input_q: *mut half::f16,
         input_k: *mut half::f16,
-        input_pos: *const i32,
+        positions: *const i32,
         seq_len: i32,
-        sin_cache: *const half::f16,
-        cos_cache: *const half::f16,
-        stream: cuda::ffi::cudaStream_t,
-    );
-
-    // Batch 版本: positions[i] 为第 i 行 (seq i) 的绝对位置
-    pub fn rope_kernel_cu_bf16_batch(
-        dim: i32,
-        kv_dim: i32,
-        head_size: i32,
-        input_q: *mut half::bf16,
-        input_k: *mut half::bf16,
-        positions: *const i32,
-        batch_size: i32,
-        q_row_stride: i32,
-        k_row_stride: i32,
-        sin_cache: *const half::bf16,
-        cos_cache: *const half::bf16,
-        stream: cuda::ffi::cudaStream_t,
-    );
-
-    pub fn rope_kernel_cu_fp16_batch(
-        dim: i32,
-        kv_dim: i32,
-        head_size: i32,
-        input_q: *mut half::f16,
-        input_k: *mut half::f16,
-        positions: *const i32,
-        batch_size: i32,
         q_row_stride: i32,
         k_row_stride: i32,
         sin_cache: *const half::f16,
@@ -77,20 +51,18 @@ unsafe extern "C" {
     );
 }
 
-/// Rotary Positional Embedding (RoPE) 的 CUDA 内核包装函数
+/// Rotary Positional Embedding 的 CUDA kernel 包装函数。
 ///
-/// 这是一个就地 (in-place) 操作，会修改 input_q 和 input_k 的内容。
+/// **唯一**入口：永远传一个位置数组。caller 永远负责把当前这批 token 的
+/// 绝对位置写到 `positions`（长度 = `input_q.shape()[0]`）。
+/// - decode 单步：positions = `[p]`
+/// - batch decode：positions = `[p_0, p_1, ..., p_{B-1}]`
+/// - prefill 一段：positions = `[start, start+1, ..., start+seq_len-1]`
 ///
 /// # Arguments
-/// * `dim`: Q 和 K 向量的总旋转维度。
-/// * `kv_dim`: K 向量旋转的维度。
-/// * `head_size`: Attention Head 的大小。
-/// * `input_q`: Query 张量, 被就地修改。
-/// * `input_k`: Key 张量, 被就地修改。
-/// * `input_pos`: 包含当前位置索引的张量。
-/// * `sin_cache`: 正弦缓存张量。
-/// * `cos_cache`: 余弦缓存张量。
-/// * `stream`: 可选的 CUDA stream。
+/// * `input_q` / `input_k` — in-place 修改，shape `[seq_len, num_q_heads*head_size]` /
+///   `[seq_len, num_kv_heads*head_size]`（连续内存）
+/// * `positions` — I32 device tensor, shape `[seq_len]`
 #[allow(clippy::too_many_arguments)]
 pub fn rope(
     dim: usize,
@@ -98,103 +70,111 @@ pub fn rope(
     head_size: usize,
     input_q: &mut Tensor,
     input_k: &mut Tensor,
-    input_pos: &Tensor,
-    seq_len:i32,
+    positions: &Tensor,
     sin_cache: &Tensor,
     cos_cache: &Tensor,
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
-    // --- 1. 根据数据类型获取具体类型和指针 ---
-    let dtype = input_q.dtype();
-    
-    // Pos 是 i32，需要不可变指针
-    let pos = input_pos.as_i32()?.buffer().as_ptr() as *const i32;
+    let seq_len = input_q.shape()[0];
+    rope_strided(
+        dim, kv_dim, head_size,
+        input_q, input_k,
+        dim, kv_dim, 0, 0,    // 连续内存，row_stride = inner_dim，col_offset = 0
+        positions,
+        sin_cache, cos_cache,
+        seq_len,
+        cuda_config,
+    )
+}
 
-    // --- 2. 维度检查和转换 ---
-    
-    // 维度转换为 i32。注意：这里我们信任上层 Op 已经做了充分的边界检查。
+/// RoPE 低层接口：允许传任意 row_stride / col_offset（元素单位），
+/// 使 q / k 可以指向 fused qkv tensor 的对应段，省去上游 split。
+#[allow(clippy::too_many_arguments)]
+pub fn rope_strided(
+    dim: usize,
+    kv_dim: usize,
+    head_size: usize,
+    q_tensor: &mut Tensor,
+    k_tensor: &mut Tensor,
+    q_row_stride: usize,
+    k_row_stride: usize,
+    q_col_offset: usize,
+    k_col_offset: usize,
+    positions: &Tensor,
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+    seq_len: usize,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    let dtype = q_tensor.dtype();
+    if positions.shape()[0] < seq_len {
+        return Err(Error::InvalidArgument(format!(
+            "rope_strided: positions.len ({}) < seq_len ({})",
+            positions.shape()[0], seq_len
+        )).into());
+    }
+
+    let pos_ptr = positions.as_i32()?.buffer().as_ptr() as *const i32;
     let dim_i32 = dim as i32;
     let kv_dim_i32 = kv_dim as i32;
     let head_size_i32 = head_size as i32;
-
-    if dim_i32 < 0 || kv_dim_i32 < 0 || head_size_i32 < 0 {
-         return Err(Error::InvalidArgument("RoPE dimensions must be non-negative.".to_string()).into());
-    }
-
-    // --- 3. 获取 CUDA stream ---
+    let q_stride_i32 = q_row_stride as i32;
+    let k_stride_i32 = k_row_stride as i32;
+    let seq_len_i32 = seq_len as i32;
     let stream = CudaConfig::resolve_stream(cuda_config);
 
-    // --- 4. 根据数据类型调用相应的 FFI 函数 ---
     match dtype {
-        crate::base::DataType::F32 => {
-            // Q 和 K 需要可变指针
-            let q_ptr = input_q.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-            let k_ptr = input_k.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-
-            // Cache 是 f32，需要不可变指针
-            let sin_ptr = sin_cache.as_f32()?.buffer().as_ptr() as *const f32;
-            let cos_ptr = cos_cache.as_f32()?.buffer().as_ptr() as *const f32;
-
-            unsafe {
-                rope_kernel_cu(
-                    dim_i32,
-                    kv_dim_i32,
-                    head_size_i32,
-                    q_ptr,       // *mut f32
-                    k_ptr,       // *mut f32
-                    pos,     // *const i32
-                    seq_len,
-                    sin_ptr,     // *const f32
-                    cos_ptr,     // *const f32
-                    stream,
-                );
-            }
-        }
         crate::base::DataType::BF16 => {
-            // Q 和 K 需要可变指针
-            let q_ptr = input_q.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let k_ptr = input_k.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-
-            // Cache 是 bf16，需要不可变指针
+            let q_base = q_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let k_base = k_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let q_ptr = unsafe { q_base.add(q_col_offset) };
+            let k_ptr = unsafe { k_base.add(k_col_offset) };
             let sin_ptr = sin_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
             let cos_ptr = cos_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-
             unsafe {
                 rope_kernel_cu_bf16(
-                    dim_i32,
-                    kv_dim_i32,
-                    head_size_i32,
-                    q_ptr,       // *mut bf16
-                    k_ptr,       // *mut bf16
-                    pos,     // const  * i32
-                    seq_len,
-                    sin_ptr,     // *const bf16
-                    cos_ptr,     // *const bf16
-                    stream,
+                    dim_i32, kv_dim_i32, head_size_i32,
+                    q_ptr, k_ptr, pos_ptr, seq_len_i32,
+                    q_stride_i32, k_stride_i32,
+                    sin_ptr, cos_ptr, stream,
                 );
             }
         }
         crate::base::DataType::F16 => {
-            // Q 和 K 需要可变指针
-            let q_ptr = input_q.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let k_ptr = input_k.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-
-            // Cache 是 fp16，需要不可变指针
+            let q_base = q_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let k_base = k_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let q_ptr = unsafe { q_base.add(q_col_offset) };
+            let k_ptr = unsafe { k_base.add(k_col_offset) };
             let sin_ptr = sin_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
             let cos_ptr = cos_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
-
             unsafe {
                 rope_kernel_cu_fp16(
-                    dim_i32,
-                    kv_dim_i32,
-                    head_size_i32,
-                    q_ptr,       // *mut fp16
-                    k_ptr,       // *mut fp16
-                    pos,     // const  * i32
-                    seq_len,
-                    sin_ptr,     // *const fp16
-                    cos_ptr,     // *const fp16
-                    stream,
+                    dim_i32, kv_dim_i32, head_size_i32,
+                    q_ptr, k_ptr, pos_ptr, seq_len_i32,
+                    q_stride_i32, k_stride_i32,
+                    sin_ptr, cos_ptr, stream,
+                );
+            }
+        }
+        crate::base::DataType::F32 => {
+            // F32 还用旧的 pos_offset+seq_idx 语义，限制 positions 必须是长度 1 的 "起始 pos"。
+            // （F32 RoPE 目前只有 z_image 的 non-LLM 路径在用。）
+            if positions.shape()[0] != 1 {
+                return Err(Error::InvalidArgument(
+                    "F32 RoPE kernel 仍采用 'start_pos + seq_idx' 语义，positions 必须长度 1".into()
+                ).into());
+            }
+            let q_base = q_tensor.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let k_base = k_tensor.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let q_ptr = unsafe { q_base.add(q_col_offset) };
+            let k_ptr = unsafe { k_base.add(k_col_offset) };
+            let sin_ptr = sin_cache.as_f32()?.buffer().as_ptr() as *const f32;
+            let cos_ptr = cos_cache.as_f32()?.buffer().as_ptr() as *const f32;
+            unsafe {
+                rope_kernel_cu(
+                    dim_i32, kv_dim_i32, head_size_i32,
+                    q_ptr, k_ptr, pos_ptr, seq_len_i32,
+                    sin_ptr, cos_ptr, stream,
                 );
             }
         }
@@ -204,9 +184,10 @@ pub fn rope(
             )).into());
         }
     }
-    
     Ok(())
 }
+
+// ─────────────────── sin/cos cache 计算（不受 rope 合并影响）───────────────────
 
 unsafe extern "C" {
     pub fn sin_cos_cache_calc_cu(
@@ -218,7 +199,6 @@ unsafe extern "C" {
         stream: cuda::ffi::cudaStream_t,
     );
 
-    // BF16版本的sin_cos_cache_calc CUDA kernel
     pub fn sin_cos_cache_calc_cu_bf16(
         head_size: i32,
         max_seq_len: i32,
@@ -246,14 +226,8 @@ unsafe extern "C" {
     );
 }
 
-/// 计算并填充正弦和余弦旋转嵌入 (RoPE) 的缓存的 CUDA 内核包装函数。
-///
-/// # Arguments
-/// * `head_size`: 旋转维度的大小 (K)。
-/// * `max_seq_len`: 序列的最大长度 (M)。
-/// * `sin_cache`: 正弦值输出张量, 形状 [max_seq_len, head_size]。
-/// * `cos_cache`: 余弦值输出张量, 形状 [max_seq_len, head_size]。
-/// * `cuda_config`: 可选的 CUDA 配置，用于获取 stream。
+/// 计算并填充 RoPE 的 sin/cos 缓存。
+#[allow(clippy::too_many_arguments)]
 pub fn sin_cos_cache_calc_cuda(
     head_size: usize,
     max_seq_len: usize,
@@ -267,196 +241,41 @@ pub fn sin_cos_cache_calc_cuda(
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     let dtype = sin_cache.dtype();
-   
-    // --- 2. 维度转换 ---
-    
-    // 维度转换为 i32
     let head_size_i32 = head_size as i32;
     let max_seq_len_i32 = max_seq_len as i32;
-
-    if head_size_i32 < 0 || max_seq_len_i32 < 0 {
-         return Err(Error::InvalidArgument("Dimensions must be non-negative.".to_string()).into());
-    }
-
-    // --- 3. 获取 CUDA stream ---
     let stream = CudaConfig::resolve_stream(cuda_config);
 
-    // --- 4. 根据数据类型调用相应的 FFI 函数 ---
     match dtype {
         crate::base::DataType::F32 => {
-            // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut f32)
             let sin_ptr = sin_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
             let cos_ptr = cos_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-
             unsafe {
-                sin_cos_cache_calc_cu(
-                    head_size_i32,
-                    max_seq_len_i32,
-                    rope_theta,
-                    sin_ptr,
-                    cos_ptr,
-                    stream,
-                );
+                sin_cos_cache_calc_cu(head_size_i32, max_seq_len_i32, rope_theta, sin_ptr, cos_ptr, stream);
             }
         }
         crate::base::DataType::BF16 => {
-            // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut bf16)
             let sin_ptr = sin_cache.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
             let cos_ptr = cos_cache.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-
             unsafe {
                 sin_cos_cache_calc_cu_bf16(
-                    head_size_i32,
-                    max_seq_len_i32,
-                    rope_theta,
-                    sin_ptr,
-                    cos_ptr,
-                    factor,
-                    low_freq_factor,
-                    high_freq_factor,
-                    original_max_pos_emb,
-                    stream,
+                    head_size_i32, max_seq_len_i32, rope_theta, sin_ptr, cos_ptr,
+                    factor, low_freq_factor, high_freq_factor, original_max_pos_emb, stream,
                 );
             }
         }
         crate::base::DataType::F16 => {
-            // sin_cache 和 cos_cache 都是输出，需要可变指针 (*mut fp16)
             let sin_ptr = sin_cache.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
             let cos_ptr = cos_cache.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-
             unsafe {
                 sin_cos_cache_calc_cu_fp16(
-                    head_size_i32,
-                    max_seq_len_i32,
-                    rope_theta,
-                    sin_ptr,
-                    cos_ptr,
-                    factor,
-                    low_freq_factor,
-                    high_freq_factor,
-                    original_max_pos_emb,
-                    stream,
+                    head_size_i32, max_seq_len_i32, rope_theta, sin_ptr, cos_ptr,
+                    factor, low_freq_factor, high_freq_factor, original_max_pos_emb, stream,
                 );
             }
         }
         _ => {
             return Err(Error::InvalidArgument(format!(
                 "Unsupported data type for sin_cos_cache_calc CUDA kernel: {:?}", dtype
-            )).into());
-        }
-    }
-    
-    Ok(())
-}
-
-/// RoPE batch decode 版本：对 [B, num_heads*head_size] 的 q / [B, num_kv_heads*head_size] 的 k
-/// 做就地旋转；每行 i 的绝对位置由 `positions[i]` 决定。
-///
-/// 与 `rope` 不同：`rope` 的 CUDA kernel 将 pos 视为"起始位置"，内部 abs_pos =
-/// pos[0] + seq_idx，要求一 batch 内所有 token 位置连续，这是 prefill 段语义；
-/// 本函数使用 `rope_kernel_cu_{bf16,fp16}_batch`，直接读 positions[seq_idx]。
-#[allow(clippy::too_many_arguments)]
-pub fn rope_batch(
-    dim: usize,
-    kv_dim: usize,
-    head_size: usize,
-    input_q: &mut Tensor,
-    input_k: &mut Tensor,
-    positions: &Tensor, // [B], I32, device
-    sin_cache: &Tensor,
-    cos_cache: &Tensor,
-    cuda_config: Option<&CudaConfig>,
-) -> Result<()> {
-    // 连续内存版：row_stride = inner dim
-    let batch_size = input_q.shape()[0];
-    rope_batch_strided(
-        dim, kv_dim, head_size,
-        input_q, input_k,
-        dim, kv_dim, // row strides = inner dims
-        positions,
-        sin_cache, cos_cache,
-        batch_size, 0, 0,
-        cuda_config,
-    )
-}
-
-/// RoPE batch decode 的低层接口：允许传任意 row_stride 和起点 offset（元素单位），
-/// 使 q / k 可直接指向 fused qkv tensor 里的对应段，省去 split_cols。
-///
-/// # Arguments
-/// * `q_tensor`, `k_tensor` — 起点 tensor（可以是 qkv 整块）
-/// * `q_row_stride`, `k_row_stride` — 每行元素数（对 fused qkv，= q_dim + 2*kv_dim）
-/// * `q_col_offset`, `k_col_offset` — 起点列（对 fused qkv，q=0, k=q_dim）
-/// * `batch_size` — 处理的行数
-#[allow(clippy::too_many_arguments)]
-pub fn rope_batch_strided(
-    dim: usize,
-    kv_dim: usize,
-    head_size: usize,
-    q_tensor: &mut Tensor,
-    k_tensor: &mut Tensor,
-    q_row_stride: usize,
-    k_row_stride: usize,
-    positions: &Tensor,
-    sin_cache: &Tensor,
-    cos_cache: &Tensor,
-    batch_size: usize,
-    q_col_offset: usize,
-    k_col_offset: usize,
-    cuda_config: Option<&CudaConfig>,
-) -> Result<()> {
-    let dtype = q_tensor.dtype();
-    if positions.shape()[0] < batch_size {
-        return Err(Error::InvalidArgument(format!(
-            "rope_batch_strided: positions.len ({}) < batch_size ({})",
-            positions.shape()[0], batch_size
-        )).into());
-    }
-
-    let pos_ptr = positions.as_i32()?.buffer().as_ptr() as *const i32;
-    let dim_i32 = dim as i32;
-    let kv_dim_i32 = kv_dim as i32;
-    let head_size_i32 = head_size as i32;
-    let q_stride_i32 = q_row_stride as i32;
-    let k_stride_i32 = k_row_stride as i32;
-    let stream = CudaConfig::resolve_stream(cuda_config);
-
-    match dtype {
-        crate::base::DataType::BF16 => {
-            let q_base = q_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let k_base = k_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let q_ptr = unsafe { q_base.add(q_col_offset) };
-            let k_ptr = unsafe { k_base.add(k_col_offset) };
-            let sin_ptr = sin_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let cos_ptr = cos_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            unsafe {
-                rope_kernel_cu_bf16_batch(
-                    dim_i32, kv_dim_i32, head_size_i32,
-                    q_ptr, k_ptr, pos_ptr, batch_size as i32,
-                    q_stride_i32, k_stride_i32,
-                    sin_ptr, cos_ptr, stream,
-                );
-            }
-        }
-        crate::base::DataType::F16 => {
-            let q_base = q_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let k_base = k_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let q_ptr = unsafe { q_base.add(q_col_offset) };
-            let k_ptr = unsafe { k_base.add(k_col_offset) };
-            let sin_ptr = sin_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let cos_ptr = cos_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
-            unsafe {
-                rope_kernel_cu_fp16_batch(
-                    dim_i32, kv_dim_i32, head_size_i32,
-                    q_ptr, k_ptr, pos_ptr, batch_size as i32,
-                    q_stride_i32, k_stride_i32,
-                    sin_ptr, cos_ptr, stream,
-                );
-            }
-        }
-        _ => {
-            return Err(Error::InvalidArgument(format!(
-                "Unsupported data type for rope_batch_strided: {:?}", dtype
             )).into());
         }
     }

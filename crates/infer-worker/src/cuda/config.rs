@@ -46,10 +46,14 @@ pub enum GraphSlot {
 ///
 /// - [`Self::flash_decode_workspace`] 给 split-K flash-decoding (pass-1 → pass-2) 用。
 ///   **默认不分配** (null)；在要跑 bf16 decode 的模型 init 时显式链式调用
-///   [`Self::with_flash_decode`] 按实际 `(num_q_heads, head_dim)` 一次性分配：
+///   [`Self::with_flash_decode`] 按实际 `(num_q_heads, head_dim, max_batch_size)`
+///   一次性分配：
 ///
 ///   ```ignore
-///   let cfg = CudaConfig::new()?.with_flash_decode(head_num, head_size)?;
+///   // serial 单 seq decode: max_batch_size = 1
+///   let cfg = CudaConfig::new()?.with_flash_decode(head_num, head_size, 1)?;
+///   // batched decode: 传上限 B
+///   let cfg = CudaConfig::new()?.with_flash_decode(head_num, head_size, max_batch)?;
 ///   ```
 ///
 ///   若 decode 路径 kernel 被调用时发现该字段为 null，dispatcher 会返回明确错误
@@ -155,29 +159,13 @@ impl CudaConfig {
     ///
     /// **只应调用一次，且必须在任何 `capture_graph_begin` 之前**。重复调用或在
     /// graph 捕获期间调用会 panic（前者是误用，后者会破坏 graph）。
+    /// 为 split-K flash-decoding 预分配 pass1→pass2 的 fp32 scratch。
+    ///
+    /// `max_batch_size` 是将要跑的 decode batch 的最大 B（serial 单 seq decode 传 1，
+    /// batched decode 传实际上限）。workspace 会按 `max_batch_size * per_seq` 分配。
+    ///
+    /// **只应调用一次，且必须在任何 graph capture 之前**。重复调用会 panic。
     pub fn with_flash_decode(
-        mut self,
-        num_q_heads: usize,
-        head_dim: usize,
-    ) -> Result<Self> {
-        assert!(
-            self.flash_decode_workspace.is_null(),
-            "with_flash_decode called twice on the same CudaConfig"
-        );
-
-        let elems = num_q_heads * FLASH_DECODE_N_SPLIT * (2 + head_dim);
-        let bytes = elems * std::mem::size_of::<f32>();
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut ptr, bytes))? };
-
-        self.flash_decode_workspace = ptr;
-        self.flash_decode_workspace_size = bytes;
-        Ok(self)
-    }
-
-    /// 同 `with_flash_decode`，但为 batched decode 预留 `max_batch_size * per_seq` 大小
-    /// 的 workspace。
-    pub fn with_flash_decode_batch(
         mut self,
         num_q_heads: usize,
         head_dim: usize,
@@ -185,7 +173,7 @@ impl CudaConfig {
     ) -> Result<Self> {
         assert!(
             self.flash_decode_workspace.is_null(),
-            "with_flash_decode_batch called on a CudaConfig that already has a workspace"
+            "with_flash_decode called twice on the same CudaConfig"
         );
         let per_seq = num_q_heads * FLASH_DECODE_N_SPLIT * (2 + head_dim);
         let bytes = max_batch_size.max(1) * per_seq * std::mem::size_of::<f32>();

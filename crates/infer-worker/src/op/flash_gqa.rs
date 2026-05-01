@@ -840,7 +840,7 @@ mod tests {
             o_a.as_bf16_mut()?.buffer_mut().copy_from_host(&zeros)?;
         }
         let cuda_cfg = CudaConfig::new()?
-            .with_flash_decode_batch(num_q_heads, head_dim, batch_size)?;
+            .with_flash_decode(num_q_heads, head_dim, batch_size)?;
 
         // 分配 device 指针 buffer
         let bytes_ptrs = batch_size * std::mem::size_of::<u64>();
@@ -881,7 +881,7 @@ mod tests {
             o_b.as_bf16_mut()?.buffer_mut().copy_from_host(&zeros)?;
         }
         let single_cfg = CudaConfig::new()?
-            .with_flash_decode(num_q_heads, head_dim)?;
+            .with_flash_decode(num_q_heads, head_dim, 1)?;
         let op = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
         for i in 0..batch_size {
             let q_row = q.slice(&[i, 0], &[1, q_dim])?;
