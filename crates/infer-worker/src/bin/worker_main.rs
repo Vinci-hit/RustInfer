@@ -98,7 +98,8 @@ fn main() {
 
     // 创建 Runner 和 Server
     let runner_shared = Arc::clone(&shared);
-    let runner = ModelRunner::new(model, states, runner_shared, device_id);
+    let runner = ModelRunner::new(model, states, runner_shared, device_id)
+        .expect("Failed to create ModelRunner");
 
     let server = WorkerServer::new(zmq_in, zmq_out, shared, device_id, 128009); // Llama3 EOS
 

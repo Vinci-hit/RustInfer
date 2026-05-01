@@ -656,9 +656,14 @@ impl Llama3 {
     /// * `states` - B 个 InferenceState (各自有独立 KV cache)
     /// * `workspace` - 共享的 batch workspace (预分配 [max_batch, dim] 等)
     /// * `positions` - [B] CPU i32, 每个 seq 的 decode position
+    /// Batched decode 入口。
+    ///
+    /// `states` 采用 `&mut [&mut InferenceState]`（可变引用切片）而非 `&mut [InferenceState]`，
+    /// 这样调用者可以从一个大 slot 池子里用 `get_disjoint_mut` / 手动 split 拿出任意子集，
+    /// 不要求它们在内存里连续——对 continuous batching 的 scheduler 是必需的。
     pub fn forward_batch_decode(
         &self,
-        states: &mut [InferenceState],
+        states: &mut [&mut InferenceState],
         workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
         positions: &[i32],
         cuda_config: Option<&crate::OpConfig>,
@@ -677,7 +682,7 @@ impl Llama3 {
             pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = positions[0];
             // tokens 在 forward_decoding 里内部用 state.output_token，这里传一个 placeholder
             let placeholder = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            let tok = self.forward_decoding(&mut states[0], &placeholder, &pos_cpu)?;
+            let tok = self.forward_decoding(&mut *states[0], &placeholder, &pos_cpu)?;
             return Ok(vec![tok]);
         }
 
@@ -891,7 +896,7 @@ impl Llama3 {
     #[allow(clippy::too_many_arguments)]
     fn forward_batch_decode_capture(
         &self,
-        states: &mut [InferenceState],
+        states: &mut [&mut InferenceState],
         workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
         batch_size: usize,
         dim: usize,

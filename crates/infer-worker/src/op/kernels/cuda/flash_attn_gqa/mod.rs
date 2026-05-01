@@ -49,6 +49,7 @@ unsafe extern "C" {
         k_ptr: *const half::f16,
         v_ptr: *const half::f16,
         o_ptr: *mut half::f16,
+        workspace: *mut f32,
         kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
@@ -97,6 +98,7 @@ unsafe extern "C" {
         k_ptr: *const half::f16,
         v_ptr: *const half::f16,
         o_ptr: *mut half::f16,
+        workspace: *mut f32,
         kv_seq_len: *const i32,
         num_q_heads: i32,
         num_kv_heads: i32,
@@ -331,12 +333,27 @@ pub unsafe fn flash_attn_gqa(
 
             unsafe {
                 if q_seq_len == 1 {
+                    // Decode 路径走 split-K（与 BF16 同结构）。调用方 CudaConfig 必须已经用
+                    // `.with_flash_decode(num_q_heads, head_dim, max_batch_size)` 分配了 workspace。
+                    let cfg = cuda_config.ok_or_else(|| Error::InvalidArgument(
+                        "flash_attn_gqa F16 decode path requires CudaConfig".into()
+                    ))?;
+                    if cfg.flash_decode_workspace.is_null() {
+                        return Err(Error::InvalidArgument(
+                            "CudaConfig.flash_decode_workspace not initialized; \
+                             construct the config as \
+                             `CudaConfig::new()?.with_flash_decode(num_q_heads, head_dim, max_batch_size)?`".into()
+                        ).into());
+                    }
+                    let workspace_ptr = cfg.flash_decode_workspace as *mut f32;
+
                     if head_dim_i32 <= 64 {
                         flash_decoding_cu_fp16(
                             q_ptr,
                             k_ptr,
                             v_ptr,
                             o_ptr,
+                            workspace_ptr,
                             current_kv_len_gpu,
                             num_q_heads_i32,
                             num_kv_heads_i32,
@@ -349,6 +366,7 @@ pub unsafe fn flash_attn_gqa(
                             k_ptr,
                             v_ptr,
                             o_ptr,
+                            workspace_ptr,
                             current_kv_len_gpu,
                             num_q_heads_i32,
                             num_kv_heads_i32,

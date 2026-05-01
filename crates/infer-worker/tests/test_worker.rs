@@ -299,7 +299,8 @@ fn test_worker_with_llama3() {
     scheduler_pull.set_rcvtimeo(60000).unwrap();
 
     let runner_shared = Arc::clone(&shared);
-    let runner = ModelRunner::new(model_worker, states, runner_shared, 0);
+    let runner = ModelRunner::new(model_worker, states, runner_shared, 0)
+        .expect("ModelRunner::new");
     thread::spawn(move || runner.run());
 
     let server_shared = Arc::clone(&shared);

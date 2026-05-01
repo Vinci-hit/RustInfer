@@ -73,7 +73,8 @@ fn test_batch_decode_matches_serial() {
     for step in 0..num_decode_steps {
         let pos = (prompt_tokens.len() + step) as i32;
         let positions = [pos];
-        let result = model.forward_batch_decode(&mut states, &mut workspace, &positions, Some(&cuda_cfg)).unwrap();
+        let mut refs: Vec<&mut _> = states.iter_mut().collect();
+        let result = model.forward_batch_decode(refs.as_mut_slice(), &mut workspace, &positions, Some(&cuda_cfg)).unwrap();
         assert_eq!(result.len(), 1);
         batch_tokens.push(result[0]);
     }
@@ -175,7 +176,8 @@ fn test_batch_decode_two_seqs() {
         let pos_b = (tokens_b.len() + step) as i32;
         let positions = [pos_a, pos_b];
 
-        let result = model.forward_batch_decode(&mut states, &mut workspace, &positions, Some(&cuda_cfg)).unwrap();
+        let mut refs: Vec<&mut _> = states.iter_mut().collect();
+        let result = model.forward_batch_decode(refs.as_mut_slice(), &mut workspace, &positions, Some(&cuda_cfg)).unwrap();
         assert_eq!(result.len(), 2);
         batch_a.push(result[0]);
         batch_b.push(result[1]);
@@ -257,8 +259,9 @@ fn bench_batch_throughput() {
         // Warmup
         for step in 0..warmup_steps {
             let positions: Vec<i32> = (0..batch_size).map(|_| (prompt_len + step) as i32).collect();
+            let mut refs: Vec<&mut _> = states.iter_mut().collect();
             let _ = model.forward_batch_decode(
-                &mut states, &mut workspace, &positions, Some(&cuda_cfg),
+                refs.as_mut_slice(), &mut workspace, &positions, Some(&cuda_cfg),
             ).unwrap();
         }
         cuda_cfg.sync_stream().unwrap();
@@ -269,8 +272,9 @@ fn bench_batch_throughput() {
             let positions: Vec<i32> = (0..batch_size)
                 .map(|_| (prompt_len + warmup_steps + step) as i32)
                 .collect();
+            let mut refs: Vec<&mut _> = states.iter_mut().collect();
             let _ = model.forward_batch_decode(
-                &mut states, &mut workspace, &positions, Some(&cuda_cfg),
+                refs.as_mut_slice(), &mut workspace, &positions, Some(&cuda_cfg),
             ).unwrap();
         }
         cuda_cfg.sync_stream().unwrap();

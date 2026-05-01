@@ -59,15 +59,24 @@ impl SharedBuffers {
     /// # Arguments
     /// * `max_batch_tokens` - 单步最大 token 数 (如 2048)
     /// * `max_seqs` - 最大并发序列数 (如 64)
-    /// * `device` - GPU 设备
-    pub fn new(max_batch_tokens: usize, max_seqs: usize, device: DeviceType) -> Result<Arc<Self>> {
+    /// * `_device` - GPU 设备（保留参数；当前所有 metadata 放 CPU，无需 H2D/D2H）
+    ///
+    /// # Design note
+    /// 所有 5 个 input buffer + output token buffer 都放在 **CPU**：
+    ///   - Scheduler 的 metadata 本就在 host 上构造；
+    ///   - Runner 读出来也是 host 侧使用（分组、slot 取 state、构造 tokens_cpu/pos_cpu）；
+    ///   - 真正进 GPU 的只有 `forward_batch_decode` / `forward_prefill` 内部自行 H2D 的 `input_pos`
+    ///     等 kernel 参数（这些用 `cudaMemcpyAsync` 在模型 stream 上异步拷贝）。
+    /// 放在 CPU 可以省掉 Server↔Runner 之间 6 次同步 `cudaMemcpy`（~50 us/step）。
+    pub fn new(max_batch_tokens: usize, max_seqs: usize, _device: DeviceType) -> Result<Arc<Self>> {
+        let cpu = DeviceType::Cpu;
         Ok(Arc::new(Self {
-            input_token_ids: Tensor::new(&[max_batch_tokens], DataType::I32, device)?,
-            input_positions: Tensor::new(&[max_batch_tokens], DataType::I32, device)?,
-            input_q_start_loc: Tensor::new(&[max_seqs + 1], DataType::I32, device)?,
-            input_context_lens: Tensor::new(&[max_seqs], DataType::I32, device)?,
-            input_slot_indices: Tensor::new(&[max_seqs], DataType::I32, device)?,
-            output_token_ids: Tensor::new(&[max_seqs], DataType::I32, device)?,
+            input_token_ids: Tensor::new(&[max_batch_tokens], DataType::I32, cpu)?,
+            input_positions: Tensor::new(&[max_batch_tokens], DataType::I32, cpu)?,
+            input_q_start_loc: Tensor::new(&[max_seqs + 1], DataType::I32, cpu)?,
+            input_context_lens: Tensor::new(&[max_seqs], DataType::I32, cpu)?,
+            input_slot_indices: Tensor::new(&[max_seqs], DataType::I32, cpu)?,
+            output_token_ids: Tensor::new(&[max_seqs], DataType::I32, cpu)?,
             input_meta: InputMeta {
                 ready: AtomicU32::new(0),
                 batch_type: AtomicU8::new(0),
