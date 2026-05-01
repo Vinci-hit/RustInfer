@@ -95,6 +95,27 @@ void launch_flash_attn_cute_bf16_hdim128(
     int is_causal,
     cudaStream_t stream);
 
+// Batched flash-decoding (BF16, head_dim=64):
+//   q_flat:  device [B, num_q_heads, HD] 连续
+//   k_ptrs_dev / v_ptrs_dev: 设备上的 B 个 cache 起点指针（指针数组本身在 device memory 中）
+//   o_flat:  device [B, num_q_heads, HD] 连续
+//   workspace: B * num_q_heads * N_SPLIT * (2 + HD) 个 float
+//   seq_lens_dev: device [B] int32 (= 每个 seq 的 kv_len)
+void flash_decoding_cu_bf16_batch(
+    const __nv_bfloat16* q_flat,
+    const __nv_bfloat16* const* k_ptrs_dev,
+    const __nv_bfloat16* const* v_ptrs_dev,
+    __nv_bfloat16* o_flat,
+    float* workspace,
+    const int32_t* seq_lens_dev,
+    int32_t batch_size,
+    int32_t num_q_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t q_row_stride,
+    int32_t o_row_stride,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

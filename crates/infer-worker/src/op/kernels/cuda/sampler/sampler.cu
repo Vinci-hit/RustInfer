@@ -181,3 +181,89 @@ extern "C" void argmax_cu_fp16_ffi(
     argmax_phase2<<<1, threads, 0, stream>>>(num_blocks, result_ptr_gpu);
 }
 
+
+// ============================================================================
+// Batched argmax: 每个 CUDA block 处理一个 seq 的 [vocab_size] logits 行。
+// 每行独立 BlockReduce，不需要 partial buffer。
+// ============================================================================
+template <typename T>
+__device__ inline float to_float_helper(T v);
+template <> __device__ inline float to_float_helper<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <> __device__ inline float to_float_helper<__half>(__half v) { return __half2float(v); }
+template <> __device__ inline float to_float_helper<float>(float v) { return v; }
+
+template <typename T>
+__global__ void argmax_batch_row_kernel(
+    const T* __restrict__ logits, // base pointer (不一定连续)
+    int vocab_size,
+    int row_stride,               // elements per row
+    int* __restrict__ out         // [B]
+)
+{
+    int seq = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const T* row = logits + (size_t)seq * row_stride;
+
+    float max_val = -3.40282e38f;
+    int   max_idx = -1;
+    for (int i = tid; i < vocab_size; i += blockDim.x) {
+        float v = to_float_helper<T>(row[i]);
+        if (v > max_val) { max_val = v; max_idx = i; }
+    }
+
+    using BlockReduce = cub::BlockReduce<cub::KeyValuePair<int, float>, 256>;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    cub::KeyValuePair<int, float> thread_data{max_idx, max_val};
+    auto argmax_op = [](const cub::KeyValuePair<int, float>& a,
+                        const cub::KeyValuePair<int, float>& b) {
+        return (a.value >= b.value) ? a : b;
+    };
+    auto block_result = BlockReduce(temp_storage).Reduce(thread_data, argmax_op);
+    if (tid == 0) {
+        out[seq] = block_result.key;
+    }
+}
+
+extern "C" void argmax_batch_cu_bf16_ffi(
+    const __nv_bfloat16* logits_ptr,
+    int batch_size,
+    int vocab_size,
+    int row_stride,
+    int* out_ptr,
+    cudaStream_t stream
+)
+{
+    const int threads = 256;
+    argmax_batch_row_kernel<__nv_bfloat16><<<batch_size, threads, 0, stream>>>(
+        logits_ptr, vocab_size, row_stride, out_ptr);
+}
+
+extern "C" void argmax_batch_cu_fp16_ffi(
+    const __half* logits_ptr,
+    int batch_size,
+    int vocab_size,
+    int row_stride,
+    int* out_ptr,
+    cudaStream_t stream
+)
+{
+    const int threads = 256;
+    argmax_batch_row_kernel<__half><<<batch_size, threads, 0, stream>>>(
+        logits_ptr, vocab_size, row_stride, out_ptr);
+}
+
+extern "C" void argmax_batch_cu_f32_ffi(
+    const float* logits_ptr,
+    int batch_size,
+    int vocab_size,
+    int row_stride,
+    int* out_ptr,
+    cudaStream_t stream
+)
+{
+    const int threads = 256;
+    argmax_batch_row_kernel<float><<<batch_size, threads, 0, stream>>>(
+        logits_ptr, vocab_size, row_stride, out_ptr);
+}

@@ -41,6 +41,25 @@ void argmax_cu_bf16_ffi(
     cudaStream_t stream
 );
 
+// Batched argmax: logits 起点 + row_stride (elements), 每 block 一个 seq 行，scan 前 vocab_size 列
+void argmax_batch_cu_bf16_ffi(
+    const __nv_bfloat16* logits_ptr,
+    int batch_size,
+    int vocab_size,
+    int row_stride,
+    int* out_ptr,
+    cudaStream_t stream
+);
+
+void argmax_batch_cu_f32_ffi(
+    const float* logits_ptr,
+    int batch_size,
+    int vocab_size,
+    int row_stride,
+    int* out_ptr,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

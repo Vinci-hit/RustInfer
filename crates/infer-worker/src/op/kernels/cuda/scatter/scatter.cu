@@ -228,3 +228,117 @@ extern "C" void scatter_kv_kernel_fp16(
     );
 }
 
+
+
+// ============================================================================
+// Batched scatter_kv：一次 kernel launch 写 B 行 K/V 到 B 个不同 cache
+// dst_k_ptrs / dst_v_ptrs 是设备上保存的 B 个指针数组（每个指向一个 cache 起点）
+// src_k, src_v 可以是非连续（如 fused qkv 的 k/v 段），通过
+// src_{k,v}_row_stride（元素单位）和 src_{k,v}_col_offset（元素单位）寻址。
+// ============================================================================
+
+__global__ void scatter_kv_batch_bf16_vec8_kernel(
+    __nv_bfloat16** __restrict__ dst_k_ptrs,
+    __nv_bfloat16** __restrict__ dst_v_ptrs,
+    const __nv_bfloat16* __restrict__ src_k_base,
+    const __nv_bfloat16* __restrict__ src_v_base,
+    const int* __restrict__ positions,
+    int kvdim,
+    int num_vec4,             // kvdim / 8
+    int src_k_row_stride,     // elements (bf16)
+    int src_v_row_stride
+)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int seq = blockIdx.y;
+    if (idx >= num_vec4) return;
+
+    const int pos = positions[seq];
+    const int dst_offset_vec = (pos * kvdim) / 8;
+
+    // Each seq's row starts at seq * row_stride (in bf16 elements) → /8 for float4
+    const int src_k_row_vec = (seq * src_k_row_stride) / 8;
+    const int src_v_row_vec = (seq * src_v_row_stride) / 8;
+
+    float4* dst_k_f4 = reinterpret_cast<float4*>(dst_k_ptrs[seq]);
+    float4* dst_v_f4 = reinterpret_cast<float4*>(dst_v_ptrs[seq]);
+    const float4* src_k_f4 = reinterpret_cast<const float4*>(src_k_base);
+    const float4* src_v_f4 = reinterpret_cast<const float4*>(src_v_base);
+
+    dst_k_f4[dst_offset_vec + idx] = src_k_f4[src_k_row_vec + idx];
+    dst_v_f4[dst_offset_vec + idx] = src_v_f4[src_v_row_vec + idx];
+}
+
+extern "C" void scatter_kv_batch_kernel_bf16(
+    __nv_bfloat16** dst_k_ptrs,
+    __nv_bfloat16** dst_v_ptrs,
+    const __nv_bfloat16* src_k,
+    const __nv_bfloat16* src_v,
+    const int* positions,
+    int batch_size,
+    int kvdim,
+    int src_k_row_stride,
+    int src_v_row_stride,
+    cudaStream_t stream)
+{
+    int num_vec4 = kvdim / 8;
+    const int threads_per_block = 256;
+    int blocks_x = (num_vec4 + threads_per_block - 1) / threads_per_block;
+    dim3 grid(blocks_x, batch_size);
+    scatter_kv_batch_bf16_vec8_kernel<<<grid, threads_per_block, 0, stream>>>(
+        dst_k_ptrs, dst_v_ptrs, src_k, src_v, positions,
+        kvdim, num_vec4, src_k_row_stride, src_v_row_stride
+    );
+}
+
+__global__ void scatter_kv_batch_fp16_vec8_kernel(
+    __half** __restrict__ dst_k_ptrs,
+    __half** __restrict__ dst_v_ptrs,
+    const __half* __restrict__ src_k_base,
+    const __half* __restrict__ src_v_base,
+    const int* __restrict__ positions,
+    int kvdim,
+    int num_vec4,
+    int src_k_row_stride,
+    int src_v_row_stride
+)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int seq = blockIdx.y;
+    if (idx >= num_vec4) return;
+
+    const int pos = positions[seq];
+    const int dst_offset_vec = (pos * kvdim) / 8;
+    const int src_k_row_vec = (seq * src_k_row_stride) / 8;
+    const int src_v_row_vec = (seq * src_v_row_stride) / 8;
+
+    float4* dst_k_f4 = reinterpret_cast<float4*>(dst_k_ptrs[seq]);
+    float4* dst_v_f4 = reinterpret_cast<float4*>(dst_v_ptrs[seq]);
+    const float4* src_k_f4 = reinterpret_cast<const float4*>(src_k_base);
+    const float4* src_v_f4 = reinterpret_cast<const float4*>(src_v_base);
+
+    dst_k_f4[dst_offset_vec + idx] = src_k_f4[src_k_row_vec + idx];
+    dst_v_f4[dst_offset_vec + idx] = src_v_f4[src_v_row_vec + idx];
+}
+
+extern "C" void scatter_kv_batch_kernel_fp16(
+    __half** dst_k_ptrs,
+    __half** dst_v_ptrs,
+    const __half* src_k,
+    const __half* src_v,
+    const int* positions,
+    int batch_size,
+    int kvdim,
+    int src_k_row_stride,
+    int src_v_row_stride,
+    cudaStream_t stream)
+{
+    int num_vec4 = kvdim / 8;
+    const int threads_per_block = 256;
+    int blocks_x = (num_vec4 + threads_per_block - 1) / threads_per_block;
+    dim3 grid(blocks_x, batch_size);
+    scatter_kv_batch_fp16_vec8_kernel<<<grid, threads_per_block, 0, stream>>>(
+        dst_k_ptrs, dst_v_ptrs, src_k, src_v, positions,
+        kvdim, num_vec4, src_k_row_stride, src_v_row_stride
+    );
+}

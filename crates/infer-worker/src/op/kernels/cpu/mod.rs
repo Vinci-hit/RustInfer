@@ -18,6 +18,7 @@ pub use embedding::*;
 mod rope;
 pub use rope::rope_kernel_batch;
 pub use rope::rope_kernel_batch_bf16;
+pub use rope::rope_kernel_batch_per_row;
 pub use rope::sin_cos_cache_calc as rope_sin_cos_cache_calc;
 pub use rope::sin_cos_cache_calc_bf16 as rope_sin_cos_cache_calc_bf16;
 

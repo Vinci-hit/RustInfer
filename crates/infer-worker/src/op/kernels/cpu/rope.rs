@@ -382,3 +382,137 @@ fn rope_kernel_batch_f32(
     }
     Ok(())
 }
+// ============================================================================
+// Per-row pos batch 版本：positions 长度 = B，每行使用 positions[i] 作为绝对位置
+// （与 rope_kernel_batch 的 start_pos+i 语义不同）
+// ============================================================================
+
+fn rope_kernel_batch_per_row_bf16(
+    kv_dim: usize,
+    head_size: usize,
+    input_q: &mut Tensor,
+    input_k: &mut Tensor,
+    positions: &Tensor, // [B] i32
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+) -> Result<()> {
+    if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
+        return Err(Error::InvalidArgument("Input Q and K for rope_batch_per_row must be 2D.".to_string()).into());
+    }
+    let seq_len = input_q.shape()[0];
+    let dim = input_q.shape()[1];
+    let pos_slice = positions.as_i32()?.as_slice()?;
+    if pos_slice.len() < seq_len {
+        return Err(Error::InvalidArgument(format!(
+            "rope_kernel_batch_per_row: positions.len ({}) < seq_len ({})",
+            pos_slice.len(), seq_len
+        )).into());
+    }
+    let q_slice = input_q.as_bf16_mut()?.as_slice_mut()?;
+    let k_slice = input_k.as_bf16_mut()?.as_slice_mut()?;
+    let sin_slice = sin_cache.as_bf16()?.as_slice()?;
+    let cos_slice = cos_cache.as_bf16()?.as_slice()?;
+    let head_dim = head_size;
+    for i in 0..seq_len {
+        let pos = pos_slice[i] as usize;
+        let q_row_start = i * dim;
+        let k_row_start = i * kv_dim;
+        for j in (0..dim).step_by(head_dim) {
+            for k in 0..head_dim / 2 {
+                let sin_val = sin_slice[pos * head_dim + k * 2];
+                let cos_val = cos_slice[pos * head_dim + k * 2];
+                let q_idx_j = q_row_start + j + k;
+                let q_idx_j1 = q_row_start + j + k + head_dim / 2;
+                let v0_q = q_slice[q_idx_j];
+                let v1_q = q_slice[q_idx_j1];
+                q_slice[q_idx_j] = v0_q * cos_val - v1_q * sin_val;
+                q_slice[q_idx_j1] = v0_q * sin_val + v1_q * cos_val;
+                if j < kv_dim {
+                    let k_idx_j = k_row_start + j + k;
+                    let k_idx_j1 = k_row_start + j + k + head_dim / 2;
+                    let v0_k = k_slice[k_idx_j];
+                    let v1_k = k_slice[k_idx_j1];
+                    k_slice[k_idx_j] = v0_k * cos_val - v1_k * sin_val;
+                    k_slice[k_idx_j1] = v0_k * sin_val + v1_k * cos_val;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rope_kernel_batch_per_row_f32(
+    kv_dim: usize,
+    head_size: usize,
+    input_q: &mut Tensor,
+    input_k: &mut Tensor,
+    positions: &Tensor,
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+) -> Result<()> {
+    if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
+        return Err(Error::InvalidArgument("Input Q and K for rope_batch_per_row must be 2D.".to_string()).into());
+    }
+    let seq_len = input_q.shape()[0];
+    let dim = input_q.shape()[1];
+    let pos_slice = positions.as_i32()?.as_slice()?;
+    if pos_slice.len() < seq_len {
+        return Err(Error::InvalidArgument(format!(
+            "rope_kernel_batch_per_row: positions.len ({}) < seq_len ({})",
+            pos_slice.len(), seq_len
+        )).into());
+    }
+    let q_slice = input_q.as_f32_mut()?.as_slice_mut()?;
+    let k_slice = input_k.as_f32_mut()?.as_slice_mut()?;
+    let sin_slice = sin_cache.as_f32()?.as_slice()?;
+    let cos_slice = cos_cache.as_f32()?.as_slice()?;
+    let head_dim = head_size;
+    for i in 0..seq_len {
+        let pos = pos_slice[i] as usize;
+        let q_row_start = i * dim;
+        let k_row_start = i * kv_dim;
+        for j in (0..dim).step_by(head_dim) {
+            for k in 0..head_dim / 2 {
+                let sin_val = sin_slice[pos * head_dim + k * 2];
+                let cos_val = cos_slice[pos * head_dim + k * 2];
+                let q_idx_j = q_row_start + j + k;
+                let q_idx_j1 = q_row_start + j + k + head_dim / 2;
+                let v0_q = q_slice[q_idx_j];
+                let v1_q = q_slice[q_idx_j1];
+                q_slice[q_idx_j] = v0_q * cos_val - v1_q * sin_val;
+                q_slice[q_idx_j1] = v0_q * sin_val + v1_q * cos_val;
+                if j < kv_dim {
+                    let k_idx_j = k_row_start + j + k;
+                    let k_idx_j1 = k_row_start + j + k + head_dim / 2;
+                    let v0_k = k_slice[k_idx_j];
+                    let v1_k = k_slice[k_idx_j1];
+                    k_slice[k_idx_j] = v0_k * cos_val - v1_k * sin_val;
+                    k_slice[k_idx_j1] = v0_k * sin_val + v1_k * cos_val;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn rope_kernel_batch_per_row(
+    kv_dim: usize,
+    head_size: usize,
+    input_q: &mut Tensor,
+    input_k: &mut Tensor,
+    positions: &Tensor,
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+) -> Result<()> {
+    match input_q.dtype() {
+        crate::base::DataType::F32 => rope_kernel_batch_per_row_f32(
+            kv_dim, head_size, input_q, input_k, positions, sin_cache, cos_cache,
+        ),
+        crate::base::DataType::BF16 => rope_kernel_batch_per_row_bf16(
+            kv_dim, head_size, input_q, input_k, positions, sin_cache, cos_cache,
+        ),
+        dt => Err(Error::InvalidArgument(format!(
+            "Unsupported data type for rope_kernel_batch_per_row: {:?}", dt
+        )).into()),
+    }
+}

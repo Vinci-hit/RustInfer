@@ -782,4 +782,133 @@ mod tests {
         assert!(max_diff < 0.1, "Non-causal BF16 CPU vs CUDA max diff {} too large", max_diff);
         Ok(())
     }
+
+    // ========================================================================
+    // Batched flash decoding (BF16, hdim=64) 正确性：
+    // batched kernel 一次 launch vs 按 seq 循环调用 flash_decoding_cu_bf16
+    // ========================================================================
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_flash_decoding_batch_cuda_matches_loop() -> crate::base::error::Result<()> {
+        use crate::cuda::CudaConfig;
+        use half::bf16;
+
+        let device = DeviceType::Cuda(0);
+        let dtype = crate::base::DataType::BF16;
+
+        // Llama-3.2-1B 兼容配置
+        let num_q_heads  = 8;
+        let num_kv_heads = 2;
+        let head_dim     = 64;
+        let max_seq_len  = 32;
+        let batch_size   = 4;
+        // B 个不同的 kv_len（kernel 里会 +1，所以这是 pos=prompt_len..）
+        let kv_lens: Vec<i32> = vec![7, 3, 15, 0];
+
+        let q_dim  = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        // 构造 B 行 Q；B 个独立 K/V cache
+        let mut rng = rand::rng();
+        let q_data: Vec<bf16> = (0..batch_size * q_dim)
+            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0)))
+            .collect();
+
+        let mut q = crate::tensor::Tensor::new(&[batch_size, q_dim], dtype, device)?;
+        q.as_bf16_mut()?.buffer_mut().copy_from_host(&q_data)?;
+
+        let mut k_caches: Vec<crate::tensor::Tensor> = Vec::with_capacity(batch_size);
+        let mut v_caches: Vec<crate::tensor::Tensor> = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let kd: Vec<bf16> = (0..max_seq_len * kv_dim)
+                .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
+            let vd: Vec<bf16> = (0..max_seq_len * kv_dim)
+                .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
+            let mut k = crate::tensor::Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
+            let mut v = crate::tensor::Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
+            k.as_bf16_mut()?.buffer_mut().copy_from_host(&kd)?;
+            v.as_bf16_mut()?.buffer_mut().copy_from_host(&vd)?;
+            k_caches.push(k);
+            v_caches.push(v);
+        }
+
+        // ---- A: batched kernel ----
+        let mut o_a = crate::tensor::Tensor::new(&[batch_size, q_dim], dtype, device)?;
+        {
+            let zeros = vec![bf16::from_f32(0.0); batch_size * q_dim];
+            o_a.as_bf16_mut()?.buffer_mut().copy_from_host(&zeros)?;
+        }
+        let cuda_cfg = CudaConfig::new()?
+            .with_flash_decode_batch(num_q_heads, head_dim, batch_size)?;
+
+        // 分配 device 指针 buffer
+        let bytes_ptrs = batch_size * std::mem::size_of::<u64>();
+        let mut k_ptrs_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut v_ptrs_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut k_ptrs_dev, bytes_ptrs))?;
+            crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut v_ptrs_dev, bytes_ptrs))?;
+        }
+        // kv_lens device
+        let mut kv_lens_cpu_t = crate::tensor::Tensor::new(
+            &[batch_size], crate::base::DataType::I32, DeviceType::Cpu,
+        )?;
+        kv_lens_cpu_t.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&kv_lens);
+        let kv_lens_gpu = kv_lens_cpu_t.to_cuda(0)?;
+
+        let k_refs: Vec<&crate::tensor::Tensor> = k_caches.iter().collect();
+        let v_refs: Vec<&crate::tensor::Tensor> = v_caches.iter().collect();
+        unsafe {
+            crate::op::kernels::cuda::flash_decoding_batch_bf16(
+                &q, &k_refs, &v_refs, &mut o_a,
+                &kv_lens_gpu,
+                k_ptrs_dev as *mut u64, v_ptrs_dev as *mut u64,
+                &cuda_cfg,
+                num_q_heads, num_kv_heads, head_dim,
+            )?;
+        }
+        cuda_cfg.sync_stream()?;
+        unsafe {
+            let _ = crate::cuda::ffi::cudaFree(k_ptrs_dev);
+            let _ = crate::cuda::ffi::cudaFree(v_ptrs_dev);
+        }
+
+        // ---- B: 按 seq 循环调用原 flash_decoding_cu_bf16 ----
+        let mut o_b = crate::tensor::Tensor::new(&[batch_size, q_dim], dtype, device)?;
+        {
+            let zeros = vec![bf16::from_f32(0.0); batch_size * q_dim];
+            o_b.as_bf16_mut()?.buffer_mut().copy_from_host(&zeros)?;
+        }
+        let single_cfg = CudaConfig::new()?
+            .with_flash_decode(num_q_heads, head_dim)?;
+        let op = FlashAttnGQA::new(num_q_heads, num_kv_heads, head_dim, true)?;
+        for i in 0..batch_size {
+            let q_row = q.slice(&[i, 0], &[1, q_dim])?;
+            let mut o_row = o_b.slice(&[i, 0], &[1, q_dim])?;
+            let mut klen_cpu = crate::tensor::Tensor::new(
+                &[1], crate::base::DataType::I32, DeviceType::Cpu,
+            )?;
+            klen_cpu.as_i32_mut()?.as_slice_mut()?[0] = kv_lens[i];
+            let klen_gpu = klen_cpu.to_cuda(0)?;
+            op.forward(&q_row, &k_caches[i], &v_caches[i], &klen_gpu, &mut o_row, Some(&single_cfg))?;
+        }
+        single_cfg.sync_stream()?;
+
+        // ---- 比对 ----
+        let oa = o_a.to_cpu()?;
+        let ob = o_b.to_cpu()?;
+        let a_s = oa.as_bf16()?.as_slice()?;
+        let b_s = ob.as_bf16()?.as_slice()?;
+        // 两路径数值运算顺序/布局完全一样，应该逐 bit 相等（BF16 round-trip 到 gpu 再回 cpu 可能带 0 ulp 差）
+        let mut max_diff: f32 = 0.0;
+        for i in 0..a_s.len() {
+            max_diff = max_diff.max((a_s[i].to_f32() - b_s[i].to_f32()).abs());
+        }
+        println!("flash_decoding batched vs loop max diff: {}", max_diff);
+        // Flash-decoding 两路径执行等价的 split-K（B 方向拆得不同，但数值等价），
+        // 这里允许 bf16 级小误差（reduce 顺序有可能不同）。
+        assert!(max_diff < 1e-2, "batched flash_decoding diverged: max_diff={}", max_diff);
+        Ok(())
+    }
 }

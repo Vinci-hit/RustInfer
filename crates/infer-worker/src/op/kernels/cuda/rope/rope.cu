@@ -187,6 +187,98 @@ void rope_kernel_cu_bf16(
     }
 }
 
+// --- BF16 per-row pos 批量版本 (decode batching) ---
+// 与 rope_rotate_kernel_llama3_bf16 的唯一区别：
+//   abs_pos = positions[seq_idx]     (而非 pos_offset[0] + seq_idx)
+//   q_row_stride / k_row_stride 用于支持非连续输入（如 qkv.slice 的 q、k 段）
+// 适用于 batch decode：每个 seq 各自 q/k 只有 1 行，但对应的绝对位置
+// positions[i] 完全独立。
+__global__ void rope_rotate_kernel_llama3_bf16_batch(
+    __nv_bfloat16* __restrict__ input_q,
+    __nv_bfloat16* __restrict__ input_k,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_size,
+    const int* __restrict__ positions, // [batch_size], 每行绝对位置
+    const int batch_size,
+    const int q_row_stride,            // elements (bf16) per row in input_q
+    const int k_row_stride             // elements (bf16) per row in input_k
+) {
+    const int tid = threadIdx.x;
+    const int q_head_idx = blockIdx.x;
+    const int seq_idx = blockIdx.y; // 行号 == batch 内 seq 下标
+    const int half_head = head_size / 2;
+    const int group_size = num_heads / num_kv_heads;
+
+    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= batch_size) {
+        return;
+    }
+
+    int abs_pos = positions[seq_idx];
+    float sin_val = __bfloat162float(sin_cache[abs_pos * half_head + tid]);
+    float cos_val = __bfloat162float(cos_cache[abs_pos * half_head + tid]);
+
+    int q_base = seq_idx * q_row_stride + q_head_idx * head_size;
+    int idx_1 = q_base + tid;
+    int idx_2 = q_base + tid + half_head;
+
+    float q1 = __bfloat162float(input_q[idx_1]);
+    float q2 = __bfloat162float(input_q[idx_2]);
+
+    input_q[idx_1] = __float2bfloat16(q1 * cos_val - q2 * sin_val);
+    input_q[idx_2] = __float2bfloat16(q1 * sin_val + q2 * cos_val);
+
+    if (q_head_idx % group_size == 0) {
+        int kv_head_idx = q_head_idx / group_size;
+        int k_base = seq_idx * k_row_stride + kv_head_idx * head_size;
+
+        int k_idx_1 = k_base + tid;
+        int k_idx_2 = k_base + tid + half_head;
+
+        float k1 = __bfloat162float(input_k[k_idx_1]);
+        float k2 = __bfloat162float(input_k[k_idx_2]);
+
+        input_k[k_idx_1] = __float2bfloat16(k1 * cos_val - k2 * sin_val);
+        input_k[k_idx_2] = __float2bfloat16(k1 * sin_val + k2 * cos_val);
+    }
+}
+
+extern "C" void rope_kernel_cu_bf16_batch(
+    int32_t dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    __nv_bfloat16* input_q,
+    __nv_bfloat16* input_k,
+    const int32_t* positions,
+    int32_t batch_size,
+    int32_t q_row_stride,
+    int32_t k_row_stride,
+    __nv_bfloat16* sin_cache,
+    __nv_bfloat16* cos_cache,
+    cudaStream_t stream)
+{
+    int threads_per_block = head_size / 2;
+    int num_heads = dim / head_size;
+    dim3 grid(num_heads, batch_size);
+
+    rope_rotate_kernel_llama3_bf16_batch<<<grid, threads_per_block, 0, stream>>>(
+        input_q,
+        input_k,
+        sin_cache,
+        cos_cache,
+        num_heads,
+        kv_dim / head_size,
+        head_size,
+        positions,
+        batch_size,
+        q_row_stride,
+        k_row_stride
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // --- FFI 包装函数 (Host Function) ---
 void rope_kernel_cu(
     int32_t dim,
@@ -439,6 +531,92 @@ extern "C" void rope_kernel_cu_fp16(
     if (err != cudaSuccess) {
         printf("RoPE Kernel Failed: %s\n", cudaGetErrorString(err));
     }
+}
+
+// --- FP16 per-row pos 批量版本 ---
+__global__ void rope_rotate_kernel_llama3_fp16_batch(
+    __half* __restrict__ input_q,
+    __half* __restrict__ input_k,
+    const __half* __restrict__ sin_cache,
+    const __half* __restrict__ cos_cache,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_size,
+    const int* __restrict__ positions,
+    const int batch_size,
+    const int q_row_stride,
+    const int k_row_stride
+) {
+    const int tid = threadIdx.x;
+    const int q_head_idx = blockIdx.x;
+    const int seq_idx = blockIdx.y;
+    const int half_head = head_size / 2;
+    const int group_size = num_heads / num_kv_heads;
+
+    if (tid >= half_head || q_head_idx >= num_heads || seq_idx >= batch_size) {
+        return;
+    }
+
+    int abs_pos = positions[seq_idx];
+    float sin_val = __half2float(sin_cache[abs_pos * half_head + tid]);
+    float cos_val = __half2float(cos_cache[abs_pos * half_head + tid]);
+
+    int q_base = seq_idx * q_row_stride + q_head_idx * head_size;
+    int idx_1 = q_base + tid;
+    int idx_2 = q_base + tid + half_head;
+
+    float q1 = __half2float(input_q[idx_1]);
+    float q2 = __half2float(input_q[idx_2]);
+
+    input_q[idx_1] = __float2half(q1 * cos_val - q2 * sin_val);
+    input_q[idx_2] = __float2half(q1 * sin_val + q2 * cos_val);
+
+    if (q_head_idx % group_size == 0) {
+        int kv_head_idx = q_head_idx / group_size;
+        int k_base = seq_idx * k_row_stride + kv_head_idx * head_size;
+        int k_idx_1 = k_base + tid;
+        int k_idx_2 = k_base + tid + half_head;
+
+        float k1 = __half2float(input_k[k_idx_1]);
+        float k2 = __half2float(input_k[k_idx_2]);
+
+        input_k[k_idx_1] = __float2half(k1 * cos_val - k2 * sin_val);
+        input_k[k_idx_2] = __float2half(k1 * sin_val + k2 * cos_val);
+    }
+}
+
+extern "C" void rope_kernel_cu_fp16_batch(
+    int32_t dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    __half* input_q,
+    __half* input_k,
+    const int32_t* positions,
+    int32_t batch_size,
+    int32_t q_row_stride,
+    int32_t k_row_stride,
+    __half* sin_cache,
+    __half* cos_cache,
+    cudaStream_t stream)
+{
+    int threads_per_block = head_size / 2;
+    int num_heads = dim / head_size;
+    dim3 grid(num_heads, batch_size);
+
+    rope_rotate_kernel_llama3_fp16_batch<<<grid, threads_per_block, 0, stream>>>(
+        input_q,
+        input_k,
+        sin_cache,
+        cos_cache,
+        num_heads,
+        kv_dim / head_size,
+        head_size,
+        positions,
+        batch_size,
+        q_row_stride,
+        k_row_stride
+    );
+    CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void sin_cos_calc_fp16(int head_size, int max_seq_len, float rope_theta,

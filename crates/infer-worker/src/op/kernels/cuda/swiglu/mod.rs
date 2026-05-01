@@ -27,6 +27,18 @@ unsafe extern "C" {
         num_elements: i32,
         stream: crate::cuda::ffi::cudaStream_t,
     );
+
+    fn swiglu_inplace_strided_cu_bf16x8(
+        x_base: *mut half::bf16,
+        y_base: *const half::bf16,
+        num_rows: i32,
+        inner_dim: i32,
+        x_row_stride: i32,
+        y_row_stride: i32,
+        x_col_offset: i32,
+        y_col_offset: i32,
+        stream: crate::cuda::ffi::cudaStream_t,
+    );
 }
 
 /// (原地版本) SwiGLU 的 CUDA 内核包装函数。
@@ -112,5 +124,39 @@ pub fn swiglu(
         }
     }
 
+    Ok(())
+}
+/// Strided inplace SwiGLU (BF16)：支持非连续 row_stride + col_offset，避免 split_cols。
+/// 参数 x_base / y_base 是 tensor 起点；实际访问位置为
+///     x[seq, col] = x_base[seq * x_row_stride + x_col_offset + col]  (col in [0, inner_dim))
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn swiglu_inplace_strided_bf16(
+    x_base: &mut Tensor,
+    y_base: &Tensor,
+    num_rows: usize,
+    inner_dim: usize,
+    x_row_stride: usize,
+    y_row_stride: usize,
+    x_col_offset: usize,
+    y_col_offset: usize,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    if !inner_dim.is_multiple_of(8) {
+        return Err(Error::InvalidArgument(format!(
+            "swiglu_inplace_strided_bf16: inner_dim ({}) must be multiple of 8", inner_dim
+        )).into());
+    }
+    let stream = CudaConfig::resolve_stream(cuda_config);
+    let x_ptr = x_base.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let y_ptr = y_base.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    unsafe {
+        swiglu_inplace_strided_cu_bf16x8(
+            x_ptr, y_ptr,
+            num_rows as i32, inner_dim as i32,
+            x_row_stride as i32, y_row_stride as i32,
+            x_col_offset as i32, y_col_offset as i32,
+            stream,
+        );
+    }
     Ok(())
 }

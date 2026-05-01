@@ -217,3 +217,71 @@ extern "C" void swiglu_inplace_cu_fp16x8(
     );
 }
 
+
+// ============================================================================
+// Strided SwiGLU inplace (BF16): 按 (num_rows, inner_dim) 2D 循环，支持非连续
+// row_stride，避免调用方必须 split 独立 buffer。
+//   dst = silu(x) * y = x*sigmoid(x) * y, 写入 x 的位置。
+//   x_base + seq * x_row_stride + col_offset_x  (col in [0, inner_dim))
+//   y_base + seq * y_row_stride + col_offset_y
+//   inner_dim 必须是 8 的倍数（用 float4 读写）
+// ============================================================================
+__global__ void swiglu_inplace_strided_kernel_bf16x8(
+    __nv_bfloat16* __restrict__ x_base,         // 整体 base 指针（未加 col_offset）
+    const __nv_bfloat16* __restrict__ y_base,
+    int num_rows,
+    int inner_dim,           // elements per row to process
+    int x_row_stride,        // elements per row in x
+    int y_row_stride,
+    int x_col_offset,
+    int y_col_offset
+) {
+    int seq = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    if (seq >= num_rows) return;
+
+    int num_vec4 = inner_dim / 8;
+
+    __nv_bfloat16* x_row = x_base + (size_t)seq * x_row_stride + x_col_offset;
+    const __nv_bfloat16* y_row = y_base + (size_t)seq * y_row_stride + y_col_offset;
+
+    float4* x_f4 = reinterpret_cast<float4*>(x_row);
+    const float4* y_f4 = reinterpret_cast<const float4*>(y_row);
+
+    for (int i = idx; i < num_vec4; i += stride) {
+        float4 x_v = x_f4[i];
+        float4 y_v = y_f4[i];
+        __nv_bfloat16* xbh = reinterpret_cast<__nv_bfloat16*>(&x_v);
+        const __nv_bfloat16* ybh = reinterpret_cast<const __nv_bfloat16*>(&y_v);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float xf = __bfloat162float(xbh[j]);
+            float yf = __bfloat162float(ybh[j]);
+            float s = 1.0f / (1.0f + expf(-xf));
+            xbh[j] = __float2bfloat16(xf * s * yf);
+        }
+        x_f4[i] = x_v;
+    }
+}
+
+extern "C" void swiglu_inplace_strided_cu_bf16x8(
+    __nv_bfloat16* x_base,
+    const __nv_bfloat16* y_base,
+    int num_rows,
+    int inner_dim,
+    int x_row_stride,
+    int y_row_stride,
+    int x_col_offset,
+    int y_col_offset,
+    cudaStream_t stream)
+{
+    int num_vec4 = inner_dim / 8;
+    const int threads = 256;
+    int blocks_x = (num_vec4 + threads - 1) / threads;
+    dim3 grid(blocks_x, num_rows);
+    swiglu_inplace_strided_kernel_bf16x8<<<grid, threads, 0, stream>>>(
+        x_base, y_base, num_rows, inner_dim,
+        x_row_stride, y_row_stride, x_col_offset, y_col_offset
+    );
+}

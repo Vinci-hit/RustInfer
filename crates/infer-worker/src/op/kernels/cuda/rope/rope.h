@@ -76,6 +76,35 @@ void sin_cos_cache_calc_cu_fp16(
     float original_max_pos_emb,
     cudaStream_t stream);
 
+// Batch decode：每行用 positions[i] 作为绝对位置
+void rope_kernel_cu_bf16_batch(
+    int32_t dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    __nv_bfloat16* input_q,       // [B, q_row_stride] (至少前 num_q_heads*head_size 元素有效)
+    __nv_bfloat16* input_k,       // [B, k_row_stride]
+    const int32_t* positions,     // [B]
+    int32_t batch_size,
+    int32_t q_row_stride,         // elements per row in input_q
+    int32_t k_row_stride,         // elements per row in input_k
+    __nv_bfloat16* sin_cache,
+    __nv_bfloat16* cos_cache,
+    cudaStream_t stream);
+
+void rope_kernel_cu_fp16_batch(
+    int32_t dim,
+    int32_t kv_dim,
+    int32_t head_size,
+    __half* input_q,
+    __half* input_k,
+    const int32_t* positions,
+    int32_t batch_size,
+    int32_t q_row_stride,
+    int32_t k_row_stride,
+    __half* sin_cache,
+    __half* cos_cache,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -29,6 +29,24 @@ unsafe extern "C" {
         result_ptr_gpu: *mut i32, // << 指向 GPU 内存
         stream: cuda::ffi::cudaStream_t,
     );
+
+    // Batched argmax: logits [B, vocab_size], out [B]
+    fn argmax_batch_cu_bf16_ffi(
+        logits_ptr: *const bf16,
+        batch_size: i32,
+        vocab_size: i32,
+        row_stride: i32,
+        out_ptr: *mut i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+    fn argmax_batch_cu_f32_ffi(
+        logits_ptr: *const f32,
+        batch_size: i32,
+        vocab_size: i32,
+        row_stride: i32,
+        out_ptr: *mut i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// 在 GPU 上执行 argmax，并通过 D2H 拷贝隐式同步返回结果。
@@ -93,5 +111,56 @@ pub fn argmax(logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&C
         }
     };
 
+    Ok(())
+}
+/// Batched argmax：`logits[B, vocab_size]` → `out[B]`。
+/// 每个 CUDA block 处理一个 seq 行。
+pub fn argmax_batch(logits: &Tensor, out: &mut Tensor, cuda_config: Option<&CudaConfig>) -> Result<()> {
+    let batch_size = logits.shape()[0];
+    let vocab_size = logits.shape()[1];
+    argmax_batch_strided(
+        logits, vocab_size, vocab_size, 0,
+        batch_size, out, cuda_config,
+    )
+}
+
+/// Batched argmax strided：logits 从 col_offset 起，每行跨 row_stride 个元素，
+/// 扫描 vocab_size 个元素。可直接从非连续 [B, full_vocab] 里取前 vocab_size 列做 argmax，
+/// 省去 split_cols。
+#[allow(clippy::too_many_arguments)]
+pub fn argmax_batch_strided(
+    logits: &Tensor,
+    vocab_size: usize,
+    row_stride: usize,
+    col_offset: usize,
+    batch_size: usize,
+    out: &mut Tensor,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    let cuda_cfg = cuda_config
+        .ok_or_else(|| Error::InvalidArgument("CudaConfig required for argmax_batch".to_string()))?;
+    let stream = cuda_cfg.stream;
+    let out_ptr = out.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32;
+    match logits.dtype() {
+        DataType::BF16 => unsafe {
+            let base = logits.as_bf16()?.buffer().as_ptr() as *const bf16;
+            argmax_batch_cu_bf16_ffi(
+                base.add(col_offset),
+                batch_size as i32, vocab_size as i32, row_stride as i32,
+                out_ptr, stream,
+            );
+        },
+        DataType::F32 => unsafe {
+            let base = logits.as_f32()?.buffer().as_ptr() as *const f32;
+            argmax_batch_cu_f32_ffi(
+                base.add(col_offset),
+                batch_size as i32, vocab_size as i32, row_stride as i32,
+                out_ptr, stream,
+            );
+        },
+        other => return Err(Error::InvalidArgument(
+            format!("argmax_batch_strided: unsupported dtype {:?}", other)
+        ).into()),
+    }
     Ok(())
 }

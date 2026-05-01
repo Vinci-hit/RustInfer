@@ -45,6 +45,9 @@ pub struct CudaConfig {
     pub flash_decode_workspace: *mut c_void,
     pub flash_decode_workspace_size: usize,
     pub cuda_graph: Option<CudaGraph>,
+    /// Graph slot 专用于 `Llama3::forward_batch_decode` 的 batched decode 路径。
+    /// 与 `cuda_graph`（serial forward_decoding 使用）独立，互不干扰。
+    pub batch_graph: Option<CudaGraph>,
     /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
     pub cudnn_handle: ffi::cudnnHandle_t,
     /// Descriptor / algorithm / workspace cache shared across every
@@ -112,6 +115,7 @@ impl CudaConfig {
             flash_decode_workspace: std::ptr::null_mut(),
             flash_decode_workspace_size: 0,
             cuda_graph: None,
+            batch_graph: None,
             cudnn_handle,
             conv2d_cache: Mutex::new(
                 crate::op::kernels::cuda::Conv2dCache::default(),
@@ -141,6 +145,27 @@ impl CudaConfig {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut ptr, bytes))? };
 
+        self.flash_decode_workspace = ptr;
+        self.flash_decode_workspace_size = bytes;
+        Ok(self)
+    }
+
+    /// 同 `with_flash_decode`，但为 batched decode 预留 `max_batch_size * per_seq` 大小
+    /// 的 workspace。
+    pub fn with_flash_decode_batch(
+        mut self,
+        num_q_heads: usize,
+        head_dim: usize,
+        max_batch_size: usize,
+    ) -> Result<Self> {
+        assert!(
+            self.flash_decode_workspace.is_null(),
+            "with_flash_decode_batch called on a CudaConfig that already has a workspace"
+        );
+        let per_seq = num_q_heads * FLASH_DECODE_N_SPLIT * (2 + head_dim);
+        let bytes = max_batch_size.max(1) * per_seq * std::mem::size_of::<f32>();
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut ptr, bytes))? };
         self.flash_decode_workspace = ptr;
         self.flash_decode_workspace_size = bytes;
         Ok(self)
@@ -233,6 +258,33 @@ impl CudaConfig {
             Err(crate::base::error::Error::InvalidArgument("CUDA graph not captured".to_string()).into())
         }
     }
+
+    // ─────────────────── Batch-decode graph API ───────────────────
+    // 与 serial decode 的 cuda_graph 独立。
+    pub fn capture_batch_graph_begin(&mut self) -> Result<()> {
+        unsafe { crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?; }
+        Ok(())
+    }
+    pub fn capture_batch_graph_end(&mut self) -> Result<()> {
+        unsafe {
+            let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
+            crate::cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph))?;
+            let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
+            crate::cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0))?;
+            self.batch_graph = Some(CudaGraph { graph, exec });
+        }
+        Ok(())
+    }
+    pub fn launch_batch_graph(&self) -> Result<()> {
+        if let Some(g) = &self.batch_graph {
+            unsafe { crate::cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream))?; }
+            Ok(())
+        } else {
+            Err(crate::base::error::Error::InvalidArgument(
+                "batch CUDA graph not captured".to_string()).into())
+        }
+    }
+    pub fn batch_graph_ready(&self) -> bool { self.batch_graph.is_some() }
 
     pub fn sync_stream(&self) -> Result<()> {
         unsafe {

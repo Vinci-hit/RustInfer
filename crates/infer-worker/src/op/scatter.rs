@@ -95,48 +95,68 @@ pub fn scatter_kv(
 ///
 /// 用于 batch decode: B 个 seq 各产生 1 行 KV，需要写入各自独立的 cache。
 ///
+/// CUDA 路径：一次 kernel launch 并行处理 B 行。需要调用方提供两块 device
+/// 指针数组 buffer（容量 ≥ batch_size * sizeof(u64) bytes），以及 device 上的
+/// `positions_dev` 张量。
+///
+/// CPU 路径：循环 B 次（内存拷贝已经很快，不值得额外 kernel 化）。
+///
 /// # Arguments
-/// * `k_caches` - B 个 K cache 的 &mut Tensor 引用, 每个 shape [max_seq_len, kv_dim]
-/// * `v_caches` - B 个 V cache 的 &mut Tensor 引用
-/// * `src_k` - [B, kv_dim] 新的 K 值
-/// * `src_v` - [B, kv_dim] 新的 V 值
-/// * `positions` - [B] 每个 seq 的写入位置 (CPU i32 slice)
-#[allow(unused_variables)]
+/// * `k_caches` / `v_caches` - B 个 K/V cache 的 &mut Tensor 引用, 每个 shape [max_seq_len, kv_dim]
+/// * `src_k` / `src_v` - [B, kv_dim] 新的 K/V
+/// * `positions_cpu` - [B] 每个 seq 的写入位置（host slice，用于 CPU 分支）
+/// * `positions_dev` - [B] I32 设备张量（用于 CUDA 分支），CPU 下可传 None
+/// * `k_ptrs_dev` / `v_ptrs_dev` - 预分配的 device 指针数组 buffer（CUDA 必须提供）
+#[allow(clippy::too_many_arguments)]
 pub fn scatter_kv_batch(
     k_caches: &mut [&mut Tensor],
     v_caches: &mut [&mut Tensor],
     src_k: &Tensor,
     src_v: &Tensor,
-    positions: &[i32],
+    positions_cpu: &[i32],
+    #[cfg(feature = "cuda")] positions_dev: Option<&Tensor>,
+    #[cfg(feature = "cuda")] k_ptrs_dev: *mut u64,
+    #[cfg(feature = "cuda")] v_ptrs_dev: *mut u64,
+    #[allow(unused_variables)]
     cuda_config: Option<&OpConfig>,
 ) -> Result<()> {
     let batch_size = k_caches.len();
     assert_eq!(v_caches.len(), batch_size);
-    assert_eq!(positions.len(), batch_size);
+    assert_eq!(positions_cpu.len(), batch_size);
+    if batch_size == 0 { return Ok(()); }
 
     let kv_dim = k_caches[0].shape()[1];
 
-    // 逐 seq 调用现有的 scatter_kv
-    // 从 src_k/src_v [B, kv_dim] 中 slice 出每行
-    for i in 0..batch_size {
-        let src_k_row = src_k.slice(&[i, 0], &[1, kv_dim])?;
-        let src_v_row = src_v.slice(&[i, 0], &[1, kv_dim])?;
-
-        // 构造单个 pos tensor
-        let mut pos_tensor = Tensor::new(&[1], crate::base::DataType::I32, crate::base::DeviceType::Cpu)?;
-        pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = positions[i];
-
-        scatter_kv(
-            k_caches[i],
-            &src_k_row,
-            v_caches[i],
-            &src_v_row,
-            &pos_tensor,
-            cuda_config,
-        )?;
+    match k_caches[0].device() {
+        DeviceType::Cpu => {
+            for i in 0..batch_size {
+                let src_k_row = src_k.slice(&[i, 0], &[1, kv_dim])?;
+                let src_v_row = src_v.slice(&[i, 0], &[1, kv_dim])?;
+                let mut pos_tensor = Tensor::new(&[1], crate::base::DataType::I32, DeviceType::Cpu)?;
+                pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = positions_cpu[i];
+                kernels::cpu::scatter_kv(
+                    k_caches[i], &src_k_row, v_caches[i], &src_v_row, &pos_tensor,
+                )?;
+            }
+            Ok(())
+        }
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => {
+            let pos_dev = positions_dev.ok_or_else(|| crate::base::error::Error::InvalidArgument(
+                "scatter_kv_batch CUDA 路径需要 positions_dev".into()
+            ))?;
+            if k_ptrs_dev.is_null() || v_ptrs_dev.is_null() {
+                return Err(crate::base::error::Error::InvalidArgument(
+                    "scatter_kv_batch CUDA 路径需要预分配的 k/v_ptrs_dev 指针数组 buffer".into()
+                ).into());
+            }
+            kernels::cuda::scatter_kv_batch(
+                k_caches, v_caches, src_k, src_v,
+                pos_dev, k_ptrs_dev, v_ptrs_dev,
+                cuda_config,
+            )
+        }
     }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -362,6 +382,204 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // scatter_kv_batch 正确性：batched 一次 kernel launch vs per-seq 循环
+    // ========================================================================
+
+    /// CPU: scatter_kv_batch 写 B 行到 B 个 cache vs 逐 seq 循环 scatter_kv
+    #[test]
+    fn test_scatter_kv_batch_cpu_matches_loop() -> Result<()> {
+        let device = DeviceType::Cpu;
+        let dtype = DataType::BF16;
+        let batch = 4;
+        let max_seq_len = 32;
+        let kv_dim = 128;
+
+        // 构造 B 个独立 cache，填 -1.0；随机 src_k, src_v；随机 positions
+        let mut rng = rand::rng();
+        let positions: Vec<i32> = vec![3, 0, 17, 8]; // 各不相同
+
+        // 构造 src_k / src_v: [B, kv_dim]
+        let src_k_data: Vec<bf16> = (0..batch * kv_dim)
+            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
+        let src_v_data: Vec<bf16> = (0..batch * kv_dim)
+            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
+        let mut src_k = Tensor::new(&[batch, kv_dim], dtype, device)?;
+        let mut src_v = Tensor::new(&[batch, kv_dim], dtype, device)?;
+        src_k.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&src_k_data);
+        src_v.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&src_v_data);
+
+        // 两套 caches: A 走 batched, B 走循环。都用 -1.0 初值
+        let init: Vec<bf16> = vec![bf16::from_f32(-1.0); max_seq_len * kv_dim];
+        let mut k_caches_a: Vec<Tensor> = (0..batch).map(|_| {
+            let mut t = Tensor::new(&[max_seq_len, kv_dim], dtype, device).unwrap();
+            t.as_bf16_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&init);
+            t
+        }).collect();
+        let mut v_caches_a: Vec<Tensor> = (0..batch).map(|_| {
+            let mut t = Tensor::new(&[max_seq_len, kv_dim], dtype, device).unwrap();
+            t.as_bf16_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&init);
+            t
+        }).collect();
+        let mut k_caches_b: Vec<Tensor> = (0..batch).map(|_| {
+            let mut t = Tensor::new(&[max_seq_len, kv_dim], dtype, device).unwrap();
+            t.as_bf16_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&init);
+            t
+        }).collect();
+        let mut v_caches_b: Vec<Tensor> = (0..batch).map(|_| {
+            let mut t = Tensor::new(&[max_seq_len, kv_dim], dtype, device).unwrap();
+            t.as_bf16_mut().unwrap().as_slice_mut().unwrap().copy_from_slice(&init);
+            t
+        }).collect();
+
+        // A: batched
+        {
+            let mut k_refs: Vec<&mut Tensor> = k_caches_a.iter_mut().collect();
+            let mut v_refs: Vec<&mut Tensor> = v_caches_a.iter_mut().collect();
+            super::scatter_kv_batch(
+                &mut k_refs, &mut v_refs,
+                &src_k, &src_v, &positions,
+                #[cfg(feature = "cuda")] None,
+                #[cfg(feature = "cuda")] std::ptr::null_mut(),
+                #[cfg(feature = "cuda")] std::ptr::null_mut(),
+                None,
+            )?;
+        }
+
+        // B: per-seq loop，使用 CPU scatter_kv
+        for i in 0..batch {
+            let src_k_row = src_k.slice(&[i, 0], &[1, kv_dim])?;
+            let src_v_row = src_v.slice(&[i, 0], &[1, kv_dim])?;
+            let mut pos_t = Tensor::new(&[1], DataType::I32, device)?;
+            pos_t.as_i32_mut()?.as_slice_mut()?[0] = positions[i];
+            crate::op::kernels::cpu::scatter_kv(
+                &mut k_caches_b[i], &src_k_row, &mut v_caches_b[i], &src_v_row, &pos_t,
+            )?;
+        }
+
+        // 比对
+        for i in 0..batch {
+            let a = k_caches_a[i].as_bf16()?.as_slice()?;
+            let b = k_caches_b[i].as_bf16()?.as_slice()?;
+            assert_eq!(a, b, "CPU K cache[{}] batched vs loop mismatch", i);
+            let a = v_caches_a[i].as_bf16()?.as_slice()?;
+            let b = v_caches_b[i].as_bf16()?.as_slice()?;
+            assert_eq!(a, b, "CPU V cache[{}] batched vs loop mismatch", i);
+        }
+        Ok(())
+    }
+
+    /// CUDA: scatter_kv_batch kernel vs per-seq 循环 scatter_kv
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_scatter_kv_batch_cuda_matches_loop() -> Result<()> {
+        use crate::cuda::CudaConfig;
+
+        let device = DeviceType::Cuda(0);
+        let dtype = DataType::BF16;
+        let batch = 6;
+        let max_seq_len = 64;
+        let kv_dim = 256; // 需要 %8==0
+
+        let mut rng = rand::rng();
+        let positions: Vec<i32> = vec![0, 1, 10, 20, 33, 63]; // 互不相同，都 < max_seq_len
+
+        let src_k_data: Vec<bf16> = (0..batch * kv_dim)
+            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
+        let src_v_data: Vec<bf16> = (0..batch * kv_dim)
+            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
+        let mut src_k = Tensor::new(&[batch, kv_dim], dtype, device)?;
+        let mut src_v = Tensor::new(&[batch, kv_dim], dtype, device)?;
+        src_k.as_bf16_mut()?.buffer_mut().copy_from_host(&src_k_data)?;
+        src_v.as_bf16_mut()?.buffer_mut().copy_from_host(&src_v_data)?;
+
+        // 两套 caches：zeros
+        let zero: Vec<bf16> = vec![bf16::from_f32(0.0); max_seq_len * kv_dim];
+        let mut k_caches_a: Vec<Tensor> = Vec::new();
+        let mut v_caches_a: Vec<Tensor> = Vec::new();
+        let mut k_caches_b: Vec<Tensor> = Vec::new();
+        let mut v_caches_b: Vec<Tensor> = Vec::new();
+        for _ in 0..batch {
+            let mut k = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
+            let mut v = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
+            k.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
+            v.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
+            k_caches_a.push(k);
+            v_caches_a.push(v);
+
+            let mut k = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
+            let mut v = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
+            k.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
+            v.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
+            k_caches_b.push(k);
+            v_caches_b.push(v);
+        }
+
+        let cuda_cfg = CudaConfig::new()?;
+
+        // 分配 device 指针数组 buffer
+        let bytes = batch * std::mem::size_of::<u64>();
+        let mut k_ptrs_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut v_ptrs_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut k_ptrs_dev, bytes))?;
+            crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut v_ptrs_dev, bytes))?;
+        }
+
+        // positions device tensor
+        let mut pos_cpu_t = Tensor::new(&[batch], DataType::I32, DeviceType::Cpu)?;
+        pos_cpu_t.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&positions);
+        let pos_dev = pos_cpu_t.to_cuda(0)?;
+
+        // A: batched
+        {
+            let mut k_refs: Vec<&mut Tensor> = k_caches_a.iter_mut().collect();
+            let mut v_refs: Vec<&mut Tensor> = v_caches_a.iter_mut().collect();
+            super::scatter_kv_batch(
+                &mut k_refs, &mut v_refs,
+                &src_k, &src_v, &positions,
+                Some(&pos_dev),
+                k_ptrs_dev as *mut u64,
+                v_ptrs_dev as *mut u64,
+                Some(&cuda_cfg),
+            )?;
+        }
+        cuda_cfg.sync_stream()?;
+
+        // B: per-seq 循环 scatter_kv (CUDA)
+        for i in 0..batch {
+            let src_k_row = src_k.slice(&[i, 0], &[1, kv_dim])?;
+            let src_v_row = src_v.slice(&[i, 0], &[1, kv_dim])?;
+            let mut pos_t = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+            pos_t.as_i32_mut()?.as_slice_mut()?[0] = positions[i];
+            let pos_gpu = pos_t.to_cuda(0)?;
+            crate::op::kernels::cuda::scatter_kv(
+                &mut k_caches_b[i], &src_k_row, &mut v_caches_b[i], &src_v_row, &pos_gpu,
+                Some(&cuda_cfg),
+            )?;
+        }
+        cuda_cfg.sync_stream()?;
+
+        // 释放指针 buffer
+        unsafe {
+            let _ = crate::cuda::ffi::cudaFree(k_ptrs_dev);
+            let _ = crate::cuda::ffi::cudaFree(v_ptrs_dev);
+        }
+
+        // 比对
+        for i in 0..batch {
+            let ka = k_caches_a[i].to_cpu()?;
+            let kb = k_caches_b[i].to_cpu()?;
+            let va = v_caches_a[i].to_cpu()?;
+            let vb = v_caches_b[i].to_cpu()?;
+            assert_eq!(ka.as_bf16()?.as_slice()?, kb.as_bf16()?.as_slice()?,
+                "CUDA K cache[{}] batched vs loop mismatch", i);
+            assert_eq!(va.as_bf16()?.as_slice()?, vb.as_bf16()?.as_slice()?,
+                "CUDA V cache[{}] batched vs loop mismatch", i);
+        }
         Ok(())
     }
 }

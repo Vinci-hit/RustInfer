@@ -25,6 +25,20 @@ void swiglu_inplace_cu_bf16x8(
     cudaStream_t stream
 );
 
+/// Strided inplace SwiGLU (BF16): 支持非连续 row_stride / col_offset（element 单位）。
+/// 处理 num_rows × inner_dim 个 bf16 元素（inner_dim 必须是 8 的倍数）。
+void swiglu_inplace_strided_cu_bf16x8(
+    __nv_bfloat16* x_base,
+    const __nv_bfloat16* y_base,
+    int num_rows,
+    int inner_dim,
+    int x_row_stride,
+    int y_row_stride,
+    int x_col_offset,
+    int y_col_offset,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

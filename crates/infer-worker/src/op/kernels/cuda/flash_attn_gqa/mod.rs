@@ -128,6 +128,23 @@ unsafe extern "C" {
         is_causal: i32,
         stream: cuda::ffi::cudaStream_t,
     );
+
+    // Batched flash-decoding (BF16, head_dim = 64)
+    pub fn flash_decoding_cu_bf16_batch(
+        q_flat: *const half::bf16,
+        k_ptrs_dev: *const *const half::bf16,
+        v_ptrs_dev: *const *const half::bf16,
+        o_flat: *mut half::bf16,
+        workspace: *mut f32,
+        seq_lens_dev: *const i32,
+        batch_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_row_stride: i32,
+        o_row_stride: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Flash Attention GQA 的 CUDA 内核包装函数 (Prefill/Decode 模式)。
@@ -372,5 +389,166 @@ pub unsafe fn flash_attn_gqa(
         }
     }
     
+    Ok(())
+}
+/// Batched flash-decoding (BF16, head_dim=64):
+/// - `q`  : [B, num_q_heads, head_dim]  CUDA tensor
+/// - `o`  : [B, num_q_heads, head_dim]  CUDA tensor (输出)
+/// - `k_caches` / `v_caches` : B 个独立 cache (每个 `[max_seq_len, num_kv_heads, head_dim]`)
+/// - `kv_lens_dev` : [B] i32 device tensor，每 seq 的有效 kv 长度 - 1（kernel 内部会 +1）
+/// - `k_ptrs_dev` / `v_ptrs_dev` : 预分配的 device 指针数组 buffer（容量 ≥ B*8 bytes）
+///
+/// `cuda_config` 必须满足 `with_flash_decode(num_q_heads, head_dim)`——
+/// 但 workspace 大小需要覆盖 B 段，调用方需使用 `flash_decode_workspace_size_batch` 辅助
+/// 函数或自行检查。
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_decoding_batch_bf16(
+    q: &Tensor,
+    k_caches: &[&Tensor],
+    v_caches: &[&Tensor],
+    o: &mut Tensor,
+    kv_lens_dev: &Tensor,
+    k_ptrs_dev: *mut u64,
+    v_ptrs_dev: *mut u64,
+    cuda_config: &CudaConfig,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let batch_size = k_caches.len();
+    assert_eq!(v_caches.len(), batch_size);
+    if batch_size == 0 { return Ok(()); }
+    if head_dim != 64 {
+        return Err(Error::InvalidArgument(format!(
+            "flash_decoding_batch_bf16 currently only supports head_dim=64, got {}", head_dim
+        )).into());
+    }
+
+    let stream = CudaConfig::resolve_stream(Some(cuda_config));
+
+    // 收集 host 指针数组
+    let mut k_host: Vec<u64> = Vec::with_capacity(batch_size);
+    let mut v_host: Vec<u64> = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        k_host.push(k_caches[i].as_bf16()?.buffer().as_ptr() as u64);
+        v_host.push(v_caches[i].as_bf16()?.buffer().as_ptr() as u64);
+    }
+    let bytes = batch_size * std::mem::size_of::<u64>();
+    unsafe {
+        crate::cuda_check!(cuda::ffi::cudaMemcpyAsync(
+            k_ptrs_dev as *mut _,
+            k_host.as_ptr() as *const _,
+            bytes,
+            cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            stream,
+        ))?;
+        crate::cuda_check!(cuda::ffi::cudaMemcpyAsync(
+            v_ptrs_dev as *mut _,
+            v_host.as_ptr() as *const _,
+            bytes,
+            cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            stream,
+        ))?;
+        crate::cuda_check!(cuda::ffi::cudaStreamSynchronize(stream))?;
+    }
+    drop(k_host);
+    drop(v_host);
+
+    // 检查 workspace 足够大
+    let needed_per_seq = num_q_heads * crate::cuda::FLASH_DECODE_N_SPLIT * (2 + head_dim);
+    let needed_bytes = batch_size * needed_per_seq * std::mem::size_of::<f32>();
+    if cuda_config.flash_decode_workspace_size < needed_bytes {
+        return Err(Error::InvalidArgument(format!(
+            "flash_decoding_batch_bf16: workspace too small ({} < {})",
+            cuda_config.flash_decode_workspace_size, needed_bytes
+        )).into());
+    }
+
+    let q_ptr = q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let o_ptr = o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let kv_lens_ptr = kv_lens_dev.as_i32()?.buffer().as_ptr() as *const i32;
+    let workspace_ptr = cuda_config.flash_decode_workspace as *mut f32;
+    let qo_stride = (num_q_heads * head_dim) as i32;
+
+    unsafe {
+        flash_decoding_cu_bf16_batch(
+            q_ptr,
+            k_ptrs_dev as *const *const half::bf16,
+            v_ptrs_dev as *const *const half::bf16,
+            o_ptr,
+            workspace_ptr,
+            kv_lens_ptr,
+            batch_size as i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            qo_stride, qo_stride,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Batched flash-decoding (BF16, hdim=64) 的 "launch-ready" 版：
+/// `k_ptrs_dev` / `v_ptrs_dev` 必须已经包含 B 个 cache 的正确指针，
+/// 不做 H2D copy / stream sync → 可 CUDA Graph 捕获。
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_decoding_batch_bf16_launch_ready(
+    q: &Tensor,
+    o: &mut Tensor,
+    kv_lens_dev: &Tensor,
+    k_ptrs_dev: *mut u64,
+    v_ptrs_dev: *mut u64,
+    cuda_config: &CudaConfig,
+    batch_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_row_stride: usize,
+    o_row_stride: usize,
+    q_col_offset: usize,
+    o_col_offset: usize,
+) -> Result<()> {
+    if batch_size == 0 { return Ok(()); }
+    if head_dim != 64 {
+        return Err(Error::InvalidArgument(format!(
+            "flash_decoding_batch_bf16_launch_ready only supports head_dim=64, got {}", head_dim
+        )).into());
+    }
+
+    let needed_per_seq = num_q_heads * crate::cuda::FLASH_DECODE_N_SPLIT * (2 + head_dim);
+    let needed_bytes = batch_size * needed_per_seq * std::mem::size_of::<f32>();
+    if cuda_config.flash_decode_workspace_size < needed_bytes {
+        return Err(Error::InvalidArgument(format!(
+            "flash_decoding_batch_bf16_launch_ready: workspace too small ({} < {})",
+            cuda_config.flash_decode_workspace_size, needed_bytes
+        )).into());
+    }
+
+    let stream = CudaConfig::resolve_stream(Some(cuda_config));
+    let q_base = q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let o_base = o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let q_ptr = unsafe { q_base.add(q_col_offset) };
+    let o_ptr = unsafe { o_base.add(o_col_offset) };
+    let kv_lens_ptr = kv_lens_dev.as_i32()?.buffer().as_ptr() as *const i32;
+    let workspace_ptr = cuda_config.flash_decode_workspace as *mut f32;
+
+    unsafe {
+        flash_decoding_cu_bf16_batch(
+            q_ptr,
+            k_ptrs_dev as *const *const half::bf16,
+            v_ptrs_dev as *const *const half::bf16,
+            o_ptr,
+            workspace_ptr,
+            kv_lens_ptr,
+            batch_size as i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_row_stride as i32,
+            o_row_stride as i32,
+            stream,
+        );
+    }
     Ok(())
 }

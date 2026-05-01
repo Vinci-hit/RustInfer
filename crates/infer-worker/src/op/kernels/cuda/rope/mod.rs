@@ -44,6 +44,37 @@ unsafe extern "C" {
         cos_cache: *const half::f16,
         stream: cuda::ffi::cudaStream_t,
     );
+
+    // Batch 版本: positions[i] 为第 i 行 (seq i) 的绝对位置
+    pub fn rope_kernel_cu_bf16_batch(
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        input_q: *mut half::bf16,
+        input_k: *mut half::bf16,
+        positions: *const i32,
+        batch_size: i32,
+        q_row_stride: i32,
+        k_row_stride: i32,
+        sin_cache: *const half::bf16,
+        cos_cache: *const half::bf16,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn rope_kernel_cu_fp16_batch(
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        input_q: *mut half::f16,
+        input_k: *mut half::f16,
+        positions: *const i32,
+        batch_size: i32,
+        q_row_stride: i32,
+        k_row_stride: i32,
+        sin_cache: *const half::f16,
+        cos_cache: *const half::f16,
+        stream: cuda::ffi::cudaStream_t,
+    );
 }
 
 /// Rotary Positional Embedding (RoPE) 的 CUDA 内核包装函数
@@ -315,5 +346,119 @@ pub fn sin_cos_cache_calc_cuda(
         }
     }
     
+    Ok(())
+}
+
+/// RoPE batch decode 版本：对 [B, num_heads*head_size] 的 q / [B, num_kv_heads*head_size] 的 k
+/// 做就地旋转；每行 i 的绝对位置由 `positions[i]` 决定。
+///
+/// 与 `rope` 不同：`rope` 的 CUDA kernel 将 pos 视为"起始位置"，内部 abs_pos =
+/// pos[0] + seq_idx，要求一 batch 内所有 token 位置连续，这是 prefill 段语义；
+/// 本函数使用 `rope_kernel_cu_{bf16,fp16}_batch`，直接读 positions[seq_idx]。
+#[allow(clippy::too_many_arguments)]
+pub fn rope_batch(
+    dim: usize,
+    kv_dim: usize,
+    head_size: usize,
+    input_q: &mut Tensor,
+    input_k: &mut Tensor,
+    positions: &Tensor, // [B], I32, device
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    // 连续内存版：row_stride = inner dim
+    let batch_size = input_q.shape()[0];
+    rope_batch_strided(
+        dim, kv_dim, head_size,
+        input_q, input_k,
+        dim, kv_dim, // row strides = inner dims
+        positions,
+        sin_cache, cos_cache,
+        batch_size, 0, 0,
+        cuda_config,
+    )
+}
+
+/// RoPE batch decode 的低层接口：允许传任意 row_stride 和起点 offset（元素单位），
+/// 使 q / k 可直接指向 fused qkv tensor 里的对应段，省去 split_cols。
+///
+/// # Arguments
+/// * `q_tensor`, `k_tensor` — 起点 tensor（可以是 qkv 整块）
+/// * `q_row_stride`, `k_row_stride` — 每行元素数（对 fused qkv，= q_dim + 2*kv_dim）
+/// * `q_col_offset`, `k_col_offset` — 起点列（对 fused qkv，q=0, k=q_dim）
+/// * `batch_size` — 处理的行数
+#[allow(clippy::too_many_arguments)]
+pub fn rope_batch_strided(
+    dim: usize,
+    kv_dim: usize,
+    head_size: usize,
+    q_tensor: &mut Tensor,
+    k_tensor: &mut Tensor,
+    q_row_stride: usize,
+    k_row_stride: usize,
+    positions: &Tensor,
+    sin_cache: &Tensor,
+    cos_cache: &Tensor,
+    batch_size: usize,
+    q_col_offset: usize,
+    k_col_offset: usize,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    let dtype = q_tensor.dtype();
+    if positions.shape()[0] < batch_size {
+        return Err(Error::InvalidArgument(format!(
+            "rope_batch_strided: positions.len ({}) < batch_size ({})",
+            positions.shape()[0], batch_size
+        )).into());
+    }
+
+    let pos_ptr = positions.as_i32()?.buffer().as_ptr() as *const i32;
+    let dim_i32 = dim as i32;
+    let kv_dim_i32 = kv_dim as i32;
+    let head_size_i32 = head_size as i32;
+    let q_stride_i32 = q_row_stride as i32;
+    let k_stride_i32 = k_row_stride as i32;
+    let stream = CudaConfig::resolve_stream(cuda_config);
+
+    match dtype {
+        crate::base::DataType::BF16 => {
+            let q_base = q_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let k_base = k_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let q_ptr = unsafe { q_base.add(q_col_offset) };
+            let k_ptr = unsafe { k_base.add(k_col_offset) };
+            let sin_ptr = sin_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let cos_ptr = cos_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            unsafe {
+                rope_kernel_cu_bf16_batch(
+                    dim_i32, kv_dim_i32, head_size_i32,
+                    q_ptr, k_ptr, pos_ptr, batch_size as i32,
+                    q_stride_i32, k_stride_i32,
+                    sin_ptr, cos_ptr, stream,
+                );
+            }
+        }
+        crate::base::DataType::F16 => {
+            let q_base = q_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let k_base = k_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let q_ptr = unsafe { q_base.add(q_col_offset) };
+            let k_ptr = unsafe { k_base.add(k_col_offset) };
+            let sin_ptr = sin_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let cos_ptr = cos_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+            unsafe {
+                rope_kernel_cu_fp16_batch(
+                    dim_i32, kv_dim_i32, head_size_i32,
+                    q_ptr, k_ptr, pos_ptr, batch_size as i32,
+                    q_stride_i32, k_stride_i32,
+                    sin_ptr, cos_ptr, stream,
+                );
+            }
+        }
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "Unsupported data type for rope_batch_strided: {:?}", dtype
+            )).into());
+        }
+    }
     Ok(())
 }
