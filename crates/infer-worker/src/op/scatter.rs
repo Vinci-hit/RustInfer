@@ -91,6 +91,54 @@ pub fn scatter_kv(
     }
 }
 
+/// 批量 scatter: 将 B 行 K/V 写入 B 个不同的 KV cache 的各自 position。
+///
+/// 用于 batch decode: B 个 seq 各产生 1 行 KV，需要写入各自独立的 cache。
+///
+/// # Arguments
+/// * `k_caches` - B 个 K cache 的 &mut Tensor 引用, 每个 shape [max_seq_len, kv_dim]
+/// * `v_caches` - B 个 V cache 的 &mut Tensor 引用
+/// * `src_k` - [B, kv_dim] 新的 K 值
+/// * `src_v` - [B, kv_dim] 新的 V 值
+/// * `positions` - [B] 每个 seq 的写入位置 (CPU i32 slice)
+#[allow(unused_variables)]
+pub fn scatter_kv_batch(
+    k_caches: &mut [&mut Tensor],
+    v_caches: &mut [&mut Tensor],
+    src_k: &Tensor,
+    src_v: &Tensor,
+    positions: &[i32],
+    cuda_config: Option<&OpConfig>,
+) -> Result<()> {
+    let batch_size = k_caches.len();
+    assert_eq!(v_caches.len(), batch_size);
+    assert_eq!(positions.len(), batch_size);
+
+    let kv_dim = k_caches[0].shape()[1];
+
+    // 逐 seq 调用现有的 scatter_kv
+    // 从 src_k/src_v [B, kv_dim] 中 slice 出每行
+    for i in 0..batch_size {
+        let src_k_row = src_k.slice(&[i, 0], &[1, kv_dim])?;
+        let src_v_row = src_v.slice(&[i, 0], &[1, kv_dim])?;
+
+        // 构造单个 pos tensor
+        let mut pos_tensor = Tensor::new(&[1], crate::base::DataType::I32, crate::base::DeviceType::Cpu)?;
+        pos_tensor.as_i32_mut()?.as_slice_mut()?[0] = positions[i];
+
+        scatter_kv(
+            k_caches[i],
+            &src_k_row,
+            v_caches[i],
+            &src_v_row,
+            &pos_tensor,
+            cuda_config,
+        )?;
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 //  Unit Tests
 // ============================================================================

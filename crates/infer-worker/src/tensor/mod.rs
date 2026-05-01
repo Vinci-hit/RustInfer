@@ -1068,6 +1068,51 @@ impl Tensor {
 
         Ok(new_tensor)
     }
+
+    // ═══════════════════════════════════════════════════════
+    // 共享显存 helper: 用于 Worker 的 Server ↔ Runner 通信
+    // ═══════════════════════════════════════════════════════
+
+    /// 将 CPU 上的 i32 slice 写入此 GPU tensor 的前 `count` 个元素。
+    ///
+    /// 不分配新内存，直接 H2D copy 到已有 buffer 的前部。
+    /// `count` 必须 <= self.shape()[0]。
+    pub fn write_from_i32_host(&mut self, src: &[i32], count: usize) -> Result<()> {
+        assert!(count <= src.len(), "count exceeds src length");
+        let elem_bytes = std::mem::size_of::<i32>();
+        let copy_bytes = count * elem_bytes;
+
+        // 取前 count 个元素对应的 buffer 切片
+        let mut dst_slice = self.buffer().slice(0, copy_bytes)?;
+        dst_slice.copy_from_host(&src[..count])?;
+        Ok(())
+    }
+
+    /// 从此 GPU tensor 的前 `count` 个 i32 元素 D2H copy 到 CPU Vec。
+    pub fn read_i32_to_host(&self, count: usize) -> Result<Vec<i32>> {
+        let elem_bytes = std::mem::size_of::<i32>();
+        let copy_bytes = count * elem_bytes;
+
+        // 取 GPU buffer 的前 count 个元素
+        let src_slice = self.buffer().slice(0, copy_bytes)?;
+
+        // 创建 CPU buffer 并 D2H copy
+        let allocator: Arc<dyn DeviceAllocator + Send + Sync> = Arc::new(CpuAllocator);
+        let mut cpu_buf = Buffer::new(copy_bytes, allocator)?;
+        cpu_buf.copy_from(&src_slice)?;
+
+        // 读出数据
+        let ptr = cpu_buf.as_ptr() as *const i32;
+        let result = unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec();
+        Ok(result)
+    }
+
+    /// 零拷贝返回此 tensor 前 `count` 个元素的 1D 视图。
+    ///
+    /// 返回的 Tensor 共享底层 GPU 内存，不分配新内存。
+    pub fn view_prefix(&self, count: usize) -> Result<Self> {
+        self.slice(&[0], &[count])
+    }
 }
 
 // --- 1. 实现不可变索引 (tensor[i]) ---

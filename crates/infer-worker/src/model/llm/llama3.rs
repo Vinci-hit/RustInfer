@@ -163,6 +163,16 @@ impl Llama3 {
         InferenceState::new(&self.config, self.device_type)
     }
 
+    /// 获取 tokenizer 引用
+    pub fn tokenizer(&self) -> &dyn crate::model::common::tokenizer::Tokenizer {
+        self.tokenizer.as_ref()
+    }
+
+    /// 获取模型配置引用
+    pub fn config(&self) -> &RuntimeModelConfig {
+        &self.config
+    }
+
     // ---- Weight loading helpers ----
 
     fn load_matmul(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Matmul> {
@@ -391,7 +401,7 @@ impl Llama3 {
         Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
 
-    fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
+    pub fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
         state.input_pos.copy_from(pos_cpu)?;
         let input_tokens_view = &state.output_token;
 
@@ -517,7 +527,7 @@ impl Llama3 {
         Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
     }
 
-    fn forward_prefill(&self, state: &mut InferenceState, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
+    pub fn forward_prefill(&self, state: &mut InferenceState, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
         let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
 
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
@@ -603,6 +613,169 @@ impl Llama3 {
         state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
 
         Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Batch Forward Methods
+    // ════════════════════════════════════════════════════════════════
+
+    /// Batch decode forward: B 个 seq 各 seq_len=1，共享 matmul/rmsnorm 等 op 调用。
+    ///
+    /// 与 `forward_decoding` 的区别:
+    /// - 所有 [1, dim] 变为 [B, dim]，一次 GEMM 调用
+    /// - RoPE 用 positions[B] 为每行不同 pos
+    /// - scatter_kv_batch: 写 B 行到 B 个独立 cache
+    /// - FlashAttn: 循环 per-seq (Phase 1)
+    /// - Sampler: 循环 per-seq (Phase 1)
+    ///
+    /// # Arguments
+    /// * `states` - B 个 InferenceState (各自有独立 KV cache)
+    /// * `workspace` - 共享的 batch workspace (预分配 [max_batch, dim] 等)
+    /// * `positions` - [B] CPU i32, 每个 seq 的 decode position
+    pub fn forward_batch_decode(
+        &self,
+        states: &mut [InferenceState],
+        workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
+        positions: &[i32],
+        cuda_config: Option<&crate::OpConfig>,
+    ) -> Result<Vec<i32>> {
+        let batch_size = states.len();
+        assert_eq!(positions.len(), batch_size);
+        assert!(batch_size > 0);
+
+        let dim = self.config.dim;
+        let q_dim = self.config.q_dim;
+        let kv_dim = self.config.kv_dim;
+        let inter = self.config.intermediate_size;
+        let qkv_cols = q_dim + 2 * kv_dim;
+
+        let cuda_config_ref = cuda_config;
+
+        // 1. 收集 B 个 input token (各 state.output_token) → input_tokens[B]
+        {
+            let input_buf = &mut workspace.input_tokens;
+            let mut tokens_view = input_buf.slice(&[0], &[batch_size])?;
+            for i in 0..batch_size {
+                let tok = states[i].output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+                // 写入 workspace 的第 i 个位置
+                let mut dst = tokens_view.slice(&[i], &[1])?;
+                let src = &states[i].output_token;
+                dst.copy_from(src)?;
+            }
+        }
+
+        // 收集 positions → workspace.input_pos[B] (CPU)
+        {
+            let pos_slice = workspace.input_pos.as_i32_mut()?.as_slice_mut()?;
+            pos_slice[..batch_size].copy_from_slice(positions);
+        }
+        let input_pos_view = workspace.input_pos.slice(&[0], &[batch_size])?;
+
+        // 2. Embedding: [B] → [B, dim]
+        let input_tokens_view = workspace.input_tokens.slice(&[0], &[batch_size])?;
+        let mut x = workspace.x.slice(&[0, 0], &[batch_size, dim])?;
+        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
+
+        // 3. Transformer layers
+        for layer_idx in 0..self.config.layer_num {
+            // RMSNorm
+            let mut attn_norm_out = workspace.rms_out.slice(&[0, 0], &[batch_size, dim])?;
+            self.layers.rmsnorm_attn_layers[layer_idx].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
+
+            // QKV GEMM: [B, dim] → [B, q_dim+2*kv_dim]
+            let mut qkv = workspace.qkv_out.slice(&[0, 0], &[batch_size, qkv_cols])?;
+            self.layers.wqkv_layers[layer_idx].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
+
+            // Split Q/K/V
+            let mut q = qkv.slice(&[0, 0], &[batch_size, q_dim])?;
+            let mut k = qkv.slice(&[0, q_dim], &[batch_size, kv_dim])?;
+            let v = qkv.slice(&[0, q_dim + kv_dim], &[batch_size, kv_dim])?;
+
+            // RoPE: positions[B], 每行不同 pos
+            let sin_cache = &workspace.sin_cache;
+            let cos_cache = &workspace.cos_cache;
+            self.layers.rope_layers[layer_idx].forward(
+                &input_pos_view, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref,
+            )?;
+
+            // scatter_kv_batch: 写 B 行到 B 个 cache
+            {
+                let mut k_caches: Vec<&mut Tensor> = Vec::with_capacity(batch_size);
+                let mut v_caches: Vec<&mut Tensor> = Vec::with_capacity(batch_size);
+                for state in states.iter_mut() {
+                    let (kc, vc) = state.kv_cache.get_mut(layer_idx)?;
+                    k_caches.push(kc);
+                    v_caches.push(vc);
+                }
+                crate::op::scatter::scatter_kv_batch(
+                    &mut k_caches, &mut v_caches,
+                    &k, &v, positions, cuda_config_ref,
+                )?;
+            }
+
+            // Attention: 循环 per-seq (Phase 1)
+            // 每个 seq 的 q[1, q_dim] attend 自己的 k_cache, v_cache
+            let mut attn_out = attn_norm_out; // reuse buffer
+            {
+                let k_cache_refs: Vec<&Tensor> = states.iter()
+                    .map(|s| { let (k, _) = s.kv_cache.get(layer_idx).unwrap(); k })
+                    .collect();
+                let v_cache_refs: Vec<&Tensor> = states.iter()
+                    .map(|s| { let (_, v) = s.kv_cache.get(layer_idx).unwrap(); v })
+                    .collect();
+                // kv_lens[i] = positions[i] + 1 (包含本步刚写入的 KV)
+                let kv_lens: Vec<i32> = positions.iter().map(|&p| p + 1).collect();
+
+                self.layers.mha_layers[layer_idx].forward_batch_decode(
+                    &q, &k_cache_refs, &v_cache_refs, &kv_lens,
+                    &mut attn_out, cuda_config_ref,
+                )?;
+            }
+
+            // WO projection: [B, q_dim] → [B, dim]
+            let mut wo_out = q; // reuse q buffer (same shape [B, q_dim=dim])
+            self.layers.wo_layers[layer_idx].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
+
+            // Residual + FFN RMSNorm
+            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
+            let mut ffn_norm_out = attn_out; // reuse
+            self.layers.rmsnorm_ffn_layers[layer_idx].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
+
+            // FFN: Gate+Up GEMM → SwiGLU → Down GEMM
+            let mut gate_up = workspace.gate_up_out.slice(&[0, 0], &[batch_size, 2 * inter])?;
+            self.layers.w_gate_up_layers[layer_idx].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
+            let mut w1_out = gate_up.slice(&[0, 0], &[batch_size, inter])?;
+            let w3_out = gate_up.slice(&[0, inter], &[batch_size, inter])?;
+            self.layers.swiglu_layers[layer_idx].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
+
+            let mut w2_out = ffn_norm_out; // reuse
+            self.layers.w2_layers[layer_idx].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
+
+            // Residual
+            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
+        }
+
+        // 4. Final RMSNorm + LM head
+        let mut final_norm_out = workspace.rms_out.slice(&[0, 0], &[batch_size, dim])?;
+        self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_out, cuda_config_ref)?;
+
+        // LM head: [B, dim] → [B, vocab_size]
+        let mut logits = workspace.logits.slice(&[0, 0], &[batch_size, self.config.vocab_size])?;
+        self.layers.cls_layer.forward(&final_norm_out, &mut logits, cuda_config_ref)?;
+
+        // 5. Sample: 循环 per-seq (Phase 1)
+        let mut output_tokens = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let logits_row = logits.slice(&[i, 0], &[1, self.config.vocab_size])?;
+            let logits_trimmed = logits_row.slice(&[0, 0], &[1, self.config.tokenizer_vocab_size])?;
+            // reshape to [tokenizer_vocab_size] for sampler
+            let logits_1d = logits_trimmed.reshape(&[self.config.tokenizer_vocab_size])?;
+            states[i].sampler.sample(&logits_1d, &mut states[i].output_token, cuda_config_ref)?;
+            let tok = states[i].output_token.to_cpu()?.as_i32()?.as_slice()?[0];
+            output_tokens.push(tok);
+        }
+
+        Ok(output_tokens)
     }
 }
 

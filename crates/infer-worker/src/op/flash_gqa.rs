@@ -103,9 +103,65 @@ impl FlashAttnGQA {
 
         Ok(())
     }
-}
 
-#[cfg(feature = "cuda")]
+    /// Batch decode attention: B 个 query 各 attend 各自的 KV cache。
+    ///
+    /// Phase 1: 循环 launch per-seq（复用现有单 seq flash_decoding kernel）。
+    /// Phase 2 (TODO): 写一个 batched kernel 一次 launch 处理 B 个 seq。
+    ///
+    /// # Arguments
+    /// * `q` - [B, num_q_heads * head_dim]  所有 seq 的 query
+    /// * `k_caches` - B 个 KV cache K tensor 引用, 每个 [max_seq_len, kv_dim]
+    /// * `v_caches` - B 个 KV cache V tensor 引用
+    /// * `kv_lens` - [B] 每个 seq 的 KV cache 长度 (i32, CPU)
+    /// * `output` - [B, num_q_heads * head_dim]
+    pub fn forward_batch_decode(
+        &self,
+        q: &Tensor,
+        k_caches: &[&Tensor],
+        v_caches: &[&Tensor],
+        kv_lens: &[i32],
+        output: &mut Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
+        let batch_size = k_caches.len();
+        assert_eq!(v_caches.len(), batch_size);
+        assert_eq!(kv_lens.len(), batch_size);
+
+        let q_dim = self.num_q_heads * self.head_dim;
+
+        // 逐 seq 调用现有 forward (q_seq_len=1)
+        for i in 0..batch_size {
+            let q_row = q.slice(&[i, 0], &[1, q_dim])?;
+            let mut out_row = output.slice(&[i, 0], &[1, q_dim])?;
+
+            // 构造 kv_len tensor
+            let mut kv_len_tensor = Tensor::new(
+                &[1],
+                crate::base::DataType::I32,
+                k_caches[i].device(),
+            )?;
+            // 对 GPU tensor: 需要 H2D copy kv_lens[i]
+            let kv_len_val = [kv_lens[i]];
+            if k_caches[i].device().is_cuda() {
+                kv_len_tensor.write_from_i32_host(&kv_len_val, 1)?;
+            } else {
+                kv_len_tensor.as_i32_mut()?.as_slice_mut()?[0] = kv_lens[i];
+            }
+
+            self.forward(
+                &q_row,
+                k_caches[i],
+                v_caches[i],
+                &kv_len_tensor,
+                &mut out_row,
+                cuda_config,
+            )?;
+        }
+
+        Ok(())
+    }
+}
 impl FlashAttnGQA {
     /// FlashAttnGQA has no internal tensors to move; no-op
     pub fn to_cuda(&mut self, _device_id: i32) -> Result<()> {
