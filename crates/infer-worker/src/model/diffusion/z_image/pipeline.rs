@@ -133,8 +133,27 @@ impl ZImagePipeline {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
-        // 1. Scheduler
-        let scheduler = FlowMatchEulerScheduler::new(1000, 3.0);
+        // 1. Scheduler — read config from scheduler/scheduler_config.json
+        let scheduler = {
+            let sched_cfg_path = model_dir.join("scheduler/scheduler_config.json");
+            let (num_train_timesteps, shift) = if sched_cfg_path.exists() {
+                let cfg_str = std::fs::read_to_string(&sched_cfg_path)?;
+                let cfg: serde_json::Value = serde_json::from_str(&cfg_str)
+                    .map_err(|e| crate::base::error::Error::InvalidArgument(
+                        format!("failed to parse scheduler config: {}", e)
+                    ))?;
+                let num_train = cfg.get("num_train_timesteps")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1000) as usize;
+                let shift = cfg.get("shift")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(3.0) as f32;
+                (num_train, shift)
+            } else {
+                (1000, 3.0) // Turbo default
+            };
+            FlowMatchEulerScheduler::new(num_train_timesteps, shift)
+        };
 
         // 2. TextEncoder (Qwen3)
         let te_dir = model_dir.join("text_encoder");
@@ -817,16 +836,16 @@ mod tests {
         // Conv2d cache) at the exact shape we're about to generate at.
         // Without this, the single generate() call below eats the full
         // cold-start tax — typically 10×+ the steady-state latency.
-        eprintln!("[test] warming up at 256x256...");
+        eprintln!("[test] warming up at 1024x1024...");
         let t_warm = Instant::now();
-        pipeline.warmup_for(256, 256)?;
+        pipeline.warmup_for(1024, 1024)?;
         eprintln!("[test] warmup done in {}ms", t_warm.elapsed().as_millis());
 
-        // Very small size to isolate correctness / hang issues.
+        // Z-Image-Turbo: 1024x1024 HD, 2-step distilled schedule
         let request = DiffusionRequest {
-            prompt: "一只小猫在炒菜".to_string(),
-            height: 256,
-            width: 256,
+            prompt: "一只可爱的橘色小猫咪，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格".to_string(),
+            height: 1024,
+            width: 1024,
             // Keep the original 2-step Turbo schedule so this test
             // stays comparable to previous runs. Use
             // `test_pipeline_bench_cuda_9step` to measure the 9-step
@@ -855,6 +874,54 @@ mod tests {
         );
         save_tensor_as_ppm(&output.output, "/root/z_image_cuda_output.ppm")?;
         eprintln!("Saved /root/z_image_cuda_output.ppm");
+        Ok(())
+    }
+
+    /// Test Z-Image (non-Turbo) model with full inference steps.
+    /// Unlike Turbo which uses 2-step distilled schedule, Z-Image requires
+    /// more steps (typically 28) and uses CFG guidance.
+    #[test]
+    #[ignore = "需要 Z-Image 模型权重 + CUDA"]
+    #[cfg(feature = "cuda")]
+    fn test_pipeline_z_image_full_cuda() -> Result<()> {
+        let model_dir = Path::new("/root/models/Z-Image");
+        if !model_dir.join("text_encoder/config.json").exists() {
+            eprintln!("[test] Z-Image model not found at {:?}, skipping", model_dir);
+            return Ok(());
+        }
+
+        eprintln!("[test] loading Z-Image (full, non-Turbo) pipeline...");
+        let mut pipeline = ZImagePipeline::from_pretrained(model_dir, DeviceType::Cuda(0))?;
+        eprintln!("[test] scheduler shift: {}", pipeline.scheduler.shift);
+
+        // Warmup at target resolution
+        eprintln!("[test] warming up at 1024x1024...");
+        let t_warm = Instant::now();
+        pipeline.warmup_for(1024, 1024)?;
+        eprintln!("[test] warmup done in {}ms", t_warm.elapsed().as_millis());
+
+        // Z-Image full model — 1024x1024 HD, 50 denoising steps, CFG=4.5
+        let request = DiffusionRequest {
+            prompt: "一只可爱的橘色小猫咪，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格".to_string(),
+            height: 1024,
+            width: 1024,
+            num_inference_steps: 50,
+            guidance_scale: 4.5,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let output = pipeline.generate(&request)?;
+        eprintln!("Output shape: {:?}", output.output.shape());
+        eprintln!("Metrics: encode={}ms, denoise={}ms, decode={}ms, total={}ms",
+            output.metrics.encode_prompt_ms,
+            output.metrics.denoise_ms,
+            output.metrics.decode_ms,
+            output.metrics.total_ms,
+        );
+
+        save_tensor_as_ppm(&output.output, "/root/z_image_full_cuda_output.ppm")?;
+        eprintln!("Saved /root/z_image_full_cuda_output.ppm");
         Ok(())
     }
 
