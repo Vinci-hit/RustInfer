@@ -79,6 +79,36 @@ const VAE_SHIFT_FACTOR: f32 = 0.1159;
 /// Turbo sigmas — fixed 2-step schedule.
 const TURBO_SIGMAS: &[f32] = &[1.0, 0.3];
 
+fn validate_sigmas(sigmas: &[f32]) -> Result<()> {
+    if sigmas.is_empty() {
+        return Err(crate::base::error::Error::InvalidArgument(
+            "sigmas must contain at least one step".into()
+        ).into());
+    }
+    if sigmas.len() > crate::model::diffusion::z_image::state::N_MAX_STEPS {
+        return Err(crate::base::error::Error::InvalidArgument(format!(
+            "sigmas length ({}) exceeds N_MAX_STEPS ({})",
+            sigmas.len(),
+            crate::model::diffusion::z_image::state::N_MAX_STEPS,
+        )).into());
+    }
+    for (i, &sigma) in sigmas.iter().enumerate() {
+        if !sigma.is_finite() || !(0.0..=1.0).contains(&sigma) {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "sigma[{}]={} must be finite and in [0, 1]",
+                i, sigma
+            )).into());
+        }
+        if i > 0 && sigma > sigmas[i - 1] {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "sigmas must be monotonically non-increasing: sigma[{}]={} > sigma[{}]={}",
+                i, sigma, i - 1, sigmas[i - 1]
+            )).into());
+        }
+    }
+    Ok(())
+}
+
 /// Z-Image text-to-image pipeline.
 ///
 /// Owns all components of the diffusers pipeline:
@@ -257,12 +287,25 @@ impl ZImagePipeline {
         request: &DiffusionRequest,
         latent_h: usize,
         latent_w: usize,
-    ) {
+    ) -> Result<()> {
         match request.sigmas.as_deref() {
             Some(sigmas) => {
+                validate_sigmas(sigmas)?;
                 self.scheduler.set_timesteps_from_sigmas(sigmas);
             }
             None => {
+                if request.num_inference_steps == 0 {
+                    return Err(crate::base::error::Error::InvalidArgument(
+                        "num_inference_steps must be >= 1".into()
+                    ).into());
+                }
+                if request.num_inference_steps > crate::model::diffusion::z_image::state::N_MAX_STEPS {
+                    return Err(crate::base::error::Error::InvalidArgument(format!(
+                        "num_inference_steps ({}) exceeds N_MAX_STEPS ({})",
+                        request.num_inference_steps,
+                        crate::model::diffusion::z_image::state::N_MAX_STEPS,
+                    )).into());
+                }
                 // image_seq_len = number of DiT tokens after patchify.
                 let patch = self.transformer.patch_size;
                 let image_seq_len = (latent_h / patch) * (latent_w / patch);
@@ -272,6 +315,7 @@ impl ZImagePipeline {
                 );
             }
         }
+        Ok(())
     }
 
     // ─────────────────── Step 4: Denoise Loop ────────────────────────
@@ -424,7 +468,12 @@ impl ZImagePipeline {
             let mut _t_launch_ms = 0.0_f64;
             let mut _t_sync_ms = 0.0_f64;
             with_cuda_stream(stream_copy, || -> Result<()> {
-                let slot = crate::cuda::GraphSlot::Denoise;
+                let slot = crate::cuda::GraphSlot::Denoise {
+                    latent_h,
+                    latent_w,
+                    cap_padded_len: shapes.cap_padded_len,
+                    steps: num_steps,
+                };
                 let graph_ready = self.text_encoder_state
                     .cuda_config.as_ref().unwrap()
                     .graph_ready(slot);
@@ -709,8 +758,16 @@ impl DiffusionPipeline for ZImagePipeline {
             request.height, request.width, request.seed,
         )?;
 
+        if prompt_embeds.shape()[0] > self.dit_state.spec.capacity.max_cap_len {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "prompt token length {} exceeds configured max_cap_len {}",
+                prompt_embeds.shape()[0],
+                self.dit_state.spec.capacity.max_cap_len
+            )).into());
+        }
+
         // ── Step 3: Prepare timesteps ──
-        self.prepare_timesteps(request, latent_h, latent_w);
+        self.prepare_timesteps(request, latent_h, latent_w)?;
 
         // ── Step 4: Denoise loop (ping-pongs through the state pool) ──
         let denoise_start = Instant::now();
@@ -902,7 +959,7 @@ mod tests {
 
         // Z-Image full model — 1024x1024 HD, 50 denoising steps, CFG=4.5
         let request = DiffusionRequest {
-            prompt: "一只可爱的橘色小猫咪，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格".to_string(),
+            prompt: "一只可爱的奶龙，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格".to_string(),
             height: 1024,
             width: 1024,
             num_inference_steps: 50,

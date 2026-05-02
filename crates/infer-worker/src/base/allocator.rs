@@ -161,29 +161,27 @@ impl DeviceAllocator for &CachingCudaAllocator {
     }
     unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
         let target_ptr = CudaPtr(ptr);
-        let device_id_res = cuda::device::current_device();
-        if device_id_res.is_err() { return; } // 在 deallocate 中不应 panic
-        let device_id = device_id_res.unwrap();
-        
-        // --- 在池中查找并标记为空闲 ---
-        for pool in [&self.state.small_pool, &self.state.large_pool] {
-            if let Some(mut pool_for_device) = pool.get_mut(&device_id)
-                && let Some(chunk) = pool_for_device.iter_mut().find(|c| c.ptr == target_ptr) {
 
-                chunk.is_busy = false;
-                // 如果是小块内存，增加 GC 计数
-                if chunk.size_bytes <= BIG_BUFFER_THRESHOLD {
-                    let mut idle_bytes = self.state.idle_bytes.entry(device_id).or_insert(0);
-                    *idle_bytes += chunk.size_bytes;
-                    // --- 检查是否需要 GC ---
-                    if *idle_bytes > GC_THRESHOLD {
-                        CachingCudaAllocator::garbage_collect(&self.state, device_id);
+        // --- 在所有设备池中查找并标记为空闲，避免依赖当前 CUDA device。 ---
+        for pool in [&self.state.small_pool, &self.state.large_pool] {
+            for mut pool_for_device in pool.iter_mut() {
+                let device_id = *pool_for_device.key();
+                if let Some(chunk) = pool_for_device.iter_mut().find(|c| c.ptr == target_ptr) {
+                    chunk.is_busy = false;
+                    // 如果是小块内存，增加 GC 计数
+                    if chunk.size_bytes <= BIG_BUFFER_THRESHOLD {
+                        let mut idle_bytes = self.state.idle_bytes.entry(device_id).or_insert(0);
+                        *idle_bytes += chunk.size_bytes;
+                        // --- 检查是否需要 GC ---
+                        if *idle_bytes > GC_THRESHOLD {
+                            CachingCudaAllocator::garbage_collect(&self.state, device_id);
+                        }
                     }
+                    return;
                 }
-                return;
             }
         }
-        // --- 如果在池中找不到，直接释放 ---
+        // --- 如果在池中找不到，直接释放当前指针。此路径理论上只处理外部/异常指针。 ---
         let _ = unsafe {cuda::ffi::cudaFree(ptr.as_ptr() as *mut _)};
     }
     fn device(&self) -> DeviceType {

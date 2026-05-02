@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::Arc;
 
+use crate::base::error::{Error, Result};
 use crate::worker::protocol::*;
 use crate::worker::shared_buffers::SharedBuffers;
 
@@ -60,17 +61,51 @@ impl WorkerServer {
         }
     }
 
+    fn validate_prefill(&self, cmd: &PrefillBatchCmd) -> Result<()> {
+        cmd.validate(self.shared.max_batch_tokens, self.shared.max_seqs, self.shared.max_seqs)
+    }
+
+    fn recv_next_prefill_blocking(&mut self) -> PrefillBatchCmd {
+        loop {
+            match self.zmq_in.recv_bytes(0) {
+                Ok(data) => match rmp_serde::from_slice::<PrefillBatchCmd>(&data) {
+                    Ok(cmd) => match self.validate_prefill(&cmd) {
+                        Ok(()) => return cmd,
+                        Err(e) => tracing::error!("Reject invalid PrefillBatchCmd: {}", e),
+                    },
+                    Err(e) => tracing::error!("Failed to deserialize PrefillBatchCmd: {}", e),
+                },
+                Err(e) => tracing::error!("ZMQ recv error while waiting for prefill: {}", e),
+            }
+        }
+    }
+
+    fn enqueue_next_step(&mut self) {
+        if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
+            return;
+        }
+
+        match self.write_input_buffer() {
+            Ok(()) => self.promote_prefills_to_decodes(),
+            Err(e) => {
+                tracing::error!("Failed to write worker input buffer; dropping pending prefills: {}", e);
+                self.pending_prefills.clear();
+                if !self.active_decodes.is_empty() {
+                    self.write_input_buffer()
+                        .expect("active decodes must fit in worker input buffer");
+                }
+            }
+        }
+    }
+
     /// 主循环
     pub fn run(mut self) {
-        // ══ 启动: 阻塞等第一个 prefill ══
+        // ══ 启动: 阻塞等第一个有效 prefill ══
         tracing::info!("WorkerServer waiting for first prefill...");
-        let data = self.zmq_in.recv_bytes(0).expect("ZMQ recv failed");
-        let cmd: PrefillBatchCmd =
-            rmp_serde::from_slice(&data).expect("Failed to deserialize PrefillBatchCmd");
+        let cmd = self.recv_next_prefill_blocking();
         self.pending_prefills.push(cmd);
 
-        self.write_input_buffer();
-        self.promote_prefills_to_decodes();
+        self.enqueue_next_step();
         tracing::info!("WorkerServer started, {} active decodes", self.active_decodes.len());
 
         // ══ 稳态循环 ══
@@ -89,48 +124,57 @@ impl WorkerServer {
             // 2. 更新 active_decodes 的 last_token / position
             self.update_decode_tokens(&output_tokens);
 
-            // 3. 收新 prefill (非阻塞)
+            // 3. 先判 EOS / max_tokens 并移除已结束序列，避免下一步继续 decode finished 请求。
+            self.process_eos_and_send_zmq(&output_tokens);
+
+            // 4. 收新 prefill (非阻塞)
             self.drain_zmq_prefills();
 
-            // 4. 写 input buffer → signal Runner
-            if !self.active_decodes.is_empty() || !self.pending_prefills.is_empty() {
-                self.write_input_buffer();
-                self.promote_prefills_to_decodes();
-            }
-            // ── 气泡结束, Runner 开始跑 ──
-
-            // ── 慢路径 (与 Runner 并行): 判 EOS + ZMQ 发送 ──
-            self.process_eos_and_send_zmq(&output_tokens);
+            // 5. 基于过滤后的 active_decodes 写 input buffer → signal Runner
+            self.enqueue_next_step();
 
             // 所有请求结束且无新 prefill → 阻塞等
             if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
                 tracing::debug!("All sequences finished, waiting for new prefill...");
-                let data = self.zmq_in.recv_bytes(0).expect("ZMQ recv failed");
-                let cmd: PrefillBatchCmd =
-                    rmp_serde::from_slice(&data).expect("Failed to deserialize PrefillBatchCmd");
+                let cmd = self.recv_next_prefill_blocking();
                 self.pending_prefills.push(cmd);
+                self.enqueue_next_step();
             }
         }
     }
 
     /// 快路径: 只更新 last_token (不动 position, position 在 write 之后更新)
     fn update_decode_tokens(&mut self, tokens: &[i32]) {
-        for (i, seq) in self.active_decodes.iter_mut().enumerate() {
-            seq.last_token = tokens[i];
+        if tokens.len() != self.active_decodes.len() {
+            tracing::error!(
+                "Runner output length {} != active decode length {}",
+                tokens.len(),
+                self.active_decodes.len()
+            );
+            return;
+        }
+        for (seq, &token) in self.active_decodes.iter_mut().zip(tokens) {
+            seq.last_token = token;
             seq.generated_count += 1;
         }
     }
 
     /// 慢路径: 判 EOS / max_tokens, 移除已结束, 发 ZMQ_OUT
     fn process_eos_and_send_zmq(&mut self, tokens: &[i32]) {
+        if tokens.len() != self.active_decodes.len() {
+            tracing::error!(
+                "Skip EOS processing: Runner output length {} != active decode length {}",
+                tokens.len(),
+                self.active_decodes.len()
+            );
+            return;
+        }
         let mut step_output = StepOutput {
             tokens: Vec::with_capacity(tokens.len()),
         };
-        let mut write_idx = 0;
+        let old_decodes = std::mem::take(&mut self.active_decodes);
 
-        for i in 0..self.active_decodes.len() {
-            let seq = &self.active_decodes[i];
-            let token_id = tokens[i];
+        for (seq, &token_id) in old_decodes.into_iter().zip(tokens) {
             let finished =
                 token_id == self.eos_token_id || seq.generated_count >= seq.max_tokens;
 
@@ -141,21 +185,25 @@ impl WorkerServer {
             });
 
             if !finished {
-                if write_idx != i {
-                    self.active_decodes.swap(write_idx, i);
-                }
-                write_idx += 1;
+                self.active_decodes.push(seq);
             }
         }
-        self.active_decodes.truncate(write_idx);
 
-        let data = rmp_serde::to_vec(&step_output).expect("Failed to serialize StepOutput");
-        self.zmq_out.send(&data, 0).expect("ZMQ send failed");
+        let data = match rmp_serde::to_vec(&step_output) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("Failed to serialize StepOutput: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = self.zmq_out.send(&data, 0) {
+            tracing::error!("ZMQ send failed: {}", e);
+        }
     }
 
     /// 写入共享 input buffer: Decode 在前, Prefill 在后
     /// 写入后 decode seq 的 next_position 自动 +1
-    fn write_input_buffer(&mut self) {
+    fn write_input_buffer(&mut self) -> Result<()> {
         let num_decode = self.active_decodes.len();
         let num_prefill_seqs: usize = self
             .pending_prefills
@@ -167,21 +215,40 @@ impl WorkerServer {
         let total_tokens = num_decode + num_prefill_tokens;
         let num_seqs = num_decode + num_prefill_seqs;
 
+        if total_tokens > self.shared.max_batch_tokens {
+            return Err(Error::InvalidArgument(format!(
+                "worker input has {} tokens, exceeds max_batch_tokens {}",
+                total_tokens, self.shared.max_batch_tokens
+            )).into());
+        }
+        if num_seqs > self.shared.max_seqs {
+            return Err(Error::InvalidArgument(format!(
+                "worker input has {} seqs, exceeds max_seqs {}",
+                num_seqs, self.shared.max_seqs
+            )).into());
+        }
+
         let mut token_ids = Vec::with_capacity(total_tokens);
         let mut positions = Vec::with_capacity(total_tokens);
         let mut q_start_loc = Vec::with_capacity(num_seqs + 1);
         let mut context_lens = Vec::with_capacity(num_seqs);
         let mut slot_indices = Vec::with_capacity(num_seqs);
-        let mut offset = 0u32;
+        let mut offset = 0usize;
 
         // Decode 在前
         for d in &self.active_decodes {
             token_ids.push(d.last_token);
-            positions.push(d.next_position as i32);
+            positions.push(i32::try_from(d.next_position).map_err(|_| {
+                Error::InvalidArgument(format!("decode position {} exceeds i32", d.next_position))
+            })?);
             q_start_loc.push(offset);
             offset += 1;
-            context_lens.push(d.next_position as i32);
-            slot_indices.push(d.kv_slot as i32);
+            context_lens.push(i32::try_from(d.next_position).map_err(|_| {
+                Error::InvalidArgument(format!("context len {} exceeds i32", d.next_position))
+            })?);
+            slot_indices.push(i32::try_from(d.kv_slot).map_err(|_| {
+                Error::InvalidArgument(format!("kv_slot {} exceeds i32", d.kv_slot))
+            })?);
         }
 
         // 写入后 decode seq 的 position +1 (下一步用)
@@ -203,18 +270,37 @@ impl WorkerServer {
                 let computed = p.num_computed_tokens[i] as usize;
 
                 token_ids.extend_from_slice(&p.input_ids[start..end]);
-                positions.extend((0..seq_len).map(|j| (computed + j) as i32));
+                let pos_start = computed;
+                let pos_end = computed.checked_add(seq_len).ok_or_else(|| {
+                    Error::InvalidArgument("prefill position overflow".into())
+                })?;
+                for pos in pos_start..pos_end {
+                    positions.push(i32::try_from(pos).map_err(|_| {
+                        Error::InvalidArgument(format!("prefill position {} exceeds i32", pos))
+                    })?);
+                }
                 q_start_loc.push(offset);
-                offset += seq_len as u32;
-                context_lens.push(computed as i32);
-                slot_indices.push(p.kv_slots[i] as i32);
+                offset = offset.checked_add(seq_len).ok_or_else(|| {
+                    Error::InvalidArgument("q_start_loc offset overflow".into())
+                })?;
+                context_lens.push(i32::try_from(computed).map_err(|_| {
+                    Error::InvalidArgument(format!("computed tokens {} exceeds i32", computed))
+                })?);
+                slot_indices.push(i32::try_from(p.kv_slots[i]).map_err(|_| {
+                    Error::InvalidArgument(format!("kv_slot {} exceeds i32", p.kv_slots[i]))
+                })?);
             }
         }
         q_start_loc.push(offset); // 末尾哨兵
 
         // 写共享 CPU 交换区。安全性来自 SharedBuffers 的信号协议：
         // 调用 write_input_buffer 时 input_meta.ready == 0，Runner 不会读 input。
-        let q_start_loc_i32: Vec<i32> = q_start_loc.iter().map(|&v| v as i32).collect();
+        let q_start_loc_i32: Vec<i32> = q_start_loc
+            .iter()
+            .map(|&v| i32::try_from(v).map_err(|_| {
+                Error::InvalidArgument(format!("q_start_loc {} exceeds i32", v))
+            }))
+            .collect::<std::result::Result<_, _>>()?;
         unsafe {
             self.shared.input_token_ids.as_mut_slice(total_tokens)
                 .copy_from_slice(&token_ids);
@@ -237,20 +323,29 @@ impl WorkerServer {
         self.shared
             .input_meta
             .num_decode_seqs
-            .store(num_decode as u32, Release);
+            .store(u32::try_from(num_decode).map_err(|_| {
+                Error::InvalidArgument(format!("num_decode {} exceeds u32", num_decode))
+            })?, Release);
         self.shared
             .input_meta
             .num_prefill_seqs
-            .store(num_prefill_seqs as u32, Release);
+            .store(u32::try_from(num_prefill_seqs).map_err(|_| {
+                Error::InvalidArgument(format!("num_prefill_seqs {} exceeds u32", num_prefill_seqs))
+            })?, Release);
         self.shared
             .input_meta
             .num_prefill_tokens
-            .store(num_prefill_tokens as u32, Release);
+            .store(u32::try_from(num_prefill_tokens).map_err(|_| {
+                Error::InvalidArgument(format!("num_prefill_tokens {} exceeds u32", num_prefill_tokens))
+            })?, Release);
         // 最后发信号
         self.shared
             .input_meta
             .ready
-            .store(total_tokens as u32, Release);
+            .store(u32::try_from(total_tokens).map_err(|_| {
+                Error::InvalidArgument(format!("total_tokens {} exceeds u32", total_tokens))
+            })?, Release);
+        Ok(())
     }
 
     /// Prefill 写入 input 后,对应序列进入 decode 状态
@@ -285,7 +380,10 @@ impl WorkerServer {
             match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
                 Ok(data) => {
                     match rmp_serde::from_slice::<PrefillBatchCmd>(&data) {
-                        Ok(cmd) => self.pending_prefills.push(cmd),
+                        Ok(cmd) => match self.validate_prefill(&cmd) {
+                            Ok(()) => self.pending_prefills.push(cmd),
+                            Err(e) => tracing::error!("Reject invalid PrefillBatchCmd: {}", e),
+                        },
                         Err(e) => tracing::error!("Failed to deserialize PrefillBatchCmd: {}", e),
                     }
                 }

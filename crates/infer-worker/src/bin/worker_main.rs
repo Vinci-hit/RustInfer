@@ -3,7 +3,75 @@ use std::sync::Arc;
 use std::thread;
 
 use infer_worker::base::DeviceType;
-use infer_worker::worker::{ModelRunner, SharedBuffers, WorkerServer};
+use infer_worker::base::error::Result;
+use infer_worker::model::common::config::RuntimeModelConfig;
+use infer_worker::model::common::tokenizer::Tokenizer;
+use infer_worker::model::llm::llm_model::LlmModel;
+use infer_worker::model::runtime::InferenceState;
+use infer_worker::tensor::Tensor;
+use infer_worker::worker::{BatchWorkspace, ModelRunner, SharedBuffers, WorkerServer};
+
+enum LoadedModel {
+    Llama3(infer_worker::model::llm::llama3::Llama3),
+    Qwen3(infer_worker::model::llm::qwen3::Qwen3),
+}
+
+impl LlmModel for LoadedModel {
+    fn config(&self) -> &RuntimeModelConfig {
+        match self {
+            LoadedModel::Llama3(m) => m.config(),
+            LoadedModel::Qwen3(m) => m.config(),
+        }
+    }
+
+    fn tokenizer(&self) -> &dyn Tokenizer {
+        match self {
+            LoadedModel::Llama3(m) => m.tokenizer(),
+            LoadedModel::Qwen3(m) => m.tokenizer(),
+        }
+    }
+
+    fn create_state(&self) -> Result<InferenceState> {
+        match self {
+            LoadedModel::Llama3(m) => m.create_state(),
+            LoadedModel::Qwen3(m) => m.create_state(),
+        }
+    }
+
+    fn forward_prefill(&self, state: &mut InferenceState, tokens: &[i32], start_pos: i32, seq_len: usize) -> Result<i32> {
+        match self {
+            LoadedModel::Llama3(m) => m.forward_prefill(state, tokens, start_pos, seq_len),
+            LoadedModel::Qwen3(m) => m.forward_prefill(state, tokens, start_pos, seq_len),
+        }
+    }
+
+    fn forward_decoding(&self, state: &mut InferenceState, pos: i32) -> Result<i32> {
+        match self {
+            LoadedModel::Llama3(m) => m.forward_decoding(state, pos),
+            LoadedModel::Qwen3(m) => m.forward_decoding(state, pos),
+        }
+    }
+
+    fn forward_batch_decode(
+        &self,
+        states: &mut [&mut InferenceState],
+        workspace: &mut BatchWorkspace,
+        positions: &[i32],
+        cuda_config: Option<&infer_worker::OpConfig>,
+    ) -> Result<Vec<i32>> {
+        match self {
+            LoadedModel::Llama3(m) => m.forward_batch_decode(states, workspace, positions, cuda_config),
+            LoadedModel::Qwen3(m) => m.forward_batch_decode(states, workspace, positions, cuda_config),
+        }
+    }
+
+    fn fill_rope_cache(&self, dst_sin: &mut Tensor, dst_cos: &mut Tensor) -> Result<()> {
+        match self {
+            LoadedModel::Llama3(m) => m.fill_rope_cache(dst_sin, dst_cos),
+            LoadedModel::Qwen3(m) => m.fill_rope_cache(dst_sin, dst_cos),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker")]
@@ -42,7 +110,7 @@ struct Args {
     log_level: String,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     tracing_subscriber::fmt()
@@ -61,53 +129,70 @@ fn main() {
     tracing::info!("  Max num seqs: {}", args.max_num_seqs);
 
     // 解析 device
-    let device_id = parse_device_id(&args.device).expect("Invalid device string");
+    let device_id = parse_device_id(&args.device)
+        .map_err(|e| infer_worker::base::error::Error::InvalidArgument(e))?;
     let device = DeviceType::Cuda(device_id);
 
-    // TODO: 加载模型
-    // let model = load_model(&args.model, &args.model_type, device);
     tracing::info!("Loading model...");
 
-    // 加载模型
-    let model = infer_worker::model::llm::llama3::Llama3::new(&args.model, device)
-        .expect("Failed to load model");
-    tracing::info!("Model loaded");
+    let model = match args.model_type.as_str() {
+        "llama3" => LoadedModel::Llama3(infer_worker::model::llm::llama3::Llama3::new(&args.model, device)?),
+        "qwen3" => LoadedModel::Qwen3(infer_worker::model::llm::qwen3::Qwen3::new(&args.model, device)?),
+        other => {
+            return Err(infer_worker::base::error::Error::InvalidArgument(format!(
+                "Unsupported model_type '{}'; expected llama3 or qwen3",
+                other
+            )).into());
+        }
+    };
+    let eos_token_id = model
+        .tokenizer()
+        .eos_token_ids()
+        .first()
+        .copied()
+        .ok_or_else(|| infer_worker::base::error::Error::InternalError(
+            "Tokenizer has no EOS token".into()
+        ))?;
+    let eos_token_id = i32::try_from(eos_token_id).map_err(|_| {
+        infer_worker::base::error::Error::InvalidArgument(format!(
+            "EOS token id {} exceeds i32",
+            eos_token_id
+        ))
+    })?;
+    tracing::info!("Model loaded; eos_token_id={}", eos_token_id);
 
     // 创建 InferenceState 数组 (每个 slot 一个)
     let mut states = Vec::with_capacity(args.max_num_seqs);
     for _ in 0..args.max_num_seqs {
-        states.push(model.create_state().expect("Failed to create InferenceState"));
+        states.push(model.create_state()?);
     }
     tracing::info!("Created {} inference states", states.len());
 
     // 预分配共享 buffer
-    let shared = SharedBuffers::new(args.max_batch_tokens, args.max_num_seqs)
-        .expect("Failed to allocate shared buffers");
+    let shared = SharedBuffers::new(args.max_batch_tokens, args.max_num_seqs)?;
     tracing::info!("Shared buffers allocated");
 
     // ZMQ sockets
     let zmq_ctx = zmq::Context::new();
 
-    let zmq_in = zmq_ctx.socket(zmq::PULL).expect("Failed to create ZMQ PULL socket");
-    zmq_in.bind(&args.zmq_in).expect("Failed to bind ZMQ PULL");
+    let zmq_in = zmq_ctx.socket(zmq::PULL)?;
+    zmq_in.bind(&args.zmq_in)?;
 
-    let zmq_out = zmq_ctx.socket(zmq::PUSH).expect("Failed to create ZMQ PUSH socket");
-    zmq_out.connect(&args.zmq_out).expect("Failed to connect ZMQ PUSH");
+    let zmq_out = zmq_ctx.socket(zmq::PUSH)?;
+    zmq_out.connect(&args.zmq_out)?;
 
     tracing::info!("ZMQ sockets ready");
 
     // 创建 Runner 和 Server
     let runner_shared = Arc::clone(&shared);
-    let runner = ModelRunner::new(model, states, runner_shared, device_id)
-        .expect("Failed to create ModelRunner");
+    let runner = ModelRunner::new(model, states, runner_shared, device_id)?;
 
-    let server = WorkerServer::new(zmq_in, zmq_out, shared, device_id, 128009); // Llama3 EOS
+    let server = WorkerServer::new(zmq_in, zmq_out, shared, device_id, eos_token_id);
 
     // 启动 Runner 线程
     let runner_handle = thread::Builder::new()
         .name("model-runner".into())
-        .spawn(move || runner.run())
-        .expect("Failed to spawn runner thread");
+        .spawn(move || runner.run())?;
 
     tracing::info!("Worker pipeline running.");
 
@@ -115,7 +200,10 @@ fn main() {
     server.run();
 
     // 正常不会到这里
-    runner_handle.join().unwrap();
+    runner_handle.join().map_err(|_| {
+        infer_worker::base::error::Error::InternalError("model-runner thread panicked".into())
+    })?;
+    Ok(())
 }
 
 fn parse_device_id(s: &str) -> Result<i32, String> {

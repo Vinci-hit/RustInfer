@@ -60,11 +60,16 @@ impl<T: Dtype> TypedTensor<T> {
     pub fn new(shape: &[usize], device: DeviceType) -> Result<Self> {
         let num_elements: usize = shape.iter().product();
         let size_bytes = num_elements * std::mem::size_of::<T>();
+        #[cfg(feature = "cuda")]
+        let _device_guard = match device {
+            DeviceType::Cuda(device_id) => Some(crate::cuda::device::CudaDeviceGuard::new(device_id)?),
+            DeviceType::Cpu => None,
+        };
         // 临时的分配器获取逻辑，未来可以替换为更复杂的分配器管理
         let allocator: Arc<dyn DeviceAllocator + Send + Sync> = match device {
             DeviceType::Cpu => Arc::new(CpuAllocator),
             #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => Arc::new(crate::base::allocator::CachingCudaAllocator::instance()), //最后在当前线程的设备上分配。
+            DeviceType::Cuda(_) => Arc::new(crate::base::allocator::CachingCudaAllocator::instance()),
         };
 
         let buffer = Buffer::new(size_bytes, allocator)?;
@@ -852,9 +857,15 @@ impl Tensor {
             )).into());
         }
 
-        // 检查切片是否会越过每个维度的边界
+        // 检查切片是否会越过每个维度的边界。
         for i in 0..original_shape.len() {
-            if offsets[i] + new_shape[i] > original_shape[i] {
+            let end = offsets[i].checked_add(new_shape[i]).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "Slice offset overflow on dimension {}: offset {} + shape {}",
+                    i, offsets[i], new_shape[i]
+                ))
+            })?;
+            if end > original_shape[i] {
                 return Err(Error::InvalidArgument(format!(
                     "Slice is out of bounds on dimension {}: offset {} + shape {} > original_shape {}",
                     i, offsets[i], new_shape[i], original_shape[i]

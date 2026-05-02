@@ -24,7 +24,7 @@ pub const FLASH_DECODE_N_SPLIT: usize = 8;
 ///   变化不进 graph；mixed batch 把 forward 拆成 pre-attn + attn(不入图) + post-attn 三段。
 /// - [`GraphSlot::LlmMixedPostAttn(total_tokens)`] — MixedBatch 路径 attention 之后的部分
 ///   （wo / FFN / 最后的 rmsnorm + cls + sampler）。
-/// - [`GraphSlot::Denoise`] — 扩散模型 denoise step（Z-Image 等）。
+/// - [`GraphSlot::Denoise`] — 扩散模型 denoise step（Z-Image 等），按请求 shape / step 分桶。
 ///
 /// 现在 llama3 还没实现 MixedBatch，MixedPre/Post 暂未使用，但 key 空间先留好；
 /// MixedBatch 落地时直接用，不再动 `CudaConfig` 的 API。
@@ -33,7 +33,12 @@ pub enum GraphSlot {
     LlmDecode(usize),
     LlmMixedPreAttn(usize),
     LlmMixedPostAttn(usize),
-    Denoise,
+    Denoise {
+        latent_h: usize,
+        latent_w: usize,
+        cap_padded_len: usize,
+        steps: usize,
+    },
 }
 
 /// CudaConfig 包含了执行 CUDA 内核所需的上下文信息。
@@ -76,7 +81,7 @@ pub struct CudaConfig {
     /// 典型用法：
     /// - LLM decode(B=1) → `LlmDecode`
     /// - LLM batch decode → `LlmBatchDecode(batch_size)`（不同 B 独立 cache）
-    /// - 扩散 denoise → `Denoise`
+    /// - 扩散 denoise → `Denoise { latent_h, latent_w, cap_padded_len, steps }`
     pub graphs: HashMap<GraphSlot, CudaGraph>,
     /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
     pub cudnn_handle: ffi::cudnnHandle_t,

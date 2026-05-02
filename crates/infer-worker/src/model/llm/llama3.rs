@@ -400,6 +400,14 @@ impl Llama3 {
     /// 输入 token 隐含为 `state.output_token`（graph 自闭环：上一步 sampler 写入，本步 embedding 读）；
     /// 调用方需确保 state 已完成 prefill 且 `state.output_token` 持有正确值。
     pub fn forward_decoding(&self, state: &mut InferenceState, pos: i32) -> Result<i32> {
+        let pos_usize = usize::try_from(pos).map_err(|_| Error::InvalidArgument(format!(
+            "decode position {} is negative",
+            pos
+        )))?;
+        if state.kv_cache.ensure_capacity(pos_usize + 1)? {
+            state.invalidate_decode_graphs();
+        }
+
         // state.input_pos 容量 [max_seq_len]，decode 只写前 1 个元素
         state.input_pos.write_from_i32_host(&[pos], 1)?;
         let input_tokens_view = &state.output_token;
@@ -540,7 +548,16 @@ impl Llama3 {
     /// * `start_pos`— `tokens[0]` 对应的 KV cache 绝对位置（continuation 场景可 > 0）
     pub fn forward_prefill(&self, state: &mut InferenceState, tokens: &[i32], start_pos: i32, seq_len: usize) -> Result<i32> {
         assert!(tokens.len() >= seq_len, "tokens slice shorter than seq_len");
-        let pos = start_pos as usize;
+        let pos = usize::try_from(start_pos).map_err(|_| Error::InvalidArgument(format!(
+            "prefill start_pos {} is negative",
+            start_pos
+        )))?;
+        let required_len = pos.checked_add(seq_len).ok_or_else(|| {
+            Error::InvalidArgument(format!("prefill range overflow: pos {} + len {}", start_pos, seq_len))
+        })?;
+        if state.kv_cache.ensure_capacity(required_len)? {
+            state.invalidate_decode_graphs();
+        }
 
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
 
@@ -685,6 +702,26 @@ impl Llama3 {
         let qkv_cols = q_dim + 2 * kv_dim;
 
         let cuda_config_ref = cuda_config;
+
+        let mut kv_grew = false;
+        for (state, &pos) in states.iter_mut().zip(positions) {
+            let pos_usize = usize::try_from(pos).map_err(|_| Error::InvalidArgument(format!(
+                "decode position {} is negative",
+                pos
+            )))?;
+            if state.kv_cache.ensure_capacity(pos_usize + 1)? {
+                state.invalidate_decode_graphs();
+                kv_grew = true;
+            }
+        }
+        if kv_grew {
+            workspace.invalidate_batch_member_cache();
+            #[cfg(feature = "cuda")]
+            if let Some(cfg) = cuda_config_ref {
+                let cfg_ptr = cfg as *const crate::cuda::CudaConfig as *mut crate::cuda::CudaConfig;
+                unsafe { (*cfg_ptr).graphs.clear(); }
+            }
+        }
 
         // ═══════════════════════════════════════════════════════════════
         // Stage 1: Host prelude (capture 之外) — 更新每步 H2D buffer + 首次填 KV 指针
@@ -1164,7 +1201,6 @@ impl Llama3 {
         if use_batched_argmax {
             #[cfg(feature = "cuda")]
             {
-                let split_stream2 = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
                 let mut out_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
                 // 直接走 strided argmax_batch：从 logits [B, vocab_size] 取前 tok_vocab 列
                 crate::op::kernels::cuda::argmax_batch_strided(

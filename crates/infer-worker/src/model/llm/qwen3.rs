@@ -420,6 +420,14 @@ impl Qwen3 {
     }
 
     fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
+        let pos = pos_cpu.as_i32()?.as_slice()?[0];
+        let pos_usize = usize::try_from(pos).map_err(|_| Error::InvalidArgument(format!(
+            "decode position {} is negative",
+            pos
+        )))?;
+        if state.kv_cache.ensure_capacity(pos_usize + 1)? {
+            state.invalidate_decode_graphs();
+        }
         {
             let mut dst = state.input_pos.slice(&[0], &[1])?;
             dst.copy_from(pos_cpu)?;
@@ -563,7 +571,17 @@ impl Qwen3 {
     }
 
     fn forward_prefill(&self, state: &mut InferenceState, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
-        let pos = pos_cpu.as_i32()?.as_slice()?[0] as usize;
+        let start_pos = pos_cpu.as_i32()?.as_slice()?[0];
+        let pos = usize::try_from(start_pos).map_err(|_| Error::InvalidArgument(format!(
+            "prefill start_pos {} is negative",
+            start_pos
+        )))?;
+        let required_len = pos.checked_add(seq_len).ok_or_else(|| {
+            Error::InvalidArgument(format!("prefill range overflow: pos {} + len {}", start_pos, seq_len))
+        })?;
+        if state.kv_cache.ensure_capacity(required_len)? {
+            state.invalidate_decode_graphs();
+        }
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
 
         // 把本段 prefill 的 seq_len 个绝对位置写到 state.input_pos 前 seq_len 个元素。
@@ -795,6 +813,73 @@ impl Qwen3 {
         let mut output = Tensor::new(&[seq_len, self.config.dim], x.dtype(), self.device_type)?;
         output.copy_from(&x)?;
         Ok(output)
+    }
+}
+
+impl crate::model::llm::LlmModel for Qwen3 {
+    fn config(&self) -> &crate::model::common::config::RuntimeModelConfig {
+        &self.config
+    }
+
+    fn tokenizer(&self) -> &dyn crate::model::common::tokenizer::Tokenizer {
+        self.tokenizer.as_ref()
+    }
+
+    fn create_state(&self) -> Result<crate::model::runtime::InferenceState> {
+        Qwen3::create_state(self)
+    }
+
+    fn forward_prefill(
+        &self,
+        state: &mut crate::model::runtime::InferenceState,
+        tokens: &[i32],
+        start_pos: i32,
+        seq_len: usize,
+    ) -> Result<i32> {
+        let mut input_tokens = Tensor::new(&[tokens.len()], DataType::I32, DeviceType::Cpu)?;
+        input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(tokens);
+        let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = start_pos;
+        Qwen3::forward_prefill(self, state, &input_tokens, &pos_cpu, seq_len)
+    }
+
+    fn forward_decoding(
+        &self,
+        state: &mut crate::model::runtime::InferenceState,
+        pos: i32,
+    ) -> Result<i32> {
+        let input_tokens = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = pos;
+        Qwen3::forward_decoding(self, state, &input_tokens, &pos_cpu)
+    }
+
+    fn forward_batch_decode(
+        &self,
+        states: &mut [&mut crate::model::runtime::InferenceState],
+        _workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
+        positions: &[i32],
+        _cuda_config: Option<&crate::OpConfig>,
+    ) -> Result<Vec<i32>> {
+        if states.len() != positions.len() {
+            return Err(Error::InvalidArgument(format!(
+                "Qwen3 batch decode states len {} != positions len {}",
+                states.len(), positions.len()
+            )).into());
+        }
+        states
+            .iter_mut()
+            .zip(positions.iter().copied())
+            .map(|(state, pos)| <Qwen3 as crate::model::llm::LlmModel>::forward_decoding(self, *state, pos))
+            .collect()
+    }
+
+    fn fill_rope_cache(
+        &self,
+        dst_sin: &mut Tensor,
+        dst_cos: &mut Tensor,
+    ) -> Result<()> {
+        crate::model::runtime::compute_rope_cache(&self.config, dst_sin, dst_cos)
     }
 }
 

@@ -1,6 +1,7 @@
 //! Single DiT transformer block for Z-Image.
 
 use crate::OpConfig;
+use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
 
 use crate::model::diffusion::buffer::DiffBufferType as BT;
@@ -111,19 +112,50 @@ impl DiTBlock {
             self.to_qkv.forward(&norm1_x, &mut qkv_out, cuda_config)?;
         }
 
-        // Fused QKV split + per-head RMSNorm + RoPE.
+        // QKV split + per-head RMSNorm + RoPE. CUDA BF16 uses the fused kernel;
+        // F32/F16/CPU fall back to the generic ops so tests and non-BF16 checkpoints work.
         {
             let qkv_out = state.slice(BT::BlkQkvOut, &[seq, 3 * dim])?;
-            crate::op::kernels::cuda::zimage_fused_qkv_split_head_rmsnorm_rope_interleaved_bf16(
-                &qkv_out,
-                &self.norm_q.weight,
-                &self.norm_k.weight,
-                cos, sin,
-                &mut q, &mut k, &mut v,
-                seq, self.n_heads, self.head_dim,
-                self.norm_q.eps(),
-                cuda_config,
-            )?;
+            if matches!(qkv_out.device(), DeviceType::Cuda(_)) && qkv_out.dtype() == DataType::BF16 {
+                crate::op::kernels::cuda::zimage_fused_qkv_split_head_rmsnorm_rope_interleaved_bf16(
+                    &qkv_out,
+                    &self.norm_q.weight,
+                    &self.norm_k.weight,
+                    cos, sin,
+                    &mut q, &mut k, &mut v,
+                    seq, self.n_heads, self.head_dim,
+                    self.norm_q.eps(),
+                    cuda_config,
+                )?;
+            } else {
+                #[cfg(feature = "cuda")]
+                let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config);
+                crate::op::split_cols::split_cols_tensor(
+                    &qkv_out, &mut q, seq, 3 * dim, 0, dim,
+                    #[cfg(feature = "cuda")] stream,
+                )?;
+                crate::op::split_cols::split_cols_tensor(
+                    &qkv_out, &mut k, seq, 3 * dim, dim, dim,
+                    #[cfg(feature = "cuda")] stream,
+                )?;
+                crate::op::split_cols::split_cols_tensor(
+                    &qkv_out, &mut v, seq, 3 * dim, 2 * dim, dim,
+                    #[cfg(feature = "cuda")] stream,
+                )?;
+
+                {
+                    let mut q_norm = q.view(&[seq * self.n_heads, self.head_dim])?;
+                    self.norm_q.forward_inplace(&mut q_norm, cuda_config)?;
+                }
+                {
+                    let mut k_norm = k.view(&[seq * self.n_heads, self.head_dim])?;
+                    self.norm_k.forward_inplace(&mut k_norm, cuda_config)?;
+                }
+                q.view(&[seq, self.n_heads, self.head_dim])?
+                    .rope_interleaved(cos, sin, self.head_dim)?;
+                k.view(&[seq, self.n_heads, self.head_dim])?
+                    .rope_interleaved(cos, sin, self.head_dim)?;
+            }
         }
 
         // ── Self-attention (SHD layout) ──
@@ -148,14 +180,20 @@ impl DiTBlock {
             norm2_attn.mul_row(g)?;
         }
 
-        // ── Residual + fused_add_rmsnorm ──
+        // ── Residual + RMSNorm. CUDA BF16 uses fused add+rmsnorm;
+        // F32/F16/CPU fall back to explicit add then RMSNorm.
         dst.copy_from_on_current_stream(x)?;
         let mut norm1_ffn = state.slice_mut(BT::BlkNorm1Ffn, &[seq, dim])?;
-        crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-            &mut norm1_ffn, dst, &norm2_attn,
-            &self.ffn_norm1.weight, self.ffn_norm1.eps(),
-            cuda_config,
-        )?;
+        if matches!(dst.device(), DeviceType::Cuda(_)) && dst.dtype() == DataType::BF16 {
+            crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
+                &mut norm1_ffn, dst, &norm2_attn,
+                &self.ffn_norm1.weight, self.ffn_norm1.eps(),
+                cuda_config,
+            )?;
+        } else {
+            *dst += &norm2_attn;
+            self.ffn_norm1.forward(dst, &mut norm1_ffn, cuda_config)?;
+        }
 
         // ── FFN (SwiGLU) ──
         if let Some(ref s) = scale_mlp {

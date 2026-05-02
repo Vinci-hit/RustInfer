@@ -213,6 +213,17 @@ impl PipelineState {
     /// state's capacity. Callers should invoke this at the top of
     /// `generate()`.
     pub fn check_request(&self, height: usize, width: usize) -> Result<()> {
+        if height == 0 || width == 0 {
+            return Err(crate::base::error::Error::InvalidArgument(
+                "image height/width must be > 0".into()
+            ).into());
+        }
+        if height % 16 != 0 || width % 16 != 0 {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "image size {}x{} must be multiples of 16",
+                height, width
+            )).into());
+        }
         if height > self.capacity.max_height || width > self.capacity.max_width {
             return Err(crate::base::error::Error::InvalidArgument(format!(
                 "image size {}x{} exceeds configured ZImageCapacity {}x{}",

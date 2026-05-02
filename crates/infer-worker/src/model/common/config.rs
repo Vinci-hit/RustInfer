@@ -213,7 +213,11 @@ impl RuntimeModelConfig {
         let layer_num = file_config.num_hidden_layers;
         let head_num = file_config.num_attention_heads;
         let kv_head_num = file_config.num_key_value_heads;
-        let seq_len = 2048;
+        // Runtime workspace/KV cache capacity. Many HF configs advertise very large
+        // max_position_embeddings (e.g. 128K); eagerly allocating that much KV/workspace
+        // OOMs the current worker. Keep the historical safe default until max_model_len
+        // becomes an explicit runtime option.
+        let seq_len = file_config.max_position_embeddings.min(2048);
 
         let head_size = file_config.head_dim.unwrap_or(dim / head_num);
         let q_dim = head_num * head_size;

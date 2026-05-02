@@ -22,6 +22,13 @@ pub struct InferenceState {
 }
 
 impl InferenceState {
+    pub fn invalidate_decode_graphs(&mut self) {
+        #[cfg(feature = "cuda")]
+        if let Some(cfg) = self.cuda_config.as_mut() {
+            cfg.graphs.clear();
+        }
+    }
+
     pub fn new(config: &RuntimeModelConfig, device_type: DeviceType) -> Result<Self> {
         let kv_cache = KvCache::new(config, &device_type)?;
         let mut workspace = Self::init_workspace(config, &device_type)?;

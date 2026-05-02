@@ -85,11 +85,9 @@ pub struct BatchWorkspace {
     pub max_batch_seqs: usize,
 }
 
-// 裸指针不自动 Send/Sync，但 BatchWorkspace 只会被一个 runner 线程独占使用
+// 裸指针不自动 Send，但 BatchWorkspace 只会被一个 runner 线程独占使用并跨线程移动一次。
 #[cfg(feature = "cuda")]
 unsafe impl Send for BatchWorkspace {}
-#[cfg(feature = "cuda")]
-unsafe impl Sync for BatchWorkspace {}
 
 impl BatchWorkspace {
     pub fn new(

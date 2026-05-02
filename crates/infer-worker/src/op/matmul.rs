@@ -142,12 +142,41 @@ impl Matmul {
             let bias_numel = bias.num_elements();
 
             if bias_numel == last_dim && out_shape != vec![bias_numel] {
+                #[cfg(feature = "cuda")]
+                if matches!(device, DeviceType::Cuda(_)) {
+                    unsafe extern "C" {
+                        fn broadcast_add_inplace_f32_forward(a: *mut f32, b: *const f32, rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
+                        fn broadcast_add_inplace_bf16_forward(a: *mut half::bf16, b: *const half::bf16, rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
+                        fn broadcast_add_inplace_f16_forward(a: *mut half::f16, b: *const half::f16, rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
+                    }
+                    let stream = crate::cuda::get_current_cuda_stream();
+                    match bias.dtype() {
+                        DataType::F32 => unsafe {
+                            broadcast_add_inplace_f32_forward(
+                                output.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
+                                bias.as_f32()?.buffer().as_ptr() as *const f32,
+                                outer as i32, last_dim as i32, stream);
+                        }
+                        DataType::BF16 => unsafe {
+                            broadcast_add_inplace_bf16_forward(
+                                output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
+                                bias.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+                                outer as i32, last_dim as i32, stream);
+                        }
+                        DataType::F16 => unsafe {
+                            broadcast_add_inplace_f16_forward(
+                                output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16,
+                                bias.as_f16()?.buffer().as_ptr() as *const half::f16,
+                                outer as i32, last_dim as i32, stream);
+                        }
+                        _ => return Err(Error::InvalidArgument(format!(
+                            "Matmul bias CUDA: unsupported dtype {:?}", bias.dtype())).into()),
+                    }
+                    return Ok(());
+                }
+
                 // Broadcast add: out[i, c] += bias[c]
-                // Reshape out as [outer, last_dim] (zero-copy view) and bias as [last_dim],
-                // then call broadcast-add. We use broadcast_mul's friend pattern via
-                // add_inplace on tiled bias.
-                //
-                // For simplicity, materialize bias as [outer, last_dim] once.
+                // CPU fallback materializes a tiled bias once.
                 let mut bias_bc = crate::tensor::Tensor::new(
                     &[outer, last_dim], bias.dtype(), bias.device())?;
                 // Broadcast bias row into every row of bias_bc.
@@ -173,29 +202,7 @@ impl Matmul {
                         }
                     }
                     #[cfg(feature = "cuda")]
-                    DeviceType::Cuda(_) => {
-                        let stream = crate::cuda::get_current_cuda_stream();
-                        unsafe extern "C" {
-                            fn broadcast_row_bf16_forward(dst: *mut half::bf16, row: *const half::bf16, num_rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
-                            fn broadcast_row_f32_forward(dst: *mut f32, row: *const f32, num_rows: i32, d: i32, stream: crate::cuda::ffi::cudaStream_t);
-                        }
-                        match bias.dtype() {
-                            DataType::F32 => unsafe {
-                                broadcast_row_f32_forward(
-                                    bias_bc.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
-                                    bias.as_f32()?.buffer().as_ptr() as *const f32,
-                                    outer as i32, last_dim as i32, stream);
-                            }
-                            DataType::BF16 => unsafe {
-                                broadcast_row_bf16_forward(
-                                    bias_bc.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
-                                    bias.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-                                    outer as i32, last_dim as i32, stream);
-                            }
-                            _ => return Err(Error::InvalidArgument(format!(
-                                "Matmul bias CUDA: unsupported dtype {:?}", bias.dtype())).into()),
-                        }
-                    }
+                    DeviceType::Cuda(_) => unreachable!("CUDA bias path handled before materialization"),
                 }
                 // Now add in-place. Reshape bias_bc to match output shape via view.
                 let bias_bc_matched = bias_bc.view(&out_shape)?;

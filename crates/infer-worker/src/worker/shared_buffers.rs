@@ -67,7 +67,12 @@ impl<T> SyncBuf<T> {
     /// 调用方保证此时没有任何其他线程持有 `&mut` 视图。
     #[inline]
     pub unsafe fn as_slice(&self, len: usize) -> &[T] {
-        debug_assert!(len <= self.capacity());
+        assert!(
+            len <= self.capacity(),
+            "SyncBuf::as_slice length {} exceeds capacity {}",
+            len,
+            self.capacity()
+        );
         // SAFETY: UnsafeCell 保证通过 &self 能拿 &mut 内部；
         //         外部同步协议保证此时无 overlapping borrow。
         let ptr: *const T = unsafe { (*self.cell.get()).as_ptr() };
@@ -81,7 +86,12 @@ impl<T> SyncBuf<T> {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_mut_slice(&self, len: usize) -> &mut [T] {
-        debug_assert!(len <= self.capacity());
+        assert!(
+            len <= self.capacity(),
+            "SyncBuf::as_mut_slice length {} exceeds capacity {}",
+            len,
+            self.capacity()
+        );
         let ptr: *mut T = unsafe { (*self.cell.get()).as_mut_ptr() };
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }

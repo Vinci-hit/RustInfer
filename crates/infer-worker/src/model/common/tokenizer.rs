@@ -35,6 +35,8 @@ pub trait Tokenizer: Send + Sync {
     }
 
     fn is_eos(&self, token_id: i32) -> bool;
+
+    fn eos_token_ids(&self) -> &[u32];
 }
 
 
@@ -82,9 +84,13 @@ impl Tokenizer for GenericHfTokenizer {
     }
 
     fn is_eos(&self, token_id: i32) -> bool {
-        // 我们将输入的 i32 token ID 转换为 u32，
-        // 然后与我们存储的 u32 类型的 eos_token_id 进行比较。
-        let token_id_u32 = token_id as u32;
+        let Ok(token_id_u32) = u32::try_from(token_id) else {
+            return false;
+        };
         self.eos_token_id.contains(&token_id_u32)
+    }
+
+    fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_id
     }
 }

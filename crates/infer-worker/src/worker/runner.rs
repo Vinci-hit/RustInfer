@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::base::DeviceType;
-use crate::base::error::Result;
+use crate::base::error::{Error, Result};
 use crate::base::slice_utils::disjoint_mut;
 use crate::model::llm::LlmModel;
 use crate::model::runtime::InferenceState;
@@ -166,6 +166,26 @@ impl<M: LlmModel> ModelRunner<M> {
     ) -> Result<()> {
         let slots: Vec<usize> = decode_order.iter().map(|&i| meta.seq_slot(i)).collect();
         let positions: Vec<i32> = decode_order.iter().map(|&i| meta.seq_pos(i)).collect();
+
+        let mut kv_grew = false;
+        for (&slot, &pos) in slots.iter().zip(&positions) {
+            let pos_usize = usize::try_from(pos).map_err(|_| {
+                Error::InvalidArgument(format!("decode position {} is negative", pos))
+            })?;
+            let state = self.states.get_mut(slot).ok_or_else(|| {
+                Error::InvalidArgument(format!("state slot {} out of range", slot))
+            })?;
+            if state.kv_cache.ensure_capacity(pos_usize + 1)? {
+                state.invalidate_decode_graphs();
+                kv_grew = true;
+            }
+        }
+
+        if kv_grew {
+            self.workspace.invalidate_batch_member_cache();
+            #[cfg(feature = "cuda")]
+            self.batch_cuda_cfg.graphs.clear();
+        }
 
         // batch 组合变化时让 workspace 的 KV 指针缓存失效。
         let mut slots_sorted = slots.clone();
