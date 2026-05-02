@@ -11,9 +11,11 @@ use std::thread;
 use std::time::Duration;
 
 use infer_worker::base::DeviceType;
+use infer_worker::model::llm::LlmModel;
 use infer_worker::worker::protocol::*;
 use infer_worker::worker::shared_buffers::SharedBuffers;
-use infer_worker::worker::WorkerServer;
+use infer_worker::worker::{BatchWorkspace, WorkerServer};
+use infer_worker::worker::runner::WorkerBatchMeta;
 use infer_worker::worker::runner_dummy::DummyModelRunner;
 
 /// 使用 CPU device 跑通整个流水线 (无需 GPU)
@@ -43,7 +45,7 @@ fn test_worker_pipeline_cpu() {
     scheduler_pull.set_rcvtimeo(5000).unwrap(); // 5s timeout
 
     // 共享 buffer (CPU device)
-    let shared = SharedBuffers::new(2048, 64).unwrap();
+    let shared = SharedBuffers::new(2048, 64, DeviceType::Cpu).unwrap();
 
     // EOS token = 128009 (llama3), 我们用 dummy token 42, 不会触发 EOS
     // 但 max_tokens = 3, 所以第 3 步会 finished=true
@@ -141,7 +143,7 @@ fn test_worker_multi_request_batch() {
     scheduler_pull.connect(zmq_out_endpoint).unwrap();
     scheduler_pull.set_rcvtimeo(5000).unwrap();
 
-    let shared = SharedBuffers::new(2048, 64).unwrap();
+    let shared = SharedBuffers::new(2048, 64, DeviceType::Cpu).unwrap();
     let eos_token_id = 128009;
 
     let runner_shared = Arc::clone(&shared);
@@ -236,20 +238,61 @@ fn test_worker_with_llama3() {
     tracing::info!("Baseline output: '{}' ({} tokens)", baseline_text, baseline_num_tokens);
 
     // 重新 generate 获取 token ids (generate 只返回 text)
-    // 手动做 prefill + decode 收集 token ids
+    // 手动通过统一 worker forward 收集 token ids
     let mut state2 = model_baseline.create_state().expect("create state2");
-    let first_tok = model_baseline.forward_prefill(
-        &mut state2, &prompt_tokens, 0, prompt_tokens.len(),
-    ).expect("baseline prefill");
+    let mut baseline_workspace = BatchWorkspace::new(model_baseline.config(), 2048, 1, device)
+        .expect("baseline workspace");
+    model_baseline
+        .fill_rope_cache(&mut baseline_workspace.sin_cache, &mut baseline_workspace.cos_cache)
+        .expect("fill rope cache");
+
+    let prefill_positions: Vec<i32> = (0..prompt_tokens.len()).map(|i| i as i32).collect();
+    let prefill_q_start = [0, prompt_tokens.len() as i32];
+    let slot_indices = [0];
+    let prefill_meta = WorkerBatchMeta {
+        q_start_loc: &prefill_q_start,
+        slot_indices: &slot_indices,
+        token_ids: &prompt_tokens,
+        positions: &prefill_positions,
+        num_decode: 0,
+        num_prefill: 1,
+    };
+    baseline_workspace.input_tokens.write_from_i32_host(&prompt_tokens, prompt_tokens.len()).unwrap();
+    baseline_workspace.input_pos.write_from_i32_host(&prefill_positions, prefill_positions.len()).unwrap();
+    let mut baseline_out = infer_worker::tensor::Tensor::new(&[1], infer_worker::base::DataType::I32, device).unwrap();
+    let first_tok = {
+        let mut refs = vec![&mut state2];
+        model_baseline.forward(refs.as_mut_slice(), &mut baseline_workspace, &prefill_meta, &mut baseline_out, None)
+            .expect("baseline prefill");
+        baseline_out.as_i32().unwrap().as_slice().unwrap()[0]
+    };
+    state2.output_token.copy_from(&baseline_out).unwrap();
 
     let mut baseline_tokens = vec![first_tok];
     let mut current_token = first_tok;
 
     for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_gen) {
         if current_token == eos_token_id { break; }
-        let next = model_baseline.forward_decoding(
-            &mut state2, pos as i32,
-        ).expect("baseline decode");
+        let token_ids = [0];
+        let positions = [pos as i32];
+        let q_start = [0, 1];
+        let meta = WorkerBatchMeta {
+            q_start_loc: &q_start,
+            slot_indices: &slot_indices,
+            token_ids: &token_ids,
+            positions: &positions,
+            num_decode: 1,
+            num_prefill: 0,
+        };
+        baseline_workspace.input_tokens.write_from_i32_host(&[current_token], 1).unwrap();
+        baseline_workspace.input_pos.write_from_i32_host(&positions, 1).unwrap();
+        let next = {
+            let mut refs = vec![&mut state2];
+            model_baseline.forward(refs.as_mut_slice(), &mut baseline_workspace, &meta, &mut baseline_out, None)
+                .expect("baseline decode");
+            baseline_out.as_i32().unwrap().as_slice().unwrap()[0]
+        };
+        state2.output_token.copy_from(&baseline_out).unwrap();
         baseline_tokens.push(next);
         current_token = next;
     }
@@ -264,7 +307,7 @@ fn test_worker_with_llama3() {
         states.push(model_worker.create_state().expect("create_state"));
     }
 
-    let shared = SharedBuffers::new(2048, max_num_seqs).unwrap();
+    let shared = SharedBuffers::new(2048, max_num_seqs, device).unwrap();
 
     let zmq_ctx = zmq::Context::new();
     let zmq_in_ep = "inproc://test-llama-in";

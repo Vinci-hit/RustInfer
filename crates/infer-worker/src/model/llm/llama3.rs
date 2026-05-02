@@ -3,8 +3,6 @@ use std::path::Path;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
-#[cfg(feature = "cuda")]
-use crate::cuda::CudaConfig;
 use crate::op::add_inplace::AddInplace;
 use std::time::Instant;
 
@@ -20,7 +18,6 @@ use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::rope::RoPEOp;
 use crate::op::swiglu::SwiGLU;
-use crate::model::BufferType;
 use crate::op::scatter::Scatter;
 use crate::model::runtime::InferenceState;
 
@@ -349,9 +346,60 @@ impl Llama3 {
             return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
         }
 
-        // Prefill
+        let mut workspace = crate::worker::BatchWorkspace::new(
+            self.config(),
+            prompt_tokens.len().max(1),
+            1,
+            self.device_type,
+        )?;
+        crate::model::runtime::compute_rope_cache(
+            self.config(),
+            &mut workspace.sin_cache,
+            &mut workspace.cos_cache,
+        )?;
+
+        #[cfg(feature = "cuda")]
+        let cuda_cfg = if self.device_type.is_cuda() {
+            Some(crate::cuda::CudaConfig::new()?.with_flash_decode(
+                self.config.head_num,
+                self.config.head_size,
+                1,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "cuda")]
+        let cuda_ref = cuda_cfg.as_ref().map(|c| c as &crate::OpConfig);
+        #[cfg(not(feature = "cuda"))]
+        let cuda_ref = None;
+
         let prefill_start = Instant::now();
-        let first_token = self.forward_prefill(state, &prompt_tokens, 0, prompt_tokens.len())?;
+        let prefill_positions: Vec<i32> = (0..prompt_tokens.len()).map(|i| i as i32).collect();
+        let prefill_q_start = [0, prompt_tokens.len() as i32];
+        let slot_indices = [0];
+        let prefill_meta = crate::worker::runner::WorkerBatchMeta {
+            q_start_loc: &prefill_q_start,
+            slot_indices: &slot_indices,
+            token_ids: &prompt_tokens,
+            positions: &prefill_positions,
+            num_decode: 0,
+            num_prefill: 1,
+        };
+        let mut gen_output = Tensor::new(&[1], DataType::I32, self.device_type)?;
+        let first_token = {
+            workspace.input_tokens.write_from_i32_host(&prompt_tokens, prompt_tokens.len())?;
+            workspace.input_pos.write_from_i32_host(&prefill_positions, prefill_positions.len())?;
+            workspace.kv_lens_cpu.as_i32_mut()?.as_slice_mut()?[0] = 0;
+            #[cfg(feature = "cuda")]
+            {
+                let src = workspace.kv_lens_cpu.slice(&[0], &[1])?;
+                let mut dst = workspace.kv_lens_dev.slice(&[0], &[1])?;
+                dst.copy_from(&src)?;
+            }
+            let mut refs = vec![&mut *state];
+            self.forward(refs.as_mut_slice(), &mut workspace, &prefill_meta, &mut gen_output, cuda_ref)?;
+            gen_output.to_cpu()?.as_i32()?.as_slice()?[0]
+        };
         let prefill_ms = prefill_start.elapsed().as_millis() as u64;
 
         let mut generated_tokens = vec![first_token];
@@ -363,11 +411,35 @@ impl Llama3 {
             stdout.flush()?;
         }
 
-        // Decode
         let decode_start = Instant::now();
         let mut decode_iterations = 0;
-        for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
-            let next_token = self.forward_decoding(state, pos as i32)?;
+        let max_decode_end = (prompt_tokens.len() - 1 + max_tokens).min(self.config.seq_len);
+        for pos in prompt_tokens.len()..max_decode_end {
+            let token_ids = [0i32];
+            let positions = [pos as i32];
+            let q_start = [0, 1];
+            let meta = crate::worker::runner::WorkerBatchMeta {
+                q_start_loc: &q_start,
+                slot_indices: &slot_indices,
+                token_ids: &token_ids,
+                positions: &positions,
+                num_decode: 1,
+                num_prefill: 0,
+            };
+            let next_token = {
+                workspace.input_tokens.write_from_i32_host(&[generated_tokens[generated_tokens.len() - 1]], 1)?;
+                workspace.input_pos.write_from_i32_host(&positions, 1)?;
+                workspace.kv_lens_cpu.as_i32_mut()?.as_slice_mut()?[0] = positions[0];
+                #[cfg(feature = "cuda")]
+                {
+                    let src = workspace.kv_lens_cpu.slice(&[0], &[1])?;
+                    let mut dst = workspace.kv_lens_dev.slice(&[0], &[1])?;
+                    dst.copy_from(&src)?;
+                }
+                let mut refs = vec![&mut *state];
+                self.forward(refs.as_mut_slice(), &mut workspace, &meta, &mut gen_output, cuda_ref)?;
+                gen_output.to_cpu()?.as_i32()?.as_slice()?[0]
+            };
 
             if self.tokenizer.is_eos(next_token) { break; }
 
@@ -393,713 +465,185 @@ impl Llama3 {
         Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
     }
 
-    /// 单步 decode（B=1）。
-    ///
-    /// * `pos` — 当前待生成 token 的绝对位置（**不是** 上一步生成的 token 的 pos）。
-    ///
-    /// 输入 token 隐含为 `state.output_token`（graph 自闭环：上一步 sampler 写入，本步 embedding 读）；
-    /// 调用方需确保 state 已完成 prefill 且 `state.output_token` 持有正确值。
-    pub fn forward_decoding(&self, state: &mut InferenceState, pos: i32) -> Result<i32> {
-        let pos_usize = usize::try_from(pos).map_err(|_| Error::InvalidArgument(format!(
-            "decode position {} is negative",
-            pos
-        )))?;
-        if state.kv_cache.ensure_capacity(pos_usize + 1)? {
-            state.invalidate_decode_graphs();
-        }
-
-        // state.input_pos 容量 [max_seq_len]，decode 只写前 1 个元素
-        state.input_pos.write_from_i32_host(&[pos], 1)?;
-        let input_tokens_view = &state.output_token;
-
-        // CUDA Graph
-        if self.device_type.is_cuda() {
-            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            let slot = crate::cuda::GraphSlot::LlmDecode(1);
-            if cfg.graph_ready(slot) {
-                cfg.launch(slot)?;
-                cfg.sync_stream()?;
-                return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
-            } else {
-                cfg.capture_begin()?;
-            }
-        }
-
-        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
-
-        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
-        let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.embedding_layer.forward(input_tokens_view, &mut x, cuda_config_ref)?;
-
-        for i in 0..self.config.layer_num {
-            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            if i == 0 || !self.device_type.is_cuda() {
-                self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
-            }
-
-            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
-            let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
-
-            let mut q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
-            let mut k = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
-            let v = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[1, self.config.kv_dim])?;
-            let (k_cache_full, v_cache_full) = state.kv_cache.get_mut(i)?;
-
-            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
-
-            crate::op::scatter::scatter_kv(k_cache_full, &k, v_cache_full, &v, &state.input_pos, cuda_config_ref)?;
-
-            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &state.input_pos, &mut attn_out, cuda_config_ref)?;
-            let mut wo_out = q;
-            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
-
-            let mut ffn_norm_out = attn_out;
-            if self.device_type.is_cuda() {
-                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                    &mut ffn_norm_out,
-                    &mut x,
-                    &wo_out,
-                    &self.layers.rmsnorm_ffn_layers[i].weight,
-                    self.config.rms_norm_eps,
-                    cuda_config_ref,
-                )?;
-            } else {
-                self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
-                self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
-            }
-
-            let inter = self.config.intermediate_size;
-            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
-            let mut gate_up = gu_buffer.slice(&[0, 0], &[1, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
-            let mut w1_out = gate_up.slice(&[0, 0], &[1, inter])?;
-            let w3_out = gate_up.slice(&[0, inter], &[1, inter])?;
-            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
-
-            let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
-
-            if self.device_type.is_cuda() {
-                if i + 1 < self.config.layer_num {
-                    let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-                    let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                        &mut next_out,
-                        &mut x,
-                        &w2_out,
-                        &self.layers.rmsnorm_attn_layers[i + 1].weight,
-                        self.config.rms_norm_eps,
-                        cuda_config_ref,
-                    )?;
-                } else {
-                    let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-                    let mut final_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                        &mut final_out,
-                        &mut x,
-                        &w2_out,
-                        &self.layers.rmsnorm_final_layer.weight,
-                        self.config.rms_norm_eps,
-                        cuda_config_ref,
-                    )?;
-                }
-            } else {
-                self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
-            }
-        }
-
-        let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        if !self.device_type.is_cuda() {
-            self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_out, cuda_config_ref)?;
-        }
-
-        let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
-        let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
-        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-        state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
-
-        if self.device_type.is_cuda() {
-            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            let slot = crate::cuda::GraphSlot::LlmDecode(1);
-            if !cfg.graph_ready(slot) {
-                cfg.capture_end(slot)?;
-                // capture 期间 kernel 只被记录不被执行，所以 step 0 必须手动 launch
-                // 一次，否则 state.output_token 仍是上一步（prefill 最后一次）的值。
-                cfg.launch(slot)?;
-                cfg.sync_stream()?;
-            }
-        }
-
-        Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
-    }
-
-    /// 一段 prefill，把 `tokens[0..seq_len]` 投喂模型并一次性生成（采样）下一个 token。
-    ///
-    /// * `tokens`   — host 侧 i32 token 数组，长度 ≥ seq_len；内部做 H2D
-    /// * `start_pos`— `tokens[0]` 对应的 KV cache 绝对位置（continuation 场景可 > 0）
-    pub fn forward_prefill(&self, state: &mut InferenceState, tokens: &[i32], start_pos: i32, seq_len: usize) -> Result<i32> {
-        assert!(tokens.len() >= seq_len, "tokens slice shorter than seq_len");
-        let pos = usize::try_from(start_pos).map_err(|_| Error::InvalidArgument(format!(
-            "prefill start_pos {} is negative",
-            start_pos
-        )))?;
-        let required_len = pos.checked_add(seq_len).ok_or_else(|| {
-            Error::InvalidArgument(format!("prefill range overflow: pos {} + len {}", start_pos, seq_len))
-        })?;
-        if state.kv_cache.ensure_capacity(required_len)? {
-            state.invalidate_decode_graphs();
-        }
-
-        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
-
-        // 把本段 prefill 的 seq_len 个绝对位置 [pos, pos+1, ..., pos+seq_len-1]
-        // 写到 state.input_pos 前 seq_len 个元素，供 RoPE 按 per-row 语义消费。
-        let positions_host: Vec<i32> = (0..seq_len).map(|i| (pos + i) as i32).collect();
-        state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
-
-        // MHA.forward 的 kv_len 参数：prefill 场景下为 start_pos（历史长度），
-        // 存在一个 host 侧单元素 tensor 中。
-        let mut kv_len_tensor = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        kv_len_tensor.as_i32_mut()?.as_slice_mut()?[0] = start_pos;
-
-        // tokens H2D 到 InputTokens buffer 的前 seq_len 个元素
-        let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
-        input_tokens_buffer.write_from_i32_host(tokens, seq_len)?;
-        let input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
-
-        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
-        let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
-
-        for i in 0..self.config.layer_num {
-            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
-
-            let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
-
-            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
-            let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
-            let stream = CudaConfig::resolve_stream(cuda_config_ref);
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
-
-            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
-
-            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
-            let mut attn_out = attn_norm_out;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &kv_len_tensor, &mut attn_out, cuda_config_ref)?;
-            let mut wo_out = q;
-            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
-
-            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
-
-            // FFN
-            let mut ffn_norm_out = attn_out;
-            self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
-            let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
-            let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
-            let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
-            let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, self.config.intermediate_size])?;
-
-            let inter = self.config.intermediate_size;
-            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
-            let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
-            let stream = CudaConfig::resolve_stream(cuda_config_ref);
-            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
-            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
-
-            let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
-
-            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
-        }
-
-        // Extract last token
-        let last_hidden = x.slice(&[seq_len - 1, 0], &[1, self.config.dim])?;
-        let buf = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-        let mut final_norm_input = buf.slice(&[0, 0], &[1, self.config.dim])?;
-        final_norm_input.copy_from(&last_hidden)?;
-
-        let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.rmsnorm_final_layer.forward(&final_norm_input, &mut final_norm_out, cuda_config_ref)?;
-
-        let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
-
-        let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
-        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-        state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
-
-        Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
-    }
-
-    // ════════════════════════════════════════════════════════════════
-    // Batch Forward Methods
-    // ════════════════════════════════════════════════════════════════
-
-    /// Batch decode forward: B 个 seq 各 seq_len=1，共享 matmul/rmsnorm 等 op 调用。
-    ///
-    /// 与 `forward_decoding` 的区别:
-    /// - 所有 [1, dim] 变为 [B, dim]，一次 GEMM 调用
-    /// - RoPE 用 positions[B] 为每行不同 pos
-    /// - scatter_kv_batch: 写 B 行到 B 个独立 cache
-    /// - FlashAttn: 循环 per-seq (Phase 1)
-    /// - Sampler: 循环 per-seq (Phase 1)
-    ///
-    /// # Arguments
-    /// * `states` - B 个 InferenceState (各自有独立 KV cache)
-    /// * `workspace` - 共享的 batch workspace (预分配 [max_batch, dim] 等)
-    /// * `positions` - [B] CPU i32, 每个 seq 的 decode position
-    /// Batched decode 入口。
-    ///
-    /// `states` 采用 `&mut [&mut InferenceState]`（可变引用切片）而非 `&mut [InferenceState]`，
-    /// 这样调用者可以从一个大 slot 池子里用 `get_disjoint_mut` / 手动 split 拿出任意子集，
-    /// 不要求它们在内存里连续——对 continuous batching 的 scheduler 是必需的。
-    pub fn forward_batch_decode(
+    pub fn forward(
         &self,
         states: &mut [&mut InferenceState],
         workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
-        positions: &[i32],
+        batch: &crate::worker::runner::WorkerBatchMeta<'_>,
+        output_tokens: &mut Tensor,
         cuda_config: Option<&crate::OpConfig>,
-    ) -> Result<Vec<i32>> {
-        let batch_size = states.len();
-        assert_eq!(positions.len(), batch_size);
-        assert!(batch_size > 0);
-
-        // ═══ B=1 fast path: 直接转发到 serial `forward_decoding` ═══
-        // forward_decoding 已经实现了高度优化的 CUDA Graph + fused_add_rmsnorm + hgemv 路径，
-        // 性能最优。batch 路径的 "_batch" kernel 族只在 B>1 时才有必要。
-        #[cfg(feature = "cuda")]
-        if batch_size == 1 && self.device_type.is_cuda() {
-            let tok = self.forward_decoding(&mut *states[0], positions[0])?;
-            return Ok(vec![tok]);
+    ) -> Result<()> {
+        let num_seqs = batch.num_seqs();
+        if states.len() != num_seqs {
+            return Err(Error::InvalidArgument(format!(
+                "Llama3::forward states len {} != batch seqs {}",
+                states.len(), num_seqs
+            )).into());
+        }
+        if num_seqs == 0 {
+            return Ok(());
+        }
+        let total_tokens = batch.seq_end(num_seqs - 1);
+        if total_tokens > workspace.max_batch_tokens {
+            return Err(Error::InvalidArgument(format!(
+                "Llama3::forward total tokens {} exceeds workspace capacity {}",
+                total_tokens, workspace.max_batch_tokens
+            )).into());
+        }
+        if num_seqs > workspace.max_batch_seqs {
+            return Err(Error::InvalidArgument(format!(
+                "Llama3::forward seqs {} exceeds workspace capacity {}",
+                num_seqs, workspace.max_batch_seqs
+            )).into());
         }
 
-        let dim = self.config.dim;
-        let q_dim = self.config.q_dim;
-        let kv_dim = self.config.kv_dim;
-        let inter = self.config.intermediate_size;
-        let qkv_cols = q_dim + 2 * kv_dim;
-
-        let cuda_config_ref = cuda_config;
-
         let mut kv_grew = false;
-        for (state, &pos) in states.iter_mut().zip(positions) {
-            let pos_usize = usize::try_from(pos).map_err(|_| Error::InvalidArgument(format!(
-                "decode position {} is negative",
-                pos
-            )))?;
-            if state.kv_cache.ensure_capacity(pos_usize + 1)? {
-                state.invalidate_decode_graphs();
+        for i in 0..num_seqs {
+            if states[i].kv_cache.ensure_capacity(batch.seq_end_pos(i)?)? {
+                states[i].invalidate_decode_graphs();
                 kv_grew = true;
             }
         }
         if kv_grew {
             workspace.invalidate_batch_member_cache();
             #[cfg(feature = "cuda")]
-            if let Some(cfg) = cuda_config_ref {
+            if let Some(cfg) = cuda_config {
                 let cfg_ptr = cfg as *const crate::cuda::CudaConfig as *mut crate::cuda::CudaConfig;
                 unsafe { (*cfg_ptr).graphs.clear(); }
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // Stage 1: Host prelude (capture 之外) — 更新每步 H2D buffer + 首次填 KV 指针
-        // ═══════════════════════════════════════════════════════════════
-
-        // 1a. 首次调用：把每个 state.output_token → workspace.output_tokens (D2D 一次性)
-        //     之后的调用：embedding 直接从 workspace.output_tokens 读（graph 自闭环），
-        //     sampler 写回同一 buffer，prelude 不再需要每步 D2D input_tokens。
-        #[cfg(feature = "cuda")]
-        if !workspace.cache_ptrs_filled {
-            let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
-            crate::cuda::with_cuda_stream(stream, || -> Result<()> {
-                let out_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
-                for i in 0..batch_size {
-                    let mut dst = out_view.slice(&[i], &[1])?;
-                    let src = &states[i].output_token;
-                    dst.copy_from_on_current_stream(src)?;
-                }
-                Ok(())
-            })?;
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            // CPU 路径：每步从 state.output_token 搬到 workspace.output_tokens
-            // （CPU 不走 graph 闭环）
-            let out_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
-            for i in 0..batch_size {
-                let mut dst = out_view.slice(&[i], &[1])?;
-                let src = &states[i].output_token;
-                dst.copy_from(src)?;
-            }
-        }
-
-        // 1b. 收集 positions → input_pos_cpu → input_pos(device) (H2D async)
-        //     kv_lens 与 positions 值相同（见 serial forward_decoding 语义），复用同一块 device buffer
-        {
-            let pos_slice = workspace.input_pos_cpu.as_i32_mut()?.as_slice_mut()?;
-            pos_slice[..batch_size].copy_from_slice(positions);
-        }
-        #[cfg(feature = "cuda")]
-        {
-            let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
-            crate::cuda::with_cuda_stream(stream, || -> Result<()> {
-                let src = workspace.input_pos_cpu.slice(&[0], &[batch_size])?;
-                let mut dst = workspace.input_pos.slice(&[0], &[batch_size])?;
-                dst.copy_from_on_current_stream(&src)?;
-                Ok(())
-            })?;
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            let src = workspace.input_pos_cpu.slice(&[0], &[batch_size])?;
-            let mut dst = workspace.input_pos.slice(&[0], &[batch_size])?;
-            dst.copy_from(&src)?;
-        }
-        // (原来需要单独做 kv_lens H2D，现在直接让 capture 里的 flash 用 input_pos 作为 kv_lens)
-
-        // 1d. 首次调用：把所有层 × B 个 seq 的 K/V cache 指针一次性填入 workspace 的
-        //     device 指针数组。之后 graph replay 复用同一个数组，不再 H2D。
-        #[cfg(feature = "cuda")]
-        if self.device_type.is_cuda() && !workspace.cache_ptrs_filled {
-            let layer_num = self.config.layer_num;
-            let mut k_host: Vec<u64> = Vec::with_capacity(layer_num * batch_size);
-            let mut v_host: Vec<u64> = Vec::with_capacity(layer_num * batch_size);
-            for layer_idx in 0..layer_num {
-                for i in 0..batch_size {
-                    let (kc, vc) = states[i].kv_cache.get(layer_idx).unwrap();
-                    let k_ptr = match kc.dtype() {
-                        DataType::BF16 => kc.as_bf16()?.buffer().as_ptr() as u64,
-                        DataType::F16 => kc.as_f16()?.buffer().as_ptr() as u64,
-                        other => return Err(crate::base::error::Error::InvalidArgument(
-                            format!("unsupported kv cache dtype: {:?}", other)).into()),
-                    };
-                    let v_ptr = match vc.dtype() {
-                        DataType::BF16 => vc.as_bf16()?.buffer().as_ptr() as u64,
-                        DataType::F16 => vc.as_f16()?.buffer().as_ptr() as u64,
-                        other => return Err(crate::base::error::Error::InvalidArgument(
-                            format!("unsupported kv cache dtype: {:?}", other)).into()),
-                    };
-                    k_host.push(k_ptr);
-                    v_host.push(v_ptr);
-                }
-            }
-            let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
-            let bytes = layer_num * batch_size * std::mem::size_of::<u64>();
-            unsafe {
-                crate::cuda_check!(crate::cuda::ffi::cudaMemcpyAsync(
-                    workspace.k_cache_ptrs_dev as *mut _,
-                    k_host.as_ptr() as *const _,
-                    bytes,
-                    crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                    stream,
-                ))?;
-                crate::cuda_check!(crate::cuda::ffi::cudaMemcpyAsync(
-                    workspace.v_cache_ptrs_dev as *mut _,
-                    v_host.as_ptr() as *const _,
-                    bytes,
-                    crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                    stream,
-                ))?;
-                crate::cuda_check!(crate::cuda::ffi::cudaStreamSynchronize(stream))?;
-            }
-            workspace.cache_ptrs_filled = true;
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // Stage 2: CUDA Graph capture/replay fast-path (首次 capture，之后 replay)
-        // ═══════════════════════════════════════════════════════════════
-        #[cfg(feature = "cuda")]
-        let use_graph = self.device_type.is_cuda()
-            && workspace.input_tokens.dtype() == DataType::I32
-            && matches!(workspace.x.dtype(), DataType::BF16)
+        let can_full_graph = false
+            && batch.is_decode_only()
+            && self.device_type.is_cuda()
+            && workspace.x.dtype() == DataType::BF16
             && self.config.head_size == 64;
-        #[cfg(not(feature = "cuda"))]
-        let use_graph = false;
 
         #[cfg(feature = "cuda")]
-        if use_graph {
-            let cuda_cfg = cuda_config_ref.ok_or_else(||
-                crate::base::error::Error::InvalidArgument(
-                    "forward_batch_decode graph path requires CudaConfig".into()
-                ))?;
-
-            // 按实际 batch_size 分桶 cache graph
-            let slot = crate::cuda::GraphSlot::LlmDecode(batch_size);
-
-            if cuda_cfg.graph_ready(slot) {
-                // Fast path: replay
-                cuda_cfg.launch(slot)?;
-                cuda_cfg.sync_stream()?;
-            } else {
-                // Slow path:
-                //   1) 先跑一次 non-graph forward (让 cuBLASLt algorithm cache / kernel JIT 预热)
-                //   2) warmup 会把 sampler 新输出写到 workspace.output_tokens，把它重置回
-                //      每个 state.output_token 的原始值（= prefill/上一步 forward 的真实 input）
-                //   3) begin_capture → 第二次 forward (这次仅被记录) → end_capture
-                //   4) 立即 launch 一次，让本次 caller step 真正执行并返回正确 token
-                //
-                // KV cache 会被写两次（同 pos），第二次覆盖第一次 — 不影响正确性。
-                self.forward_batch_decode_capture(
-                    states, workspace, batch_size, dim, q_dim, kv_dim, inter, qkv_cols,
-                    cuda_config_ref,
-                )?;
-                cuda_cfg.sync_stream()?;
-
-                // reset workspace.output_tokens[i] = state[i].output_token (原始 input token)
-                {
-                    let stream = cuda_cfg.stream;
-                    crate::cuda::with_cuda_stream(stream, || -> Result<()> {
-                        let out_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
-                        for i in 0..batch_size {
-                            let mut dst = out_view.slice(&[i], &[1])?;
-                            let src = &states[i].output_token;
-                            dst.copy_from_on_current_stream(src)?;
-                        }
-                        Ok(())
-                    })?;
-                    cuda_cfg.sync_stream()?;
-                }
-
-                let cfg_ptr = cuda_cfg as *const crate::cuda::CudaConfig
-                    as *mut crate::cuda::CudaConfig;
-                cuda_cfg.capture_begin()?;
-                self.forward_batch_decode_capture(
-                    states, workspace, batch_size, dim, q_dim, kv_dim, inter, qkv_cols,
-                    cuda_config_ref,
-                )?;
+        if can_full_graph {
+            let cfg = cuda_config.ok_or_else(|| Error::InvalidArgument(
+                "DecodeOnly FullGraph path requires CudaConfig".into()
+            ))?;
+            let output_ptr = output_tokens.as_i32()?.buffer().as_ptr() as usize;
+            let slot = crate::cuda::GraphSlot::LlmDecodeWithOutput { batch: num_seqs, output_ptr };
+            if !cfg.graph_ready(slot) {
+                cfg.sync_stream()?;
+                let cfg_ptr = cfg as *const crate::cuda::CudaConfig as *mut crate::cuda::CudaConfig;
+                cfg.capture_begin()?;
+                self.compute_worker_batch_on_stream(states, workspace, batch, output_tokens, cuda_config)?;
                 unsafe { (*cfg_ptr).capture_end(slot)?; }
-                cuda_cfg.launch(slot)?;
-                cuda_cfg.sync_stream()?;
             }
+            cfg.launch(slot)?;
+            cfg.sync_stream()?;
         } else {
-            // Non-graph 路径（CPU 或者首次未达到 graph 条件）
-            self.forward_batch_decode_capture(
-                states, workspace, batch_size, dim, q_dim, kv_dim, inter, qkv_cols,
-                cuda_config_ref,
-            )?;
+            self.compute_worker_batch_on_stream(states, workspace, batch, output_tokens, cuda_config)?;
         }
-        #[cfg(not(feature = "cuda"))]
-        self.forward_batch_decode_capture(
-            states, workspace, batch_size, dim, q_dim, kv_dim, inter, qkv_cols,
-            cuda_config_ref,
-        )?;
-
-        // ═══════════════════════════════════════════════════════════════
-        // Stage 3: Postlude (capture 外) — D2D copy 每个 state.output_token + 单次 D2H 读 tokens
-        // ═══════════════════════════════════════════════════════════════
-        let output_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
-        for i in 0..batch_size {
-            let src_view = workspace.output_tokens.slice(&[i], &[1])?;
-            states[i].output_token.copy_from_on_current_stream(&src_view)?;
-        }
-        let out_cpu = output_view.to_cpu()?;
-        let out_slice = out_cpu.as_i32()?.as_slice()?;
-        Ok(out_slice.to_vec())
+        Ok(())
     }
 
-    /// Pure GPU compute 部分，不含任何 host-side 读写/同步，可以被 CUDA Graph 完整 capture。
-    /// 输入读自 `workspace.input_tokens / input_pos / kv_lens_dev / sin_cache / cos_cache
-    /// / k_cache_ptrs_dev / v_cache_ptrs_dev`，输出写入 `workspace.output_tokens`。
-    #[allow(clippy::too_many_arguments)]
-    fn forward_batch_decode_capture(
+    fn compute_worker_batch_on_stream(
         &self,
         states: &mut [&mut InferenceState],
         workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
-        batch_size: usize,
-        dim: usize,
-        q_dim: usize,
-        kv_dim: usize,
-        inter: usize,
-        qkv_cols: usize,
+        batch: &crate::worker::runner::WorkerBatchMeta<'_>,
+        output_tokens: &mut Tensor,
         cuda_config_ref: Option<&crate::OpConfig>,
     ) -> Result<()> {
-        let input_pos_view = workspace.input_pos.slice(&[0], &[batch_size])?;
+        #[cfg(feature = "cuda")]
+        if let Some(cfg) = cuda_config_ref {
+            return crate::cuda::with_cuda_stream(cfg.stream, || {
+                self.compute_worker_batch(states, workspace, batch, output_tokens, cuda_config_ref)
+            });
+        }
+        self.compute_worker_batch(states, workspace, batch, output_tokens, cuda_config_ref)
+    }
 
-        // 2. Embedding — 输入直接读 workspace.output_tokens（与 sampler 写的是同一块
-        //    buffer），形成 graph 自闭环：当前步的 sampler 输出就是下一步的 embedding 输入。
-        //    这样 prelude 里不需要做 D2D copy "state.output_token → workspace.input_tokens"。
-        let input_tokens_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
-        let mut x = workspace.x.slice(&[0, 0], &[batch_size, dim])?;
+    fn compute_worker_batch(
+        &self,
+        states: &mut [&mut InferenceState],
+        workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
+        batch: &crate::worker::runner::WorkerBatchMeta<'_>,
+        output_tokens: &mut Tensor,
+        cuda_config_ref: Option<&crate::OpConfig>,
+    ) -> Result<()> {
+        let total_tokens = batch.seq_end(batch.num_seqs() - 1);
+        let num_seqs = batch.num_seqs();
+        let dim = self.config.dim;
+        let q_dim = self.config.q_dim;
+        let kv_dim = self.config.kv_dim;
+        let inter = self.config.intermediate_size;
+        let qkv_cols = q_dim + 2 * kv_dim;
+
+        let input_tokens_view = workspace.input_tokens.slice(&[0], &[total_tokens])?;
+        let input_pos_view = workspace.input_pos.slice(&[0], &[total_tokens])?;
+        let mut x = workspace.x.slice(&[0, 0], &[total_tokens, dim])?;
         self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
 
-        // 3. Transformer layers
+        #[cfg(feature = "cuda")]
+        let split_stream = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
+
         for layer_idx in 0..self.config.layer_num {
-            let mut attn_norm_out = workspace.rms_out.slice(&[0, 0], &[batch_size, dim])?;
+            let mut attn_norm_out = workspace.rms_out.slice(&[0, 0], &[total_tokens, dim])?;
             if layer_idx == 0 || !self.device_type.is_cuda() {
                 self.layers.rmsnorm_attn_layers[layer_idx].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
             }
 
-            let mut qkv = workspace.qkv_out.slice(&[0, 0], &[batch_size, qkv_cols])?;
+            let mut qkv = workspace.qkv_out.slice(&[0, 0], &[total_tokens, qkv_cols])?;
             self.layers.wqkv_layers[layer_idx].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
 
-            #[cfg(feature = "cuda")]
-            let split_stream = crate::cuda::CudaConfig::resolve_stream(cuda_config_ref);
+            let mut q = workspace.q_out.slice(&[0, 0], &[total_tokens, q_dim])?;
+            let mut k = workspace.k_out.slice(&[0, 0], &[total_tokens, kv_dim])?;
+            let mut v = workspace.v_out.slice(&[0, 0], &[total_tokens, kv_dim])?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, total_tokens, qkv_cols, 0, q_dim, #[cfg(feature = "cuda")] split_stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, total_tokens, qkv_cols, q_dim, kv_dim, #[cfg(feature = "cuda")] split_stream)?;
+            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, total_tokens, qkv_cols, q_dim + kv_dim, kv_dim, #[cfg(feature = "cuda")] split_stream)?;
+            self.layers.rope_layers[layer_idx].forward(&input_pos_view, &workspace.sin_cache, &workspace.cos_cache, &mut q, &mut k, cuda_config_ref)?;
 
-            // RoPE (strided)：直接从 qkv 的 q/k 段寻址，不做 split_cols
             #[cfg(feature = "cuda")]
-            if self.device_type.is_cuda() && qkv.dtype() == DataType::BF16 {
-                crate::op::kernels::cuda::rope_strided(
-                    dim, kv_dim, self.config.head_size,
-                    &mut qkv, &mut workspace.qkv_out, // k 也写在 qkv 上（同一块内存）
-                    qkv_cols, qkv_cols,
-                    0, q_dim,                          // q_col_offset, k_col_offset
-                    &input_pos_view,
-                    &workspace.sin_cache, &workspace.cos_cache,
-                    batch_size,
-                    cuda_config_ref,
-                )?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                // CPU fallback: 仍走 split → per-row rope
-                let qkv_runtime_dtype = qkv.dtype();
-                let mut q = Tensor::new(&[batch_size, q_dim], qkv_runtime_dtype, qkv.device())?;
-                let mut k = Tensor::new(&[batch_size, kv_dim], qkv_runtime_dtype, qkv.device())?;
-                crate::op::split_cols::split_cols_tensor(
-                    &qkv, &mut q, batch_size, qkv_cols, 0, q_dim,
-                )?;
-                crate::op::split_cols::split_cols_tensor(
-                    &qkv, &mut k, batch_size, qkv_cols, q_dim, kv_dim,
-                )?;
-                self.layers.rope_layers[layer_idx].forward(
-                    &input_pos_view, &workspace.sin_cache, &workspace.cos_cache,
-                    &mut q, &mut k, cuda_config_ref,
-                )?;
-            }
-
-            // scatter_kv_batch (strided)：从 qkv 的 k/v 段直接寻址
-            #[cfg(feature = "cuda")]
-            if self.device_type.is_cuda() {
-                let k_ptrs_layer = unsafe {
-                    workspace.k_cache_ptrs_dev.add(layer_idx * batch_size)
-                };
-                let v_ptrs_layer = unsafe {
-                    workspace.v_cache_ptrs_dev.add(layer_idx * batch_size)
-                };
+            if false && batch.is_decode_only() && self.device_type.is_cuda() {
+                let k_ptrs_layer = unsafe { workspace.k_cache_ptrs_dev.add(layer_idx * num_seqs) };
+                let v_ptrs_layer = unsafe { workspace.v_cache_ptrs_dev.add(layer_idx * num_seqs) };
                 crate::op::kernels::cuda::scatter_kv_batch_launch_ready(
-                    qkv.dtype(), kv_dim, batch_size,
-                    &qkv, &qkv,
-                    qkv_cols, qkv_cols,
-                    q_dim, q_dim + kv_dim,
+                    k.dtype(), kv_dim, num_seqs,
+                    &k, &v,
+                    kv_dim, kv_dim,
+                    0, 0,
                     &input_pos_view,
                     k_ptrs_layer, v_ptrs_layer,
                     cuda_config_ref,
                 )?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                // CPU: 先 split_cols k/v 出来，再 per-seq scatter
-                let qkv_dtype = qkv.dtype();
-                let mut k = Tensor::new(&[batch_size, kv_dim], qkv_dtype, qkv.device())?;
-                let mut v = Tensor::new(&[batch_size, kv_dim], qkv_dtype, qkv.device())?;
-                crate::op::split_cols::split_cols_tensor(
-                    &qkv, &mut k, batch_size, qkv_cols, q_dim, kv_dim,
-                )?;
-                crate::op::split_cols::split_cols_tensor(
-                    &qkv, &mut v, batch_size, qkv_cols, q_dim + kv_dim, kv_dim,
-                )?;
-                let mut k_caches: Vec<&mut Tensor> = Vec::with_capacity(batch_size);
-                let mut v_caches: Vec<&mut Tensor> = Vec::with_capacity(batch_size);
-                for state in states.iter_mut() {
-                    let (kc, vc) = state.kv_cache.get_mut(layer_idx)?;
-                    k_caches.push(kc);
-                    v_caches.push(vc);
-                }
-                crate::op::scatter::scatter_kv_batch(
-                    &mut k_caches, &mut v_caches, &k, &v,
-                    workspace.input_pos_cpu.as_i32()?.as_slice()?,
-                    cuda_config_ref,
-                )?;
-            }
-
-            // Attention (batched): attn 输出写到 workspace.q_out（用作 wo 输入，且前 q_dim 连续）
-            let mut attn_out = workspace.q_out.slice(&[0, 0], &[batch_size, q_dim])?;
-            #[cfg(feature = "cuda")]
-            let cuda_flash_path = self.device_type.is_cuda()
-                && qkv.dtype() == DataType::BF16
-                && self.config.head_size == 64;
-            #[cfg(not(feature = "cuda"))]
-            let cuda_flash_path = false;
-
-            if cuda_flash_path {
-                #[cfg(feature = "cuda")]
-                {
-                    // kv_lens 和 positions 值相同，直接复用 input_pos_view
-                    let kv_lens_view = input_pos_view.clone();
-                    let cuda_cfg = cuda_config_ref.ok_or_else(||
-                        crate::base::error::Error::InvalidArgument(
-                            "flash_decoding_batch_bf16 需要 CudaConfig".into()
-                        ))?;
-                    let k_ptrs_layer = unsafe {
-                        workspace.k_cache_ptrs_dev.add(layer_idx * batch_size)
-                    };
-                    let v_ptrs_layer = unsafe {
-                        workspace.v_cache_ptrs_dev.add(layer_idx * batch_size)
-                    };
-                    unsafe {
-                        crate::op::kernels::cuda::flash_decoding_batch_bf16_launch_ready(
-                            &qkv, &mut attn_out,
-                            &kv_lens_view,
-                            k_ptrs_layer, v_ptrs_layer,
-                            cuda_cfg,
-                            batch_size,
-                            self.config.head_num,
-                            self.config.kv_head_num,
-                            self.config.head_size,
-                            qkv_cols, q_dim, // q_row_stride = qkv_cols, o_row_stride = q_dim (连续)
-                            0, 0,            // q_col_offset = 0, o_col_offset = 0
-                        )?;
-                    }
-                }
             } else {
-                // CPU fallback: 先 split q 再调原 forward_batch_decode
-                let qkv_dtype = qkv.dtype();
-                let mut q = Tensor::new(&[batch_size, q_dim], qkv_dtype, qkv.device())?;
-                crate::op::split_cols::split_cols_tensor(
-                    &qkv, &mut q, batch_size, qkv_cols, 0, q_dim,
-                    #[cfg(feature = "cuda")] split_stream,
-                )?;
-                let kv_lens: Vec<i32> = workspace.input_pos_cpu.as_i32()?.as_slice()?[..batch_size].to_vec();
-                let k_cache_refs: Vec<&Tensor> = states.iter()
-                    .map(|s| { let (k, _) = s.kv_cache.get(layer_idx).unwrap(); k })
-                    .collect();
-                let v_cache_refs: Vec<&Tensor> = states.iter()
-                    .map(|s| { let (_, v) = s.kv_cache.get(layer_idx).unwrap(); v })
-                    .collect();
-                self.layers.mha_layers[layer_idx].forward_batch_decode(
-                    &q, &k_cache_refs, &v_cache_refs, &kv_lens,
-                    &mut attn_out, cuda_config_ref,
-                )?;
+                for seq_idx in 0..num_seqs {
+                    let start = batch.seq_start(seq_idx);
+                    let len = batch.seq_len(seq_idx);
+                    let pos = batch.seq_pos(seq_idx);
+                    let (mut k_dst, mut v_dst) = states[seq_idx].kv_cache.slice_kv_cache(layer_idx, pos, len, kv_dim)?;
+                    let k_src = k.slice(&[start, 0], &[len, kv_dim])?;
+                    let v_src = v.slice(&[start, 0], &[len, kv_dim])?;
+                    k_dst.copy_from_on_current_stream(&k_src)?;
+                    v_dst.copy_from_on_current_stream(&v_src)?;
+                }
             }
 
-            // WO projection: [B, q_dim] → [B, dim]
-            // wo_out 用独立连续 buffer（workspace.intermediate），避免和 attn_out 地址冲突
-            let mut wo_out = workspace.intermediate.slice(&[0, 0], &[batch_size, dim])?;
-            self.layers.wo_layers[layer_idx].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
+            let attn_all = workspace.intermediate.slice(&[0, 0], &[total_tokens, q_dim])?;
+            for seq_idx in 0..num_seqs {
+                let start = batch.seq_start(seq_idx);
+                let len = batch.seq_len(seq_idx);
+                let q_seq = q.slice(&[start, 0], &[len, q_dim])?;
+                let (k_hist, v_hist) = states[seq_idx].kv_cache.get(layer_idx)?;
+                let mut out_seq = attn_all.slice(&[start, 0], &[len, q_dim])?;
+                let kv_len = if self.device_type.is_cuda() {
+                    workspace.kv_lens_dev.slice(&[seq_idx], &[1])?
+                } else {
+                    workspace.kv_lens_cpu.slice(&[seq_idx], &[1])?
+                };
+                self.layers.mha_layers[layer_idx].forward(&q_seq, k_hist, v_hist, &kv_len, &mut out_seq, cuda_config_ref)?;
+            }
 
-            let mut ffn_norm_out = attn_out;
+            let mut wo_out = workspace.ffn_out.slice(&[0, 0], &[total_tokens, dim])?;
+            self.layers.wo_layers[layer_idx].forward(&attn_all, &mut wo_out, cuda_config_ref)?;
+
+            let mut ffn_norm_out = workspace.rms_out.slice(&[0, 0], &[total_tokens, dim])?;
             if self.device_type.is_cuda() {
                 crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
                     &mut ffn_norm_out, &mut x, &wo_out,
@@ -1111,87 +655,49 @@ impl Llama3 {
                 self.layers.rmsnorm_ffn_layers[layer_idx].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
             }
 
-            let mut gate_up = workspace.gate_up_out.slice(&[0, 0], &[batch_size, 2 * inter])?;
+            let mut gate_up = workspace.gate_up_out.slice(&[0, 0], &[total_tokens, 2 * inter])?;
             self.layers.w_gate_up_layers[layer_idx].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
 
-            // w1 必须连续（后续 w2 GEMM 要连续输入）。
-            //   - B=1 时，gate_up.slice(col=0, inner=inter) 的物理布局就是前 inter 连续，
-            //     可以直接当 w1 使用，省掉一次 split_cols kernel launch。
-            //   - B>1 时，需要 split_cols 到独立连续 buffer。
-            let mut w1_out = if batch_size == 1 {
-                gate_up.slice(&[0, 0], &[batch_size, inter])?
-            } else {
-                let mut w1 = workspace.w1_out.slice(&[0, 0], &[batch_size, inter])?;
-                crate::op::split_cols::split_cols_tensor(
-                    &gate_up, &mut w1, batch_size, 2 * inter, 0, inter,
-                    #[cfg(feature = "cuda")] split_stream,
-                )?;
-                w1
-            };
-            // w3 不 split，直接用 strided swiglu 从 gate_up 第 inter 列读，in-place 写到 w1_out
-            //   B=1: w1_out 实际是 gate_up.slice，row stride = 2*inter
-            //   B>1: w1_out 是独立 buffer，row stride = inter
-            let x_row_stride_w1 = if batch_size == 1 { 2 * inter } else { inter };
-            #[cfg(feature = "cuda")]
-            if self.device_type.is_cuda() && w1_out.dtype() == DataType::BF16 {
-                unsafe {
-                    crate::op::kernels::cuda::swiglu_inplace_strided_bf16(
-                        &mut w1_out, &gate_up,
-                        batch_size, inter,
-                        x_row_stride_w1, // w1 的 row stride (B=1 时 = 2*inter, B>1 时 = inter)
-                        2 * inter,       // y_row_stride = gate_up 是 [B, 2*inter]
-                        0,               // x_col_offset
-                        inter,           // y_col_offset = w3 的起点
-                        cuda_config_ref,
-                    )?;
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                // CPU: split w3 后调原 SwiGLU
-                let mut w3_out = workspace.w3_out.slice(&[0, 0], &[batch_size, inter])?;
-                crate::op::split_cols::split_cols_tensor(
-                    &gate_up, &mut w3_out, batch_size, 2 * inter, inter, inter,
-                )?;
-                self.layers.swiglu_layers[layer_idx].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
-            }
+            let mut w1_out = workspace.w1_out.slice(&[0, 0], &[total_tokens, inter])?;
+            let mut w3_out = workspace.w3_out.slice(&[0, 0], &[total_tokens, inter])?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, total_tokens, 2 * inter, 0, inter, #[cfg(feature = "cuda")] split_stream)?;
+            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, total_tokens, 2 * inter, inter, inter, #[cfg(feature = "cuda")] split_stream)?;
+            self.layers.swiglu_layers[layer_idx].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
 
-            let mut w2_out = ffn_norm_out;
+            let mut w2_out = workspace.ffn_out.slice(&[0, 0], &[total_tokens, dim])?;
             self.layers.w2_layers[layer_idx].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
-
             if self.device_type.is_cuda() {
-                if layer_idx + 1 < self.config.layer_num {
-                    let buf = &mut workspace.rms_out;
-                    let mut next_out = buf.slice(&[0, 0], &[batch_size, dim])?;
-                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                        &mut next_out, &mut x, &w2_out,
-                        &self.layers.rmsnorm_attn_layers[layer_idx + 1].weight,
-                        self.config.rms_norm_eps, cuda_config_ref,
-                    )?;
+                let next_norm_weight = if layer_idx + 1 < self.config.layer_num {
+                    &self.layers.rmsnorm_attn_layers[layer_idx + 1].weight
                 } else {
-                    let buf = &mut workspace.rms_out;
-                    let mut final_out = buf.slice(&[0, 0], &[batch_size, dim])?;
-                    crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                        &mut final_out, &mut x, &w2_out,
-                        &self.layers.rmsnorm_final_layer.weight,
-                        self.config.rms_norm_eps, cuda_config_ref,
-                    )?;
-                }
+                    &self.layers.rmsnorm_final_layer.weight
+                };
+                let mut next_out = workspace.rms_out.slice(&[0, 0], &[total_tokens, dim])?;
+                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
+                    &mut next_out, &mut x, &w2_out,
+                    next_norm_weight, self.config.rms_norm_eps, cuda_config_ref,
+                )?;
             } else {
                 self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
             }
         }
 
-        // 4. Final RMSNorm + LM head
-        let mut final_norm_out = workspace.rms_out.slice(&[0, 0], &[batch_size, dim])?;
+        let mut final_norm_all = workspace.rms_out.slice(&[0, 0], &[total_tokens, dim])?;
         if !self.device_type.is_cuda() {
-            self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_out, cuda_config_ref)?;
+            self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_all, cuda_config_ref)?;
         }
 
-        let mut logits = workspace.logits.slice(&[0, 0], &[batch_size, self.config.vocab_size])?;
-        self.layers.cls_layer.forward(&final_norm_out, &mut logits, cuda_config_ref)?;
+        let sample_hidden = workspace.intermediate.slice(&[0, 0], &[num_seqs, dim])?;
+        for seq_idx in 0..num_seqs {
+            let last = batch.seq_end(seq_idx) - 1;
+            let src = final_norm_all.slice(&[last, 0], &[1, dim])?;
+            let mut dst = sample_hidden.slice(&[seq_idx, 0], &[1, dim])?;
+            dst.copy_from_on_current_stream(&src)?;
+        }
 
-        // 5. Sample → workspace.output_tokens（D2D/GPU，可被 graph capture）
+        let mut logits = workspace.logits.slice(&[0, 0], &[num_seqs, self.config.vocab_size])?;
+        self.layers.cls_layer.forward(&sample_hidden, &mut logits, cuda_config_ref)?;
+
         let tok_vocab = self.config.tokenizer_vocab_size;
         #[cfg(feature = "cuda")]
         let use_batched_argmax = self.device_type.is_cuda() && logits.dtype() == DataType::BF16;
@@ -1201,25 +707,18 @@ impl Llama3 {
         if use_batched_argmax {
             #[cfg(feature = "cuda")]
             {
-                let mut out_view = workspace.output_tokens.slice(&[0], &[batch_size])?;
-                // 直接走 strided argmax_batch：从 logits [B, vocab_size] 取前 tok_vocab 列
-                crate::op::kernels::cuda::argmax_batch_strided(
-                    &logits, tok_vocab, self.config.vocab_size, 0,
-                    batch_size, &mut out_view, cuda_config_ref,
-                )?;
+                let mut out_view = output_tokens.slice(&[0], &[num_seqs])?;
+                crate::op::kernels::cuda::argmax_batch_strided(&logits, tok_vocab, self.config.vocab_size, 0, num_seqs, &mut out_view, cuda_config_ref)?;
             }
         } else {
-            for i in 0..batch_size {
+            for i in 0..num_seqs {
                 let logits_row = logits.slice(&[i, 0], &[1, self.config.vocab_size])?;
                 let logits_trimmed = logits_row.slice(&[0, 0], &[1, tok_vocab])?;
                 let logits_1d = logits_trimmed.reshape(&[tok_vocab])?;
-                states[i].sampler.sample(&logits_1d, &mut states[i].output_token, cuda_config_ref)?;
-                // 同时把结果写一份到 workspace.output_tokens[i]，让 postlude 统一走 D2H
-                let mut dst = workspace.output_tokens.slice(&[i], &[1])?;
-                dst.copy_from(&states[i].output_token)?;
+                let mut dst = output_tokens.slice(&[i], &[1])?;
+                states[i].sampler.sample(&logits_1d, &mut dst, cuda_config_ref)?;
             }
         }
-
         Ok(())
     }
 }
@@ -1267,7 +766,14 @@ mod tests {
     fn warmup(model: &Llama3, state: &mut InferenceState) -> Result<()> {
         // ~10 tokens after BPE — safely above the flash-attn prefill
         // tile floor. A few decode steps also capture the CUDA Graph.
-        let prompt = "The quick brown fox jumps over the lazy dog.";
+        let prompt = "The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog. \
+            The quick brown fox jumps over the lazy dog.";
         let _ = model.generate(state, prompt, 4, false)?;
         Ok(())
     }
@@ -1366,32 +872,15 @@ impl crate::model::llm::LlmModel for Llama3 {
         Llama3::create_state(self)
     }
 
-    fn forward_prefill(
-        &self,
-        state: &mut crate::model::runtime::InferenceState,
-        tokens: &[i32],
-        start_pos: i32,
-        seq_len: usize,
-    ) -> Result<i32> {
-        Llama3::forward_prefill(self, state, tokens, start_pos, seq_len)
-    }
-
-    fn forward_decoding(
-        &self,
-        state: &mut crate::model::runtime::InferenceState,
-        pos: i32,
-    ) -> Result<i32> {
-        Llama3::forward_decoding(self, state, pos)
-    }
-
-    fn forward_batch_decode(
+    fn forward(
         &self,
         states: &mut [&mut crate::model::runtime::InferenceState],
         workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
-        positions: &[i32],
+        batch: &crate::worker::runner::WorkerBatchMeta<'_>,
+        output_tokens: &mut Tensor,
         cuda_config: Option<&crate::OpConfig>,
-    ) -> Result<Vec<i32>> {
-        Llama3::forward_batch_decode(self, states, workspace, positions, cuda_config)
+    ) -> Result<()> {
+        Llama3::forward(self, states, workspace, batch, output_tokens, cuda_config)
     }
 
     fn fill_rope_cache(

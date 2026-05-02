@@ -10,6 +10,7 @@ use infer_worker::model::llm::llm_model::LlmModel;
 use infer_worker::model::runtime::InferenceState;
 use infer_worker::tensor::Tensor;
 use infer_worker::worker::{BatchWorkspace, ModelRunner, SharedBuffers, WorkerServer};
+use infer_worker::worker::runner::WorkerBatchMeta;
 
 enum LoadedModel {
     Llama3(infer_worker::model::llm::llama3::Llama3),
@@ -38,30 +39,17 @@ impl LlmModel for LoadedModel {
         }
     }
 
-    fn forward_prefill(&self, state: &mut InferenceState, tokens: &[i32], start_pos: i32, seq_len: usize) -> Result<i32> {
-        match self {
-            LoadedModel::Llama3(m) => m.forward_prefill(state, tokens, start_pos, seq_len),
-            LoadedModel::Qwen3(m) => m.forward_prefill(state, tokens, start_pos, seq_len),
-        }
-    }
-
-    fn forward_decoding(&self, state: &mut InferenceState, pos: i32) -> Result<i32> {
-        match self {
-            LoadedModel::Llama3(m) => m.forward_decoding(state, pos),
-            LoadedModel::Qwen3(m) => m.forward_decoding(state, pos),
-        }
-    }
-
-    fn forward_batch_decode(
+    fn forward(
         &self,
         states: &mut [&mut InferenceState],
         workspace: &mut BatchWorkspace,
-        positions: &[i32],
+        batch: &WorkerBatchMeta<'_>,
+        output_tokens: &mut Tensor,
         cuda_config: Option<&infer_worker::OpConfig>,
-    ) -> Result<Vec<i32>> {
+    ) -> Result<()> {
         match self {
-            LoadedModel::Llama3(m) => m.forward_batch_decode(states, workspace, positions, cuda_config),
-            LoadedModel::Qwen3(m) => m.forward_batch_decode(states, workspace, positions, cuda_config),
+            LoadedModel::Llama3(m) => m.forward(states, workspace, batch, output_tokens, cuda_config),
+            LoadedModel::Qwen3(m) => m.forward(states, workspace, batch, output_tokens, cuda_config),
         }
     }
 
@@ -169,7 +157,7 @@ fn main() -> Result<()> {
     tracing::info!("Created {} inference states", states.len());
 
     // 预分配共享 buffer
-    let shared = SharedBuffers::new(args.max_batch_tokens, args.max_num_seqs)?;
+    let shared = SharedBuffers::new(args.max_batch_tokens, args.max_num_seqs, device)?;
     tracing::info!("Shared buffers allocated");
 
     // ZMQ sockets

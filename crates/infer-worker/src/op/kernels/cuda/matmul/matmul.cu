@@ -365,11 +365,18 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     float alpha = 1.0f;
     float beta = 0.0f;
     // Inputs swapped so that output is column-major [N,M] == row-major [M,N].
-    CHECK_CUBLAS(cublasLtMatmul(
-        ltHandle, entry.op, &alpha,
-        d_B, entry.A, d_A, entry.B, &beta,
-        d_C, entry.C, d_C, entry.C,
-        &entry.algo, workspace, workspaceSize, stream));
+    {
+        cublasStatus_t status = cublasLtMatmul(
+            ltHandle, entry.op, &alpha,
+            d_B, entry.A, d_A, entry.B, &beta,
+            d_C, entry.C, d_C, entry.C,
+            &entry.algo, workspace, workspaceSize, stream);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("cuBLASLt BF16 matmul failed: status=%d M=%d N=%d K=%d workspace=%zu\n",
+                   status, M, N, K, workspaceSize);
+            exit(EXIT_FAILURE);
+        }
+    }
 }
 // ============================================================================
 // BF16 GEMV kernel v3 for decode phase (M=1)

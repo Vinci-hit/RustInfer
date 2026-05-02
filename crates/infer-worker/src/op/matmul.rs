@@ -112,16 +112,30 @@ impl Matmul {
                         kernels::cuda::kpack_gemm(input, &self.weight, zeros, scales, *group_size, output, cuda_config)?;
                     }
                 } else if input.dtype() == DataType::BF16 {
+                    let m = input.shape()[0];
                     let n = weight.shape()[0];
-                    if input.shape()[0] == 1 && n <= 16384 {
+                    if m == 1 {
                         kernels::cuda::hgemv_bf16(input, weight, output, cuda_config)?;
+                    } else if m <= 4 && n > 65_536 {
+                        for row in 0..m {
+                            let row_in = input.slice(&[row, 0], &[1, input.shape()[1]])?;
+                            let mut row_out = output.slice(&[row, 0], &[1, n])?;
+                            kernels::cuda::hgemv_bf16(&row_in, weight, &mut row_out, cuda_config)?;
+                        }
                     } else {
                         kernels::cuda::hgemm_bf16(input, weight, output, cuda_config)?;
                     }
                 } else if input.dtype() == DataType::F16 {
+                    let m = input.shape()[0];
                     let n = weight.shape()[0];
-                    if input.shape()[0] == 1 && n <= 16384 {
+                    if m == 1 {
                         kernels::cuda::hgemv_fp16(input, weight, output, cuda_config)?;
+                    } else if m <= 4 && n > 65_536 {
+                        for row in 0..m {
+                            let row_in = input.slice(&[row, 0], &[1, input.shape()[1]])?;
+                            let mut row_out = output.slice(&[row, 0], &[1, n])?;
+                            kernels::cuda::hgemv_fp16(&row_in, weight, &mut row_out, cuda_config)?;
+                        }
                     } else {
                         kernels::cuda::hgemm_fp16(input, weight, output, cuda_config)?;
                     }

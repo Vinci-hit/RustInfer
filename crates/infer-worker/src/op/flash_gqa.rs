@@ -80,21 +80,46 @@ impl FlashAttnGQA {
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                let current_kv_len_ptr = input_kv_len.as_i32()?.buffer().as_ptr() as *const i32;
-                unsafe {
-                    kernels::cuda::flash_attn_gqa(
-                        input_q,
-                        input_k_cache,
-                        input_v_cache,
-                        output_o,
+                // 当前 prefill CUDA kernel 在部分短/非整 tile 序列上不稳定；prefill 先走 CPU fallback，
+                // decode(q_seq_len=1) 仍走 CUDA split-K 快路径。
+                if q_seq_len > 1 {
+                    let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config);
+                    unsafe { crate::cuda_check!(crate::cuda::ffi::cudaStreamSynchronize(stream))?; }
+                    let current_kv_len = input_kv_len.to_cpu()?.as_i32()?.as_slice()?[0] as usize;
+                    let q_cpu = input_q.to_cpu()?;
+                    let k_cpu = input_k_cache.to_cpu()?;
+                    let v_cpu = input_v_cache.to_cpu()?;
+                    let mut o_cpu = Tensor::new(output_o.shape(), output_o.dtype(), DeviceType::Cpu)?;
+                    kernels::cpu::flash_attn_gqa(
+                        &q_cpu,
+                        &k_cpu,
+                        &v_cpu,
+                        &mut o_cpu,
                         q_seq_len,
-                        current_kv_len_ptr,
+                        current_kv_len,
                         self.num_q_heads,
                         self.num_kv_heads,
                         self.head_dim,
                         self.causal,
-                        cuda_config,
                     )?;
+                    output_o.copy_from(&o_cpu)?;
+                } else {
+                    let current_kv_len_ptr = input_kv_len.as_i32()?.buffer().as_ptr() as *const i32;
+                    unsafe {
+                        kernels::cuda::flash_attn_gqa(
+                            input_q,
+                            input_k_cache,
+                            input_v_cache,
+                            output_o,
+                            q_seq_len,
+                            current_kv_len_ptr,
+                            self.num_q_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.causal,
+                            cuda_config,
+                        )?;
+                    }
                 }
             }
             #[cfg(not(feature = "cuda"))]

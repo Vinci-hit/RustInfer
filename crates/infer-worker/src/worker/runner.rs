@@ -102,53 +102,45 @@ impl<M: LlmModel> ModelRunner<M> {
         let num_seqs = num_decode + num_prefill;
         let step_start = Instant::now();
 
-        // 拿一个独立 Arc clone，让 meta 的生命周期不再借自 `self`——这样下面
-        // `self.run_batch_decode(&meta, ...)` 的 `&mut self` 借用不会与 meta 冲突。
+        // 拿一个独立 Arc clone，让 meta 的生命周期不再借自 `self`。
         let shared = Arc::clone(&self.shared);
         // 从 CPU 共享区拿 host slice（零拷贝）。SAFETY: input_meta.ready > 0 表示
         // Server 已完成写入且 Runner 独占这些 buffer 直到本 step 末尾。
         let meta = unsafe {
-            StepMeta {
-                q_start_loc: shared.input_q_start_loc.as_slice(num_seqs + 1),
-                slot_indices: shared.input_slot_indices.as_slice(num_seqs),
-                token_ids: shared.input_token_ids.as_slice(total_tokens),
-                positions: shared.input_positions.as_slice(total_tokens),
+            WorkerBatchMeta {
+                q_start_loc: shared.host_q_start_loc.as_slice(num_seqs + 1),
+                slot_indices: shared.host_slot_indices.as_slice(num_seqs),
+                token_ids: &[],
+                positions: shared.host_positions.as_slice(total_tokens),
+                num_decode,
+                num_prefill,
             }
         };
 
-        // 分组：seq_len==1 → decode；seq_len>1 → prefill。
-        let mut decode_order: Vec<usize> = Vec::with_capacity(num_decode);
-        let mut prefill_order: Vec<usize> = Vec::with_capacity(num_prefill);
-        for i in 0..num_seqs {
-            if meta.seq_len(i) == 1 {
-                decode_order.push(i);
-            } else {
-                prefill_order.push(i);
-            }
-        }
+        let slots: Vec<usize> = (0..meta.num_seqs()).map(|i| meta.seq_slot(i)).collect();
+        self.prepare_state_and_workspace(&slots, &meta)?;
+        self.stage_device_inputs(total_tokens, num_seqs)?;
+        let mut refs = disjoint_mut(&mut self.states, &slots)?;
 
-        let mut output_tokens = vec![0i32; num_seqs];
+        #[cfg(feature = "cuda")]
+        let cuda_cfg: Option<&crate::OpConfig> = Some(&self.batch_cuda_cfg);
+        #[cfg(not(feature = "cuda"))]
+        let cuda_cfg = None;
 
-        if !decode_order.is_empty() {
-            self.run_batch_decode(&decode_order, &meta, &mut output_tokens)?;
-        }
-        for &seq_idx in &prefill_order {
-            let slot = meta.seq_slot(seq_idx);
-            let (tokens, start_pos, seq_len) = meta.seq_prefill(seq_idx);
-            let tok = self.model.forward_prefill(&mut self.states[slot], tokens, start_pos, seq_len)?;
-            output_tokens[seq_idx] = tok;
-        }
-
-        // 写输出（CPU memcpy）。SAFETY: output_meta.ready==0 由主循环协议保证。
-        unsafe {
-            shared.output_token_ids.as_mut_slice(num_seqs).copy_from_slice(&output_tokens);
-        }
+        let mut output_token_ids = shared.output_token_ids.clone();
+        self.model.forward(
+            refs.as_mut_slice(),
+            &mut self.workspace,
+            &meta,
+            &mut output_token_ids,
+            cuda_cfg,
+        )?;
 
         tracing::debug!(
             "Runner step done in {}us ({}d/{}p)",
             step_start.elapsed().as_micros() as u64,
-            decode_order.len(),
-            prefill_order.len(),
+            num_decode,
+            num_prefill,
         );
 
         // 信号翻转
@@ -157,25 +149,42 @@ impl<M: LlmModel> ModelRunner<M> {
         Ok(())
     }
 
-    /// 把本步所有 decode seq 聚合成一次 `forward_batch_decode`。
-    fn run_batch_decode(
-        &mut self,
-        decode_order: &[usize],
-        meta: &StepMeta<'_>,
-        output_tokens: &mut [i32],
-    ) -> Result<()> {
-        let slots: Vec<usize> = decode_order.iter().map(|&i| meta.seq_slot(i)).collect();
-        let positions: Vec<i32> = decode_order.iter().map(|&i| meta.seq_pos(i)).collect();
+    fn stage_device_inputs(&mut self, total_tokens: usize, num_seqs: usize) -> Result<()> {
+        let mut dst_tokens = self.workspace.input_tokens.slice(&[0], &[total_tokens])?;
+        let src_tokens = self.shared.input_token_ids.slice(&[0], &[total_tokens])?;
+        dst_tokens.copy_from_on_current_stream(&src_tokens)?;
 
+        let mut dst_pos = self.workspace.input_pos.slice(&[0], &[total_tokens])?;
+        let src_pos = self.shared.input_positions.slice(&[0], &[total_tokens])?;
+        dst_pos.copy_from_on_current_stream(&src_pos)?;
+
+        let dst_pos_cpu = self.workspace.input_pos_cpu.as_i32_mut()?.as_slice_mut()?;
+        let src_pos_cpu = unsafe { self.shared.host_positions.as_slice(total_tokens) };
+        dst_pos_cpu[..total_tokens].copy_from_slice(src_pos_cpu);
+
+        let dst_kv = self.workspace.kv_lens_cpu.as_i32_mut()?.as_slice_mut()?;
+        let q_start = unsafe { self.shared.host_q_start_loc.as_slice(num_seqs + 1) };
+        let pos = unsafe { self.shared.host_positions.as_slice(total_tokens) };
+        for i in 0..num_seqs {
+            dst_kv[i] = pos[q_start[i] as usize];
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let src = self.workspace.kv_lens_cpu.slice(&[0], &[num_seqs])?;
+            let mut dst = self.workspace.kv_lens_dev.slice(&[0], &[num_seqs])?;
+            dst.copy_from_on_current_stream(&src)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_state_and_workspace(&mut self, slots: &[usize], meta: &WorkerBatchMeta<'_>) -> Result<()> {
         let mut kv_grew = false;
-        for (&slot, &pos) in slots.iter().zip(&positions) {
-            let pos_usize = usize::try_from(pos).map_err(|_| {
-                Error::InvalidArgument(format!("decode position {} is negative", pos))
-            })?;
+        for (seq_idx, &slot) in slots.iter().enumerate() {
+            let required_len = meta.seq_end_pos(seq_idx)?;
             let state = self.states.get_mut(slot).ok_or_else(|| {
                 Error::InvalidArgument(format!("state slot {} out of range", slot))
             })?;
-            if state.kv_cache.ensure_capacity(pos_usize + 1)? {
+            if state.kv_cache.ensure_capacity(required_len)? {
                 state.invalidate_decode_graphs();
                 kv_grew = true;
             }
@@ -187,57 +196,68 @@ impl<M: LlmModel> ModelRunner<M> {
             self.batch_cuda_cfg.graphs.clear();
         }
 
-        // batch 组合变化时让 workspace 的 KV 指针缓存失效。
-        let mut slots_sorted = slots.clone();
+        let mut slots_sorted = slots.to_vec();
         slots_sorted.sort_unstable();
         if slots_sorted != self.last_decode_slots {
             self.workspace.invalidate_batch_member_cache();
             self.last_decode_slots = slots_sorted;
-        }
-
-        let mut refs = disjoint_mut(&mut self.states, &slots)?;
-
-        #[cfg(feature = "cuda")]
-        let cuda_cfg: Option<&crate::OpConfig> = Some(&self.batch_cuda_cfg);
-        #[cfg(not(feature = "cuda"))]
-        let cuda_cfg = None;
-
-        let result = self.model.forward_batch_decode(
-            refs.as_mut_slice(),
-            &mut self.workspace,
-            &positions,
-            cuda_cfg,
-        )?;
-        debug_assert_eq!(result.len(), decode_order.len());
-
-        for (i, &seq_idx) in decode_order.iter().enumerate() {
-            output_tokens[seq_idx] = result[i];
         }
         Ok(())
     }
 }
 
 /// 本步 metadata 的只读 view，所有字段都是 host slice。
-struct StepMeta<'a> {
-    q_start_loc: &'a [i32],
-    slot_indices: &'a [i32],
-    token_ids: &'a [i32],
-    positions: &'a [i32],
+pub struct WorkerBatchMeta<'a> {
+    pub q_start_loc: &'a [i32],
+    pub slot_indices: &'a [i32],
+    pub token_ids: &'a [i32],
+    pub positions: &'a [i32],
+    pub num_decode: usize,
+    pub num_prefill: usize,
 }
 
-impl<'a> StepMeta<'a> {
-    fn seq_slot(&self, i: usize) -> usize {
+impl<'a> WorkerBatchMeta<'a> {
+    pub fn num_seqs(&self) -> usize {
+        self.num_decode + self.num_prefill
+    }
+
+    pub fn is_decode_only(&self) -> bool {
+        self.num_prefill == 0
+    }
+
+    pub fn seq_slot(&self, i: usize) -> usize {
         self.slot_indices[i] as usize
     }
-    fn seq_pos(&self, i: usize) -> i32 {
-        self.positions[self.q_start_loc[i] as usize]
+
+    pub fn seq_start(&self, i: usize) -> usize {
+        self.q_start_loc[i] as usize
     }
-    fn seq_len(&self, i: usize) -> usize {
-        (self.q_start_loc[i + 1] - self.q_start_loc[i]) as usize
+
+    pub fn seq_end(&self, i: usize) -> usize {
+        self.q_start_loc[i + 1] as usize
     }
-    fn seq_prefill(&self, i: usize) -> (&'a [i32], i32, usize) {
-        let start = self.q_start_loc[i] as usize;
-        let end = self.q_start_loc[i + 1] as usize;
-        (&self.token_ids[start..end], self.positions[start], end - start)
+
+    pub fn seq_len(&self, i: usize) -> usize {
+        self.seq_end(i) - self.seq_start(i)
+    }
+
+    pub fn seq_pos(&self, i: usize) -> i32 {
+        self.positions[self.seq_start(i)]
+    }
+
+    pub fn seq_tokens(&self, i: usize) -> &'a [i32] {
+        &self.token_ids[self.seq_start(i)..self.seq_end(i)]
+    }
+
+    pub fn seq_end_pos(&self, i: usize) -> Result<usize> {
+        let end_idx = self.seq_end(i).checked_sub(1).ok_or_else(|| {
+            Error::InvalidArgument(format!("empty sequence at index {}", i))
+        })?;
+        let last_pos = usize::try_from(self.positions[end_idx]).map_err(|_| {
+            Error::InvalidArgument(format!("negative position {}", self.positions[end_idx]))
+        })?;
+        last_pos.checked_add(1).ok_or_else(|| {
+            Error::InvalidArgument(format!("position overflow at seq {}", i)).into()
+        })
     }
 }

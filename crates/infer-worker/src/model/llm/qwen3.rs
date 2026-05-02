@@ -362,18 +362,47 @@ impl Qwen3 {
             stdout.flush()?;
         }
 
-        let mut input_pos = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        input_pos.as_i32_mut()?.as_slice_mut()?[0] = 0;
         let prompt_tokens = self.tokenizer.encode(prompt)?;
         if prompt_tokens.is_empty() {
             return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
         }
-        let mut input_tokens_cpu = Tensor::new(&[prompt_tokens.len()], DataType::I32, DeviceType::Cpu)?;
-        input_tokens_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&prompt_tokens);
+
+        // Qwen3 当前 worker forward 内部仍使用 per-state workspace；这里的 BatchWorkspace
+        // 仅用于满足统一 trait 接口，不能按 prompt_len 额外分配大块 GPU workspace。
+        let mut workspace = crate::worker::BatchWorkspace::new(
+            &self.config,
+            1,
+            1,
+            self.device_type,
+        )?;
+
+        let mut gen_output = Tensor::new(&[1], DataType::I32, self.device_type)?;
 
         // Prefill
         let prefill_start = Instant::now();
-        let mut current_token = self.forward_prefill(state, &input_tokens_cpu, &input_pos, prompt_tokens.len())?;
+        let prefill_positions: Vec<i32> = (0..prompt_tokens.len()).map(|i| i as i32).collect();
+        let prefill_q_start = [0, prompt_tokens.len() as i32];
+        let slot_indices = [0];
+        let prefill_meta = crate::worker::runner::WorkerBatchMeta {
+            q_start_loc: &prefill_q_start,
+            slot_indices: &slot_indices,
+            token_ids: &prompt_tokens,
+            positions: &prefill_positions,
+            num_decode: 0,
+            num_prefill: 1,
+        };
+        let current_token = {
+            let mut refs = vec![&mut *state];
+            <Qwen3 as crate::model::llm::LlmModel>::forward(
+                self,
+                refs.as_mut_slice(),
+                &mut workspace,
+                &prefill_meta,
+                &mut gen_output,
+                None,
+            )?;
+            gen_output.to_cpu()?.as_i32()?.as_slice()?[0]
+        };
         let prefill_ms = prefill_start.elapsed().as_millis() as u64;
 
         let mut generated_tokens = vec![current_token];
@@ -388,16 +417,34 @@ impl Qwen3 {
         // Decode
         let decode_start = Instant::now();
         let mut decode_iterations = 0;
-        let mut input_tokens_cpu = input_tokens_cpu.slice(&[0], &[1])?;
         for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
-            input_pos.as_i32_mut()?.as_slice_mut()?[0] = pos as i32;
-            input_tokens_cpu.as_i32_mut()?.as_slice_mut()?[0] = current_token;
-            let next_token = self.forward_decoding(state, &input_tokens_cpu, &input_pos)?;
+            let token_ids = [0i32];
+            let positions = [pos as i32];
+            let q_start = [0, 1];
+            let meta = crate::worker::runner::WorkerBatchMeta {
+                q_start_loc: &q_start,
+                slot_indices: &slot_indices,
+                token_ids: &token_ids,
+                positions: &positions,
+                num_decode: 1,
+                num_prefill: 0,
+            };
+            let next_token = {
+                let mut refs = vec![&mut *state];
+                <Qwen3 as crate::model::llm::LlmModel>::forward(
+                    self,
+                    refs.as_mut_slice(),
+                    &mut workspace,
+                    &meta,
+                    &mut gen_output,
+                    None,
+                )?;
+                gen_output.to_cpu()?.as_i32()?.as_slice()?[0]
+            };
 
             if self.tokenizer.is_eos(next_token) { break; }
 
             generated_tokens.push(next_token);
-            current_token = next_token;
             decode_iterations += 1;
 
             if print_output {
@@ -584,6 +631,19 @@ impl Qwen3 {
         }
         let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
 
+        let mut kv_len_tensor = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+        kv_len_tensor.as_i32_mut()?.as_slice_mut()?[0] = start_pos;
+        #[cfg(feature = "cuda")]
+        let kv_len_tensor_dev;
+        let kv_len_for_attn = match self.device_type {
+            DeviceType::Cpu => &kv_len_tensor,
+            #[cfg(feature = "cuda")]
+            DeviceType::Cuda(_) => {
+                kv_len_tensor_dev = kv_len_tensor.to_device(self.device_type)?;
+                &kv_len_tensor_dev
+            }
+        };
+
         // 把本段 prefill 的 seq_len 个绝对位置写到 state.input_pos 前 seq_len 个元素。
         let positions_host: Vec<i32> = (0..seq_len).map(|i| (pos + i) as i32).collect();
         match state.input_pos.device() {
@@ -647,7 +707,7 @@ impl Qwen3 {
             let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
             let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
             let mut attn_out = attn_out_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, pos_cpu, &mut attn_out, cuda_config_ref)?;
+            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, kv_len_for_attn, &mut attn_out, cuda_config_ref)?;
 
             let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
             let mut wo_out = wo_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
@@ -829,49 +889,40 @@ impl crate::model::llm::LlmModel for Qwen3 {
         Qwen3::create_state(self)
     }
 
-    fn forward_prefill(
-        &self,
-        state: &mut crate::model::runtime::InferenceState,
-        tokens: &[i32],
-        start_pos: i32,
-        seq_len: usize,
-    ) -> Result<i32> {
-        let mut input_tokens = Tensor::new(&[tokens.len()], DataType::I32, DeviceType::Cpu)?;
-        input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(tokens);
-        let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = start_pos;
-        Qwen3::forward_prefill(self, state, &input_tokens, &pos_cpu, seq_len)
-    }
-
-    fn forward_decoding(
-        &self,
-        state: &mut crate::model::runtime::InferenceState,
-        pos: i32,
-    ) -> Result<i32> {
-        let input_tokens = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = pos;
-        Qwen3::forward_decoding(self, state, &input_tokens, &pos_cpu)
-    }
-
-    fn forward_batch_decode(
+    fn forward(
         &self,
         states: &mut [&mut crate::model::runtime::InferenceState],
         _workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
-        positions: &[i32],
+        batch: &crate::worker::runner::WorkerBatchMeta<'_>,
+        output_tokens: &mut Tensor,
         _cuda_config: Option<&crate::OpConfig>,
-    ) -> Result<Vec<i32>> {
-        if states.len() != positions.len() {
+    ) -> Result<()> {
+        if states.len() != batch.num_seqs() {
             return Err(Error::InvalidArgument(format!(
-                "Qwen3 batch decode states len {} != positions len {}",
-                states.len(), positions.len()
+                "Qwen3::forward states len {} != batch seqs {}",
+                states.len(), batch.num_seqs()
             )).into());
         }
-        states
-            .iter_mut()
-            .zip(positions.iter().copied())
-            .map(|(state, pos)| <Qwen3 as crate::model::llm::LlmModel>::forward_decoding(self, *state, pos))
-            .collect()
+
+        for i in 0..batch.num_seqs() {
+            let seq_len = batch.seq_len(i);
+            let tok = if seq_len == 1 {
+                let input_tokens = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+                let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+                pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = batch.seq_pos(i);
+                Qwen3::forward_decoding(self, states[i], &input_tokens, &pos_cpu)?
+            } else {
+                let tokens = batch.seq_tokens(i);
+                let mut input_tokens = Tensor::new(&[tokens.len()], DataType::I32, DeviceType::Cpu)?;
+                input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(tokens);
+                let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
+                pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = batch.seq_pos(i);
+                Qwen3::forward_prefill(self, states[i], &input_tokens, &pos_cpu, seq_len)?
+            };
+            let mut dst = output_tokens.slice(&[i], &[1])?;
+            dst.write_from_i32_host(&[tok], 1)?;
+        }
+        Ok(())
     }
 
     fn fill_rope_cache(
@@ -934,7 +985,7 @@ mod tests {
     }
 
     fn get_qwen3_model_path() -> &'static Path {
-        Path::new("/root/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c")
+        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct")
     }
 
     #[test]

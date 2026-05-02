@@ -11,10 +11,13 @@ use std::time::{Duration, Instant};
 
 use infer_worker::base::DeviceType;
 use infer_worker::model::llm::llama3::Llama3;
+use infer_worker::model::llm::LlmModel;
+use infer_worker::model::runtime::InferenceState;
 use infer_worker::worker::{
     BatchWorkspace, ModelRunner, SharedBuffers, WorkerServer,
 };
 use infer_worker::worker::protocol::*;
+use infer_worker::worker::runner::WorkerBatchMeta;
 
 const MODEL_PATH: &str = "/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b";
 
@@ -24,6 +27,77 @@ fn maybe_skip() -> bool {
         return true;
     }
     false
+}
+
+fn forward_prefill_unified(
+    model: &Llama3,
+    state: &mut InferenceState,
+    workspace: &mut BatchWorkspace,
+    tokens: &[i32],
+    cuda_cfg: &infer_worker::cuda::CudaConfig,
+) -> i32 {
+    let positions: Vec<i32> = (0..tokens.len()).map(|i| i as i32).collect();
+    let q_start_loc = [0, tokens.len() as i32];
+    let slot_indices = [0];
+    workspace.input_tokens.write_from_i32_host(tokens, tokens.len()).unwrap();
+    workspace.input_pos.write_from_i32_host(&positions, positions.len()).unwrap();
+    workspace.kv_lens_cpu.as_i32_mut().unwrap().as_slice_mut().unwrap()[0] = 0;
+    let src = workspace.kv_lens_cpu.slice(&[0], &[1]).unwrap();
+    let mut dst = workspace.kv_lens_dev.slice(&[0], &[1]).unwrap();
+    dst.copy_from(&src).unwrap();
+    let meta = WorkerBatchMeta {
+        q_start_loc: &q_start_loc,
+        slot_indices: &slot_indices,
+        token_ids: tokens,
+        positions: &positions,
+        num_decode: 0,
+        num_prefill: 1,
+    };
+    let mut out = infer_worker::tensor::Tensor::new(&[1], infer_worker::base::DataType::I32, DeviceType::Cuda(0)).unwrap();
+    let mut refs = vec![state];
+    model.forward(refs.as_mut_slice(), workspace, &meta, &mut out, Some(cuda_cfg)).unwrap();
+    let tok = out.to_cpu().unwrap().as_i32().unwrap().as_slice().unwrap()[0];
+    refs[0].output_token.copy_from(&out.slice(&[0], &[1]).unwrap()).unwrap();
+    tok
+}
+
+fn forward_decode_unified(
+    model: &Llama3,
+    states: &mut [InferenceState],
+    workspace: &mut BatchWorkspace,
+    positions: &[i32],
+    cuda_cfg: &infer_worker::cuda::CudaConfig,
+) {
+    let batch = states.len();
+    let token_ids = vec![0i32; batch];
+    let q_start_loc: Vec<i32> = (0..=batch).map(|i| i as i32).collect();
+    let slot_indices: Vec<i32> = (0..batch).map(|i| i as i32).collect();
+    let meta = WorkerBatchMeta {
+        q_start_loc: &q_start_loc,
+        slot_indices: &slot_indices,
+        token_ids: &token_ids,
+        positions,
+        num_decode: batch,
+        num_prefill: 0,
+    };
+    for (i, state) in states.iter_mut().enumerate() {
+        let mut dst = workspace.input_tokens.slice(&[i], &[1]).unwrap();
+        dst.copy_from_on_current_stream(&state.output_token).unwrap();
+    }
+    workspace.input_pos.write_from_i32_host(positions, positions.len()).unwrap();
+    {
+        let kv = workspace.kv_lens_cpu.as_i32_mut().unwrap().as_slice_mut().unwrap();
+        kv[..batch].copy_from_slice(positions);
+    }
+    let src = workspace.kv_lens_cpu.slice(&[0], &[batch]).unwrap();
+    let mut dst = workspace.kv_lens_dev.slice(&[0], &[batch]).unwrap();
+    dst.copy_from(&src).unwrap();
+    let mut out = infer_worker::tensor::Tensor::new(&[batch], infer_worker::base::DataType::I32, DeviceType::Cuda(0)).unwrap();
+    let mut refs: Vec<&mut _> = states.iter_mut().collect();
+    model.forward(refs.as_mut_slice(), workspace, &meta, &mut out, Some(cuda_cfg)).unwrap();
+    for i in 0..batch {
+        refs[i].output_token.copy_from(&out.slice(&[i], &[1]).unwrap()).unwrap();
+    }
 }
 
 /// Worker 端到端 bench：从调度器侧 push B 个 prefill 请求 → 等 Runner 推完 N 步 decode → 统计时间。
@@ -61,30 +135,24 @@ fn bench_worker_e2e_vs_direct() {
         let model = Llama3::new(MODEL_PATH, device).expect("load model");
         let prompt_len = prompt_tokens.len();
 
-        let mut states: Vec<infer_worker::model::runtime::InferenceState> =
+        let mut states: Vec<InferenceState> =
             (0..batch_size).map(|_| model.create_state().unwrap()).collect();
 
-        for state in states.iter_mut() {
-            let _ = model.forward_prefill(state, prompt_tokens, 0, prompt_len).unwrap();
-        }
-
         let mut workspace = BatchWorkspace::new(model.config(), 64, batch_size, device).unwrap();
-        {
-            use infer_worker::model::llm::LlmModel;
-            model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache).unwrap();
-        }
+        model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache).unwrap();
 
         let cuda_cfg = infer_worker::cuda::CudaConfig::new()
             .and_then(|c| c.with_flash_decode(
                 model.config().head_num, model.config().head_size, batch_size,
             )).expect("cuda cfg");
 
+        for state in states.iter_mut() {
+            let _ = forward_prefill_unified(&model, state, &mut workspace, prompt_tokens, &cuda_cfg);
+        }
+
         for step in 0..warmup {
             let positions: Vec<i32> = (0..batch_size).map(|_| (prompt_len + step) as i32).collect();
-            let mut refs: Vec<&mut _> = states.iter_mut().collect();
-            let _ = model.forward_batch_decode(
-                refs.as_mut_slice(), &mut workspace, &positions, Some(&cuda_cfg),
-            ).unwrap();
+            forward_decode_unified(&model, &mut states, &mut workspace, &positions, &cuda_cfg);
         }
         cuda_cfg.sync_stream().unwrap();
 
@@ -92,10 +160,7 @@ fn bench_worker_e2e_vs_direct() {
         for step in 0..bench {
             let positions: Vec<i32> = (0..batch_size)
                 .map(|_| (prompt_len + warmup + step) as i32).collect();
-            let mut refs: Vec<&mut _> = states.iter_mut().collect();
-            let _ = model.forward_batch_decode(
-                refs.as_mut_slice(), &mut workspace, &positions, Some(&cuda_cfg),
-            ).unwrap();
+            forward_decode_unified(&model, &mut states, &mut workspace, &positions, &cuda_cfg);
         }
         cuda_cfg.sync_stream().unwrap();
         let elapsed = start.elapsed();
@@ -115,7 +180,7 @@ fn bench_worker_e2e_vs_direct() {
         let max_num_seqs = batch_size.max(1);
         let states: Vec<_> = (0..max_num_seqs).map(|_| model.create_state().unwrap()).collect();
 
-        let shared = SharedBuffers::new(2048, max_num_seqs).unwrap();
+        let shared = SharedBuffers::new(2048, max_num_seqs, device).unwrap();
 
         // ZMQ endpoints 用 inproc（同进程内）；唯一化避免多次 run_worker 冲突
         let tag = format!(

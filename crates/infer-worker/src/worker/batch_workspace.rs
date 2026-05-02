@@ -43,8 +43,6 @@ pub struct BatchWorkspace {
     pub logits: Tensor,
     /// 裁剪到 tokenizer_vocab_size 的 logits, [max_batch_seqs, tokenizer_vocab_size]
     pub logits_trim: Tensor,
-    /// 采样输出 token ids, [max_batch_seqs], I32
-    pub output_tokens: Tensor,
 
     // ═══ 每层 Q/K/V、w1/w3 的独立连续 buffer（避免在 capture 中分配）═══
     /// [max_batch_tokens, q_dim]
@@ -141,7 +139,6 @@ impl BatchWorkspace {
 
             logits: Tensor::new(&[max_batch_seqs, vocab_size], float_dtype, device)?,
             logits_trim: Tensor::new(&[max_batch_seqs, config.tokenizer_vocab_size], float_dtype, device)?,
-            output_tokens: Tensor::new(&[max_batch_seqs], int_dtype, device)?,
 
             q_out: Tensor::new(&[max_batch_tokens, q_dim], float_dtype, device)?,
             k_out: Tensor::new(&[max_batch_tokens, kv_dim], float_dtype, device)?,

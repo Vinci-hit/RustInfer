@@ -301,17 +301,20 @@ impl WorkerServer {
                 Error::InvalidArgument(format!("q_start_loc {} exceeds i32", v))
             }))
             .collect::<std::result::Result<_, _>>()?;
+        let mut input_token_ids = self.shared.input_token_ids.clone();
+        let mut input_positions = self.shared.input_positions.clone();
+        let mut input_q_start_loc = self.shared.input_q_start_loc.clone();
+        let mut input_context_lens = self.shared.input_context_lens.clone();
+        let mut input_slot_indices = self.shared.input_slot_indices.clone();
+        input_token_ids.write_from_i32_host(&token_ids, total_tokens)?;
+        input_positions.write_from_i32_host(&positions, total_tokens)?;
+        input_q_start_loc.write_from_i32_host(&q_start_loc_i32, num_seqs + 1)?;
+        input_context_lens.write_from_i32_host(&context_lens, num_seqs)?;
+        input_slot_indices.write_from_i32_host(&slot_indices, num_seqs)?;
         unsafe {
-            self.shared.input_token_ids.as_mut_slice(total_tokens)
-                .copy_from_slice(&token_ids);
-            self.shared.input_positions.as_mut_slice(total_tokens)
-                .copy_from_slice(&positions);
-            self.shared.input_q_start_loc.as_mut_slice(num_seqs + 1)
-                .copy_from_slice(&q_start_loc_i32);
-            self.shared.input_context_lens.as_mut_slice(num_seqs)
-                .copy_from_slice(&context_lens);
-            self.shared.input_slot_indices.as_mut_slice(num_seqs)
-                .copy_from_slice(&slot_indices);
+            self.shared.host_positions.as_mut_slice(total_tokens).copy_from_slice(&positions);
+            self.shared.host_q_start_loc.as_mut_slice(num_seqs + 1).copy_from_slice(&q_start_loc_i32);
+            self.shared.host_slot_indices.as_mut_slice(num_seqs).copy_from_slice(&slot_indices);
         }
 
         // 写元信息, ready 最后 store
@@ -410,8 +413,12 @@ impl WorkerServer {
     /// 读 Runner 写好的 output tokens。
     fn read_output_tokens(&self, num_seqs: usize) -> Vec<i32> {
         // SAFETY: 调用点保证 output_meta.ready > 0，Runner 不再写 output_token_ids。
-        unsafe {
-            self.shared.output_token_ids.as_slice(num_seqs).to_vec()
-        }
+        self.shared
+            .output_token_ids
+            .read_i32_to_host(num_seqs)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to read output_token_ids: {}", e);
+                Vec::new()
+            })
     }
 }

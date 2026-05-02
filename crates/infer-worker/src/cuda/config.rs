@@ -31,6 +31,7 @@ pub const FLASH_DECODE_N_SPLIT: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
     LlmDecode(usize),
+    LlmDecodeWithOutput { batch: usize, output_ptr: usize },
     LlmMixedPreAttn(usize),
     LlmMixedPostAttn(usize),
     Denoise {
