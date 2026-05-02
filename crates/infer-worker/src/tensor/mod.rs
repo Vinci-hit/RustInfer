@@ -60,11 +60,6 @@ impl<T: Dtype> TypedTensor<T> {
     pub fn new(shape: &[usize], device: DeviceType) -> Result<Self> {
         let num_elements: usize = shape.iter().product();
         let size_bytes = num_elements * std::mem::size_of::<T>();
-        #[cfg(feature = "cuda")]
-        let _device_guard = match device {
-            DeviceType::Cuda(device_id) => Some(crate::cuda::device::CudaDeviceGuard::new(device_id)?),
-            DeviceType::Cpu => None,
-        };
         // 临时的分配器获取逻辑，未来可以替换为更复杂的分配器管理
         let allocator: Arc<dyn DeviceAllocator + Send + Sync> = match device {
             DeviceType::Cpu => Arc::new(CpuAllocator),

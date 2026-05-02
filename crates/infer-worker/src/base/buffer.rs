@@ -12,7 +12,6 @@ struct BufferInner {
     ptr: NonNull<u8>,             // "地契"上记录的地址
     len_bytes: usize,             // "地契"上记录的面积
     allocator: Arc<dyn DeviceAllocator + Send + Sync>,// "地契"上记录了是哪个"开发商"分配的
-    device: DeviceType,
 }
 
 // SAFETY: BufferInner can be safely sent between threads because:
@@ -54,7 +53,6 @@ impl Buffer {
             ptr,
             len_bytes,
             allocator,
-            device,
         });
 
         Ok(Buffer {
@@ -405,15 +403,6 @@ impl Drop for BufferInner {
     fn drop(&mut self) {
         if self.len_bytes > 0 {
             let layout = Buffer::calculate_layout(self.len_bytes).unwrap();
-            #[cfg(feature = "cuda")]
-            let _guard = match self.device {
-                DeviceType::Cuda(device_id) => crate::cuda::device::CudaDeviceGuard::new(device_id).ok(),
-                DeviceType::Cpu => None,
-            };
-            #[cfg(feature = "cuda")]
-            if matches!(self.device, DeviceType::Cuda(_)) {
-                let _ = unsafe { crate::cuda::ffi::cudaDeviceSynchronize() };
-            }
             unsafe {
                 self.allocator.deallocate(self.ptr, layout);
             }

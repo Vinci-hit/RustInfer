@@ -39,8 +39,7 @@ impl DeviceType {
     pub fn sync(&self) -> crate::base::error::Result<()> {
         #[cfg(feature = "cuda")]
         {
-            if let DeviceType::Cuda(device_id) = *self {
-                let _guard = crate::cuda::device::CudaDeviceGuard::new(device_id)?;
+            if self.is_cuda() {
                 unsafe {
                     crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?;
                 }
