@@ -85,7 +85,7 @@ impl TimestepEmbedder {
         t_out_slot: &mut Tensor,
         cuda_config: Option<&crate::OpConfig>,
     ) -> Result<()> {
-        crate::op::scalar::sinusoid_embedding_from_dev(t_freq_slot, d_t_scaled)?;
+        crate::op::timestep_embed::sinusoid_embedding_from_dev(t_freq_slot, d_t_scaled)?;
         self.mlp1.forward(t_freq_slot, t_hidden_slot, cuda_config)?;
         t_hidden_slot.silu()?;
         self.mlp2.forward(t_hidden_slot, t_out_slot, cuda_config)?;

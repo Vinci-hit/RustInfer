@@ -3,9 +3,13 @@ name = "infer-worker"
 version = "0.1.0"
 edition = "2024"
 
+# High-level model/worker binary is gated behind the `models` feature —
+# see `src/lib.rs`. Building the crate without `models` exercises only
+# the tensor / op / cuda infrastructure.
 [[bin]]
 name = "rustinfer-worker"
 path = "src/bin/worker_main.rs"
+required-features = ["models"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -40,4 +44,8 @@ walkdir = {version = "2.5.0" , optional = true}
 [features]
 default = ["cuda"]
 cuda = ["dep:cc", "dep:bindgen", "dep:walkdir"]
-qwen3 = []
+# Enable the high-level model / worker layer (LLM + diffusion pipelines,
+# zmq-based worker server, `rustinfer-worker` binary). Leave disabled
+# while rebuilding the tensor foundation.
+models = []
+qwen3 = ["models"]

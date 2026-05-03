@@ -8,6 +8,7 @@ mod zmq_server;
 
 use engine::{InferenceEngine, ModelInstance};
 use infer_worker::base::DeviceType;
+use infer_worker::model::llm::LlmModel;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]

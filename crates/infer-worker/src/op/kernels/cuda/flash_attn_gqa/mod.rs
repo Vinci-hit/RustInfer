@@ -212,10 +212,10 @@ pub unsafe fn flash_attn_gqa(
     // --- 4. 根据数据类型分发 ---
     match dtype {
         crate::base::DataType::F32 => {
-            let q_ptr = input_q.as_f32()?.buffer().as_ptr() as *const f32;
-            let k_ptr = input_k_cache.as_f32()?.buffer().as_ptr() as *const f32;
-            let v_ptr = input_v_cache.as_f32()?.buffer().as_ptr() as *const f32;
-            let o_ptr = output_o.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let q_ptr = input_q.as_f32()?.data_ptr();
+            let k_ptr = input_k_cache.as_f32()?.data_ptr();
+            let v_ptr = input_v_cache.as_f32()?.data_ptr();
+            let o_ptr = output_o.as_f32_mut()?.data_ptr_mut();
             unsafe {
                 if q_seq_len == 1 {
                     flash_decoding_cu(
@@ -248,10 +248,10 @@ pub unsafe fn flash_attn_gqa(
             }
         }
         crate::base::DataType::BF16 => {
-            let q_ptr = input_q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let k_ptr = input_k_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let v_ptr = input_v_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let o_ptr = output_o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let q_ptr = input_q.as_bf16()?.data_ptr();
+            let k_ptr = input_k_cache.as_bf16()?.data_ptr();
+            let v_ptr = input_v_cache.as_bf16()?.data_ptr();
+            let o_ptr = output_o.as_bf16_mut()?.data_ptr_mut();
 
             unsafe {
                 if q_seq_len == 1 {
@@ -326,10 +326,10 @@ pub unsafe fn flash_attn_gqa(
             }
         }
         crate::base::DataType::F16 => {
-            let q_ptr = input_q.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let k_ptr = input_k_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let v_ptr = input_v_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let o_ptr = output_o.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let q_ptr = input_q.as_f16()?.data_ptr();
+            let k_ptr = input_k_cache.as_f16()?.data_ptr();
+            let v_ptr = input_v_cache.as_f16()?.data_ptr();
+            let o_ptr = output_o.as_f16_mut()?.data_ptr_mut();
 
             unsafe {
                 if q_seq_len == 1 {
@@ -448,8 +448,8 @@ pub unsafe fn flash_decoding_batch_bf16(
     let mut k_host: Vec<u64> = Vec::with_capacity(batch_size);
     let mut v_host: Vec<u64> = Vec::with_capacity(batch_size);
     for i in 0..batch_size {
-        k_host.push(k_caches[i].as_bf16()?.buffer().as_ptr() as u64);
-        v_host.push(v_caches[i].as_bf16()?.buffer().as_ptr() as u64);
+        k_host.push(k_caches[i].as_bf16()?.data_ptr() as u64);
+        v_host.push(v_caches[i].as_bf16()?.data_ptr() as u64);
     }
     let bytes = batch_size * std::mem::size_of::<u64>();
     unsafe {
@@ -482,9 +482,9 @@ pub unsafe fn flash_decoding_batch_bf16(
         )).into());
     }
 
-    let q_ptr = q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let o_ptr = o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let kv_lens_ptr = kv_lens_dev.as_i32()?.buffer().as_ptr() as *const i32;
+    let q_ptr = q.as_bf16()?.data_ptr();
+    let o_ptr = o.as_bf16_mut()?.data_ptr_mut();
+    let kv_lens_ptr = kv_lens_dev.as_i32()?.data_ptr();
     let workspace_ptr = cuda_config.flash_decode_workspace as *mut f32;
     let qo_stride = (num_q_heads * head_dim) as i32;
 
@@ -544,11 +544,11 @@ pub unsafe fn flash_decoding_batch_bf16_launch_ready(
     }
 
     let stream = CudaConfig::resolve_stream(Some(cuda_config));
-    let q_base = q.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let o_base = o.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let q_base = q.as_bf16()?.data_ptr();
+    let o_base = o.as_bf16_mut()?.data_ptr_mut();
     let q_ptr = unsafe { q_base.add(q_col_offset) };
     let o_ptr = unsafe { o_base.add(o_col_offset) };
-    let kv_lens_ptr = kv_lens_dev.as_i32()?.buffer().as_ptr() as *const i32;
+    let kv_lens_ptr = kv_lens_dev.as_i32()?.data_ptr();
     let workspace_ptr = cuda_config.flash_decode_workspace as *mut f32;
 
     unsafe {

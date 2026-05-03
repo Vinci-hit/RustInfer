@@ -108,9 +108,9 @@ pub fn hgemv_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let k = a_shape[1];     // inner dimension
     let n = b_shape[0];     // output dimension (rows of weight)
 
-    let input_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let weight_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let output_ptr = output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let input_ptr = input.as_bf16()?.data_ptr();
+    let weight_ptr = weight.as_bf16()?.data_ptr();
+    let output_ptr = output.as_bf16_mut()?.data_ptr_mut();
     let stream = CudaConfig::resolve_stream(cuda_config);
 
     unsafe {
@@ -137,13 +137,13 @@ pub fn hgemm_bf16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     
     // (这里可以添加形状检查)
 
-    let a_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let a_ptr = input.as_bf16()?.data_ptr();
     // **注意**: 我们的 sgemm 内核不支持转置，所以 B 必须已经是 W^T
     // 在实践中，我们会使用 cuBLAS，它支持转置。
     // 为了使用您的 naive_kernel，我们需要一个已经转置好的 weight。
     // 这里我们假设 weight 就是 B，而不是 W。
-    let b_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let c_ptr = output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let b_ptr = weight.as_bf16()?.data_ptr();
+    let c_ptr = output.as_bf16_mut()?.data_ptr_mut();
     let stream = CudaConfig::resolve_stream(cuda_config);
     let cublaslt_handle = cuda_config.map_or(std::ptr::null_mut(), |config| config.cublaslt_handle);
     let workspace = cuda_config.map_or(std::ptr::null_mut(), |config| config.workspace);
@@ -172,9 +172,9 @@ pub fn hgemv_fp16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let qweight_shape = weight.shape();
     let n = qweight_shape[0] as i32;
     let k = qweight_shape[1] as i32;
-    let input_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
-    let weight_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
-    let output_ptr = output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+    let input_ptr = input.as_f16()?.data_ptr();
+    let weight_ptr = weight.as_f16()?.data_ptr();
+    let output_ptr = output.as_f16_mut()?.data_ptr_mut();
     let stream = CudaConfig::resolve_stream(cuda_config);
     unsafe { hgemv_fp16_cu(input_ptr, weight_ptr, output_ptr, n, k, stream); }
     Ok(())
@@ -187,9 +187,9 @@ pub fn hgemm_fp16(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_con
     let m = a_shape[0];
     let k = a_shape[1];
     let n = b_shape[0];
-    let a_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
-    let b_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
-    let c_ptr = output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+    let a_ptr = input.as_f16()?.data_ptr();
+    let b_ptr = weight.as_f16()?.data_ptr();
+    let c_ptr = output.as_f16_mut()?.data_ptr_mut();
     let stream = CudaConfig::resolve_stream(cuda_config);
     let cublaslt_handle = cuda_config.map_or(std::ptr::null_mut(), |config| config.cublaslt_handle);
     let workspace = cuda_config.map_or(std::ptr::null_mut(), |config| config.workspace);
@@ -211,9 +211,9 @@ pub fn sgemv(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config:O
     let x_typed = input.as_f32()?;
     let y_typed = output.as_f32_mut()?;
     
-    let a_ptr = a_typed.buffer().as_ptr() as *const f32;
-    let x_ptr = x_typed.buffer().as_ptr() as *const f32;
-    let y_ptr = y_typed.buffer_mut().as_mut_ptr() as *mut f32;
+    let a_ptr = a_typed.data_ptr();
+    let x_ptr = x_typed.data_ptr();
+    let y_ptr = y_typed.data_ptr_mut();
 
     // --- 2. 形状检查和维度计算 ---
     let a_shape = weight.shape();
@@ -260,9 +260,9 @@ pub fn sgemm(input: &Tensor, weight: &Tensor, output: &mut Tensor, cuda_config: 
     
     // (这里可以添加形状检查)
 
-    let a_ptr = input.as_f32()?.buffer().as_ptr() as *const f32;
-    let b_ptr = weight.as_f32()?.buffer().as_ptr() as *const f32;
-    let c_ptr = output.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+    let a_ptr = input.as_f32()?.data_ptr();
+    let b_ptr = weight.as_f32()?.data_ptr();
+    let c_ptr = output.as_f32_mut()?.data_ptr_mut();
 
     unsafe {
         sgemm_naive_f32_cu(a_ptr, b_ptr, c_ptr, n as i32, m as i32, k as i32, stream);
@@ -295,11 +295,11 @@ pub fn kpack_gemv(
 
     unsafe {
         kpack_gemv_cu(
-            input.buffer().as_ptr() as *const std::ffi::c_void,
-            weight_packed.buffer().as_ptr() as *const std::ffi::c_void,
-            weight_zero_point.buffer().as_ptr() as *const std::ffi::c_void,
-            weight_scale.buffer().as_ptr() as *const std::ffi::c_void,
-            output.buffer_mut().as_mut_ptr() as *mut std::ffi::c_void,
+            input.data_ptr() as *const std::ffi::c_void,
+            weight_packed.data_ptr() as *const std::ffi::c_void,
+            weight_zero_point.data_ptr() as *const std::ffi::c_void,
+            weight_scale.data_ptr() as *const std::ffi::c_void,
+            output.data_ptr_mut() as *mut std::ffi::c_void,
             n,
             k,
             group_size as i32,
@@ -334,11 +334,11 @@ pub fn kpack_gemm(
 
     unsafe {
         kpack_gemm_cu(
-            input.buffer().as_ptr() as *const std::ffi::c_void,
-            weight_packed.buffer().as_ptr() as *const std::ffi::c_void,
-            weight_zero_point.buffer().as_ptr() as *const std::ffi::c_void,
-            weight_scale.buffer().as_ptr() as *const std::ffi::c_void,
-            output.buffer_mut().as_mut_ptr() as *mut std::ffi::c_void,
+            input.data_ptr() as *const std::ffi::c_void,
+            weight_packed.data_ptr() as *const std::ffi::c_void,
+            weight_zero_point.data_ptr() as *const std::ffi::c_void,
+            weight_scale.data_ptr() as *const std::ffi::c_void,
+            output.data_ptr_mut() as *mut std::ffi::c_void,
             m,
             n,
             k,

@@ -1,3 +1,4 @@
+#![cfg(feature = "models")]
 //! 集成测试: 模拟调度器向 Worker 发送 prefill 指令, 验证能正确收到输出。
 //!
 //! - test_worker_pipeline_cpu / test_worker_multi_request_batch:
@@ -232,10 +233,10 @@ fn test_worker_with_llama3() {
     let prompt_tokens = model_baseline.tokenizer().encode(prompt).expect("tokenize");
     tracing::info!("Prompt '{}' → tokens {:?}", prompt, &prompt_tokens);
 
-    let (baseline_text, baseline_num_tokens, _, _, _) = model_baseline
+    let baseline_stats = model_baseline
         .generate(&mut state_baseline, prompt, max_gen, false)
         .expect("baseline generate");
-    tracing::info!("Baseline output: '{}' ({} tokens)", baseline_text, baseline_num_tokens);
+    tracing::info!("Baseline output: '{}' ({} tokens)", baseline_stats.text, baseline_stats.num_tokens);
 
     // 重新 generate 获取 token ids (generate 只返回 text)
     // 手动通过统一 worker forward 收集 token ids

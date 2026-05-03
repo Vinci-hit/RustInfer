@@ -84,7 +84,7 @@ pub fn add(
     }
 
     // 长度校验
-    let num_elements = input_a.num_elements();
+    let num_elements = input_a.numel();
     if num_elements == 0 {
         return Err(Error::InvalidArgument("Input Tensor cannot be empty".into()).into());
     }
@@ -105,9 +105,9 @@ pub fn add(
             let input_b_typed = input_b.as_f32()?;
             let output_c_typed: &mut TypedTensor<f32> = output_c.as_f32_mut()?;
             
-            let a_ptr = input_a_typed.buffer().as_ptr() as *const f32;
-            let b_ptr = input_b_typed.buffer().as_ptr() as *const f32;
-            let c_ptr = output_c_typed.buffer_mut().as_mut_ptr() as *mut f32;
+            let a_ptr = input_a_typed.data_ptr();
+            let b_ptr = input_b_typed.data_ptr();
+            let c_ptr = output_c_typed.data_ptr_mut();
 
             unsafe {
                 add_kernel_float2_forward(
@@ -124,9 +124,9 @@ pub fn add(
             let input_b_typed = input_b.as_bf16()?;
             let output_c_typed: &mut TypedTensor<half::bf16> = output_c.as_bf16_mut()?;
             
-            let a_ptr = input_a_typed.buffer().as_ptr() as *const half::bf16;
-            let b_ptr = input_b_typed.buffer().as_ptr() as *const half::bf16;
-            let c_ptr = output_c_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let a_ptr = input_a_typed.data_ptr();
+            let b_ptr = input_b_typed.data_ptr();
+            let c_ptr = output_c_typed.data_ptr_mut();
 
             unsafe {
                 add_kernel_bf16x8(
@@ -143,9 +143,9 @@ pub fn add(
             let input_b_typed = input_b.as_f16()?;
             let output_c_typed: &mut TypedTensor<half::f16> = output_c.as_f16_mut()?;
             
-            let a_ptr = input_a_typed.buffer().as_ptr() as *const half::f16;
-            let b_ptr = input_b_typed.buffer().as_ptr() as *const half::f16;
-            let c_ptr = output_c_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let a_ptr = input_a_typed.data_ptr();
+            let b_ptr = input_b_typed.data_ptr();
+            let c_ptr = output_c_typed.data_ptr_mut();
 
             unsafe {
                 add_kernel_fp16x8(
@@ -197,7 +197,7 @@ pub fn add_inplace(
         )).into());
     }
     
-    let num_elements = input_output_a.num_elements();
+    let num_elements = input_output_a.numel();
     if num_elements == 0 {
         return Err(Error::InvalidArgument("Input Tensor cannot be empty".into()).into());
     }
@@ -217,8 +217,8 @@ pub fn add_inplace(
             let input_output_a_typed: &mut TypedTensor<f32> = input_output_a.as_f32_mut()?;
             let input_b_typed = input_b.as_f32()?;
             
-            let a_and_c_ptr = input_output_a_typed.buffer_mut().as_mut_ptr() as *mut f32;
-            let b_ptr = input_b_typed.buffer().as_ptr() as *const f32;
+            let a_and_c_ptr = input_output_a_typed.data_ptr_mut();
+            let b_ptr = input_b_typed.data_ptr();
 
             unsafe {
                 add_inplace_kernel_float2_forward(
@@ -233,8 +233,8 @@ pub fn add_inplace(
             let input_output_a_typed: &mut TypedTensor<half::bf16> = input_output_a.as_bf16_mut()?;
             let input_b_typed = input_b.as_bf16()?;
             
-            let a_and_c_ptr = input_output_a_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let b_ptr = input_b_typed.buffer().as_ptr() as *const half::bf16;
+            let a_and_c_ptr = input_output_a_typed.data_ptr_mut();
+            let b_ptr = input_b_typed.data_ptr();
 
             unsafe {
                 add_inplace_kernel_bf16x8(
@@ -249,8 +249,8 @@ pub fn add_inplace(
             let input_output_a_typed: &mut TypedTensor<half::f16> = input_output_a.as_f16_mut()?;
             let input_b_typed = input_b.as_f16()?;
             
-            let a_and_c_ptr = input_output_a_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let b_ptr = input_b_typed.buffer().as_ptr() as *const half::f16;
+            let a_and_c_ptr = input_output_a_typed.data_ptr_mut();
+            let b_ptr = input_b_typed.data_ptr();
 
             unsafe {
                 add_inplace_kernel_fp16x8(

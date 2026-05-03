@@ -17,7 +17,7 @@ pub fn softmax(input: &Tensor, output: &mut Tensor) -> Result<()> {
 fn softmax_f32(input: &Tensor, output: &mut Tensor) -> Result<()> {
     let shape = input.shape();
     let last_dim = *shape.last().unwrap();
-    let n_rows = input.num_elements() / last_dim;
+    let n_rows = input.numel() / last_dim;
 
     let in_data = input.as_f32()?.as_slice()?;
     let out_data = output.as_f32_mut()?.as_slice_mut()?;
@@ -44,7 +44,7 @@ fn softmax_f32(input: &Tensor, output: &mut Tensor) -> Result<()> {
 fn softmax_bf16(input: &Tensor, output: &mut Tensor) -> Result<()> {
     let shape = input.shape();
     let last_dim = *shape.last().unwrap();
-    let n_rows = input.num_elements() / last_dim;
+    let n_rows = input.numel() / last_dim;
 
     let in_data = input.as_bf16()?.as_slice()?;
     let out_data = output.as_bf16_mut()?.as_slice_mut()?;

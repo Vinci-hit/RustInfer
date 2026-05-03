@@ -75,8 +75,10 @@ mod tests {
         let (p_f, p_h, p_w) = (f_patch_size, patch_size, patch_size);
         let (f_t, h_t, w_t) = (f / p_f, h / p_h, w / p_w);
         let t = image.view(&[c, f_t, p_f, h_t, p_h, w_t, p_w])?;
+        // `permute` yields a zero-copy strided view; `reshape` densifies
+        // before collapsing the axes.
         let t = t.permute(&[1, 3, 5, 2, 4, 6, 0])?;
-        t.view(&[f_t * h_t * w_t, p_f * p_h * p_w * c])
+        t.reshape(&[f_t * h_t * w_t, p_f * p_h * p_w * c])
     }
 
     fn unpatchify(
@@ -87,7 +89,7 @@ mod tests {
         let (f_t, h_t, w_t) = (f / p_f, h / p_h, w / p_w);
         let t = tokens.view(&[f_t, h_t, w_t, p_f, p_h, p_w, out_channels])?;
         let t = t.permute(&[6, 0, 3, 1, 4, 2, 5])?;
-        t.view(&[out_channels, f, h, w])
+        t.reshape(&[out_channels, f, h, w])
     }
 
     #[test]

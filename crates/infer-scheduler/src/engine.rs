@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use infer_protocol::{InferenceRequest, InferenceResponse, InferenceMetrics, ResponseStatus};
 use anyhow::Result;
+use infer_worker::model::llm::{GenerateStats, LlmModel};
 
 /// 模型实例枚举，支持多种模型类型
 pub enum ModelInstance {
@@ -17,7 +18,7 @@ impl ModelInstance {
         prompt: &str,
         max_tokens: usize,
         print_output: bool,
-    ) -> Result<(String, u32, u64, u64, usize)> {
+    ) -> Result<GenerateStats> {
         match self {
             ModelInstance::Llama3(model, state) => Ok(model.generate(state, prompt, max_tokens, print_output)?),
             ModelInstance::Qwen3(model, state) => Ok(model.generate(state, prompt, max_tokens, print_output)?),
@@ -125,33 +126,33 @@ impl InferenceEngine {
             );
 
             let response = match result {
-                Ok((text, num_tokens, prefill_ms, decode_ms, decode_iterations)) => {
+                Ok(stats) => {
                     let total_time_ms = start.elapsed().as_millis() as u64;
                     let tokens_per_second = if total_time_ms > 0 {
-                        (num_tokens as f64 / total_time_ms as f64) * 1000.0
+                        (stats.num_tokens as f64 / total_time_ms as f64) * 1000.0
                     } else {
                         0.0
                     };
 
                     tracing::info!(
                         "Request {} completed: {} tokens in {}ms ({:.1} tok/s)",
-                        req.request_id, num_tokens, total_time_ms, tokens_per_second
+                        req.request_id, stats.num_tokens, total_time_ms, tokens_per_second
                     );
 
                     InferenceResponse {
                         request_id: req.request_id,
                         status: ResponseStatus::Success,
-                        text: Some(text),
+                        text: Some(stats.text),
                         tokens: None,
-                        num_tokens,
+                        num_tokens: stats.num_tokens,
                         error: None,
                         metrics: InferenceMetrics {
-                            prefill_ms,
-                            decode_ms,
+                            prefill_ms: stats.prefill_ms,
+                            decode_ms: stats.decode_ms,
                             queue_ms,
                             batch_size: 1,
                             tokens_per_second,
-                            decode_iterations,
+                            decode_iterations: stats.decode_iterations,
                         },
                     }
                 }

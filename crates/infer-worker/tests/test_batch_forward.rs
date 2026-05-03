@@ -1,3 +1,4 @@
+#![cfg(feature = "models")]
 //! 测试 worker 统一 forward 与串行/批量输出一致性
 
 use infer_worker::base::DeviceType;

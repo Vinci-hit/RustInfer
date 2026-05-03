@@ -11,22 +11,22 @@ unsafe extern "C" {
 pub fn softmax(input: &Tensor, output: &mut Tensor, stream: ffi::cudaStream_t) -> Result<()> {
     let shape = input.shape();
     let last_dim = *shape.last().unwrap();
-    let n_rows = (input.num_elements() / last_dim) as i32;
+    let n_rows = (input.numel() / last_dim) as i32;
     let cols = last_dim as i32;
 
     match input.dtype() {
         crate::base::DataType::F32 => unsafe {
             softmax_f32_forward(
-                output.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
-                input.as_f32()?.buffer().as_ptr() as *const f32,
+                output.as_f32_mut()?.data_ptr_mut(),
+                input.as_f32()?.data_ptr(),
                 n_rows, cols, stream,
             );
             Ok(())
         },
         crate::base::DataType::BF16 => unsafe {
             softmax_bf16_forward(
-                output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
-                input.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+                output.as_bf16_mut()?.data_ptr_mut(),
+                input.as_bf16()?.data_ptr(),
                 n_rows, cols, stream,
             );
             Ok(())

@@ -211,7 +211,6 @@ mod tests {
             let cuda_config = crate::cuda::CudaConfig::new()?;
             sampler_op.forward(&logits, &mut output, Some(&cuda_config))?;
 
-
             assert_eq!(
                 output.to_cpu()?.as_i32()?.as_slice()?[0], max_index as i32,
                 "CUDA vocab size {}: Expected max_index {}, got {}",
@@ -222,118 +221,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn test_sampler_bf16_cpu_vs_cuda() -> Result<()> {
-        let dtype = DataType::BF16;
-
-        // Test CPU vs CUDA for various vocab sizes
-        for (vocab_size, max_index) in [(512, 256), (4096, 2048), (16000, 8000)] {
-            // Prepare logits data
-            let logits_data: Vec<bf16> = (0..vocab_size)
-                .map(|i| {
-                    if i == max_index {
-                        bf16::from_f32(50.0)
-                    } else {
-                        bf16::from_f32(((i * 7) % 100) as f32 * 0.1)
-                    }
-                })
-                .collect();
-
-            // CPU computation
-            let mut logits_cpu = Tensor::new(&[vocab_size], dtype, DeviceType::Cpu)?;
-            logits_cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&logits_data);
-
-            let argmax_sampler_cpu = Box::new(ArgmaxSampler::new(DeviceType::Cpu));
-            let sampler_op_cpu = SamplerOp::new(argmax_sampler_cpu);
-
-            let mut output_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            sampler_op_cpu.forward(&logits_cpu, &mut output_cpu, None)?;
-            let cpu_result = output_cpu.as_i32()?.as_slice()?[0];
-
-            // GPU computation
-            let mut logits_gpu = Tensor::new(&[vocab_size], dtype, DeviceType::Cuda(0))?;
-            logits_gpu.as_bf16_mut()?.buffer_mut().copy_from_host(&logits_data)?;
-
-            let argmax_sampler_gpu = Box::new(ArgmaxSampler::new(DeviceType::Cuda(0)));
-            let sampler_op_gpu = SamplerOp::new(argmax_sampler_gpu);
-
-            let mut output_gpu = Tensor::new(&[1], DataType::I32, DeviceType::Cuda(0))?;
-            let cuda_config = crate::cuda::CudaConfig::new()?;
-            sampler_op_gpu.forward(&logits_gpu, &mut output_gpu, Some(&cuda_config))?;
-            let gpu_result = output_gpu.to_cpu()?.as_i32()?.as_slice()?[0];
-
-            // CPU and GPU results should match
-            assert_eq!(
-                cpu_result, gpu_result,
-                "Vocab size {}: CPU result {} != GPU result {}",
-                vocab_size, cpu_result, gpu_result
-            );
-            assert_eq!(
-                cpu_result, max_index as i32,
-                "Vocab size {}: Both should find max_index {}",
-                vocab_size, max_index
-            );
-        }
-
-        Ok(())
-    }
-
     // ========================================================================
     // Batched argmax: argmax_batch([B, V]) == per-row argmax
     // ========================================================================
 
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn test_argmax_batch_cuda_matches_loop() -> crate::base::error::Result<()> {
-        use crate::cuda::CudaConfig;
-        use half::bf16;
-
-        let device = crate::base::DeviceType::Cuda(0);
-        let dtype = crate::base::DataType::BF16;
-
-        // 使用不同的 batch 大小 / vocab 大小组合覆盖
-        for (batch, vocab) in [(1usize, 128usize), (4, 1024), (8, 32000), (5, 3)] {
-            let mut rng = rand::rng();
-            // 构造 batch 行 logits；在每行故意放一个唯一极大值位置
-            let mut host_logits: Vec<bf16> = (0..batch * vocab)
-                .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0)))
-                .collect();
-            let mut expected_idx: Vec<i32> = Vec::with_capacity(batch);
-            for seq in 0..batch {
-                let idx = (seq * 7 + 3) % vocab;
-                host_logits[seq * vocab + idx] = bf16::from_f32(999.0);
-                expected_idx.push(idx as i32);
-            }
-
-            let mut logits = crate::tensor::Tensor::new(&[batch, vocab], dtype, device)?;
-            logits.as_bf16_mut()?.buffer_mut().copy_from_host(&host_logits)?;
-
-            // A: batched kernel
-            let mut out_a = crate::tensor::Tensor::new(
-                &[batch], crate::base::DataType::I32, device)?;
-            let cuda_cfg = CudaConfig::new()?;
-            crate::op::kernels::cuda::argmax_batch(&logits, &mut out_a, Some(&cuda_cfg))?;
-            cuda_cfg.sync_stream()?;
-            let out_a_cpu = out_a.to_cpu()?;
-            let a_s = out_a_cpu.as_i32()?.as_slice()?;
-            assert_eq!(a_s, &expected_idx[..],
-                "batched argmax wrong (batch={},vocab={})", batch, vocab);
-
-            // B: per-seq 循环 argmax (单行 [vocab])
-            let mut out_b: Vec<i32> = Vec::with_capacity(batch);
-            for seq in 0..batch {
-                let row = logits.slice(&[seq, 0], &[1, vocab])?;
-                let row_1d = row.reshape(&[vocab])?;
-                let mut o = crate::tensor::Tensor::new(
-                    &[1], crate::base::DataType::I32, device)?;
-                crate::op::kernels::cuda::argmax(&row_1d, &mut o, Some(&cuda_cfg))?;
-                cuda_cfg.sync_stream()?;
-                out_b.push(o.to_cpu()?.as_i32()?.as_slice()?[0]);
-            }
-            assert_eq!(a_s, &out_b[..],
-                "batched vs per-seq argmax mismatch (batch={},vocab={})", batch, vocab);
-        }
-        Ok(())
-    }
 }

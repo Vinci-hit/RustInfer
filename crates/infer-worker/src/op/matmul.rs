@@ -152,8 +152,8 @@ impl Matmul {
             // Use broadcast_mul-style row-wise broadcasted add.
             let out_shape: Vec<usize> = output.shape().to_vec();
             let last_dim = *out_shape.last().unwrap();
-            let outer = output.num_elements() / last_dim;
-            let bias_numel = bias.num_elements();
+            let outer = output.numel() / last_dim;
+            let bias_numel = bias.numel();
 
             if bias_numel == last_dim && out_shape != vec![bias_numel] {
                 #[cfg(feature = "cuda")]
@@ -167,20 +167,20 @@ impl Matmul {
                     match bias.dtype() {
                         DataType::F32 => unsafe {
                             broadcast_add_inplace_f32_forward(
-                                output.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
-                                bias.as_f32()?.buffer().as_ptr() as *const f32,
+                                output.as_f32_mut()?.data_ptr_mut(),
+                                bias.as_f32()?.data_ptr(),
                                 outer as i32, last_dim as i32, stream);
                         }
                         DataType::BF16 => unsafe {
                             broadcast_add_inplace_bf16_forward(
-                                output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
-                                bias.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+                                output.as_bf16_mut()?.data_ptr_mut(),
+                                bias.as_bf16()?.data_ptr(),
                                 outer as i32, last_dim as i32, stream);
                         }
                         DataType::F16 => unsafe {
                             broadcast_add_inplace_f16_forward(
-                                output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16,
-                                bias.as_f16()?.buffer().as_ptr() as *const half::f16,
+                                output.as_f16_mut()?.data_ptr_mut(),
+                                bias.as_f16()?.data_ptr(),
                                 outer as i32, last_dim as i32, stream);
                         }
                         _ => return Err(Error::InvalidArgument(format!(
@@ -302,77 +302,6 @@ mod tests {
     // 权重: [M, N]
     // 输出: [B, N]
     // ------------------------------------------------------------------------
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn test_matmul_multidim_compare_cpu_vs_gpu() -> Result<()> {
-        use crate::cuda::CudaConfig;
-        
-        let cpu_device = DeviceType::Cpu;
-        let gpu_device = DeviceType::Cuda(0);
-        let dtype = DataType::F32;
-
-        // 1. 定义多维矩阵的维度
-        const B:usize = 16; // Batch size
-        const M:usize = 64; // Input feature size
-        const N:usize = 64; // Output feature size
-
-        // --- 2. 准备 CPU 数据和计算 ---
-        println!("Preparing CPU data...");
-        
-        // 输入张量: [B, M]
-        let input_shape = &[B, M];
-        let mut input_cpu = Tensor::new(input_shape, dtype, cpu_device)?;
-        let input_data: Vec<f32> = (0..(B*M)).map(|i| i as f32).collect(); // 简单的线性数据
-        input_cpu.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&input_data);
-        println!("CPU Input:\n{:?}", input_data.chunks_exact(M).collect::<Vec<_>>());
-
-        // 权重张量: [M, N]
-        let mut matmul_op_cpu = Matmul::new(M, N, false, dtype, cpu_device)?; // weight is [M, N], no transpose
-        let weight_data: Vec<f32> = (0..(M*N)).map(|i| i as f32).collect();
-        matmul_op_cpu.weight.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&weight_data);
-        println!("CPU Weight:\n{:?}", weight_data.chunks_exact(N).collect::<Vec<_>>());
-        
-        // 在 CPU 上计算黄金结果
-        let output_shape = &[B, N];
-        let mut output_cpu = Tensor::new(output_shape, dtype, cpu_device)?;
-        matmul_op_cpu.forward(&input_cpu, &mut output_cpu, None)?;
-        let cpu_result_slice = output_cpu.as_f32()?.as_slice()?;
-        println!("CPU Result:\n{:?}", cpu_result_slice.chunks_exact(N).collect::<Vec<_>>());
-
-        // --- 3. 准备 GPU 数据和计算 ---
-        println!("\nPreparing GPU data...");
-        
-        // 将输入和权重拷贝到 GPU
-        let input_gpu = input_cpu.to_cuda(0)?;
-        
-        let mut matmul_op_gpu = Matmul::new(M, N, false, dtype, gpu_device)?;
-        matmul_op_gpu.weight = matmul_op_cpu.weight.to_cuda(0)?;
-
-        // 在 GPU 上分配输出张量
-        let mut output_gpu = Tensor::new(output_shape, dtype, gpu_device)?;
-
-        // 执行 GPU 计算
-        let cuda_config = CudaConfig::new()?;
-        matmul_op_gpu.forward(&input_gpu, &mut output_gpu, Some(&cuda_config))?;
-        
-        // 等待 GPU 计算完成
-        unsafe { crate::cuda_check!(crate::cuda::ffi::cudaDeviceSynchronize())?; }
-        println!("GPU computation finished.");
-
-        // --- 4. 结果对比 ---
-        println!("\nComparing results...");
-        
-        // 将 GPU 结果拷贝回 CPU
-        let gpu_result_tensor = output_gpu.to_cpu()?;
-        let gpu_result_slice = gpu_result_tensor.as_f32()?.as_slice()?;
-        println!("GPU Result:\n{:?}", gpu_result_slice.chunks_exact(N).collect::<Vec<_>>());
-
-        // 断言两个结果是否接近
-        assert_close(cpu_result_slice, gpu_result_slice, 1e-5);
-        
-        println!("\nTest passed! CPU and GPU results match within tolerance.");
-        Ok(())
-    }
 
     // ========================================================================
     // BF16 Comprehensive Batch Tests

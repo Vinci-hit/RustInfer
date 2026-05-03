@@ -137,14 +137,14 @@ pub fn scatter(
             let dst_typed: &mut TypedTensor<half::bf16> = dst.as_bf16_mut()?;
             let src_typed = src.as_bf16()?;
 
-            let dst_ptr = dst_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let src_ptr = src_typed.buffer().as_ptr() as *const half::bf16;
+            let dst_ptr = dst_typed.data_ptr_mut();
+            let src_ptr = src_typed.data_ptr();
 
             unsafe {
                 scatter_kernel_bf16(
                     dst_ptr,
                     src_ptr,
-                    pos.as_i32()?.buffer().as_ptr() as *const i32,
+                    pos.as_i32()?.data_ptr(),
                     kvdim as i32,
                     max_seq_len as i32,
                     stream,
@@ -155,14 +155,14 @@ pub fn scatter(
             let dst_typed: &mut TypedTensor<half::f16> = dst.as_f16_mut()?;
             let src_typed = src.as_f16()?;
 
-            let dst_ptr = dst_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let src_ptr = src_typed.buffer().as_ptr() as *const half::f16;
+            let dst_ptr = dst_typed.data_ptr_mut();
+            let src_ptr = src_typed.data_ptr();
 
             unsafe {
                 scatter_kernel_fp16(
                     dst_ptr,
                     src_ptr,
-                    pos.as_i32()?.buffer().as_ptr() as *const i32,
+                    pos.as_i32()?.data_ptr(),
                     kvdim as i32,
                     max_seq_len as i32,
                     stream,
@@ -173,14 +173,14 @@ pub fn scatter(
             let dst_typed: &mut TypedTensor<f32> = dst.as_f32_mut()?;
             let src_typed = src.as_f32()?;
 
-            let dst_ptr = dst_typed.buffer_mut().as_mut_ptr() as *mut f32;
-            let src_ptr = src_typed.buffer().as_ptr() as *const f32;
+            let dst_ptr = dst_typed.data_ptr_mut();
+            let src_ptr = src_typed.data_ptr();
 
             unsafe {
                 scatter_kernel_f32(
                     dst_ptr,
                     src_ptr,
-                    pos.as_i32()?.buffer().as_ptr() as *const i32,
+                    pos.as_i32()?.data_ptr(),
                     kvdim as i32,
                     max_seq_len as i32,
                     stream,
@@ -215,14 +215,14 @@ pub fn scatter_kv(
     let max_seq_len = dst_k.shape()[0];
     let stream = CudaConfig::resolve_stream(cuda_config);
     let dtype = dst_k.dtype();
-    let pos_ptr = pos.as_i32()?.buffer().as_ptr() as *const i32;
+    let pos_ptr = pos.as_i32()?.data_ptr();
 
     match dtype {
         crate::base::DataType::BF16 => {
-            let dst_k_ptr = dst_k.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let src_k_ptr = src_k.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let dst_v_ptr = dst_v.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let src_v_ptr = src_v.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let dst_k_ptr = dst_k.as_bf16_mut()?.data_ptr_mut();
+            let src_k_ptr = src_k.as_bf16()?.data_ptr();
+            let dst_v_ptr = dst_v.as_bf16_mut()?.data_ptr_mut();
+            let src_v_ptr = src_v.as_bf16()?.data_ptr();
             unsafe {
                 scatter_kv_kernel_bf16(
                     dst_k_ptr, src_k_ptr, dst_v_ptr, src_v_ptr,
@@ -231,10 +231,10 @@ pub fn scatter_kv(
             }
         }
         crate::base::DataType::F16 => {
-            let dst_k_ptr = dst_k.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let src_k_ptr = src_k.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let dst_v_ptr = dst_v.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let src_v_ptr = src_v.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let dst_k_ptr = dst_k.as_f16_mut()?.data_ptr_mut();
+            let src_k_ptr = src_k.as_f16()?.data_ptr();
+            let dst_v_ptr = dst_v.as_f16_mut()?.data_ptr_mut();
+            let src_v_ptr = src_v.as_f16()?.data_ptr();
             unsafe {
                 scatter_kv_kernel_fp16(
                     dst_k_ptr, src_k_ptr, dst_v_ptr, src_v_ptr,
@@ -279,14 +279,14 @@ pub fn scatter_kv_batch(
     match dtype {
         crate::base::DataType::BF16 => {
             for i in 0..batch_size {
-                k_host.push(k_caches[i].as_bf16_mut()?.buffer_mut().as_mut_ptr() as u64);
-                v_host.push(v_caches[i].as_bf16_mut()?.buffer_mut().as_mut_ptr() as u64);
+                k_host.push(k_caches[i].as_bf16_mut()?.data_ptr_mut() as u64);
+                v_host.push(v_caches[i].as_bf16_mut()?.data_ptr_mut() as u64);
             }
         }
         crate::base::DataType::F16 => {
             for i in 0..batch_size {
-                k_host.push(k_caches[i].as_f16_mut()?.buffer_mut().as_mut_ptr() as u64);
-                v_host.push(v_caches[i].as_f16_mut()?.buffer_mut().as_mut_ptr() as u64);
+                k_host.push(k_caches[i].as_f16_mut()?.data_ptr_mut() as u64);
+                v_host.push(v_caches[i].as_f16_mut()?.data_ptr_mut() as u64);
             }
         }
         _ => {
@@ -321,11 +321,11 @@ pub fn scatter_kv_batch(
     drop(v_host);
 
     // 3. Launch batched kernel (src_{k,v}_row_stride = kvdim, 连续情形)
-    let pos_ptr = positions_dev.as_i32()?.buffer().as_ptr() as *const i32;
+    let pos_ptr = positions_dev.as_i32()?.data_ptr();
     match dtype {
         crate::base::DataType::BF16 => {
-            let src_k_ptr = src_k.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let src_v_ptr = src_v.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let src_k_ptr = src_k.as_bf16()?.data_ptr();
+            let src_v_ptr = src_v.as_bf16()?.data_ptr();
             unsafe {
                 scatter_kv_batch_kernel_bf16(
                     k_ptrs_dev as *mut *mut half::bf16,
@@ -338,8 +338,8 @@ pub fn scatter_kv_batch(
             }
         }
         crate::base::DataType::F16 => {
-            let src_k_ptr = src_k.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let src_v_ptr = src_v.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let src_k_ptr = src_k.as_f16()?.data_ptr();
+            let src_v_ptr = src_v.as_f16()?.data_ptr();
             unsafe {
                 scatter_kv_batch_kernel_fp16(
                     k_ptrs_dev as *mut *mut half::f16,
@@ -380,11 +380,11 @@ pub fn scatter_kv_batch_launch_ready(
 ) -> Result<()> {
     if batch_size == 0 { return Ok(()); }
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let pos_ptr = positions_dev.as_i32()?.buffer().as_ptr() as *const i32;
+    let pos_ptr = positions_dev.as_i32()?.data_ptr();
     match dtype {
         crate::base::DataType::BF16 => {
-            let k_base = src_k.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let v_base = src_v.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let k_base = src_k.as_bf16()?.data_ptr();
+            let v_base = src_v.as_bf16()?.data_ptr();
             let src_k_ptr = unsafe { k_base.add(src_k_col_offset) };
             let src_v_ptr = unsafe { v_base.add(src_v_col_offset) };
             unsafe {
@@ -399,8 +399,8 @@ pub fn scatter_kv_batch_launch_ready(
             }
         }
         crate::base::DataType::F16 => {
-            let k_base = src_k.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let v_base = src_v.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let k_base = src_k.as_f16()?.data_ptr();
+            let v_base = src_v.as_f16()?.data_ptr();
             let src_k_ptr = unsafe { k_base.add(src_k_col_offset) };
             let src_v_ptr = unsafe { v_base.add(src_v_col_offset) };
             unsafe {

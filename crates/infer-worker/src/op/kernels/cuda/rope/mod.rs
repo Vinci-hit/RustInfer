@@ -114,7 +114,7 @@ pub fn rope_strided(
         )).into());
     }
 
-    let pos_ptr = positions.as_i32()?.buffer().as_ptr() as *const i32;
+    let pos_ptr = positions.as_i32()?.data_ptr();
     let dim_i32 = dim as i32;
     let kv_dim_i32 = kv_dim as i32;
     let head_size_i32 = head_size as i32;
@@ -125,12 +125,12 @@ pub fn rope_strided(
 
     match dtype {
         crate::base::DataType::BF16 => {
-            let q_base = q_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let k_base = k_tensor.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let q_base = q_tensor.as_bf16_mut()?.data_ptr_mut();
+            let k_base = k_tensor.as_bf16_mut()?.data_ptr_mut();
             let q_ptr = unsafe { q_base.add(q_col_offset) };
             let k_ptr = unsafe { k_base.add(k_col_offset) };
-            let sin_ptr = sin_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let cos_ptr = cos_cache.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let sin_ptr = sin_cache.as_bf16()?.data_ptr();
+            let cos_ptr = cos_cache.as_bf16()?.data_ptr();
             unsafe {
                 rope_kernel_cu_bf16(
                     dim_i32, kv_dim_i32, head_size_i32,
@@ -141,12 +141,12 @@ pub fn rope_strided(
             }
         }
         crate::base::DataType::F16 => {
-            let q_base = q_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let k_base = k_tensor.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let q_base = q_tensor.as_f16_mut()?.data_ptr_mut();
+            let k_base = k_tensor.as_f16_mut()?.data_ptr_mut();
             let q_ptr = unsafe { q_base.add(q_col_offset) };
             let k_ptr = unsafe { k_base.add(k_col_offset) };
-            let sin_ptr = sin_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let cos_ptr = cos_cache.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let sin_ptr = sin_cache.as_f16()?.data_ptr();
+            let cos_ptr = cos_cache.as_f16()?.data_ptr();
             unsafe {
                 rope_kernel_cu_fp16(
                     dim_i32, kv_dim_i32, head_size_i32,
@@ -164,12 +164,12 @@ pub fn rope_strided(
                     "F32 RoPE kernel 仍采用 'start_pos + seq_idx' 语义，positions 必须长度 1".into()
                 ).into());
             }
-            let q_base = q_tensor.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-            let k_base = k_tensor.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let q_base = q_tensor.as_f32_mut()?.data_ptr_mut();
+            let k_base = k_tensor.as_f32_mut()?.data_ptr_mut();
             let q_ptr = unsafe { q_base.add(q_col_offset) };
             let k_ptr = unsafe { k_base.add(k_col_offset) };
-            let sin_ptr = sin_cache.as_f32()?.buffer().as_ptr() as *const f32;
-            let cos_ptr = cos_cache.as_f32()?.buffer().as_ptr() as *const f32;
+            let sin_ptr = sin_cache.as_f32()?.data_ptr();
+            let cos_ptr = cos_cache.as_f32()?.data_ptr();
             unsafe {
                 rope_kernel_cu(
                     dim_i32, kv_dim_i32, head_size_i32,
@@ -247,15 +247,15 @@ pub fn sin_cos_cache_calc_cuda(
 
     match dtype {
         crate::base::DataType::F32 => {
-            let sin_ptr = sin_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-            let cos_ptr = cos_cache.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let sin_ptr = sin_cache.as_f32_mut()?.data_ptr_mut();
+            let cos_ptr = cos_cache.as_f32_mut()?.data_ptr_mut();
             unsafe {
                 sin_cos_cache_calc_cu(head_size_i32, max_seq_len_i32, rope_theta, sin_ptr, cos_ptr, stream);
             }
         }
         crate::base::DataType::BF16 => {
-            let sin_ptr = sin_cache.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let cos_ptr = cos_cache.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let sin_ptr = sin_cache.as_bf16_mut()?.data_ptr_mut();
+            let cos_ptr = cos_cache.as_bf16_mut()?.data_ptr_mut();
             unsafe {
                 sin_cos_cache_calc_cu_bf16(
                     head_size_i32, max_seq_len_i32, rope_theta, sin_ptr, cos_ptr,
@@ -264,8 +264,8 @@ pub fn sin_cos_cache_calc_cuda(
             }
         }
         crate::base::DataType::F16 => {
-            let sin_ptr = sin_cache.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let cos_ptr = cos_cache.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let sin_ptr = sin_cache.as_f16_mut()?.data_ptr_mut();
+            let cos_ptr = cos_cache.as_f16_mut()?.data_ptr_mut();
             unsafe {
                 sin_cos_cache_calc_cu_fp16(
                     head_size_i32, max_seq_len_i32, rope_theta, sin_ptr, cos_ptr,

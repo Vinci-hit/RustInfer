@@ -85,9 +85,9 @@ pub fn conv2d_cudnn(
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
 
-    let in_ptr = input.buffer().as_ptr() as *const c_void;
-    let w_ptr = weight.buffer().as_ptr() as *const c_void;
-    let out_ptr = output.buffer_mut().as_mut_ptr() as *mut c_void;
+    let in_ptr = input.data_ptr() as *const c_void;
+    let w_ptr = weight.data_ptr() as *const c_void;
+    let out_ptr = output.data_ptr_mut() as *mut c_void;
 
     unsafe {
         cudnn_check!(ffi::cudnnConvolutionForward(
@@ -103,7 +103,7 @@ pub fn conv2d_cudnn(
 
         if let (Some(bias_t), Some(bd)) = (bias, bias_desc) {
             let alpha_bias: f32 = 1.0;
-            let bias_ptr = bias_t.buffer().as_ptr() as *const c_void;
+            let bias_ptr = bias_t.data_ptr() as *const c_void;
             cudnn_check!(ffi::cudnnAddTensor(
                 handle,
                 &alpha_bias as *const f32 as *const c_void,

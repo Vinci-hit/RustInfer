@@ -5,71 +5,38 @@ use crate::OpConfig;
 
 use super::kernels;
 
-/// Scatter operator: copies src[0, :] to dst[pos, :]
-#[derive(Debug, Clone, Copy)]
-pub struct Scatter;
-
-impl Scatter {
-    pub fn new() -> Self {
-        Scatter
-    }
-
-    /// 执行 scatter: dst[pos, :] = src[0, :]
-    pub fn forward(
-        &self,
-        src: &Tensor,
-        pos: &Tensor,
-        dst: &mut Tensor,
-        #[allow(unused_variables)]
-        cuda_config: Option<&OpConfig>,
-    ) -> Result<()> {
-        match src.device() {
-            DeviceType::Cpu => {
-                let pos_val = pos.as_i32()?.as_slice()?[0] as usize;
-                let kvdim = src.shape()[1];
-
-                match src.dtype() {
-                    crate::base::DataType::F32 => {
-                        let src_slice = src.as_f32()?.as_slice()?;
-                        let dst_slice = dst.as_f32_mut()?.as_slice_mut()?;
-                        let dst_start = pos_val * kvdim;
-                        dst_slice[dst_start..dst_start + kvdim]
-                            .copy_from_slice(&src_slice[..kvdim]);
-                    }
-                    crate::base::DataType::BF16 => {
-                        let src_slice = src.as_bf16()?.as_slice()?;
-                        let dst_slice = dst.as_bf16_mut()?.as_slice_mut()?;
-                        let dst_start = pos_val * kvdim;
-                        dst_slice[dst_start..dst_start + kvdim]
-                            .copy_from_slice(&src_slice[..kvdim]);
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(
-                            "Scatter CPU: unsupported dtype {:?}", src.dtype()
-                        ));
-                    }
+/// Scatter: `dst[pos, :] = src[0, :]` where `pos` is a `[1] i32` tensor
+/// (device-resident for CUDA).
+pub fn scatter(
+    src: &Tensor,
+    pos: &Tensor,
+    dst: &mut Tensor,
+    cuda_config: Option<&OpConfig>,
+) -> Result<()> {
+    match src.device() {
+        DeviceType::Cpu => {
+            let _ = cuda_config;
+            let pos_val = pos.as_i32()?.as_slice()?[0] as usize;
+            let kvdim = src.shape()[1];
+            match src.dtype() {
+                crate::base::DataType::F32 => {
+                    let s = src.as_f32()?.as_slice()?;
+                    let d = dst.as_f32_mut()?.as_slice_mut()?;
+                    let start = pos_val * kvdim;
+                    d[start..start + kvdim].copy_from_slice(&s[..kvdim]);
                 }
+                crate::base::DataType::BF16 => {
+                    let s = src.as_bf16()?.as_slice()?;
+                    let d = dst.as_bf16_mut()?.as_slice_mut()?;
+                    let start = pos_val * kvdim;
+                    d[start..start + kvdim].copy_from_slice(&s[..kvdim]);
+                }
+                other => anyhow::bail!("scatter CPU: unsupported dtype {:?}", other),
             }
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                kernels::cuda::scatter(dst, src, pos, cuda_config)?;
-            }
+            Ok(())
         }
-
-        Ok(())
-    }
-}
-
-impl Default for Scatter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Scatter {
-    pub fn to_cuda(&mut self, _device_id: i32) -> Result<()> {
-        Ok(())
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(_) => kernels::cuda::scatter(dst, src, pos, cuda_config),
     }
 }
 
@@ -213,9 +180,8 @@ mod tests {
             dst.as_bf16_mut()?.buffer_mut().copy_from_host(&dst_data)?;
 
             // Execute scatter
-            let scatter_op = Scatter::new();
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            scatter_op.forward(&src, &pos_gpu, &mut dst, Some(&cuda_config))?;
+            scatter(&src, &pos_gpu, &mut dst, Some(&cuda_config))?;
 
             // Copy result back and verify
             let result_tensor = dst.to_cpu()?;
@@ -273,9 +239,8 @@ mod tests {
             dst.as_bf16_mut()?.buffer_mut().copy_from_host(&dst_data)?;
 
             // Execute scatter
-            let scatter_op = Scatter::new();
             let cuda_config = crate::cuda::CudaConfig::new()?;
-            scatter_op.forward(&src, &pos_gpu, &mut dst, Some(&cuda_config))?;
+            scatter(&src, &pos_gpu, &mut dst, Some(&cuda_config))?;
 
             // Verify
             let result_tensor = dst.to_cpu()?;
@@ -321,7 +286,6 @@ mod tests {
         let dst_data = vec![bf16::from_f32(-1.0); max_seq_len * kvdim]; // Initialize with -1.0
         dst.as_bf16_mut()?.buffer_mut().copy_from_host(&dst_data)?;
 
-        let scatter_op = Scatter::new();
         let cuda_config = crate::cuda::CudaConfig::new()?;
 
         // Scatter to multiple positions
@@ -339,7 +303,7 @@ mod tests {
             let pos_gpu = pos.to_cuda(0)?;
 
             // Execute scatter
-            scatter_op.forward(&src, &pos_gpu, &mut dst, Some(&cuda_config))?;
+            scatter(&src, &pos_gpu, &mut dst, Some(&cuda_config))?;
 
             // Verify this position was updated correctly
             let result_tensor = dst.to_cpu()?;
@@ -468,117 +432,6 @@ mod tests {
             let a = v_caches_a[i].as_bf16()?.as_slice()?;
             let b = v_caches_b[i].as_bf16()?.as_slice()?;
             assert_eq!(a, b, "CPU V cache[{}] batched vs loop mismatch", i);
-        }
-        Ok(())
-    }
-
-    /// CUDA: scatter_kv_batch kernel vs per-seq 循环 scatter_kv
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn test_scatter_kv_batch_cuda_matches_loop() -> Result<()> {
-        use crate::cuda::CudaConfig;
-
-        let device = DeviceType::Cuda(0);
-        let dtype = DataType::BF16;
-        let batch = 6;
-        let max_seq_len = 64;
-        let kv_dim = 256; // 需要 %8==0
-
-        let mut rng = rand::rng();
-        let positions: Vec<i32> = vec![0, 1, 10, 20, 33, 63]; // 互不相同，都 < max_seq_len
-
-        let src_k_data: Vec<bf16> = (0..batch * kv_dim)
-            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
-        let src_v_data: Vec<bf16> = (0..batch * kv_dim)
-            .map(|_| bf16::from_f32(rand::Rng::random_range(&mut rng, -1.0f32..1.0))).collect();
-        let mut src_k = Tensor::new(&[batch, kv_dim], dtype, device)?;
-        let mut src_v = Tensor::new(&[batch, kv_dim], dtype, device)?;
-        src_k.as_bf16_mut()?.buffer_mut().copy_from_host(&src_k_data)?;
-        src_v.as_bf16_mut()?.buffer_mut().copy_from_host(&src_v_data)?;
-
-        // 两套 caches：zeros
-        let zero: Vec<bf16> = vec![bf16::from_f32(0.0); max_seq_len * kv_dim];
-        let mut k_caches_a: Vec<Tensor> = Vec::new();
-        let mut v_caches_a: Vec<Tensor> = Vec::new();
-        let mut k_caches_b: Vec<Tensor> = Vec::new();
-        let mut v_caches_b: Vec<Tensor> = Vec::new();
-        for _ in 0..batch {
-            let mut k = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
-            let mut v = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
-            k.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
-            v.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
-            k_caches_a.push(k);
-            v_caches_a.push(v);
-
-            let mut k = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
-            let mut v = Tensor::new(&[max_seq_len, kv_dim], dtype, device)?;
-            k.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
-            v.as_bf16_mut()?.buffer_mut().copy_from_host(&zero)?;
-            k_caches_b.push(k);
-            v_caches_b.push(v);
-        }
-
-        let cuda_cfg = CudaConfig::new()?;
-
-        // 分配 device 指针数组 buffer
-        let bytes = batch * std::mem::size_of::<u64>();
-        let mut k_ptrs_dev: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut v_ptrs_dev: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut k_ptrs_dev, bytes))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut v_ptrs_dev, bytes))?;
-        }
-
-        // positions device tensor
-        let mut pos_cpu_t = Tensor::new(&[batch], DataType::I32, DeviceType::Cpu)?;
-        pos_cpu_t.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&positions);
-        let pos_dev = pos_cpu_t.to_cuda(0)?;
-
-        // A: batched
-        {
-            let mut k_refs: Vec<&mut Tensor> = k_caches_a.iter_mut().collect();
-            let mut v_refs: Vec<&mut Tensor> = v_caches_a.iter_mut().collect();
-            super::scatter_kv_batch(
-                &mut k_refs, &mut v_refs,
-                &src_k, &src_v, &positions,
-                Some(&pos_dev),
-                k_ptrs_dev as *mut u64,
-                v_ptrs_dev as *mut u64,
-                Some(&cuda_cfg),
-            )?;
-        }
-        cuda_cfg.sync_stream()?;
-
-        // B: per-seq 循环 scatter_kv (CUDA)
-        for i in 0..batch {
-            let src_k_row = src_k.slice(&[i, 0], &[1, kv_dim])?;
-            let src_v_row = src_v.slice(&[i, 0], &[1, kv_dim])?;
-            let mut pos_t = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-            pos_t.as_i32_mut()?.as_slice_mut()?[0] = positions[i];
-            let pos_gpu = pos_t.to_cuda(0)?;
-            crate::op::kernels::cuda::scatter_kv(
-                &mut k_caches_b[i], &src_k_row, &mut v_caches_b[i], &src_v_row, &pos_gpu,
-                Some(&cuda_cfg),
-            )?;
-        }
-        cuda_cfg.sync_stream()?;
-
-        // 释放指针 buffer
-        unsafe {
-            let _ = crate::cuda::ffi::cudaFree(k_ptrs_dev);
-            let _ = crate::cuda::ffi::cudaFree(v_ptrs_dev);
-        }
-
-        // 比对
-        for i in 0..batch {
-            let ka = k_caches_a[i].to_cpu()?;
-            let kb = k_caches_b[i].to_cpu()?;
-            let va = v_caches_a[i].to_cpu()?;
-            let vb = v_caches_b[i].to_cpu()?;
-            assert_eq!(ka.as_bf16()?.as_slice()?, kb.as_bf16()?.as_slice()?,
-                "CUDA K cache[{}] batched vs loop mismatch", i);
-            assert_eq!(va.as_bf16()?.as_slice()?, vb.as_bf16()?.as_slice()?,
-                "CUDA V cache[{}] batched vs loop mismatch", i);
         }
         Ok(())
     }

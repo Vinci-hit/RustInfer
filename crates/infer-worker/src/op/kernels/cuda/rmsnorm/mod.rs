@@ -37,7 +37,7 @@ unsafe extern "C" {
 /// RMSNorm 的 CUDA 内核包装函数
 pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, cuda_config:Option<&CudaConfig>) -> Result<()> {
     let dim = weight.shape()[0];
-    let rows = input.num_elements() / dim;
+    let rows = input.numel() / dim;
     
     // 获取 CUDA stream
     let stream = CudaConfig::resolve_stream(cuda_config);
@@ -54,9 +54,9 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, c
                 return Err(Error::InvalidArgument("RMSNorm f32 kernel requires dimension to be multiple of 16".to_string()).into());
             }
             
-            let input_ptr = input_typed.buffer().as_ptr() as *const f32;
-            let weight_ptr = weight_typed.buffer().as_ptr() as *const f32;
-            let output_ptr = output_typed.buffer_mut().as_mut_ptr() as *mut f32;
+            let input_ptr = input_typed.data_ptr();
+            let weight_ptr = weight_typed.data_ptr();
+            let output_ptr = output_typed.data_ptr_mut();
             
             unsafe {
                 rmsnorm_kernel_cu_dim(
@@ -79,9 +79,9 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, c
                 return Err(Error::InvalidArgument("RMSNorm bf16 kernel requires dimension to be multiple of 16".to_string()).into());
             }
             
-            let input_ptr = input_typed.buffer().as_ptr() as *const half::bf16;
-            let weight_ptr = weight_typed.buffer().as_ptr() as *const half::bf16;
-            let output_ptr = output_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let input_ptr = input_typed.data_ptr();
+            let weight_ptr = weight_typed.data_ptr();
+            let output_ptr = output_typed.data_ptr_mut();
             
             unsafe {
                 rmsnorm_kernel_cu_bf16x8(
@@ -104,9 +104,9 @@ pub fn rmsnorm(input: &Tensor, weight: &Tensor, output: &mut Tensor, eps: f32, c
                 return Err(Error::InvalidArgument("RMSNorm fp16 kernel requires dimension to be multiple of 16".to_string()).into());
             }
             
-            let input_ptr = input_typed.buffer().as_ptr() as *const half::f16;
-            let weight_ptr = weight_typed.buffer().as_ptr() as *const half::f16;
-            let output_ptr = output_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let input_ptr = input_typed.data_ptr();
+            let weight_ptr = weight_typed.data_ptr();
+            let output_ptr = output_typed.data_ptr_mut();
             
             unsafe {
                 rmsnorm_kernel_cu_fp16x8(
@@ -147,7 +147,7 @@ pub fn rmsnorm_inplace(
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     let dim = weight.shape()[0];
-    let rows = x.num_elements() / dim;
+    let rows = x.numel() / dim;
 
     if !dim.is_multiple_of(16) {
         return Err(Error::InvalidArgument(
@@ -161,8 +161,8 @@ pub fn rmsnorm_inplace(
         crate::base::DataType::F32 => {
             let x_typed: &mut TypedTensor<f32> = x.as_f32_mut()?;
             let w_typed = weight.as_f32()?;
-            let ptr = x_typed.buffer_mut().as_mut_ptr() as *mut f32;
-            let w_ptr = w_typed.buffer().as_ptr() as *const f32;
+            let ptr = x_typed.data_ptr_mut();
+            let w_ptr = w_typed.data_ptr();
             unsafe {
                 rmsnorm_kernel_cu_dim(ptr, ptr as *const f32, w_ptr, rows as i32, dim as i32, eps, stream);
             }
@@ -170,8 +170,8 @@ pub fn rmsnorm_inplace(
         crate::base::DataType::BF16 => {
             let x_typed: &mut TypedTensor<half::bf16> = x.as_bf16_mut()?;
             let w_typed = weight.as_bf16()?;
-            let ptr = x_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let w_ptr = w_typed.buffer().as_ptr() as *const half::bf16;
+            let ptr = x_typed.data_ptr_mut();
+            let w_ptr = w_typed.data_ptr();
             unsafe {
                 rmsnorm_kernel_cu_bf16x8(ptr, ptr as *const half::bf16, w_ptr, rows as i32, dim as i32, eps, stream);
             }
@@ -179,8 +179,8 @@ pub fn rmsnorm_inplace(
         crate::base::DataType::F16 => {
             let x_typed: &mut TypedTensor<half::f16> = x.as_f16_mut()?;
             let w_typed = weight.as_f16()?;
-            let ptr = x_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let w_ptr = w_typed.buffer().as_ptr() as *const half::f16;
+            let ptr = x_typed.data_ptr_mut();
+            let w_ptr = w_typed.data_ptr();
             unsafe {
                 rmsnorm_kernel_cu_fp16x8(ptr, ptr as *const half::f16, w_ptr, rows as i32, dim as i32, eps, stream);
             }

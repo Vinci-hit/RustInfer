@@ -1,8 +1,15 @@
 pub mod base;
 pub mod op;
 pub mod tensor;
+
+// Higher-level model and worker code is currently paused while we rebuild
+// the tensor/stride foundation. Gate it behind `models` so the base
+// infrastructure (tensor + kernels + cuda) can build and test alone.
+#[cfg(feature = "models")]
 pub mod model;
+#[cfg(feature = "models")]
 pub mod worker;
+#[cfg(feature = "models")]
 pub use model::runtime;
 
 #[cfg(feature = "cuda")]

@@ -1,6 +1,4 @@
-use std::io::{self, Write};
 use std::path::Path;
-use std::time::Instant;
 
 use crate::base::{DataType, DeviceType};
 use crate::base::error::{Error, Result};
@@ -20,6 +18,7 @@ use crate::op::swiglu::SwiGLU;
 use crate::model::runtime::InferenceState;
 use crate::tensor::Tensor;
 use crate::model::common::config::RuntimeModelConfig;
+use crate::model::common::{GateUpDims, QkvDims};
 use crate::model::ModelLoader;
 use crate::model::common::tokenizer::Tokenizer;
 
@@ -112,31 +111,34 @@ impl Qwen3 {
             q.quant_method == "compressed-tensors");
         let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
 
+        let qkv_dims = QkvDims { q_dim: config.q_dim, kv_dim: config.kv_dim, dim: config.dim };
+        let gate_up_dims = GateUpDims { intermediate_size: config.intermediate_size, dim: config.dim };
+
         for i in 0..layer_num {
-            wqkv_layers.push(Self::load_fused_qkv(i, &loader, device_type, config.q_dim, config.kv_dim, config.dim)?);
-            wo_layers.push(Matmul::from(Self::load_weight(&format!("model.layers.{}.self_attn.o_proj.weight", i), &loader, device_type)?, None));
+            wqkv_layers.push(loader.load_fused_qkv(i, qkv_dims, device_type)?);
+            wo_layers.push(loader.load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), device_type)?);
 
             if is_awq {
-                w_gate_up_layers.push(Self::load_fused_gate_up_awq(i, &loader, device_type, config.intermediate_size, group_size)?);
-                w2_layers.push(Self::load_awq_matmul(&format!("model.layers.{}.mlp.down_proj", i), &loader, device_type, group_size)?);
+                w_gate_up_layers.push(loader.load_fused_gate_up_awq(i, config.intermediate_size, device_type, group_size)?);
+                w2_layers.push(loader.load_awq_matmul(&format!("model.layers.{}.mlp.down_proj", i), device_type, group_size)?);
             } else {
-                w_gate_up_layers.push(Self::load_fused_gate_up(i, &loader, device_type, config.intermediate_size, config.dim)?);
-                w2_layers.push(Matmul::from(Self::load_weight(&format!("model.layers.{}.mlp.down_proj.weight", i), &loader, device_type)?, None));
+                w_gate_up_layers.push(loader.load_fused_gate_up(i, gate_up_dims, device_type)?);
+                w2_layers.push(loader.load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), device_type)?);
             }
-            rmsnorm_attn_layers.push(RMSNorm::from(Self::load_weight(&format!("model.layers.{}.input_layernorm.weight", i), &loader, device_type)?, config.rms_norm_eps));
-            rmsnorm_ffn_layers.push(RMSNorm::from(Self::load_weight(&format!("model.layers.{}.post_attention_layernorm.weight", i), &loader, device_type)?, config.rms_norm_eps));
+            rmsnorm_attn_layers.push(loader.load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), device_type, config.rms_norm_eps)?);
+            rmsnorm_ffn_layers.push(loader.load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), device_type, config.rms_norm_eps)?);
             if has_qnorm {
-                qnorm_layers_opt.push(RMSNorm::from(Self::load_weight(&format!("model.layers.{}.self_attn.q_norm.weight", i), &loader, device_type)?, config.rms_norm_eps));
+                qnorm_layers_opt.push(loader.load_rmsnorm(&format!("model.layers.{}.self_attn.q_norm.weight", i), device_type, config.rms_norm_eps)?);
             }
             if has_knorm {
-                knorm_layers_opt.push(RMSNorm::from(Self::load_weight(&format!("model.layers.{}.self_attn.k_norm.weight", i), &loader, device_type)?, config.rms_norm_eps));
+                knorm_layers_opt.push(loader.load_rmsnorm(&format!("model.layers.{}.self_attn.k_norm.weight", i), device_type, config.rms_norm_eps)?);
             }
         }
 
-        let embedding_layer = Embedding::from(Self::load_weight("model.embed_tokens.weight", &loader, device_type)?);
-        let rmsnorm_final_layer = RMSNorm::from(Self::load_weight("model.norm.weight", &loader, device_type)?, config.rms_norm_eps);
+        let embedding_layer = loader.load_embedding("model.embed_tokens.weight", device_type)?;
+        let rmsnorm_final_layer = loader.load_rmsnorm("model.norm.weight", device_type, config.rms_norm_eps)?;
         let cls_layer = if tensor_names.contains("lm_head.weight") {
-            Matmul::from(Self::load_weight("lm_head.weight", &loader, device_type)?, None)
+            loader.load_matmul("lm_head.weight", device_type)?
         } else {
             Matmul::from(embedding_layer.weight.clone(), None)
         };
@@ -210,261 +212,7 @@ impl Qwen3 {
         Ok(state)
     }
 
-    // ---- Weight loading helpers ----
-
-    /// Load a raw tensor, optionally casting to F32 on CPU, and move to `device`.
-    fn load_weight(name: &str, loader: &ModelLoader, device: DeviceType) -> Result<Tensor> {
-        let weight = Tensor::from_view_on_cpu(&loader.get_tensor(name)?)?;
-        let weight = if device.is_cpu() && weight.dtype() != DataType::F32 {
-            weight.to_dtype(DataType::F32)?
-        } else {
-            weight
-        };
-        weight.to_device(device)
-    }
-
-    fn load_fused_qkv(
-        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
-        q_dim: usize, kv_dim: usize, dim: usize,
-    ) -> Result<Matmul> {
-        let wq = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))?)?;
-        let wk = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx))?)?;
-        let wv = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx))?)?;
-
-        let dtype = wq.dtype();
-        let fused_rows = q_dim + 2 * kv_dim;
-        let mut fused = Tensor::new(&[fused_rows, dim], dtype, DeviceType::Cpu)?;
-        let elem_size = dtype.size_in_bytes();
-        let (wq_bytes, wk_bytes, wv_bytes) = (q_dim * dim * elem_size, kv_dim * dim * elem_size, kv_dim * dim * elem_size);
-        let fused_ptr = fused.buffer_mut().as_mut_ptr();
-        unsafe {
-            std::ptr::copy_nonoverlapping(wq.buffer().as_ptr(), fused_ptr, wq_bytes);
-            std::ptr::copy_nonoverlapping(wk.buffer().as_ptr(), fused_ptr.add(wq_bytes), wk_bytes);
-            std::ptr::copy_nonoverlapping(wv.buffer().as_ptr(), fused_ptr.add(wq_bytes + wk_bytes), wv_bytes);
-        }
-        let fused = if device.is_cpu() && dtype != DataType::F32 { fused.to_dtype(DataType::F32)? } else { fused };
-        Ok(Matmul::from(fused.to_device(device)?, None))
-    }
-
-    fn load_fused_gate_up(
-        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
-        intermediate_size: usize, dim: usize,
-    ) -> Result<Matmul> {
-        let w1 = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))?)?;
-        let w3 = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))?)?;
-
-        let dtype = w1.dtype();
-        let fused_rows = 2 * intermediate_size;
-        let mut fused = Tensor::new(&[fused_rows, dim], dtype, DeviceType::Cpu)?;
-        let elem_size = dtype.size_in_bytes();
-        let (w1_bytes, w3_bytes) = (intermediate_size * dim * elem_size, intermediate_size * dim * elem_size);
-        let fused_ptr = fused.buffer_mut().as_mut_ptr();
-        unsafe {
-            std::ptr::copy_nonoverlapping(w1.buffer().as_ptr(), fused_ptr, w1_bytes);
-            std::ptr::copy_nonoverlapping(w3.buffer().as_ptr(), fused_ptr.add(w1_bytes), w3_bytes);
-        }
-        let fused = if device.is_cpu() && dtype != DataType::F32 { fused.to_dtype(DataType::F32)? } else { fused };
-        Ok(Matmul::from(fused.to_device(device)?, None))
-    }
-
-    // ---- AWQ weight loading helpers (K-packed format) ----
-
-    /// 辅助: 将多个 [rows_i, cols] 的张量纵向拼接为 [sum(rows_i), cols]
-    fn fuse_tensors_vertically(tensors: &[&Tensor], row_counts: &[usize], cols: usize, dtype: DataType) -> Result<Tensor> {
-        let total_rows: usize = row_counts.iter().sum();
-        let elem_size = dtype.size_in_bytes();
-        let mut fused = Tensor::new(&[total_rows, cols], dtype, DeviceType::Cpu)?;
-        let fused_ptr = fused.buffer_mut().as_mut_ptr();
-        let mut offset = 0usize;
-        for (tensor, &rows) in tensors.iter().zip(row_counts) {
-            let bytes = rows * cols * elem_size;
-            unsafe {
-                std::ptr::copy_nonoverlapping(tensor.buffer().as_ptr(), fused_ptr.add(offset), bytes);
-            }
-            offset += bytes;
-        }
-        Ok(fused)
-    }
-
-    fn load_awq_matmul(name_prefix: &str, loader: &ModelLoader, device: DeviceType, group_size: usize) -> Result<Matmul> {
-        let weight_packed = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_packed", name_prefix))?)?;
-        let weight_zero_point = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_zero_point", name_prefix))?)?;
-        let weight_scale = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("{}.weight_scale", name_prefix))?)?;
-
-        Ok(Matmul::from_awq(
-            weight_packed.to_device(device)?,
-            weight_zero_point.to_device(device)?,
-            weight_scale.to_device(device)?,
-            group_size,
-            None,
-        ))
-    }
-
-    fn load_fused_gate_up_awq(
-        layer_idx: usize, loader: &ModelLoader, device: DeviceType,
-        intermediate_size: usize, group_size: usize,
-    ) -> Result<Matmul> {
-        let gate_wp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_packed", layer_idx))?)?;
-        let up_wp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_packed", layer_idx))?)?;
-
-        let gate_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_scale", layer_idx))?)?;
-        let up_sc = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_scale", layer_idx))?)?;
-
-        let gate_zp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.gate_proj.weight_zero_point", layer_idx))?)?;
-        let up_zp = Tensor::from_view_on_cpu(&loader.get_tensor(&format!("model.layers.{}.mlp.up_proj.weight_zero_point", layer_idx))?)?;
-
-        let k_packed = gate_wp.shape()[1];
-        let num_groups = gate_sc.shape()[1];
-
-        let fused_wp = Self::fuse_tensors_vertically(
-            &[&gate_wp, &up_wp],
-            &[intermediate_size, intermediate_size],
-            k_packed, DataType::I32,
-        )?;
-
-        let sc_dtype = gate_sc.dtype();
-        let fused_sc = Self::fuse_tensors_vertically(
-            &[&gate_sc, &up_sc],
-            &[intermediate_size, intermediate_size],
-            num_groups, sc_dtype,
-        )?;
-
-        let gate_n_packed = intermediate_size / 8;
-        let up_n_packed = intermediate_size / 8;
-        let fused_zp = Self::fuse_tensors_vertically(
-            &[&gate_zp, &up_zp],
-            &[gate_n_packed, up_n_packed],
-            num_groups, DataType::I32,
-        )?;
-
-        Ok(Matmul::from_awq(
-            fused_wp.to_device(device)?,
-            fused_zp.to_device(device)?,
-            fused_sc.to_device(device)?,
-            group_size,
-            None,
-        ))
-    }
-
     // ---- Inference methods (&self + &mut InferenceState) ----
-
-    pub fn generate(
-        &self,
-        state: &mut InferenceState,
-        prompt: &str,
-        max_tokens: usize,
-        print_output: bool,
-    ) -> Result<(String, u32, u64, u64, usize)> {
-        let mut stdout = io::stdout();
-        if print_output {
-            println!("----------------------------------------");
-            println!("Prompt: {}", prompt);
-            stdout.flush()?;
-        }
-
-        let prompt_tokens = self.tokenizer.encode(prompt)?;
-        if prompt_tokens.is_empty() {
-            return Err(Error::InvalidArgument("Prompt cannot be empty.".to_string()).into());
-        }
-
-        // Qwen3 当前 worker forward 内部仍使用 per-state workspace；这里的 BatchWorkspace
-        // 仅用于满足统一 trait 接口，不能按 prompt_len 额外分配大块 GPU workspace。
-        let mut workspace = crate::worker::BatchWorkspace::new(
-            &self.config,
-            1,
-            1,
-            self.device_type,
-        )?;
-
-        let mut gen_output = Tensor::new(&[1], DataType::I32, self.device_type)?;
-
-        // Prefill
-        let prefill_start = Instant::now();
-        let prefill_positions: Vec<i32> = (0..prompt_tokens.len()).map(|i| i as i32).collect();
-        let prefill_q_start = [0, prompt_tokens.len() as i32];
-        let slot_indices = [0];
-        let prefill_meta = crate::worker::runner::WorkerBatchMeta {
-            q_start_loc: &prefill_q_start,
-            slot_indices: &slot_indices,
-            token_ids: &prompt_tokens,
-            positions: &prefill_positions,
-            num_decode: 0,
-            num_prefill: 1,
-        };
-        let current_token = {
-            let mut refs = vec![&mut *state];
-            <Qwen3 as crate::model::llm::LlmModel>::forward(
-                self,
-                refs.as_mut_slice(),
-                &mut workspace,
-                &prefill_meta,
-                &mut gen_output,
-                None,
-            )?;
-            gen_output.to_cpu()?.as_i32()?.as_slice()?[0]
-        };
-        let prefill_ms = prefill_start.elapsed().as_millis() as u64;
-
-        let mut generated_tokens = vec![current_token];
-        let mut printed_len = 0usize;
-        if print_output {
-            let decoded = self.tokenizer.decode(&generated_tokens)?;
-            let _ = write!(stdout, "{}", &decoded[printed_len..]);
-            printed_len = decoded.len();
-            stdout.flush()?;
-        }
-
-        // Decode
-        let decode_start = Instant::now();
-        let mut decode_iterations = 0;
-        for pos in prompt_tokens.len()..(prompt_tokens.len() - 1 + max_tokens) {
-            let token_ids = [0i32];
-            let positions = [pos as i32];
-            let q_start = [0, 1];
-            let meta = crate::worker::runner::WorkerBatchMeta {
-                q_start_loc: &q_start,
-                slot_indices: &slot_indices,
-                token_ids: &token_ids,
-                positions: &positions,
-                num_decode: 1,
-                num_prefill: 0,
-            };
-            let next_token = {
-                let mut refs = vec![&mut *state];
-                <Qwen3 as crate::model::llm::LlmModel>::forward(
-                    self,
-                    refs.as_mut_slice(),
-                    &mut workspace,
-                    &meta,
-                    &mut gen_output,
-                    None,
-                )?;
-                gen_output.to_cpu()?.as_i32()?.as_slice()?[0]
-            };
-
-            if self.tokenizer.is_eos(next_token) { break; }
-
-            generated_tokens.push(next_token);
-            decode_iterations += 1;
-
-            if print_output {
-                let decoded = self.tokenizer.decode(&generated_tokens)?;
-                if decoded.len() > printed_len {
-                    let new_text = &decoded[printed_len..];
-                    if !new_text.contains('\u{FFFD}') {
-                        let _ = write!(stdout, "{}", new_text);
-                        printed_len = decoded.len();
-                        stdout.flush()?;
-                    }
-                }
-            }
-        }
-        let decode_ms = decode_start.elapsed().as_millis() as u64;
-        if print_output { println!(); }
-
-        let generated_text = self.tokenizer.decode(&generated_tokens)?;
-        Ok((generated_text, generated_tokens.len() as u32, prefill_ms, decode_ms, decode_iterations))
-    }
 
     fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
         let pos = pos_cpu.as_i32()?.as_slice()?[0];
@@ -885,6 +633,11 @@ impl crate::model::llm::LlmModel for Qwen3 {
         self.tokenizer.as_ref()
     }
 
+    fn device_type(&self) -> DeviceType {
+        self.device_type
+    }
+
+    /// Qwen3 需要额外的 QK-norm workspace buffers，所以 override 默认实现。
     fn create_state(&self) -> Result<crate::model::runtime::InferenceState> {
         Qwen3::create_state(self)
     }
@@ -924,14 +677,6 @@ impl crate::model::llm::LlmModel for Qwen3 {
         }
         Ok(())
     }
-
-    fn fill_rope_cache(
-        &self,
-        dst_sin: &mut Tensor,
-        dst_cos: &mut Tensor,
-    ) -> Result<()> {
-        crate::model::runtime::compute_rope_cache(&self.config, dst_sin, dst_cos)
-    }
 }
 
 // ============================================================================
@@ -943,14 +688,15 @@ mod tests {
     use std::path::Path;
     use std::time::Instant;
     use crate::base::error::Result;
+    use crate::model::llm::{GenerateStats, LlmModel};
 
     fn generate_and_measure(
         model: &Qwen3, state: &mut InferenceState,
         prompt: &str, max_tokens: usize, verbose: bool,
-    ) -> Result<(String, u64, u32, u64, u64, usize)> {
+    ) -> Result<(u64, GenerateStats)> {
         let start = Instant::now();
-        let (text, n_tok, prefill_ms, decode_ms, decode_iter) = model.generate(state, prompt, max_tokens, verbose)?;
-        Ok((text, start.elapsed().as_millis() as u64, n_tok, prefill_ms, decode_ms, decode_iter))
+        let stats = model.generate(state, prompt, max_tokens, verbose)?;
+        Ok((start.elapsed().as_millis() as u64, stats))
     }
 
     /// Pre-run a tiny `generate()` on the same state the benchmark will
@@ -1000,15 +746,15 @@ mod tests {
         let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
         warmup(&model, &mut state)?;
-        let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
+        let (_dur_ms, stats) =
             generate_and_measure(&model, &mut state, prompt, 2000, false)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
-        let total_ms = (prefill_ms + decode_ms) as f64;
+        let total_ms = (stats.prefill_ms + stats.decode_ms) as f64;
         println!("\n=== CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
-            n_tok, total_ms,
-            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
-            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
+            stats.num_tokens, total_ms,
+            (prompt_len + stats.num_tokens as f64) / (total_ms / 1000.0),
+            if stats.decode_ms > 0 { stats.decode_iterations as f64 / (stats.decode_ms as f64 / 1000.0) } else { 0.0 });
         Ok(())
     }
 
@@ -1022,15 +768,15 @@ mod tests {
 
         let model = Qwen3::new(model_path, DeviceType::Cpu)?;
         let mut state = model.create_state()?;
-        let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
+        let (_dur_ms, stats) =
             generate_and_measure(&model, &mut state, prompt, 150, true)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
-        let total_ms = (prefill_ms + decode_ms) as f64;
+        let total_ms = (stats.prefill_ms + stats.decode_ms) as f64;
         println!("\n=== CPU: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
-            n_tok, total_ms,
-            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
-            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
+            stats.num_tokens, total_ms,
+            (prompt_len + stats.num_tokens as f64) / (total_ms / 1000.0),
+            if stats.decode_ms > 0 { stats.decode_iterations as f64 / (stats.decode_ms as f64 / 1000.0) } else { 0.0 });
         Ok(())
     }
 
@@ -1050,15 +796,15 @@ mod tests {
         let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
         let mut state = model.create_state()?;
         warmup(&model, &mut state)?;
-        let (_text, _dur, n_tok, prefill_ms, decode_ms, decode_iter) =
+        let (_dur_ms, stats) =
             generate_and_measure(&model, &mut state, prompt, 2000, true)?;
 
         let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
-        let total_ms = (prefill_ms + decode_ms) as f64;
+        let total_ms = (stats.prefill_ms + stats.decode_ms) as f64;
         println!("\n=== Qwen3 AWQ CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
-            n_tok, total_ms,
-            (prompt_len + n_tok as f64) / (total_ms / 1000.0),
-            if decode_ms > 0 { decode_iter as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 });
+            stats.num_tokens, total_ms,
+            (prompt_len + stats.num_tokens as f64) / (total_ms / 1000.0),
+            if stats.decode_ms > 0 { stats.decode_iterations as f64 / (stats.decode_ms as f64 / 1000.0) } else { 0.0 });
         Ok(())
     }
 }

@@ -54,7 +54,7 @@ pub fn swiglu(
     let stream = CudaConfig::resolve_stream(cuda_config);
     
     // --- 2. 检查前置条件 ---
-    let num_elements = input_output_x.num_elements();
+    let num_elements = input_output_x.numel();
     // a) 元素数量必须是 8 的倍数 (对于 bf16x8 内核)
     if !num_elements.is_multiple_of(8) {
         return Err(Error::InvalidArgument(
@@ -77,8 +77,8 @@ pub fn swiglu(
     match x_dtype {
         crate::base::DataType::F32 => {
             // --- F32 路径 ---
-            let y_ptr = input_y.as_f32()?.buffer().as_ptr() as *const f32;
-            let x_ptr = input_output_x.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let y_ptr = input_y.as_f32()?.data_ptr();
+            let x_ptr = input_output_x.as_f32_mut()?.data_ptr_mut();
 
             unsafe {
                 swiglu_inplace_kernel_cu_fp32x4(
@@ -91,8 +91,8 @@ pub fn swiglu(
         }
         crate::base::DataType::BF16 => {
             // --- BF16 路径 ---
-            let y_ptr = input_y.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let x_ptr = input_output_x.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let y_ptr = input_y.as_bf16()?.data_ptr();
+            let x_ptr = input_output_x.as_bf16_mut()?.data_ptr_mut();
 
             unsafe {
                 swiglu_inplace_cu_bf16x8(
@@ -105,8 +105,8 @@ pub fn swiglu(
         }
         crate::base::DataType::F16 => {
             // --- FP16 路径 ---
-            let y_ptr = input_y.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let x_ptr = input_output_x.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let y_ptr = input_y.as_f16()?.data_ptr();
+            let x_ptr = input_output_x.as_f16_mut()?.data_ptr_mut();
 
             unsafe {
                 swiglu_inplace_cu_fp16x8(
@@ -147,8 +147,8 @@ pub unsafe fn swiglu_inplace_strided_bf16(
         )).into());
     }
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let x_ptr = x_base.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let y_ptr = y_base.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+    let x_ptr = x_base.as_bf16_mut()?.data_ptr_mut();
+    let y_ptr = y_base.as_bf16()?.data_ptr();
     unsafe {
         swiglu_inplace_strided_cu_bf16x8(
             x_ptr, y_ptr,

@@ -7,7 +7,7 @@ use half::{bf16, f16};
 pub fn broadcast_mul(a: &Tensor, b: &Tensor, dst: &mut Tensor) -> Result<()> {
     let shape = a.shape();
     let d = *shape.last().unwrap();
-    let rows = a.num_elements() / d;
+    let rows = a.numel() / d;
 
     match (a, b, dst) {
         (Tensor::F32(ta), Tensor::F32(tb), Tensor::F32(td)) => {

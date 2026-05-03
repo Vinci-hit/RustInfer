@@ -15,7 +15,7 @@ pub fn broadcast_mul(a: &Tensor, b: &Tensor, dst: &mut Tensor) -> Result<()> {
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
             let d = *a.shape().last().unwrap() as i32;
-            let rows = (a.num_elements() / d as usize) as i32;
+            let rows = (a.numel() / d as usize) as i32;
             kernels::cuda::broadcast_mul(a, b, dst, rows, d, crate::cuda::get_current_cuda_stream())
         }
     }
@@ -37,7 +37,7 @@ pub fn broadcast_mul_inplace(a: &mut Tensor, b: &Tensor) -> Result<()> {
 fn broadcast_mul_inplace_cuda(a: &mut Tensor, b: &Tensor) -> Result<()> {
     use crate::cuda::ffi::cudaStream_t;
     let d = *a.shape().last().unwrap() as i32;
-    let rows = (a.num_elements() / d as usize) as i32;
+    let rows = (a.numel() / d as usize) as i32;
     let stream: cudaStream_t = crate::cuda::get_current_cuda_stream();
 
     unsafe extern "C" {
@@ -51,18 +51,18 @@ fn broadcast_mul_inplace_cuda(a: &mut Tensor, b: &Tensor) -> Result<()> {
 
     match a.dtype() {
         crate::base::DataType::F32 => {
-            let ap = a.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
-            let bp = b.as_f32()?.buffer().as_ptr() as *const f32;
+            let ap = a.as_f32_mut()?.data_ptr_mut();
+            let bp = b.as_f32()?.data_ptr();
             unsafe { broadcast_mul_f32_forward(ap, ap as *const f32, bp, rows, d, stream); }
         }
         crate::base::DataType::BF16 => {
-            let ap = a.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let bp = b.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let ap = a.as_bf16_mut()?.data_ptr_mut();
+            let bp = b.as_bf16()?.data_ptr();
             unsafe { broadcast_mul_bf16_forward(ap, ap as *const half::bf16, bp, rows, d, stream); }
         }
         crate::base::DataType::F16 => {
-            let ap = a.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let bp = b.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let ap = a.as_f16_mut()?.data_ptr_mut();
+            let bp = b.as_f16()?.data_ptr();
             unsafe { broadcast_mul_f16_forward(ap, ap as *const half::f16, bp, rows, d, stream); }
         }
         other => return Err(Error::InvalidArgument(format!(
@@ -73,7 +73,7 @@ fn broadcast_mul_inplace_cuda(a: &mut Tensor, b: &Tensor) -> Result<()> {
 
 fn broadcast_mul_inplace_cpu(a: &mut Tensor, b: &Tensor) -> Result<()> {
     let last = *a.shape().last().unwrap();
-    let rows = a.num_elements() / last;
+    let rows = a.numel() / last;
     match (a, b) {
         (Tensor::F32(a_t), Tensor::F32(b_t)) => {
             let bv: Vec<f32> = b_t.as_slice()?.to_vec();

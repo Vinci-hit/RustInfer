@@ -46,8 +46,8 @@ pub(crate) fn split_cols_bf16_tensor(
     dst_cols: usize,
     stream: cuda::ffi::cudaStream_t,
 ) -> Result<()> {
-    let src_ptr = src.as_bf16()?.buffer().as_ptr() as *const c_void;
-    let dst_ptr = dst.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut c_void;
+    let src_ptr = src.as_bf16()?.data_ptr() as *const c_void;
+    let dst_ptr = dst.as_bf16_mut()?.data_ptr_mut() as *mut c_void;
     unsafe {
         split_cols_bf16(
             src_ptr,
@@ -71,8 +71,8 @@ pub(crate) fn split_cols_fp16_tensor(
     dst_cols: usize,
     stream: cuda::ffi::cudaStream_t,
 ) -> Result<()> {
-    let src_ptr = src.as_f16()?.buffer().as_ptr() as *const c_void;
-    let dst_ptr = dst.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut c_void;
+    let src_ptr = src.as_f16()?.data_ptr() as *const c_void;
+    let dst_ptr = dst.as_f16_mut()?.data_ptr_mut() as *mut c_void;
     unsafe {
         split_cols_fp16(
             src_ptr,
@@ -96,8 +96,8 @@ pub(crate) fn split_cols_f32_tensor(
     dst_cols: usize,
     stream: cuda::ffi::cudaStream_t,
 ) -> Result<()> {
-    let src_ptr = src.as_f32()?.buffer().as_ptr() as *const c_void;
-    let dst_ptr = dst.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut c_void;
+    let src_ptr = src.as_f32()?.data_ptr() as *const c_void;
+    let dst_ptr = dst.as_f32_mut()?.data_ptr_mut() as *mut c_void;
     unsafe {
         split_cols_f32(
             src_ptr,

@@ -38,16 +38,16 @@ pub fn fused_add_rmsnorm(
     cuda_config: Option<&CudaConfig>,
 ) -> Result<()> {
     let dim = weight.shape()[0];
-    let rows = input.num_elements() / dim;
+    let rows = input.numel() / dim;
     let stream = CudaConfig::resolve_stream(cuda_config);
     let dtype = input.dtype();
 
     match dtype {
         DataType::BF16 => {
-            let norm_out_ptr = norm_output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let res_ptr = residual.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-            let input_ptr = input.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let weight_ptr = weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
+            let norm_out_ptr = norm_output.as_bf16_mut()?.data_ptr_mut();
+            let res_ptr = residual.as_bf16_mut()?.data_ptr_mut();
+            let input_ptr = input.as_bf16()?.data_ptr();
+            let weight_ptr = weight.as_bf16()?.data_ptr();
             unsafe {
                 fused_add_rmsnorm_kernel_cu_bf16(
                     norm_out_ptr, res_ptr, input_ptr, weight_ptr,
@@ -56,10 +56,10 @@ pub fn fused_add_rmsnorm(
             }
         }
         DataType::F16 => {
-            let norm_out_ptr = norm_output.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let res_ptr = residual.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
-            let input_ptr = input.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let weight_ptr = weight.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let norm_out_ptr = norm_output.as_f16_mut()?.data_ptr_mut();
+            let res_ptr = residual.as_f16_mut()?.data_ptr_mut();
+            let input_ptr = input.as_f16()?.data_ptr();
+            let weight_ptr = weight.as_f16()?.data_ptr();
             unsafe {
                 fused_add_rmsnorm_kernel_cu_fp16(
                     norm_out_ptr, res_ptr, input_ptr, weight_ptr,

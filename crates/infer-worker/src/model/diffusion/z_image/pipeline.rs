@@ -51,12 +51,12 @@ const VAE_SCALE_FACTOR: usize = 8;
 /// call) into a pre-allocated `[N_MAX_STEPS]` F32 device slot.
 ///
 /// Prefers a raw stream-ordered `cudaMemcpyAsync` to avoid allocating a
-/// transient CPU `Tensor`. `src.len()` must be `<= dst.num_elements()`.
+/// transient CPU `Tensor`. `src.len()` must be `<= dst.numel()`.
 #[cfg(feature = "cuda")]
 fn upload_f32_slice_into(dst: &mut Tensor, src: &[f32]) -> Result<()> {
     use crate::cuda::ffi;
     debug_assert!(dst.dtype() == DataType::F32);
-    debug_assert!(src.len() <= dst.num_elements());
+    debug_assert!(src.len() <= dst.numel());
     let stream = crate::cuda::get_current_cuda_stream();
     let dptr = dst.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut std::ffi::c_void;
     let sptr = src.as_ptr() as *const std::ffi::c_void;

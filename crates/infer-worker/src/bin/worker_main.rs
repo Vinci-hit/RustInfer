@@ -4,62 +4,8 @@ use std::thread;
 
 use infer_worker::base::DeviceType;
 use infer_worker::base::error::Result;
-use infer_worker::model::common::config::RuntimeModelConfig;
-use infer_worker::model::common::tokenizer::Tokenizer;
-use infer_worker::model::llm::llm_model::LlmModel;
-use infer_worker::model::runtime::InferenceState;
-use infer_worker::tensor::Tensor;
-use infer_worker::worker::{BatchWorkspace, ModelRunner, SharedBuffers, WorkerServer};
-use infer_worker::worker::runner::WorkerBatchMeta;
-
-enum LoadedModel {
-    Llama3(infer_worker::model::llm::llama3::Llama3),
-    Qwen3(infer_worker::model::llm::qwen3::Qwen3),
-}
-
-impl LlmModel for LoadedModel {
-    fn config(&self) -> &RuntimeModelConfig {
-        match self {
-            LoadedModel::Llama3(m) => m.config(),
-            LoadedModel::Qwen3(m) => m.config(),
-        }
-    }
-
-    fn tokenizer(&self) -> &dyn Tokenizer {
-        match self {
-            LoadedModel::Llama3(m) => m.tokenizer(),
-            LoadedModel::Qwen3(m) => m.tokenizer(),
-        }
-    }
-
-    fn create_state(&self) -> Result<InferenceState> {
-        match self {
-            LoadedModel::Llama3(m) => m.create_state(),
-            LoadedModel::Qwen3(m) => m.create_state(),
-        }
-    }
-
-    fn forward(
-        &self,
-        states: &mut [&mut InferenceState],
-        workspace: &mut BatchWorkspace,
-        batch: &WorkerBatchMeta<'_>,
-        output_tokens: &mut Tensor,
-        cuda_config: Option<&infer_worker::OpConfig>,
-    ) -> Result<()> {
-        match self {
-            LoadedModel::Llama3(m) => m.forward(states, workspace, batch, output_tokens, cuda_config),
-            LoadedModel::Qwen3(m) => m.forward(states, workspace, batch, output_tokens, cuda_config),
-        }
-    }
-
-    fn fill_rope_cache(&self, dst_sin: &mut Tensor, dst_cos: &mut Tensor) -> Result<()> {
-        match self {
-            LoadedModel::Llama3(m) => m.fill_rope_cache(dst_sin, dst_cos),
-            LoadedModel::Qwen3(m) => m.fill_rope_cache(dst_sin, dst_cos),
-        }
-    }
-}
+use infer_worker::model::llm::LlmModel;
+use infer_worker::worker::{ModelRunner, SharedBuffers, WorkerServer};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker")]
@@ -123,9 +69,9 @@ fn main() -> Result<()> {
 
     tracing::info!("Loading model...");
 
-    let model = match args.model_type.as_str() {
-        "llama3" => LoadedModel::Llama3(infer_worker::model::llm::llama3::Llama3::new(&args.model, device)?),
-        "qwen3" => LoadedModel::Qwen3(infer_worker::model::llm::qwen3::Qwen3::new(&args.model, device)?),
+    let model: Box<dyn LlmModel> = match args.model_type.as_str() {
+        "llama3" => Box::new(infer_worker::model::llm::llama3::Llama3::new(&args.model, device)?),
+        "qwen3" => Box::new(infer_worker::model::llm::qwen3::Qwen3::new(&args.model, device)?),
         other => {
             return Err(infer_worker::base::error::Error::InvalidArgument(format!(
                 "Unsupported model_type '{}'; expected llama3 or qwen3",

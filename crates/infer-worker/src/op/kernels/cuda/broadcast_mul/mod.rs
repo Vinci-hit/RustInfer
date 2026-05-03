@@ -17,21 +17,21 @@ unsafe extern "C" {
 pub fn broadcast_mul(a: &Tensor, b: &Tensor, dst: &mut Tensor, rows: i32, d: i32, stream: cudaStream_t) -> Result<()> {
     match a.dtype() {
         crate::base::DataType::F32 => {
-            let ap = a.as_f32()?.buffer().as_ptr() as *const f32;
-            let bp = b.as_f32()?.buffer().as_ptr() as *const f32;
-            let dp = dst.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32;
+            let ap = a.as_f32()?.data_ptr();
+            let bp = b.as_f32()?.data_ptr();
+            let dp = dst.as_f32_mut()?.data_ptr_mut();
             unsafe { broadcast_mul_f32_forward(dp, ap, bp, rows, d, stream); }
         }
         crate::base::DataType::BF16 => {
-            let ap = a.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let bp = b.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-            let dp = dst.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let ap = a.as_bf16()?.data_ptr();
+            let bp = b.as_bf16()?.data_ptr();
+            let dp = dst.as_bf16_mut()?.data_ptr_mut();
             unsafe { broadcast_mul_bf16_forward(dp, ap, bp, rows, d, stream); }
         }
         crate::base::DataType::F16 => {
-            let ap = a.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let bp = b.as_f16()?.buffer().as_ptr() as *const half::f16;
-            let dp = dst.as_f16_mut()?.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let ap = a.as_f16()?.data_ptr();
+            let bp = b.as_f16()?.data_ptr();
+            let dp = dst.as_f16_mut()?.data_ptr_mut();
             unsafe { broadcast_mul_f16_forward(dp, ap, bp, rows, d, stream); }
         }
         other => return Err(Error::InvalidArgument(format!(

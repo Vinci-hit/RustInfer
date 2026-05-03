@@ -20,16 +20,16 @@ pub fn upsample_nearest_2x(input: &Tensor, output: &mut Tensor, stream: ffi::cud
     match input.dtype() {
         crate::base::DataType::F32 => unsafe {
             upsample_nearest_2x_f32_forward(
-                output.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut f32,
-                input.as_f32()?.buffer().as_ptr() as *const f32,
+                output.as_f32_mut()?.data_ptr_mut(),
+                input.as_f32()?.data_ptr(),
                 batch, channels, h_in, w_in, stream,
             );
             Ok(())
         },
         crate::base::DataType::BF16 => unsafe {
             upsample_nearest_2x_bf16_forward(
-                output.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16,
-                input.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+                output.as_bf16_mut()?.data_ptr_mut(),
+                input.as_bf16()?.data_ptr(),
                 batch, channels, h_in, w_in, stream,
             );
             Ok(())

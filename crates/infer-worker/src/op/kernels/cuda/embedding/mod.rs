@@ -50,7 +50,7 @@ pub fn embedding(
     let dim = weight.shape()[1];
     let token_len = input_tokens.shape()[0];
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let tokens_ptr = tokens_typed.buffer().as_ptr() as *const i32;
+    let tokens_ptr = tokens_typed.data_ptr();
     
     // --- 2. 数据类型分发 ---
     let dtype = output.dtype();
@@ -66,8 +66,8 @@ pub fn embedding(
                 ).into());
             }
             
-            let weight_ptr = weight_typed.buffer().as_ptr() as *const f32;
-            let out_ptr = out_typed.buffer_mut().as_mut_ptr() as *mut f32;
+            let weight_ptr = weight_typed.data_ptr();
+            let out_ptr = out_typed.data_ptr_mut();
             
             // --- 4. 调用 FFI 函数 ---
             unsafe {
@@ -93,8 +93,8 @@ pub fn embedding(
                 ).into());
             }
             
-            let weight_ptr = weight_typed.buffer().as_ptr() as *const half::bf16;
-            let out_ptr = out_typed.buffer_mut().as_mut_ptr() as *mut half::bf16;
+            let weight_ptr = weight_typed.data_ptr();
+            let out_ptr = out_typed.data_ptr_mut();
             
             // --- 4. 调用 FFI 函数 ---
             unsafe {
@@ -120,8 +120,8 @@ pub fn embedding(
                 ).into());
             }
             
-            let weight_ptr = weight_typed.buffer().as_ptr() as *const half::f16;
-            let out_ptr = out_typed.buffer_mut().as_mut_ptr() as *mut half::f16;
+            let weight_ptr = weight_typed.data_ptr();
+            let out_ptr = out_typed.data_ptr_mut();
             
             // --- 4. 调用 FFI 函数 ---
             unsafe {

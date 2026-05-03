@@ -7,7 +7,7 @@ use half::{bf16, f16};
 pub fn layernorm(input: &Tensor, output: &mut Tensor, eps: f32) -> Result<()> {
     let shape = input.shape();
     let cols = *shape.last().unwrap();
-    let rows = input.num_elements() / cols;
+    let rows = input.numel() / cols;
 
     match (input, output) {
         (Tensor::F32(ti), Tensor::F32(to)) => {

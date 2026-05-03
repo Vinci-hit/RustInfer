@@ -64,42 +64,42 @@ pub fn argmax(logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&C
     match logits.dtype() {
         DataType::F32 => {
             // 提取类型化指针
-            let logits_ptr = logits.as_f32()?.buffer().as_ptr() as *const f32;
+            let logits_ptr = logits.as_f32()?.data_ptr();
 
             // 调用 f32 专用的 FFI 函数
             unsafe {
                 argmax_cu_f32_ffi(
                     logits_ptr,
                     vocab_size as i32,
-                    output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
+                    output_token.as_i32_mut()?.data_ptr_mut(),
                     stream,
                 )
             }
         }
         DataType::BF16 => {
             // 提取类型化指针
-            let logits_ptr = logits.as_bf16()?.buffer().as_ptr() as *const bf16;
+            let logits_ptr = logits.as_bf16()?.data_ptr() as *const bf16;
 
             // 调用 bf16 专用的 FFI 函数
             unsafe {
                 argmax_cu_bf16_ffi(
                     logits_ptr,
                     vocab_size as i32,
-                    output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
+                    output_token.as_i32_mut()?.data_ptr_mut(),
                     stream,
                 )
             }
         }
         DataType::F16 => {
             // 提取类型化指针
-            let logits_ptr = logits.as_f16()?.buffer().as_ptr() as *const half::f16;
+            let logits_ptr = logits.as_f16()?.data_ptr();
 
             // 调用 bf16 专用的 FFI 函数
             unsafe {
                 argmax_cu_fp16_ffi(
                     logits_ptr,
                     vocab_size as i32,
-                    output_token.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32,
+                    output_token.as_i32_mut()?.data_ptr_mut(),
                     stream,
                 )
             }
@@ -140,10 +140,10 @@ pub fn argmax_batch_strided(
     let cuda_cfg = cuda_config
         .ok_or_else(|| Error::InvalidArgument("CudaConfig required for argmax_batch".to_string()))?;
     let stream = cuda_cfg.stream;
-    let out_ptr = out.as_i32_mut()?.buffer_mut().as_mut_ptr() as *mut i32;
+    let out_ptr = out.as_i32_mut()?.data_ptr_mut();
     match logits.dtype() {
         DataType::BF16 => unsafe {
-            let base = logits.as_bf16()?.buffer().as_ptr() as *const bf16;
+            let base = logits.as_bf16()?.data_ptr() as *const bf16;
             argmax_batch_cu_bf16_ffi(
                 base.add(col_offset),
                 batch_size as i32, vocab_size as i32, row_stride as i32,
@@ -151,7 +151,7 @@ pub fn argmax_batch_strided(
             );
         },
         DataType::F32 => unsafe {
-            let base = logits.as_f32()?.buffer().as_ptr() as *const f32;
+            let base = logits.as_f32()?.data_ptr();
             argmax_batch_cu_f32_ffi(
                 base.add(col_offset),
                 batch_size as i32, vocab_size as i32, row_stride as i32,

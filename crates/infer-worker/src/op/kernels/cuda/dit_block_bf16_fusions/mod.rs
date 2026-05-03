@@ -80,15 +80,15 @@ pub fn zimage_fused_adaln_modulation_split_scale_add_tanh_bf16_inplace(
         "zimage_fused_adaln_modulation_split_scale_add_tanh_bf16_inplace",
         &[mod_out],
     )?;
-    if mod_out.num_elements() != 4 * dim {
+    if mod_out.numel() != 4 * dim {
         return Err(Error::InvalidArgument(format!(
             "zimage fused adaLN expects mod_out numel {}, got {}",
             4 * dim,
-            mod_out.num_elements(),
+            mod_out.numel(),
         )).into());
     }
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let p = mod_out.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let p = mod_out.as_bf16_mut()?.data_ptr_mut();
     unsafe {
         zimage_fused_adaln_modulation_split_scale_add_tanh_bf16_forward(
             p,
@@ -143,14 +143,14 @@ pub fn zimage_fused_qkv_split_head_rmsnorm_rope_interleaved_bf16(
     }
 
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let q_ptr = q.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let k_ptr = k.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let v_ptr = v.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let qkv_ptr = qkv_out.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let wq_ptr = norm_q_weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let wk_ptr = norm_k_weight.as_bf16()?.buffer().as_ptr() as *const half::bf16;
-    let cos_ptr = cos.as_f32()?.buffer().as_ptr() as *const f32;
-    let sin_ptr = sin.as_f32()?.buffer().as_ptr() as *const f32;
+    let q_ptr = q.as_bf16_mut()?.data_ptr_mut();
+    let k_ptr = k.as_bf16_mut()?.data_ptr_mut();
+    let v_ptr = v.as_bf16_mut()?.data_ptr_mut();
+    let qkv_ptr = qkv_out.as_bf16()?.data_ptr();
+    let wq_ptr = norm_q_weight.as_bf16()?.data_ptr();
+    let wk_ptr = norm_k_weight.as_bf16()?.data_ptr();
+    let cos_ptr = cos.as_f32()?.data_ptr();
+    let sin_ptr = sin.as_f32()?.data_ptr();
     unsafe {
         zimage_fused_qkv_split_head_rmsnorm_rope_interleaved_bf16_forward(
             q_ptr,
@@ -190,13 +190,13 @@ pub fn zimage_fused_post_attention_rmsnorm_gate_residual_and_ffn_prenorm_scale_b
         &[x, to_out_result, gate_msa, scale_mlp, attention_norm2_weight, ffn_norm1_weight, residual_mid, ffn_in],
     )?;
     let dim = attention_norm2_weight.shape()[0];
-    let rows = x.num_elements() / dim;
+    let rows = x.numel() / dim;
     if x.shape() != to_out_result.shape()
         || residual_mid.shape() != x.shape()
         || ffn_in.shape() != x.shape()
-        || gate_msa.num_elements() != dim
-        || scale_mlp.num_elements() != dim
-        || ffn_norm1_weight.num_elements() != dim
+        || gate_msa.numel() != dim
+        || scale_mlp.numel() != dim
+        || ffn_norm1_weight.numel() != dim
     {
         return Err(Error::InvalidArgument(format!(
             "zimage fused post-attn/pre-ffn shape mismatch: x={:?} to_out={:?} gate={:?} scale={:?} attn_w={:?} ffn_w={:?} residual={:?} ffn_in={:?}",
@@ -205,18 +205,18 @@ pub fn zimage_fused_post_attention_rmsnorm_gate_residual_and_ffn_prenorm_scale_b
         )).into());
     }
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let residual_ptr = residual_mid.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
-    let ffn_in_ptr = ffn_in.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let residual_ptr = residual_mid.as_bf16_mut()?.data_ptr_mut();
+    let ffn_in_ptr = ffn_in.as_bf16_mut()?.data_ptr_mut();
     unsafe {
         zimage_fused_post_attention_rmsnorm_gate_residual_and_ffn_prenorm_scale_bf16_forward(
             residual_ptr,
             ffn_in_ptr,
-            x.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            to_out_result.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            gate_msa.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            scale_mlp.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            attention_norm2_weight.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            ffn_norm1_weight.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+            x.as_bf16()?.data_ptr(),
+            to_out_result.as_bf16()?.data_ptr(),
+            gate_msa.as_bf16()?.data_ptr(),
+            scale_mlp.as_bf16()?.data_ptr(),
+            attention_norm2_weight.as_bf16()?.data_ptr(),
+            ffn_norm1_weight.as_bf16()?.data_ptr(),
             rows as i32,
             dim as i32,
             attention_norm2_eps,
@@ -242,10 +242,10 @@ pub fn zimage_fused_ffn_down_rmsnorm_gate_residual_bf16(
         &[residual_mid, ffn_out, gate_mlp, ffn_norm2_weight, dst],
     )?;
     let dim = ffn_norm2_weight.shape()[0];
-    let rows = residual_mid.num_elements() / dim;
+    let rows = residual_mid.numel() / dim;
     if residual_mid.shape() != ffn_out.shape()
         || dst.shape() != residual_mid.shape()
-        || gate_mlp.num_elements() != dim
+        || gate_mlp.numel() != dim
     {
         return Err(Error::InvalidArgument(format!(
             "zimage fused ffn-out/residual shape mismatch: residual={:?} ffn_out={:?} gate={:?} weight={:?} dst={:?}",
@@ -253,14 +253,14 @@ pub fn zimage_fused_ffn_down_rmsnorm_gate_residual_bf16(
         )).into());
     }
     let stream = CudaConfig::resolve_stream(cuda_config);
-    let dst_ptr = dst.as_bf16_mut()?.buffer_mut().as_mut_ptr() as *mut half::bf16;
+    let dst_ptr = dst.as_bf16_mut()?.data_ptr_mut();
     unsafe {
         zimage_fused_ffn_down_rmsnorm_gate_residual_bf16_forward(
             dst_ptr,
-            residual_mid.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            ffn_out.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            gate_mlp.as_bf16()?.buffer().as_ptr() as *const half::bf16,
-            ffn_norm2_weight.as_bf16()?.buffer().as_ptr() as *const half::bf16,
+            residual_mid.as_bf16()?.data_ptr(),
+            ffn_out.as_bf16()?.data_ptr(),
+            gate_mlp.as_bf16()?.data_ptr(),
+            ffn_norm2_weight.as_bf16()?.data_ptr(),
             rows as i32,
             dim as i32,
             ffn_norm2_eps,

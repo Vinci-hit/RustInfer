@@ -1,3 +1,4 @@
+#![cfg(feature = "models")]
 //! 端到端吞吐 Bench：通过 WorkerServer + ModelRunner 经 ZMQ 驱动，
 //! 对比直接调用 `forward_batch_decode` 的吞吐。
 //!
