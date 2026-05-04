@@ -13,7 +13,7 @@
 //! - **Free functions** (`add`, `swiglu`, `softmax`, …) for algorithms
 //!   with no cached state.
 //! - **Structs** (`Matmul`, `RMSNorm`, `RoPEOp`, `Embedding`,
-//!   `FlashAttnGQA`, `SamplerOp`) for operators that cache device
+//!   `FlashAttnDecodeBatch`, `SamplerOp`) for operators that cache device
 //!   handles, sin/cos tables, or other precomputed resources.
 //! - Most kernels come in pairs: an allocating convenience variant
 //!   (`foo(...) -> Result<Tensor>`) and a hot-path `*_into` variant that
@@ -46,7 +46,8 @@
 //!
 //! ## Attention
 //! - [`sdpa`]       — `scaled_dot_product_attention`, `dit_sdpa`
-//! - [`flash_gqa`]  — grouped-query flash attention (prefill + decode)
+//! - [`attention`]  — `FlashAttnDecodeBatch` (batched split-KV decode, graph-ready)
+//!                    and `FlashAttnRagged` (ragged prefill; kernel TBD)
 //!
 //! ## Positional encoding
 //! - [`rope`]              — standard RoPE (`RoPEOp` struct with sin/cos cache)
@@ -102,7 +103,7 @@ pub mod conv2d;
 
 // attention
 pub mod sdpa;
-pub mod flash_gqa;
+pub mod attention;
 
 // positional encoding
 pub mod rope;
@@ -118,6 +119,6 @@ pub mod upsample;
 
 // sequence / KV utilities
 pub mod embedding;
-pub mod scatter;
+pub mod kv_cache;
 pub mod encode;
 pub mod sampler;

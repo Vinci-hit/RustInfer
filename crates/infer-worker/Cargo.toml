@@ -42,7 +42,7 @@ bindgen = { version ="0.72.1", optional = true }
 walkdir = {version = "2.5.0" , optional = true}
 [dev-dependencies]
 [features]
-default = ["cuda"]
+default = ["cuda","models"]
 cuda = ["dep:cc", "dep:bindgen", "dep:walkdir"]
 # Enable the high-level model / worker layer (LLM + diffusion pipelines,
 # zmq-based worker server, `rustinfer-worker` binary). Leave disabled

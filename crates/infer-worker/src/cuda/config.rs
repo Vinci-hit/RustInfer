@@ -9,25 +9,8 @@ use super::ffi;
 /// cuBLASLt 默认 workspace 大小（字节）。
 const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
 
-/// Split-K flash-decoding 用的 N_SPLIT 常量。
-/// 必须与 `.cu` 内 `N_SPLIT` / `N_SPLIT_1B` 保持一致；改常量需三处同步。
-pub const FLASH_DECODE_N_SPLIT: usize = 8;
-
 /// CUDA Graph 的用途分桶。一个 [`CudaConfig`] 可以同时 cache 多张不同用途/不同 batch
 /// 形状的 graph；同一 key 里只保存一张 graph（后 capture 的覆盖前一张）。
-///
-/// 当前 / 未来使用点：
-/// - [`GraphSlot::LlmDecode(batch_size)`] — **DecodeOnly** 路径：`forward_decoding` 传 1，
-///   `forward_batch_decode` 传实际 B。整个 forward 一次 capture。
-/// - [`GraphSlot::LlmMixedPreAttn(total_tokens)`] — **MixedBatch** 路径 attention 之前的部分
-///   （embedding / RMSNorm / wqkv / RoPE / scatter_kv）。attention 自身因 cu_seqlens 每步
-///   变化不进 graph；mixed batch 把 forward 拆成 pre-attn + attn(不入图) + post-attn 三段。
-/// - [`GraphSlot::LlmMixedPostAttn(total_tokens)`] — MixedBatch 路径 attention 之后的部分
-///   （wo / FFN / 最后的 rmsnorm + cls + sampler）。
-/// - [`GraphSlot::Denoise`] — 扩散模型 denoise step（Z-Image 等），按请求 shape / step 分桶。
-///
-/// 现在 llama3 还没实现 MixedBatch，MixedPre/Post 暂未使用，但 key 空间先留好；
-/// MixedBatch 落地时直接用，不再动 `CudaConfig` 的 API。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
     LlmDecode(usize),
@@ -50,21 +33,8 @@ pub enum GraphSlot {
 ///
 /// - [`Self::workspace`] (128 MB) 给 cuBLASLt 用，[`Self::new`] 里默认分配。
 ///
-/// - [`Self::flash_decode_workspace`] 给 split-K flash-decoding (pass-1 → pass-2) 用。
-///   **默认不分配** (null)；在要跑 bf16 decode 的模型 init 时显式链式调用
-///   [`Self::with_flash_decode`] 按实际 `(num_q_heads, head_dim, max_batch_size)`
-///   一次性分配：
-///
-///   ```ignore
-///   // serial 单 seq decode: max_batch_size = 1
-///   let cfg = CudaConfig::new()?.with_flash_decode(head_num, head_size, 1)?;
-///   // batched decode: 传上限 B
-///   let cfg = CudaConfig::new()?.with_flash_decode(head_num, head_size, max_batch)?;
-///   ```
-///
-///   若 decode 路径 kernel 被调用时发现该字段为 null，dispatcher 会返回明确错误
-///   而非静默写坏显存。单测中构造的 `CudaConfig::new()` 实例永远不会命中 bf16
-///   decode 分支，所以不需要调 `with_flash_decode`。
+/// Attention workspaces are now owned by the caller (see
+/// `FlashAttnDecodeBatch::workspace_bytes`), not by `CudaConfig`.
 #[derive(Debug)]
 pub struct CudaConfig {
     /// CUDA stream for asynchronous execution.
@@ -74,22 +44,12 @@ pub struct CudaConfig {
     /// cuBLASLt 算法选择 workspace（128 MB，构造时分配）。
     pub workspace: *mut c_void,
     pub workspace_size: usize,
-    /// Split-K flash-decoding (pass-1 → pass-2) 所需的 fp32 scratch。
-    /// 默认 null；由 [`Self::with_flash_decode`] 按模型实际 shape 分配。
-    pub flash_decode_workspace: *mut c_void,
-    pub flash_decode_workspace_size: usize,
     /// 按用途/shape 分桶 cache 的 CUDA Graph。key 见 [`GraphSlot`]。
-    /// 典型用法：
-    /// - LLM decode(B=1) → `LlmDecode`
-    /// - LLM batch decode → `LlmBatchDecode(batch_size)`（不同 B 独立 cache）
-    /// - 扩散 denoise → `Denoise { latent_h, latent_w, cap_padded_len, steps }`
     pub graphs: HashMap<GraphSlot, CudaGraph>,
     /// cuDNN handle，用于 Conv2d 等卷积操作。构造时创建并绑定到 stream。
     pub cudnn_handle: ffi::cudnnHandle_t,
     /// Descriptor / algorithm / workspace cache shared across every
-    /// `conv2d_cudnn` invocation that runs against this handle. Eliminates
-    /// per-call `cudnnCreate*` / `cudnnGetAlgorithm` / `cudaMalloc`
-    /// overhead once the cache is warm.
+    /// `conv2d_cudnn` invocation that runs against this handle.
     pub conv2d_cache: Mutex<crate::op::kernels::cuda::Conv2dCache>,
 }
 
@@ -148,46 +108,12 @@ impl CudaConfig {
             cublas_handle_v2,
             workspace,
             workspace_size,
-            flash_decode_workspace: std::ptr::null_mut(),
-            flash_decode_workspace_size: 0,
             graphs: HashMap::new(),
             cudnn_handle,
             conv2d_cache: Mutex::new(
                 crate::op::kernels::cuda::Conv2dCache::default(),
             ),
         })
-    }
-
-    /// 一次性分配 split-K flash-decoding 所需的 fp32 scratch，按实际模型形状。
-    ///
-    /// 总 fp32 数 = `num_q_heads × FLASH_DECODE_N_SPLIT × (2 + head_dim)`。
-    /// 典型 Qwen3 (32, 128) ≈ 130 KB，Llama-3.2-1B (32, 64) ≈ 66 KB。
-    ///
-    /// **只应调用一次，且必须在任何 `capture_graph_begin` 之前**。重复调用或在
-    /// graph 捕获期间调用会 panic（前者是误用，后者会破坏 graph）。
-    /// 为 split-K flash-decoding 预分配 pass1→pass2 的 fp32 scratch。
-    ///
-    /// `max_batch_size` 是将要跑的 decode batch 的最大 B（serial 单 seq decode 传 1，
-    /// batched decode 传实际上限）。workspace 会按 `max_batch_size * per_seq` 分配。
-    ///
-    /// **只应调用一次，且必须在任何 graph capture 之前**。重复调用会 panic。
-    pub fn with_flash_decode(
-        mut self,
-        num_q_heads: usize,
-        head_dim: usize,
-        max_batch_size: usize,
-    ) -> Result<Self> {
-        assert!(
-            self.flash_decode_workspace.is_null(),
-            "with_flash_decode called twice on the same CudaConfig"
-        );
-        let per_seq = num_q_heads * FLASH_DECODE_N_SPLIT * (2 + head_dim);
-        let bytes = max_batch_size.max(1) * per_seq * std::mem::size_of::<f32>();
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        unsafe { crate::cuda_check!(ffi::cudaMalloc(&mut ptr, bytes))? };
-        self.flash_decode_workspace = ptr;
-        self.flash_decode_workspace_size = bytes;
-        Ok(self)
     }
 }
 
@@ -212,11 +138,6 @@ impl Drop for CudaConfig {
         if !self.workspace.is_null() {
             unsafe {
                 let _ = ffi::cudaFree(self.workspace);
-            }
-        }
-        if !self.flash_decode_workspace.is_null() {
-            unsafe {
-                let _ = ffi::cudaFree(self.flash_decode_workspace);
             }
         }
         if !self.cudnn_handle.is_null() {

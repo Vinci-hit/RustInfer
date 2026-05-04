@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 pub mod base;
 pub mod op;
 pub mod tensor;

@@ -44,9 +44,9 @@ impl InferenceState {
         let cuda_config = {
             // 按当前模型实际形状一次性分配 split-K flash-decoding workspace。
             // 必须在任何 graph capture 之前完成（这里在 init，显然满足）。
-            // 单 seq decode：max_batch_size = 1。
-            let cfg = CudaConfig::new()?
-                .with_flash_decode(config.head_num, config.head_size, 1)?;
+            // NOTE: `with_flash_decode` 已随 op 层重构迁出到 AttentionPlan；
+            // 此处待 runtime 重写时一并迁移。
+            let cfg = CudaConfig::new()?;
             Some(cfg)
         };
 

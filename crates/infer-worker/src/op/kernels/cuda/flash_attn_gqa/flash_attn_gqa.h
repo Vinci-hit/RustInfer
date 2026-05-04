@@ -7,113 +7,141 @@
         cudaError_t err = call;                                                   \
         if (err != cudaSuccess) {                                                 \
             fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            /* 在生产代码中可能需要更复杂的错误处理机制 */                           \
         }                                                                         \
     } while (0)
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/**
- * @brief 在 CUDA 设备上执行 Flash Attention GQA (Prefill/Decode 模式)。
- * 
- * 该函数是 Rust FFI 的入口点，调用底层的 CUDA Kernel 来计算 O = Softmax(Q K^T) V。
- * 
- * @param q_ptr Query 张量的设备指针 (只读), 形状 [Q_S, Q_D]。
- * @param k_ptr K Cache 的设备指针 (只读), 形状 [Max_S, KV_D]。
- * @param v_ptr V Cache 的设备指针 (只读), 形状 [Max_S, KV_D]。
- * @param o_ptr 输出张量的设备指针 (可写), 形状 [Q_S, Q_D]。
- * @param q_seq_len Q 的实际序列长度 (S_Q)。
- * @param kv_seq_len K/V Cache 的有效历史长度 (S_KV_history)。不包含最新的长度！
- * @param num_q_heads Query 头数量 (N_Q)。
- * @param num_kv_heads K/V 头数量 (N_KV)。
- * @param head_dim 单个 Attention Head 的维度 (D_H)。
- * @param stream CUDA stream (可为 NULL/0)。
- */
-void flash_attn_gqa_cu(
-    const float* q_ptr,
-    const float* k_ptr,
-    const float* v_ptr,
-    float* o_ptr,
-    int32_t q_seq_len,
-    int32_t* kv_seq_len,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    int32_t is_causal,
-    cudaStream_t stream
-);
+// ======================================================================
+// Flash-Attention / Flash-Decoding on CUDA: BF16 / FP16 only.
+// Two kernels cover all attention paths:
+//
+//   1) launch_flash_attn_prefill_{bf16,fp16}
+//      Stride-aware prefill (q_len > 1).  Arbitrary batch/stride layout,
+//      head_dim ∈ {64, 128, 192, 256}.  See docs/FLASH_ATTN_PREFILL.md.
+//
+//   2) launch_flash_attn_batched_decode_{bf16,fp16}
+//      Batched Flash-Decoding (q_len = 1) with split-KV.  Each request
+//      carries its own KV cache pointed to by a device pointer array,
+//      looked up via req_to_slot → graph-friendly.
+//
+// F32 is *not* supported on CUDA; run F32 attention on CPU.
+// ======================================================================
 
-void flash_decoding_cu(
-    const float* q_ptr,
-    const float* k_ptr,
-    const float* v_ptr,
-    float* o_ptr,
-    int32_t q_seq_len,
-    int32_t* kv_seq_len,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    cudaStream_t stream
-);
+// --- Prefill ---------------------------------------------------------------
+void launch_flash_attn_prefill_bf16(
+    const __nv_bfloat16* q, int64_t qsb, int64_t qss, int64_t qsh,
+    const __nv_bfloat16* k, int64_t ksb, int64_t kss, int64_t ksh,
+    const __nv_bfloat16* v, int64_t vsb, int64_t vss, int64_t vsh,
+          __nv_bfloat16* o, int64_t osb, int64_t oss, int64_t osh,
+    int batch, int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream);
 
-void flash_decoding_cu_bf16(
-    const __nv_bfloat16* q_ptr,
-    const __nv_bfloat16* k_ptr,
-    const __nv_bfloat16* v_ptr,
-    __nv_bfloat16* o_ptr,
+void launch_flash_attn_prefill_fp16(
+    const __half* q, int64_t qsb, int64_t qss, int64_t qsh,
+    const __half* k, int64_t ksb, int64_t kss, int64_t ksh,
+    const __half* v, int64_t vsb, int64_t vss, int64_t vsh,
+          __half* o, int64_t osb, int64_t oss, int64_t osh,
+    int batch, int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream);
+
+// --- Ragged attention (variable q_len / kv_len per request) ---------------
+// Packed Q / O layout:
+//   q, o : [total_q_tokens, num_q_heads, head_dim]
+//
+// KV is per-request, accessed via a device pointer array like the decode op.
+//
+// All control arrays live on the device with stable addresses so the launch
+// is CUDA-Graph-capturable:
+//
+//   req_to_slot[B]          — which KV-cache slot each request uses
+//   kv_lens[B]              — current total KV length per request
+//   cu_q_lens[B+1]          — prefix sum of q_len_i (Q tokens packed in order)
+//   block2req[total_tiles]  — for each flattened (req, q_tile) slot, the req id
+//   block2tile[total_tiles] — and the q-tile index within that request
+//
+//   total_q_tiles = Σ ceil(q_len_i / 128)  — Q-tile size is fixed at 128.
+void launch_flash_attn_ragged_bf16(
+    const __nv_bfloat16* q, int64_t qss, int64_t qsh,
+    const __nv_bfloat16* const* k_cache_ptrs,
+    const __nv_bfloat16* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __nv_bfloat16* o, int64_t oss, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream);
+
+void launch_flash_attn_ragged_fp16(
+    const __half* q, int64_t qss, int64_t qsh,
+    const __half* const* k_cache_ptrs,
+    const __half* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __half* o, int64_t oss, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream);
+
+// --- Batched Decode --------------------------------------------------------
+// Shapes (logical):
+//   q     : [batch, num_q_heads, head_dim]     (contiguous over last two)
+//   o     : [batch, num_q_heads, head_dim]
+//   K/V cache (per slot) : [max_seq_len, num_kv_heads, head_dim]
+//
+// Strides are in *elements*. kv_stride_s is the per-token stride of a single
+// KV cache buffer; kv_stride_h is the per-kv-head stride (typically head_dim).
+//
+// `k_cache_ptrs` / `v_cache_ptrs` are device arrays (size = max_slots ≥ B)
+// holding each slot's base pointer.  `req_to_slot[i]` tells the kernel
+// which slot request i is currently occupying.
+//
+// `kv_lens[i]` is each request's current KV length (past + new).
+//
+// `workspace` must be at least `flash_attn_batched_decode_workspace_bytes`.
+// Returns required workspace size in bytes for planning purposes.
+int64_t flash_attn_batched_decode_workspace_bytes(
+    int batch, int num_q_heads, int head_dim);
+
+void launch_flash_attn_batched_decode_bf16(
+    const __nv_bfloat16* q, int64_t qsb, int64_t qsh,
+    const __nv_bfloat16* const* k_cache_ptrs,
+    const __nv_bfloat16* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __nv_bfloat16* o, int64_t osb, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
     float* workspace,
-    int32_t* kv_seq_len,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
     cudaStream_t stream);
 
-void launch_flash_attn_cute_128x64x64_tile(
-    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
-    int seq_len, int* kv_len, int q_heads, int kv_heads,
-    int is_causal,
-    cudaStream_t stream);
-
-// head_dim=128 decode kernel (Qwen3 等模型使用)
-void flash_decoding_cu_bf16_hdim128(
-    const __nv_bfloat16* q_ptr,
-    const __nv_bfloat16* k_ptr,
-    const __nv_bfloat16* v_ptr,
-    __nv_bfloat16* o_ptr,
+void launch_flash_attn_batched_decode_fp16(
+    const __half* q, int64_t qsb, int64_t qsh,
+    const __half* const* k_cache_ptrs,
+    const __half* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __half* o, int64_t osb, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
     float* workspace,
-    int32_t* kv_seq_len,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    cudaStream_t stream);
-
-// head_dim=128 版本 (Qwen3 等模型使用)
-void launch_flash_attn_cute_bf16_hdim128(
-    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
-    int seq_len, int* kv_len, int q_heads, int kv_heads,
-    int is_causal,
-    cudaStream_t stream);
-
-// Batched flash-decoding (BF16, head_dim=64):
-//   q_flat:  device [B, num_q_heads, HD] 连续
-//   k_ptrs_dev / v_ptrs_dev: 设备上的 B 个 cache 起点指针（指针数组本身在 device memory 中）
-//   o_flat:  device [B, num_q_heads, HD] 连续
-//   workspace: B * num_q_heads * N_SPLIT * (2 + HD) 个 float
-//   seq_lens_dev: device [B] int32 (= 每个 seq 的 kv_len)
-void flash_decoding_cu_bf16_batch(
-    const __nv_bfloat16* q_flat,
-    const __nv_bfloat16* const* k_ptrs_dev,
-    const __nv_bfloat16* const* v_ptrs_dev,
-    __nv_bfloat16* o_flat,
-    float* workspace,
-    const int32_t* seq_lens_dev,
-    int32_t batch_size,
-    int32_t num_q_heads,
-    int32_t num_kv_heads,
-    int32_t head_dim,
-    int32_t q_row_stride,
-    int32_t o_row_stride,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
     cudaStream_t stream);
 
 #ifdef __cplusplus

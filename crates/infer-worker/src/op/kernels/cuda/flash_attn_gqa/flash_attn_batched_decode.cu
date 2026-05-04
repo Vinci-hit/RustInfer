@@ -1,0 +1,770 @@
+// flash_attn_batched_decode.cu
+// -----------------------------------------------------------------------------
+// Batched Flash-Decoding: q_len = 1, arbitrary batch with independent KV caches.
+//
+// Design goals
+//   * One kernel launch handles B requests, each with its own KV cache buffer.
+//   * Split-KV along the sequence dim so long contexts can saturate SMs.
+//   * Per-request dynamic `num_splits` inside the kernel — grid shape stays
+//     fixed at (num_q_heads, MaxSplits, B) so CUDA Graph replay is safe.
+//   * Single-split requests write directly to the final output (no reduction).
+//   * Graph-friendly: caller provides fixed device pointer arrays for K/V and
+//     a `req_to_slot` remap; nothing is allocated/freed per step.
+//
+// Pipeline
+//   Pass1 (attention per chunk):
+//       grid = (num_q_heads, MaxSplits, batch),  block = 128 threads
+//       each block computes attention for one (req, q_head, kv_chunk)
+//       if it's the only chunk for that request: write directly to O
+//       otherwise: write to workspace[req, q_head, split, :] + lse
+//   Pass2 (LSE reduction):
+//       grid = (num_q_heads, batch),  block = HeadDim threads
+//       each block merges `num_splits[req]` partials into final O
+//       if only one split existed: bypass (Pass1 already wrote O)
+//
+// Workspace layout (float):
+//       partial_o  : [B, Hq, MaxSplits, HeadDim]
+//       partial_lse: [B, Hq, MaxSplits]
+//       num_splits : [B]      (int32 packed as f32)
+//   Total size = B * Hq * MaxSplits * (HeadDim + 1) * 4 bytes + B * 4 bytes
+// -----------------------------------------------------------------------------
+
+#include "flash_attn_gqa.h"
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include <cstdint>
+#include <cstdio>
+
+namespace flash_batched_decode {
+
+// MaxSplits governs the maximum number of KV chunks a single request can
+// be split into.  The actual `num_splits` is computed from kv_len at runtime.
+// 16 splits × 128-tokens-per-chunk covers kv up to 2048 with chunk=128; longer
+// contexts automatically use a larger chunk size (chunk = ceil(kv/MaxSplits)).
+static constexpr int kMaxSplits       = 16;
+static constexpr int kMinChunkSize    = 128;
+
+// Number of threads per CTA in Pass 1; also used for HeadDim-wise work split.
+// Picked so that HeadDim / Threads is an integer vector size ≥ 4 bytes.
+static constexpr int kPass1Threads = 128;
+
+// Pass 2 uses exactly HeadDim threads (each thread handles one output element).
+// Since HeadDim ∈ {64, 128, 192, 256}, this fits in 1-2 warps cleanly.
+
+// ---- element traits ---------------------------------------------------------
+template <class E> struct ET;
+template <> struct ET<__nv_bfloat16> {
+    using h = __nv_bfloat16;
+    __device__ __forceinline__ static float to_f(h x) { return __bfloat162float(x); }
+    __device__ __forceinline__ static h from_f(float x) { return __float2bfloat16_rn(x); }
+};
+template <> struct ET<__half> {
+    using h = __half;
+    __device__ __forceinline__ static float to_f(h x) { return __half2float(x); }
+    __device__ __forceinline__ static h from_f(float x) { return __float2half_rn(x); }
+};
+
+// ============================================================================
+// Pass 1 kernel
+// ============================================================================
+template <class Elem, int HeadDim>
+__global__ void pass1_kernel(
+    const Elem* __restrict__ q_ptr,
+    int64_t q_stride_b, int64_t q_stride_h,
+    const Elem* const* __restrict__ k_cache_ptrs,
+    const Elem* const* __restrict__ v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+    Elem* __restrict__ o_ptr,
+    int64_t o_stride_b, int64_t o_stride_h,
+    const int32_t* __restrict__ req_to_slot,
+    const int32_t* __restrict__ kv_lens,
+    float*  __restrict__ workspace_partial_o,   // [B, Hq, MaxSplits, HeadDim]
+    float*  __restrict__ workspace_partial_lse, // [B, Hq, MaxSplits]
+    int32_t* __restrict__ workspace_num_splits, // [B]
+    int num_q_heads, int num_kv_heads,
+    float softmax_scale)
+{
+    const int qh    = blockIdx.x;  // query head
+    const int split = blockIdx.y;  // KV chunk index in [0, MaxSplits)
+    const int b     = blockIdx.z;  // batch / request index
+    const int tid   = threadIdx.x;
+
+    // Per-request geometry
+    const int slot  = req_to_slot[b];
+    const int kv_len = kv_lens[b];
+    if (kv_len <= 0) {
+        // Degenerate request; write zero on split==0 so reduction sees NaN-free data.
+        if (split == 0 && tid < HeadDim) {
+            Elem* o_row = o_ptr + (int64_t)b * o_stride_b + (int64_t)qh * o_stride_h;
+            o_row[tid] = ET<Elem>::from_f(0.f);
+            if (tid == 0) workspace_num_splits[b] = 0;
+        }
+        return;
+    }
+
+    // Decide actual splitting for this request.
+    // chunk_size = max(kMinChunkSize, ceil(kv_len / kMaxSplits)), then snap up
+    // to a multiple of 16 for nice vector loads.
+    int chunk_size = (kv_len + kMaxSplits - 1) / kMaxSplits;
+    if (chunk_size < kMinChunkSize) chunk_size = kMinChunkSize;
+    // round up to 16 to keep cp.async aligned (HeadDim is already aligned)
+    chunk_size = (chunk_size + 15) & ~15;
+
+    const int num_splits = (kv_len + chunk_size - 1) / chunk_size;
+    if (split >= num_splits) return;   // this CTA has no work
+
+    // Thread 0 records the actual num_splits so Pass 2 knows how many to merge.
+    if (split == 0 && tid == 0) {
+        workspace_num_splits[b] = num_splits;
+    }
+
+    const int kv_start = split * chunk_size;
+    const int kv_end   = min(kv_start + chunk_size, kv_len);
+    const int chunk_n  = kv_end - kv_start;
+
+    // GQA: pick the KV head that this q_head maps to.
+    const int group_size = num_q_heads / num_kv_heads;
+    const int kv_head    = qh / group_size;
+
+    const Elem* q_bh = q_ptr + (int64_t)b * q_stride_b + (int64_t)qh * q_stride_h;
+    const Elem* k_slot = k_cache_ptrs[slot] + (int64_t)kv_head * kv_stride_h;
+    const Elem* v_slot = v_cache_ptrs[slot] + (int64_t)kv_head * kv_stride_h;
+
+    // Shared memory layout:
+    //   q_smem  : [HeadDim]   float
+    //   s_smem  : [chunk_n]   float  (fits worst case chunk_size rounded up)
+    extern __shared__ unsigned char smem_raw[];
+    float* q_smem = reinterpret_cast<float*>(smem_raw);
+    float* s_smem = q_smem + HeadDim;
+
+    // ---- Load Q into smem (as float32 for FMA convenience) ------------------
+    #pragma unroll
+    for (int i = tid; i < HeadDim; i += kPass1Threads) {
+        q_smem[i] = ET<Elem>::to_f(q_bh[i]) * softmax_scale;
+    }
+    __syncthreads();
+
+    // ---- Pass over KV: compute scores s[j] = <q, K[j]> ----------------------
+    // Each thread owns a subset of the chunk rows. We parallelise across tid
+    // because chunk_n is typically small (128) and we want to keep the inner
+    // reduction over HeadDim inside a warp.
+
+    // Layout we use: blockDim.x = 128 threads split as 32 (lanes over HeadDim)
+    // × 4 (rows-per-step). Each warp handles one KV row at a time, dot product
+    // via warp-reduce.
+    constexpr int kLanes         = 32;
+    constexpr int kWarpsPerBlock = kPass1Threads / 32;  // 4
+    constexpr int kElemsPerLane  = HeadDim / kLanes;    // 2, 4, 6, 8
+
+    static_assert(HeadDim % kLanes == 0,
+                  "HeadDim must be a multiple of 32 (warp size)");
+
+    const int warp_id = tid / 32;
+    const int lane_id = tid & 31;
+
+    // Compute s[j] for j in [0, chunk_n)
+    for (int j = warp_id; j < chunk_n; j += kWarpsPerBlock) {
+        const Elem* k_row = k_slot + (int64_t)(kv_start + j) * kv_stride_s;
+        float acc = 0.f;
+        #pragma unroll
+        for (int e = 0; e < kElemsPerLane; ++e) {
+            const int d = lane_id + e * kLanes;
+            // q already has scale folded in
+            acc += q_smem[d] * ET<Elem>::to_f(k_row[d]);
+        }
+        // warp reduce
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_xor_sync(0xffffffff, acc, off);
+        if (lane_id == 0) s_smem[j] = acc;
+    }
+    __syncthreads();
+
+    // ---- Online softmax over the chunk (all threads together) ---------------
+    // Compute chunk max
+    float m = -INFINITY;
+    for (int j = tid; j < chunk_n; j += kPass1Threads) {
+        float v = s_smem[j];
+        if (v > m) m = v;
+    }
+    // block reduce max (warp-shfl then smem)
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_xor_sync(0xffffffff, m, off);
+        if (other > m) m = other;
+    }
+    __shared__ float m_warp[4];
+    if (lane_id == 0) m_warp[warp_id] = m;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane_id < kWarpsPerBlock) ? m_warp[lane_id] : -INFINITY;
+        #pragma unroll
+        for (int off = kWarpsPerBlock / 2; off > 0; off >>= 1) {
+            float o = __shfl_xor_sync(0xffffffff, v, off);
+            if (o > v) v = o;
+        }
+        if (lane_id == 0) m_warp[0] = v;
+    }
+    __syncthreads();
+    const float m_chunk = m_warp[0];
+
+    // Compute exp(s - m) and row sum
+    float l = 0.f;
+    for (int j = tid; j < chunk_n; j += kPass1Threads) {
+        float e = __expf(s_smem[j] - m_chunk);
+        s_smem[j] = e;
+        l += e;
+    }
+    // block reduce sum of l
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        l += __shfl_xor_sync(0xffffffff, l, off);
+    __shared__ float l_warp[4];
+    if (lane_id == 0) l_warp[warp_id] = l;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane_id < kWarpsPerBlock) ? l_warp[lane_id] : 0.f;
+        #pragma unroll
+        for (int off = kWarpsPerBlock / 2; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, off);
+        }
+        if (lane_id == 0) l_warp[0] = v;
+    }
+    __syncthreads();
+    const float l_chunk = l_warp[0];
+    const float inv_l   = (l_chunk > 0.f) ? (1.f / l_chunk) : 0.f;
+
+    // ---- Accumulate weighted V: o_d = Σ p[j] * V[j, d] ----------------------
+    // Each thread owns `kPerThread` head_dim elements (strided by kPass1Threads).
+    constexpr int kPerThread = (HeadDim + kPass1Threads - 1) / kPass1Threads;
+    float o_local[kPerThread];
+    #pragma unroll
+    for (int i = 0; i < kPerThread; ++i) o_local[i] = 0.f;
+
+    #pragma unroll 4
+    for (int j = 0; j < chunk_n; ++j) {
+        const float p = s_smem[j];
+        const Elem* v_row = v_slot + (int64_t)(kv_start + j) * kv_stride_s;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int d = tid + i * kPass1Threads;
+            if (d < HeadDim) {
+                o_local[i] += p * ET<Elem>::to_f(v_row[d]);
+            }
+        }
+    }
+
+    // ---- Write out ----------------------------------------------------------
+    if (num_splits == 1) {
+        // Write-through: normalize and store directly to the final output.
+        Elem* o_row = o_ptr + (int64_t)b * o_stride_b + (int64_t)qh * o_stride_h;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int d = tid + i * kPass1Threads;
+            if (d < HeadDim) {
+                o_row[d] = ET<Elem>::from_f(o_local[i] * inv_l);
+            }
+        }
+    } else {
+        // Store *locally normalised* partial o:
+        //     partial_o_s = (Σ p_s V) / l_chunk_s
+        // and partial_lse_s = m_chunk + log(l_chunk).
+        // Merge in Pass 2 as:
+        //     o_final = Σ exp(lse_s - m*) * partial_o_s / Σ exp(lse_s - m*)
+        // This formulation has only one reduction weight, so the kernel is
+        // numerically clean and maps to the standard Flash-Decoding recipe.
+        const int64_t po_base = ((int64_t)b * num_q_heads + qh) * kMaxSplits + split;
+        float* po = workspace_partial_o + po_base * HeadDim;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int d = tid + i * kPass1Threads;
+            if (d < HeadDim) {
+                po[d] = o_local[i] * inv_l;
+            }
+        }
+        if (tid == 0) {
+            // Guard against all-zero chunk (shouldn't happen since chunk_n > 0,
+            // but be safe on the log).
+            workspace_partial_lse[po_base] =
+                (l_chunk > 0.f) ? (m_chunk + __logf(l_chunk)) : -INFINITY;
+        }
+    }
+}
+
+// ============================================================================
+// Pass 2 kernel — LSE-weighted merge across splits
+// ============================================================================
+template <class Elem, int HeadDim>
+__global__ void pass2_kernel(
+    Elem* __restrict__ o_ptr,
+    int64_t o_stride_b, int64_t o_stride_h,
+    const float* __restrict__ workspace_partial_o,
+    const float* __restrict__ workspace_partial_lse,
+    const int32_t* __restrict__ workspace_num_splits,
+    int num_q_heads)
+{
+    const int qh = blockIdx.x;
+    const int b  = blockIdx.z;  // grid is (Hq, 1, B)
+    const int tid = threadIdx.x;
+
+    const int num_splits = workspace_num_splits[b];
+    if (num_splits <= 1) return;  // Pass 1 already wrote O directly
+
+    // All threads compute m* from lse table (cheap, only num_splits entries).
+    const int64_t lse_base = ((int64_t)b * num_q_heads + qh) * kMaxSplits;
+    const float* lse_ptr = workspace_partial_lse + lse_base;
+
+    // Broadcast m_star via smem (or just compute in every thread — small trip).
+    __shared__ float m_star;
+    __shared__ float l_star;
+    if (tid == 0) {
+        float m = -INFINITY;
+        #pragma unroll
+        for (int s = 0; s < kMaxSplits; ++s) {
+            if (s >= num_splits) break;
+            float v = lse_ptr[s];
+            if (v > m) m = v;
+        }
+        float l = 0.f;
+        #pragma unroll
+        for (int s = 0; s < kMaxSplits; ++s) {
+            if (s >= num_splits) break;
+            l += __expf(lse_ptr[s] - m);
+        }
+        m_star = m;
+        l_star = l;
+    }
+    __syncthreads();
+
+    const float inv_l = (l_star > 0.f) ? (1.f / l_star) : 0.f;
+
+    // Merge this thread's head-dim element.
+    //   partial_o_s is locally-normalised (= softmax(chunk_s) @ V_s).
+    //   Final:  o = Σ exp(lse_s - m*) * partial_o_s  /  Σ exp(lse_s - m*)
+    if (tid < HeadDim) {
+        const int64_t po_base = ((int64_t)b * num_q_heads + qh) * kMaxSplits;
+        const float* po = workspace_partial_o + po_base * HeadDim;
+
+        float acc = 0.f;
+        #pragma unroll
+        for (int s = 0; s < kMaxSplits; ++s) {
+            if (s >= num_splits) break;
+            float w = __expf(lse_ptr[s] - m_star);
+            acc += w * po[s * HeadDim + tid];
+        }
+
+        Elem* o_row = o_ptr + (int64_t)b * o_stride_b + (int64_t)qh * o_stride_h;
+        o_row[tid] = ET<Elem>::from_f(acc * inv_l);
+    }
+}
+
+// ============================================================================
+// Launcher
+// ============================================================================
+template <class Elem, int HeadDim>
+static cudaError_t launch_impl(
+    const Elem*  q_ptr,      int64_t qsb, int64_t qsh,
+    const Elem* const* k_ptrs,
+    const Elem* const* v_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          Elem*  o_ptr,      int64_t osb, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    float*   workspace,
+    int batch, int num_q_heads, int num_kv_heads,
+    float softmax_scale,
+    cudaStream_t stream)
+{
+    // Workspace partition.
+    float* partial_o  = workspace;
+    float* partial_lse = partial_o + (int64_t)batch * num_q_heads * kMaxSplits * HeadDim;
+    int32_t* num_splits = reinterpret_cast<int32_t*>(partial_lse + (int64_t)batch * num_q_heads * kMaxSplits);
+
+    // Pass 1
+    {
+        dim3 grid(num_q_heads, kMaxSplits, batch);
+        dim3 block(kPass1Threads);
+        // smem: q [HeadDim] + s [chunk_size_max] floats.
+        // chunk_size_max <= max(kMinChunkSize, ceil(kMaxKvLen / kMaxSplits)).
+        // We don't know kv_len here, but chunk_size in kernel is bounded by
+        // ceil(kv_len / kMaxSplits) rounded up to 16. Reserve a safe upper bound:
+        // chunk_size <= 4096 / kMaxSplits * kMaxSplits = 4096 for the largest
+        // split; but for any SINGLE split, chunk_size = ceil(kv_len / num_splits)
+        // so max realistic ~= 1024. Give generous headroom.
+        const int kv_chunk_smem = 2048;  // sufficient for kv_len up to 32768
+        const size_t smem_size = (HeadDim + kv_chunk_smem) * sizeof(float);
+        auto kernel = pass1_kernel<Elem, HeadDim>;
+        cudaError_t err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size);
+        if (err != cudaSuccess) return err;
+        kernel<<<grid, block, smem_size, stream>>>(
+            q_ptr, qsb, qsh,
+            k_ptrs, v_ptrs, kv_stride_s, kv_stride_h,
+            o_ptr, osb, osh,
+            req_to_slot, kv_lens,
+            partial_o, partial_lse, num_splits,
+            num_q_heads, num_kv_heads, softmax_scale);
+    }
+
+    // Pass 2
+    {
+        dim3 grid(num_q_heads, 1, batch);
+        dim3 block(HeadDim);
+        auto kernel = pass2_kernel<Elem, HeadDim>;
+        kernel<<<grid, block, 0, stream>>>(
+            o_ptr, osb, osh,
+            partial_o, partial_lse, num_splits,
+            num_q_heads);
+    }
+
+    return cudaGetLastError();
+}
+
+template <class Elem>
+static cudaError_t launch_dispatch(
+    const Elem*  q,  int64_t qsb, int64_t qsh,
+    const Elem* const* k_ptrs,
+    const Elem* const* v_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          Elem*  o,  int64_t osb, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    float*   workspace,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
+    cudaStream_t stream)
+{
+    switch (head_dim) {
+    case 64:  return launch_impl<Elem,  64>(q,qsb,qsh, k_ptrs,v_ptrs,kv_stride_s,kv_stride_h,
+                                            o,osb,osh, req_to_slot,kv_lens,workspace,
+                                            batch,num_q_heads,num_kv_heads,
+                                            softmax_scale,stream);
+    case 128: return launch_impl<Elem, 128>(q,qsb,qsh, k_ptrs,v_ptrs,kv_stride_s,kv_stride_h,
+                                            o,osb,osh, req_to_slot,kv_lens,workspace,
+                                            batch,num_q_heads,num_kv_heads,
+                                            softmax_scale,stream);
+    case 192: return launch_impl<Elem, 192>(q,qsb,qsh, k_ptrs,v_ptrs,kv_stride_s,kv_stride_h,
+                                            o,osb,osh, req_to_slot,kv_lens,workspace,
+                                            batch,num_q_heads,num_kv_heads,
+                                            softmax_scale,stream);
+    case 256: return launch_impl<Elem, 256>(q,qsb,qsh, k_ptrs,v_ptrs,kv_stride_s,kv_stride_h,
+                                            o,osb,osh, req_to_slot,kv_lens,workspace,
+                                            batch,num_q_heads,num_kv_heads,
+                                            softmax_scale,stream);
+    default:
+        fprintf(stderr, "[flash_batched_decode] unsupported head_dim=%d "
+                        "(supported: 64, 128, 192, 256)\n", head_dim);
+        return cudaErrorInvalidValue;
+    }
+}
+
+}  // namespace flash_batched_decode
+
+// ============================================================================
+// Public C ABI
+// ============================================================================
+extern "C" {
+
+// Required workspace size (in bytes) for a given (batch, num_q_heads, head_dim).
+int64_t flash_attn_batched_decode_workspace_bytes(
+    int batch, int num_q_heads, int head_dim)
+{
+    constexpr int kMaxSplits = flash_batched_decode::kMaxSplits;
+    int64_t partial_o   = (int64_t)batch * num_q_heads * kMaxSplits * head_dim * (int64_t)sizeof(float);
+    int64_t partial_lse = (int64_t)batch * num_q_heads * kMaxSplits * (int64_t)sizeof(float);
+    int64_t num_splits  = (int64_t)batch * (int64_t)sizeof(int32_t);
+    return partial_o + partial_lse + num_splits;
+}
+
+void launch_flash_attn_batched_decode_bf16(
+    const __nv_bfloat16* q, int64_t qsb, int64_t qsh,
+    const __nv_bfloat16* const* k_ptrs,
+    const __nv_bfloat16* const* v_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __nv_bfloat16* o, int64_t osb, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    float* workspace,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
+    cudaStream_t stream)
+{
+    cudaError_t err = flash_batched_decode::launch_dispatch<__nv_bfloat16>(
+        q, qsb, qsh, k_ptrs, v_ptrs, kv_stride_s, kv_stride_h,
+        o, osb, osh, req_to_slot, kv_lens, workspace,
+        batch, num_q_heads, num_kv_heads, head_dim, softmax_scale, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[flash_attn_batched_decode_bf16] launch error: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
+void launch_flash_attn_batched_decode_fp16(
+    const __half* q, int64_t qsb, int64_t qsh,
+    const __half* const* k_ptrs,
+    const __half* const* v_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __half* o, int64_t osb, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    float* workspace,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
+    cudaStream_t stream)
+{
+    cudaError_t err = flash_batched_decode::launch_dispatch<__half>(
+        q, qsb, qsh, k_ptrs, v_ptrs, kv_stride_s, kv_stride_h,
+        o, osb, osh, req_to_slot, kv_lens, workspace,
+        batch, num_q_heads, num_kv_heads, head_dim, softmax_scale, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[flash_attn_batched_decode_fp16] launch error: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
+} // extern "C"
+
+
+// =============================================================================
+// Stand-alone test main (same pattern as flash_attn_gqa_prefill.cu)
+//   nvcc -std=c++17 -arch=sm_80 -O3 -I<cutlass-include> \
+//        -DFLASH_ATTN_BATCHED_DECODE_STANDALONE_TEST \
+//        flash_attn_batched_decode.cu -o bdecode_test
+// =============================================================================
+#ifdef FLASH_ATTN_BATCHED_DECODE_STANDALONE_TEST
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <random>
+#include <vector>
+
+#define CUDA_MUST(e) do { cudaError_t _e=(e); if(_e!=cudaSuccess){ \
+    std::cerr<<cudaGetErrorString(_e)<<" @ "<<__FILE__<<":"<<__LINE__<<"\n"; std::exit(1);}} while(0)
+
+template <class E> struct HT;
+template <> struct HT<__nv_bfloat16> {
+    static __nv_bfloat16 f(float x) { return __float2bfloat16(x); }
+    static float to(__nv_bfloat16 x) { return __bfloat162float(x); }
+    static const char* n() { return "bf16"; }
+};
+template <> struct HT<__half> {
+    static __half f(float x) { return __float2half(x); }
+    static float to(__half x) { return __half2float(x); }
+    static const char* n() { return "fp16"; }
+};
+
+__global__ void ref_decode(
+    const float* Q, int64_t qsb, int64_t qsh,
+    const float* K, const float* V,
+    int64_t kvs_s, int64_t kvs_h,
+    float* O, int64_t osb, int64_t osh,
+    int Hq, int Hkv, int HD, int kv_len, float scale)
+{
+    int b  = blockIdx.z;
+    int qh = blockIdx.y;
+    int kvh = qh / (Hq / Hkv);
+
+    const float* q = Q + b*qsb + qh*qsh;
+    const float* k_base = K + (int64_t)b * (kv_len * kvs_s) + kvh*kvs_h;
+    const float* v_base = V + (int64_t)b * (kv_len * kvs_s) + kvh*kvs_h;
+    float* o = O + b*osb + qh*osh;
+
+    float m = -INFINITY;
+    for (int t = 0; t < kv_len; ++t) {
+        const float* kp = k_base + (int64_t)t * kvs_s;
+        float s = 0.f;
+        for (int d = 0; d < HD; ++d) s += q[d] * kp[d];
+        s *= scale;
+        if (s > m) m = s;
+    }
+    float denom = 0.f;
+    for (int d = 0; d < HD; ++d) o[d] = 0.f;
+    for (int t = 0; t < kv_len; ++t) {
+        const float* kp = k_base + (int64_t)t * kvs_s;
+        const float* vp = v_base + (int64_t)t * kvs_s;
+        float s = 0.f;
+        for (int d = 0; d < HD; ++d) s += q[d] * kp[d];
+        float e = __expf(s * scale - m);
+        denom += e;
+        for (int d = 0; d < HD; ++d) o[d] += e * vp[d];
+    }
+    float inv = (denom==0.f)?1.f:1.f/denom;
+    for (int d = 0; d < HD; ++d) o[d] *= inv;
+}
+
+extern "C" int64_t flash_attn_batched_decode_workspace_bytes(int,int,int);
+extern "C" void launch_flash_attn_batched_decode_bf16(
+    const __nv_bfloat16*, int64_t, int64_t,
+    const __nv_bfloat16* const*, const __nv_bfloat16* const*,
+    int64_t, int64_t,
+    __nv_bfloat16*, int64_t, int64_t,
+    const int32_t*, const int32_t*,
+    float*, int, int, int, int, float, cudaStream_t);
+extern "C" void launch_flash_attn_batched_decode_fp16(
+    const __half*, int64_t, int64_t,
+    const __half* const*, const __half* const*,
+    int64_t, int64_t,
+    __half*, int64_t, int64_t,
+    const int32_t*, const int32_t*,
+    float*, int, int, int, int, float, cudaStream_t);
+
+template <class Elem>
+bool run_case(int B, int Hq, int Hkv, int HD, std::vector<int> kv_lens_host, std::mt19937& rng) {
+    const int max_kv = *std::max_element(kv_lens_host.begin(), kv_lens_host.end());
+    const float scale = 1.f / std::sqrt((float)HD);
+
+    // Build independent KV caches: B buffers each [max_kv, Hkv, HD]
+    std::vector<std::vector<Elem>>  h_k(B), h_v(B);
+    std::vector<std::vector<float>> fk(B),  fv(B);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    for (int b = 0; b < B; ++b) {
+        h_k[b].resize((size_t)max_kv * Hkv * HD);
+        h_v[b].resize((size_t)max_kv * Hkv * HD);
+        fk[b].resize(h_k[b].size()); fv[b].resize(h_v[b].size());
+        for (size_t i = 0; i < h_k[b].size(); ++i) {
+            float a = dist(rng), c = dist(rng);
+            fk[b][i] = a; fv[b][i] = c;
+            h_k[b][i] = HT<Elem>::f(a); h_v[b][i] = HT<Elem>::f(c);
+        }
+    }
+    // Q: [B, Hq, HD]
+    std::vector<Elem>  h_q((size_t)B * Hq * HD);
+    std::vector<float> fq((size_t)B * Hq * HD);
+    for (size_t i = 0; i < fq.size(); ++i) { float x = dist(rng); fq[i] = x; h_q[i] = HT<Elem>::f(x); }
+
+    // Allocate device buffers
+    Elem* d_q=nullptr; CUDA_MUST(cudaMalloc(&d_q, h_q.size()*sizeof(Elem)));
+    CUDA_MUST(cudaMemcpy(d_q, h_q.data(), h_q.size()*sizeof(Elem), cudaMemcpyHostToDevice));
+
+    std::vector<Elem*> d_k_slots(B), d_v_slots(B);
+    for (int b = 0; b < B; ++b) {
+        CUDA_MUST(cudaMalloc(&d_k_slots[b], h_k[b].size()*sizeof(Elem)));
+        CUDA_MUST(cudaMalloc(&d_v_slots[b], h_v[b].size()*sizeof(Elem)));
+        CUDA_MUST(cudaMemcpy(d_k_slots[b], h_k[b].data(), h_k[b].size()*sizeof(Elem), cudaMemcpyHostToDevice));
+        CUDA_MUST(cudaMemcpy(d_v_slots[b], h_v[b].data(), h_v[b].size()*sizeof(Elem), cudaMemcpyHostToDevice));
+    }
+    Elem** d_k_ptrs=nullptr; CUDA_MUST(cudaMalloc(&d_k_ptrs, B*sizeof(Elem*)));
+    Elem** d_v_ptrs=nullptr; CUDA_MUST(cudaMalloc(&d_v_ptrs, B*sizeof(Elem*)));
+    CUDA_MUST(cudaMemcpy(d_k_ptrs, d_k_slots.data(), B*sizeof(Elem*), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemcpy(d_v_ptrs, d_v_slots.data(), B*sizeof(Elem*), cudaMemcpyHostToDevice));
+
+    int32_t* d_kvlen=nullptr; CUDA_MUST(cudaMalloc(&d_kvlen, B*sizeof(int32_t)));
+    CUDA_MUST(cudaMemcpy(d_kvlen, kv_lens_host.data(), B*sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    std::vector<int32_t> slot_map(B);
+    for (int b = 0; b < B; ++b) slot_map[b] = b;
+    int32_t* d_slot=nullptr; CUDA_MUST(cudaMalloc(&d_slot, B*sizeof(int32_t)));
+    CUDA_MUST(cudaMemcpy(d_slot, slot_map.data(), B*sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    Elem* d_o=nullptr; CUDA_MUST(cudaMalloc(&d_o, (size_t)B*Hq*HD*sizeof(Elem)));
+    CUDA_MUST(cudaMemset(d_o, 0, (size_t)B*Hq*HD*sizeof(Elem)));
+
+    int64_t ws_bytes = flash_attn_batched_decode_workspace_bytes(B, Hq, HD);
+    float* d_ws=nullptr; CUDA_MUST(cudaMalloc(&d_ws, ws_bytes));
+
+    const int64_t qsb = (int64_t)Hq * HD, qsh = HD;
+    const int64_t osb = qsb, osh = qsh;
+    const int64_t kvs_s = (int64_t)Hkv * HD, kvs_h = HD;
+
+    if constexpr (std::is_same_v<Elem, __nv_bfloat16>) {
+        launch_flash_attn_batched_decode_bf16(
+            d_q, qsb, qsh,
+            (const __nv_bfloat16* const*)d_k_ptrs,
+            (const __nv_bfloat16* const*)d_v_ptrs,
+            kvs_s, kvs_h,
+            d_o, osb, osh,
+            d_slot, d_kvlen,
+            d_ws,
+            B, Hq, Hkv, HD, scale, 0);
+    } else {
+        launch_flash_attn_batched_decode_fp16(
+            d_q, qsb, qsh,
+            (const __half* const*)d_k_ptrs,
+            (const __half* const*)d_v_ptrs,
+            kvs_s, kvs_h,
+            d_o, osb, osh,
+            d_slot, d_kvlen,
+            d_ws,
+            B, Hq, Hkv, HD, scale, 0);
+    }
+    CUDA_MUST(cudaDeviceSynchronize());
+
+    // Reference on f32 (per batch, because kv_lens differ we need per-b launch)
+    std::vector<float> ref_o((size_t)B*Hq*HD, 0.f);
+    for (int b = 0; b < B; ++b) {
+        const int kv_len = kv_lens_host[b];
+        // copy per-b slices
+        float* d_Q=nullptr; cudaMalloc(&d_Q, (size_t)Hq*HD*sizeof(float));
+        float* d_K=nullptr; cudaMalloc(&d_K, (size_t)kv_len*Hkv*HD*sizeof(float));
+        float* d_V=nullptr; cudaMalloc(&d_V, (size_t)kv_len*Hkv*HD*sizeof(float));
+        float* d_O=nullptr; cudaMalloc(&d_O, (size_t)Hq*HD*sizeof(float));
+        cudaMemcpy(d_Q, fq.data() + (size_t)b*Hq*HD, Hq*HD*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_K, fk[b].data(), (size_t)kv_len*Hkv*HD*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_V, fv[b].data(), (size_t)kv_len*Hkv*HD*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemset(d_O, 0, (size_t)Hq*HD*sizeof(float));
+
+        ref_decode<<<dim3(1, Hq, 1)>>>(
+            d_Q, (int64_t)Hq*HD, HD,
+            d_K, d_V, (int64_t)Hkv*HD, HD,
+            d_O, (int64_t)Hq*HD, HD,
+            Hq, Hkv, HD, kv_len, scale);
+        cudaDeviceSynchronize();
+
+        std::vector<float> tmp(Hq*HD);
+        cudaMemcpy(tmp.data(), d_O, Hq*HD*sizeof(float), cudaMemcpyDeviceToHost);
+        std::copy(tmp.begin(), tmp.end(), ref_o.begin() + (size_t)b*Hq*HD);
+        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+    }
+
+    std::vector<Elem> got((size_t)B*Hq*HD);
+    CUDA_MUST(cudaMemcpy(got.data(), d_o, got.size()*sizeof(Elem), cudaMemcpyDeviceToHost));
+
+    const float atol = std::is_same_v<Elem, __nv_bfloat16> ? 7e-2f : 1e-2f;
+    const float rtol = std::is_same_v<Elem, __nv_bfloat16> ? 1e-2f : 5e-3f;
+    double max_err = 0; long bad = 0;
+    for (size_t i = 0; i < ref_o.size(); ++i) {
+        float a = HT<Elem>::to(got[i]);
+        float r = ref_o[i];
+        float e = std::fabs(a - r);
+        float tol = atol + rtol * std::fabs(r);
+        max_err = std::max<double>(max_err, e);
+        if (e > tol) ++bad;
+    }
+    std::printf("  [%s] B=%d Hq=%d Hkv=%d HD=%d kv_lens=", HT<Elem>::n(), B, Hq, Hkv, HD);
+    for (int x : kv_lens_host) std::printf("%d,", x);
+    std::printf("  max_err=%.4e bad=%ld/%zu  %s\n", max_err, bad, ref_o.size(), bad==0?"OK":"FAIL");
+
+    cudaFree(d_q); cudaFree(d_o); cudaFree(d_kvlen); cudaFree(d_slot); cudaFree(d_ws);
+    for (int b = 0; b < B; ++b) { cudaFree(d_k_slots[b]); cudaFree(d_v_slots[b]); }
+    cudaFree(d_k_ptrs); cudaFree(d_v_ptrs);
+    return bad == 0;
+}
+
+int main() {
+    std::mt19937 rng(0xBEEF);
+    bool ok = true;
+
+    std::cout << "=== BF16 ===\n";
+    ok &= run_case<__nv_bfloat16>(1,  8, 2,  64, {100},                  rng);
+    ok &= run_case<__nv_bfloat16>(3,  4, 2,  64, {10, 20, 30},           rng);
+    ok &= run_case<__nv_bfloat16>(3,  8, 2,  64, {99, 199, 299},         rng);
+    ok &= run_case<__nv_bfloat16>(4,  8, 2, 128, {50, 50, 50, 50},       rng);   // 50+50
+    ok &= run_case<__nv_bfloat16>(4, 16, 4, 128, {100, 2048, 500, 99},   rng);   // mixed
+    ok &= run_case<__nv_bfloat16>(2,  8, 2, 128, {4096, 8192},           rng);   // long ctx
+    ok &= run_case<__nv_bfloat16>(1,  8, 2, 192, {1234},                 rng);
+    ok &= run_case<__nv_bfloat16>(1,  8, 2, 256, {1024},                 rng);
+
+    std::cout << "=== FP16 ===\n";
+    ok &= run_case<__half>(1,  8, 2,  64, {100},                  rng);
+    ok &= run_case<__half>(3,  4, 2,  64, {10, 20, 30},           rng);
+    ok &= run_case<__half>(4,  8, 2, 128, {50, 50, 50, 50},       rng);
+    ok &= run_case<__half>(4, 16, 4, 128, {100, 2048, 500, 99},   rng);
+    ok &= run_case<__half>(2,  8, 2, 128, {4096, 8192},           rng);
+
+    std::cout << (ok?"ALL TESTS PASSED\n":"SOME TESTS FAILED\n");
+    return ok ? 0 : 1;
+}
+#endif // FLASH_ATTN_BATCHED_DECODE_STANDALONE_TEST

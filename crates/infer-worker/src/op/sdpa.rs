@@ -258,11 +258,10 @@ pub fn dit_sdpa(
         if !force_fallback
             && q.device().is_cuda()
             && q.dtype() == DataType::BF16
-            && head_dim == 128
-            && seq % 128 == 0
+            && matches!(head_dim, 64 | 128 | 192 | 256)
             && seq > 0
         {
-            return dit_sdpa_cuda_flash_bf16_hdim128(q, k, v, output, seq, n_heads, cuda_config);
+            return dit_sdpa_cuda_flash_bf16_hdim128(q, k, v, output, seq, n_heads, head_dim, cuda_config);
         }
     }
 
@@ -278,46 +277,48 @@ fn dit_sdpa_cuda_flash_bf16_hdim128(
     output: &mut Tensor,
     seq: usize,
     n_heads: usize,
+    head_dim: usize,
     _cuda_config: Option<&crate::OpConfig>,
 ) -> Result<()> {
     use crate::cuda::CudaConfig;
 
+    // Use the new stride-aware prefill kernel (batch=1, self-attn, no causal).
     unsafe extern "C" {
-        fn launch_flash_attn_cute_bf16_hdim128(
-            q_ptr: *const half::bf16,
-            k_ptr: *const half::bf16,
-            v_ptr: *const half::bf16,
-            o_ptr: *mut half::bf16,
-            q_seq_len: i32,
-            kv_len_ptr: *const i32,
-            num_q_heads: i32,
-            num_kv_heads: i32,
-            is_causal: i32,
+        fn launch_flash_attn_prefill_bf16(
+            q: *const half::bf16, qsb: i64, qss: i64, qsh: i64,
+            k: *const half::bf16, ksb: i64, kss: i64, ksh: i64,
+            v: *const half::bf16, vsb: i64, vss: i64, vsh: i64,
+            o: *mut   half::bf16, osb: i64, oss: i64, osh: i64,
+            batch: i32, q_len: i32, kv_len: i32,
+            num_q_heads: i32, num_kv_heads: i32, head_dim: i32,
+            softmax_scale: f32, is_causal: i32,
             stream: crate::cuda::ffi::cudaStream_t,
         );
     }
 
     let stream = CudaConfig::resolve_stream(_cuda_config);
 
-    // Self-attention (no KV cache): the kernel computes kv_len = *kv_len_ptr
-    // + seq, which it does on the HOST side (see the kernel's launch
-    // function). So kv_len_ptr must be a host pointer; a stack i32 of 0
-    // satisfies that and makes `kv_len == seq`.
-    let kv_len_host: i32 = 0;
+    // SHD [seq, n_heads, head_dim] contiguous → canonical row-major strides.
+    let ss = (n_heads * head_dim) as i64;       // stride along seq
+    let hs = head_dim as i64;                   // stride along head
+    let bs = (seq as i64) * ss;                 // stride along batch (unused, B=1)
 
     let q_ptr = q.as_bf16()?.data_ptr();
     let k_ptr = k.as_bf16()?.data_ptr();
     let v_ptr = v.as_bf16()?.data_ptr();
     let o_ptr = output.as_bf16_mut()?.data_ptr_mut();
 
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
     unsafe {
-        launch_flash_attn_cute_bf16_hdim128(
-            q_ptr, k_ptr, v_ptr, o_ptr,
-            seq as i32,
-            &kv_len_host as *const i32,
-            n_heads as i32,
-            n_heads as i32, // self-attn: num_kv_heads == num_q_heads
-            /*is_causal=*/ 0,
+        launch_flash_attn_prefill_bf16(
+            q_ptr, bs, ss, hs,
+            k_ptr, bs, ss, hs,
+            v_ptr, bs, ss, hs,
+            o_ptr, bs, ss, hs,
+            /*batch=*/1, seq as i32, seq as i32,
+            n_heads as i32, n_heads as i32, head_dim as i32,
+            scale, /*is_causal=*/0,
             stream,
         );
     }

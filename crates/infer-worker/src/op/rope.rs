@@ -47,6 +47,11 @@ impl RoPEOp {
     /// - prefill 一段：caller 提前把 `[start, start+1, ..., start+seq_len-1]` 写进去。
     /// - decode 单步：`positions = [p]`。
     /// - batch decode：`positions = [p_0, p_1, ..., p_{B-1}]`。
+    ///
+    /// **Stride-aware**：`q` / `k` 可以是 strided view（例如 `qkv.narrow(1, ...)`
+    /// 切出来的列段），kernel 用各自真实的 row stride 访问。要求：
+    ///   - q / k 都是 2D；
+    ///   - 最内层 stride == 1（列方向连续）—— `narrow` 在非 0 维切出来天然满足。
     pub fn forward(
         &self,
         positions: &Tensor,
@@ -69,11 +74,20 @@ impl RoPEOp {
             }
             #[cfg(feature = "cuda")]
             DeviceType::Cuda(_) => {
-                kernels::cuda::rope(
+                // 用 tensor 真实的 row stride / storage offset 喂给 stride-aware
+                // kernel —— 这样 `qkv.narrow(1, 0, q_dim)` 切出来的 strided q 也
+                // 能直接跑，不需要先物理 split。
+                let seq_len = q.shape()[0];
+                let q_row_stride = q.strides()[0];
+                let k_row_stride = k.strides()[0];
+                // `data_ptr_mut()` 已经把 storage_offset 叠进去，所以这里 col_offset=0。
+                kernels::cuda::rope_strided(
                     self.dim, self.kv_dim, self.head_size,
                     q, k,
+                    q_row_stride, k_row_stride, 0, 0,
                     positions,
                     sin_cache, cos_cache,
+                    seq_len,
                     cuda_config,
                 )?;
             }
@@ -428,6 +442,203 @@ use crate::base::DeviceType;
         let kb = k_b.as_bf16()?.as_slice()?;
         assert_eq!(qa, qb, "q rope batch vs loop mismatch");
         assert_eq!(ka, kb, "k rope batch vs loop mismatch");
+        Ok(())
+    }
+
+    // ========================================================================
+    //  Stride 正确性：Q/K 作为 fused `qkv` 的列视图 vs 先物理 split 再跑 rope
+    //  两种输入几何应得到逐 bit 相同的结果。
+    //
+    //  这个测试直接锁死"strided view 能 in-place 过 rope"的不变量 ——
+    //  llama3 Attention 已经依赖它，以后任何 kernel 改动都要保持通过。
+    // ========================================================================
+
+    fn build_qkv_bf16(
+        seq_len: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        device: DeviceType,
+    ) -> Result<(Tensor, Vec<half::bf16>)> {
+        let total_cols = q_dim + 2 * kv_dim;
+        let dtype = DataType::BF16;
+        let mut qkv = Tensor::new(&[seq_len, total_cols], dtype, device)?;
+        let mut rng = rand::rng();
+        let data: Vec<half::bf16> = (0..(seq_len * total_cols))
+            .map(|_| half::bf16::from_f32(rng.random_range(-1.0f32..1.0f32)))
+            .collect();
+        qkv.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&data);
+        Ok((qkv, data))
+    }
+
+    /// CPU：`qkv.narrow(1, ...)` 直接喂给 rope 的结果，必须等于先把 q/k 拷到
+    /// 连续 tensor 再跑 rope 的结果（逐 bit 相等，因为都是同一 kernel 路径）。
+    #[test]
+    fn test_rope_stride_cpu_qkv_split_matches_contiguous() -> Result<()> {
+        let seq_len = 4;
+        let head_size = 32;
+        let q_dim = 128;   // 4 heads
+        let kv_dim = 64;   // 2 heads
+        let device = DeviceType::Cpu;
+
+        // 共享随机数据：一份给 "strided 路径"，另一份等价数据给 "连续路径"
+        let (qkv, data) = build_qkv_bf16(seq_len, q_dim, kv_dim, device)?;
+
+        // positions = [0, 1, 2, 3]
+        let mut positions = Tensor::new(&[seq_len], DataType::I32, device)?;
+        for (i, v) in positions.as_i32_mut()?.as_slice_mut()?.iter_mut().enumerate() {
+            *v = i as i32;
+        }
+
+        // sin/cos cache
+        let max_seq_len = seq_len + 8;
+        let (sin_cache, cos_cache) = fill_sin_cos_bf16(head_size, max_seq_len)?;
+
+        // --- A. strided 路径：q/k 是 qkv 的列视图 ---
+        let op = RoPEOp::new(q_dim, kv_dim, head_size)?;
+        {
+            let mut q_view = qkv.narrow(1, 0, q_dim)?;
+            let mut k_view = qkv.narrow(1, q_dim, kv_dim)?;
+            op.forward(&positions, &sin_cache, &cos_cache, &mut q_view, &mut k_view, None)?;
+        }
+        // 读回 strided 路径的 q / k 段（只比较这两段，V 段没被旋转不关心）
+        let qkv_after_strided = qkv.as_bf16()?.as_slice()?.to_vec();
+        let mut q_strided = vec![half::bf16::from_f32(0.0); seq_len * q_dim];
+        let mut k_strided = vec![half::bf16::from_f32(0.0); seq_len * kv_dim];
+        let total_cols = q_dim + 2 * kv_dim;
+        for i in 0..seq_len {
+            for j in 0..q_dim {
+                q_strided[i * q_dim + j] = qkv_after_strided[i * total_cols + j];
+            }
+            for j in 0..kv_dim {
+                k_strided[i * kv_dim + j] = qkv_after_strided[i * total_cols + q_dim + j];
+            }
+        }
+
+        // --- B. 连续路径：把 Q/K 先拷贝到独立 tensor 再跑 rope ---
+        let mut q_dense = Tensor::new(&[seq_len, q_dim], DataType::BF16, device)?;
+        let mut k_dense = Tensor::new(&[seq_len, kv_dim], DataType::BF16, device)?;
+        for i in 0..seq_len {
+            for j in 0..q_dim {
+                q_dense.as_bf16_mut()?.as_slice_mut()?[i * q_dim + j]
+                    = data[i * total_cols + j];
+            }
+            for j in 0..kv_dim {
+                k_dense.as_bf16_mut()?.as_slice_mut()?[i * kv_dim + j]
+                    = data[i * total_cols + q_dim + j];
+            }
+        }
+        op.forward(&positions, &sin_cache, &cos_cache, &mut q_dense, &mut k_dense, None)?;
+
+        // --- 比对：两条路径必须逐 bit 一致 ---
+        assert_eq!(q_dense.as_bf16()?.as_slice()?, q_strided.as_slice(),
+                   "Q 旋转结果 strided vs contiguous 不一致");
+        assert_eq!(k_dense.as_bf16()?.as_slice()?, k_strided.as_slice(),
+                   "K 旋转结果 strided vs contiguous 不一致");
+
+        // --- 附加：V 段完全未被改动 ---
+        for i in 0..seq_len {
+            for j in 0..kv_dim {
+                let orig = data[i * total_cols + q_dim + kv_dim + j];
+                let now  = qkv_after_strided[i * total_cols + q_dim + kv_dim + j];
+                assert_eq!(orig, now, "V 段第 ({},{}) 被 rope 误改", i, j);
+            }
+        }
+        Ok(())
+    }
+
+    /// CUDA 版：同上几何等价性。
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_rope_stride_cuda_qkv_split_matches_contiguous() -> Result<()> {
+        let seq_len = 4;
+        let head_size = 64;
+        let q_dim = 256;   // 4 heads
+        let kv_dim = 128;  // 2 heads
+        let device = DeviceType::Cuda(0);
+        let total_cols = q_dim + 2 * kv_dim;
+
+        // 先在 CPU 准备随机数据，再上传两份：一份 fused qkv，一份 split 后 q/k
+        let mut rng = rand::rng();
+        let data: Vec<half::bf16> = (0..(seq_len * total_cols))
+            .map(|_| half::bf16::from_f32(rng.random_range(-1.0f32..1.0f32)))
+            .collect();
+
+        let mut qkv = Tensor::new(&[seq_len, total_cols], DataType::BF16, device)?;
+        qkv.as_bf16_mut()?.buffer_mut().copy_from_host(&data)?;
+
+        let mut q_dense = Tensor::new(&[seq_len, q_dim], DataType::BF16, device)?;
+        let mut k_dense = Tensor::new(&[seq_len, kv_dim], DataType::BF16, device)?;
+        let mut q_host = vec![half::bf16::from_f32(0.0); seq_len * q_dim];
+        let mut k_host = vec![half::bf16::from_f32(0.0); seq_len * kv_dim];
+        for i in 0..seq_len {
+            for j in 0..q_dim {
+                q_host[i * q_dim + j] = data[i * total_cols + j];
+            }
+            for j in 0..kv_dim {
+                k_host[i * kv_dim + j] = data[i * total_cols + q_dim + j];
+            }
+        }
+        q_dense.as_bf16_mut()?.buffer_mut().copy_from_host(&q_host)?;
+        k_dense.as_bf16_mut()?.buffer_mut().copy_from_host(&k_host)?;
+
+        // positions on device
+        let positions_host: Vec<i32> = (0..seq_len as i32).collect();
+        let mut positions_cpu = Tensor::new(&[seq_len], DataType::I32, DeviceType::Cpu)?;
+        positions_cpu.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&positions_host);
+        let positions = positions_cpu.to_cuda(0)?;
+
+        // sin/cos cache on device（BF16）
+        let max_seq_len = seq_len + 8;
+        let (sin_cpu, cos_cpu) = fill_sin_cos_bf16(head_size, max_seq_len)?;
+        let sin_cache = sin_cpu.to_cuda(0)?;
+        let cos_cache = cos_cpu.to_cuda(0)?;
+
+        let op = RoPEOp::new(q_dim, kv_dim, head_size)?;
+        let cfg = crate::cuda::CudaConfig::new()?;
+
+        // --- A. strided 路径 ---
+        {
+            let mut q_view = qkv.narrow(1, 0, q_dim)?;
+            let mut k_view = qkv.narrow(1, q_dim, kv_dim)?;
+            op.forward(&positions, &sin_cache, &cos_cache, &mut q_view, &mut k_view, Some(&cfg))?;
+        }
+
+        // --- B. 连续路径 ---
+        op.forward(&positions, &sin_cache, &cos_cache, &mut q_dense, &mut k_dense, Some(&cfg))?;
+
+        // --- 取回 CPU 比对 ---
+        let qkv_host = qkv.to_cpu()?;
+        let q_ref    = q_dense.to_cpu()?;
+        let k_ref    = k_dense.to_cpu()?;
+
+        let qkv_out   = qkv_host.as_bf16()?.as_slice()?;
+        let q_ref_out = q_ref.as_bf16()?.as_slice()?;
+        let k_ref_out = k_ref.as_bf16()?.as_slice()?;
+
+        for i in 0..seq_len {
+            for j in 0..q_dim {
+                let strided = qkv_out[i * total_cols + j];
+                let dense   = q_ref_out[i * q_dim + j];
+                assert_eq!(strided, dense,
+                    "CUDA Q 旋转在 ({},{}) strided={} dense={}",
+                    i, j, strided.to_f32(), dense.to_f32());
+            }
+            for j in 0..kv_dim {
+                let strided = qkv_out[i * total_cols + q_dim + j];
+                let dense   = k_ref_out[i * kv_dim + j];
+                assert_eq!(strided, dense,
+                    "CUDA K 旋转在 ({},{}) strided={} dense={}",
+                    i, j, strided.to_f32(), dense.to_f32());
+            }
+            // V 段未动
+            for j in 0..kv_dim {
+                let orig = data[i * total_cols + q_dim + kv_dim + j];
+                let now  = qkv_out[i * total_cols + q_dim + kv_dim + j];
+                assert_eq!(orig, now,
+                    "CUDA V 段 ({},{}) 被 rope 误改：{} -> {}",
+                    i, j, orig.to_f32(), now.to_f32());
+            }
+        }
         Ok(())
     }
 }

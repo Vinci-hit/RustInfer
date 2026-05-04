@@ -70,6 +70,24 @@ impl RMSNorm {
             DeviceType::Cuda(_) => kernels::cuda::rmsnorm_inplace(x, weight, self.eps, cuda_config),
         }
     }
+
+    /// Fused `residual += input; out = rmsnorm(residual, self.weight, self.eps)`.
+    ///
+    /// 等价于 [`crate::op::fused_add_rmsnorm::fused_add_rmsnorm`]，但由
+    /// `RMSNorm` 自身持有 weight / eps —— 调用方不再需要显式传 weight。
+    /// 这就是在模型代码里替代 `fused_add_rmsnorm(out, x, a, &next_norm.weight, eps, cfg)`
+    /// 的那一行的优雅形态：`next_norm.forward_with_residual(out, x, a, cfg)`。
+    pub fn forward_with_residual(
+        &self,
+        out: &mut Tensor,
+        residual: &mut Tensor,
+        input: &Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
+        crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
+            out, residual, input, &self.weight, self.eps, cuda_config,
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]

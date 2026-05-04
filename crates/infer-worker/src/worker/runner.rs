@@ -54,12 +54,9 @@ impl<M: LlmModel> ModelRunner<M> {
         model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache)?;
 
         #[cfg(feature = "cuda")]
-        let batch_cuda_cfg = crate::cuda::CudaConfig::new()?
-            .with_flash_decode(
-                model.config().head_num,
-                model.config().head_size,
-                max_batch_seqs,
-            )?;
+        let batch_cuda_cfg = crate::cuda::CudaConfig::new()?;
+        // NOTE: `with_flash_decode` 所做的 workspace 预分配已随 op 层重构
+        // 迁出（见 `AttentionPlan`）；runner 本身的重写待后续单独 PR 处理。
 
         Ok(Self {
             model,
@@ -128,13 +125,17 @@ impl<M: LlmModel> ModelRunner<M> {
         let cuda_cfg = None;
 
         let mut output_token_ids = shared.output_token_ids.clone();
-        self.model.forward(
-            refs.as_mut_slice(),
-            &mut self.workspace,
-            &meta,
-            &mut output_token_ids,
-            cuda_cfg,
-        )?;
+        // NOTE: runner → `LlmModel::forward(&mut ForwardCtx)` 的迁移待后续单独
+        // 处理；此处先 panic 让待重写位置非常显眼。
+        let _ = (&mut refs, &mut self.workspace, &meta, &mut output_token_ids, cuda_cfg);
+        return Err(crate::base::error::Error::InvalidArgument(
+            "ModelRunner::run_step: pending ForwardCtx migration (see kv_cache scatter PR)"
+                .into(),
+        ).into());
+        #[allow(unreachable_code)]
+        {
+        self.model.forward(todo!("wire runner to ForwardCtx path"))?;
+        }
 
         tracing::debug!(
             "Runner step done in {}us ({}d/{}p)",

@@ -30,6 +30,9 @@ pub use sampler::*;
 mod scatter;
 pub use scatter::*;
 
+mod kv_cache;
+pub use kv_cache::*;
+
 mod split_cols;
 pub(crate) use split_cols::*;
 

@@ -192,10 +192,141 @@ fn sin_cos_cache_calc_f32(
 // 每行使用 positions[i] 作为绝对位置。
 // 所有 caller（prefill 传 [p, p+1, ...]，decode 传 [p] 或 [p0, p1, ...]）
 // 都走这条路径。
+//
+// Stride-aware：Q / K tensor 允许是 strided view（例如 `qkv.narrow(1, ...)`
+// 切出来的列段），kernel 通过 `strides()[0]` + `data_ptr()` 按行步长访问，
+// 不再要求整块连续。sin_cache / cos_cache 仍然假定是连续的 `[max_seq, head_size]`。
 // ============================================================================
 
+/// 核心 stride-aware 内核：以 2D row-major 视图访问 `[seq_len, inner_dim]`，
+/// 但行步长由 `row_stride` 参数给出（元素单位）。
+///
+/// SAFETY: `base` 必须指向 tensor 当前 view 的第 0 元素（含 storage_offset），
+/// 访问范围为 `[base + row * row_stride + col]`，0 ≤ row < seq_len,
+/// 0 ≤ col < inner_dim。
+///
+/// RoPE 只在 inner 维度前 `inner_dim` 个元素内做旋转；inner 内部必是连续的
+/// （`narrow(1, ...)` 切的列段天然满足：列维 stride == 1）。
+#[inline(always)]
+fn rope_rotate_bf16(
+    q_base: *mut bf16,
+    q_row_stride: usize,
+    q_inner_dim: usize,
+    k_base: *mut bf16,
+    k_row_stride: usize,
+    k_inner_dim: usize,
+    head_size: usize,
+    seq_len: usize,
+    positions: &[i32],
+    sin_cache: &[bf16],
+    cos_cache: &[bf16],
+) {
+    let half = head_size / 2;
+    for i in 0..seq_len {
+        let pos = positions[i] as usize;
+        // 行内偏移用指针加法，不再走 flat index（后者要求整块连续）
+        let q_row = unsafe { q_base.add(i * q_row_stride) };
+        let k_row = unsafe { k_base.add(i * k_row_stride) };
+        let sin_row = &sin_cache[pos * head_size..pos * head_size + head_size];
+        let cos_row = &cos_cache[pos * head_size..pos * head_size + head_size];
+
+        let mut j = 0usize;
+        while j < q_inner_dim {
+            for k in 0..half {
+                let sin_val = sin_row[k * 2];
+                let cos_val = cos_row[k * 2];
+                unsafe {
+                    let p0 = q_row.add(j + k);
+                    let p1 = q_row.add(j + k + half);
+                    let v0 = *p0;
+                    let v1 = *p1;
+                    *p0 = v0 * cos_val - v1 * sin_val;
+                    *p1 = v0 * sin_val + v1 * cos_val;
+                    // K 只在它自己的 inner 范围内做
+                    if j + head_size <= k_inner_dim {
+                        let kp0 = k_row.add(j + k);
+                        let kp1 = k_row.add(j + k + half);
+                        let kv0 = *kp0;
+                        let kv1 = *kp1;
+                        *kp0 = kv0 * cos_val - kv1 * sin_val;
+                        *kp1 = kv0 * sin_val + kv1 * cos_val;
+                    }
+                }
+            }
+            j += head_size;
+        }
+    }
+}
+
+#[inline(always)]
+fn rope_rotate_f32(
+    q_base: *mut f32,
+    q_row_stride: usize,
+    q_inner_dim: usize,
+    k_base: *mut f32,
+    k_row_stride: usize,
+    k_inner_dim: usize,
+    head_size: usize,
+    seq_len: usize,
+    positions: &[i32],
+    sin_cache: &[f32],
+    cos_cache: &[f32],
+) {
+    let half = head_size / 2;
+    for i in 0..seq_len {
+        let pos = positions[i] as usize;
+        let q_row = unsafe { q_base.add(i * q_row_stride) };
+        let k_row = unsafe { k_base.add(i * k_row_stride) };
+        let sin_row = &sin_cache[pos * head_size..pos * head_size + head_size];
+        let cos_row = &cos_cache[pos * head_size..pos * head_size + head_size];
+
+        let mut j = 0usize;
+        while j < q_inner_dim {
+            for k in 0..half {
+                let sin_val = sin_row[k * 2];
+                let cos_val = cos_row[k * 2];
+                unsafe {
+                    let p0 = q_row.add(j + k);
+                    let p1 = q_row.add(j + k + half);
+                    let v0 = *p0;
+                    let v1 = *p1;
+                    *p0 = v0 * cos_val - v1 * sin_val;
+                    *p1 = v0 * sin_val + v1 * cos_val;
+                    if j + head_size <= k_inner_dim {
+                        let kp0 = k_row.add(j + k);
+                        let kp1 = k_row.add(j + k + half);
+                        let kv0 = *kp0;
+                        let kv1 = *kp1;
+                        *kp0 = kv0 * cos_val - kv1 * sin_val;
+                        *kp1 = kv0 * sin_val + kv1 * cos_val;
+                    }
+                }
+            }
+            j += head_size;
+        }
+    }
+}
+
+/// 取 2D tensor 的 row stride（元素单位）。若是连续 storage，等于列数。
+#[inline]
+fn row_stride_2d(t: &Tensor) -> Result<usize> {
+    let s = t.strides();
+    if s.len() != 2 {
+        return Err(Error::InvalidArgument(format!(
+            "rope: expected 2D tensor, got shape {:?}", t.shape()
+        )).into());
+    }
+    // 列维 stride 必须 == 1（即最后一维在内存里连续），否则 RoPE 的 head 级访问会错。
+    if s[1] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "rope: inner-dim stride must be 1, got strides={:?}", s
+        )).into());
+    }
+    Ok(s[0])
+}
+
 fn rope_kernel_batch_bf16(
-    kv_dim: usize,
+    kv_inner_dim: usize,
     head_size: usize,
     input_q: &mut Tensor,
     input_k: &mut Tensor,
@@ -204,52 +335,50 @@ fn rope_kernel_batch_bf16(
     cos_cache: &Tensor,
 ) -> Result<()> {
     if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
-        return Err(Error::InvalidArgument("Input Q and K for rope_batch_per_row must be 2D.".to_string()).into());
+        return Err(Error::InvalidArgument(
+            "rope: Q and K must be 2D [seq_len, inner_dim].".into(),
+        ).into());
     }
     let seq_len = input_q.shape()[0];
-    let dim = input_q.shape()[1];
+    if input_k.shape()[0] != seq_len {
+        return Err(Error::InvalidArgument(format!(
+            "rope: Q and K seq_len mismatch: {} vs {}", seq_len, input_k.shape()[0]
+        )).into());
+    }
+    let q_inner_dim = input_q.shape()[1];
+    if kv_inner_dim != input_k.shape()[1] {
+        return Err(Error::InvalidArgument(format!(
+            "rope: kv_dim arg ({}) mismatches K.shape[1] ({})",
+            kv_inner_dim, input_k.shape()[1]
+        )).into());
+    }
+
+    let q_row_stride = row_stride_2d(input_q)?;
+    let k_row_stride = row_stride_2d(input_k)?;
+
     let pos_slice = positions.as_i32()?.as_slice()?;
     if pos_slice.len() < seq_len {
         return Err(Error::InvalidArgument(format!(
-            "rope_kernel_batch: positions.len ({}) < seq_len ({})",
-            pos_slice.len(), seq_len
+            "rope: positions.len ({}) < seq_len ({})", pos_slice.len(), seq_len
         )).into());
     }
-    let q_slice = input_q.as_bf16_mut()?.as_slice_mut()?;
-    let k_slice = input_k.as_bf16_mut()?.as_slice_mut()?;
     let sin_slice = sin_cache.as_bf16()?.as_slice()?;
     let cos_slice = cos_cache.as_bf16()?.as_slice()?;
-    let head_dim = head_size;
-    for i in 0..seq_len {
-        let pos = pos_slice[i] as usize;
-        let q_row_start = i * dim;
-        let k_row_start = i * kv_dim;
-        for j in (0..dim).step_by(head_dim) {
-            for k in 0..head_dim / 2 {
-                let sin_val = sin_slice[pos * head_dim + k * 2];
-                let cos_val = cos_slice[pos * head_dim + k * 2];
-                let q_idx_j = q_row_start + j + k;
-                let q_idx_j1 = q_row_start + j + k + head_dim / 2;
-                let v0_q = q_slice[q_idx_j];
-                let v1_q = q_slice[q_idx_j1];
-                q_slice[q_idx_j] = v0_q * cos_val - v1_q * sin_val;
-                q_slice[q_idx_j1] = v0_q * sin_val + v1_q * cos_val;
-                if j < kv_dim {
-                    let k_idx_j = k_row_start + j + k;
-                    let k_idx_j1 = k_row_start + j + k + head_dim / 2;
-                    let v0_k = k_slice[k_idx_j];
-                    let v1_k = k_slice[k_idx_j1];
-                    k_slice[k_idx_j] = v0_k * cos_val - v1_k * sin_val;
-                    k_slice[k_idx_j1] = v0_k * sin_val + v1_k * cos_val;
-                }
-            }
-        }
-    }
+
+    let q_base = input_q.as_bf16_mut()?.data_ptr_mut();
+    let k_base = input_k.as_bf16_mut()?.data_ptr_mut();
+
+    rope_rotate_bf16(
+        q_base, q_row_stride, q_inner_dim,
+        k_base, k_row_stride, kv_inner_dim,
+        head_size, seq_len,
+        pos_slice, sin_slice, cos_slice,
+    );
     Ok(())
 }
 
 fn rope_kernel_batch_f32(
-    kv_dim: usize,
+    kv_inner_dim: usize,
     head_size: usize,
     input_q: &mut Tensor,
     input_k: &mut Tensor,
@@ -258,47 +387,45 @@ fn rope_kernel_batch_f32(
     cos_cache: &Tensor,
 ) -> Result<()> {
     if input_q.shape().len() != 2 || input_k.shape().len() != 2 {
-        return Err(Error::InvalidArgument("Input Q and K for rope_batch_per_row must be 2D.".to_string()).into());
+        return Err(Error::InvalidArgument(
+            "rope: Q and K must be 2D [seq_len, inner_dim].".into(),
+        ).into());
     }
     let seq_len = input_q.shape()[0];
-    let dim = input_q.shape()[1];
+    if input_k.shape()[0] != seq_len {
+        return Err(Error::InvalidArgument(format!(
+            "rope: Q and K seq_len mismatch: {} vs {}", seq_len, input_k.shape()[0]
+        )).into());
+    }
+    let q_inner_dim = input_q.shape()[1];
+    if kv_inner_dim != input_k.shape()[1] {
+        return Err(Error::InvalidArgument(format!(
+            "rope: kv_dim arg ({}) mismatches K.shape[1] ({})",
+            kv_inner_dim, input_k.shape()[1]
+        )).into());
+    }
+
+    let q_row_stride = row_stride_2d(input_q)?;
+    let k_row_stride = row_stride_2d(input_k)?;
+
     let pos_slice = positions.as_i32()?.as_slice()?;
     if pos_slice.len() < seq_len {
         return Err(Error::InvalidArgument(format!(
-            "rope_kernel_batch: positions.len ({}) < seq_len ({})",
-            pos_slice.len(), seq_len
+            "rope: positions.len ({}) < seq_len ({})", pos_slice.len(), seq_len
         )).into());
     }
-    let q_slice = input_q.as_f32_mut()?.as_slice_mut()?;
-    let k_slice = input_k.as_f32_mut()?.as_slice_mut()?;
     let sin_slice = sin_cache.as_f32()?.as_slice()?;
     let cos_slice = cos_cache.as_f32()?.as_slice()?;
-    let head_dim = head_size;
-    for i in 0..seq_len {
-        let pos = pos_slice[i] as usize;
-        let q_row_start = i * dim;
-        let k_row_start = i * kv_dim;
-        for j in (0..dim).step_by(head_dim) {
-            for k in 0..head_dim / 2 {
-                let sin_val = sin_slice[pos * head_dim + k * 2];
-                let cos_val = cos_slice[pos * head_dim + k * 2];
-                let q_idx_j = q_row_start + j + k;
-                let q_idx_j1 = q_row_start + j + k + head_dim / 2;
-                let v0_q = q_slice[q_idx_j];
-                let v1_q = q_slice[q_idx_j1];
-                q_slice[q_idx_j] = v0_q * cos_val - v1_q * sin_val;
-                q_slice[q_idx_j1] = v0_q * sin_val + v1_q * cos_val;
-                if j < kv_dim {
-                    let k_idx_j = k_row_start + j + k;
-                    let k_idx_j1 = k_row_start + j + k + head_dim / 2;
-                    let v0_k = k_slice[k_idx_j];
-                    let v1_k = k_slice[k_idx_j1];
-                    k_slice[k_idx_j] = v0_k * cos_val - v1_k * sin_val;
-                    k_slice[k_idx_j1] = v0_k * sin_val + v1_k * cos_val;
-                }
-            }
-        }
-    }
+
+    let q_base = input_q.as_f32_mut()?.data_ptr_mut();
+    let k_base = input_k.as_f32_mut()?.data_ptr_mut();
+
+    rope_rotate_f32(
+        q_base, q_row_stride, q_inner_dim,
+        k_base, k_row_stride, kv_inner_dim,
+        head_size, seq_len,
+        pos_slice, sin_slice, cos_slice,
+    );
     Ok(())
 }
 

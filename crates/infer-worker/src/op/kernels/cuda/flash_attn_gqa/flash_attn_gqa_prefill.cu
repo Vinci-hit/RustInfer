@@ -1,574 +1,1481 @@
-// flash_attn_gqa_prefill_kernel.cu
-// 泛型化的 Flash Attention GQA prefill kernel (head_dim=64)。
-// 一份模板代码，同时实例化 BF16 / FP16 两个 extern "C" 入口。
-#include <iostream>
-#include <vector>
-#include <random>
-#include <cmath>
-#include <algorithm>
-#include <iomanip>
+// flash_attn_gqa_prefill.cu
+// -----------------------------------------------------------------------------
+// A modern, batched, stride-aware Flash-Attention GQA prefill kernel (CuTe/SM80).
+//
+// Highlights:
+//   * Arbitrary batch size      (gridDim.z = B).
+//   * Arbitrary stride layout   (Q/K/V/O: stride_b, stride_s, stride_h).
+//     Caller passes real tensor strides; NHD / HND / sliced-view all work.
+//   * Arbitrary head_dim        (dispatched statically: 64, 128, 192, 256).
+//     Adding more sizes = adding one line in the dispatcher below.
+//   * 2-stage cp.async pipeline on K/V; single-shot load of Q.
+//   * Predicate-masked epilogue for non-multiple-of-BlockM seq lengths.
+//
+// Public C ABI (used by Rust FFI and stand-alone tests):
+//
+//   void launch_flash_attn_prefill_bf16(
+//       const __nv_bfloat16* Q,  int64_t qsb, int64_t qss, int64_t qsh,
+//       const __nv_bfloat16* K,  int64_t ksb, int64_t kss, int64_t ksh,
+//       const __nv_bfloat16* V,  int64_t vsb, int64_t vss, int64_t vsh,
+//             __nv_bfloat16* O,  int64_t osb, int64_t oss, int64_t osh,
+//       int batch, int q_len, int kv_len,
+//       int num_q_heads, int num_kv_heads, int head_dim,
+//       float softmax_scale, int is_causal,
+//       cudaStream_t stream);
+//
+//   void launch_flash_attn_prefill_fp16(... same shape with __half ...);
+//
+// Legacy ABI (kept for backwards compatibility):
+//   launch_flash_attn_cute_128x64x64_tile         (head_dim=64, bf16, B=1, NHD)
+//   launch_flash_attn_cute_128x64x64_tile_fp16    (head_dim=64, fp16, B=1, NHD)
+//   launch_flash_attn_cute_bf16_hdim128           (head_dim=128, bf16, B=1, NHD)
+//   launch_flash_attn_cute_fp16_hdim128           (head_dim=128, fp16, B=1, NHD)
+// They are implemented as thin wrappers on top of the new ABI.
+//
+// Note: head_dim=128 version lives in flash_attn_gqa_prefill_hdim128.cu for the
+// legacy hdim128 symbol; we provide our own templated path here that covers
+// 64/128/192/256 uniformly.  The legacy hdim128 TU still owns its own
+// launch_flash_attn_cute_bf16_hdim128 / _fp16_hdim128 symbols; we *do not*
+// redefine them here to avoid duplicate symbols.
+// -----------------------------------------------------------------------------
+
 #include "flash_attn_gqa.h"
+
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_conversion.h>
 
-// 用 Elem 元素类型选择对应的 SM80 MMA atom。
-template <class Elem> struct ElementMmaAtom;
-template <> struct ElementMmaAtom<__nv_bfloat16> {
-    using type = cute::SM80_16x8x16_F32BF16BF16F32_TN;
-};
-template <> struct ElementMmaAtom<__half> {
-    using type = cute::SM80_16x8x16_F32F16F16F32_TN;
-};
-template <class ElementType, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV>
-struct SharedStorage {
-    cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutQ>> smem_q;
-    cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutK>> smem_k;
-    cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutV>> smem_v;
-};
+#include <cstdint>
+#include <cstdio>
+
+namespace flash_attn_prefill {
 
 using namespace cute;
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
-__device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
-    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
-    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
-    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
-#pragma unroll
-    for (int mi = 0; mi < size<0>(tensor); mi++) {
-        summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));
-#pragma unroll
-        for (int ni = 1; ni < size<1>(tensor); ni++) {
-            summary(mi) = op(summary(mi), tensor(mi, ni));
+
+// =============================================================================
+// Element -> MMA atom mapping
+// =============================================================================
+template <class Elem> struct MmaAtomFor;
+template <> struct MmaAtomFor<__nv_bfloat16> {
+    using type = SM80_16x8x16_F32BF16BF16F32_TN;
+};
+template <> struct MmaAtomFor<__half> {
+    using type = SM80_16x8x16_F32F16F16F32_TN;
+};
+
+// =============================================================================
+// Static kernel traits (BlockM / BlockN fixed; HeadDim is a template parameter)
+// =============================================================================
+static constexpr int kNWarps   = 4;
+static constexpr int kBlockM   = 128;
+static constexpr int kBlockN   = 64;
+
+template <class Elem_, int HeadDim_>
+struct KTraits {
+    using Elem = Elem_;
+    static constexpr int HeadDim = HeadDim_;
+    static_assert(HeadDim % 64 == 0, "HeadDim must be a multiple of 64");
+
+    // Swizzled smem atom: <3,3,3> over a 8x64 tile -> 128B lines, bank-conflict free
+    using SmemAtom = decltype(composition(
+        Swizzle<3,3,3>{},
+        Layout<Shape<_8, _64>, Stride<_64, _1>>{}));
+
+    using SmemLayoutQ  = decltype(tile_to_shape(SmemAtom{},
+                                      Shape<Int<kBlockM>, Int<HeadDim>>{}));
+    using SmemLayoutKV = decltype(tile_to_shape(SmemAtom{},
+                                      Shape<Int<kBlockN>, Int<HeadDim>>{}));
+    using SmemLayoutO  = SmemLayoutQ;
+
+    // V transposed (for P @ V, where V reads as B-operand of MMA)
+    using SmemLayoutVt =
+        decltype(composition(SmemLayoutKV{},
+                             make_layout(Shape<Int<HeadDim>, Int<kBlockN>>{},
+                                         GenRowMajor{})));
+    using SmemLayoutVtNoSwi =
+        decltype(get_nonswizzle_portion(SmemLayoutVt{}));
+
+    // Async gmem -> smem copy atom (128-bit cp.async)
+    using GmemCopyAtom =
+        Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, Elem>;
+
+    // A 16x8 thread layout, each thread copies 1x8 elements (16B = 128b).
+    // That covers 16 rows x 64 cols per instruction; we tile it over (BlockM, HD)
+    // / (BlockN, HD) via partition_*.
+    using GmemTiledCopy = decltype(make_tiled_copy(
+        GmemCopyAtom{},
+        Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+        Layout<Shape<_1, _8>>{}));
+
+    // Smem -> reg ldmatrix atoms
+    using S2RAtomAB   = Copy_Atom<SM75_U32x4_LDSM_N, Elem>;
+    using S2RAtomVT   = Copy_Atom<SM75_U16x8_LDSM_T, Elem>;
+
+    // Output copy: smem -> gmem (universal 128-bit copy, predicated in M)
+    using GmemCopyOut =
+        Copy_Atom<UniversalCopy<uint128_t>, Elem>;
+    using GmemTiledCopyO = decltype(make_tiled_copy(
+        GmemCopyOut{},
+        Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+        Layout<Shape<_1, _8>>{}));
+
+    // MMA tile: (16*NWarps, 64, 64). K-direction iterations are handled by
+    // partition_fragment_* automatically when HeadDim > 64.
+    using WarpLayout = Layout<Shape<Int<kNWarps>, _1, _1>>;
+    using MmaTile    = Tile<Int<16 * kNWarps>, _64, _64>;
+    using Mma        = decltype(make_tiled_mma(
+        typename MmaAtomFor<Elem>::type{},
+        WarpLayout{},
+        MmaTile{}));
+
+    static constexpr int NumThreads = 32 * kNWarps;
+};
+
+template <class Elem, class LayoutQ, class LayoutKV>
+struct SharedStorage {
+    array_aligned<Elem, cosize_v<LayoutQ>>  smem_q;
+    array_aligned<Elem, cosize_v<LayoutKV>> smem_k;
+    array_aligned<Elem, cosize_v<LayoutKV>> smem_v;
+};
+
+// =============================================================================
+// Device helpers: reductions, layout conversions, mask, softmax scaling.
+// =============================================================================
+
+template <bool ZeroInit=true, class T0, class L0, class T1, class L1, class Op>
+__device__ __forceinline__
+void thread_reduce(Tensor<T0, L0> const& src, Tensor<T1, L1>& dst, Op op) {
+    static_assert(L0::rank == 2, "src must be 2D");
+    static_assert(L1::rank == 1, "dst must be 1D");
+    CUTE_STATIC_ASSERT_V(size<0>(dst) == size<0>(src));
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(src); ++mi) {
+        dst(mi) = ZeroInit ? src(mi, 0) : op(dst(mi), src(mi, 0));
+        #pragma unroll
+        for (int ni = 1; ni < size<1>(src); ++ni) {
+            dst(mi) = op(dst(mi), src(mi, ni));
         }
     }
 }
-template<int THREADS>
+
+template <int Threads>
 struct Allreduce {
-    static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
-    template<typename T, typename Operator>
-    static __device__ __forceinline__ T run(T x, Operator &op) {
-        constexpr int OFFSET = THREADS / 2;
-        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
-        return Allreduce<OFFSET>::run(x, op);
+    static_assert(Threads == 32 || Threads == 16 || Threads == 8 || Threads == 4);
+    template <class T, class Op>
+    static __device__ __forceinline__ T run(T x, Op op) {
+        constexpr int Off = Threads / 2;
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, Off));
+        return Allreduce<Off>::run(x, op);
     }
 };
-template<>
+template <>
 struct Allreduce<2> {
-    template<typename T, typename Operator>
-    static __device__ __forceinline__ T run(T x, Operator &op) {
-        x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
-        return x;
+    template <class T, class Op>
+    static __device__ __forceinline__ T run(T x, Op op) {
+        return op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
     }
 };
-template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
-__device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Engine1, Layout1> &src, Operator &op) {
+
+template <class T0, class L0, class T1, class L1, class Op>
+__device__ __forceinline__
+void quad_allreduce(Tensor<T0, L0>& dst, Tensor<T1, L1>& src, Op op) {
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
-#pragma unroll
-    for (int i = 0; i < size(dst); i++){
+    #pragma unroll
+    for (int i = 0; i < size(dst); ++i) {
         dst(i) = Allreduce<4>::run(src(i), op);
     }
 }
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
-__device__ __forceinline__ void reduce_(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
-    thread_reduce_<zero_init>(tensor, summary, op);
-    quad_allreduce_(summary, summary, op);
+
+struct MaxOp { __device__ __forceinline__ float operator()(float a, float b) const { return max(a, b); } };
+struct SumOp { __device__ __forceinline__ float operator()(float a, float b) const { return a + b; } };
+
+template <bool ZeroInit, class T0, class L0, class T1, class L1>
+__device__ __forceinline__
+void reduce_max_rows(Tensor<T0, L0> const& src, Tensor<T1, L1>& dst) {
+    MaxOp op;
+    thread_reduce<ZeroInit>(src, dst, op);
+    quad_allreduce(dst, dst, op);
+}
+template <bool ZeroInit, class T0, class L0, class T1, class L1>
+__device__ __forceinline__
+void reduce_sum_rows(Tensor<T0, L0> const& src, Tensor<T1, L1>& dst) {
+    SumOp op;
+    thread_reduce<ZeroInit>(src, dst, op);
 }
 
-template<typename T>
-struct MaxOp {
-    __device__ __forceinline__ T operator()(T const & x, T const & y) { return x > y ? x : y; }
-};
-
-template <>
-struct MaxOp<float> {
-    // This is slightly faster
-    __device__ __forceinline__ float operator()(float const &x, float const &y) { return max(x, y); }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename T>
-struct SumOp {
-    __device__ __forceinline__ T operator()(T const & x, T const & y) { return x + y; }
-};
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
-    MaxOp<float> max_op;
-    reduce_<zero_init>(tensor, max, max_op);
+// Reshape MMA-C accumulator layout (MMA=4, M, N) -> (row, col) 2D view.
+template <class Layout>
+__forceinline__ __device__ auto to_rowcol(Layout l) {
+    static_assert(decltype(size<0>(l))::value == 4);
+    static_assert(decltype(rank(l))::value == 3);
+    auto x = logical_divide(l, Shape<_2>{});   // ((2,2), M, N)
+    return make_layout(make_layout(get<0,1>(x), get<1>(x)),
+                       make_layout(get<0,0>(x), get<2>(x)));
 }
 
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
-    SumOp<float> sum_op;
-    thread_reduce_<zero_init>(tensor, sum, sum_op);
+// Convert MMA-C accumulator (float) to MMA-A input layout (bf16/fp16) for the 2nd GEMM.
+template <class MmaT, class Layout>
+__forceinline__ __device__ auto to_A_regs(Layout l) {
+    using X = Underscore;
+    static_assert(decltype(size<0>(l))::value == 4);
+    static_assert(decltype(rank(l))::value == 3);
+    constexpr int K = get<2>(typename MmaT::Shape_MNK{});
+    static_assert(K == 8 || K == 16);
+    if constexpr (K == 8) { return l; }
+    else {
+        auto x = logical_divide(l, Shape<X, X, _2>{});
+        return make_layout(make_layout(get<0>(x), get<2,0>(x)), get<1>(x), get<2,1>(x));
+    }
 }
-template<typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
-};
-template <typename To_type, typename Engine, typename Layout>
-__forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
-    using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-    // HACK: this requires tensor to be "contiguous"
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+
+template <class To, class Eng, class Lay>
+__forceinline__ __device__ auto convert_type(Tensor<Eng, Lay> const& src) {
+    using From = typename Eng::value_type;
+    constexpr int N = decltype(size(src))::value;
+    cutlass::NumericArrayConverter<To, From, N> conv;
+    auto frag = conv(*reinterpret_cast<const cutlass::Array<From, N>*>(src.data()));
+    return make_tensor(make_rmem_ptr<To>(&frag), src.layout());
 }
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor_,
-                                           const int col_idx_offset_,
-                                           const int row_idx_offset,
-                                           const int warp_row_stride,const int causal_shift) {
-    // 检查 Tensor 格式是否符合 MMA 累加器的布局要求
-    static_assert(Layout::rank == 3, "Only support 3D Tensor");
-    static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
-    Tensor tensor = make_tensor(tensor_.data(), convert_layout_acc_rowcol(tensor_.layout()));
-    const int lane_id = threadIdx.x % 32;
-    // 计算当前线程处理的列索引基础偏移
+
+// Causal mask: set scores to -inf where col > row + causal_shift.
+// `tensor_` is MMA-C fragment (rank-3, size<0>=4).
+template <class Eng, class Lay>
+__forceinline__ __device__
+void apply_causal_mask(Tensor<Eng, Lay>& tensor_,
+                       int col_idx_offset_,
+                       int row_idx_offset,
+                       int warp_row_stride,
+                       int causal_shift,
+                       int kv_upper_bound) {
+    static_assert(Lay::rank == 3);
+    static_assert(decltype(size<0>(tensor_))::value == 4);
+    auto t = make_tensor(tensor_.data(), to_rowcol(tensor_.layout()));
+    const int lane_id = threadIdx.x & 31;
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 
-    // 遍历 MMA 布局的行维度 (外层)
-#pragma unroll
-    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+    #pragma unroll
+    for (int mi = 0; mi < size<0,1>(t); ++mi) {
         const int row_idx_base = row_idx_offset + mi * warp_row_stride;
-#pragma unroll
-        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+        #pragma unroll
+        for (int i = 0; i < size<0,0>(t); ++i) {
             const int row_idx = row_idx_base + i * 8;
-
-            // [核心修改]
-            // 允许查看的最大列号 = 当前行号 + 历史长度偏移
-            // 比如 row=0, shift=99 -> limit=100 (可以看 col 0~99)
-            const int col_idx_limit = row_idx + 1 + causal_shift;
-
-#pragma unroll
-            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                const int col_idx_base = col_idx_offset + nj * 8;
-#pragma unroll
-                for (int j = 0; j < size<1, 0>(tensor); ++j) {
-                    const int col_idx = col_idx_base + j;
-
-                    // Causal Mask 判断
-                    if (col_idx >= col_idx_limit) {
-                        tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+            const int col_limit = row_idx + 1 + causal_shift;
+            #pragma unroll
+            for (int nj = 0; nj < size<1,1>(t); ++nj) {
+                const int col_base = col_idx_offset + nj * 8;
+                #pragma unroll
+                for (int j = 0; j < size<1,0>(t); ++j) {
+                    const int col_idx = col_base + j;
+                    if (col_idx >= col_limit || col_idx >= kv_upper_bound) {
+                        t(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
                 }
             }
         }
     }
 }
-template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
-    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
-    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
-    CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
-#pragma unroll
-    for (int mi = 0; mi < size<0>(tensor); ++mi) {
-        // If max is -inf, then all elements must have been -inf (possibly due to masking).
-        // We don't want (-inf - (-inf)) since that would give NaN.
-        // If we don't have float around M_LOG2E the multiplication is done in fp64.
-        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * (Scale_max ? scale : float(M_LOG2E));
-#pragma unroll
-        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
-            // max * log_2(e)) This allows the compiler to use the ffma
-            // instruction instead of fadd and fmul separately.
-            // The following macro will disable the use of fma.
-            // See: https://github.com/pytorch/pytorch/issues/121558 for more details
-            // This macro is set in PyTorch and not FlashAttention
-#ifdef UNFUSE_FMA
-            tensor(mi, ni) = exp2f(__fmul_rn(tensor(mi, ni), scale) - max_scaled);
-#else
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
-#endif
+
+// Non-causal: only mask columns >= kv_len (for the ragged last tile).
+template <class Eng, class Lay>
+__forceinline__ __device__
+void apply_col_bound_mask(Tensor<Eng, Lay>& tensor_,
+                          int col_idx_offset_,
+                          int kv_upper_bound) {
+    static_assert(Lay::rank == 3);
+    auto t = make_tensor(tensor_.data(), to_rowcol(tensor_.layout()));
+    const int lane_id = threadIdx.x & 31;
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    #pragma unroll
+    for (int mi = 0; mi < size<0,1>(t); ++mi) {
+        #pragma unroll
+        for (int i = 0; i < size<0,0>(t); ++i) {
+            #pragma unroll
+            for (int nj = 0; nj < size<1,1>(t); ++nj) {
+                const int col_base = col_idx_offset + nj * 8;
+                #pragma unroll
+                for (int j = 0; j < size<1,0>(t); ++j) {
+                    if (col_base + j >= kv_upper_bound) {
+                        t(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    }
+                }
+            }
         }
     }
 }
-template<typename MMA_traits, typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
-    using X = Underscore;
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
-    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-    if constexpr (mma_shape_K == 8) {
-        return acc_layout;
-    } else {
-        auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-        return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-    }
-};
-template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-         typename TiledMma, typename TiledCopy, typename ThrCopy>
-__forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
-                               TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
-                               ThrCopy smem_thr_copy_B) {
-    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
-    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
-    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
-    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
-#pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+
+template <bool ScaleMax=true, class T0, class L0, class T1, class L1>
+__forceinline__ __device__
+void scale_apply_exp2(Tensor<T0, L0>& s, Tensor<T1, L1> const& m, float scale) {
+    static_assert(L0::rank == 2);
+    static_assert(L1::rank == 1);
+    CUTE_STATIC_ASSERT_V(size<0>(m) == size<0>(s));
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(s); ++mi) {
+        const float mm = (m(mi) == -INFINITY) ? 0.f
+                          : m(mi) * (ScaleMax ? scale : float(M_LOG2E));
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(s); ++ni) {
+            s(mi, ni) = exp2f(s(mi, ni) * scale - mm);
         }
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
-const int kNWarps = 4;
-template <class Elem,
-          class QShape, class KVShape,
-          class QStride, class QSmemLayout, class TiledCopyQ, class S2RAtom,
-          class KStride, class KVSmemLayout, class TiledCopyK, class S2RAtomTrans, class SmemVTransNoSwi, class SmemVTrans,
-          class VStride,
-          class OStride, class OSmemLayout, class TiledCopyO, class TiledMma>
-__global__ void flash_attn_gqa_kernel(
-    QShape q_shape, KVShape kv_shape,
-    const Elem* __restrict__ q_ptr, QStride dQ, QSmemLayout sQ_layout, TiledCopyQ copy_q, S2RAtom s2r_atom,
-    const Elem* __restrict__ k_ptr, KStride dK, KVSmemLayout sKV_layout, TiledCopyK copy_kv, S2RAtomTrans s2r_atom_trans, SmemVTransNoSwi V_layout_trans_no_swi,SmemVTrans V_layout_trans,
-    const Elem* __restrict__ v_ptr, VStride dV,
-    Elem* __restrict__ o_ptr,OStride dO, OSmemLayout sO_layout, TiledCopyO gmem_tiled_copy_O, TiledMma mma,
+
+// Second GEMM (acc += P @ V^T) with overlapped smem->reg loads on B operand.
+template <class T0, class T1, class T2, class T3, class M, class TC, class ThrC>
+__forceinline__ __device__
+void gemm_rs(T0& acc, T1& tA, T2& tB, T3 const& tsB, M mma, TC copyB, ThrC thrB) {
+    CUTE_STATIC_ASSERT_V(size<1>(tA) == size<1>(acc));
+    CUTE_STATIC_ASSERT_V(size<1>(tB) == size<2>(acc));
+    CUTE_STATIC_ASSERT_V(size<2>(tA) == size<2>(tB));
+    auto tB_view = thrB.retile_D(tB);
+    CUTE_STATIC_ASSERT_V(size<1>(tsB) == size<1>(tB_view));
+    cute::copy(copyB, tsB(_, _, _0{}), tB_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tA); ++i) {
+        if (i < size<2>(tA) - 1) {
+            cute::copy(copyB, tsB(_, _, i + 1), tB_view(_, _, i + 1));
+        }
+        cute::gemm(mma, tA(_, _, i), tB(_, _, i), acc);
+    }
+}
+
+// =============================================================================
+// Main kernel
+//   grid = (m_blocks, num_q_heads, batch)
+//   block threads = 32 * kNWarps
+// =============================================================================
+template <class Traits>
+__global__ void flash_attn_prefill_kernel(
+    const typename Traits::Elem* __restrict__ q_ptr,
+    int64_t q_stride_b, int64_t q_stride_s, int64_t q_stride_h,
+    const typename Traits::Elem* __restrict__ k_ptr,
+    int64_t k_stride_b, int64_t k_stride_s, int64_t k_stride_h,
+    const typename Traits::Elem* __restrict__ v_ptr,
+    int64_t v_stride_b, int64_t v_stride_s, int64_t v_stride_h,
+          typename Traits::Elem* __restrict__ o_ptr,
+    int64_t o_stride_b, int64_t o_stride_s, int64_t o_stride_h,
+    int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads,
+    float softmax_scale,
     int is_causal)
 {
-    unsigned int q_head_idx = blockIdx.y;
-    unsigned int block_m = blockIdx.x;
-    constexpr float softmax_scale_log2 = M_LOG2E / 8.0f;
-    unsigned int kv_head_idx = q_head_idx / (size<1>(q_shape) / size<1>(kv_shape)); // 简单的映射
-    Tensor Q = make_tensor(make_gmem_ptr(q_ptr), q_shape, dQ);// (seq,head_num,head_dim)
-    Tensor K = make_tensor(make_gmem_ptr(k_ptr), kv_shape, dK);
-    Tensor V = make_tensor(make_gmem_ptr(v_ptr), kv_shape, dV);
-    Tensor O = make_tensor(make_gmem_ptr(o_ptr), q_shape, dO);// (seq,head_num,head_dim)
-    Tensor gQ = local_tile(Q(_,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0)); //每个blockx处理一块q
-    Tensor gK = local_tile(K(_,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0)); // 把第0个维度堆叠起来，变成（64,64，N/64）
-    Tensor gV = local_tile(V(_,kv_head_idx,_),Shape<Int<64>, Int<64>>{}, make_coord(_, 0));
-    Tensor gO = local_tile(O(_,q_head_idx,_),Shape<Int<128>, Int<64>>{}, make_coord(block_m, 0));
-    extern __shared__ __align__(16) unsigned char flash_attn_gqa_shared_memory_bytes[];
-    using SharedStorage = SharedStorage<Elem, QSmemLayout, KVSmemLayout,KVSmemLayout>;
-    SharedStorage& smem = *reinterpret_cast<SharedStorage*>(flash_attn_gqa_shared_memory_bytes);
-    Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.begin()), sQ_layout);
-    Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.begin()), sKV_layout);
-    Tensor sV = make_tensor(make_smem_ptr(smem.smem_v.begin()), sKV_layout);
-    Tensor sVt = make_tensor(sV.data(), V_layout_trans);
-    Tensor sVtNoSwizzle = make_tensor(sV.data(), V_layout_trans_no_swi);
-    int q_len = size<0>(q_shape);
-    int kv_len = size<0>(kv_shape);
-    // 创建一个假的 Tensor 用于分配寄存器
-    ThrCopy thr_copy_q  = copy_q.get_slice(threadIdx.x);
-    ThrCopy thr_copy_kv = copy_kv.get_slice(threadIdx.x);
-    Tensor tQgQ = thr_copy_q.partition_S(gQ);
-    Tensor tQsQ = thr_copy_q.partition_D(sQ);
-    copy(copy_q, tQgQ, tQsQ);
-    Tensor tKgK = thr_copy_kv.partition_S(gK);
-    Tensor tKsK = thr_copy_kv.partition_D(sK);
-    Tensor tVgV = thr_copy_kv.partition_S(gV);
-    Tensor tVsV = thr_copy_kv.partition_D(sV);
+    using Elem = typename Traits::Elem;
+    constexpr int HD = Traits::HeadDim;
 
-    copy(copy_kv, tKgK(_,_,_,0), tKsK); //把k的第0分片从全局读到共享
-    auto thr_mma = mma.get_slice(threadIdx.x);
-    // 用于计算 S = Q * K^T
-    Tensor rQ = thr_mma.partition_fragment_A(sQ); // (MMA, MMA_M, MMA_K)
-    // 想办法把sQ里面的值塞进rQ，但是要重排列
-    TiledCopy s2r_copy_q = make_tiled_copy_A(s2r_atom, mma);
-    ThrCopy   s2r_thr_copy_q = s2r_copy_q.get_slice(threadIdx.x);
-    Tensor tXsQ = s2r_thr_copy_q.partition_S(sQ);
-    Tensor tXrQ = s2r_thr_copy_q.retile_D(rQ);
-    CUTE_STATIC_ASSERT_V(size<1>(tXsQ) == size<1>(tXrQ));
+    const int block_m    = blockIdx.x;
+    const int q_head_idx = blockIdx.y;
+    const int batch_idx  = blockIdx.z;
+    const int kv_head_idx = q_head_idx / (num_q_heads / num_kv_heads);
 
-    Tensor rK = thr_mma.partition_fragment_B(sK); // (MMA, MMA_N, MMA_K)
+    // Per-row base pointers (batch and head offsets folded in).
+    const Elem* q_bh = q_ptr + batch_idx * q_stride_b + q_head_idx  * q_stride_h;
+    const Elem* k_bh = k_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h;
+    const Elem* v_bh = v_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h;
+          Elem* o_bh = o_ptr + batch_idx * o_stride_b + q_head_idx  * o_stride_h;
 
-    Tensor rS = partition_fragment_C(mma, Shape<Int<128>, Int<64>>{});  // (MMA=4, MMA_M, MMA_N)
-    Tensor acc_o = partition_fragment_C(mma, Shape<Int<128>, Int<64>>{});  // MMA, MMA_M, MMA_K
-    clear(rS);
-    clear(acc_o);
-    TiledCopy s2r_copy_k = make_tiled_copy_B(s2r_atom, mma);
-    ThrCopy   s2r_thr_copy_k = s2r_copy_k.get_slice(threadIdx.x);
-    Tensor tXsK = s2r_thr_copy_k.partition_S(sK); // (CPY, MMA_N, MMA_K)
-    Tensor tXrK = s2r_thr_copy_k.retile_D(rK);    // (CPY, MMA_N, MMA_K)
+    // Build global tensors shaped (seq, head_dim) with arbitrary row stride.
+    auto Q = make_tensor(make_gmem_ptr(q_bh),
+                         make_shape(q_len, Int<HD>{}),
+                         make_stride(q_stride_s, _1{}));
+    auto K = make_tensor(make_gmem_ptr(k_bh),
+                         make_shape(kv_len, Int<HD>{}),
+                         make_stride(k_stride_s, _1{}));
+    auto V = make_tensor(make_gmem_ptr(v_bh),
+                         make_shape(kv_len, Int<HD>{}),
+                         make_stride(v_stride_s, _1{}));
+    auto O = make_tensor(make_gmem_ptr(o_bh),
+                         make_shape(q_len, Int<HD>{}),
+                         make_stride(o_stride_s, _1{}));
 
-    Tensor rVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);
-    TiledCopy s2r_copy_v = make_tiled_copy_B(s2r_atom_trans, mma);
-    ThrCopy   s2r_thr_copy_v = s2r_copy_v.get_slice(threadIdx.x);
-    Tensor tOsVt = s2r_thr_copy_v.partition_S(sVt); // (CPY, MMA_N, MMA_K, PIPE)
+    // Block-level tiles (N tile = _ for K/V, iterated at runtime).
+    auto gQ = local_tile(Q, Shape<Int<kBlockM>, Int<HD>>{}, make_coord(block_m, 0));
+    auto gK = local_tile(K, Shape<Int<kBlockN>, Int<HD>>{}, make_coord(_,       0));
+    auto gV = local_tile(V, Shape<Int<kBlockN>, Int<HD>>{}, make_coord(_,       0));
+    auto gO = local_tile(O, Shape<Int<kBlockM>, Int<HD>>{}, make_coord(block_m, 0));
 
-    cp_async_fence(); // 提交
+    // Shared memory.
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    using SharedT = SharedStorage<Elem,
+                                  typename Traits::SmemLayoutQ,
+                                  typename Traits::SmemLayoutKV>;
+    SharedT& smem = *reinterpret_cast<SharedT*>(smem_raw);
 
-    //用于存储每个线程持有的最终结果
-    auto rAccOut = partition_fragment_C(mma, Shape<Int<128>, Int<64>>{});
-    clear(rAccOut);
-    auto ol = logical_divide(rAccOut.layout(), Shape<Int<2>>{});
-    auto rAccOut_new_layout =
-        make_layout(make_layout(get<1>(get<0>(ol)), get<1>(ol)),
-                    make_layout(get<0>(get<0>(ol)), get<2>(ol)));
-    auto rAccOut_new = make_tensor(rAccOut.data(), rAccOut_new_layout);
-    Tensor row_max = make_tensor<float>(Shape<Int<size<0>(rAccOut_new)>>{});
-    Tensor row_sum = make_tensor<float>(Shape<Int<size<0>(rAccOut_new)>>{});
-    CUTE_UNROLL
-    for (int ii = 0; ii < size(row_max); ii++) {
-        row_max(ii) = float(-5e4);
-        row_sum(ii) = 0;
+    auto sQ  = make_tensor(make_smem_ptr(smem.smem_q.begin()), typename Traits::SmemLayoutQ{});
+    auto sK  = make_tensor(make_smem_ptr(smem.smem_k.begin()), typename Traits::SmemLayoutKV{});
+    auto sV  = make_tensor(make_smem_ptr(smem.smem_v.begin()), typename Traits::SmemLayoutKV{});
+    auto sVt = make_tensor(sV.data(), typename Traits::SmemLayoutVt{});
+    auto sVtNS = make_tensor(sV.data(), typename Traits::SmemLayoutVtNoSwi{});
+
+    // Copy engines.
+    typename Traits::GmemTiledCopy  copy_q{};
+    typename Traits::GmemTiledCopy  copy_kv{};
+    typename Traits::GmemTiledCopyO copy_o_gmem{};
+    typename Traits::Mma            mma{};
+
+    auto thr_copy_q  = copy_q .get_slice(threadIdx.x);
+    auto thr_copy_kv = copy_kv.get_slice(threadIdx.x);
+
+    auto tQgQ = thr_copy_q .partition_S(gQ);       // (CPY, M, K)
+    auto tQsQ = thr_copy_q .partition_D(sQ);
+    auto tKgK = thr_copy_kv.partition_S(gK);       // (CPY, N, K, n_tiles)
+    auto tKsK = thr_copy_kv.partition_D(sK);
+    auto tVgV = thr_copy_kv.partition_S(gV);
+    auto tVsV = thr_copy_kv.partition_D(sV);
+
+    // --- Predicate tensors for ragged Q / KV in seq dim ---
+    auto cQ = make_identity_tensor(make_shape(Int<kBlockM>{}, Int<HD>{}));
+    auto tQcQ = thr_copy_q.partition_S(cQ);
+    auto cK = make_identity_tensor(make_shape(Int<kBlockN>{}, Int<HD>{}));
+    auto tKcK = thr_copy_kv.partition_S(cK);
+
+    // -- Load Q (predicated in M) --
+    #pragma unroll
+    for (int m = 0; m < size<1>(tQgQ); ++m) {
+        const int row = block_m * kBlockM + get<0>(tQcQ(0, m, 0));
+        if (row < q_len) {
+            cute::copy(copy_q, tQgQ(_, m, _), tQsQ(_, m, _));
+        } else {
+            cute::clear(tQsQ(_, m, _));
+        }
     }
-    cp_async_wait<0>();
-    __syncthreads();//进入循环前，等Q和KV读入共享内存
+    cp_async_fence();
 
-    copy(s2r_copy_q, tXsQ, tXrQ); // 把Q从共享内存读入寄存器
+    // -- Launch first K tile (predicated in N) --
+    auto load_kv_tile = [&](auto tXgX, auto tXsX, auto tXcX,
+                            int n_tile, int kv_upper) {
+        #pragma unroll
+        for (int n = 0; n < size<1>(tXsX); ++n) {
+            const int row = n_tile * kBlockN + get<0>(tXcX(0, n, 0));
+            if (row < kv_upper) {
+                cute::copy(copy_kv, tXgX(_, n, _, n_tile), tXsX(_, n, _));
+            } else {
+                cute::clear(tXsX(_, n, _));
+            }
+        }
+    };
+    load_kv_tile(tKgK, tKsK, tKcK, 0, kv_len);
+    cp_async_fence();
+
+    // -- Register fragments --
+    auto thr_mma = mma.get_slice(threadIdx.x);
+    auto rQ = thr_mma.partition_fragment_A(sQ);                 // Q fragments
+    auto rK = thr_mma.partition_fragment_B(sK);                 // K fragments
+    auto rS = partition_fragment_C(mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+    auto rO = partition_fragment_C(mma, Shape<Int<kBlockM>, Int<HD>>{});
+    auto rVt = thr_mma.partition_fragment_B(sVtNS);
+    clear(rS); clear(rO);
+
+    // -- smem -> reg copy atoms --
+    auto s2r_q  = make_tiled_copy_A(typename Traits::S2RAtomAB{}, mma);
+    auto s2r_k  = make_tiled_copy_B(typename Traits::S2RAtomAB{}, mma);
+    auto s2r_v  = make_tiled_copy_B(typename Traits::S2RAtomVT{}, mma);
+    auto thr_s2r_q = s2r_q.get_slice(threadIdx.x);
+    auto thr_s2r_k = s2r_k.get_slice(threadIdx.x);
+    auto thr_s2r_v = s2r_v.get_slice(threadIdx.x);
+    auto tXsQ = thr_s2r_q.partition_S(sQ);
+    auto tXrQ = thr_s2r_q.retile_D(rQ);
+    auto tXsK = thr_s2r_k.partition_S(sK);
+    auto tXrK = thr_s2r_k.retile_D(rK);
+    auto tOsVt = thr_s2r_v.partition_S(sVt);
+
+    // -- Softmax state --
+    auto rS_rc_layout = to_rowcol(rS.layout());
+    Tensor row_max = make_tensor<float>(Shape<Int<size<0>(rS_rc_layout)>>{});
+    Tensor row_sum = make_tensor<float>(Shape<Int<size<0>(rS_rc_layout)>>{});
+    CUTE_UNROLL
+    for (int i = 0; i < size(row_max); ++i) { row_max(i) = -5e4f; row_sum(i) = 0.f; }
+
+    const float scale_log2 = softmax_scale * float(M_LOG2E);
+
+    // -- Wait for Q in smem, pull Q into registers (once) --
+    cp_async_wait<1>();   // Q done; K tile 0 may still be in flight
+    __syncthreads();
+    cute::copy(s2r_q, tXsQ, tXrQ);
+
+    // -- KV tile range (causal prune) --
     int n_block_max;
     if (is_causal) {
-        int max_k_col = (block_m + 1) * 128 + (size<0>(kv_shape) - size<0>(q_shape));
-        n_block_max = (max_k_col + 64 - 1) / 64;
-        n_block_max = min(n_block_max, (size<0>(kv_shape) + 64 - 1) / 64);
+        const int max_k = (block_m + 1) * kBlockM + (kv_len - q_len);
+        n_block_max = (max_k + kBlockN - 1) / kBlockN;
+        const int total = (kv_len + kBlockN - 1) / kBlockN;
+        n_block_max = min(n_block_max, total);
     } else {
-        n_block_max = (size<0>(kv_shape) + 64 - 1) / 64;
+        n_block_max = (kv_len + kBlockN - 1) / kBlockN;
     }
-     for (int n_tile = 0; n_tile < n_block_max; ++n_tile)
-     {
+    if (n_block_max <= 0) {
+        // Nothing to attend to (can happen for causal + empty KV). Write zeros.
+        // Fallthrough: rO is already zero and row_sum=0 → epilogue writes zeros.
+        n_block_max = 0;
+    }
 
-         copy(copy_kv, tVgV(_,_,_,n_tile), tVsV);
+    const int warp_id     = threadIdx.x / 32;
+    const int lane_id     = threadIdx.x & 31;
+    const int row_idx_ofs = block_m * kBlockM + warp_id * 16 + lane_id / 4;
 
-         cp_async_wait<1>();
-         __syncthreads();//进入循环前，等上一轮的K存入共享内存完毕
-         clear(rS);
-         copy(s2r_copy_k, tXsK, tXrK);
+    // =========================== Main KV loop ===========================
+    for (int nt = 0; nt < n_block_max; ++nt) {
+        // Issue V load for this tile (overlap with QK^T).
+        load_kv_tile(tVgV, tVsV, tKcK, nt, kv_len);
+        cp_async_fence();
 
-         gemm(mma, rQ, rK, rS); //用完了rK，可以读下一轮的了
+        // Wait for this tile's K to be ready.
+        cp_async_wait<1>();   // V may still be in flight
+        __syncthreads();
 
-         copy(copy_kv, tKgK(_,_,_,(n_tile + 1 ) % n_block_max), tKsK);
-         cp_async_fence();
-         if (is_causal) {
-             apply_mask(
-                 rS, 64 *n_tile, block_m * 128 + (threadIdx.x / 32) * 16 + (threadIdx.x % 32) / 4,16*kNWarps, kv_len - q_len
-             );
-         }
+        // --- S = Q @ K^T ---
+        clear(rS);
+        cute::copy(s2r_k, tXsK, tXrK);
+        cute::gemm(mma, rQ, rK, rS);
 
-        //softmax
-         Tensor scores = make_tensor(rS.data(), convert_layout_acc_rowcol(rS.layout()));//把tensorcore计算完后的乱序结果视为有序
+        // Issue next K prefetch (if any).
+        if (nt + 1 < n_block_max) {
+            load_kv_tile(tKgK, tKsK, tKcK, nt + 1, kv_len);
+        }
+        cp_async_fence();
 
-        if (n_tile == 0)
-        {
-            reduce_max</*zero_init=*/true>(scores, row_max);
-            scale_apply_exp2(scores, row_max, softmax_scale_log2);
-            reduce_sum</*zero_init=*/true>(scores, row_sum);
-        }else
-        {
-            Tensor scores_max_prev = make_fragment_like(row_max);
-            cute::copy(row_max, scores_max_prev);
-            reduce_max</*zero_init=*/false>(scores, row_max);
-            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
-            Tensor acc_o_rowcol = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
-#pragma unroll
-            for (int mi = 0; mi < size(row_max); ++mi) {
-                float scores_max_cur = row_max(mi) == -INFINITY ? 0.0f : row_max(mi);
-                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-                row_sum(mi) *= scores_scale;
-#pragma unroll
-                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+        // --- Mask ---
+        if (is_causal) {
+            apply_causal_mask(rS, kBlockN * nt, row_idx_ofs,
+                              16 * kNWarps, kv_len - q_len, kv_len);
+        } else {
+            // Only the last tile can be ragged in N.
+            if ((nt + 1) * kBlockN > kv_len) {
+                apply_col_bound_mask(rS, kBlockN * nt, kv_len);
             }
-            scale_apply_exp2(scores, row_max, softmax_scale_log2);
-            // We don't do the reduce across threads here since we don't need to use the row_sum.
-            // We do that reduce at the end when we need to normalize the softmax.
-            reduce_sum</*zero_init=*/false>(scores, row_sum);
         }
 
-         Tensor rP = convert_type<Elem>(rS);
-         Tensor tOrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMma>(rP.layout()));
-         gemm_rs(acc_o, tOrP, rVt, tOsVt, mma, s2r_copy_v, s2r_thr_copy_v);
-     }
-
-    SumOp<float> sum_op;
-    quad_allreduce_(row_sum, row_sum, sum_op);
-    Tensor acc_o_rowcol = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
-#pragma unroll
-    for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
-        float sum = row_sum(mi);
-        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
-
-        float scale = inv_sum; // 推理通常没有 dropout
-
-#pragma unroll
-        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-            acc_o_rowcol(mi, ni) *= scale; // 只做归一化
+        // --- Online softmax ---
+        auto scores = make_tensor(rS.data(), to_rowcol(rS.layout()));
+        if (nt == 0) {
+            reduce_max_rows<true>(scores, row_max);
+            scale_apply_exp2(scores, row_max, scale_log2);
+            reduce_sum_rows<true>(scores, row_sum);
+        } else {
+            Tensor m_prev = make_fragment_like(row_max);
+            cute::copy(row_max, m_prev);
+            reduce_max_rows<false>(scores, row_max);
+            auto rO_rc = make_tensor(rO.data(), to_rowcol(rO.layout()));
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                const float m_cur = (row_max(mi) == -INFINITY) ? 0.f : row_max(mi);
+                const float sc    = exp2f((m_prev(mi) - m_cur) * scale_log2);
+                row_sum(mi) *= sc;
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(rO_rc); ++ni) rO_rc(mi, ni) *= sc;
+            }
+            scale_apply_exp2(scores, row_max, scale_log2);
+            reduce_sum_rows<false>(scores, row_sum);
         }
+
+        // --- Wait for V to be ready, then acc += P @ V ---
+        cp_async_wait<1>();   // keep the next K prefetch in flight
+        __syncthreads();
+
+        auto rP = convert_type<Elem>(rS);
+        auto tOrP = make_tensor(
+            rP.data(),
+            to_A_regs<typename Traits::Mma>(rP.layout()));
+        gemm_rs(rO, tOrP, rVt, tOsVt, mma, s2r_v, thr_s2r_v);
     }
 
-    // Convert acc_o from fp32 to fp16/bf16
-    Tensor rO = convert_type<Elem>(acc_o);
-    // sO 复用 sQ 的 Shared Memory 空间 (节省显存)
-    Tensor sO = make_tensor(sQ.data(), sO_layout);
+    // Drain remaining cp.async groups (next-K prefetch from the last iteration).
+    cp_async_wait<0>();
+    __syncthreads();
 
-    // 定义 Smem -> Reg 的拷贝策略 (用于 Output)
-    // 这里的 Atom 必须支持向量化写入，且要配合 MMA 的布局
+    // --- Final softmax normalization: row_sum needs warp-group reduce ---
+    SumOp sum_op;
+    quad_allreduce(row_sum, row_sum, sum_op);
+    auto rO_rc = make_tensor(rO.data(), to_rowcol(rO.layout()));
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(rO_rc); ++mi) {
+        const float s = row_sum(mi);
+        const float inv = (s == 0.f || s != s) ? 1.f : (1.f / s);
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(rO_rc); ++ni) rO_rc(mi, ni) *= inv;
+    }
+
+    // --- Write back: reg -> smem -> gmem (reusing Q's smem buffer) ---
+    auto rO_out = convert_type<Elem>(rO);
+    auto sO = make_tensor(sQ.data(), typename Traits::SmemLayoutO{});
+
     using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Elem>;
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(threadIdx.x);
-
-    // retile_S: 将 MMA 布局的 rO 重排为 Copy 布局
-    Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
-    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
-
-    // 执行拷贝: Reg -> Smem
+    auto taccOrO = smem_thr_copy_O.retile_S(rO_out);
+    auto taccOsO = smem_thr_copy_O.partition_D(sO);
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
-    __syncthreads(); // 必须同步，等待所有线程写完 Smem
+    __syncthreads();
 
-    // ----------------------------------------------------------------
-    // 2. Global Memory 写回 (Smem -> Gmem)
-    // ----------------------------------------------------------------
+    auto thr_copy_o = copy_o_gmem.get_slice(threadIdx.x);
+    auto tOsO = thr_copy_o.partition_S(sO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+    auto rO_tmp = make_tensor<Elem>(shape(tOgO));
+    cute::copy(copy_o_gmem, tOsO, rO_tmp);
 
-    // 获取 Gmem Copy 的线程切片
-    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(threadIdx.x);
-
-    // 切分 Source (Smem) 和 Dest (Gmem)
-    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
-    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-
-    // 创建寄存器中转站 (用于谓词 Masking 拷贝)
-    Tensor tOrO = make_tensor<Elem>(shape(tOgO));
-
-    // 从 Smem 读到寄存器
-    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-
-    // ----------------------------------------------------------------
-    // 3. 边界检查与最终写入
-    // ----------------------------------------------------------------
-
-    // 构造 Identity Tensor 用于计算逻辑坐标 (Row, Col)
-    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO))); // (BLK_M, BLK_K)
-    Tensor tOcO = gmem_thr_copy_O.partition_D(cO); // 切分坐标
-
-    // 构造谓词 Mask (Predicate Tensor)
-    // 用于处理 HeadDim (K维度) 不对齐的情况
-    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-
+    auto cO   = make_identity_tensor(make_shape(Int<kBlockM>{}, Int<HD>{}));
+    auto tOcO = thr_copy_o.partition_D(cO);
     #pragma unroll
-    for (int i = 0; i < size(tOrO); ++i) {
-        // 获取当前元素的逻辑坐标 (m, n)
-        // 注意：tOcO 的布局和 tOrO 是一一对应的
-        // get<0> 是 M 坐标 (Row)，get<1> 是 N 坐标 (Col/HeadDim)
-        int m_coord = get<0>(tOcO(i));
-
-        // 判断是否越界 (M 维度)
-        // size<0>(q_shape) 是 seq_len
-        // block_m * 128 是当前 Block 的起始行
-        if (block_m * 128 + m_coord < size<0>(q_shape)) {
-            tOgO(i) = tOrO(i);
+    for (int i = 0; i < size(rO_tmp); ++i) {
+        const int m = get<0>(tOcO(i));
+        if (block_m * kBlockM + m < q_len) {
+            tOgO(i) = rO_tmp(i);
         }
     }
 }
 
+// =============================================================================
+// Launcher (templated)
+// =============================================================================
+template <class Elem, int HD>
+static cudaError_t launch_impl(
+    const Elem* q, int64_t qsb, int64_t qss, int64_t qsh,
+    const Elem* k, int64_t ksb, int64_t kss, int64_t ksh,
+    const Elem* v, int64_t vsb, int64_t vss, int64_t vsh,
+          Elem* o, int64_t osb, int64_t oss, int64_t osh,
+    int batch, int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream)
+{
+    using Traits = KTraits<Elem, HD>;
+    const int m_blocks = (q_len + kBlockM - 1) / kBlockM;
+    dim3 grid(m_blocks, num_q_heads, batch);
+    dim3 block(Traits::NumThreads);
+
+    const int smem_size = int(sizeof(SharedStorage<Elem,
+                                 typename Traits::SmemLayoutQ,
+                                 typename Traits::SmemLayoutKV>));
+
+    auto kernel = flash_attn_prefill_kernel<Traits>;
+    cudaError_t err = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (err != cudaSuccess) return err;
+
+    kernel<<<grid, block, smem_size, stream>>>(
+        q, qsb, qss, qsh,
+        k, ksb, kss, ksh,
+        v, vsb, vss, vsh,
+        o, osb, oss, osh,
+        q_len, kv_len, num_q_heads, num_kv_heads,
+        softmax_scale, is_causal);
+    return cudaGetLastError();
+}
+
 template <class Elem>
-static void launch_flash_attn_cute_128x64x64_tile_impl(
-    const Elem* d_Q, const Elem* d_K, const Elem* d_V, Elem* d_O,
-    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
-    int is_causal,
+static cudaError_t launch_dispatch(
+    const Elem* q, int64_t qsb, int64_t qss, int64_t qsh,
+    const Elem* k, int64_t ksb, int64_t kss, int64_t ksh,
+    const Elem* v, int64_t vsb, int64_t vss, int64_t vsh,
+          Elem* o, int64_t osb, int64_t oss, int64_t osh,
+    int batch, int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
     cudaStream_t stream)
 {
-    using namespace cute; // 确保使用 cute 命名空间
-    int kv_len = *kv_len_ptr + seq_len;//prefill阶段可以在cpu里面用
-    // 配置 Block 大小
-    constexpr int kBlockM = 128;
-    constexpr int kBlockN = 64;
-    constexpr int kHeadDim = 64; // 已确认 HeadDim = 64
-    // 1. 定义 Shapes (使用 Int<kHeadDim> 确保静态编译)
-    auto q_shape = make_shape(seq_len, q_heads, Int<kHeadDim>{});
-    auto kv_shape = make_shape(kv_len,kv_heads, Int<kHeadDim>{});
-
-    // 2. 定义 Strides
-    auto stride_Q = make_stride(q_heads * kHeadDim, kHeadDim, _1{});
-    auto stride_K = make_stride(kv_heads * kHeadDim, kHeadDim, _1{});
-    auto stride_V = make_stride(kv_heads * kHeadDim, kHeadDim, _1{});
-    auto stride_O = make_stride(q_heads * kHeadDim, kHeadDim, _1{});
-
-    using SmemLayoutAtomQ = decltype(composition(Swizzle<3,3,3>{},
-                                  Layout<Shape <_8,_64>,
-                                         Stride<_64,_1>>{}));
-
-    using SmemLayoutKV = decltype(tile_to_shape(
-        SmemLayoutAtomQ{},
-        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-    using SmemLayoutVtransposed = decltype(
-            composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
-    using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
-    auto sQ = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
-    auto sKV = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockN>{}, Int<kHeadDim>{}));
-
-    auto sO = tile_to_shape(SmemLayoutAtomQ{}, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
-    using AtomGMEM = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, Elem>;
-
-    auto copy_q = make_tiled_copy(
-        AtomGMEM{},
-        Layout<Shape<_16,_8>,Stride<_8,_1>>{},
-        Layout<Shape< _1,_8>>{});
-
-    auto copy_kv = make_tiled_copy(
-        AtomGMEM{},
-        Layout<Shape<_16,_8>,Stride<_8,_1>>{},
-        Layout<Shape< _1,_8>>{});
-
-    using AtomGMEM_Out = Copy_Atom<UniversalCopy<cute::uint128_t>, Elem>;
-    auto copy_o = make_tiled_copy(
-        AtomGMEM_Out{},
-        make_layout(Shape<Int<128>, Int<1>>{}),
-        make_layout(Shape<Int<1>, Int<8>>{}));
-
-
-    auto warp_layout = make_layout(make_shape(Int<kNWarps>{}, Int<1>{}, Int<1>{}));
-
-    // 定义总 Tile 大小
-    // M=128, N=64, K=64
-    auto tile_shape = make_tile(Int<16 * kNWarps>{}, Int<64>{}, Int<64>{});
-
-    // 生成 MMA: 依据 Elem 选择 BF16/FP16 版本的 atom
-    using MmaAtom = typename ElementMmaAtom<Elem>::type;
-    auto mma = make_tiled_mma(
-        MmaAtom{},                        // Atom（BF16 / FP16 自动分派）
-        warp_layout,                      // Warp Layout (4x1x1)
-        tile_shape                        // Tile Shape
-    );
-    using S2RAtom = Copy_Atom<SM75_U32x4_LDSM_N, Elem>;
-    using S2RAtom_trans = Copy_Atom<SM75_U16x8_LDSM_T, Elem>;
-    // 6. Launch Config
-    dim3 dimGrid(size(ceil_div(seq_len, Int<kBlockM>{})),
-               size(q_heads));
-    dim3 block(size(mma));
-
-    int smem_size = int(sizeof(SharedStorage<Elem, decltype(sQ), decltype(sKV), decltype(sKV)>));
-    
-    // 8. 启动 Kernel
-    flash_attn_gqa_kernel<Elem><<<dimGrid, block, smem_size, stream>>>(
-        q_shape, kv_shape,
-        d_Q, stride_Q, sQ, copy_q, S2RAtom{},
-        d_K, stride_K, sKV, copy_kv, S2RAtom_trans{},SmemLayoutVtransposedNoSwizzle{},SmemLayoutVtransposed{},
-        d_V, stride_V,
-        d_O, stride_O, sO, copy_o, mma,
-        is_causal
-    );
-    CUDA_CHECK(cudaGetLastError());
+    switch (head_dim) {
+    case 64:
+        return launch_impl<Elem, 64>(q,qsb,qss,qsh, k,ksb,kss,ksh, v,vsb,vss,vsh,
+                                     o,osb,oss,osh, batch,q_len,kv_len,
+                                     num_q_heads,num_kv_heads, softmax_scale,is_causal,stream);
+    case 128:
+        return launch_impl<Elem,128>(q,qsb,qss,qsh, k,ksb,kss,ksh, v,vsb,vss,vsh,
+                                     o,osb,oss,osh, batch,q_len,kv_len,
+                                     num_q_heads,num_kv_heads, softmax_scale,is_causal,stream);
+    case 192:
+        return launch_impl<Elem,192>(q,qsb,qss,qsh, k,ksb,kss,ksh, v,vsb,vss,vsh,
+                                     o,osb,oss,osh, batch,q_len,kv_len,
+                                     num_q_heads,num_kv_heads, softmax_scale,is_causal,stream);
+    case 256:
+        return launch_impl<Elem,256>(q,qsb,qss,qsh, k,ksb,kss,ksh, v,vsb,vss,vsh,
+                                     o,osb,oss,osh, batch,q_len,kv_len,
+                                     num_q_heads,num_kv_heads, softmax_scale,is_causal,stream);
+    default:
+        fprintf(stderr, "[flash_attn_prefill] unsupported head_dim=%d; "
+                        "supported: 64, 128, 192, 256\n", head_dim);
+        return cudaErrorInvalidValue;
+    }
 }
 
-// ---- extern "C" 入口 ----
-// BF16: 名字与 flash_attn_gqa.h 声明保持一致（自带 C 链接）
-void launch_flash_attn_cute_128x64x64_tile(
-    const __nv_bfloat16* d_Q, const __nv_bfloat16* d_K, const __nv_bfloat16* d_V, __nv_bfloat16* d_O,
-    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
-    int is_causal,
+// =============================================================================
+// Ragged kernel
+//   grid = (total_q_tiles, num_q_heads)  — each block handles (req, q_tile, qh)
+//   Q / O are packed over the batch: [total_q_tokens, num_q_heads, head_dim]
+//   K / V live in independent per-slot cache buffers, addressed via a device
+//   pointer array.  All control arrays (req_to_slot, kv_lens, cu_q_lens,
+//   block2req, block2tile) have stable addresses so CUDA Graphs can capture
+//   the launch.
+// =============================================================================
+template <class Traits>
+__global__ void flash_attn_ragged_kernel(
+    const typename Traits::Elem* __restrict__ q_ptr,    // [total_q, Hq, HD] packed
+    int64_t q_stride_s, int64_t q_stride_h,
+    const typename Traits::Elem* const* __restrict__ k_cache_ptrs,
+    const typename Traits::Elem* const* __restrict__ v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          typename Traits::Elem* __restrict__ o_ptr,    // [total_q, Hq, HD] packed
+    int64_t o_stride_s, int64_t o_stride_h,
+    const int32_t* __restrict__ req_to_slot,            // [B]
+    const int32_t* __restrict__ kv_lens,                // [B]
+    const int32_t* __restrict__ cu_q_lens,              // [B+1]
+    const int32_t* __restrict__ block2req,              // [total_q_tiles]
+    const int32_t* __restrict__ block2tile,             // [total_q_tiles]
+    int num_q_heads, int num_kv_heads,
+    float softmax_scale,
+    int is_causal)
+{
+    using Elem = typename Traits::Elem;
+    constexpr int HD = Traits::HeadDim;
+
+    const int flat_tile  = blockIdx.x;
+    const int q_head_idx = blockIdx.y;
+
+    // Lookup which request / q-tile-within-request this CTA owns.
+    const int req     = block2req[flat_tile];
+    const int block_m = block2tile[flat_tile];
+
+    const int q_start = cu_q_lens[req];
+    const int q_end   = cu_q_lens[req + 1];
+    const int q_len   = q_end - q_start;
+    const int kv_len  = kv_lens[req];
+    if (q_len <= 0) return;
+
+    const int slot = req_to_slot[req];
+    const int kv_head_idx = q_head_idx / (num_q_heads / num_kv_heads);
+
+    // Per-request base pointers.
+    //   Q / O are packed [total_q_tokens, Hq, HD], so we jump by
+    //   q_start * q_stride_s (token offset) and then by q_head_idx * q_stride_h.
+    const Elem* q_bh = q_ptr + (int64_t)q_start * q_stride_s + (int64_t)q_head_idx  * q_stride_h;
+          Elem* o_bh = o_ptr + (int64_t)q_start * o_stride_s + (int64_t)q_head_idx  * o_stride_h;
+    //   K / V point to a per-slot cache buffer; jump only over KV-head.
+    const Elem* k_bh = k_cache_ptrs[slot] + (int64_t)kv_head_idx * kv_stride_h;
+    const Elem* v_bh = v_cache_ptrs[slot] + (int64_t)kv_head_idx * kv_stride_h;
+
+    // Global tensors.
+    auto Q = make_tensor(make_gmem_ptr(q_bh),
+                         make_shape(q_len, Int<HD>{}),
+                         make_stride(q_stride_s, _1{}));
+    auto K = make_tensor(make_gmem_ptr(k_bh),
+                         make_shape(kv_len, Int<HD>{}),
+                         make_stride(kv_stride_s, _1{}));
+    auto V = make_tensor(make_gmem_ptr(v_bh),
+                         make_shape(kv_len, Int<HD>{}),
+                         make_stride(kv_stride_s, _1{}));
+    auto O = make_tensor(make_gmem_ptr(o_bh),
+                         make_shape(q_len, Int<HD>{}),
+                         make_stride(o_stride_s, _1{}));
+
+    auto gQ = local_tile(Q, Shape<Int<kBlockM>, Int<HD>>{}, make_coord(block_m, 0));
+    auto gK = local_tile(K, Shape<Int<kBlockN>, Int<HD>>{}, make_coord(_,       0));
+    auto gV = local_tile(V, Shape<Int<kBlockN>, Int<HD>>{}, make_coord(_,       0));
+    auto gO = local_tile(O, Shape<Int<kBlockM>, Int<HD>>{}, make_coord(block_m, 0));
+
+    // ------------------------------------------------------------------
+    // From here on: identical structure to `flash_attn_prefill_kernel`.
+    // ------------------------------------------------------------------
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    using SharedT = SharedStorage<Elem,
+                                  typename Traits::SmemLayoutQ,
+                                  typename Traits::SmemLayoutKV>;
+    SharedT& smem = *reinterpret_cast<SharedT*>(smem_raw);
+
+    auto sQ    = make_tensor(make_smem_ptr(smem.smem_q.begin()), typename Traits::SmemLayoutQ{});
+    auto sK    = make_tensor(make_smem_ptr(smem.smem_k.begin()), typename Traits::SmemLayoutKV{});
+    auto sV    = make_tensor(make_smem_ptr(smem.smem_v.begin()), typename Traits::SmemLayoutKV{});
+    auto sVt   = make_tensor(sV.data(), typename Traits::SmemLayoutVt{});
+    auto sVtNS = make_tensor(sV.data(), typename Traits::SmemLayoutVtNoSwi{});
+
+    typename Traits::GmemTiledCopy  copy_q{};
+    typename Traits::GmemTiledCopy  copy_kv{};
+    typename Traits::GmemTiledCopyO copy_o_gmem{};
+    typename Traits::Mma            mma{};
+
+    auto thr_copy_q  = copy_q .get_slice(threadIdx.x);
+    auto thr_copy_kv = copy_kv.get_slice(threadIdx.x);
+
+    auto tQgQ = thr_copy_q .partition_S(gQ);
+    auto tQsQ = thr_copy_q .partition_D(sQ);
+    auto tKgK = thr_copy_kv.partition_S(gK);
+    auto tKsK = thr_copy_kv.partition_D(sK);
+    auto tVgV = thr_copy_kv.partition_S(gV);
+    auto tVsV = thr_copy_kv.partition_D(sV);
+
+    auto cQ = make_identity_tensor(make_shape(Int<kBlockM>{}, Int<HD>{}));
+    auto tQcQ = thr_copy_q.partition_S(cQ);
+    auto cK = make_identity_tensor(make_shape(Int<kBlockN>{}, Int<HD>{}));
+    auto tKcK = thr_copy_kv.partition_S(cK);
+
+    // Load Q (predicated in M).
+    #pragma unroll
+    for (int m = 0; m < size<1>(tQgQ); ++m) {
+        const int row = block_m * kBlockM + get<0>(tQcQ(0, m, 0));
+        if (row < q_len) {
+            cute::copy(copy_q, tQgQ(_, m, _), tQsQ(_, m, _));
+        } else {
+            cute::clear(tQsQ(_, m, _));
+        }
+    }
+    cp_async_fence();
+
+    auto load_kv_tile = [&](auto tXgX, auto tXsX, auto tXcX,
+                            int n_tile, int kv_upper) {
+        #pragma unroll
+        for (int n = 0; n < size<1>(tXsX); ++n) {
+            const int row = n_tile * kBlockN + get<0>(tXcX(0, n, 0));
+            if (row < kv_upper) {
+                cute::copy(copy_kv, tXgX(_, n, _, n_tile), tXsX(_, n, _));
+            } else {
+                cute::clear(tXsX(_, n, _));
+            }
+        }
+    };
+    load_kv_tile(tKgK, tKsK, tKcK, 0, kv_len);
+    cp_async_fence();
+
+    auto thr_mma = mma.get_slice(threadIdx.x);
+    auto rQ  = thr_mma.partition_fragment_A(sQ);
+    auto rK  = thr_mma.partition_fragment_B(sK);
+    auto rS  = partition_fragment_C(mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+    auto rO  = partition_fragment_C(mma, Shape<Int<kBlockM>, Int<HD>>{});
+    auto rVt = thr_mma.partition_fragment_B(sVtNS);
+    clear(rS); clear(rO);
+
+    auto s2r_q  = make_tiled_copy_A(typename Traits::S2RAtomAB{}, mma);
+    auto s2r_k  = make_tiled_copy_B(typename Traits::S2RAtomAB{}, mma);
+    auto s2r_v  = make_tiled_copy_B(typename Traits::S2RAtomVT{}, mma);
+    auto thr_s2r_q = s2r_q.get_slice(threadIdx.x);
+    auto thr_s2r_k = s2r_k.get_slice(threadIdx.x);
+    auto thr_s2r_v = s2r_v.get_slice(threadIdx.x);
+    auto tXsQ = thr_s2r_q.partition_S(sQ);
+    auto tXrQ = thr_s2r_q.retile_D(rQ);
+    auto tXsK = thr_s2r_k.partition_S(sK);
+    auto tXrK = thr_s2r_k.retile_D(rK);
+    auto tOsVt = thr_s2r_v.partition_S(sVt);
+
+    auto rS_rc_layout = to_rowcol(rS.layout());
+    Tensor row_max = make_tensor<float>(Shape<Int<size<0>(rS_rc_layout)>>{});
+    Tensor row_sum = make_tensor<float>(Shape<Int<size<0>(rS_rc_layout)>>{});
+    CUTE_UNROLL
+    for (int i = 0; i < size(row_max); ++i) { row_max(i) = -5e4f; row_sum(i) = 0.f; }
+
+    const float scale_log2 = softmax_scale * float(M_LOG2E);
+
+    cp_async_wait<1>();
+    __syncthreads();
+    cute::copy(s2r_q, tXsQ, tXrQ);
+
+    // KV tile range (causal pruning is per-request).
+    int n_block_max;
+    if (is_causal) {
+        const int max_k = (block_m + 1) * kBlockM + (kv_len - q_len);
+        n_block_max = (max_k + kBlockN - 1) / kBlockN;
+        const int total = (kv_len + kBlockN - 1) / kBlockN;
+        n_block_max = min(n_block_max, total);
+    } else {
+        n_block_max = (kv_len + kBlockN - 1) / kBlockN;
+    }
+    if (n_block_max <= 0) n_block_max = 0;
+
+    const int warp_id     = threadIdx.x / 32;
+    const int lane_id     = threadIdx.x & 31;
+    const int row_idx_ofs = block_m * kBlockM + warp_id * 16 + lane_id / 4;
+
+    for (int nt = 0; nt < n_block_max; ++nt) {
+        load_kv_tile(tVgV, tVsV, tKcK, nt, kv_len);
+        cp_async_fence();
+        cp_async_wait<1>();
+        __syncthreads();
+
+        clear(rS);
+        cute::copy(s2r_k, tXsK, tXrK);
+        cute::gemm(mma, rQ, rK, rS);
+
+        if (nt + 1 < n_block_max) {
+            load_kv_tile(tKgK, tKsK, tKcK, nt + 1, kv_len);
+        }
+        cp_async_fence();
+
+        if (is_causal) {
+            apply_causal_mask(rS, kBlockN * nt, row_idx_ofs,
+                              16 * kNWarps, kv_len - q_len, kv_len);
+        } else {
+            if ((nt + 1) * kBlockN > kv_len) {
+                apply_col_bound_mask(rS, kBlockN * nt, kv_len);
+            }
+        }
+
+        auto scores = make_tensor(rS.data(), to_rowcol(rS.layout()));
+        if (nt == 0) {
+            reduce_max_rows<true>(scores, row_max);
+            scale_apply_exp2(scores, row_max, scale_log2);
+            reduce_sum_rows<true>(scores, row_sum);
+        } else {
+            Tensor m_prev = make_fragment_like(row_max);
+            cute::copy(row_max, m_prev);
+            reduce_max_rows<false>(scores, row_max);
+            auto rO_rc = make_tensor(rO.data(), to_rowcol(rO.layout()));
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                const float m_cur = (row_max(mi) == -INFINITY) ? 0.f : row_max(mi);
+                const float sc    = exp2f((m_prev(mi) - m_cur) * scale_log2);
+                row_sum(mi) *= sc;
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(rO_rc); ++ni) rO_rc(mi, ni) *= sc;
+            }
+            scale_apply_exp2(scores, row_max, scale_log2);
+            reduce_sum_rows<false>(scores, row_sum);
+        }
+
+        cp_async_wait<1>();
+        __syncthreads();
+
+        auto rP = convert_type<Elem>(rS);
+        auto tOrP = make_tensor(
+            rP.data(),
+            to_A_regs<typename Traits::Mma>(rP.layout()));
+        gemm_rs(rO, tOrP, rVt, tOsVt, mma, s2r_v, thr_s2r_v);
+    }
+
+    cp_async_wait<0>();
+    __syncthreads();
+
+    SumOp sum_op;
+    quad_allreduce(row_sum, row_sum, sum_op);
+    auto rO_rc = make_tensor(rO.data(), to_rowcol(rO.layout()));
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(rO_rc); ++mi) {
+        const float s = row_sum(mi);
+        const float inv = (s == 0.f || s != s) ? 1.f : (1.f / s);
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(rO_rc); ++ni) rO_rc(mi, ni) *= inv;
+    }
+
+    auto rO_out = convert_type<Elem>(rO);
+    auto sO = make_tensor(sQ.data(), typename Traits::SmemLayoutO{});
+
+    using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Elem>;
+    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(threadIdx.x);
+    auto taccOrO = smem_thr_copy_O.retile_S(rO_out);
+    auto taccOsO = smem_thr_copy_O.partition_D(sO);
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    __syncthreads();
+
+    auto thr_copy_o = copy_o_gmem.get_slice(threadIdx.x);
+    auto tOsO = thr_copy_o.partition_S(sO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+    auto rO_tmp = make_tensor<Elem>(shape(tOgO));
+    cute::copy(copy_o_gmem, tOsO, rO_tmp);
+
+    auto cO   = make_identity_tensor(make_shape(Int<kBlockM>{}, Int<HD>{}));
+    auto tOcO = thr_copy_o.partition_D(cO);
+    #pragma unroll
+    for (int i = 0; i < size(rO_tmp); ++i) {
+        const int m = get<0>(tOcO(i));
+        if (block_m * kBlockM + m < q_len) {
+            tOgO(i) = rO_tmp(i);
+        }
+    }
+}
+
+// =============================================================================
+// Ragged launcher
+// =============================================================================
+template <class Elem, int HD>
+static cudaError_t launch_ragged_impl(
+    const Elem* q, int64_t qss, int64_t qsh,
+    const Elem* const* k_cache_ptrs,
+    const Elem* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          Elem* o, int64_t oss, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int num_q_heads, int num_kv_heads,
+    float softmax_scale, int is_causal,
     cudaStream_t stream)
 {
-    launch_flash_attn_cute_128x64x64_tile_impl<__nv_bfloat16>(
-        d_Q, d_K, d_V, d_O, seq_len, kv_len_ptr, q_heads, kv_heads, is_causal, stream);
+    using Traits = KTraits<Elem, HD>;
+    if (total_q_tiles <= 0) return cudaSuccess;
+    dim3 grid(total_q_tiles, num_q_heads, 1);
+    dim3 block(Traits::NumThreads);
+
+    const int smem_size = int(sizeof(SharedStorage<Elem,
+                                 typename Traits::SmemLayoutQ,
+                                 typename Traits::SmemLayoutKV>));
+    auto kernel = flash_attn_ragged_kernel<Traits>;
+    cudaError_t err = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (err != cudaSuccess) return err;
+
+    kernel<<<grid, block, smem_size, stream>>>(
+        q, qss, qsh,
+        k_cache_ptrs, v_cache_ptrs, kv_stride_s, kv_stride_h,
+        o, oss, osh,
+        req_to_slot, kv_lens, cu_q_lens, block2req, block2tile,
+        num_q_heads, num_kv_heads,
+        softmax_scale, is_causal);
+    return cudaGetLastError();
 }
 
-// FP16: 与原 flash_attn_gqa_fp16.cu 保持相同签名
-extern "C" void launch_flash_attn_cute_128x64x64_tile_fp16(
-    const __half* d_Q, const __half* d_K, const __half* d_V, __half* d_O,
-    int seq_len, int* kv_len_ptr, int q_heads, int kv_heads,
-    int is_causal,
+template <class Elem>
+static cudaError_t launch_ragged_dispatch(
+    const Elem* q, int64_t qss, int64_t qsh,
+    const Elem* const* k_cache_ptrs,
+    const Elem* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          Elem* o, int64_t oss, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
     cudaStream_t stream)
 {
-    launch_flash_attn_cute_128x64x64_tile_impl<__half>(
-        d_Q, d_K, d_V, d_O, seq_len, kv_len_ptr, q_heads, kv_heads, is_causal, stream);
+    switch (head_dim) {
+    case 64:  return launch_ragged_impl<Elem, 64>(q,qss,qsh, k_cache_ptrs,v_cache_ptrs,
+                                                  kv_stride_s,kv_stride_h,
+                                                  o,oss,osh,
+                                                  req_to_slot,kv_lens,cu_q_lens,
+                                                  block2req,block2tile,total_q_tiles,
+                                                  num_q_heads,num_kv_heads,
+                                                  softmax_scale,is_causal,stream);
+    case 128: return launch_ragged_impl<Elem,128>(q,qss,qsh, k_cache_ptrs,v_cache_ptrs,
+                                                  kv_stride_s,kv_stride_h,
+                                                  o,oss,osh,
+                                                  req_to_slot,kv_lens,cu_q_lens,
+                                                  block2req,block2tile,total_q_tiles,
+                                                  num_q_heads,num_kv_heads,
+                                                  softmax_scale,is_causal,stream);
+    case 192: return launch_ragged_impl<Elem,192>(q,qss,qsh, k_cache_ptrs,v_cache_ptrs,
+                                                  kv_stride_s,kv_stride_h,
+                                                  o,oss,osh,
+                                                  req_to_slot,kv_lens,cu_q_lens,
+                                                  block2req,block2tile,total_q_tiles,
+                                                  num_q_heads,num_kv_heads,
+                                                  softmax_scale,is_causal,stream);
+    case 256: return launch_ragged_impl<Elem,256>(q,qss,qsh, k_cache_ptrs,v_cache_ptrs,
+                                                  kv_stride_s,kv_stride_h,
+                                                  o,oss,osh,
+                                                  req_to_slot,kv_lens,cu_q_lens,
+                                                  block2req,block2tile,total_q_tiles,
+                                                  num_q_heads,num_kv_heads,
+                                                  softmax_scale,is_causal,stream);
+    default:
+        fprintf(stderr, "[flash_attn_ragged] unsupported head_dim=%d; "
+                        "supported: 64, 128, 192, 256\n", head_dim);
+        return cudaErrorInvalidValue;
+    }
 }
+
+} // namespace flash_attn_prefill
+
+// =============================================================================
+// Public C ABI
+// =============================================================================
+extern "C" {
+
+void launch_flash_attn_prefill_bf16(
+    const __nv_bfloat16* q, int64_t qsb, int64_t qss, int64_t qsh,
+    const __nv_bfloat16* k, int64_t ksb, int64_t kss, int64_t ksh,
+    const __nv_bfloat16* v, int64_t vsb, int64_t vss, int64_t vsh,
+          __nv_bfloat16* o, int64_t osb, int64_t oss, int64_t osh,
+    int batch, int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream)
+{
+    cudaError_t err = flash_attn_prefill::launch_dispatch<__nv_bfloat16>(
+        q,qsb,qss,qsh, k,ksb,kss,ksh, v,vsb,vss,vsh, o,osb,oss,osh,
+        batch,q_len,kv_len,num_q_heads,num_kv_heads,head_dim,
+        softmax_scale,is_causal,stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[flash_attn_prefill_bf16] launch error: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
+void launch_flash_attn_prefill_fp16(
+    const __half* q, int64_t qsb, int64_t qss, int64_t qsh,
+    const __half* k, int64_t ksb, int64_t kss, int64_t ksh,
+    const __half* v, int64_t vsb, int64_t vss, int64_t vsh,
+          __half* o, int64_t osb, int64_t oss, int64_t osh,
+    int batch, int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream)
+{
+    cudaError_t err = flash_attn_prefill::launch_dispatch<__half>(
+        q,qsb,qss,qsh, k,ksb,kss,ksh, v,vsb,vss,vsh, o,osb,oss,osh,
+        batch,q_len,kv_len,num_q_heads,num_kv_heads,head_dim,
+        softmax_scale,is_causal,stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[flash_attn_prefill_fp16] launch error: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
+// ---- Legacy shims removed. Use launch_flash_attn_prefill_{bf16,fp16} only. ----
+
+void launch_flash_attn_ragged_bf16(
+    const __nv_bfloat16* q, int64_t qss, int64_t qsh,
+    const __nv_bfloat16* const* k_cache_ptrs,
+    const __nv_bfloat16* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __nv_bfloat16* o, int64_t oss, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream)
+{
+    cudaError_t err = flash_attn_prefill::launch_ragged_dispatch<__nv_bfloat16>(
+        q, qss, qsh,
+        k_cache_ptrs, v_cache_ptrs, kv_stride_s, kv_stride_h,
+        o, oss, osh,
+        req_to_slot, kv_lens, cu_q_lens, block2req, block2tile, total_q_tiles,
+        num_q_heads, num_kv_heads, head_dim,
+        softmax_scale, is_causal, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[flash_attn_ragged_bf16] launch error: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
+void launch_flash_attn_ragged_fp16(
+    const __half* q, int64_t qss, int64_t qsh,
+    const __half* const* k_cache_ptrs,
+    const __half* const* v_cache_ptrs,
+    int64_t kv_stride_s, int64_t kv_stride_h,
+          __half* o, int64_t oss, int64_t osh,
+    const int32_t* req_to_slot,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream)
+{
+    cudaError_t err = flash_attn_prefill::launch_ragged_dispatch<__half>(
+        q, qss, qsh,
+        k_cache_ptrs, v_cache_ptrs, kv_stride_s, kv_stride_h,
+        o, oss, osh,
+        req_to_slot, kv_lens, cu_q_lens, block2req, block2tile, total_q_tiles,
+        num_q_heads, num_kv_heads, head_dim,
+        softmax_scale, is_causal, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[flash_attn_ragged_fp16] launch error: %s\n",
+                cudaGetErrorString(err));
+    }
+}
+
+} // extern "C"
+
+// =============================================================================
+// Stand-alone C++ test main:
+//   nvcc -std=c++17 -arch=sm_80 -O3 -I<cutlass-include> \
+//        -DFLASH_ATTN_PREFILL_STANDALONE_TEST flash_attn_gqa_prefill.cu \
+//        -o flash_attn_prefill_test
+//   ./flash_attn_prefill_test
+// =============================================================================
+#ifdef FLASH_ATTN_PREFILL_STANDALONE_TEST
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace test {
+
+#define CUDA_MUST(expr) do {                                                    \
+    cudaError_t _e = (expr);                                                    \
+    if (_e != cudaSuccess) {                                                    \
+        std::cerr << "CUDA error " << cudaGetErrorString(_e)                    \
+                  << " at " << __FILE__ << ":" << __LINE__ << std::endl;        \
+        std::exit(1);                                                           \
+    }                                                                           \
+} while (0)
+
+// Naive f32 reference Attention on device (one block per (batch, q_head),
+// one thread per q_row). Slow but correct.
+__global__ void naive_attn_ref_kernel(
+    const float* __restrict__ Q, int64_t qsb, int64_t qss, int64_t qsh,
+    const float* __restrict__ K, int64_t ksb, int64_t kss, int64_t ksh,
+    const float* __restrict__ V, int64_t vsb, int64_t vss, int64_t vsh,
+          float* __restrict__ O, int64_t osb, int64_t oss, int64_t osh,
+    int q_len, int kv_len,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float scale, int is_causal)
+{
+    const int bid = blockIdx.z;
+    const int qh  = blockIdx.y;
+    const int kvh = qh / (num_q_heads / num_kv_heads);
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= q_len) return;
+
+    const float* q = Q + bid*qsb + qh *qsh + row * qss;
+          float* o = O + bid*osb + qh *osh + row * oss;
+
+    const int causal_shift = kv_len - q_len;
+    const int k_upper = is_causal ? min(kv_len, row + 1 + causal_shift) : kv_len;
+
+    // Pass 1: logits max
+    float m = -INFINITY;
+    for (int t = 0; t < k_upper; ++t) {
+        const float* k = K + bid*ksb + kvh*ksh + t * kss;
+        float s = 0.f;
+        for (int d = 0; d < head_dim; ++d) s += q[d] * k[d];
+        s *= scale;
+        if (s > m) m = s;
+    }
+    if (m == -INFINITY) {
+        for (int d = 0; d < head_dim; ++d) o[d] = 0.f;
+        return;
+    }
+    // Pass 2: weighted sum
+    float denom = 0.f;
+    for (int d = 0; d < head_dim; ++d) o[d] = 0.f;
+    for (int t = 0; t < k_upper; ++t) {
+        const float* k = K + bid*ksb + kvh*ksh + t * kss;
+        const float* v = V + bid*vsb + kvh*vsh + t * vss;
+        float s = 0.f;
+        for (int d = 0; d < head_dim; ++d) s += q[d] * k[d];
+        s = __expf(s * scale - m);
+        denom += s;
+        for (int d = 0; d < head_dim; ++d) o[d] += s * v[d];
+    }
+    const float inv = (denom == 0.f) ? 1.f : 1.f / denom;
+    for (int d = 0; d < head_dim; ++d) o[d] *= inv;
+}
+
+template <class HT /* bf16 or fp16 host-visible proxy: use uint16_t bit-cast */>
+struct HalfType;
+template<> struct HalfType<__nv_bfloat16> {
+    static __nv_bfloat16 from_f32(float x) { return __float2bfloat16(x); }
+    static float         to_f32(__nv_bfloat16 x) { return __bfloat162float(x); }
+    static const char*   name() { return "bf16"; }
+};
+template<> struct HalfType<__half> {
+    static __half from_f32(float x) { return __float2half(x); }
+    static float  to_f32(__half x)  { return __half2float(x); }
+    static const char* name() { return "fp16"; }
+};
+
+struct Case {
+    int B, Hq, Hkv, HD, Qn, Kn;
+    bool causal;
+    // If true, Q/O carry an extra padding stride (non-contiguous view test).
+    bool q_padded;
+    bool kv_padded;
+    const char* tag;
+};
+
+template <class Elem>
+bool run_case(const Case& c, std::mt19937& rng) {
+    auto scale = 1.f / std::sqrt((float)c.HD);
+
+    // Host storage in f32 for reference and for value generation.
+    const size_t q_n  = (size_t)c.B * c.Qn * c.Hq  * c.HD;
+    const size_t kv_n = (size_t)c.B * c.Kn * c.Hkv * c.HD;
+
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    std::vector<float> q_f(q_n), k_f(kv_n), v_f(kv_n);
+    for (auto& x : q_f) x = dist(rng);
+    for (auto& x : k_f) x = dist(rng);
+    for (auto& x : v_f) x = dist(rng);
+
+    // Build low-precision device buffers, potentially with "padding" in the
+    // head dimension to make strides non-contiguous.
+    const int q_pad_heads  = c.q_padded  ? (c.Hq  + 3) : c.Hq;
+    const int kv_pad_heads = c.kv_padded ? (c.Hkv + 3) : c.Hkv;
+
+    const int64_t qsh = c.HD;
+    const int64_t qss = (int64_t)q_pad_heads * c.HD;
+    const int64_t qsb = (int64_t)c.Qn * qss;
+    const int64_t ksh = c.HD;
+    const int64_t kss = (int64_t)kv_pad_heads * c.HD;
+    const int64_t ksb = (int64_t)c.Kn * kss;
+    // O uses the same stride as Q (same padding) so that kernel's stride path
+    // is exercised on the output side as well.
+    const int64_t osh = c.HD;
+    const int64_t oss = qss;
+    const int64_t osb = qsb;
+
+    const size_t q_buf_elems = (size_t)c.B * qsb;
+    const size_t k_buf_elems = (size_t)c.B * ksb;
+
+    std::vector<Elem>  h_q(q_buf_elems, HalfType<Elem>::from_f32(0.f));
+    std::vector<Elem>  h_k(k_buf_elems, HalfType<Elem>::from_f32(0.f));
+    std::vector<Elem>  h_v(k_buf_elems, HalfType<Elem>::from_f32(0.f));
+    std::vector<Elem>  h_o(q_buf_elems, HalfType<Elem>::from_f32(0.f));
+
+    // Also build full f32 mirrors (with the same padding!) for the reference.
+    std::vector<float> qf_full(q_buf_elems, 0.f);
+    std::vector<float> kf_full(k_buf_elems, 0.f);
+    std::vector<float> vf_full(k_buf_elems, 0.f);
+    std::vector<float> of_full(q_buf_elems, 0.f);
+
+    auto idx_q = [&](int b, int s, int h, int d) -> size_t {
+        return (size_t)b * qsb + (size_t)s * qss + (size_t)h * qsh + d;
+    };
+    auto idx_k = [&](int b, int s, int h, int d) -> size_t {
+        return (size_t)b * ksb + (size_t)s * kss + (size_t)h * ksh + d;
+    };
+
+    for (int b = 0; b < c.B; ++b) {
+        for (int s = 0; s < c.Qn; ++s)
+            for (int h = 0; h < c.Hq; ++h)
+                for (int d = 0; d < c.HD; ++d) {
+                    const size_t src = ((size_t)b*c.Qn*c.Hq + s*c.Hq + h) * c.HD + d;
+                    const size_t dst = idx_q(b,s,h,d);
+                    h_q[dst]    = HalfType<Elem>::from_f32(q_f[src]);
+                    qf_full[dst] = q_f[src];
+                }
+        for (int s = 0; s < c.Kn; ++s)
+            for (int h = 0; h < c.Hkv; ++h)
+                for (int d = 0; d < c.HD; ++d) {
+                    const size_t src = ((size_t)b*c.Kn*c.Hkv + s*c.Hkv + h) * c.HD + d;
+                    const size_t dst = idx_k(b,s,h,d);
+                    h_k[dst] = HalfType<Elem>::from_f32(k_f[src]);
+                    h_v[dst] = HalfType<Elem>::from_f32(v_f[src]);
+                    kf_full[dst] = k_f[src];
+                    vf_full[dst] = v_f[src];
+                }
+    }
+
+    // Device allocations
+    Elem  *d_q=nullptr, *d_k=nullptr, *d_v=nullptr, *d_o=nullptr;
+    float *d_qf=nullptr,*d_kf=nullptr,*d_vf=nullptr,*d_of=nullptr;
+    CUDA_MUST(cudaMalloc(&d_q, h_q.size()*sizeof(Elem)));
+    CUDA_MUST(cudaMalloc(&d_k, h_k.size()*sizeof(Elem)));
+    CUDA_MUST(cudaMalloc(&d_v, h_v.size()*sizeof(Elem)));
+    CUDA_MUST(cudaMalloc(&d_o, h_o.size()*sizeof(Elem)));
+    CUDA_MUST(cudaMalloc(&d_qf, qf_full.size()*sizeof(float)));
+    CUDA_MUST(cudaMalloc(&d_kf, kf_full.size()*sizeof(float)));
+    CUDA_MUST(cudaMalloc(&d_vf, vf_full.size()*sizeof(float)));
+    CUDA_MUST(cudaMalloc(&d_of, of_full.size()*sizeof(float)));
+
+    CUDA_MUST(cudaMemcpy(d_q, h_q.data(), h_q.size()*sizeof(Elem), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemcpy(d_k, h_k.data(), h_k.size()*sizeof(Elem), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemcpy(d_v, h_v.data(), h_v.size()*sizeof(Elem), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemset(d_o, 0,         h_o.size()*sizeof(Elem)));
+    CUDA_MUST(cudaMemcpy(d_qf, qf_full.data(), qf_full.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemcpy(d_kf, kf_full.data(), kf_full.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemcpy(d_vf, vf_full.data(), vf_full.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_MUST(cudaMemset(d_of, 0,              of_full.size()*sizeof(float)));
+
+    // --- Launch kernel under test ---
+    if constexpr (std::is_same_v<Elem, __nv_bfloat16>) {
+        launch_flash_attn_prefill_bf16(
+            d_q,qsb,qss,qsh, d_k,ksb,kss,ksh, d_v,ksb,kss,ksh, d_o,osb,oss,osh,
+            c.B, c.Qn, c.Kn, c.Hq, c.Hkv, c.HD,
+            scale, c.causal ? 1 : 0, 0);
+    } else {
+        launch_flash_attn_prefill_fp16(
+            d_q,qsb,qss,qsh, d_k,ksb,kss,ksh, d_v,ksb,kss,ksh, d_o,osb,oss,osh,
+            c.B, c.Qn, c.Kn, c.Hq, c.Hkv, c.HD,
+            scale, c.causal ? 1 : 0, 0);
+    }
+    CUDA_MUST(cudaDeviceSynchronize());
+
+    // --- Reference on f32 ---
+    const int TPB = 128;
+    dim3 grid((c.Qn + TPB - 1) / TPB, c.Hq, c.B);
+    naive_attn_ref_kernel<<<grid, TPB>>>(
+        d_qf,qsb,qss,qsh, d_kf,ksb,kss,ksh, d_vf,ksb,kss,ksh, d_of,osb,oss,osh,
+        c.Qn, c.Kn, c.Hq, c.Hkv, c.HD, scale, c.causal ? 1 : 0);
+    CUDA_MUST(cudaDeviceSynchronize());
+
+    // --- Compare ---
+    CUDA_MUST(cudaMemcpy(h_o.data(),   d_o,  h_o.size()*sizeof(Elem),   cudaMemcpyDeviceToHost));
+    CUDA_MUST(cudaMemcpy(of_full.data(), d_of, of_full.size()*sizeof(float), cudaMemcpyDeviceToHost));
+
+    // tolerances (Q is bf16/fp16, accumulation in f32).
+    const float atol = std::is_same_v<Elem, __nv_bfloat16> ? 5e-2f : 1e-2f;
+    const float rtol = std::is_same_v<Elem, __nv_bfloat16> ? 1e-2f : 5e-3f;
+
+    double max_abs = 0, sum_abs = 0;
+    long   cnt = 0, bad = 0;
+    for (int b = 0; b < c.B; ++b) {
+        for (int s = 0; s < c.Qn; ++s) {
+            for (int h = 0; h < c.Hq; ++h) {
+                for (int d = 0; d < c.HD; ++d) {
+                    const size_t p = idx_q(b,s,h,d);
+                    const float got = HalfType<Elem>::to_f32(h_o[p]);
+                    const float ref = of_full[p];
+                    const float err = std::fabs(got - ref);
+                    const float tol = atol + rtol * std::fabs(ref);
+                    max_abs = std::max<double>(max_abs, err);
+                    sum_abs += err;
+                    ++cnt;
+                    if (err > tol) ++bad;
+                }
+            }
+        }
+    }
+
+    const bool ok = (bad == 0);
+    std::printf("  [%s|%-6s] B=%d Hq=%d Hkv=%d HD=%d Qn=%d Kn=%d causal=%d "
+                "q_pad=%d kv_pad=%d  max_err=%.4f mean_err=%.4f bad=%ld/%ld  %s\n",
+                c.tag, HalfType<Elem>::name(), c.B, c.Hq, c.Hkv, c.HD, c.Qn, c.Kn,
+                c.causal, c.q_padded, c.kv_padded,
+                max_abs, sum_abs / std::max(1L, cnt), bad, cnt,
+                ok ? "OK" : "FAIL");
+
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o);
+    cudaFree(d_qf); cudaFree(d_kf); cudaFree(d_vf); cudaFree(d_of);
+    return ok;
+}
+
+} // namespace test
+
+int main() {
+    std::mt19937 rng(0xC0DEBEEFu);
+
+    // Matrix of cases: batch, heads, head_dim, seq lengths, causal, stride padding.
+    std::vector<test::Case> cases = {
+        // --- head_dim=64 ---
+        {1, 4,  2,  64,  128, 128, true,  false, false, "hd64-B1-causal"},
+        {1, 8,  2,  64,  160, 160, true,  false, false, "hd64-B1-ragged-causal"},
+        {2, 4,  4,  64,  128, 256, false, false, false, "hd64-B2-cross"},
+        {3, 8,  4,  64,  256, 256, true,  true,  true,  "hd64-B3-strided"},
+        // --- head_dim=128 ---
+        {1, 4,  4, 128,  128, 128, true,  false, false, "hd128-B1-causal"},
+        {2, 8,  2, 128,  256, 384, false, true,  false, "hd128-B2-crossatt-strided"},
+        {2, 8,  2, 128,  130, 300, true,  false, true,  "hd128-B2-ragged"},
+        // --- head_dim=192 ---
+        {1, 4,  4, 192,  128, 128, true,  false, false, "hd192-B1-causal"},
+        {2, 8,  4, 192,  128, 200, false, true,  true,  "hd192-B2-strided"},
+        // --- head_dim=256 ---
+        {1, 4,  4, 256,  128, 128, true,  false, false, "hd256-B1-causal"},
+    };
+
+    bool all_ok = true;
+    std::cout << "=== BF16 ===" << std::endl;
+    for (const auto& c : cases) all_ok &= test::run_case<__nv_bfloat16>(c, rng);
+    std::cout << "=== FP16 ===" << std::endl;
+    for (const auto& c : cases) all_ok &= test::run_case<__half>(c, rng);
+
+    std::cout << (all_ok ? "ALL TESTS PASSED\n" : "SOME TESTS FAILED\n");
+    return all_ok ? 0 : 1;
+}
+
+#endif // FLASH_ATTN_PREFILL_STANDALONE_TEST
