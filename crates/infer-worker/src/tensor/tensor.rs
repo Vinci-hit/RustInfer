@@ -135,6 +135,28 @@ impl Tensor {
     #[inline]
     pub fn storage_offset(&self) -> usize { dispatch_on_tensor!(self, offset_elems()) }
 
+    /// "This tensor *exclusively* owns its backing storage and exactly fills
+    /// it" predicate.
+    ///
+    /// Returns true iff:
+    /// - `is_contiguous() == true`,
+    /// - `storage_offset() == 0`,
+    /// - the underlying `Buffer` has length **exactly** `numel * sizeof(dtype)`.
+    ///
+    /// This is the correct precondition for any "fast-path bulk copy of the
+    /// whole buffer" (cross-device migration, dtype cast, deep clone). The
+    /// looser `is_contiguous() && storage_offset() == 0` test is **not**
+    /// sufficient: a prefix-narrowed view (e.g. `base.narrow(0, 0, n)` with
+    /// `n < base.shape[0]`) is contiguous and offset 0, yet its buffer still
+    /// covers the full base storage.
+    pub fn owns_storage_tightly(&self) -> bool {
+        if !self.is_contiguous() || self.storage_offset() != 0 {
+            return false;
+        }
+        let expected = self.numel() * self.dtype().size_in_bytes();
+        self.buffer().len_bytes() == expected
+    }
+
     /// Dtype tag.
     pub fn dtype(&self) -> DataType {
         match self {

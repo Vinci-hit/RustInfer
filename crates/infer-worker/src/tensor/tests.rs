@@ -347,3 +347,81 @@ fn cuda_contiguous_materialises_transpose() -> Result<()> {
     assert_eq!(cpu_c.as_f32()?.as_slice()?, cpu_t.as_f32()?.as_slice()?);
     Ok(())
 }
+
+// ───────── prefix-narrowed view materialisation regressions ──────────
+//
+// 一个 base 张量被 `narrow(0, 0, n)` 切成前缀视图后：
+//   - `is_contiguous() == true`
+//   - `storage_offset() == 0`
+//   - **但** `buffer.len_bytes()` 仍是 base 整张的尺寸（> shape.numel * elem）
+//
+// 早期 `to_owned` / `to_cpu` / `to_cuda` 用 `is_contiguous && offset==0`
+// 走快路径，会按 src buffer 长度整段拷贝 → `from_buffer` 的尺寸校验直接 panic。
+// 这里固化精确判定 (`owns_storage_tightly`) 后的行为。
+
+#[test]
+fn owns_storage_tightly_distinguishes_prefix_view() -> Result<()> {
+    let base = make_f32_cpu_2d(8, 4, 0)?;     // shape=[8,4]，buffer=8*4*4=128B
+    assert!(base.owns_storage_tightly());
+
+    let prefix = base.narrow(0, 0, 3)?;       // shape=[3,4]，buffer 仍 128B
+    assert!(prefix.is_contiguous());
+    assert_eq!(prefix.storage_offset(), 0);
+    assert!(
+        !prefix.owns_storage_tightly(),
+        "prefix-narrowed view must NOT be considered tightly owned"
+    );
+    Ok(())
+}
+
+#[test]
+fn to_owned_on_prefix_view_returns_tight_buffer() -> Result<()> {
+    let base = make_f32_cpu_2d(8, 4, 0)?;
+    let prefix = base.narrow(0, 0, 3)?;
+    let owned = prefix.to_owned()?;
+    // 内容前 12 个 f32 与 base 前 12 个一致
+    let base_slice = base.as_f32()?.as_slice()?;
+    let owned_slice = owned.as_f32()?.as_slice()?;
+    assert_eq!(owned_slice, &base_slice[..12]);
+    // 且 owned 的 buffer 大小 = numel * 4
+    assert!(owned.owns_storage_tightly());
+    assert_eq!(owned.buffer().len_bytes(), 12 * std::mem::size_of::<f32>());
+    Ok(())
+}
+
+#[test]
+fn contiguous_on_prefix_view_does_not_panic_and_is_tight() -> Result<()> {
+    let base = make_f32_cpu_2d(8, 4, 0)?;
+    let prefix = base.narrow(0, 0, 3)?;
+    let c = prefix.contiguous()?;
+    assert!(c.owns_storage_tightly());
+    assert_eq!(c.shape(), &[3, 4]);
+    let want = base.as_f32()?.as_slice()?[..12].to_vec();
+    assert_eq!(c.as_f32()?.as_slice()?, want.as_slice());
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn to_cpu_on_cuda_prefix_view_does_not_panic() -> Result<()> {
+    let cpu = make_f32_cpu_2d(8, 4, 0)?;
+    let gpu = cpu.to_cuda(0)?;
+    let gpu_prefix = gpu.narrow(0, 0, 3)?;
+    let back = gpu_prefix.to_cpu()?;
+    let want = cpu.as_f32()?.as_slice()?[..12].to_vec();
+    assert_eq!(back.as_f32()?.as_slice()?, want.as_slice());
+    assert!(back.owns_storage_tightly());
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn to_cuda_on_cpu_prefix_view_does_not_panic() -> Result<()> {
+    let cpu = make_f32_cpu_2d(8, 4, 0)?;
+    let cpu_prefix = cpu.narrow(0, 0, 3)?;
+    let gpu = cpu_prefix.to_cuda(0)?;
+    let back = gpu.to_cpu()?;
+    let want = cpu.as_f32()?.as_slice()?[..12].to_vec();
+    assert_eq!(back.as_f32()?.as_slice()?, want.as_slice());
+    Ok(())
+}

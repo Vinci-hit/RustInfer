@@ -44,6 +44,13 @@ pub enum AttentionKind {
 ///
 /// 字段语义与 [`FlashAttnDecodeBatch::forward`] / [`FlashAttnRagged::forward`]
 /// 完全一致，此处只做聚合。
+///
+/// 注意：`k_cache_ptrs_dev` / `v_cache_ptrs_dev` 是整张
+/// `[layer_num × max_batch_seqs]` u64 指针表的**起始地址**；模型每层调用
+/// [`Attention::forward`] 时需要传入 `layer_idx` 与 `max_batch_seqs`，本 facade
+/// 内部将这两张表按 `layer_idx * max_batch_seqs` 偏移到本层对应行起始处再下传给
+/// kernel —— 因为 attention kernel（ragged / decode-batch）只接受按 slot 索引
+/// 的"单层指针表"，与 scatter 的 `[layer × slot]` 大表索引语义不同。
 pub struct AttentionPlan {
     pub kind: AttentionKind,
 
@@ -54,6 +61,9 @@ pub struct AttentionPlan {
     pub kv_stride_h: i64,
     pub req_to_slot_dev: *const i32,
     pub kv_lens_dev: *const i32,
+    /// 指针表中每层占用的列数（= `BatchWorkspace::max_batch_seqs`），用于按
+    /// `layer_idx` 偏移定位本层对应行的起始指针。
+    pub max_batch_seqs: usize,
 
     // DecodeOnly 专用
     pub workspace: *mut f32,
@@ -85,6 +95,7 @@ impl AttentionPlan {
             kv_stride_h: 0,
             req_to_slot_dev: std::ptr::null(),
             kv_lens_dev: std::ptr::null(),
+            max_batch_seqs: 0,
             workspace: std::ptr::null_mut(),
             cu_q_lens_dev: std::ptr::null(),
             block2req_dev: std::ptr::null(),
@@ -118,23 +129,38 @@ impl Attention {
     /// - `q` / `o` 均为 `[total_q_tokens, num_q_heads, head_dim]` 的 3D view。
     ///   - `DecodeOnly` 时 `total_q_tokens == batch`（每 seq 一个 token）。
     ///   - `Ragged` 时 `total_q_tokens == Σ q_len_i`。
+    /// - `layer_idx`：本次 attention 对应的 transformer 层；本 facade 据此把
+    ///   `plan.k_cache_ptrs_dev` / `plan.v_cache_ptrs_dev` 偏移到该层在
+    ///   `[layer_num × max_batch_seqs]` 大表里的行起始处，下传给 kernel。
     ///
     /// # Safety
     /// `plan` 里所有裸指针在本调用期间必须有效；且 `plan.kind` 与 `q` 的布局
-    /// 必须自洽（由 runner 保证）。
+    /// 必须自洽（由 runner 保证）。`layer_idx` 与 `plan.max_batch_seqs` 必须
+    /// 与 [`crate::worker::BatchWorkspace`] 中实际填表时使用的同一组数值。
     pub unsafe fn forward(
         &self,
         q: &Tensor,
         o: &mut Tensor,
+        layer_idx: usize,
         plan: &AttentionPlan,
         cuda_cfg: Option<&OpConfig>,
     ) -> Result<()> {
+        // 同一张 [layer_num × max_batch_seqs] u64 指针大表，按 layer_idx 偏移到
+        // 本层对应行起始处。Kernel 端只接受按 slot 索引的"单层指针表"。
+        let row = layer_idx
+            .checked_mul(plan.max_batch_seqs)
+            .ok_or_else(|| crate::base::error::Error::InvalidArgument(format!(
+                "Attention::forward: layer_idx {} * max_batch_seqs {} overflows",
+                layer_idx, plan.max_batch_seqs,
+            )))?;
+        let k_layer = unsafe { plan.k_cache_ptrs_dev.add(row) };
+        let v_layer = unsafe { plan.v_cache_ptrs_dev.add(row) };
         match plan.kind {
             AttentionKind::DecodeOnly => unsafe {
                 self.decode.forward(
                     q,
-                    plan.k_cache_ptrs_dev,
-                    plan.v_cache_ptrs_dev,
+                    k_layer,
+                    v_layer,
                     plan.kv_stride_s,
                     plan.kv_stride_h,
                     plan.req_to_slot_dev,
@@ -147,8 +173,8 @@ impl Attention {
             AttentionKind::Ragged => unsafe {
                 self.ragged.forward(
                     q,
-                    plan.k_cache_ptrs_dev,
-                    plan.v_cache_ptrs_dev,
+                    k_layer,
+                    v_layer,
                     plan.kv_stride_s,
                     plan.kv_stride_h,
                     plan.req_to_slot_dev,

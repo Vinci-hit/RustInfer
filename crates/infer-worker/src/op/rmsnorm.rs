@@ -456,4 +456,116 @@ use crate::base::DeviceType;
 
         Ok(())
     }
+
+    // ========================================================================
+    // strided view 回归：从一个 dense [rows, q_dim+2*kv_dim] tensor narrow 出
+    // [rows, q_dim] 的列视图（行 stride > q_dim），验证：
+    //   - CUDA 路径直接接受 strided view（不再要求 contiguous）
+    //   - in-place norm 结果与"先 contiguous 再 dense norm"完全一致
+    // ========================================================================
+
+    /// 通用的 strided view 检查：构造 fused QKV 形态的 dense base，narrow 出 Q
+    /// 列做 in-place norm；然后 base 再 narrow 一份相同区域、先 `contiguous()`
+    /// 物化、走 dense norm 作为 reference。两条路径应当输出完全相同。
+    fn check_strided_inplace_matches_dense(device: DeviceType) -> Result<()> {
+        use half::bf16;
+        let dtype = DataType::BF16;
+        let rows = 16usize;
+        let head_dim = 64usize;            // RMSNorm dim 必须 % 8 = 0
+        let q_heads = 4usize;
+        let kv_heads = 1usize;
+        let q_dim = q_heads * head_dim;       // 256
+        let kv_dim = kv_heads * head_dim;     // 64
+        let cols = q_dim + 2 * kv_dim;        // 384
+
+        // base: [rows, cols] dense bf16，填一些非零数据
+        let mut base = Tensor::new(&[rows, cols], dtype, device)?;
+        let raw: Vec<bf16> = (0..(rows * cols))
+            .map(|i| bf16::from_f32(((i * 13) % 97) as f32 * 0.01 - 0.5))
+            .collect();
+        // 先在 CPU 上构造数据再上传，避免 cuda 端 raw 写入复杂
+        if device.is_cuda() {
+            let mut cpu = Tensor::new(&[rows, cols], dtype, DeviceType::Cpu)?;
+            cpu.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&raw);
+            base = cpu.to_cuda(0)?;
+        } else {
+            base.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&raw);
+        }
+
+        // QK-norm weight: [head_dim]
+        let w_data: Vec<bf16> = (0..head_dim)
+            .map(|i| bf16::from_f32(0.5 + (i as f32) * 0.001))
+            .collect();
+        let q_norm = {
+            let mut w = Tensor::new(&[head_dim], dtype, DeviceType::Cpu)?;
+            w.as_bf16_mut()?.as_slice_mut()?.copy_from_slice(&w_data);
+            let w = if device.is_cuda() { w.to_cuda(0)? } else { w };
+            RMSNorm::from(w, 1e-6)
+        };
+
+        // ── reference：先拷出 Q 列、reshape 成 [rows*head_num, head_dim] dense，
+        //    走原来的 dense 路径做 norm ──
+        let ref_q_dense = base.narrow(1, 0, q_dim)?.contiguous()?;
+        // dense reshape 是零拷贝 view 改 strides
+        let mut ref_q_2d = ref_q_dense
+            .reshape(&[rows * q_heads, head_dim])?
+            .to_owned()?;
+        q_norm.forward_inplace(&mut ref_q_2d, None)?;
+        let ref_cpu = ref_q_2d.to_cpu()?;
+        let ref_slice: Vec<f32> = ref_cpu.as_bf16()?.as_slice()?.iter().map(|v| v.to_f32()).collect();
+
+        // ── strided in-place：base2 的 Q 列 unflatten 为 3-D
+        //    [T, head_num, head_dim]（strides=[cols, head_dim, 1]）→ 直接喂 RMSNorm ──
+        let base2 = base.contiguous()?.to_owned()?;
+        let mut q_view_3d = base2
+            .narrow(1, 0, q_dim)?
+            .unflatten(1, &[q_heads, head_dim])?;
+        // sanity: 3-D strided view，stride0 = cols, stride1 = head_dim
+        assert_eq!(q_view_3d.shape(), &[rows, q_heads, head_dim]);
+        assert_eq!(q_view_3d.strides()[0], cols);
+        assert_eq!(q_view_3d.strides()[1], head_dim);
+        assert_eq!(q_view_3d.strides()[2], 1);
+        assert!(!q_view_3d.is_contiguous());
+
+        q_norm.forward_inplace(&mut q_view_3d, None)?;
+
+        // 取出 base2 的 Q 列（每行前 q_dim 个 elem）跟 reference 比对
+        let strided_cpu = base2.to_cpu()?;
+        let strided_slice = strided_cpu.as_bf16()?.as_slice()?;
+        let mut got: Vec<f32> = Vec::with_capacity(rows * q_dim);
+        for r in 0..rows {
+            let start = r * cols;
+            for c in 0..q_dim {
+                got.push(strided_slice[start + c].to_f32());
+            }
+        }
+        assert_close(&got, &ref_slice, 5e-3);
+
+        // K/V 区（base2 的 [q_dim..]）必须未被触碰
+        let raw_f32: Vec<f32> = raw.iter().map(|v| v.to_f32()).collect();
+        for r in 0..rows {
+            let row_start = r * cols;
+            for c in q_dim..cols {
+                let got_v = strided_slice[row_start + c].to_f32();
+                let want_v = raw_f32[row_start + c];
+                assert!(
+                    (got_v - want_v).abs() < 1e-6,
+                    "K/V region row {} col {} was overwritten: got {} want {}",
+                    r, c, got_v, want_v
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_rmsnorm_strided_inplace_cpu() -> Result<()> {
+        check_strided_inplace_matches_dense(DeviceType::Cpu)
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_rmsnorm_strided_inplace_cuda() -> Result<()> {
+        check_strided_inplace_matches_dense(DeviceType::Cuda(0))
+    }
 }

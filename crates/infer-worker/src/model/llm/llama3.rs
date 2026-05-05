@@ -110,7 +110,7 @@ impl Attention {
         let mut attn_all_3d =
             ctx.attn.attn_merged.reshape(&[total_tokens, head_num, head_size])?;
         unsafe {
-            self.mha.forward(&q3, &mut attn_all_3d, &ctx.attn_plan, cuda_cfg)?;
+            self.mha.forward(&q3, &mut attn_all_3d, layer_idx, &ctx.attn_plan, cuda_cfg)?;
         }
 
         // ── o_proj ──（使用回 [T, q_dim] 的 view）

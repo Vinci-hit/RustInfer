@@ -6,7 +6,7 @@
 //! 代码。
 
 pub mod llama3;
-// pub mod qwen3;
+pub mod qwen3;
 
 use crate::base::DeviceType;
 use crate::base::error::Result;
@@ -181,13 +181,12 @@ impl<'a, 's> ForwardCtx<'a, 's> {
         states: &'a mut [&'s mut InferenceState],
         cuda_cfg: Option<&'a crate::OpConfig>,
         device: DeviceType,
-        config: &RuntimeModelConfig,
+        _config: &RuntimeModelConfig,
         attn_plan: crate::op::attention::AttentionPlan,
         output_tokens: &'a mut Tensor,
     ) -> Result<Self> {
         let num_seqs = meta.num_seqs();
         let total_tokens = meta.seq_end(num_seqs - 1);
-        let q_dim = config.q_dim;
 
         let kv_lens_src = match device {
             DeviceType::Cpu => &workspace.kv_lens_cpu,
@@ -201,16 +200,15 @@ impl<'a, 's> ForwardCtx<'a, 's> {
             hidden: workspace.x.narrow(0, 0, total_tokens)?,
             norm_out: workspace.rms_out.narrow(0, 0, total_tokens)?,
             block_out: workspace.ffn_out.narrow(0, 0, total_tokens)?,
-            sample_hidden: workspace.intermediate.narrow(0, 0, num_seqs)?,
+            sample_hidden: workspace.sample_hidden.narrow(0, 0, num_seqs)?,
             logits: workspace.logits.narrow(0, 0, num_seqs)?,
             kv_lens: kv_lens_src.narrow(0, 0, num_seqs)?,
         };
 
         let attn = AttentionBuffer {
             qkv: workspace.qkv_out.narrow(0, 0, total_tokens)?,
-            attn_merged: workspace
-                .intermediate
-                .slice_ranges(&[0..total_tokens, 0..q_dim])?,
+            // intermediate 的物理宽度 = q_dim，所以这里 narrow 整行即得 dense `[T, q_dim]`。
+            attn_merged: workspace.intermediate.narrow(0, 0, total_tokens)?,
         };
 
         let mlp = SwigluBuffer {

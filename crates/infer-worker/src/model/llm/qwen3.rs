@@ -1,635 +1,400 @@
+//! Qwen3 model —— 纯 forward 实现。
+//!
+//! 与 [`crate::model::llm::llama3`] 几乎同构（embedding → N × (norm + attention
+//! + norm + mlp) → final norm → lm_head → sampling），跨层 fused add+rmsnorm
+//! 的设计完全一样。唯一差异：**QK-norm**（Qwen3 特性）。
+//!
+//! QK-norm：QKV 投影 + split 后、RoPE 之前，分别对 Q 和 K 走一遍 per-head
+//! RMSNorm。weight shape 是 `[head_size]`，对 strided 3-D 视图
+//! `[T, head_num/kv_head_num, head_size]` 直接 in-place 做归一化（RMSNorm 算子
+//! 原生支持 strided 输入）。weight 本身**可选** —— 取决于权重文件里是否含
+//! `q_norm` / `k_norm`。
+//!
+//! 其它一切（fused gate_up MLP、跨层 fused norm、KV scatter、attention plan）
+//! 都与 Llama3 的实现完全一致，详见 [`crate::model::llm::llama3`] 注释。
+
+use std::boxed::Box;
 use std::path::Path;
 
-use crate::base::{DataType, DeviceType};
-use crate::base::error::{Error, Result};
-#[cfg(feature = "cuda")]
-use crate::cuda::CudaConfig;
-use crate::base::error::Error::InternalError;
-use crate::model::BufferType;
-
-use crate::op::add_inplace::AddInplace;
+use crate::base::DeviceType;
+use crate::base::error::Result;
+use crate::model::ModelLoader;
+use crate::model::common::config::RuntimeModelConfig;
+use crate::model::common::tokenizer::Tokenizer;
+use crate::model::common::{GateUpDims, QkvDims};
+use crate::model::llm::{ForwardCtx, LlmModel};
+use crate::op::attention::Attention as FlashAttn;
 use crate::op::embedding::Embedding;
-use crate::op::flash_gqa::FlashAttnGQA;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::rope::RoPEOp;
-use crate::op::scatter::Scatter;
-use crate::op::swiglu::SwiGLU;
-use crate::model::runtime::InferenceState;
+use crate::op::swiglu::swiglu;
 use crate::tensor::Tensor;
-use crate::model::common::config::RuntimeModelConfig;
-use crate::model::common::{GateUpDims, QkvDims};
-use crate::model::ModelLoader;
-use crate::model::common::tokenizer::Tokenizer;
 
+// ============================================================================
+//  Attention —— fused QKV + (optional) QK-norm + RoPE + flash GQA + o_proj
+// ============================================================================
 
-/// Qwen3Layers holds all operators and weights for the model.
-/// Compared to Llama3, Qwen3 adds optional per-head QK-norm layers.
-pub struct Qwen3Layers {
-    pub embedding_layer: Embedding,
-    pub rmsnorm_final_layer: RMSNorm,
-    pub cls_layer: Matmul,
-
-    pub rmsnorm_attn_layers: Vec<RMSNorm>,
-    pub rmsnorm_ffn_layers: Vec<RMSNorm>,
-
-    pub qnorm_layers: Option<Vec<RMSNorm>>,
-    pub knorm_layers: Option<Vec<RMSNorm>>,
-
-    pub wqkv_layers: Vec<Matmul>,
-    pub wo_layers: Vec<Matmul>,
-    pub mha_layers: Vec<FlashAttnGQA>,
-    pub rope_layers: Vec<RoPEOp>,
-    pub add_layers: AddInplace,
-    pub scatter_layer: Scatter,
-
-    pub w_gate_up_layers: Vec<Matmul>,
-    pub w2_layers: Vec<Matmul>,
-    pub swiglu_layers: Vec<SwiGLU>,
+struct Attention {
+    wqkv: Matmul,
+    wo: Matmul,
+    rope: RoPEOp,
+    mha: FlashAttn,
+    /// 可选 per-head Q-norm（weight shape `[head_size]`）。
+    q_norm: Option<RMSNorm>,
+    /// 可选 per-head K-norm（weight shape `[head_size]`）。
+    k_norm: Option<RMSNorm>,
 }
 
-impl Qwen3Layers {
-    #[cfg(feature = "cuda")]
-    pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        self.embedding_layer.to_cuda(device_id)?;
-        self.rmsnorm_final_layer.to_cuda(device_id)?;
-        self.cls_layer.to_cuda(device_id)?;
-        self.rmsnorm_attn_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.rmsnorm_ffn_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        if let Some(ref mut layers) = self.qnorm_layers {
-            layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+impl Attention {
+    fn load(
+        layer_idx: usize,
+        loader: &ModelLoader,
+        config: &RuntimeModelConfig,
+        device: DeviceType,
+        has_qnorm: bool,
+        has_knorm: bool,
+    ) -> Result<Self> {
+        let qkv_dims = QkvDims {
+            q_dim: config.q_dim,
+            kv_dim: config.kv_dim,
+            dim: config.dim,
+        };
+        let wqkv = loader.load_fused_qkv(layer_idx, qkv_dims, device)?;
+        let wo = loader.load_matmul(
+            &format!("model.layers.{}.self_attn.o_proj.weight", layer_idx),
+            device,
+        )?;
+        let rope = RoPEOp::new(config.dim, config.kv_dim, config.head_size)?;
+        let mha = FlashAttn::new(config.head_num, config.kv_head_num, config.head_size, true)?;
+
+        let q_norm = if has_qnorm {
+            Some(loader.load_rmsnorm(
+                &format!("model.layers.{}.self_attn.q_norm.weight", layer_idx),
+                device,
+                config.rms_norm_eps,
+            )?)
+        } else {
+            None
+        };
+        let k_norm = if has_knorm {
+            Some(loader.load_rmsnorm(
+                &format!("model.layers.{}.self_attn.k_norm.weight", layer_idx),
+                device,
+                config.rms_norm_eps,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self { wqkv, wo, rope, mha, q_norm, k_norm })
+    }
+
+    /// 输入 `x_norm` = input_layernorm 的输出；输出写到 `attn_out`。residual 由
+    /// [`DecoderLayer`] 统一处理。
+    fn forward(
+        &self,
+        x_norm: &Tensor,
+        attn_out: &mut Tensor,
+        layer_idx: usize,
+        config: &RuntimeModelConfig,
+        ctx: &mut ForwardCtx<'_, '_>,
+    ) -> Result<()> {
+        let q_dim = config.q_dim;
+        let kv_dim = config.kv_dim;
+        let head_num = config.head_num;
+        let kv_head_num = config.kv_head_num;
+        let head_size = config.head_size;
+        let total_tokens = ctx.total_tokens;
+        let cuda_cfg = ctx.cuda_cfg;
+
+        // ── wqkv ──
+        let mut qkv = ctx.attn.qkv.clone();
+        self.wqkv.forward(x_norm, &mut qkv, cuda_cfg)?;
+
+        // ── split → Q/K/V（零拷贝 strided view）──
+        //
+        // 行 stride = q_dim + 2*kv_dim；最后一维 dense。下游 RoPE / scatter /
+        // attention 都接受 strided 输入。
+        let mut q = qkv.narrow(1, 0, q_dim)?;
+        let mut k = qkv.narrow(1, q_dim, kv_dim)?;
+        let v = qkv.narrow(1, q_dim + kv_dim, kv_dim)?;
+
+        // ── Optional QK-norm（per-head RMSNorm，weight `[head_size]`）──
+        //
+        // RMSNorm 算子原生支持 strided 3-D `[T, n_heads, head_size]` 视图：
+        // 通过 `unflatten` 零拷贝把 strided `[T, q_dim]` 视为 `[T, head_num,
+        // head_size]`（strides = `[cols, head_size, 1]`），kernel 按
+        // `T * head_num` 行做 norm。无需物化、无临时 buffer。
+        if let Some(qn) = &self.q_norm {
+            let mut q3 = q.unflatten(1, &[head_num, head_size])?;
+            qn.forward_inplace(&mut q3, cuda_cfg)?;
         }
-        if let Some(ref mut layers) = self.knorm_layers {
-            layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+        if let Some(kn) = &self.k_norm {
+            let mut k3 = k.unflatten(1, &[kv_head_num, head_size])?;
+            kn.forward_inplace(&mut k3, cuda_cfg)?;
         }
-        self.wqkv_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.wo_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.w_gate_up_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.w2_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.mha_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.rope_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
-        self.add_layers.to_cuda(device_id)?;
-        self.swiglu_layers.iter_mut().try_for_each(|l| l.to_cuda(device_id))?;
+
+        // ── RoPE on Q/K（in-place 写回 qkv 的 Q/K 列段）──
+        self.rope.forward(
+            &ctx.llm.input_pos,
+            &ctx.sin_cache,
+            &ctx.cos_cache,
+            &mut q,
+            &mut k,
+            cuda_cfg,
+        )?;
+
+        // ── scatter K/V → per-seq KV cache ──
+        crate::op::kv_cache::scatter(
+            &k, &v, layer_idx, ctx.states, ctx.meta, ctx.workspace, cuda_cfg,
+        )?;
+
+        // ── flash attention（一次 launch 覆盖整个 batch）──
+        let q_for_attn = q.reshape(&[total_tokens, head_num, head_size])?;
+        let mut attn_all_3d =
+            ctx.attn.attn_merged.reshape(&[total_tokens, head_num, head_size])?;
+        unsafe {
+            self.mha.forward(&q_for_attn, &mut attn_all_3d, layer_idx, &ctx.attn_plan, cuda_cfg)?;
+        }
+
+        // ── o_proj ──（按 [T, q_dim] 视图喂回去）
+        let attn_all = ctx.attn.attn_merged.clone();
+        self.wo.forward(&attn_all, attn_out, cuda_cfg)?;
         Ok(())
     }
 }
 
-/// Qwen3 model — holds only static weights and configuration.
-/// Request-level mutable state lives in `InferenceState`.
+// ============================================================================
+//  Mlp —— fused gate_up + SwiGLU + down_proj
+// ============================================================================
+
+struct Mlp {
+    w_gate_up: Matmul,
+    w2: Matmul,
+}
+
+impl Mlp {
+    fn load(
+        layer_idx: usize,
+        loader: &ModelLoader,
+        config: &RuntimeModelConfig,
+        is_awq: bool,
+        device: DeviceType,
+    ) -> Result<Self> {
+        let gate_up_dims = GateUpDims {
+            intermediate_size: config.intermediate_size,
+            dim: config.dim,
+        };
+        let group_size = config
+            .quant_config
+            .as_ref()
+            .map(|q| q.group_size)
+            .unwrap_or(128);
+
+        let (w_gate_up, w2) = if is_awq {
+            (
+                loader.load_fused_gate_up_awq(
+                    layer_idx,
+                    config.intermediate_size,
+                    device,
+                    group_size,
+                )?,
+                loader.load_awq_matmul(
+                    &format!("model.layers.{}.mlp.down_proj", layer_idx),
+                    device,
+                    group_size,
+                )?,
+            )
+        } else {
+            (
+                loader.load_fused_gate_up(layer_idx, gate_up_dims, device)?,
+                loader.load_matmul(
+                    &format!("model.layers.{}.mlp.down_proj.weight", layer_idx),
+                    device,
+                )?,
+            )
+        };
+
+        Ok(Self { w_gate_up, w2 })
+    }
+
+    fn forward(
+        &self,
+        x_norm: &Tensor,
+        ffn_out: &mut Tensor,
+        config: &RuntimeModelConfig,
+        ctx: &mut ForwardCtx<'_, '_>,
+    ) -> Result<()> {
+        let inter = config.intermediate_size;
+        let total_tokens = ctx.total_tokens;
+        let cuda_cfg = ctx.cuda_cfg;
+
+        let mut gate_up = ctx.mlp.gate_up.clone();
+        self.w_gate_up.forward(x_norm, &mut gate_up, cuda_cfg)?;
+
+        let mut gate = ctx.mlp.gate.clone();
+        let mut up = ctx.mlp.up.clone();
+        crate::op::split_cols::split_cols_tensor(
+            &gate_up, &mut gate, total_tokens, 2 * inter, 0, inter, cuda_cfg,
+        )?;
+        crate::op::split_cols::split_cols_tensor(
+            &gate_up, &mut up, total_tokens, 2 * inter, inter, inter, cuda_cfg,
+        )?;
+
+        swiglu(&up, &mut gate, cuda_cfg)?;
+        self.w2.forward(&gate, ffn_out, cuda_cfg)?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+//  DecoderLayer —— attn + rmsnorm + mlp + rmsnorm，两处 residual 走 fused op
+// ============================================================================
+
+/// 跨层 fused 设计与 [`crate::model::llm::llama3::DecoderLayer`] 完全一致：
+/// 进入本层的 `h_in` 已经是 `input_layernorm(x)` 的结果（由上一层末尾的 fused
+/// add+rmsnorm 顺手产出），layer 0 由 [`Qwen3::forward`] 顶层显式跑一次。
+///
+/// 1. `a      = self_attn(h_in)`
+/// 2. `x     += a`；`h_mid = post_attention_rmsnorm(x)`         ← fused op
+/// 3. `f      = mlp(h_mid)`
+/// 4. `x     += f`；`h_out = next_input_rmsnorm(x)`             ← fused op
+struct DecoderLayer {
+    input_layernorm: RMSNorm,
+    post_attention_layernorm: RMSNorm,
+    self_attn: Attention,
+    mlp: Mlp,
+}
+
+impl DecoderLayer {
+    fn load(
+        layer_idx: usize,
+        loader: &ModelLoader,
+        config: &RuntimeModelConfig,
+        is_awq: bool,
+        device: DeviceType,
+        has_qnorm: bool,
+        has_knorm: bool,
+    ) -> Result<Self> {
+        let input_layernorm = loader.load_rmsnorm(
+            &format!("model.layers.{}.input_layernorm.weight", layer_idx),
+            device,
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = loader.load_rmsnorm(
+            &format!("model.layers.{}.post_attention_layernorm.weight", layer_idx),
+            device,
+            config.rms_norm_eps,
+        )?;
+        let self_attn = Attention::load(layer_idx, loader, config, device, has_qnorm, has_knorm)?;
+        let mlp = Mlp::load(layer_idx, loader, config, is_awq, device)?;
+
+        Ok(Self {
+            input_layernorm,
+            post_attention_layernorm,
+            self_attn,
+            mlp,
+        })
+    }
+
+    fn forward(
+        &self,
+        x: &mut Tensor,
+        h_in: &Tensor,
+        h_out: &mut Tensor,
+        layer_idx: usize,
+        config: &RuntimeModelConfig,
+        next_input_rmsnorm: &RMSNorm,
+        ctx: &mut ForwardCtx<'_, '_>,
+    ) -> Result<()> {
+        // 1. a = self_attn(h_in) → 写到 block_out 复用 scratch
+        let mut a = ctx.llm.block_out.clone();
+        self.self_attn.forward(h_in, &mut a, layer_idx, config, ctx)?;
+
+        // 2. x += a;  h_mid = post_attention_rmsnorm(x)
+        let mut h_mid = ctx.llm.norm_out.clone();
+        self.post_attention_layernorm
+            .forward_with_residual(&mut h_mid, x, &a, ctx.cuda_cfg)?;
+
+        // 3. f = mlp(h_mid) → 写到 block_out
+        let mut f = ctx.llm.block_out.clone();
+        self.mlp.forward(&h_mid, &mut f, config, ctx)?;
+
+        // 4. x += f;  h_out = next_input_rmsnorm(x)
+        next_input_rmsnorm.forward_with_residual(h_out, x, &f, ctx.cuda_cfg)
+    }
+}
+
+// ============================================================================
+//  Qwen3 —— 对外门面
+// ============================================================================
+
 pub struct Qwen3 {
     pub(crate) config: RuntimeModelConfig,
     pub(crate) device_type: DeviceType,
     pub(crate) tokenizer: Box<dyn Tokenizer>,
-    pub(crate) layers: Qwen3Layers,
+
+    embed_tokens: Embedding,
+    layers: Vec<DecoderLayer>,
+    norm: RMSNorm,
+    lm_head: Matmul,
 }
 
 impl Qwen3 {
-    pub fn new<P: AsRef<Path>>(
-        model_dir: P,
-        device_type: DeviceType,
-    ) -> Result<Self> {
-
+    pub fn new<P: AsRef<Path>>(model_dir: P, device_type: DeviceType) -> Result<Self> {
         let mut loader = ModelLoader::load(model_dir.as_ref())?;
-        let tensor_names: std::collections::HashSet<String> = loader.tensor_names().into_iter().collect();
+        let tensor_names: std::collections::HashSet<String> =
+            loader.tensor_names().into_iter().collect();
         let tokenizer = loader.create_tokenizer(model_dir.as_ref())?;
         let config = loader.config.clone();
 
-        let layer_num = config.layer_num;
+        let is_awq = config
+            .quant_config
+            .as_ref()
+            .is_some_and(|q| q.quant_method == "compressed-tensors");
+
+        // Qwen3 与 Llama3 唯一结构性差异：可选的 per-head q_norm / k_norm。
+        // 探测权重文件里是否包含相应键来决定是否加载。
         let has_qnorm = tensor_names.iter().any(|n| n.contains("q_norm"));
         let has_knorm = tensor_names.iter().any(|n| n.contains("k_norm"));
 
-        let mut rmsnorm_attn_layers = Vec::with_capacity(layer_num);
-        let mut rmsnorm_ffn_layers = Vec::with_capacity(layer_num);
-        let mut qnorm_layers_opt = Vec::with_capacity(layer_num);
-        let mut knorm_layers_opt = Vec::with_capacity(layer_num);
-        let mut wqkv_layers = Vec::with_capacity(layer_num);
-        let mut wo_layers = Vec::with_capacity(layer_num);
-        let mut w_gate_up_layers = Vec::with_capacity(layer_num);
-        let mut w2_layers = Vec::with_capacity(layer_num);
+        let layers: Vec<DecoderLayer> = (0..config.layer_num)
+            .map(|i| {
+                DecoderLayer::load(i, &loader, &config, is_awq, device_type, has_qnorm, has_knorm)
+            })
+            .collect::<Result<_>>()?;
 
-        let is_awq = config.quant_config.as_ref().is_some_and(|q|
-            q.quant_method == "compressed-tensors");
-        let group_size = config.quant_config.as_ref().map(|q| q.group_size).unwrap_or(128);
-
-        let qkv_dims = QkvDims { q_dim: config.q_dim, kv_dim: config.kv_dim, dim: config.dim };
-        let gate_up_dims = GateUpDims { intermediate_size: config.intermediate_size, dim: config.dim };
-
-        for i in 0..layer_num {
-            wqkv_layers.push(loader.load_fused_qkv(i, qkv_dims, device_type)?);
-            wo_layers.push(loader.load_matmul(&format!("model.layers.{}.self_attn.o_proj.weight", i), device_type)?);
-
-            if is_awq {
-                w_gate_up_layers.push(loader.load_fused_gate_up_awq(i, config.intermediate_size, device_type, group_size)?);
-                w2_layers.push(loader.load_awq_matmul(&format!("model.layers.{}.mlp.down_proj", i), device_type, group_size)?);
-            } else {
-                w_gate_up_layers.push(loader.load_fused_gate_up(i, gate_up_dims, device_type)?);
-                w2_layers.push(loader.load_matmul(&format!("model.layers.{}.mlp.down_proj.weight", i), device_type)?);
-            }
-            rmsnorm_attn_layers.push(loader.load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), device_type, config.rms_norm_eps)?);
-            rmsnorm_ffn_layers.push(loader.load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), device_type, config.rms_norm_eps)?);
-            if has_qnorm {
-                qnorm_layers_opt.push(loader.load_rmsnorm(&format!("model.layers.{}.self_attn.q_norm.weight", i), device_type, config.rms_norm_eps)?);
-            }
-            if has_knorm {
-                knorm_layers_opt.push(loader.load_rmsnorm(&format!("model.layers.{}.self_attn.k_norm.weight", i), device_type, config.rms_norm_eps)?);
-            }
-        }
-
-        let embedding_layer = loader.load_embedding("model.embed_tokens.weight", device_type)?;
-        let rmsnorm_final_layer = loader.load_rmsnorm("model.norm.weight", device_type, config.rms_norm_eps)?;
-        let cls_layer = if tensor_names.contains("lm_head.weight") {
+        let embed_tokens = loader.load_embedding("model.embed_tokens.weight", device_type)?;
+        let norm = loader.load_rmsnorm("model.norm.weight", device_type, config.rms_norm_eps)?;
+        let lm_head = if tensor_names.contains("lm_head.weight") {
             loader.load_matmul("lm_head.weight", device_type)?
         } else {
-            Matmul::from(embedding_layer.weight.clone(), None)
+            Matmul::from(embed_tokens.weight.clone(), None)
         };
 
-        let mha_layers = (0..layer_num)
-            .map(|_| FlashAttnGQA::new(config.head_num, config.kv_head_num, config.head_size, true))
-            .collect::<Result<Vec<_>>>()?;
-        let rope_layers = (0..layer_num)
-            .map(|_| RoPEOp::new(config.q_dim, config.kv_dim, config.head_size))
-            .collect::<Result<Vec<_>>>()?;
-        let add_layers = AddInplace::new();
-        let swiglu_layers: Vec<SwiGLU> = (0..layer_num).map(|_| SwiGLU::new()).collect();
-
-        if rmsnorm_attn_layers.len() != layer_num || rmsnorm_ffn_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of RMSNorm layers.".to_string()).into());
-        }
-        if wqkv_layers.len() != layer_num || wo_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of attention Matmul layers.".to_string()).into());
-        }
-        if w_gate_up_layers.len() != layer_num || w2_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of FFN Matmul layers.".to_string()).into());
-        }
-        if let Some(q) = has_qnorm.then_some(&qnorm_layers_opt)
-            && q.len() != layer_num {
-            return Err(InternalError("Incorrect number of Q-norm layers.".to_string()).into());
-        }
-        if let Some(k) = has_knorm.then_some(&knorm_layers_opt)
-            && k.len() != layer_num {
-            return Err(InternalError("Incorrect number of K-norm layers.".to_string()).into());
-        }
-        if mha_layers.len() != layer_num || rope_layers.len() != layer_num || swiglu_layers.len() != layer_num {
-            return Err(InternalError("Incorrect number of non-parameterized layers.".to_string()).into());
-        }
-
-        let layers = Qwen3Layers {
-            embedding_layer, rmsnorm_final_layer, cls_layer,
-            rmsnorm_attn_layers, rmsnorm_ffn_layers,
-            qnorm_layers: has_qnorm.then_some(qnorm_layers_opt),
-            knorm_layers: has_knorm.then_some(knorm_layers_opt),
-            wqkv_layers, wo_layers, mha_layers, rope_layers,
-            add_layers, scatter_layer: Scatter::new(),
-            w_gate_up_layers, w2_layers, swiglu_layers,
-        };
-
-        Ok(Self { config, device_type, tokenizer, layers })
-    }
-
-    /// Create a new InferenceState for this model, including Qwen3-specific workspace buffers.
-    pub fn create_state(&self) -> Result<InferenceState> {
-        let mut state = InferenceState::new(&self.config, self.device_type)?;
-
-        let float_dtype = self.config.runtime_float_dtype(self.device_type)?;
-        let max_seq_len = self.config.seq_len;
-
-        // Override Query buffer: Qwen3 needs [max_seq_len, q_dim], not [max_seq_len, dim]
-        state.workspace.insert(BufferType::Query,
-            Tensor::new(&[max_seq_len, self.config.q_dim], float_dtype, self.device_type)?);
-        // Attention output: [max_seq_len, q_dim] — separate from RmsOutput to avoid aliasing
-        state.workspace.insert(BufferType::AttnOutput,
-            Tensor::new(&[max_seq_len, self.config.q_dim], float_dtype, self.device_type)?);
-        // QK-norm buffers (per-head reshape)
-        if self.layers.qnorm_layers.is_some() {
-            state.workspace.insert(BufferType::QNormBuffer,
-                Tensor::new(&[max_seq_len * self.config.head_num, self.config.head_size], float_dtype, self.device_type)?);
-        }
-        if self.layers.knorm_layers.is_some() {
-            state.workspace.insert(BufferType::KNormBuffer,
-                Tensor::new(&[max_seq_len * self.config.kv_head_num, self.config.head_size], float_dtype, self.device_type)?);
-        }
-
-        Ok(state)
-    }
-
-    // ---- Inference methods (&self + &mut InferenceState) ----
-
-    fn forward_decoding(&self, state: &mut InferenceState, _tokens: &Tensor, pos_cpu: &Tensor) -> Result<i32> {
-        let pos = pos_cpu.as_i32()?.as_slice()?[0];
-        let pos_usize = usize::try_from(pos).map_err(|_| Error::InvalidArgument(format!(
-            "decode position {} is negative",
-            pos
-        )))?;
-        if state.kv_cache.ensure_capacity(pos_usize + 1)? {
-            state.invalidate_decode_graphs();
-        }
-        {
-            let mut dst = state.input_pos.slice(&[0], &[1])?;
-            dst.copy_from(pos_cpu)?;
-        }
-
-        // CUDA Graph
-        if self.device_type.is_cuda() {
-            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            let slot = crate::cuda::GraphSlot::LlmDecode(1);
-            if cfg.graph_ready(slot) {
-                cfg.launch(slot)?;
-                cfg.sync_stream()?;
-                return Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0]);
-            } else {
-                cfg.capture_begin()?;
-            }
-        }
-
-        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
-
-        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
-        let mut x = x_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.embedding_layer.forward(&state.output_token, &mut x, cuda_config_ref)?;
-
-        for i in 0..self.config.layer_num {
-            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            if i == 0 || !self.device_type.is_cuda() {
-                self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
-            }
-
-            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
-            let mut qkv = qkv_buffer.slice(&[0, 0], &[1, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
-
-            let q = qkv.slice(&[0, 0], &[1, self.config.q_dim])?;
-            let k_view = qkv.slice(&[0, self.config.q_dim], &[1, self.config.kv_dim])?;
-            let v_view = qkv.slice(&[0, self.config.q_dim + self.config.kv_dim], &[1, self.config.kv_dim])?;
-
-            // QK-norm (Qwen3-specific)
-            let mut q = if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
-                let q_reshaped = q.reshape(&[self.config.head_num, self.config.head_size])?;
-                let qnorm_buffer = state.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
-                let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[self.config.head_num, self.config.head_size])?;
-                qnorm_layers[i].forward(&q_reshaped, &mut qnorm_out, cuda_config_ref)?;
-                qnorm_out.reshape(&[1, self.config.q_dim])?
-            } else {
-                q
-            };
-            let mut k_active = if let Some(ref knorm_layers) = self.layers.knorm_layers {
-                let k_reshaped = k_view.reshape(&[self.config.kv_head_num, self.config.head_size])?;
-                let knorm_buffer = state.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
-                let mut knorm_out = knorm_buffer.slice(&[0, 0], &[self.config.kv_head_num, self.config.head_size])?;
-                knorm_layers[i].forward(&k_reshaped, &mut knorm_out, cuda_config_ref)?;
-                knorm_out.reshape(&[1, self.config.kv_dim])?
-            } else {
-                k_view.reshape(&[1, self.config.kv_dim])?
-            };
-
-            let (k_cache_full, v_cache_full) = state.kv_cache.get_mut(i)?;
-            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k_active, cuda_config_ref)?;
-
-            crate::op::scatter::scatter_kv(k_cache_full, &k_active, v_cache_full, &v_view, &state.input_pos, cuda_config_ref)?;
-
-            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
-            let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
-            let mut attn_out = attn_out_buffer.slice(&[0, 0], &[1, self.config.q_dim])?;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &state.input_pos, &mut attn_out, cuda_config_ref)?;
-
-            let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-            let mut wo_out = wo_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
-
-            let mut ffn_norm_out = attn_norm_out;
-            if self.device_type.is_cuda() {
-                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                    &mut ffn_norm_out, &mut x, &wo_out,
-                    &self.layers.rmsnorm_ffn_layers[i].weight,
-                    self.config.rms_norm_eps, cuda_config_ref,
-                )?;
-            } else {
-                self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
-                self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
-            }
-
-            let inter = self.config.intermediate_size;
-            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
-            let mut gate_up = gu_buffer.slice(&[0, 0], &[1, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
-            let mut w1_out = gate_up.slice(&[0, 0], &[1, inter])?;
-            let w3_out = gate_up.slice(&[0, inter], &[1, inter])?;
-            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
-
-            let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
-
-            if self.device_type.is_cuda() {
-                let next_norm_weight = if i + 1 < self.config.layer_num {
-                    &self.layers.rmsnorm_attn_layers[i + 1].weight
-                } else {
-                    &self.layers.rmsnorm_final_layer.weight
-                };
-                let buf = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-                let mut next_out = buf.slice(&[0, 0], &[1, self.config.dim])?;
-                crate::op::fused_add_rmsnorm::fused_add_rmsnorm(
-                    &mut next_out, &mut x, &w2_out,
-                    next_norm_weight, self.config.rms_norm_eps, cuda_config_ref,
-                )?;
-            } else {
-                self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
-            }
-        }
-
-        let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        if !self.device_type.is_cuda() {
-            self.layers.rmsnorm_final_layer.forward(&x, &mut final_norm_out, cuda_config_ref)?;
-        }
-
-        let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
-        let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
-        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-        state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
-
-        if self.device_type.is_cuda() {
-            let cfg = state.cuda_config.as_mut().expect("CudaConfig should be initialized");
-            let slot = crate::cuda::GraphSlot::LlmDecode(1);
-            if !cfg.graph_ready(slot) {
-                cfg.capture_end(slot)?;
-                // capture 期间 kernel 不执行，首次必须立刻 launch 一次。
-                cfg.launch(slot)?;
-                cfg.sync_stream()?;
-            }
-        }
-
-        Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
-    }
-
-    fn forward_prefill(&self, state: &mut InferenceState, tokens: &Tensor, pos_cpu: &Tensor, seq_len: usize) -> Result<i32> {
-        let start_pos = pos_cpu.as_i32()?.as_slice()?[0];
-        let pos = usize::try_from(start_pos).map_err(|_| Error::InvalidArgument(format!(
-            "prefill start_pos {} is negative",
-            start_pos
-        )))?;
-        let required_len = pos.checked_add(seq_len).ok_or_else(|| {
-            Error::InvalidArgument(format!("prefill range overflow: pos {} + len {}", start_pos, seq_len))
-        })?;
-        if state.kv_cache.ensure_capacity(required_len)? {
-            state.invalidate_decode_graphs();
-        }
-        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
-
-        let mut kv_len_tensor = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        kv_len_tensor.as_i32_mut()?.as_slice_mut()?[0] = start_pos;
-        #[cfg(feature = "cuda")]
-        let kv_len_tensor_dev;
-        let kv_len_for_attn = match self.device_type {
-            DeviceType::Cpu => &kv_len_tensor,
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda(_) => {
-                kv_len_tensor_dev = kv_len_tensor.to_device(self.device_type)?;
-                &kv_len_tensor_dev
-            }
-        };
-
-        // 把本段 prefill 的 seq_len 个绝对位置写到 state.input_pos 前 seq_len 个元素。
-        let positions_host: Vec<i32> = (0..seq_len).map(|i| (pos + i) as i32).collect();
-        match state.input_pos.device() {
-            crate::base::DeviceType::Cpu => {
-                let dst = state.input_pos.as_i32_mut()?.as_slice_mut()?;
-                dst[..seq_len].copy_from_slice(&positions_host);
-            }
-            #[cfg(feature = "cuda")]
-            crate::base::DeviceType::Cuda(_) => {
-                state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
-            }
-        }
-
-        let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
-        let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
-        input_tokens_view.copy_from(tokens)?;
-
-        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
-        let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
-
-        for i in 0..self.config.layer_num {
-            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
-
-            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
-            let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
-
-            let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, pos as i32, seq_len, self.config.kv_dim)?;
-
-            let stream = CudaConfig::resolve_stream(cuda_config_ref);
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
-
-            // QK-norm (Qwen3-specific)
-            if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
-                let q_reshaped = q.reshape(&[seq_len * self.config.head_num, self.config.head_size])?;
-                let qnorm_buffer = state.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
-                let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[seq_len * self.config.head_num, self.config.head_size])?;
-                qnorm_layers[i].forward(&q_reshaped, &mut qnorm_out, cuda_config_ref)?;
-                q.copy_from(&qnorm_out.reshape(&[seq_len, self.config.q_dim])?)?;
-            }
-            if let Some(ref knorm_layers) = self.layers.knorm_layers {
-                let k_reshaped = k.reshape(&[seq_len * self.config.kv_head_num, self.config.head_size])?;
-                let knorm_buffer = state.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
-                let mut knorm_out = knorm_buffer.slice(&[0, 0], &[seq_len * self.config.kv_head_num, self.config.head_size])?;
-                knorm_layers[i].forward(&k_reshaped, &mut knorm_out, cuda_config_ref)?;
-                k.copy_from(&knorm_out.reshape(&[seq_len, self.config.kv_dim])?)?;
-            }
-
-            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
-
-            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
-            let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
-            let mut attn_out = attn_out_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, kv_len_for_attn, &mut attn_out, cuda_config_ref)?;
-
-            let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-            let mut wo_out = wo_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
-            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
-
-            let ffn_norm_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut ffn_norm_out = ffn_norm_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
-
-            let inter = self.config.intermediate_size;
-            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
-            let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
-
-            let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
-            let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, inter])?;
-            let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
-            let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, inter])?;
-
-            let stream = CudaConfig::resolve_stream(cuda_config_ref);
-            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
-
-            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
-            let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
-            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
-        }
-
-        // Extract last token
-        let last_hidden = x.slice(&[seq_len - 1, 0], &[1, self.config.dim])?;
-        let buf = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-        let mut final_norm_input = buf.slice(&[0, 0], &[1, self.config.dim])?;
-        final_norm_input.copy_from(&last_hidden)?;
-
-        let final_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-        let mut final_norm_out = final_norm_out_buffer.slice(&[0, 0], &[1, self.config.dim])?;
-        self.layers.rmsnorm_final_layer.forward(&final_norm_input, &mut final_norm_out, cuda_config_ref)?;
-
-        let logits = state.workspace.get_mut(&BufferType::ForwardOutput).unwrap();
-        self.layers.cls_layer.forward(&final_norm_out, logits, cuda_config_ref)?;
-        let logits_full = state.workspace.get(&BufferType::ForwardOutput).unwrap();
-        let logits_ref = logits_full.slice(&[0], &[self.config.tokenizer_vocab_size])?;
-        state.sampler.sample(&logits_ref, &mut state.output_token, cuda_config_ref)?;
-
-        Ok(state.output_token.to_cpu()?.as_i32()?.as_slice()?[0])
-    }
-
-    /// Run prefill for `num_layers` transformer layers and return the
-    /// **full-sequence hidden states** `[seq_len, dim]`.
-    ///
-    /// This is the core reuse point for the TextEncoder:
-    /// - `num_layers = layer_num - 1` → hidden_states[-2]
-    /// - No final RMSNorm / lm_head / sampling
-    /// - Uses the existing KV cache in `InferenceState` (pos should be 0)
-    pub fn forward_prefill_hidden_states(
-        &self,
-        state: &mut InferenceState,
-        tokens: &Tensor,
-        seq_len: usize,
-        num_layers: usize,
-    ) -> Result<Tensor> {
-        let cuda_config_ref = if self.device_type.is_cuda() { state.cuda_config.as_ref() } else { None };
-        // pos = 0 起步：text encoder 没有先前的 KV cache
-        let positions_host: Vec<i32> = (0..seq_len as i32).collect();
-        match state.input_pos.device() {
-            crate::base::DeviceType::Cpu => {
-                let dst = state.input_pos.as_i32_mut()?.as_slice_mut()?;
-                dst[..seq_len].copy_from_slice(&positions_host);
-            }
-            #[cfg(feature = "cuda")]
-            crate::base::DeviceType::Cuda(_) => {
-                state.input_pos.write_from_i32_host(&positions_host, seq_len)?;
-            }
-        }
-        // MHA.forward 仍需要 [1] 的 kv_len tensor (值 = 0，表示之前没有 KV 历史)
-        let mut pos_cpu_mut = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-        pos_cpu_mut.as_i32_mut()?.as_slice_mut()?[0] = 0;
-
-        let input_tokens_buffer = state.workspace.get_mut(&BufferType::InputTokens).unwrap();
-        let mut input_tokens_view = input_tokens_buffer.slice(&[0], &[seq_len])?;
-        input_tokens_view.copy_from(tokens)?;
-
-        let x_buffer = state.workspace.get_mut(&BufferType::InputEmbeddings).unwrap();
-        let mut x = x_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-        self.layers.embedding_layer.forward(&input_tokens_view, &mut x, cuda_config_ref)?;
-
-        let layers_to_run = num_layers.min(self.config.layer_num);
-        for i in 0..layers_to_run {
-            let attn_norm_out_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut attn_norm_out = attn_norm_out_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_attn_layers[i].forward(&x, &mut attn_norm_out, cuda_config_ref)?;
-
-            let qkv_cols = self.config.q_dim + 2 * self.config.kv_dim;
-            let qkv_buffer = state.workspace.get_mut(&BufferType::QkvOutput).unwrap();
-            let mut qkv = qkv_buffer.slice(&[0, 0], &[seq_len, qkv_cols])?;
-            self.layers.wqkv_layers[i].forward(&attn_norm_out, &mut qkv, cuda_config_ref)?;
-
-            let q_buffer = state.workspace.get_mut(&BufferType::Query).unwrap();
-            let mut q = q_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            let (mut k, mut v) = state.kv_cache.slice_kv_cache(i, 0, seq_len, self.config.kv_dim)?;
-
-            let stream = CudaConfig::resolve_stream(cuda_config_ref);
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut q, seq_len, qkv_cols, 0, self.config.q_dim, stream)?;
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut k, seq_len, qkv_cols, self.config.q_dim, self.config.kv_dim, stream)?;
-            crate::op::split_cols::split_cols_tensor(&qkv, &mut v, seq_len, qkv_cols, self.config.q_dim + self.config.kv_dim, self.config.kv_dim, stream)?;
-
-            if let Some(ref qnorm_layers) = self.layers.qnorm_layers {
-                let q_reshaped = q.reshape(&[seq_len * self.config.head_num, self.config.head_size])?;
-                let qnorm_buffer = state.workspace.get_mut(&BufferType::QNormBuffer).unwrap();
-                let mut qnorm_out = qnorm_buffer.slice(&[0, 0], &[seq_len * self.config.head_num, self.config.head_size])?;
-                qnorm_layers[i].forward(&q_reshaped, &mut qnorm_out, cuda_config_ref)?;
-                q.copy_from(&qnorm_out.reshape(&[seq_len, self.config.q_dim])?)?;
-            }
-            if let Some(ref knorm_layers) = self.layers.knorm_layers {
-                let k_reshaped = k.reshape(&[seq_len * self.config.kv_head_num, self.config.head_size])?;
-                let knorm_buffer = state.workspace.get_mut(&BufferType::KNormBuffer).unwrap();
-                let mut knorm_out = knorm_buffer.slice(&[0, 0], &[seq_len * self.config.kv_head_num, self.config.head_size])?;
-                knorm_layers[i].forward(&k_reshaped, &mut knorm_out, cuda_config_ref)?;
-                k.copy_from(&knorm_out.reshape(&[seq_len, self.config.kv_dim])?)?;
-            }
-
-            let sin_cache = state.workspace.get(&BufferType::SinCache).unwrap();
-            let cos_cache = state.workspace.get(&BufferType::CosCache).unwrap();
-            self.layers.rope_layers[i].forward(&state.input_pos, sin_cache, cos_cache, &mut q, &mut k, cuda_config_ref)?;
-
-            let (k_hist, v_hist) = state.kv_cache.get(i).unwrap();
-            let attn_out_buffer = state.workspace.get_mut(&BufferType::AttnOutput).unwrap();
-            let mut attn_out = attn_out_buffer.slice(&[0, 0], &[seq_len, self.config.q_dim])?;
-            self.layers.mha_layers[i].forward(&q, k_hist, v_hist, &pos_cpu_mut, &mut attn_out, cuda_config_ref)?;
-
-            let wo_buffer = state.workspace.get_mut(&BufferType::IntermediateBuffer1).unwrap();
-            let mut wo_out = wo_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.wo_layers[i].forward(&attn_out, &mut wo_out, cuda_config_ref)?;
-            self.layers.add_layers.forward(&wo_out, &mut x, cuda_config_ref)?;
-
-            let ffn_norm_buffer = state.workspace.get_mut(&BufferType::RmsOutput).unwrap();
-            let mut ffn_norm_out = ffn_norm_buffer.slice(&[0, 0], &[seq_len, self.config.dim])?;
-            self.layers.rmsnorm_ffn_layers[i].forward(&x, &mut ffn_norm_out, cuda_config_ref)?;
-
-            let inter = self.config.intermediate_size;
-            let gu_buffer = state.workspace.get_mut(&BufferType::GateUpOutput).unwrap();
-            let mut gate_up = gu_buffer.slice(&[0, 0], &[seq_len, 2 * inter])?;
-            self.layers.w_gate_up_layers[i].forward(&ffn_norm_out, &mut gate_up, cuda_config_ref)?;
-
-            let w1_buffer = state.workspace.get_mut(&BufferType::W1Output).unwrap();
-            let mut w1_out = w1_buffer.slice(&[0, 0], &[seq_len, inter])?;
-            let w3_buffer = state.workspace.get_mut(&BufferType::W3Output).unwrap();
-            let mut w3_out = w3_buffer.slice(&[0, 0], &[seq_len, inter])?;
-
-            let stream = CudaConfig::resolve_stream(cuda_config_ref);
-            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w1_out, seq_len, 2 * inter, 0, inter, stream)?;
-            crate::op::split_cols::split_cols_tensor(&gate_up, &mut w3_out, seq_len, 2 * inter, inter, inter, stream)?;
-
-            self.layers.swiglu_layers[i].forward(&w3_out, &mut w1_out, cuda_config_ref)?;
-            let mut w2_out = ffn_norm_out;
-            self.layers.w2_layers[i].forward(&w1_out, &mut w2_out, cuda_config_ref)?;
-            self.layers.add_layers.forward(&w2_out, &mut x, cuda_config_ref)?;
-        }
-
-        // Return full-sequence hidden states (copy out of workspace)
-        let mut output = Tensor::new(&[seq_len, self.config.dim], x.dtype(), self.device_type)?;
-        output.copy_from(&x)?;
-        Ok(output)
+        Ok(Self {
+            config,
+            device_type,
+            tokenizer,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 }
 
-impl crate::model::llm::LlmModel for Qwen3 {
-    fn config(&self) -> &crate::model::common::config::RuntimeModelConfig {
+// ============================================================================
+//  LlmModel trait 实现 —— 与 Llama3 同模板
+// ============================================================================
+
+impl LlmModel for Qwen3 {
+    fn config(&self) -> &RuntimeModelConfig {
         &self.config
     }
 
-    fn tokenizer(&self) -> &dyn crate::model::common::tokenizer::Tokenizer {
+    fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
     }
 
@@ -637,174 +402,61 @@ impl crate::model::llm::LlmModel for Qwen3 {
         self.device_type
     }
 
-    /// Qwen3 需要额外的 QK-norm workspace buffers，所以 override 默认实现。
-    fn create_state(&self) -> Result<crate::model::runtime::InferenceState> {
-        Qwen3::create_state(self)
-    }
+    fn forward(&self, ctx: &mut ForwardCtx<'_, '_>) -> Result<()> {
+        let cuda_cfg = ctx.cuda_cfg;
 
-    fn forward(
-        &self,
-        states: &mut [&mut crate::model::runtime::InferenceState],
-        _workspace: &mut crate::worker::batch_workspace::BatchWorkspace,
-        batch: &crate::worker::runner::WorkerBatchMeta<'_>,
-        output_tokens: &mut Tensor,
-        _cuda_config: Option<&crate::OpConfig>,
-    ) -> Result<()> {
-        if states.len() != batch.num_seqs() {
-            return Err(Error::InvalidArgument(format!(
-                "Qwen3::forward states len {} != batch seqs {}",
-                states.len(), batch.num_seqs()
-            )).into());
-        }
+        // ── embedding ──
+        let mut x = ctx.llm.hidden.clone();
+        self.embed_tokens.forward(&ctx.llm.input_tokens, &mut x, cuda_cfg)?;
 
-        for i in 0..batch.num_seqs() {
-            let seq_len = batch.seq_len(i);
-            let tok = if seq_len == 1 {
-                let input_tokens = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = batch.seq_pos(i);
-                Qwen3::forward_decoding(self, states[i], &input_tokens, &pos_cpu)?
+        // ── layer 0 input_rmsnorm：跨层 fuse 的"起点"──
+        let mut h = ctx.llm.norm_out.clone();
+        self.layers[0].input_layernorm.forward(&x, &mut h, cuda_cfg)?;
+
+        // ── N × DecoderLayer ──
+        let layer_num = self.layers.len();
+        for i in 0..layer_num {
+            let next_input_rmsnorm = if i + 1 < layer_num {
+                &self.layers[i + 1].input_layernorm
             } else {
-                let tokens = batch.seq_tokens(i);
-                let mut input_tokens = Tensor::new(&[tokens.len()], DataType::I32, DeviceType::Cpu)?;
-                input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(tokens);
-                let mut pos_cpu = Tensor::new(&[1], DataType::I32, DeviceType::Cpu)?;
-                pos_cpu.as_i32_mut()?.as_slice_mut()?[0] = batch.seq_pos(i);
-                Qwen3::forward_prefill(self, states[i], &input_tokens, &pos_cpu, seq_len)?
+                &self.norm
             };
-            let mut dst = output_tokens.slice(&[i], &[1])?;
-            dst.write_from_i32_host(&[tok], 1)?;
+            let h_in = h.clone();
+            let mut h_out = ctx.llm.norm_out.clone();
+            self.layers[i].forward(
+                &mut x,
+                &h_in,
+                &mut h_out,
+                i,
+                &self.config,
+                next_input_rmsnorm,
+                ctx,
+            )?;
+            h = h_out;
         }
-        Ok(())
-    }
-}
+        // 循环结束后 `h` 即为 `final_norm(x)`。
+        let final_norm_all = h;
 
-// ============================================================================
-//  Tests
-// ============================================================================
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-    use std::time::Instant;
-    use crate::base::error::Result;
-    use crate::model::llm::{GenerateStats, LlmModel};
+        // ── 每个 seq 取最后一个 token 的 hidden state ──
+        let sample_hidden = ctx.llm.sample_hidden.clone();
+        for seq_idx in 0..ctx.num_seqs {
+            let last = ctx.meta.seq_end(seq_idx) - 1;
+            let src = final_norm_all.narrow(0, last, 1)?;
+            let mut dst = sample_hidden.narrow(0, seq_idx, 1)?;
+            dst.copy_from_on_current_stream(&src)?;
+        }
 
-    fn generate_and_measure(
-        model: &Qwen3, state: &mut InferenceState,
-        prompt: &str, max_tokens: usize, verbose: bool,
-    ) -> Result<(u64, GenerateStats)> {
-        let start = Instant::now();
-        let stats = model.generate(state, prompt, max_tokens, verbose)?;
-        Ok((start.elapsed().as_millis() as u64, stats))
-    }
+        // ── lm_head → per-seq sampler ──
+        let mut logits = ctx.llm.logits.clone();
+        self.lm_head.forward(&sample_hidden, &mut logits, cuda_cfg)?;
 
-    /// Pre-run a tiny `generate()` on the same state the benchmark will
-    /// use, so the real call sees a hot CUDA context:
-    ///
-    /// - kernel module load / PTX→SASS JIT for every prefill + decode
-    ///   kernel (embedding, rmsnorm, qkv, rope, scatter_kv, flash-attn,
-    ///   wo, silu, sampler, …).
-    /// - cuBLASLt algorithm heuristics for every `(M,N,K)` shape hit.
-    /// - the decode-path CUDA Graph: captured here, replayed for free
-    ///   from the real benchmark's first decode step onward.
-    ///
-    /// After warmup returns, the real `generate(prompt, N)` call
-    /// unconditionally overwrites `kv_cache[..prompt_len]` from pos=0
-    /// (see [`Qwen3::generate`]), so warmup has no correctness impact.
-    ///
-    /// ## Why the filler prompt
-    ///
-    /// The flash-attention prefill kernel processes the sequence in
-    /// fixed-size tiles (~64 tokens). Feeding it a prompt of 1–2 tokens
-    /// causes out-of-range reads inside the tile, putting the CUDA
-    /// context into a sticky-error state that surfaces later as
-    /// `CUBLAS_STATUS_EXECUTION_FAILED (13)` on the next cuBLASLt call.
-    /// We pick a ~10-token filler string to stay above that floor while
-    /// keeping the warmup cheap.
-    fn warmup(model: &Qwen3, state: &mut InferenceState) -> Result<()> {
-        // ~10 tokens after BPE — safely above the flash-attn prefill
-        // tile floor. A few decode steps also capture the CUDA Graph.
-        let prompt = "The quick brown fox jumps over the lazy dog.";
-        let _ = model.generate(state, prompt, 4, false)?;
-        Ok(())
-    }
-
-    fn get_qwen3_model_path() -> &'static Path {
-        Path::new("/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct")
-    }
-
-    #[test]
-    #[ignore = "需要 Qwen3 模型权重，请单独运行。"]
-    #[cfg(feature = "cuda")]
-    fn test_qwen3_cuda_performance() -> Result<()> {
-        let model_path = get_qwen3_model_path();
-        assert!(model_path.exists(), "Qwen3 model directory not found at {:?}", model_path);
-
-        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n写一段C++代码，实现一个简单的中序遍历函数。<|im_end|>\n<|im_start|>assistant\n";
-
-        let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
-        let mut state = model.create_state()?;
-        warmup(&model, &mut state)?;
-        let (_dur_ms, stats) =
-            generate_and_measure(&model, &mut state, prompt, 2000, false)?;
-
-        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
-        let total_ms = (stats.prefill_ms + stats.decode_ms) as f64;
-        println!("\n=== CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
-            stats.num_tokens, total_ms,
-            (prompt_len + stats.num_tokens as f64) / (total_ms / 1000.0),
-            if stats.decode_ms > 0 { stats.decode_iterations as f64 / (stats.decode_ms as f64 / 1000.0) } else { 0.0 });
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "需要 Qwen3 模型权重，请单独运行。"]
-    fn test_qwen3_cpu_loading_and_generation() -> Result<()> {
-        let model_path = get_qwen3_model_path();
-        assert!(model_path.exists(), "Qwen3 model directory not found at {:?}", model_path);
-
-        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n写一段C++代码，实现一个简单的中序遍历函数。<|im_end|>\n<|im_start|>assistant\n";
-
-        let model = Qwen3::new(model_path, DeviceType::Cpu)?;
-        let mut state = model.create_state()?;
-        let (_dur_ms, stats) =
-            generate_and_measure(&model, &mut state, prompt, 150, true)?;
-
-        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
-        let total_ms = (stats.prefill_ms + stats.decode_ms) as f64;
-        println!("\n=== CPU: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
-            stats.num_tokens, total_ms,
-            (prompt_len + stats.num_tokens as f64) / (total_ms / 1000.0),
-            if stats.decode_ms > 0 { stats.decode_iterations as f64 / (stats.decode_ms as f64 / 1000.0) } else { 0.0 });
-        Ok(())
-    }
-
-    fn get_qwen3_awq_model_path() -> &'static Path {
-        Path::new("/data/home/vinciiliu/models/qwen3-4b-instruct-AWQ-mlp3")
-    }
-
-    #[test]
-    #[ignore = "Long running test"]
-    #[cfg(feature = "cuda")]
-    fn test_qwen3_awq_cuda() -> Result<()> {
-        let model_path = get_qwen3_awq_model_path();
-        assert!(model_path.exists(), "Qwen3 AWQ model not found.");
-
-        let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello, who are you?<|im_end|>\n<|im_start|>assistant\n";
-
-        let model = Qwen3::new(model_path, DeviceType::Cuda(0))?;
-        let mut state = model.create_state()?;
-        warmup(&model, &mut state)?;
-        let (_dur_ms, stats) =
-            generate_and_measure(&model, &mut state, prompt, 2000, true)?;
-
-        let prompt_len = model.tokenizer.encode(prompt)?.len() as f64;
-        let total_ms = (stats.prefill_ms + stats.decode_ms) as f64;
-        println!("\n=== Qwen3 AWQ CUDA: {} tok, {:.0}ms, {:.1} tok/s, decode {:.1} tok/s ===",
-            stats.num_tokens, total_ms,
-            (prompt_len + stats.num_tokens as f64) / (total_ms / 1000.0),
-            if stats.decode_ms > 0 { stats.decode_iterations as f64 / (stats.decode_ms as f64 / 1000.0) } else { 0.0 });
+        let tok_vocab = self.config.tokenizer_vocab_size;
+        for i in 0..ctx.num_seqs {
+            let logits_row = logits.narrow(0, i, 1)?;
+            let logits_1d = logits_row.narrow(1, 0, tok_vocab)?.reshape(&[tok_vocab])?;
+            let mut dst = ctx.output_tokens.narrow(0, i, 1)?;
+            ctx.states[i].sampler.sample(&logits_1d, &mut dst, cuda_cfg)?;
+        }
         Ok(())
     }
 }

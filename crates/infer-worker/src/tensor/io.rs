@@ -86,16 +86,20 @@ impl Tensor {
         if self.device() == DeviceType::Cpu {
             return Ok(self.clone());
         }
-        // We materialise in the process — cross-device copies require a
-        // contiguous, zero-offset layout.
-        let src = if self.is_contiguous() && self.storage_offset() == 0 {
+        // Cross-device copies require a contiguous, zero-offset, *tightly
+        // sized* source buffer. A prefix-narrowed view passes the cheap
+        // `is_contiguous && offset==0` test but shares the parent's
+        // oversized buffer, so use the stricter predicate here.
+        let src = if self.owns_storage_tightly() {
             self.clone()
         } else {
             self.contiguous()?
         };
 
+        let nbytes = src.numel() * src.dtype().size_in_bytes();
+        debug_assert_eq!(src.buffer().len_bytes(), nbytes);
         let allocator = Arc::new(CpuAllocator);
-        let mut cpu_buffer = Buffer::new(src.buffer().len_bytes(), allocator)?;
+        let mut cpu_buffer = Buffer::new(nbytes, allocator)?;
         cpu_buffer.copy_from(src.buffer())?;
         Tensor::from_buffer(cpu_buffer, src.shape(), src.dtype())
     }
@@ -106,15 +110,17 @@ impl Tensor {
         if self.device() == DeviceType::Cuda(device_id) {
             return Ok(self.clone());
         }
-        let src = if self.is_contiguous() && self.storage_offset() == 0 {
+        let src = if self.owns_storage_tightly() {
             self.clone()
         } else {
             self.contiguous()?
         };
 
+        let nbytes = src.numel() * src.dtype().size_in_bytes();
+        debug_assert_eq!(src.buffer().len_bytes(), nbytes);
         let allocator = Arc::new(crate::base::allocator::CachingCudaAllocator::instance());
         crate::cuda::device::set_current_device(device_id)?;
-        let mut gpu_buffer = Buffer::new(src.buffer().len_bytes(), allocator)?;
+        let mut gpu_buffer = Buffer::new(nbytes, allocator)?;
         gpu_buffer.copy_from(src.buffer())?;
         Tensor::from_buffer(gpu_buffer, src.shape(), src.dtype())
     }
@@ -140,9 +146,9 @@ impl Tensor {
             return Ok(self.clone());
         }
 
-        // Cast must see contiguous, CPU-resident input.
+        // Cast must see contiguous, CPU-resident, tightly-sized input.
         let src_cpu = if self.device() == DeviceType::Cpu {
-            if self.is_contiguous() && self.storage_offset() == 0 {
+            if self.owns_storage_tightly() {
                 self.clone()
             } else {
                 self.contiguous()?

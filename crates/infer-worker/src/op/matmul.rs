@@ -114,7 +114,11 @@ impl Matmul {
                 } else if input.dtype() == DataType::BF16 {
                     let m = input.shape()[0];
                     let n = weight.shape()[0];
-                    if m == 1 {
+                    // N≤16384 时手写 BF16 GEMV 比 cuBLASLt 快 25-44%（小矩阵
+                    // 占主导）。N>16384（典型：lm_head with vocab≈128k）时
+                    // cuBLASLt 的并行调度反而更优 —— v0.7 README 实测。
+                    const GEMV_VS_GEMM_N_THRESHOLD: usize = 16_384;
+                    if m == 1 && n <= GEMV_VS_GEMM_N_THRESHOLD {
                         kernels::cuda::hgemv_bf16(input, weight, output, cuda_config)?;
                     } else if m <= 4 && n > 65_536 {
                         for row in 0..m {
@@ -128,7 +132,8 @@ impl Matmul {
                 } else if input.dtype() == DataType::F16 {
                     let m = input.shape()[0];
                     let n = weight.shape()[0];
-                    if m == 1 {
+                    const GEMV_VS_GEMM_N_THRESHOLD: usize = 16_384;
+                    if m == 1 && n <= GEMV_VS_GEMM_N_THRESHOLD {
                         kernels::cuda::hgemv_fp16(input, weight, output, cuda_config)?;
                     } else if m <= 4 && n > 65_536 {
                         for row in 0..m {

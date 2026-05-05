@@ -191,8 +191,25 @@ impl CudaConfig {
 
     /// 开始 stream capture。`&self` 即可（capture state 由 CUDA driver 内部管理，
     /// 实际把 graph 写入 HashMap 的动作在 `capture_end` 里，需 `&mut self`）。
+    ///
+    /// 默认走 `cudaStreamCaptureModeGlobal`（最严格）。如果 capture 期间有
+    /// 任何 op 在 legacy default stream 上隐式 launch（被 cuBLAS / cuDNN
+    /// 等第三方库踩到），会触发 `cudaErrorStreamCaptureImplicit` —— 那就改用
+    /// [`Self::capture_begin_relaxed`]，CUDA 会放过这种隐式依赖。
     pub fn capture_begin(&self) -> Result<()> {
         unsafe { crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 0))?; }
+        Ok(())
+    }
+
+    /// `cudaStreamCaptureModeRelaxed` 版的 capture 启动 —— 允许 capture 期间
+    /// 有跨 stream / legacy default stream 的隐式依赖（cuBLAS handle 在第三方
+    /// 库内部偶尔会踩到）。LLM decode graph 路径用这个；纯自有 kernel 路径
+    /// （e.g. z-image denoise）继续用严格的 [`Self::capture_begin`]。
+    pub fn capture_begin_relaxed(&self) -> Result<()> {
+        const RELAXED: ffi::cudaStreamCaptureMode = 2;
+        unsafe {
+            crate::cuda_check!(ffi::cudaStreamBeginCapture(self.stream, RELAXED))?;
+        }
         Ok(())
     }
 

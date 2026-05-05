@@ -50,6 +50,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 
 namespace flash_attn_prefill {
 
@@ -650,9 +651,16 @@ static cudaError_t launch_impl(
                                  typename Traits::SmemLayoutKV>));
 
     auto kernel = flash_attn_prefill_kernel<Traits>;
-    cudaError_t err = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    if (err != cudaSuccess) return err;
+    // CUDA Graph 友好：setAttribute 是 host-同步、capture-不允许的全局 setup，
+    // 整个 process 只需调一次。template instantiation 让每个 (Elem, HD) 组合
+    // 各自独立 once_flag，对应每个 kernel 函数地址。
+    static std::once_flag prefill_attr_once;
+    static cudaError_t prefill_attr_err = cudaSuccess;
+    std::call_once(prefill_attr_once, [&]() {
+        prefill_attr_err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    });
+    if (prefill_attr_err != cudaSuccess) return prefill_attr_err;
 
     kernel<<<grid, block, smem_size, stream>>>(
         q, qsb, qss, qsh,
@@ -1011,9 +1019,14 @@ static cudaError_t launch_ragged_impl(
                                  typename Traits::SmemLayoutQ,
                                  typename Traits::SmemLayoutKV>));
     auto kernel = flash_attn_ragged_kernel<Traits>;
-    cudaError_t err = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    if (err != cudaSuccess) return err;
+    // CUDA Graph 友好：见上面 prefill kernel 的同款守卫。
+    static std::once_flag ragged_attr_once;
+    static cudaError_t ragged_attr_err = cudaSuccess;
+    std::call_once(ragged_attr_once, [&]() {
+        ragged_attr_err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    });
+    if (ragged_attr_err != cudaSuccess) return ragged_attr_err;
 
     kernel<<<grid, block, smem_size, stream>>>(
         q, qss, qsh,

@@ -22,8 +22,14 @@ pub struct BatchWorkspace {
     pub gate_up_out: Tensor,
     /// W2 (down proj) 输出 / FFN 中间 buffer, [max_batch_tokens, dim]
     pub ffn_out: Tensor,
-    /// 额外的 [max_batch_tokens, dim] buffer (用于 residual 等)
+    /// Attention fused 输出 buffer，`[max_batch_tokens, q_dim]`。
+    /// 由 attention kernel 写入，wo 读出。Llama3 / Qwen3 共用。
     pub intermediate: Tensor,
+    /// lm_head 之前的 sample buffer，`[max_batch_seqs, dim]`。
+    /// 与 `intermediate` 分离以便 Qwen3 这种 `q_dim != dim` 的模型也能拿到
+    /// dense view（`intermediate` 宽度 = q_dim，对它做 col-narrow 取 dim 是
+    /// strided，不利于下游 Matmul）。
+    pub sample_hidden: Tensor,
 
     // ═══ Token 级 buffer ═══
     /// 输入 token ids, [max_batch_tokens], I32
@@ -89,6 +95,40 @@ pub struct BatchWorkspace {
     /// [max_batch_seqs] seq i 的 token 数
     #[cfg(feature = "cuda")]
     pub scatter_seq_lens_dev: *mut i32,
+
+    // ═══ Flash-Decoding split-K workspace ═══
+    //
+    // Flash-Decoding decode-path 用 split-K 策略并行扫 KV（每 seq × 每 head 分
+    // 成 num_splits 条 block），每条 block 把"partial output + log-sum-exp"写到
+    // 这块 workspace，再由一个 reduction kernel 合并。存储**必须是 f32**：
+    //   - partial output accumulator：几千次 BF16/FP16 FMA 的累加误差不可接受；
+    //   - log-sum-exp：跨 split 合并时 `exp(lse_i - lse_max)` 对 ULP 极敏感。
+    //
+    // 尺寸由 `FlashAttnDecodeBatch::workspace_bytes(max_batch_seqs, q_heads, head_dim)`
+    // 决定；地址跨 step 稳定，graph-capture 友好。
+    #[cfg(feature = "cuda")]
+    pub flash_decode_workspace_dev: *mut f32,
+
+    // ═══ Ragged prefill 的 kernel 调度表 ═══
+    //
+    // Flash-Attn ragged kernel 的 grid 大小 = `total_q_tiles = Σ ceil(q_len_i / RAGGED_Q_TILE)`。
+    // 每个 block 要通过下列 3 张表反查"我是哪个 request 的第几个 Q-tile"：
+    //
+    // - `cu_q_lens_dev`  `[max_batch_seqs + 1]` i32: `q_len` 前缀和；
+    // - `block2req_dev`  `[max_q_tiles]`        i32: tile → request；
+    // - `block2tile_dev` `[max_q_tiles]`        i32: tile → request 内的第几 tile。
+    //
+    // `max_q_tiles` 是本 workspace 所能容纳的上界 `ceil(max_batch_tokens /
+    // RAGGED_Q_TILE)`。Runner 每 step 入口（只在 `num_prefill > 0` 时）调
+    // [`refresh_ragged_plan`] 做一次 host-compute + 3 次小 H2D。
+    #[cfg(feature = "cuda")]
+    pub ragged_cu_q_lens_dev: *mut i32,
+    #[cfg(feature = "cuda")]
+    pub ragged_block2req_dev: *mut i32,
+    #[cfg(feature = "cuda")]
+    pub ragged_block2tile_dev: *mut i32,
+    #[cfg(feature = "cuda")]
+    pub ragged_max_q_tiles: usize,
 
     /// layer_num（初始化时由模型 config 传入）
     pub layer_num: usize,
@@ -167,13 +207,79 @@ impl BatchWorkspace {
             }
         };
 
+        // Flash-Decoding split-K workspace —— 按 kernel 自报的字节数一次分配。
+        // 用 `max_batch_seqs` 做上界，batch 未满时 kernel 只用前 batch 份；地址稳定。
+        #[cfg(feature = "cuda")]
+        let flash_decode_workspace_dev = match device {
+            DeviceType::Cpu => std::ptr::null_mut::<f32>(),
+            DeviceType::Cuda(_) => {
+                let bytes = crate::op::attention::FlashAttnDecodeBatch::workspace_bytes(
+                    max_batch_seqs,
+                    config.head_num,
+                    config.head_size,
+                );
+                if bytes == 0 {
+                    std::ptr::null_mut::<f32>()
+                } else {
+                    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                    unsafe {
+                        crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut p, bytes))?;
+                    }
+                    p as *mut f32
+                }
+            }
+        };
+
+        // Ragged prefill 调度表：按 max_batch_tokens 为上界估算 max_q_tiles。
+        #[cfg(feature = "cuda")]
+        let (
+            ragged_cu_q_lens_dev,
+            ragged_block2req_dev,
+            ragged_block2tile_dev,
+            ragged_max_q_tiles,
+        ) = match device {
+            DeviceType::Cpu => (
+                std::ptr::null_mut::<i32>(),
+                std::ptr::null_mut::<i32>(),
+                std::ptr::null_mut::<i32>(),
+                0usize,
+            ),
+            DeviceType::Cuda(_) => {
+                let max_tiles = max_batch_tokens
+                    .div_ceil(crate::op::attention::ragged::RAGGED_Q_TILE)
+                    .max(1);
+                let cu_bytes = (max_batch_seqs + 1) * std::mem::size_of::<i32>();
+                let tile_bytes = max_tiles * std::mem::size_of::<i32>();
+                let mut p_cu: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut p_b2r: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut p_b2t: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut p_cu, cu_bytes))?;
+                    crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut p_b2r, tile_bytes))?;
+                    crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut p_b2t, tile_bytes))?;
+                }
+                (
+                    p_cu as *mut i32,
+                    p_b2r as *mut i32,
+                    p_b2t as *mut i32,
+                    max_tiles,
+                )
+            }
+        };
+
         Ok(Self {
             x: Tensor::new(&[max_batch_tokens, dim], float_dtype, device)?,
             rms_out: Tensor::new(&[max_batch_tokens, dim], float_dtype, device)?,
             qkv_out: Tensor::new(&[max_batch_tokens, q_dim + 2 * kv_dim], float_dtype, device)?,
             gate_up_out: Tensor::new(&[max_batch_tokens, 2 * inter], float_dtype, device)?,
             ffn_out: Tensor::new(&[max_batch_tokens, dim], float_dtype, device)?,
-            intermediate: Tensor::new(&[max_batch_tokens, dim], float_dtype, device)?,
+            // attention fused 输出 buffer：宽度 = q_dim（attention kernel 期望的
+            // `[T, q_dim]` 布局），与 wo 输入对齐。Llama3 q_dim==dim，Qwen3
+            // q_dim>dim 时此 buffer 仍按 q_dim 分配。
+            intermediate: Tensor::new(&[max_batch_tokens, q_dim], float_dtype, device)?,
+            // sample buffer：单独 `[max_batch_seqs, dim]`，下游 lm_head 直接吃
+            // dense view。
+            sample_hidden: Tensor::new(&[max_batch_seqs, dim], float_dtype, device)?,
 
             input_tokens: Tensor::new(&[max_batch_tokens], int_dtype, device)?,
             input_pos: Tensor::new(&[max_batch_tokens], int_dtype, device)?,
@@ -206,6 +312,18 @@ impl BatchWorkspace {
             scatter_seq_starts_dev,
             #[cfg(feature = "cuda")]
             scatter_seq_lens_dev,
+
+            #[cfg(feature = "cuda")]
+            flash_decode_workspace_dev,
+
+            #[cfg(feature = "cuda")]
+            ragged_cu_q_lens_dev,
+            #[cfg(feature = "cuda")]
+            ragged_block2req_dev,
+            #[cfg(feature = "cuda")]
+            ragged_block2tile_dev,
+            #[cfg(feature = "cuda")]
+            ragged_max_q_tiles,
 
             layer_num: config.layer_num,
 
@@ -294,33 +412,60 @@ impl BatchWorkspace {
     /// 职责：只在 batch 成员改变或 KV 扩容（见 `invalidate_batch_member_cache`）
     /// 之后的**下一次 step 入口**调一次；之后 graph replay 无需再调。
     ///
-    /// `slots` 指明哪一个 InferenceState 对应 batch 里哪个"slot id"（顺序即
-    /// device 指针数组的行 index）；caller 通常传 `0..states.len()`。
+    /// `states[i]` **必须**对应 `slot_ids[i]`，即 server 已经按 "slot 顺序" gather
+    /// 好 refs；函数内部按该 slot 下标填入指针表，和 kernel 侧的
+    /// `req_to_slot_dev / slot_indices_dev` 一致。
     #[cfg(feature = "cuda")]
     pub fn fill_cache_ptrs_from_states(
         &mut self,
+        slot_ids: &[usize],
         states: &mut [&mut crate::model::runtime::InferenceState],
     ) -> crate::base::error::Result<()> {
-        let layer_num = self.layer_num;
-        let cap = self.max_batch_seqs;
-        if states.len() > cap {
+        if states.len() != slot_ids.len() {
             return Err(crate::base::error::Error::InvalidArgument(format!(
-                "fill_cache_ptrs: states {} > max_batch_seqs {}",
-                states.len(), cap
+                "fill_cache_ptrs: states {} != slot_ids {}",
+                states.len(), slot_ids.len()
             )).into());
         }
+        let layer_num = self.layer_num;
+        let cap = self.max_batch_seqs;
+        for &slot in slot_ids {
+            if slot >= cap {
+                return Err(crate::base::error::Error::InvalidArgument(format!(
+                    "fill_cache_ptrs: slot {} >= max_batch_seqs {}", slot, cap
+                )).into());
+            }
+        }
         // Host 缓冲：两个 [layer_num × max_batch_seqs] u64，按行 layer-major 排列。
+        // 关键：**保留之前调用的条目不变**，只覆盖本次列出的 slot 对应位置。
+        //       因此先从 device 读回（避免"新请求初始化时把已有 slot 清零"）。
+        // 简化实现：本函数读回全表 → 改需要的 slot → 一次写回。
         let total = layer_num * cap;
         let mut k_host: Vec<u64> = vec![0u64; total];
         let mut v_host: Vec<u64> = vec![0u64; total];
-        for (slot, st) in states.iter_mut().enumerate() {
+        let bytes = total * std::mem::size_of::<u64>();
+        unsafe {
+            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+                k_host.as_mut_ptr() as *mut _,
+                self.k_cache_ptrs_dev as *const _,
+                bytes,
+                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            ))?;
+            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+                v_host.as_mut_ptr() as *mut _,
+                self.v_cache_ptrs_dev as *const _,
+                bytes,
+                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            ))?;
+        }
+        for (idx, st) in states.iter_mut().enumerate() {
+            let slot = slot_ids[idx];
             for layer_idx in 0..layer_num {
                 let (k_t, v_t) = st.kv_cache.get_mut(layer_idx)?;
                 k_host[layer_idx * cap + slot] = k_t.data_ptr_mut() as u64;
                 v_host[layer_idx * cap + slot] = v_t.data_ptr_mut() as u64;
             }
         }
-        let bytes = total * std::mem::size_of::<u64>();
         unsafe {
             crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
                 self.k_cache_ptrs_dev as *mut _,
@@ -337,6 +482,56 @@ impl BatchWorkspace {
         }
         self.cache_ptrs_filled = true;
         Ok(())
+    }
+
+    /// 在 step 入口，**num_prefill > 0** 时调一次，host 侧从 meta 算出
+    /// ragged kernel 所需的 3 张调度表并 H2D。
+    ///
+    /// 返回 `total_q_tiles`——本步 ragged kernel 的 `grid.x`。
+    #[cfg(feature = "cuda")]
+    pub fn refresh_ragged_plan(
+        &mut self,
+        meta: &crate::worker::runner::WorkerBatchMeta<'_>,
+    ) -> crate::base::error::Result<i32> {
+        let b = meta.num_seqs();
+        if b == 0 {
+            return Ok(0);
+        }
+        let mut q_lens: Vec<i32> = Vec::with_capacity(b);
+        for i in 0..b {
+            q_lens.push(meta.seq_len(i) as i32);
+        }
+        let (cu_q_lens, block2req, block2tile) =
+            crate::op::attention::ragged::plan_ragged_tiles(&q_lens);
+        let total_q_tiles = block2req.len();
+        if total_q_tiles > self.ragged_max_q_tiles {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "refresh_ragged_plan: total_q_tiles {} > max {}",
+                total_q_tiles, self.ragged_max_q_tiles
+            ))
+            .into());
+        }
+        unsafe {
+            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+                self.ragged_cu_q_lens_dev as *mut _,
+                cu_q_lens.as_ptr() as *const _,
+                cu_q_lens.len() * std::mem::size_of::<i32>(),
+                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))?;
+            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+                self.ragged_block2req_dev as *mut _,
+                block2req.as_ptr() as *const _,
+                block2req.len() * std::mem::size_of::<i32>(),
+                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))?;
+            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+                self.ragged_block2tile_dev as *mut _,
+                block2tile.as_ptr() as *const _,
+                block2tile.len() * std::mem::size_of::<i32>(),
+                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))?;
+        }
+        Ok(total_q_tiles as i32)
     }
 }
 
@@ -355,6 +550,10 @@ impl Drop for BatchWorkspace {
                 self.scatter_seq_positions_dev as *mut std::ffi::c_void,
                 self.scatter_seq_starts_dev as *mut std::ffi::c_void,
                 self.scatter_seq_lens_dev as *mut std::ffi::c_void,
+                self.flash_decode_workspace_dev as *mut std::ffi::c_void,
+                self.ragged_cu_q_lens_dev as *mut std::ffi::c_void,
+                self.ragged_block2req_dev as *mut std::ffi::c_void,
+                self.ragged_block2tile_dev as *mut std::ffi::c_void,
             ] {
                 if !p.is_null() {
                     let _ = crate::cuda::ffi::cudaFree(p);

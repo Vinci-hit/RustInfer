@@ -185,21 +185,28 @@ mod tests {
 
     /// 构造一个 WorkerBatchMeta：三条 seq，长度分别 3 / 2 / 4；每条 seq 的起始
     /// 位置（pos_in_cache）分别 0 / 5 / 10。
-    fn dummy_meta<'a>(
-        q_start_loc: &'a [i32],
-        positions: &'a [i32],
-        slot_indices: &'a [i32],
-        token_ids: &'a [i32],
+    /// 构造一个 StepMeta + WorkerBatchMeta view 对。测试生命期内 StepMeta
+    /// 由 caller 持有，view 从它借出。
+    fn build_step_meta(
+        q_start_loc: &[i32],
+        slot_indices: &[i32],
+        positions_start: &[i32],
         num_prefill: usize,
-    ) -> WorkerBatchMeta<'a> {
-        WorkerBatchMeta {
-            q_start_loc,
-            slot_indices,
-            token_ids,
-            positions,
-            num_decode: 0,
-            num_prefill,
+        num_decode: usize,
+    ) -> crate::worker::runner::StepMeta {
+        let mut m = crate::worker::runner::StepMeta::zeroed();
+        m.num_prefill = num_prefill;
+        m.num_decode = num_decode;
+        for (i, &v) in q_start_loc.iter().enumerate() {
+            m.q_start_loc[i] = v;
         }
+        for (i, &v) in slot_indices.iter().enumerate() {
+            m.slot_indices[i] = v;
+        }
+        for (i, &v) in positions_start.iter().enumerate() {
+            m.positions_start[i] = v;
+        }
+        m
     }
 
     /// 公共逻辑：准备 k/v src + 若干 InferenceState，跑 `scatter`，对每 seq
@@ -241,7 +248,9 @@ mod tests {
         }
         let slot_indices = [0i32, 1, 2];
         let token_ids: Vec<i32> = (0..total_tokens as i32).collect();
-        let meta = dummy_meta(&q_start_loc, &positions, &slot_indices, &token_ids, 3);
+        let _ = token_ids;
+        let step = build_step_meta(&q_start_loc, &slot_indices, &seq_poses, 3, 0);
+        let meta = crate::worker::runner::WorkerBatchMeta::from_step(&step);
 
         // F32 源数据：K = row*100 + col；V = K + 10000（让 BF16 下 K/V 的值也能
         // 明确区分，不受 ULP round 影响；BF16 尾数 7 位，整数 +10000 偏移在
@@ -280,7 +289,7 @@ mod tests {
             // 把 states 的 kv_cache base 指针表和 per-seq 索引表 push 到 device。
             let mut init_refs: Vec<&mut InferenceState> =
                 vec![&mut state0, &mut state1, &mut state2];
-            workspace.fill_cache_ptrs_from_states(&mut init_refs)?;
+            workspace.fill_cache_ptrs_from_states(&[0, 1, 2], &mut init_refs)?;
             workspace.refresh_scatter_indices(&meta)?;
         }
 
@@ -427,7 +436,10 @@ mod tests {
         let positions: Vec<i32> = (0..3).chain(7..10).collect();
         let slot_indices = [0i32, 1];
         let token_ids: Vec<i32> = (0..6).collect();
-        let meta = dummy_meta(&q_start_loc, &positions, &slot_indices, &token_ids, 2);
+        let _ = (positions, token_ids);
+        let seq_start_pos = [0i32, 7];
+        let step = build_step_meta(&q_start_loc, &slot_indices, &seq_start_pos, 2, 0);
+        let meta = crate::worker::runner::WorkerBatchMeta::from_step(&step);
 
         // 构造 fused qkv [T, q_dim + 2*kv_dim]（BF16）
         let total_cols = q_dim + 2 * kv_dim;
@@ -449,7 +461,7 @@ mod tests {
         let mut ws_a = BatchWorkspace::new(&cfg, total_tokens, 8, device)?;
         {
             let mut init_refs: Vec<&mut InferenceState> = vec![&mut s0, &mut s1];
-            ws_a.fill_cache_ptrs_from_states(&mut init_refs)?;
+            ws_a.fill_cache_ptrs_from_states(&[0, 1], &mut init_refs)?;
             ws_a.refresh_scatter_indices(&meta)?;
         }
         {
@@ -476,7 +488,7 @@ mod tests {
         let mut ws_b = BatchWorkspace::new(&cfg, total_tokens, 8, device)?;
         {
             let mut init_refs: Vec<&mut InferenceState> = vec![&mut s0b, &mut s1b];
-            ws_b.fill_cache_ptrs_from_states(&mut init_refs)?;
+            ws_b.fill_cache_ptrs_from_states(&[0, 1], &mut init_refs)?;
             ws_b.refresh_scatter_indices(&meta)?;
         }
         {
@@ -496,7 +508,7 @@ mod tests {
             let kb = read_as_f32(k_b)?;
             let va = read_as_f32(v_a)?;
             let vb = read_as_f32(v_b)?;
-            let pos = positions[seq_i * 3] as usize;   // 每 seq 3 个 token，起始 pos
+            let pos = seq_start_pos[seq_i] as usize;   // 每 seq 3 个 token，起始 pos
             let len = 3usize;
             for t in 0..len {
                 for c in 0..kv_dim {

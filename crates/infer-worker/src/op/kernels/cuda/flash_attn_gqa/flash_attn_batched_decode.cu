@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 
 namespace flash_batched_decode {
 
@@ -397,9 +398,18 @@ static cudaError_t launch_impl(
         const int kv_chunk_smem = 2048;  // sufficient for kv_len up to 32768
         const size_t smem_size = (HeadDim + kv_chunk_smem) * sizeof(float);
         auto kernel = pass1_kernel<Elem, HeadDim>;
-        cudaError_t err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size);
-        if (err != cudaSuccess) return err;
+        // `cudaFuncSetAttribute` 是 host-同步 API，CUDA Graph stream capture
+        // 不允许在 capture 中调用。本属性是 per-kernel 的全局状态，整个 process
+        // 只需调一次；用 `std::once_flag` 守卫。template instantiation 会让
+        // 每个 (Elem, HeadDim) 组合各自有独立的 once_flag，刚好对应每个 kernel
+        // 函数地址。
+        static std::once_flag pass1_attr_once;
+        static cudaError_t pass1_attr_err = cudaSuccess;
+        std::call_once(pass1_attr_once, [&]() {
+            pass1_attr_err = cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_size);
+        });
+        if (pass1_attr_err != cudaSuccess) return pass1_attr_err;
         kernel<<<grid, block, smem_size, stream>>>(
             q_ptr, qsb, qsh,
             k_ptrs, v_ptrs, kv_stride_s, kv_stride_h,

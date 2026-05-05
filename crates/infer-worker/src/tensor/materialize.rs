@@ -20,16 +20,24 @@ use super::dims::Dims;
 use super::tensor::Tensor;
 
 impl Tensor {
-    /// Return a contiguous copy. If `self` is already contiguous this is a
-    /// cheap metadata clone (the underlying buffer `Arc` is shared).
+    /// Return a contiguous copy. If `self` already owns its storage tightly
+    /// (contiguous, zero offset, and the backing buffer is exactly
+    /// `numel * sizeof(dtype)`) this is a cheap metadata clone (the
+    /// underlying buffer `Arc` is shared).
+    ///
+    /// Note that a *prefix-narrowed* view (e.g. `base.narrow(0, 0, n)` with
+    /// `n < base.shape[0]`) is contiguous with `storage_offset == 0` yet
+    /// shares a buffer larger than `numel`; for that case we deliberately
+    /// fall through to the strided-copy path so the returned tensor's
+    /// `buffer.len_bytes()` matches its logical size.
     pub fn contiguous(&self) -> Result<Self> {
-        if self.is_contiguous() && self.storage_offset() == 0 {
+        if self.owns_storage_tightly() {
             return Ok(self.clone());
         }
-        // Even when `is_contiguous==true`, a nonzero storage_offset means
-        // we need to rebase to offset 0. Using the identity permutation
-        // via the strided-copy code handles both the non-contiguous and
-        // offset cases uniformly.
+        // Either non-contiguous, nonzero-offset, or sharing an oversized
+        // buffer with a parent. Materialise via the identity-permute
+        // strided-copy path, which allocates a fresh buffer sized to
+        // `shape` and walks `self.strides()` to gather the right elements.
         let ndim = self.ndim();
         let identity: Vec<usize> = (0..ndim).collect();
         let mut dst = Self::empty(self.shape(), self.dtype(), self.device())?;
@@ -39,14 +47,17 @@ impl Tensor {
 
     /// Deep copy into a freshly allocated, contiguous, exclusive buffer.
     /// Unlike [`Tensor::contiguous`] this always allocates, even when the
-    /// source is already contiguous — callers asking for `to_owned` want
-    /// independent storage.
+    /// source already owns its storage tightly — callers asking for
+    /// `to_owned` want independent storage.
     pub fn to_owned(&self) -> Result<Self> {
-        if self.is_contiguous() && self.storage_offset() == 0 {
+        if self.owns_storage_tightly() {
             let mut dst = Self::empty(self.shape(), self.dtype(), self.device())?;
             dst.buffer_mut().copy_from(self.buffer())?;
             return Ok(dst);
         }
+        // Prefix-narrowed / strided / offset views: `contiguous()` already
+        // allocates a fresh buffer of the right size and gathers via
+        // strides, which gives us independent storage too.
         self.contiguous()
     }
 
