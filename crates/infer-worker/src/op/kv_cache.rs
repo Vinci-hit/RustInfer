@@ -289,8 +289,8 @@ mod tests {
             // 把 states 的 kv_cache base 指针表和 per-seq 索引表 push 到 device。
             let mut init_refs: Vec<&mut InferenceState> =
                 vec![&mut state0, &mut state1, &mut state2];
-            workspace.fill_cache_ptrs_from_states(&[0, 1, 2], &mut init_refs)?;
-            workspace.refresh_scatter_indices(&meta)?;
+            workspace.fill_cache_ptrs_from_states(&[0, 1, 2], &mut init_refs, std::ptr::null_mut())?;
+            workspace.refresh_scatter_indices(&meta, std::ptr::null_mut())?;
         }
 
         // --- 跑 scatter on layer 0 ---
@@ -461,8 +461,8 @@ mod tests {
         let mut ws_a = BatchWorkspace::new(&cfg, total_tokens, 8, device)?;
         {
             let mut init_refs: Vec<&mut InferenceState> = vec![&mut s0, &mut s1];
-            ws_a.fill_cache_ptrs_from_states(&[0, 1], &mut init_refs)?;
-            ws_a.refresh_scatter_indices(&meta)?;
+            ws_a.fill_cache_ptrs_from_states(&[0, 1], &mut init_refs, std::ptr::null_mut())?;
+            ws_a.refresh_scatter_indices(&meta, std::ptr::null_mut())?;
         }
         {
             let mut refs: Vec<&mut InferenceState> = vec![&mut s0, &mut s1];
@@ -488,8 +488,8 @@ mod tests {
         let mut ws_b = BatchWorkspace::new(&cfg, total_tokens, 8, device)?;
         {
             let mut init_refs: Vec<&mut InferenceState> = vec![&mut s0b, &mut s1b];
-            ws_b.fill_cache_ptrs_from_states(&[0, 1], &mut init_refs)?;
-            ws_b.refresh_scatter_indices(&meta)?;
+            ws_b.fill_cache_ptrs_from_states(&[0, 1], &mut init_refs, std::ptr::null_mut())?;
+            ws_b.refresh_scatter_indices(&meta, std::ptr::null_mut())?;
         }
         {
             let mut refs_b: Vec<&mut InferenceState> = vec![&mut s0b, &mut s1b];

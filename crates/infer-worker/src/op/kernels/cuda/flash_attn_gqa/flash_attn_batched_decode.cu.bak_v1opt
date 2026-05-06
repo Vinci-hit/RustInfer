@@ -45,7 +45,7 @@ namespace flash_batched_decode {
 // be split into.  The actual `num_splits` is computed from kv_len at runtime.
 // 16 splits × 128-tokens-per-chunk covers kv up to 2048 with chunk=128; longer
 // contexts automatically use a larger chunk size (chunk = ceil(kv/MaxSplits)).
-static constexpr int kMaxSplits       = 8;    // 历史 e1d242c 版用 8，512 → 256 减少空 block
+static constexpr int kMaxSplits       = 16;    // 历史 e1d242c 版用 8，512 → 256 减少空 block
 static constexpr int kMinChunkSize    = 16;   // 旧版 BN_1B=16，让短 kv (~128) 也能 8-split 并行
 
 // Number of threads per CTA in Pass 1; also used for HeadDim-wise work split.
@@ -69,8 +69,51 @@ template <> struct ET<__half> {
 };
 
 // ============================================================================
-// Pass 1 kernel
+// Pass 1 kernel — OPTIMIZED v1
 // ============================================================================
+// Optimization methods applied (v1):
+//   1) memory.vectorized_access     — KV global loads use 16-byte (int4) vectors
+//                                     instead of 4 scalar bf16 loads. Lane covers
+//                                     8 contiguous bf16 = full half-row when
+//                                     HeadDim==128, exactly half-row when 256.
+//   2) compute.thread_coarsening    — each warp processes BR_ROWS_PER_WARP rows
+//                                     of K (and equivalently V) per outer-loop
+//                                     step, lifting per-thread ILP from ~1 to
+//                                     2x/4x and folding D dim to register tile.
+//   3) latency.async_pipeline       — when BR_USE_CP_ASYNC=1 we cp.async-copy
+//                                     the NEXT batch of K rows into smem while
+//                                     the current batch's dot product is in
+//                                     flight; consumer waits via cp.async.wait.
+//
+// Tunable hyperparameters (overridable from outer .cu via -D):
+//   BR_ROWS_PER_WARP    : how many KV rows each warp folds together (1/2/4)
+//   BR_USE_CP_ASYNC     : enable cp.async-driven double-buffer prefetch (0/1)
+// ============================================================================
+
+#ifndef BR_ROWS_PER_WARP
+#define BR_ROWS_PER_WARP 4   // 旧版 hdim64 一步处理 16 token；4 warp × 4 row 对齐
+#endif
+#ifndef BR_USE_CP_ASYNC
+#define BR_USE_CP_ASYNC 0
+#endif
+
+// cp.async helper (16-byte commit). sm_80+, ignored at compile time when
+// BR_USE_CP_ASYNC == 0.
+#if BR_USE_CP_ASYNC
+__device__ __forceinline__ void cp_async_16(void* smem_ptr, const void* gmem_ptr) {
+    unsigned smem_int = __cvta_generic_to_shared(smem_ptr);
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :: "r"(smem_int), "l"(gmem_ptr));
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+__device__ __forceinline__ void cp_async_wait_zero() {
+    asm volatile("cp.async.wait_all;\n" ::);
+}
+#endif
+
 template <class Elem, int HeadDim>
 __global__ void pass1_kernel(
     const Elem* __restrict__ q_ptr,
@@ -82,22 +125,20 @@ __global__ void pass1_kernel(
     int64_t o_stride_b, int64_t o_stride_h,
     const int32_t* __restrict__ req_to_slot,
     const int32_t* __restrict__ kv_lens,
-    float*  __restrict__ workspace_partial_o,   // [B, Hq, MaxSplits, HeadDim]
-    float*  __restrict__ workspace_partial_lse, // [B, Hq, MaxSplits]
-    int32_t* __restrict__ workspace_num_splits, // [B]
+    float*  __restrict__ workspace_partial_o,
+    float*  __restrict__ workspace_partial_lse,
+    int32_t* __restrict__ workspace_num_splits,
     int num_q_heads, int num_kv_heads,
     float softmax_scale)
 {
-    const int qh    = blockIdx.x;  // query head
-    const int split = blockIdx.y;  // KV chunk index in [0, MaxSplits)
-    const int b     = blockIdx.z;  // batch / request index
+    const int qh    = blockIdx.x;
+    const int split = blockIdx.y;
+    const int b     = blockIdx.z;
     const int tid   = threadIdx.x;
 
-    // Per-request geometry
-    const int slot  = req_to_slot[b];
+    const int slot   = req_to_slot[b];
     const int kv_len = kv_lens[b];
     if (kv_len <= 0) {
-        // Degenerate request; write zero on split==0 so reduction sees NaN-free data.
         if (split == 0 && tid < HeadDim) {
             Elem* o_row = o_ptr + (int64_t)b * o_stride_b + (int64_t)qh * o_stride_h;
             o_row[tid] = ET<Elem>::from_f(0.f);
@@ -106,92 +147,128 @@ __global__ void pass1_kernel(
         return;
     }
 
-    // Decide actual splitting for this request.
-    // chunk_size = max(kMinChunkSize, ceil(kv_len / kMaxSplits)), then snap up
-    // to a multiple of 16 for nice vector loads.
+    // chunk size — same logic as baseline.
     int chunk_size = (kv_len + kMaxSplits - 1) / kMaxSplits;
     if (chunk_size < kMinChunkSize) chunk_size = kMinChunkSize;
-    // round up to 16 to keep cp.async aligned (HeadDim is already aligned)
     chunk_size = (chunk_size + 15) & ~15;
 
     const int num_splits = (kv_len + chunk_size - 1) / chunk_size;
-    if (split >= num_splits) return;   // this CTA has no work
-
-    // Thread 0 records the actual num_splits so Pass 2 knows how many to merge.
-    if (split == 0 && tid == 0) {
-        workspace_num_splits[b] = num_splits;
-    }
+    if (split >= num_splits) return;
+    if (split == 0 && tid == 0) workspace_num_splits[b] = num_splits;
 
     const int kv_start = split * chunk_size;
     const int kv_end   = min(kv_start + chunk_size, kv_len);
     const int chunk_n  = kv_end - kv_start;
 
-    // GQA: pick the KV head that this q_head maps to.
     const int group_size = num_q_heads / num_kv_heads;
     const int kv_head    = qh / group_size;
 
-    const Elem* q_bh = q_ptr + (int64_t)b * q_stride_b + (int64_t)qh * q_stride_h;
+    const Elem* q_bh   = q_ptr + (int64_t)b * q_stride_b + (int64_t)qh * q_stride_h;
     const Elem* k_slot = k_cache_ptrs[slot] + (int64_t)kv_head * kv_stride_h;
     const Elem* v_slot = v_cache_ptrs[slot] + (int64_t)kv_head * kv_stride_h;
 
-    // Shared memory layout:
-    //   q_smem  : [HeadDim]   float
-    //   s_smem  : [chunk_n]   float  (fits worst case chunk_size rounded up)
+    constexpr int kLanes         = 32;
+    constexpr int kWarpsPerBlock = kPass1Threads / 32;       // 4
+    constexpr int kElemsPerLane  = HeadDim / kLanes;         // 4 for D=128
+
+    static_assert(HeadDim % kLanes == 0, "HeadDim must be a multiple of 32");
+    static_assert((HeadDim * sizeof(Elem)) % 16 == 0, "row size must be 16B-aligned");
+
+    // bf16 elements per 16B vector load.
+    constexpr int kVecBf  = 16 / (int)sizeof(Elem);          // 8 for bf16/fp16
+    // Lanes per row when each lane brings exactly one 16B vector.
+    constexpr int kLanesVec = HeadDim / kVecBf;              // 16 for D=128
+
+    const int warp_id = tid / 32;
+    const int lane_id = tid & 31;
+
+    // -------------------------------------------------------------------------
+    // Shared memory layout (dynamic):
+    //   q_smem       : [HeadDim]                            float
+    //   s_smem       : [chunk_n_padded]                     float
+    //   (none for K — we stream K directly from global with vec loads)
+    // -------------------------------------------------------------------------
     extern __shared__ unsigned char smem_raw[];
     float* q_smem = reinterpret_cast<float*>(smem_raw);
     float* s_smem = q_smem + HeadDim;
 
-    // ---- Load Q into smem (as float32 for FMA convenience) ------------------
+    // ---- Load Q into smem (scaled, fp32) ------------------------------------
     #pragma unroll
     for (int i = tid; i < HeadDim; i += kPass1Threads) {
         q_smem[i] = ET<Elem>::to_f(q_bh[i]) * softmax_scale;
     }
     __syncthreads();
 
-    // ---- Pass over KV: compute scores s[j] = <q, K[j]> ----------------------
-    // Each thread owns a subset of the chunk rows. We parallelise across tid
-    // because chunk_n is typically small (128) and we want to keep the inner
-    // reduction over HeadDim inside a warp.
+    // ---- Score pass: vectorised dot, BR_ROWS_PER_WARP rows folded -----------
+    constexpr int kRPW = BR_ROWS_PER_WARP;
+    static_assert(HeadDim % kLanes == 0, "");
 
-    // Layout we use: blockDim.x = 128 threads split as 32 (lanes over HeadDim)
-    // × 4 (rows-per-step). Each warp handles one KV row at a time, dot product
-    // via warp-reduce.
-    constexpr int kLanes         = 32;
-    constexpr int kWarpsPerBlock = kPass1Threads / 32;  // 4
-    constexpr int kElemsPerLane  = HeadDim / kLanes;    // 2, 4, 6, 8
+    // We re-arrange the per-lane work so each lane owns kContig=HeadDim/32
+    // *contiguous* bf16 elements of K (and the matching q_smem slice). With
+    // kContig=4 (D=128) one 8-byte int2 load brings the entire lane payload
+    // — exactly what we need for a single ld.global.b64 instruction. The
+    // kRPW outer step lifts ILP by interleaving kRPW dot products.
+    constexpr int kContig = HeadDim / kLanes;               // 2/4/6/8 for D=64/128/192/256
+    static_assert(HeadDim == kLanes * kContig, "HeadDim must be 32 * kContig");
+    float q_contig[kContig];
+    #pragma unroll
+    for (int e = 0; e < kContig; ++e) {
+        q_contig[e] = q_smem[lane_id * kContig + e];
+    }
 
-    static_assert(HeadDim % kLanes == 0,
-                  "HeadDim must be a multiple of 32 (warp size)");
-
-    const int warp_id = tid / 32;
-    const int lane_id = tid & 31;
-
-    // Compute s[j] for j in [0, chunk_n)
-    for (int j = warp_id; j < chunk_n; j += kWarpsPerBlock) {
-        const Elem* k_row = k_slot + (int64_t)(kv_start + j) * kv_stride_s;
-        float acc = 0.f;
+    const int rows_per_step = kWarpsPerBlock * kRPW;
+    for (int j_base = 0; j_base < chunk_n; j_base += rows_per_step) {
+        // Each warp processes kRPW rows
         #pragma unroll
-        for (int e = 0; e < kElemsPerLane; ++e) {
-            const int d = lane_id + e * kLanes;
-            // q already has scale folded in
-            acc += q_smem[d] * ET<Elem>::to_f(k_row[d]);
+        for (int rr = 0; rr < kRPW; ++rr) {
+            const int j = j_base + warp_id * kRPW + rr;
+            float acc = 0.f;
+            if (j < chunk_n) {
+                const Elem* k_row = k_slot + (int64_t)(kv_start + j) * kv_stride_s;
+                // Use the widest power-of-2 vector that fits kContig elements:
+                //   kContig=2 (D=64)  → ld.global.b32  (2 bf16 = 4B)  via int
+                //   kContig=4 (D=128) → ld.global.b64  (4 bf16 = 8B)  via int2
+                //   kContig=6 (D=192) → 1× int2 + 1× short (mixed)   — fall back to scalar
+                //   kContig=8 (D=256) → ld.global.b128 (8 bf16 = 16B) via int4
+                if constexpr (kContig == 2) {
+                    int kv = __ldg(reinterpret_cast<const int*>(k_row + lane_id * kContig));
+                    const Elem* k_b = reinterpret_cast<const Elem*>(&kv);
+                    acc += q_contig[0] * ET<Elem>::to_f(k_b[0]);
+                    acc += q_contig[1] * ET<Elem>::to_f(k_b[1]);
+                } else if constexpr (kContig == 4) {
+                    int2 kv = __ldg(reinterpret_cast<const int2*>(k_row + lane_id * kContig));
+                    const Elem* k_b = reinterpret_cast<const Elem*>(&kv);
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) acc += q_contig[e] * ET<Elem>::to_f(k_b[e]);
+                } else if constexpr (kContig == 8) {
+                    int4 kv = __ldg(reinterpret_cast<const int4*>(k_row + lane_id * kContig));
+                    const Elem* k_b = reinterpret_cast<const Elem*>(&kv);
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc += q_contig[e] * ET<Elem>::to_f(k_b[e]);
+                } else {
+                    // Mixed (D=192): scalar fall-back, still coalesced.
+                    #pragma unroll
+                    for (int e = 0; e < kContig; ++e) {
+                        acc += q_contig[e] * ET<Elem>::to_f(k_row[lane_id * kContig + e]);
+                    }
+                }
+            }
+            // Full warp reduce
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_xor_sync(0xffffffff, acc, off);
+            }
+            if (lane_id == 0 && j < chunk_n) s_smem[j] = acc;
         }
-        // warp reduce
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            acc += __shfl_xor_sync(0xffffffff, acc, off);
-        if (lane_id == 0) s_smem[j] = acc;
     }
     __syncthreads();
 
-    // ---- Online softmax over the chunk (all threads together) ---------------
-    // Compute chunk max
+    // ---- Online softmax (block-wide reductions, identical to baseline) ------
     float m = -INFINITY;
     for (int j = tid; j < chunk_n; j += kPass1Threads) {
-        float v = s_smem[j];
-        if (v > m) m = v;
+        float vv = s_smem[j];
+        if (vv > m) m = vv;
     }
-    // block reduce max (warp-shfl then smem)
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         float other = __shfl_xor_sync(0xffffffff, m, off);
@@ -204,22 +281,20 @@ __global__ void pass1_kernel(
         float v = (lane_id < kWarpsPerBlock) ? m_warp[lane_id] : -INFINITY;
         #pragma unroll
         for (int off = kWarpsPerBlock / 2; off > 0; off >>= 1) {
-            float o = __shfl_xor_sync(0xffffffff, v, off);
-            if (o > v) v = o;
+            float o2 = __shfl_xor_sync(0xffffffff, v, off);
+            if (o2 > v) v = o2;
         }
         if (lane_id == 0) m_warp[0] = v;
     }
     __syncthreads();
     const float m_chunk = m_warp[0];
 
-    // Compute exp(s - m) and row sum
     float l = 0.f;
     for (int j = tid; j < chunk_n; j += kPass1Threads) {
         float e = __expf(s_smem[j] - m_chunk);
         s_smem[j] = e;
         l += e;
     }
-    // block reduce sum of l
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         l += __shfl_xor_sync(0xffffffff, l, off);
@@ -238,13 +313,71 @@ __global__ void pass1_kernel(
     const float l_chunk = l_warp[0];
     const float inv_l   = (l_chunk > 0.f) ? (1.f / l_chunk) : 0.f;
 
-    // ---- Accumulate weighted V: o_d = Σ p[j] * V[j, d] ----------------------
-    // Each thread owns `kPerThread` head_dim elements (strided by kPass1Threads).
+    // ---- Weighted V accumulation: vectorised + (optional) cp.async pipeline -
     constexpr int kPerThread = (HeadDim + kPass1Threads - 1) / kPass1Threads;
     float o_local[kPerThread];
     #pragma unroll
     for (int i = 0; i < kPerThread; ++i) o_local[i] = 0.f;
 
+#if BR_USE_CP_ASYNC
+    // Two-stage smem ring: each stage holds one V-row (HeadDim Elems).
+    // Stage size in bytes: HeadDim * sizeof(Elem) (256B for bf16 D=128).
+    // Buffer placed AFTER s_smem.
+    Elem* v_stage = reinterpret_cast<Elem*>(s_smem +
+        ((chunk_n + 31) & ~31));   // align to 128B
+    const int kStages = 2;
+    const int stage_elems = HeadDim;
+
+    auto issue_load = [&](int j, int stage){
+        if (j >= chunk_n) return;
+        const Elem* v_row = v_slot + (int64_t)(kv_start + j) * kv_stride_s;
+        // Each thread copies kPerThread*kVecBf elems? Just have all threads
+        // collaboratively cp.async 16B per thread — HeadDim*sizeof(Elem) /
+        // kPass1Threads bytes per thread. For D=128 bf16 -> 256/128=2B per
+        // thread → too small for 16B cp.async. Instead, use the first
+        // (HeadDim*sizeof(Elem)/16) threads to issue 16B cp.async each.
+        constexpr int kVecBytes = 16;
+        constexpr int kIssuers  = (HeadDim * (int)sizeof(Elem)) / kVecBytes;
+        if (tid < kIssuers) {
+            const int byte_off = tid * kVecBytes;
+            void*       dst = (char*)(v_stage + stage * stage_elems) + byte_off;
+            const void* src = (const char*)v_row + byte_off;
+            cp_async_16(dst, src);
+        }
+    };
+
+    // Pre-issue first row.
+    issue_load(0, 0);
+    cp_async_commit();
+
+    int cur_stage = 0;
+    for (int j = 0; j < chunk_n; ++j) {
+        // Issue NEXT load if there is one
+        const int j_next = j + 1;
+        const int next_stage = (cur_stage + 1) % kStages;
+        if (j_next < chunk_n) {
+            issue_load(j_next, next_stage);
+            cp_async_commit();
+        }
+        // Wait for THIS stage
+        cp_async_wait_zero();
+        __syncthreads();
+
+        const float p = s_smem[j];
+        const Elem* v_row_smem = v_stage + cur_stage * stage_elems;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int d = tid + i * kPass1Threads;
+            if (d < HeadDim) {
+                o_local[i] += p * ET<Elem>::to_f(v_row_smem[d]);
+            }
+        }
+        cur_stage = next_stage;
+    }
+#else
+    // Fallback path (no cp.async): direct streaming V load. Vectorisation
+    // here is tricky because kPerThread interleaves elements per thread; we
+    // keep the simple, correct loop and rely on nvcc to coalesce.
     #pragma unroll 4
     for (int j = 0; j < chunk_n; ++j) {
         const float p = s_smem[j];
@@ -257,10 +390,10 @@ __global__ void pass1_kernel(
             }
         }
     }
+#endif
 
-    // ---- Write out ----------------------------------------------------------
+    // ---- Write out (identical to baseline) ----------------------------------
     if (num_splits == 1) {
-        // Write-through: normalize and store directly to the final output.
         Elem* o_row = o_ptr + (int64_t)b * o_stride_b + (int64_t)qh * o_stride_h;
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
@@ -270,13 +403,6 @@ __global__ void pass1_kernel(
             }
         }
     } else {
-        // Store *locally normalised* partial o:
-        //     partial_o_s = (Σ p_s V) / l_chunk_s
-        // and partial_lse_s = m_chunk + log(l_chunk).
-        // Merge in Pass 2 as:
-        //     o_final = Σ exp(lse_s - m*) * partial_o_s / Σ exp(lse_s - m*)
-        // This formulation has only one reduction weight, so the kernel is
-        // numerically clean and maps to the standard Flash-Decoding recipe.
         const int64_t po_base = ((int64_t)b * num_q_heads + qh) * kMaxSplits + split;
         float* po = workspace_partial_o + po_base * HeadDim;
         #pragma unroll
@@ -287,8 +413,6 @@ __global__ void pass1_kernel(
             }
         }
         if (tid == 0) {
-            // Guard against all-zero chunk (shouldn't happen since chunk_n > 0,
-            // but be safe on the log).
             workspace_partial_lse[po_base] =
                 (l_chunk > 0.f) ? (m_chunk + __logf(l_chunk)) : -INFINITY;
         }
@@ -396,7 +520,10 @@ static cudaError_t launch_impl(
         // split; but for any SINGLE split, chunk_size = ceil(kv_len / num_splits)
         // so max realistic ~= 1024. Give generous headroom.
         const int kv_chunk_smem = 2048;  // sufficient for kv_len up to 32768
-        const size_t smem_size = (HeadDim + kv_chunk_smem) * sizeof(float);
+        // Optimized pass1 also stages V rows in smem when BR_USE_CP_ASYNC==1.
+        // Reserve an upper bound: 2 stages × HeadDim Elems (256B each for D=128 bf16).
+        const size_t smem_size = (HeadDim + kv_chunk_smem) * sizeof(float)
+                               + 2 * HeadDim * sizeof(Elem) + 256 /*align slack*/;
         auto kernel = pass1_kernel<Elem, HeadDim>;
         // `cudaFuncSetAttribute` 是 host-同步 API，CUDA Graph stream capture
         // 不允许在 capture 中调用。本属性是 per-kernel 的全局状态，整个 process
@@ -536,14 +663,6 @@ void launch_flash_attn_batched_decode_fp16(
 }
 
 } // extern "C"
-
-
-// =============================================================================
-// Stand-alone test main (same pattern as flash_attn_gqa_prefill.cu)
-//   nvcc -std=c++17 -arch=sm_80 -O3 -I<cutlass-include> \
-//        -DFLASH_ATTN_BATCHED_DECODE_STANDALONE_TEST \
-//        flash_attn_batched_decode.cu -o bdecode_test
-// =============================================================================
 #ifdef FLASH_ATTN_BATCHED_DECODE_STANDALONE_TEST
 #include <algorithm>
 #include <cmath>

@@ -335,6 +335,16 @@ impl<M: LlmModel> ModelRunner<M> {
         unsafe { &mut *self.workspace.get() }
     }
 
+    /// 取 worker stream 给 hot-path H2D 用的辅助函数。
+    ///
+    /// # Safety
+    /// 调用方需保证此引用存活期间没有别的代码动 `cuda_cfg.stream`（实际由
+    /// `SyncFlags` 的 input_ready=false 期间 server 独占语义保证）。
+    #[cfg(feature = "cuda")]
+    pub unsafe fn cuda_stream(&self) -> crate::cuda::ffi::cudaStream_t {
+        unsafe { (*self.cuda_cfg.get()).stream }
+    }
+
     /// 指定 slot 的 InferenceState 的可变引用（用于 server 初始化 / 重置 /
     /// `ensure_capacity` 等）。
     ///
@@ -831,6 +841,11 @@ mod tests {
     }
 
     /// 小工具：把本步所需的 GPU 输入 / workspace 控制数组 / cache_ptrs 都填好。
+    ///
+    /// hot-path H2D 全部走 `cudaMemcpyAsync(stream)` —— 不打断 GPU pipeline。
+    /// 调用方保证 `tokens / positions / kv_lens` slice 在 step 完成前一直有效
+    /// （drive_step 在调本函数和 set_input_ready / 等 output 之间持有这些
+    /// `Vec`，自然满足）。
     pub(super) fn fill_inputs_for_step<M: LlmModel>(
         runner: &Arc<ModelRunner<M>>,
         tokens: &[i32],
@@ -839,24 +854,29 @@ mod tests {
         meta: &StepMeta,
     ) -> Result<()> {
         let ws = unsafe { runner.workspace_mut() };
+        #[cfg(feature = "cuda")]
+        let stream = unsafe { runner.cuda_stream() };
 
-        // 1. input_tokens / input_pos device H2D
-        ws.input_tokens
-            .as_i32_mut()?
-            .buffer_mut()
-            .copy_from_host(tokens)?;
-        ws.input_pos
-            .as_i32_mut()?
-            .buffer_mut()
-            .copy_from_host(positions)?;
-        ws.kv_lens_dev
-            .as_i32_mut()?
-            .buffer_mut()
-            .copy_from_host(kv_lens)?;
+        // 1. input_tokens / input_pos / kv_lens device H2D（async on worker stream）
+        #[cfg(feature = "cuda")]
+        {
+            ws.input_tokens.as_i32_mut()?.buffer_mut().copy_from_host_async(tokens, stream)?;
+            ws.input_pos.as_i32_mut()?.buffer_mut().copy_from_host_async(positions, stream)?;
+            ws.kv_lens_dev.as_i32_mut()?.buffer_mut().copy_from_host_async(kv_lens, stream)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            ws.input_tokens.as_i32_mut()?.buffer_mut().copy_from_host(tokens)?;
+            ws.input_pos.as_i32_mut()?.buffer_mut().copy_from_host(positions)?;
+            ws.kv_lens_dev.as_i32_mut()?.buffer_mut().copy_from_host(kv_lens)?;
+        }
 
         // 2. per-seq scatter 控制数组 —— 直接从 meta 做一份 meta view，调 workspace 的 refresh
         let meta_view = WorkerBatchMeta::from_step(meta);
-        ws.refresh_scatter_indices(&meta_view)?;
+        #[cfg(feature = "cuda")]
+        ws.refresh_scatter_indices(&meta_view, stream)?;
+        #[cfg(not(feature = "cuda"))]
+        let _ = &meta_view;
 
         // 3. KV cache base 指针表。本测试每步都 fill 一次（幂等；若 batch 成员 /
         //    KV 扩容都不变，理论上可以省；为简化测试逻辑不 skip）。
@@ -876,7 +896,12 @@ mod tests {
             let p = &mut slots_all[slot] as *mut InferenceState;
             refs.push(unsafe { &mut *p });
         }
-        ws.fill_cache_ptrs_from_states(&slot_ids, &mut refs)?;
+        #[cfg(feature = "cuda")]
+        ws.fill_cache_ptrs_from_states(&slot_ids, &mut refs, stream)?;
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (&slot_ids, &mut refs, ws);
+        }
         Ok(())
     }
 

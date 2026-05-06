@@ -79,6 +79,15 @@ pub struct BatchWorkspace {
     #[cfg(feature = "cuda")]
     pub(crate) cache_ptrs_filled: bool,
 
+    /// Host-side staging 镜像：`[layer_num × max_batch_seqs]` u64 K/V cache 指针表。
+    /// `fill_cache_ptrs_from_states` 在这里 read-modify，然后**单向 H2D**到
+    /// `k_cache_ptrs_dev` / `v_cache_ptrs_dev`，避免每步都 D2H 读回。
+    /// 跨 step 持久化保留，配合 `cache_ptrs_filled` 标志一并使用。
+    #[cfg(feature = "cuda")]
+    k_cache_ptrs_host: Vec<u64>,
+    #[cfg(feature = "cuda")]
+    v_cache_ptrs_host: Vec<u64>,
+
     // ═══ scatter_kv_batch 的 per-step i32 小数组（device 常驻，step 入口 refresh）═══
     //
     // runner 在 step 入口调 `refresh_scatter_indices(meta)` 一次性上传，所有层共用。
@@ -303,6 +312,10 @@ impl BatchWorkspace {
             v_cache_ptrs_dev,
             #[cfg(feature = "cuda")]
             cache_ptrs_filled: false,
+            #[cfg(feature = "cuda")]
+            k_cache_ptrs_host: vec![0u64; config.layer_num * max_batch_seqs],
+            #[cfg(feature = "cuda")]
+            v_cache_ptrs_host: vec![0u64; config.layer_num * max_batch_seqs],
 
             #[cfg(feature = "cuda")]
             scatter_slot_indices_dev,
@@ -351,10 +364,16 @@ impl BatchWorkspace {
     /// 并且**只在 step 入口一次**，层间共用。
     ///
     /// 调用约定：runner 拿到 meta 后调一次。
+    ///
+    /// hot-path：4 个小 H2D 走 `cudaMemcpyAsync(stream)` 而非同步 cudaMemcpy。
+    /// host 端用栈上 `Vec<i32>` 暂存，pageable 内存上 `cudaMemcpyAsync` 不能
+    /// 真正 overlap（driver 退化为同步 copy），但避开了同步 cudaMemcpy 强制
+    /// 等齐 GPU pending kernel 的副作用 —— GPU pipeline 不再被打断。
     #[cfg(feature = "cuda")]
     pub fn refresh_scatter_indices(
         &mut self,
         meta: &crate::worker::runner::WorkerBatchMeta<'_>,
+        stream: crate::cuda::ffi::cudaStream_t,
     ) -> crate::base::error::Result<()> {
         let b = meta.num_seqs();
         if b == 0 {
@@ -378,29 +397,34 @@ impl BatchWorkspace {
         }
         let bytes = b * std::mem::size_of::<i32>();
         unsafe {
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_slot_indices_dev as *mut _,
                 slots.as_ptr() as *const _,
                 bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_seq_positions_dev as *mut _,
                 poses.as_ptr() as *const _,
                 bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_seq_starts_dev as *mut _,
                 starts.as_ptr() as *const _,
                 bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_seq_lens_dev as *mut _,
                 lens.as_ptr() as *const _,
                 bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
         }
         Ok(())
@@ -415,11 +439,17 @@ impl BatchWorkspace {
     /// `states[i]` **必须**对应 `slot_ids[i]`，即 server 已经按 "slot 顺序" gather
     /// 好 refs；函数内部按该 slot 下标填入指针表，和 kernel 侧的
     /// `req_to_slot_dev / slot_indices_dev` 一致。
+    ///
+    /// hot-path 优化：用 host-side staging 镜像（[`Self::k_cache_ptrs_host`] /
+    /// `v_cache_ptrs_host`，跨 step 持久持有），避免每次都 D2H 读回 device 表。
+    /// 调用方只覆盖本次列出的 slot，其它 slot 的 staging 项保留。两次小 H2D
+    /// 走 `cudaMemcpyAsync(stream)` 避免同步打断 GPU pipeline。
     #[cfg(feature = "cuda")]
     pub fn fill_cache_ptrs_from_states(
         &mut self,
         slot_ids: &[usize],
         states: &mut [&mut crate::model::runtime::InferenceState],
+        stream: crate::cuda::ffi::cudaStream_t,
     ) -> crate::base::error::Result<()> {
         if states.len() != slot_ids.len() {
             return Err(crate::base::error::Error::InvalidArgument(format!(
@@ -436,48 +466,32 @@ impl BatchWorkspace {
                 )).into());
             }
         }
-        // Host 缓冲：两个 [layer_num × max_batch_seqs] u64，按行 layer-major 排列。
-        // 关键：**保留之前调用的条目不变**，只覆盖本次列出的 slot 对应位置。
-        //       因此先从 device 读回（避免"新请求初始化时把已有 slot 清零"）。
-        // 简化实现：本函数读回全表 → 改需要的 slot → 一次写回。
-        let total = layer_num * cap;
-        let mut k_host: Vec<u64> = vec![0u64; total];
-        let mut v_host: Vec<u64> = vec![0u64; total];
-        let bytes = total * std::mem::size_of::<u64>();
-        unsafe {
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
-                k_host.as_mut_ptr() as *mut _,
-                self.k_cache_ptrs_dev as *const _,
-                bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-            ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
-                v_host.as_mut_ptr() as *mut _,
-                self.v_cache_ptrs_dev as *const _,
-                bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-            ))?;
-        }
+        // 直接在 host staging 上 read-modify-write，**不读回 device**。
+        // staging 跨 step 持久化，前一步未涉及的 slot 项保留旧值。
         for (idx, st) in states.iter_mut().enumerate() {
             let slot = slot_ids[idx];
             for layer_idx in 0..layer_num {
                 let (k_t, v_t) = st.kv_cache.get_mut(layer_idx)?;
-                k_host[layer_idx * cap + slot] = k_t.data_ptr_mut() as u64;
-                v_host[layer_idx * cap + slot] = v_t.data_ptr_mut() as u64;
+                self.k_cache_ptrs_host[layer_idx * cap + slot] = k_t.data_ptr_mut() as u64;
+                self.v_cache_ptrs_host[layer_idx * cap + slot] = v_t.data_ptr_mut() as u64;
             }
         }
+        let bytes = layer_num * cap * std::mem::size_of::<u64>();
         unsafe {
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.k_cache_ptrs_dev as *mut _,
-                k_host.as_ptr() as *const _,
+                self.k_cache_ptrs_host.as_ptr() as *const _,
                 bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.v_cache_ptrs_dev as *mut _,
-                v_host.as_ptr() as *const _,
+                self.v_cache_ptrs_host.as_ptr() as *const _,
                 bytes,
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
         }
         self.cache_ptrs_filled = true;

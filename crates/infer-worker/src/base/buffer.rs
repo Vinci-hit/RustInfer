@@ -281,6 +281,54 @@ impl Buffer {
         }
         Ok(())
     }
+
+    /// Stream-ordered 异步版的 [`Buffer::copy_from_host`]。
+    ///
+    /// CPU buffer 上等价于同步 memcpy（host 端 op，stream 不适用）。CUDA 路径
+    /// 上发起 `cudaMemcpyAsync(stream)`，**调用立即返回，不阻塞 host**；调用方
+    /// 必须保证 `host_slice` 指向的内存在 stream 完成前一直有效（最简单的方式：
+    /// 用 pinned host buffer 或在 host 端持有该 slice 直到 step 结束）。
+    ///
+    /// hot path（runner 每步写 input_tokens / positions / kv_lens / scatter
+    /// 控制数组）应当用此版本，避免每步同步打断 GPU pipeline。
+    #[cfg(feature = "cuda")]
+    pub fn copy_from_host_async<T: Copy>(
+        &mut self,
+        host_slice: &[T],
+        stream: crate::cuda::ffi::cudaStream_t,
+    ) -> Result<()> {
+        let size_bytes = std::mem::size_of_val(host_slice);
+        if self.len_bytes() < size_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "Buffer too small: buffer has {} bytes, but slice needs {} bytes",
+                self.len_bytes(),
+                size_bytes
+            )).into());
+        }
+        match self.device() {
+            DeviceType::Cpu => unsafe {
+                // CPU buffer 上 stream 不适用，退化到同步 memcpy（语义与同步版一致）。
+                let _ = stream;
+                std::ptr::copy_nonoverlapping(
+                    host_slice.as_ptr() as *const u8,
+                    self.as_mut_ptr(),
+                    size_bytes,
+                );
+                Ok(())
+            },
+            DeviceType::Cuda(_) => unsafe {
+                use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
+                crate::cuda_check!(cudaMemcpyAsync(
+                    self.as_mut_ptr() as *mut _,
+                    host_slice.as_ptr() as *const _,
+                    size_bytes,
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream,
+                ))?;
+                Ok(())
+            },
+        }
+    }
     /// 创建一个共享底层内存的、新的零拷贝 Buffer 视图（切片）。
     pub fn slice(&self, offset_bytes: usize, len_bytes: usize) -> Result<Self> {
         if offset_bytes + len_bytes > self.len_bytes() {
