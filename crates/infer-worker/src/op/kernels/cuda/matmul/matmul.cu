@@ -747,58 +747,103 @@ kpack_gemv_kernel(
 }
 
 // ============================================================================
-//  INT4 GEMM (prefill, M>1) — K-packed, BF16 magic dequant + bf16x2 FMA
+//  INT4 GEMM (M>1) — Batched-GEMV style: grid.y = M, each CTA row uses the
+//  same warp-reduce GEMV pipeline as the M=1 path. Weight is broadcast across
+//  all M rows (read once in L2). This gives full GEMV performance for any M.
 // ============================================================================
-#define INT4_GEMM_BX 16
-#define INT4_GEMM_BY 16
 
-extern "C" __global__ void kpack_gemm_kernel(
+template <int WARPS_PER_BLOCK, bool GROUP_SIZE_IS_POW2>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 4)
+kpack_gemm_kernel(
     const __nv_bfloat16* __restrict__ input,         // [M, K]
     const int32_t* __restrict__ weight_packed,        // [N, K/8]
     const int32_t* __restrict__ weight_zero_point,    // [N/8, num_groups]
     const __nv_bfloat16* __restrict__ weight_scale,   // [N, num_groups]
     __nv_bfloat16* __restrict__ output,               // [M, N]
-    int M, int N, int K, int group_size
+    const int M, const int N, const int K, const int group_size,
+    const int group_shift
 ) {
-    const int row = blockIdx.y * INT4_GEMM_BY + threadIdx.y;  // M dim
-    const int col = blockIdx.x * INT4_GEMM_BX + threadIdx.x;  // N dim
-    if (row >= M || col >= N) return;
-
-    const int K_packed = K / 8;
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int K_packed = K >> 3;
     const int num_groups = K / group_size;
 
-    const int32_t* wp_row = weight_packed + col * K_packed;
-    const __nv_bfloat16* sc_row = weight_scale + col * num_groups;
+    // blockIdx.x → which N-row (weight row), blockIdx.y → which M-row (input row)
+    const int n_row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int m_row = blockIdx.y;
+    if (n_row >= N || m_row >= M) return;
 
-    const int zp_col_packed = col >> 3;
-    const int zp_bit_offset = (col & 7) * 4;
-    const int32_t* zp_row = weight_zero_point + zp_col_packed * num_groups;
+    const int32_t* wp_row = weight_packed + n_row * K_packed;
+    const __nv_bfloat16* sc_row = weight_scale + n_row * num_groups;
+
+    const int zp_row_packed = n_row >> 3;
+    const int zp_bit_offset = (n_row & 7) * 4;
+    const int32_t* zp_row = weight_zero_point + zp_row_packed * num_groups;
+
+    const int4* input_i4 = reinterpret_cast<const int4*>(input + m_row * K);
 
     __nv_bfloat162 acc_a = __float2bfloat162_rn(0.0f);
     __nv_bfloat162 acc_b = __float2bfloat162_rn(0.0f);
 
-    const __nv_bfloat16* inp_row = input + row * K;
+    int kp = lane_id;
 
-    for (int kp = 0; kp < K_packed; kp++) {
+    // Main loop with 4x unroll (same as GEMV path)
+    for (; kp + 3 * 32 < K_packed; kp += 4 * 32) {
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            int kpu = kp + u * 32;
+            int k_base = kpu * 8;
+            int g = GROUP_SIZE_IS_POW2 ? (k_base >> group_shift) : (k_base / group_size);
+
+            __nv_bfloat16 scale_bf = __ldg(&sc_row[g]);
+            int32_t zp_packed = __ldg(&zp_row[g]);
+            int zero = (zp_packed >> zp_bit_offset) & 0xF;
+
+            __nv_bfloat16 magic_zp_val = __float2bfloat16(128.0f + (float)zero);
+            __nv_bfloat162 scale_bf2 = __halves2bfloat162(scale_bf, scale_bf);
+            __nv_bfloat162 magic_zp = __halves2bfloat162(magic_zp_val, magic_zp_val);
+
+            int32_t word = __ldg(&wp_row[kpu]);
+            __nv_bfloat162 d04, d15, d26, d37;
+            dequant_8xint4_bf16_magic(word, magic_zp, scale_bf2, d04, d15, d26, d37);
+
+            int4 in = __ldg(&input_i4[kpu]);
+            const __nv_bfloat16* inp = reinterpret_cast<const __nv_bfloat16*>(&in);
+
+            __nv_bfloat162 x04 = __halves2bfloat162(inp[0], inp[4]);
+            __nv_bfloat162 x15 = __halves2bfloat162(inp[1], inp[5]);
+            __nv_bfloat162 x26 = __halves2bfloat162(inp[2], inp[6]);
+            __nv_bfloat162 x37 = __halves2bfloat162(inp[3], inp[7]);
+
+            acc_a = __hfma2(d04, x04, acc_a);
+            acc_b = __hfma2(d15, x15, acc_b);
+            acc_a = __hfma2(d26, x26, acc_a);
+            acc_b = __hfma2(d37, x37, acc_b);
+        }
+    }
+
+    // Remainder loop
+    const __nv_bfloat16* inp_base = input + m_row * K;
+    for (; kp < K_packed; kp += 32) {
         int k_base = kp * 8;
-        int g = k_base / group_size;
+        int g = GROUP_SIZE_IS_POW2 ? (k_base >> group_shift) : (k_base / group_size);
 
-        __nv_bfloat16 scale_bf = sc_row[g];
-        int32_t zp_packed = zp_row[g];
+        __nv_bfloat16 scale_bf = __ldg(&sc_row[g]);
+        int32_t zp_packed = __ldg(&zp_row[g]);
         int zero = (zp_packed >> zp_bit_offset) & 0xF;
 
         __nv_bfloat16 magic_zp_val = __float2bfloat16(128.0f + (float)zero);
         __nv_bfloat162 scale_bf2 = __halves2bfloat162(scale_bf, scale_bf);
         __nv_bfloat162 magic_zp = __halves2bfloat162(magic_zp_val, magic_zp_val);
 
-        int32_t word = wp_row[kp];
+        int32_t word = __ldg(&wp_row[kp]);
         __nv_bfloat162 d04, d15, d26, d37;
         dequant_8xint4_bf16_magic(word, magic_zp, scale_bf2, d04, d15, d26, d37);
 
-        __nv_bfloat162 x04 = __halves2bfloat162(inp_row[k_base+0], inp_row[k_base+4]);
-        __nv_bfloat162 x15 = __halves2bfloat162(inp_row[k_base+1], inp_row[k_base+5]);
-        __nv_bfloat162 x26 = __halves2bfloat162(inp_row[k_base+2], inp_row[k_base+6]);
-        __nv_bfloat162 x37 = __halves2bfloat162(inp_row[k_base+3], inp_row[k_base+7]);
+        __nv_bfloat162 x04 = __halves2bfloat162(__ldg(&inp_base[k_base+0]), __ldg(&inp_base[k_base+4]));
+        __nv_bfloat162 x15 = __halves2bfloat162(__ldg(&inp_base[k_base+1]), __ldg(&inp_base[k_base+5]));
+        __nv_bfloat162 x26 = __halves2bfloat162(__ldg(&inp_base[k_base+2]), __ldg(&inp_base[k_base+6]));
+        __nv_bfloat162 x37 = __halves2bfloat162(__ldg(&inp_base[k_base+3]), __ldg(&inp_base[k_base+7]));
 
         acc_a = __hfma2(d04, x04, acc_a);
         acc_b = __hfma2(d15, x15, acc_b);
@@ -806,10 +851,15 @@ extern "C" __global__ void kpack_gemm_kernel(
         acc_b = __hfma2(d37, x37, acc_b);
     }
 
+    // Warp reduce
     __nv_bfloat162 sum_bf2 = __hadd2(acc_a, acc_b);
     float acc = __bfloat162float(__low2bfloat16(sum_bf2))
               + __bfloat162float(__high2bfloat16(sum_bf2));
-    output[row * N + col] = __float2bfloat16(acc);
+
+    acc = warp_reduce_sum_gemv(acc);
+    if (lane_id == 0) {
+        output[m_row * N + n_row] = __float2bfloat16(acc);
+    }
 }
 
 // ============================================================================
@@ -844,10 +894,22 @@ extern "C" void kpack_gemm_cu(
     const void* weight_scale, void* output,
     int M, int N, int K, int group_size, cudaStream_t stream
 ) {
-    dim3 block(INT4_GEMM_BX, INT4_GEMM_BY);
-    dim3 grid((N + INT4_GEMM_BX - 1) / INT4_GEMM_BX, (M + INT4_GEMM_BY - 1) / INT4_GEMM_BY);
-    kpack_gemm_kernel<<<grid, block, 0, stream>>>(
-        (const __nv_bfloat16*)input, (const int32_t*)weight_packed,
-        (const int32_t*)weight_zero_point, (const __nv_bfloat16*)weight_scale,
-        (__nv_bfloat16*)output, M, N, K, group_size);
+    constexpr int WARPS = 4;
+    int grid_x = (N + WARPS - 1) / WARPS;
+    int grid_y = M;
+    dim3 grid(grid_x, grid_y);
+    const bool group_size_is_pow2 = group_size > 0 && ((group_size & (group_size - 1)) == 0);
+    const int group_shift = group_size_is_pow2 ? __builtin_ctz(group_size) : 0;
+
+    if (group_size_is_pow2) {
+        kpack_gemm_kernel<WARPS, true><<<grid, WARPS * 32, 0, stream>>>(
+            (const __nv_bfloat16*)input, (const int32_t*)weight_packed,
+            (const int32_t*)weight_zero_point, (const __nv_bfloat16*)weight_scale,
+            (__nv_bfloat16*)output, M, N, K, group_size, group_shift);
+    } else {
+        kpack_gemm_kernel<WARPS, false><<<grid, WARPS * 32, 0, stream>>>(
+            (const __nv_bfloat16*)input, (const int32_t*)weight_packed,
+            (const int32_t*)weight_zero_point, (const __nv_bfloat16*)weight_scale,
+            (__nv_bfloat16*)output, M, N, K, group_size, group_shift);
+    }
 }

@@ -1954,4 +1954,64 @@ mod tests_perf {
         let _ = handle.join();
         Ok(())
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  AWQ (INT4) 量化模型 性能测试
+    // ════════════════════════════════════════════════════════════════════
+
+    fn llama3_awq_path() -> Option<std::path::PathBuf> {
+        std::env::var("LLAMA3_AWQ_MODEL_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let p = std::path::PathBuf::from(
+                    "/apdcephfs_qy2/share_303432435/vinciiliu/vllm_test/llama3.2-1b-AWQ-mlp3",
+                );
+                if p.exists() { Some(p) } else { None }
+            })
+    }
+
+    fn qwen3_awq_path() -> Option<std::path::PathBuf> {
+        std::env::var("QWEN3_AWQ_MODEL_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let p = std::path::PathBuf::from(
+                    "/apdcephfs_qy2/share_303432435/vinciiliu/vllm_test/qwen3-4b-instruct-AWQ-mlp3",
+                );
+                if p.exists() { Some(p) } else { None }
+            })
+    }
+
+    #[test]
+    #[ignore = "AWQ perf benchmark; requires LLAMA3_AWQ_MODEL_PATH"]
+    fn perf_llama3_awq_decode_matrix() -> Result<()> {
+        let path = match llama3_awq_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no Llama3-AWQ model path"); return Ok(()); }
+        };
+        run_matrix::<Llama3, _>(
+            "Llama3-1B-AWQ",
+            &path,
+            BATCH_SIZES,
+            1024,
+            |p, d| Llama3::new(p, d),
+        )
+    }
+
+    #[test]
+    #[ignore = "AWQ perf benchmark; requires QWEN3_AWQ_MODEL_PATH"]
+    fn perf_qwen3_awq_decode_matrix() -> Result<()> {
+        let path = match qwen3_awq_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no Qwen3-AWQ model path"); return Ok(()); }
+        };
+        run_matrix::<Qwen3, _>(
+            "Qwen3-4B-AWQ",
+            &path,
+            BATCH_SIZES,
+            1024,
+            |p, d| Qwen3::new(p, d),
+        )
+    }
 }
