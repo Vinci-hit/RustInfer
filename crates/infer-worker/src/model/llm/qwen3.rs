@@ -151,7 +151,10 @@ impl Attention {
         )?;
 
         // ── flash attention（一次 launch 覆盖整个 batch）──
-        let q_for_attn = q.reshape(&[total_tokens, head_num, head_size])?;
+        // 对 qkv 整体做 3D reshape（零拷贝），然后 narrow head 维取 Q
+        let total_heads = head_num + 2 * kv_head_num;
+        let qkv_3d = qkv.reshape(&[total_tokens, total_heads, head_size])?;
+        let q_for_attn = qkv_3d.narrow(1, 0, head_num)?;
         let mut attn_all_3d =
             ctx.attn.attn_merged.reshape(&[total_tokens, head_num, head_size])?;
         unsafe {
@@ -234,15 +237,37 @@ impl Mlp {
         self.w_gate_up.forward(x_norm, &mut gate_up, cuda_cfg)?;
 
         let mut gate = ctx.mlp.gate.clone();
-        let mut up = ctx.mlp.up.clone();
-        crate::op::split_cols::split_cols_tensor(
-            &gate_up, &mut gate, total_tokens, 2 * inter, 0, inter, cuda_cfg,
-        )?;
-        crate::op::split_cols::split_cols_tensor(
-            &gate_up, &mut up, total_tokens, 2 * inter, inter, inter, cuda_cfg,
-        )?;
+        #[cfg(feature = "cuda")]
+        {
+            if matches!(gate_up.device(), crate::base::DeviceType::Cuda(_))
+                && gate_up.dtype() == crate::base::DataType::BF16
+            {
+                crate::op::kernels::cuda::swiglu_packed_bf16(
+                    &gate_up, &mut gate, total_tokens, inter, cuda_cfg,
+                )?;
+            } else {
+                let mut up = ctx.mlp.up.clone();
+                crate::op::split_cols::split_cols_tensor(
+                    &gate_up, &mut gate, total_tokens, 2 * inter, 0, inter, cuda_cfg,
+                )?;
+                crate::op::split_cols::split_cols_tensor(
+                    &gate_up, &mut up, total_tokens, 2 * inter, inter, inter, cuda_cfg,
+                )?;
+                swiglu(&up, &mut gate, cuda_cfg)?;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let mut up = ctx.mlp.up.clone();
+            crate::op::split_cols::split_cols_tensor(
+                &gate_up, &mut gate, total_tokens, 2 * inter, 0, inter, cuda_cfg,
+            )?;
+            crate::op::split_cols::split_cols_tensor(
+                &gate_up, &mut up, total_tokens, 2 * inter, inter, inter, cuda_cfg,
+            )?;
+            swiglu(&up, &mut gate, cuda_cfg)?;
+        }
 
-        swiglu(&up, &mut gate, cuda_cfg)?;
         self.w2.forward(&gate, ffn_out, cuda_cfg)?;
         Ok(())
     }

@@ -120,12 +120,6 @@ impl Matmul {
                     const GEMV_VS_GEMM_N_THRESHOLD: usize = 16_384;
                     if m == 1 && n <= GEMV_VS_GEMM_N_THRESHOLD {
                         kernels::cuda::hgemv_bf16(input, weight, output, cuda_config)?;
-                    } else if m <= 4 && n > 65_536 {
-                        for row in 0..m {
-                            let row_in = input.slice(&[row, 0], &[1, input.shape()[1]])?;
-                            let mut row_out = output.slice(&[row, 0], &[1, n])?;
-                            kernels::cuda::hgemv_bf16(&row_in, weight, &mut row_out, cuda_config)?;
-                        }
                     } else {
                         kernels::cuda::hgemm_bf16(input, weight, output, cuda_config)?;
                     }
@@ -135,12 +129,6 @@ impl Matmul {
                     const GEMV_VS_GEMM_N_THRESHOLD: usize = 16_384;
                     if m == 1 && n <= GEMV_VS_GEMM_N_THRESHOLD {
                         kernels::cuda::hgemv_fp16(input, weight, output, cuda_config)?;
-                    } else if m <= 4 && n > 65_536 {
-                        for row in 0..m {
-                            let row_in = input.slice(&[row, 0], &[1, input.shape()[1]])?;
-                            let mut row_out = output.slice(&[row, 0], &[1, n])?;
-                            kernels::cuda::hgemv_fp16(&row_in, weight, &mut row_out, cuda_config)?;
-                        }
                     } else {
                         kernels::cuda::hgemm_fp16(input, weight, output, cuda_config)?;
                     }

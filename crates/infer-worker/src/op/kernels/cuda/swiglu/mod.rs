@@ -39,6 +39,14 @@ unsafe extern "C" {
         y_col_offset: i32,
         stream: crate::cuda::ffi::cudaStream_t,
     );
+
+    fn swiglu_packed_cu_bf16(
+        gate_up: *const half::bf16,
+        out: *mut half::bf16,
+        rows: i32,
+        inter: i32,
+        stream: crate::cuda::ffi::cudaStream_t,
+    );
 }
 
 /// (原地版本) SwiGLU 的 CUDA 内核包装函数。
@@ -155,6 +163,36 @@ pub unsafe fn swiglu_inplace_strided_bf16(
             num_rows as i32, inner_dim as i32,
             x_row_stride as i32, y_row_stride as i32,
             x_col_offset as i32, y_col_offset as i32,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// Packed SwiGLU (BF16): gate_up [rows, 2*inter] → out [rows, inter]
+///   out[r,d] = silu(gate_up[r,d]) * gate_up[r, inter+d]
+/// `inter` must be a multiple of 8.
+pub fn swiglu_packed_bf16(
+    gate_up: &Tensor,
+    out: &mut Tensor,
+    rows: usize,
+    inter: usize,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    if !inter.is_multiple_of(8) {
+        return Err(Error::InvalidArgument(format!(
+            "swiglu_packed_bf16: inter ({}) must be multiple of 8", inter
+        )).into());
+    }
+    let stream = CudaConfig::resolve_stream(cuda_config);
+    let gate_up_ptr = gate_up.as_bf16()?.data_ptr();
+    let out_ptr = out.as_bf16_mut()?.data_ptr_mut();
+    unsafe {
+        swiglu_packed_cu_bf16(
+            gate_up_ptr,
+            out_ptr,
+            rows as i32,
+            inter as i32,
             stream,
         );
     }

@@ -39,6 +39,17 @@ void swiglu_inplace_strided_cu_bf16x8(
     cudaStream_t stream
 );
 
+/// Packed SwiGLU: gate_up [rows, 2*inter] → out [rows, inter]
+///   out[r,d] = silu(gate_up[r,d]) * gate_up[r, inter+d]
+/// inter must be a multiple of 8.
+void swiglu_packed_cu_bf16(
+    const __nv_bfloat16* gate_up,
+    __nv_bfloat16* out,
+    int rows,
+    int inter,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

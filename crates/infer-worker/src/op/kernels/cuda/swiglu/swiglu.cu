@@ -285,3 +285,60 @@ extern "C" void swiglu_inplace_strided_cu_bf16x8(
         x_row_stride, y_row_stride, x_col_offset, y_col_offset
     );
 }
+
+// ============================================================================
+// swiglu_packed: gate_up [rows, 2*inter] → out [rows, inter]
+//   out[r,d] = silu(gate_up[r, d]) * gate_up[r, inter + d]
+// 一个 kernel 替代 2×split_cols + swiglu，省掉 2 次 kernel launch。
+// ============================================================================
+__global__ void swiglu_packed_kernel_bf16x8(
+    const __nv_bfloat16* __restrict__ gate_up,  // [rows, 2*inter]
+    __nv_bfloat16* __restrict__ out,            // [rows, inter]
+    int rows,
+    int inter          // half of total cols
+) {
+    // 每线程处理 8 个 bf16 (1 个 float4)
+    // grid: (ceil(inter/8 / 256), rows)
+    const int row = blockIdx.y;
+    const int vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int num_vec = inter / 8;
+    if (vec_idx >= num_vec) return;
+
+    // gate = gate_up[row, 0..inter], up = gate_up[row, inter..2*inter]
+    const int row_offset = row * (2 * inter);
+    const float4* gate_row = reinterpret_cast<const float4*>(gate_up + row_offset);
+    const float4* up_row   = reinterpret_cast<const float4*>(gate_up + row_offset + inter);
+    float4* out_row        = reinterpret_cast<float4*>(out + row * inter);
+
+    float4 g = gate_row[vec_idx];
+    float4 u = up_row[vec_idx];
+
+    __nv_bfloat16* gp = reinterpret_cast<__nv_bfloat16*>(&g);
+    const __nv_bfloat16* up_p = reinterpret_cast<const __nv_bfloat16*>(&u);
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float xf = __bfloat162float(gp[j]);
+        float yf = __bfloat162float(up_p[j]);
+        float sigmoid_x = 1.0f / (1.0f + expf(-xf));
+        gp[j] = __float2bfloat16(xf * sigmoid_x * yf);
+    }
+
+    out_row[vec_idx] = g;
+}
+
+extern "C" void swiglu_packed_cu_bf16(
+    const __nv_bfloat16* gate_up,
+    __nv_bfloat16* out,
+    int rows,
+    int inter,
+    cudaStream_t stream)
+{
+    const int num_vec = inter / 8;
+    const int threads = 256;
+    int blocks_x = (num_vec + threads - 1) / threads;
+    dim3 grid(blocks_x, rows);
+    swiglu_packed_kernel_bf16x8<<<grid, threads, 0, stream>>>(
+        gate_up, out, rows, inter);
+}
+

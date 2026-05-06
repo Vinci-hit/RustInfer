@@ -1760,29 +1760,16 @@ mod tests_perf {
         eprintln!("  {} —— decode benchmark (steps={})", model_name, DECODE_STEPS);
         eprintln!("══════════════════════════════════════════════════════════════════");
         eprintln!(
-            "{:>6}  {:>14}  {:>14}  {:>10}",
-            "batch", "eager tok/s", "graph tok/s", "speedup"
+            "{:>6}  {:>14}",
+            "batch", "graph tok/s"
         );
-        eprintln!("{:>6}  {:>14}  {:>14}  {:>10}", "─────", "──────────────", "──────────────", "──────────");
+        eprintln!("{:>6}  {:>14}", "─────", "──────────────");
 
         for &batch in batches {
-            // (A) eager
-            let model_a = new_model(path, device)?;
-            let mut runner_a_owned =
-                ModelRunner::new(model_a, device, max_batch_tokens, batch)?;
-            runner_a_owned.set_decode_graph_enabled(false);
-            let runner_a = Arc::new(runner_a_owned);
-            let runner_a_loop = Arc::clone(&runner_a);
-            let handle_a = std::thread::spawn(move || runner_a_loop.run());
-            let (_, eager_tps) = bench_one_config(&runner_a, batch, DECODE_STEPS)?;
-            runner_a.request_shutdown();
-            let _ = handle_a.join();
-
-            // (B) graph
+            // graph only (skip eager to save time)
             let model_b = new_model(path, device)?;
             let runner_b_owned =
                 ModelRunner::new(model_b, device, max_batch_tokens, batch)?;
-            // graph 默认 enabled
             let runner_b = Arc::new(runner_b_owned);
             let runner_b_loop = Arc::clone(&runner_b);
             let handle_b = std::thread::spawn(move || runner_b_loop.run());
@@ -1790,10 +1777,9 @@ mod tests_perf {
             runner_b.request_shutdown();
             let _ = handle_b.join();
 
-            let speedup = graph_tps / eager_tps;
             eprintln!(
-                "{:>6}  {:>14.1}  {:>14.1}  {:>9.2}x",
-                batch, eager_tps, graph_tps, speedup
+                "{:>6}  {:>14.1}",
+                batch, graph_tps
             );
         }
         eprintln!("══════════════════════════════════════════════════════════════════");
@@ -1884,6 +1870,85 @@ mod tests_perf {
 
         let (_, tps) = bench_one_config(&runner, batch, DECODE_STEPS)?;
         eprintln!("[profile] Llama3 BS=1 eager: {:.1} tok/s", tps);
+
+        runner.request_shutdown();
+        let _ = handle.join();
+        Ok(())
+    }
+
+    /// BS=4 eager — nsys profile 用，看 batch=4 decode 每个 kernel 真实时间分布。
+    #[test]
+    #[ignore = "for nsys profile; LLAMA3_MODEL_PATH"]
+    fn perf_llama3_b4_eager_profile() -> Result<()> {
+        let path = match get_model_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+        };
+        let device = DeviceType::Cuda(0);
+        let max_batch_tokens = 1024usize;
+        let batch = 4usize;
+
+        let model = Llama3::new(&path, device)?;
+        let mut runner_owned = ModelRunner::new(model, device, max_batch_tokens, batch)?;
+        runner_owned.set_decode_graph_enabled(false);
+        let runner = Arc::new(runner_owned);
+        let runner_loop = Arc::clone(&runner);
+        let handle = std::thread::spawn(move || runner_loop.run());
+
+        let (_, tps) = bench_one_config(&runner, batch, DECODE_STEPS)?;
+        eprintln!("[profile] Llama3 BS=4 eager: {:.1} tok/s", tps);
+
+        runner.request_shutdown();
+        let _ = handle.join();
+        Ok(())
+    }
+
+    /// BS=4 graph — nsys profile 用（需 --cuda-graph-trace=node 展开 graph 内部）
+    #[test]
+    #[ignore = "for nsys profile; LLAMA3_MODEL_PATH"]
+    fn perf_llama3_b4_graph_profile() -> Result<()> {
+        let path = match get_model_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+        };
+        let device = DeviceType::Cuda(0);
+        let max_batch_tokens = 1024usize;
+        let batch = 4usize;
+
+        let model = Llama3::new(&path, device)?;
+        let runner_owned = ModelRunner::new(model, device, max_batch_tokens, batch)?;
+        let runner = Arc::new(runner_owned);
+        let runner_loop = Arc::clone(&runner);
+        let handle = std::thread::spawn(move || runner_loop.run());
+
+        let (_, tps) = bench_one_config(&runner, batch, DECODE_STEPS)?;
+        eprintln!("[profile] Llama3 BS=4 graph: {:.1} tok/s", tps);
+
+        runner.request_shutdown();
+        let _ = handle.join();
+        Ok(())
+    }
+
+    /// BS=8 graph — nsys profile 用
+    #[test]
+    #[ignore = "for nsys profile; LLAMA3_MODEL_PATH"]
+    fn perf_llama3_b8_graph_profile() -> Result<()> {
+        let path = match get_model_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+        };
+        let device = DeviceType::Cuda(0);
+        let max_batch_tokens = 1024usize;
+        let batch = 8usize;
+
+        let model = Llama3::new(&path, device)?;
+        let runner_owned = ModelRunner::new(model, device, max_batch_tokens, batch)?;
+        let runner = Arc::new(runner_owned);
+        let runner_loop = Arc::clone(&runner);
+        let handle = std::thread::spawn(move || runner_loop.run());
+
+        let (_, tps) = bench_one_config(&runner, batch, DECODE_STEPS)?;
+        eprintln!("[profile] Llama3 BS=8 graph: {:.1} tok/s", tps);
 
         runner.request_shutdown();
         let _ = handle.join();
