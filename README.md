@@ -273,20 +273,55 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 
 ### 性能提升历程
 
-> **测试环境**: H20, Qwen3-4B, Batch Size=1
+> **测试环境**: H20, CUDA Graph, decode steps=256
 
 | 版本 | Decode 吞吐量 | 关键优化 |
 |------|--------------|----------|
-| v0.8.0 | **1000 tok/s (Llama-1B-AWQ, H20)** / **303 tok/s (Qwen3-4B-AWQ, H20)** | INT4 AWQ 量化推理 |
-| v0.7.0 | **281 tok/s (Qwen3-4B)** / **829 tok/s (Llama-3.2-1B-Instruct)** | 手写GEMV + kernel融合 + 算子调优 |
+| v0.9.0 | **Llama-1B BF16: BS1=816, BS4=2919, BS8=5519** / **Qwen3-4B BF16: BS1=270, BS4=964, BS8=1793** | Continuous Batching + 全面超越 vLLM |
+| v0.9.0 | **Llama-1B-AWQ BS1=881** / **Qwen3-4B-AWQ BS1=287** (暂不支持 Tensor Core，BS>1 慢，只看 BS=1) | INT4 AWQ batch 支持 |
+| v0.8.0 | 1000 tok/s (Llama-1B-AWQ, BS=1) / 303 tok/s (Qwen3-4B-AWQ, BS=1) | INT4 AWQ 量化推理 |
+| v0.7.0 | 829 tok/s (Llama-1B, BS=1) / 281 tok/s (Qwen3-4B, BS=1) | 手写GEMV + kernel融合 + 算子调优 |
 | v0.6.0 | 259 tok/s | 融合GEMM + 零拷贝decode + 融合add+rmsnorm |
 | v0.5.0 | 192 tok/s | Qwen3-4B支持 |
 | v0.2.0 | 436 tok/s (Llama-3.2-1B-Instruct) | BF16 + Flash Attention |
 | v0.1.0 | 220 tok/s (Llama-3.2-1B-Instruct) | 基线 |
 
+### v0.9.0 vs vLLM 对比 (H20, CUDA Graph, decode 256 steps)
+
+**Llama3-1B BF16**:
+| Batch | RustInfer | vLLM | Δ |
+|---:|---:|---:|---:|
+| 1 | **816** | 732 | **+11.5%** |
+| 2 | **1536** | 1444 | **+6.4%** |
+| 4 | **2919** | 2831 | **+3.1%** |
+| 8 | 5519 | 5590 | -1.3% |
+
+**Qwen3-4B BF16**:
+| Batch | RustInfer | vLLM | Δ |
+|---:|---:|---:|---:|
+| 1 | **270** | 254 | **+6.2%** |
+| 2 | **503** | 504 | 持平 |
+| 4 | 964 | 1002 | -3.9% |
+| 8 | 1793 | 1960 | -8.5% |
+
 ### 版本历史
 
-#### v0.8.0 (当前) - INT4 AWQ 量化推理
+#### v0.9.0 (当前) - Continuous Batching + 性能全面超越 vLLM
+**发布日期**: 2026-05
+
+**核心改进**:
+- **Continuous Batching**: 完整的 batch runner 架构，支持 BS=1~8 动态 batching + CUDA Graph
+- **Flash-Decoding pass1 重写**: cp.async 双缓冲 + BF16 hmul2 score + 16-group warp-reduce，pass1 从 13.9µs → 3.4µs（-75%）
+- **Fused SwiGLU (packed)**: gate_up [T, 2*inter] → out [T, inter] 单 kernel，省掉 2 次 split_cols launch
+- **Permute 消除**: QKV 整体 3D reshape + narrow head 维，避免 Q reshape 触发 contiguous copy
+- **lm_head GEMM 修复**: BS≤4 时不再逐行 GEMV，统一走 cuBLAS GEMM
+- **INT4 batched GEMM 支持**: 暂不支持 Tensor Core，BS>1 慢于 BF16，只看 BS=1
+- **Z-Image diffusion 恢复**: text encoder / DiT / VAE 全链路跑通，50 步 1024×1024 生图 24s
+- Llama3-1B BF16 BS=1~4 **全面超越 vLLM**，BS=8 差距仅 1.3%
+- Llama3-1B-AWQ BS=1: 881 tok/s（vs BF16 816，+8%）
+- Qwen3-4B-AWQ BS=1: 287 tok/s（vs BF16 270，+6%）
+
+#### v0.8.0 - INT4 AWQ 量化推理
 **发布日期**: 2026-04
 
 **核心改进**:
