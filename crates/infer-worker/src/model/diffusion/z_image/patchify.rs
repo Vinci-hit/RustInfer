@@ -34,8 +34,8 @@ pub fn patchify_into(
         )).into());
     }
 
-    let src_view = image.view(&[c, f_t, p_f, h_t, p_h, w_t, p_w])?;
-    let mut dst_7d = dst.view(&[f_t, h_t, w_t, p_f, p_h, p_w, c])?;
+    let src_view = image.reshape(&[c, f_t, p_f, h_t, p_h, w_t, p_w])?;
+    let mut dst_7d = dst.reshape(&[f_t, h_t, w_t, p_f, p_h, p_w, c])?;
     src_view.permute_into(&[1, 3, 5, 2, 4, 6, 0], &mut dst_7d)?;
     Ok(())
 }
@@ -57,8 +57,8 @@ pub fn unpatchify_into(
         )).into());
     }
 
-    let src_view = tokens.view(&[f_t, h_t, w_t, p_f, p_h, p_w, out_channels])?;
-    let mut dst_7d = dst.view(&[out_channels, f_t, p_f, h_t, p_h, w_t, p_w])?;
+    let src_view = tokens.reshape(&[f_t, h_t, w_t, p_f, p_h, p_w, out_channels])?;
+    let mut dst_7d = dst.reshape(&[out_channels, f_t, p_f, h_t, p_h, w_t, p_w])?;
     src_view.permute_into(&[6, 0, 3, 1, 4, 2, 5], &mut dst_7d)?;
     Ok(())
 }
@@ -74,7 +74,7 @@ mod tests {
         let (c, f, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         let (p_f, p_h, p_w) = (f_patch_size, patch_size, patch_size);
         let (f_t, h_t, w_t) = (f / p_f, h / p_h, w / p_w);
-        let t = image.view(&[c, f_t, p_f, h_t, p_h, w_t, p_w])?;
+        let t = image.reshape(&[c, f_t, p_f, h_t, p_h, w_t, p_w])?;
         // `permute` yields a zero-copy strided view; `reshape` densifies
         // before collapsing the axes.
         let t = t.permute(&[1, 3, 5, 2, 4, 6, 0])?;
@@ -87,7 +87,7 @@ mod tests {
     ) -> Result<Tensor> {
         let (p_f, p_h, p_w) = (f_patch_size, patch_size, patch_size);
         let (f_t, h_t, w_t) = (f / p_f, h / p_h, w / p_w);
-        let t = tokens.view(&[f_t, h_t, w_t, p_f, p_h, p_w, out_channels])?;
+        let t = tokens.reshape(&[f_t, h_t, w_t, p_f, p_h, p_w, out_channels])?;
         let t = t.permute(&[6, 0, 3, 1, 4, 2, 5])?;
         t.reshape(&[out_channels, f, h, w])
     }

@@ -3,7 +3,7 @@ pub mod runtime;
 
 // ── Modality sub-modules ──
 pub mod llm;
-// pub mod diffusion;
+pub mod diffusion;
 
 use common::tokenizer::{GenericHfTokenizer, Tokenizer};
 use common::config::{ModelFileConfig, RuntimeModelConfig};

@@ -11,9 +11,15 @@ use crate::op::conv2d::conv2d;
 use crate::op::groupnorm::groupnorm;
 use crate::op::matmul::Matmul;
 use crate::op::sdpa::scaled_dot_product_attention;
-use crate::op::tensor_utils::{clone_tensor as tu_clone, materialize as tu_materialize, permute_nd};
-use crate::op::upsample::upsample_nearest_2x;
 use crate::tensor::Tensor;
+
+/// Deep-copy a tensor.
+fn tu_clone(src: &Tensor) -> crate::base::error::Result<Tensor> { src.contiguous() }
+/// Materialize (ensure contiguous).
+fn tu_materialize(src: &Tensor) -> crate::base::error::Result<Tensor> { src.contiguous() }
+/// Permute dims.
+fn permute_nd(src: &Tensor, dims: &[usize]) -> crate::base::error::Result<Tensor> { src.permute(dims) }
+use crate::op::upsample::upsample_nearest_2x;
 
 const NORM_GROUPS: usize = 32;
 const EPS: f32 = 1e-6;
@@ -157,7 +163,7 @@ impl AttnBlock {
 
         // [B, C, H, W] → [B, N, C]: permute(0, 2, 3, 1) → reshape(B, N, C)
         let permuted = permute_nd(&normed, &[0, 2, 3, 1])?; // [B, H, W, C] contiguous
-        let bnc_view = permuted.view(&[b * n, c])?;
+        let bnc_view = permuted.reshape(&[b * n, c])?;
         let bnc = tu_materialize(&bnc_view)?;
 
         // q/k/v projections: [B*N, C] @ [C, C]^T → [B*N, C]
@@ -171,21 +177,21 @@ impl AttnBlock {
         }
 
         // Reshape to [B, 1, N, C] for sdpa
-        let q4 = materialize(&q.view(&[b, 1, n, c])?)?;
-        let k4 = materialize(&k.view(&[b, 1, n, c])?)?;
-        let v4 = materialize(&v.view(&[b, 1, n, c])?)?;
+        let q4 = materialize(&q.reshape(&[b, 1, n, c])?)?;
+        let k4 = materialize(&k.reshape(&[b, 1, n, c])?)?;
+        let v4 = materialize(&v.reshape(&[b, 1, n, c])?)?;
         let mut attn_out = Tensor::new(&[b, 1, n, c], x.dtype(), x.device())?;
         scaled_dot_product_attention(&q4, &k4, &v4, &mut attn_out, cuda_config)?;
 
         // [B, 1, N, C] → [B*N, C]
-        let attn_flat = materialize(&attn_out.view(&[b * n, c])?)?;
+        let attn_flat = materialize(&attn_out.reshape(&[b * n, c])?)?;
 
         // to_out
         let mut proj = Tensor::new(&[b * n, c], x.dtype(), x.device())?;
         self.to_out.forward(&attn_flat, &mut proj, cuda_config)?;
 
         // Reshape [B*N, C] → [B, H, W, C] → permute → [B, C, H, W]
-        let bhwc = proj.view(&[b, h, w, c])?;
+        let bhwc = proj.reshape(&[b, h, w, c])?;
         let bhwc_mat = tu_materialize(&bhwc)?;
         let bchw = permute_nd(&bhwc_mat, &[0, 3, 1, 2])?;
 

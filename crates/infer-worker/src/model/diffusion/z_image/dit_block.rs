@@ -78,7 +78,7 @@ impl DiTBlock {
                 Error::InvalidArgument("adaln_c required when modulation=True".into())
             })?;
 
-            let c_2d = c.view(&[1, c.shape()[0]])?;
+            let c_2d = c.reshape(&[1, c.shape()[0]])?;
             let mut mod_out = state.slice_mut(BT::BlkModOut, &[1, 4 * dim])?;
             adaln.forward(&c_2d, &mut mod_out, cuda_config)?;
 
@@ -128,43 +128,38 @@ impl DiTBlock {
                     cuda_config,
                 )?;
             } else {
-                #[cfg(feature = "cuda")]
-                let stream = crate::cuda::CudaConfig::resolve_stream(cuda_config);
                 crate::op::split_cols::split_cols_tensor(
-                    &qkv_out, &mut q, seq, 3 * dim, 0, dim,
-                    #[cfg(feature = "cuda")] stream,
+                    &qkv_out, &mut q, seq, 3 * dim, 0, dim, cuda_config,
                 )?;
                 crate::op::split_cols::split_cols_tensor(
-                    &qkv_out, &mut k, seq, 3 * dim, dim, dim,
-                    #[cfg(feature = "cuda")] stream,
+                    &qkv_out, &mut k, seq, 3 * dim, dim, dim, cuda_config,
                 )?;
                 crate::op::split_cols::split_cols_tensor(
-                    &qkv_out, &mut v, seq, 3 * dim, 2 * dim, dim,
-                    #[cfg(feature = "cuda")] stream,
+                    &qkv_out, &mut v, seq, 3 * dim, 2 * dim, dim, cuda_config,
                 )?;
 
                 {
-                    let mut q_norm = q.view(&[seq * self.n_heads, self.head_dim])?;
+                    let mut q_norm = q.reshape(&[seq * self.n_heads, self.head_dim])?;
                     self.norm_q.forward_inplace(&mut q_norm, cuda_config)?;
                 }
                 {
-                    let mut k_norm = k.view(&[seq * self.n_heads, self.head_dim])?;
+                    let mut k_norm = k.reshape(&[seq * self.n_heads, self.head_dim])?;
                     self.norm_k.forward_inplace(&mut k_norm, cuda_config)?;
                 }
-                q.view(&[seq, self.n_heads, self.head_dim])?
+                q.reshape(&[seq, self.n_heads, self.head_dim])?
                     .rope_interleaved(cos, sin, self.head_dim)?;
-                k.view(&[seq, self.n_heads, self.head_dim])?
+                k.reshape(&[seq, self.n_heads, self.head_dim])?
                     .rope_interleaved(cos, sin, self.head_dim)?;
             }
         }
 
         // ── Self-attention (SHD layout) ──
-        let q_shd = q.view(&[seq, self.n_heads, self.head_dim])?;
-        let k_shd = k.view(&[seq, self.n_heads, self.head_dim])?;
-        let v_shd = v.view(&[seq, self.n_heads, self.head_dim])?;
+        let q_shd = q.reshape(&[seq, self.n_heads, self.head_dim])?;
+        let k_shd = k.reshape(&[seq, self.n_heads, self.head_dim])?;
+        let v_shd = v.reshape(&[seq, self.n_heads, self.head_dim])?;
         let attn_flat = state.slice_mut(BT::BlkAttnFlat, &[seq, dim])?;
         {
-            let mut attn_shd = attn_flat.view(&[seq, self.n_heads, self.head_dim])?;
+            let mut attn_shd = attn_flat.reshape(&[seq, self.n_heads, self.head_dim])?;
             dit_sdpa(
                 &q_shd, &k_shd, &v_shd, &mut attn_shd,
                 self.n_heads, self.head_dim, cuda_config,
@@ -206,8 +201,7 @@ impl DiTBlock {
         self.w1.forward(&norm1_ffn, &mut w1_out, cuda_config)?;
         self.w3.forward(&norm1_ffn, &mut w3_out, cuda_config)?;
 
-        crate::op::swiglu::SwiGLU::new()
-            .forward(&w3_out, &mut w1_out, cuda_config)?;
+        crate::op::swiglu::swiglu(&w3_out, &mut w1_out, cuda_config)?;
 
         let mut ffn_out = state.slice_mut(BT::BlkFfnOut, &[seq, dim])?;
         self.w2.forward(&w1_out, &mut ffn_out, cuda_config)?;

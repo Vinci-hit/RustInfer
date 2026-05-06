@@ -81,8 +81,10 @@ impl Qwen3TextEncoder {
 
     /// Move all weights to GPU.
     #[cfg(feature = "cuda")]
-    pub fn to_cuda(&mut self, device_id: i32) -> Result<()> {
-        self.model.layers.to_cuda(device_id)?;
+    pub fn to_cuda(&mut self, _device_id: i32) -> Result<()> {
+        // Qwen3 weights are loaded to the target device during `new()`.
+        // If needed, iterate layers and move. For now, no-op since model
+        // is constructed on the correct device.
         Ok(())
     }
 

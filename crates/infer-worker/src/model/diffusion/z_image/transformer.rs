@@ -24,10 +24,8 @@ use crate::model::diffusion::z_image::state::{DitShapeSpec, DitState, ZImageCapa
 use crate::model::diffusion::z_image::timestep_embedder::TimestepEmbedder;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
-use crate::op::tensor_utils::{
-    concat_seq_into, overwrite_pad_tokens_inplace,
-    pad_last_row_into, pad_with_token_into,
-};
+use crate::op::concat::concat_seq_into;
+use crate::op::pad::{overwrite_pad_tokens_inplace, pad_last_row_into, pad_with_token_into};
 use crate::tensor::Tensor;
 
 use super::state::{ADALN_EMBED_DIM, SEQ_MULTI_OF};

@@ -40,8 +40,13 @@ use crate::model::diffusion::z_image::state::{DitState, PipelineState, ZImageCap
 use crate::model::diffusion::z_image::text_encoder::Qwen3TextEncoder;
 use crate::model::diffusion::z_image::transformer::ZImageTransformer2DModel;
 use crate::model::runtime::InferenceState;
-use crate::op::tensor_utils::{cast_dtype, clone_tensor};
+use crate::op::cast::cast_dtype;
 use crate::tensor::Tensor;
+
+/// Deep-copy a tensor (allocate + copy).
+fn clone_tensor(src: &Tensor) -> crate::base::error::Result<Tensor> {
+    src.contiguous()
+}
 
 /// VAE scale factor (2^(len(block_out_channels)-1) = 8 for standard VAE).
 const VAE_SCALE_FACTOR: usize = 8;
@@ -900,7 +905,7 @@ mod tests {
 
         // Z-Image-Turbo: 1024x1024 HD, 2-step distilled schedule
         let request = DiffusionRequest {
-            prompt: "一只可爱的橘色小猫咪，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格".to_string(),
+            prompt: "A majestic snow leopard standing on a cliff edge at sunset, with golden light illuminating its fur, dramatic mountain landscape in the background, photorealistic, 8k detail".to_string(),
             height: 1024,
             width: 1024,
             // Keep the original 2-step Turbo schedule so this test
@@ -959,7 +964,7 @@ mod tests {
 
         // Z-Image full model — 1024x1024 HD, 50 denoising steps, CFG=4.5
         let request = DiffusionRequest {
-            prompt: "一只可爱的奶龙，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格".to_string(),
+            prompt: "一座古老的中式石拱桥横跨在碧绿的湖面上，桥上有几个身穿汉服的人在散步，远处是连绵的青山和飘浮的白云，湖面倒映着蓝天，岸边有垂柳和粉色的桃花，春天的氛围，水墨风格与写实结合，高清细腻".to_string(),
             height: 1024,
             width: 1024,
             num_inference_steps: 50,

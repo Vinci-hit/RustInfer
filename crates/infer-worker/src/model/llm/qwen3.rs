@@ -361,7 +361,7 @@ pub struct Qwen3 {
     pub(crate) tokenizer: Box<dyn Tokenizer>,
 
     embed_tokens: Embedding,
-    layers: Vec<DecoderLayer>,
+    pub(crate) layers: Vec<DecoderLayer>,
     norm: RMSNorm,
     lm_head: Matmul,
 }
@@ -407,6 +407,177 @@ impl Qwen3 {
             norm,
             lm_head,
         })
+    }
+
+    /// Create an InferenceState for standalone (non-batch-runner) usage,
+    /// e.g. text encoder in diffusion pipeline.
+    pub fn create_state(&self) -> crate::base::error::Result<crate::model::runtime::InferenceState> {
+        crate::model::runtime::InferenceState::new(&self.config, self.device_type)
+    }
+
+    /// Run prefill through `num_layers` layers and return hidden_states [seq_len, dim].
+    /// Used by the diffusion text encoder which only needs intermediate hidden states,
+    /// not the full LM head logits.
+    ///
+    /// This is a standalone path (no batch runner / ForwardCtx). It allocates temporary
+    /// workspace internally — acceptable for text encoder use (seq_len ≤ 256, called once).
+    pub fn forward_prefill_hidden_states(
+        &self,
+        state: &mut crate::model::runtime::InferenceState,
+        input_tokens: &Tensor,
+        seq_len: usize,
+        num_layers: usize,
+    ) -> crate::base::error::Result<Tensor> {
+        use crate::OpConfig;
+        #[cfg(feature = "cuda")]
+        let cuda_cfg: Option<&OpConfig> = state.cuda_config.as_ref().map(|c| c as &OpConfig);
+        #[cfg(not(feature = "cuda"))]
+        let cuda_cfg: Option<&OpConfig> = None;
+
+        let dtype = self.config.runtime_float_dtype(self.device_type)?;
+        let dim = self.config.dim;
+        let q_dim = self.config.q_dim;
+        let kv_dim = self.config.kv_dim;
+        let head_num = self.config.head_num;
+        let kv_head_num = self.config.kv_head_num;
+        let head_size = self.config.head_size;
+        let inter = self.config.intermediate_size;
+
+        // ── embedding ──
+        let input_tokens_dev = if input_tokens.device() != self.device_type {
+            input_tokens.to_device(self.device_type)?
+        } else {
+            input_tokens.clone()
+        };
+        let mut x = Tensor::new(&[seq_len, dim], dtype, self.device_type)?;
+        self.embed_tokens.forward(&input_tokens_dev, &mut x, cuda_cfg)?;
+
+        // ── sin/cos cache for RoPE ──
+        let rope_cache_len = self.config.seq_len;
+        let half_head = head_size / 2;
+        let mut sin_cache = Tensor::new(&[rope_cache_len, half_head], dtype, self.device_type)?;
+        let mut cos_cache = Tensor::new(&[rope_cache_len, half_head], dtype, self.device_type)?;
+        crate::model::runtime::compute_rope_cache(&self.config, &mut sin_cache, &mut cos_cache)?;
+        // positions [seq_len]: 0, 1, 2, ..., seq_len-1
+        let mut input_pos = Tensor::new(&[seq_len], crate::base::DataType::I32, self.device_type)?;
+        {
+            let pos_data: Vec<i32> = (0..seq_len as i32).collect();
+            input_pos.as_i32_mut()?.buffer_mut().copy_from_host(&pos_data)?;
+        }
+
+        // ── run layers ──
+        let run_layers = num_layers.min(self.layers.len());
+        let mut h = Tensor::new(&[seq_len, dim], dtype, self.device_type)?;
+        self.layers[0].input_layernorm.forward(&x, &mut h, cuda_cfg)?;
+
+        for i in 0..run_layers {
+            // --- attention sublayer ---
+            let qkv_cols = q_dim + 2 * kv_dim;
+            let mut qkv = Tensor::new(&[seq_len, qkv_cols], dtype, self.device_type)?;
+            self.layers[i].self_attn.wqkv.forward(&h, &mut qkv, cuda_cfg)?;
+
+            // Q/K/V narrow views (strided)
+            let mut q = qkv.narrow(1, 0, q_dim)?;
+            let mut k = qkv.narrow(1, q_dim, kv_dim)?;
+            let v = qkv.narrow(1, q_dim + kv_dim, kv_dim)?;
+
+            // QK-norm (if present)
+            if let Some(ref qn) = self.layers[i].self_attn.q_norm {
+                let mut q3 = q.unflatten(1, &[head_num, head_size])?;
+                qn.forward_inplace(&mut q3, cuda_cfg)?;
+            }
+            if let Some(ref kn) = self.layers[i].self_attn.k_norm {
+                let mut k3 = k.unflatten(1, &[kv_head_num, head_size])?;
+                kn.forward_inplace(&mut k3, cuda_cfg)?;
+            }
+
+            // RoPE
+            self.layers[i].self_attn.rope.forward(
+                &input_pos, &sin_cache, &cos_cache,
+                &mut q, &mut k, cuda_cfg,
+            )?;
+
+            // Dense prefill attention
+            let k_contig = k.contiguous()?;
+            let v_contig = v.contiguous()?;
+            let q_contig = q.contiguous()?;
+            let mut attn_out = Tensor::new(&[seq_len, q_dim], dtype, self.device_type)?;
+            #[cfg(feature = "cuda")]
+            {
+                let cuda_cfg_ref = state.cuda_config.as_ref();
+                unsafe {
+                    crate::op::kernels::cuda::flash_attn_gqa_prefill(
+                        &q_contig, &k_contig, &v_contig, &mut attn_out,
+                        seq_len, 0, // current_kv_len_host=0 (no prior cache)
+                        head_num, kv_head_num, head_size,
+                        true, // causal
+                        cuda_cfg_ref,
+                    )?;
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                // CPU fallback — not supported for now
+                return Err(crate::base::error::Error::InvalidArgument(
+                    "forward_prefill_hidden_states requires CUDA".into()
+                ).into());
+            }
+
+            // o_proj
+            let mut wo_out = Tensor::new(&[seq_len, dim], dtype, self.device_type)?;
+            self.layers[i].self_attn.wo.forward(&attn_out, &mut wo_out, cuda_cfg)?;
+
+            // residual + post_attention_layernorm
+            let mut h_mid = Tensor::new(&[seq_len, dim], dtype, self.device_type)?;
+            self.layers[i].post_attention_layernorm
+                .forward_with_residual(&mut h_mid, &mut x, &wo_out, cuda_cfg)?;
+
+            // --- MLP sublayer ---
+            let mut gate_up = Tensor::new(&[seq_len, 2 * inter], dtype, self.device_type)?;
+            self.layers[i].mlp.w_gate_up.forward(&h_mid, &mut gate_up, cuda_cfg)?;
+
+            let mut gate = Tensor::new(&[seq_len, inter], dtype, self.device_type)?;
+            #[cfg(feature = "cuda")]
+            if matches!(self.device_type, crate::base::DeviceType::Cuda(_))
+                && dtype == crate::base::DataType::BF16
+            {
+                crate::op::kernels::cuda::swiglu_packed_bf16(
+                    &gate_up, &mut gate, seq_len, inter, cuda_cfg,
+                )?;
+            } else {
+                let mut up = Tensor::new(&[seq_len, inter], dtype, self.device_type)?;
+                crate::op::split_cols::split_cols_tensor(
+                    &gate_up, &mut gate, seq_len, 2 * inter, 0, inter, cuda_cfg)?;
+                crate::op::split_cols::split_cols_tensor(
+                    &gate_up, &mut up, seq_len, 2 * inter, inter, inter, cuda_cfg)?;
+                crate::op::swiglu::swiglu(&up, &mut gate, cuda_cfg)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let mut up = Tensor::new(&[seq_len, inter], dtype, self.device_type)?;
+                crate::op::split_cols::split_cols_tensor(
+                    &gate_up, &mut gate, seq_len, 2 * inter, 0, inter, cuda_cfg)?;
+                crate::op::split_cols::split_cols_tensor(
+                    &gate_up, &mut up, seq_len, 2 * inter, inter, inter, cuda_cfg)?;
+                crate::op::swiglu::swiglu(&up, &mut gate, cuda_cfg)?;
+            }
+
+            let mut ffn_out = Tensor::new(&[seq_len, dim], dtype, self.device_type)?;
+            self.layers[i].mlp.w2.forward(&gate, &mut ffn_out, cuda_cfg)?;
+
+            // residual + next_input_layernorm
+            let next_norm = if i + 1 < self.layers.len() {
+                &self.layers[i + 1].input_layernorm
+            } else {
+                &self.norm
+            };
+            let mut h_out = Tensor::new(&[seq_len, dim], dtype, self.device_type)?;
+            next_norm.forward_with_residual(&mut h_out, &mut x, &ffn_out, cuda_cfg)?;
+            h = h_out;
+        }
+
+        // h = hidden_states after `run_layers` layers (including final norm)
+        Ok(h)
     }
 }
 
