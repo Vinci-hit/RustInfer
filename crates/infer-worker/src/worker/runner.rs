@@ -409,6 +409,11 @@ impl<M: LlmModel> ModelRunner<M> {
         self.flags.shutdown.store(true, Ordering::Release);
     }
 
+    /// 检查 shutdown 信号是否已被设置。
+    pub fn is_shutdown(&self) -> bool {
+        self.flags.shutdown.load(Ordering::Acquire)
+    }
+
     pub fn model(&self) -> &M { &self.model }
 
     // ─── Runner 主循环 ───

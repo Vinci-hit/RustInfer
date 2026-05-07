@@ -1,0 +1,881 @@
+//! WorkerServer —— 新版 server，直接持有 `Arc<ModelRunner<M>>` 驱动推理。
+//!
+//! # 设计
+//!
+//! - ZMQ PULL 收 `PrefillBatchCmd`（来自 Scheduler），ZMQ PUSH 发 `StepOutput`。
+//! - Server 线程与 Runner 共享 `Arc<ModelRunner<M>>`，通过 `SyncFlags` 握手：
+//!   - input_ready=false 时 server 可写 workspace / states / meta；
+//!   - output_ready=true 时 server 可读 output_tokens_dev。
+//! - 不再使用 `SharedBuffers` 中间层。
+//!
+//! # 并发模型
+//!
+//! 进程内两线程：
+//! - **Runner 线程**：`ModelRunner::run()`
+//! - **Server 线程**：`WorkerServer::run()`
+//! - ZMQ socket 绑定在 server 线程上（非线程安全，不跨线程）。
+
+use std::sync::Arc;
+
+use crate::base::DeviceType;
+use crate::base::error::{Error, Result};
+use crate::model::llm::LlmModel;
+use crate::model::runtime::InferenceState;
+use crate::worker::protocol::*;
+use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta};
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  DecodeSeq —— 一个活跃的 decode 序列
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone)]
+struct DecodeSeq {
+    request_id: String,
+    kv_slot: usize,
+    /// 下一个 token 写入 KV cache 的 position (= 已有 KV 长度)
+    next_position: usize,
+    /// 上一步采样出的 token (本步 decode 输入)
+    last_token: i32,
+    /// 已生成 token 数
+    generated_count: usize,
+    max_tokens: usize,
+    /// 采样参数（后续接入 top_p / temperature / top_k）
+    #[allow(dead_code)]
+    sampling: SamplingParams,
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  WorkerServer
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// 新版 Worker Server —— 直接使用 `ModelRunner` 新 API 驱动 GPU 推理。
+pub struct WorkerServer<M: LlmModel> {
+    runner: Arc<ModelRunner<M>>,
+    #[allow(dead_code)]
+    device: DeviceType,
+    eos_token_ids: Vec<i32>,
+
+    // ZMQ (与 Scheduler 通信)
+    zmq_in: zmq::Socket,
+    zmq_out: zmq::Socket,
+
+    // 序列管理
+    active_decodes: Vec<DecodeSeq>,
+    pending_prefills: Vec<PrefillBatchCmd>,
+}
+
+impl<M: LlmModel> WorkerServer<M> {
+    pub fn new(
+        runner: Arc<ModelRunner<M>>,
+        device: DeviceType,
+        zmq_in: zmq::Socket,
+        zmq_out: zmq::Socket,
+        eos_token_ids: Vec<i32>,
+    ) -> Self {
+        Self {
+            runner,
+            device,
+            eos_token_ids,
+            zmq_in,
+            zmq_out,
+            active_decodes: Vec::new(),
+            pending_prefills: Vec::new(),
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  主循环
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// 主循环。调用线程会被阻塞在这里直到 runner shutdown。
+    pub fn run(mut self) {
+        tracing::info!("WorkerServer waiting for first prefill...");
+        let cmd = match self.recv_next_prefill_blocking() {
+            Some(c) => c,
+            None => { tracing::info!("WorkerServer: shutdown before first prefill"); return; }
+        };
+        self.pending_prefills.push(cmd);
+
+        if let Err(e) = self.ensure_capacity_and_enqueue() {
+            tracing::error!("Failed to enqueue first step: {:?}", e);
+            return;
+        }
+        tracing::info!("WorkerServer started, {} active decodes", self.active_decodes.len());
+
+        loop {
+            // 1. 与 Runner forward 并行：non-blocking 收新 prefill
+            self.drain_zmq_prefills();
+
+            // 2. 等 Runner 完成本步（同时检测 shutdown）
+            loop {
+                if self.runner.output_ready() { break; }
+                if self.runner.is_shutdown() {
+                    tracing::info!("WorkerServer: runner shutdown detected, exiting");
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+
+            // 3. 读 output tokens (D2H)
+            let output_tokens = match self.read_output_tokens() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("Failed to read output tokens: {:?}", e);
+                    self.runner.set_output_consumed();
+                    continue;
+                }
+            };
+            self.runner.set_output_consumed();
+
+            // 4. 更新 decode 状态
+            self.update_decode_tokens(&output_tokens);
+
+            // 5. 判 EOS / max_tokens，发 ZMQ output，移除已完成序列
+            self.process_eos_and_send_zmq(&output_tokens);
+
+            // 6. 非阻塞收新 prefill
+            self.drain_zmq_prefills();
+
+            // 7. 组装下一步输入 → signal runner
+            if let Err(e) = self.ensure_capacity_and_enqueue() {
+                tracing::error!("Failed to enqueue next step: {:?}", e);
+                // 安全退出：无法继续推理
+                self.runner.request_shutdown();
+                return;
+            }
+
+            // 8. 空闲时阻塞等新 prefill
+            if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
+                tracing::debug!("All sequences finished, waiting for new prefill...");
+                let cmd = match self.recv_next_prefill_blocking() {
+                    Some(c) => c,
+                    None => { tracing::info!("WorkerServer: shutdown while idle"); return; }
+                };
+                self.pending_prefills.push(cmd);
+                if let Err(e) = self.ensure_capacity_and_enqueue() {
+                    tracing::error!("Failed to enqueue after idle: {:?}", e);
+                    self.runner.request_shutdown();
+                    return;
+                }
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  写入 Runner workspace + signal（核心改动）
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// 整体流程：ensure_capacity → write_input_buffer → promote prefills → signal 已在 write 内完成
+    fn ensure_capacity_and_enqueue(&mut self) -> Result<()> {
+        if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
+            return Ok(());
+        }
+
+        // 1. ensure KV capacity for pending prefills
+        self.ensure_capacity_for_pending_prefills()?;
+        // 2. write workspace (active decodes + pending prefills) + signal runner
+        self.write_input_buffer_pre_promote()?;
+        // 3. promote prefills to decode state (之后 output 回来时 active_decodes 包含所有 seq)
+        self.promote_prefills_to_decodes();
+        Ok(())
+    }
+
+    /// 为 pending prefills 预分配 KV cache 容量。
+    fn ensure_capacity_for_pending_prefills(&mut self) -> Result<()> {
+        for cmd in &self.pending_prefills {
+            let n = cmd.num_requests();
+            for i in 0..n {
+                let slot = cmd.kv_slots[i] as usize;
+                let start = cmd.q_start_loc[i] as usize;
+                let end = if i + 1 < n {
+                    cmd.q_start_loc[i + 1] as usize
+                } else {
+                    cmd.input_ids.len()
+                };
+                let seq_len = end - start;
+                let computed = cmd.num_computed_tokens[i] as usize;
+                let max_total = computed + seq_len + cmd.request_metas[i].max_tokens;
+
+                unsafe {
+                    self.runner.state_mut(slot).kv_cache.ensure_capacity(max_total)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Prefill 写入后，对应序列进入 decode 状态。
+    fn promote_prefills_to_decodes(&mut self) {
+        for cmd in self.pending_prefills.drain(..) {
+            let n = cmd.num_requests();
+            for i in 0..n {
+                let start = cmd.q_start_loc[i] as usize;
+                let end = if i + 1 < n {
+                    cmd.q_start_loc[i + 1] as usize
+                } else {
+                    cmd.input_ids.len()
+                };
+                let seq_len = end - start;
+                let computed = cmd.num_computed_tokens[i] as usize;
+
+                self.active_decodes.push(DecodeSeq {
+                    request_id: cmd.request_metas[i].request_id.clone(),
+                    kv_slot: cmd.kv_slots[i] as usize,
+                    next_position: computed + seq_len,
+                    last_token: 0, // 首个 decode token 来自 Runner 输出
+                    generated_count: 0,
+                    max_tokens: cmd.request_metas[i].max_tokens,
+                    sampling: cmd.sampling_params[i].clone(),
+                });
+            }
+        }
+    }
+
+    /// 写入 Runner workspace。
+    ///
+    /// 调用时机：promote_prefills 之前。active_decodes 是已有 decode 序列，
+    /// pending_prefills 是本步要做的 prefill。
+    ///
+    /// 布局：decode 在前 (q_len=1 each)，prefill 在后 (q_len=seq_len each)。
+    fn write_input_buffer_pre_promote(&mut self) -> Result<()> {
+        let num_decode = self.active_decodes.len();
+        let num_prefill_seqs: usize = self.pending_prefills.iter()
+            .map(|p| p.num_requests())
+            .sum();
+        let num_prefill_tokens: usize = self.pending_prefills.iter()
+            .map(|p| p.input_ids.len())
+            .sum();
+        let total_tokens = num_decode + num_prefill_tokens;
+        let num_seqs = num_decode + num_prefill_seqs;
+
+        if num_seqs == 0 {
+            return Ok(());
+        }
+
+        let ws = unsafe { self.runner.workspace() };
+        if total_tokens > ws.max_batch_tokens {
+            return Err(Error::InvalidArgument(format!(
+                "total_tokens {} > max_batch_tokens {}", total_tokens, ws.max_batch_tokens
+            )).into());
+        }
+        if num_seqs > ws.max_batch_seqs {
+            return Err(Error::InvalidArgument(format!(
+                "num_seqs {} > max_batch_seqs {}", num_seqs, ws.max_batch_seqs
+            )).into());
+        }
+
+        // ── 1. 组装 host-side 数据 ──
+        let mut tokens = Vec::with_capacity(total_tokens);
+        let mut positions = Vec::with_capacity(total_tokens);
+        let mut kv_lens = Vec::with_capacity(num_seqs);
+        let mut meta = StepMeta::zeroed();
+
+        meta.num_decode = num_decode;
+        meta.num_prefill = num_prefill_seqs;
+
+        let mut offset: i32 = 0;
+        let mut seq_idx = 0usize;
+
+        // Decode 在前 (每条 q_len=1)
+        for d in &self.active_decodes {
+            tokens.push(d.last_token);
+            positions.push(d.next_position as i32);
+            // kv_lens for attention: past + q_len = next_position + 1
+            kv_lens.push(d.next_position as i32 + 1);
+
+            meta.q_start_loc[seq_idx] = offset;
+            meta.slot_indices[seq_idx] = d.kv_slot as i32;
+            meta.positions_start[seq_idx] = d.next_position as i32;
+
+            offset += 1;
+            seq_idx += 1;
+        }
+
+        // Prefill 在后
+        for cmd in &self.pending_prefills {
+            let n = cmd.num_requests();
+            for i in 0..n {
+                let start = cmd.q_start_loc[i] as usize;
+                let end = if i + 1 < n {
+                    cmd.q_start_loc[i + 1] as usize
+                } else {
+                    cmd.input_ids.len()
+                };
+                let seq_len = end - start;
+                let computed = cmd.num_computed_tokens[i] as usize;
+                let slot = cmd.kv_slots[i] as usize;
+
+                tokens.extend_from_slice(&cmd.input_ids[start..end]);
+                for pos in computed..(computed + seq_len) {
+                    positions.push(pos as i32);
+                }
+                // kv_lens for attention: computed + seq_len (prefill 首次 = seq_len)
+                kv_lens.push((computed + seq_len) as i32);
+
+                meta.q_start_loc[seq_idx] = offset;
+                meta.slot_indices[seq_idx] = slot as i32;
+                meta.positions_start[seq_idx] = computed as i32;
+
+                offset += seq_len as i32;
+                seq_idx += 1;
+            }
+        }
+        // 末尾哨兵
+        meta.q_start_loc[num_seqs] = offset;
+        meta.total_q_tiles = 0; // runner 内部 refresh_ragged_plan 会覆盖
+
+        // ── 2. H2D: input_tokens / input_pos / kv_lens_dev ──
+        let ws_mut = unsafe { self.runner.workspace_mut() };
+        #[cfg(feature = "cuda")]
+        let stream = unsafe { self.runner.cuda_stream() };
+
+        #[cfg(feature = "cuda")]
+        {
+            ws_mut.input_tokens.as_i32_mut()?.buffer_mut()
+                .copy_from_host_async(&tokens, stream)?;
+            ws_mut.input_pos.as_i32_mut()?.buffer_mut()
+                .copy_from_host_async(&positions, stream)?;
+            ws_mut.kv_lens_dev.as_i32_mut()?.buffer_mut()
+                .copy_from_host_async(&kv_lens, stream)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            ws_mut.input_tokens.as_i32_mut()?.buffer_mut()
+                .copy_from_host(&tokens)?;
+            ws_mut.input_pos.as_i32_mut()?.buffer_mut()
+                .copy_from_host(&positions)?;
+            ws_mut.kv_lens_dev.as_i32_mut()?.buffer_mut()
+                .copy_from_host(&kv_lens)?;
+        }
+
+        // ── 3. refresh_scatter_indices ──
+        let meta_view = WorkerBatchMeta::from_step(&meta);
+        #[cfg(feature = "cuda")]
+        ws_mut.refresh_scatter_indices(&meta_view, stream)?;
+        #[cfg(not(feature = "cuda"))]
+        let _ = &meta_view;
+
+        // ── 4. fill_cache_ptrs_from_states ──
+        //
+        // 收集 state refs（slot 必须互异；由 scheduler 保证）。
+        #[cfg(feature = "cuda")]
+        {
+            let states_all = unsafe { &mut *(self.runner.states_ptr_mut()) };
+            let mut refs: Vec<&mut InferenceState> = Vec::with_capacity(num_seqs);
+            let mut slot_ids: Vec<usize> = Vec::with_capacity(num_seqs);
+
+            for i in 0..num_seqs {
+                let slot = meta.slot_indices[i] as usize;
+                slot_ids.push(slot);
+                let p = &mut states_all[slot] as *mut InferenceState;
+                refs.push(unsafe { &mut *p });
+            }
+
+            ws_mut.fill_cache_ptrs_from_states(&slot_ids, &mut refs, stream)?;
+        }
+
+        // ── 5. write_meta + set_input_ready ──
+        unsafe { self.runner.write_meta(meta); }
+        self.runner.set_input_ready();
+
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  输出处理
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// 从 Runner 读本步 output tokens (D2H)。
+    fn read_output_tokens(&self) -> Result<Vec<i32>> {
+        let num_seqs = self.active_decodes.len();
+        let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev() }
+            .to_cpu()?
+            .as_i32()?
+            .as_slice()?
+            .iter()
+            .take(num_seqs)
+            .copied()
+            .collect();
+        Ok(tokens_out)
+    }
+
+    /// 更新 decode 序列的 last_token 和 position。
+    fn update_decode_tokens(&mut self, tokens: &[i32]) {
+        if tokens.len() != self.active_decodes.len() {
+            tracing::error!(
+                "Runner output length {} != active decode length {}",
+                tokens.len(), self.active_decodes.len()
+            );
+            return;
+        }
+        for (seq, &token) in self.active_decodes.iter_mut().zip(tokens) {
+            seq.last_token = token;
+            seq.generated_count += 1;
+            seq.next_position += 1;
+        }
+    }
+
+    /// 判 EOS / max_tokens，移除已结束序列，发 ZMQ output。
+    fn process_eos_and_send_zmq(&mut self, tokens: &[i32]) {
+        if tokens.len() != self.active_decodes.len() {
+            tracing::error!(
+                "Skip EOS processing: output len {} != active len {}",
+                tokens.len(), self.active_decodes.len()
+            );
+            return;
+        }
+
+        let mut step_output = StepOutput {
+            tokens: Vec::with_capacity(tokens.len()),
+        };
+        let old_decodes = std::mem::take(&mut self.active_decodes);
+
+        for (seq, &token_id) in old_decodes.into_iter().zip(tokens) {
+            let finished =
+                self.eos_token_ids.contains(&token_id) || seq.generated_count >= seq.max_tokens;
+
+            step_output.tokens.push(SeqToken {
+                request_id: seq.request_id.clone(),
+                token_id,
+                finished,
+            });
+
+            if !finished {
+                self.active_decodes.push(seq);
+            } else {
+                // Batch 成员变化 → invalidate KV 指针缓存
+                unsafe {
+                    self.runner.workspace_mut().invalidate_batch_member_cache();
+                }
+                // 如果启用了 CUDA Graph，batch 组成变化后需要 invalidate
+                #[cfg(feature = "cuda")]
+                self.runner.invalidate_decode_graphs();
+            }
+        }
+
+        let data = match rmp_serde::to_vec(&step_output) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("Failed to serialize StepOutput: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = self.zmq_out.send(&data, 0) {
+            tracing::error!("ZMQ send failed: {}", e);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  ZMQ 通信
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// 验证 prefill 消息合法性。
+    fn validate_prefill(&self, cmd: &PrefillBatchCmd) -> Result<()> {
+        let ws = unsafe { self.runner.workspace() };
+        cmd.validate(ws.max_batch_tokens, ws.max_batch_seqs, ws.max_batch_seqs)
+    }
+
+    /// 阻塞等待一个有效的 prefill 消息（每 100ms 检查一次 shutdown）。
+    /// 如果 runner 已 shutdown 则返回 None。
+    fn recv_next_prefill_blocking(&self) -> Option<PrefillBatchCmd> {
+        loop {
+            if self.runner.is_shutdown() {
+                return None;
+            }
+            // 用 DONTWAIT + sleep 模拟带 shutdown 检测的 blocking recv
+            match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
+                Ok(data) => match rmp_serde::from_slice::<PrefillBatchCmd>(&data) {
+                    Ok(cmd) => match self.validate_prefill(&cmd) {
+                        Ok(()) => return Some(cmd),
+                        Err(e) => tracing::error!("Reject invalid PrefillBatchCmd: {}", e),
+                    },
+                    Err(e) => tracing::error!("Failed to deserialize PrefillBatchCmd: {}", e),
+                },
+                Err(zmq::Error::EAGAIN) => {
+                    // 没有消息，等一小段时间后重试
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => tracing::error!("ZMQ recv error while waiting for prefill: {}", e),
+            }
+        }
+    }
+
+    /// 非阻塞收所有待处理的 prefill。
+    fn drain_zmq_prefills(&mut self) {
+        loop {
+            match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
+                Ok(data) => {
+                    match rmp_serde::from_slice::<PrefillBatchCmd>(&data) {
+                        Ok(cmd) => match self.validate_prefill(&cmd) {
+                            Ok(()) => self.pending_prefills.push(cmd),
+                            Err(e) => tracing::error!("Reject invalid PrefillBatchCmd: {}", e),
+                        },
+                        Err(e) => tracing::error!("Failed to deserialize PrefillBatchCmd: {}", e),
+                    }
+                }
+                Err(zmq::Error::EAGAIN) => break,
+                Err(e) => {
+                    tracing::error!("ZMQ recv error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  集成测试
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+#[cfg(feature = "models")]
+mod tests {
+    //! Server + Runner 端到端集成测试。
+    //!
+    //! 启动 runner 线程 + server 线程，主线程通过 ZMQ inproc 扮演 scheduler：
+    //! 发 PrefillBatchCmd，收 StepOutput，验证 token 合法 + finished 正确。
+    //!
+    //! 需要真实模型权重（LLAMA3_MODEL_PATH 或 well-known 路径）。
+    use super::*;
+    use crate::base::DeviceType;
+    use crate::model::llm::llama3::Llama3;
+    use crate::model::llm::LlmModel;
+    use std::sync::Arc;
+
+    fn get_model_path() -> Option<std::path::PathBuf> {
+        std::env::var("LLAMA3_MODEL_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let candidates = [
+                    std::path::PathBuf::from("/data/home/vinciiliu/models/Llama-3.2-1B-Instruct"),
+                    std::path::PathBuf::from(
+                        "/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b",
+                    ),
+                ];
+                candidates.into_iter().find(|p| p.exists())
+            })
+    }
+
+    /// 单请求端到端：prefill + decode 直到 max_tokens，验证：
+    /// - StepOutput 每步都收到
+    /// - token_id 合法
+    /// - 最后一步 finished=true
+    #[test]
+    #[ignore = "requires LLAMA3_MODEL_PATH and CUDA GPU"]
+    fn server_single_request_e2e() -> Result<()> {
+        let path = match get_model_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no model path"); return Ok(()); }
+        };
+        let device = DeviceType::Cuda(0);
+        let model = Llama3::new(&path, device)?;
+        let vocab = model.config().vocab_size;
+        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
+            .iter().map(|&id| id as i32).collect();
+
+        let max_batch_tokens = 512usize;
+        let max_batch_seqs = 4usize;
+        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+
+        // ─── ZMQ inproc sockets ───
+        let zmq_ctx = zmq::Context::new();
+        let scheduler_push = zmq_ctx.socket(zmq::PUSH)?;
+        let worker_pull = zmq_ctx.socket(zmq::PULL)?;
+        let worker_push = zmq_ctx.socket(zmq::PUSH)?;
+        let scheduler_pull = zmq_ctx.socket(zmq::PULL)?;
+
+        scheduler_push.bind("inproc://test-prefill")?;
+        worker_pull.connect("inproc://test-prefill")?;
+        worker_push.bind("inproc://test-output")?;
+        scheduler_pull.connect("inproc://test-output")?;
+
+        // ─── 启动 runner 线程 ───
+        let runner_loop = Arc::clone(&runner);
+        let runner_handle = std::thread::spawn(move || runner_loop.run());
+
+        // ─── 启动 server 线程 ───
+        let server = WorkerServer::new(
+            Arc::clone(&runner),
+            device,
+            worker_pull,
+            worker_push,
+            eos_token_ids.clone(),
+        );
+        let server_handle = std::thread::spawn(move || server.run());
+
+        // ─── 主线程扮演 scheduler ───
+        let prompt = "The capital of France is";
+        let toks: Vec<i32> = runner.model().tokenizer().encode(prompt)?;
+        let max_tokens = 10usize;
+
+        let cmd = PrefillBatchCmd {
+            input_ids: toks.clone(),
+            q_start_loc: vec![0],
+            num_computed_tokens: vec![0],
+            kv_slots: vec![0],
+            sampling_params: vec![SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: -1,
+            }],
+            request_metas: vec![RequestMeta {
+                request_id: "req-001".to_string(),
+                max_tokens,
+            }],
+        };
+        let data = rmp_serde::to_vec(&cmd).unwrap();
+        scheduler_push.send(&data, 0)?;
+
+        // ─── 收 StepOutput 直到 finished ───
+        let mut total_steps = 0usize;
+        let mut all_tokens = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("timeout: no finished after {} steps", total_steps);
+            }
+            let msg = scheduler_pull.recv_bytes(0)?;
+            let output: StepOutput = rmp_serde::from_slice(&msg)?;
+
+            assert_eq!(output.tokens.len(), 1, "expected 1 seq in output");
+            let seq_out = &output.tokens[0];
+            assert_eq!(seq_out.request_id, "req-001");
+            assert!(
+                seq_out.token_id >= 0 && (seq_out.token_id as usize) < vocab,
+                "token {} out of vocab range", seq_out.token_id
+            );
+            all_tokens.push(seq_out.token_id);
+            total_steps += 1;
+
+            if seq_out.finished {
+                break;
+            }
+        }
+
+        eprintln!("server_single_request_e2e: {} steps, tokens={:?}", total_steps, all_tokens);
+        // prefill 输出 1 token，decode max_tokens-1 步 → 总共 max_tokens 步
+        // 或者提前 EOS
+        assert!(total_steps <= max_tokens + 1, "too many steps: {}", total_steps);
+        assert!(total_steps >= 1, "no tokens generated");
+
+        // ─── Shutdown ───
+        runner.request_shutdown();
+        let _ = runner_handle.join();
+        let _ = server_handle.join();
+        Ok(())
+    }
+
+    /// 两请求并发：验证 continuous batching 正确性。
+    /// - 先发 req1，等一步 output
+    /// - 再发 req2，后续 output 应该包含两条 seq
+    #[test]
+    #[ignore = "requires LLAMA3_MODEL_PATH and CUDA GPU"]
+    fn server_two_requests_continuous_batch() -> Result<()> {
+        let path = match get_model_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no model path"); return Ok(()); }
+        };
+        let device = DeviceType::Cuda(0);
+        let model = Llama3::new(&path, device)?;
+        let vocab = model.config().vocab_size;
+        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
+            .iter().map(|&id| id as i32).collect();
+
+        let max_batch_tokens = 512usize;
+        let max_batch_seqs = 4usize;
+        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+
+        // ─── ZMQ inproc sockets ───
+        let zmq_ctx = zmq::Context::new();
+        let scheduler_push = zmq_ctx.socket(zmq::PUSH)?;
+        let worker_pull = zmq_ctx.socket(zmq::PULL)?;
+        let worker_push = zmq_ctx.socket(zmq::PUSH)?;
+        let scheduler_pull = zmq_ctx.socket(zmq::PULL)?;
+
+        scheduler_push.bind("inproc://test2-prefill")?;
+        worker_pull.connect("inproc://test2-prefill")?;
+        worker_push.bind("inproc://test2-output")?;
+        scheduler_pull.connect("inproc://test2-output")?;
+
+        // ─── 启动 ───
+        let runner_loop = Arc::clone(&runner);
+        let runner_handle = std::thread::spawn(move || runner_loop.run());
+        let server = WorkerServer::new(
+            Arc::clone(&runner),
+            device,
+            worker_pull,
+            worker_push,
+            eos_token_ids.clone(),
+        );
+        let server_handle = std::thread::spawn(move || server.run());
+
+        // ─── 发第 1 个请求 (slot 0) ───
+        let prompt1 = "Hello world";
+        let toks1: Vec<i32> = runner.model().tokenizer().encode(prompt1)?;
+        let cmd1 = PrefillBatchCmd {
+            input_ids: toks1,
+            q_start_loc: vec![0],
+            num_computed_tokens: vec![0],
+            kv_slots: vec![0],
+            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
+            request_metas: vec![RequestMeta { request_id: "req-A".to_string(), max_tokens: 5 }],
+        };
+        scheduler_push.send(&rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
+
+        // 收第一步 output（只有 req-A）
+        let msg = scheduler_pull.recv_bytes(0)?;
+        let out1: StepOutput = rmp_serde::from_slice(&msg)?;
+        assert_eq!(out1.tokens.len(), 1);
+        assert_eq!(out1.tokens[0].request_id, "req-A");
+        assert!(out1.tokens[0].token_id >= 0 && (out1.tokens[0].token_id as usize) < vocab);
+        eprintln!("step 1: req-A token={}", out1.tokens[0].token_id);
+
+        // ─── 发第 2 个请求 (slot 1)，趁 server 在 drain_zmq_prefills ───
+        let prompt2 = "The sky is";
+        let toks2: Vec<i32> = runner.model().tokenizer().encode(prompt2)?;
+        let cmd2 = PrefillBatchCmd {
+            input_ids: toks2,
+            q_start_loc: vec![0],
+            num_computed_tokens: vec![0],
+            kv_slots: vec![1],
+            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
+            request_metas: vec![RequestMeta { request_id: "req-B".to_string(), max_tokens: 5 }],
+        };
+        scheduler_push.send(&rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
+
+        // 后续 output 应该包含两条 seq（req-A decode + req-B prefill/decode）
+        let mut a_finished = false;
+        let mut b_finished = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        while !(a_finished && b_finished) {
+            if std::time::Instant::now() > deadline {
+                panic!("timeout waiting for both requests to finish");
+            }
+            let msg = scheduler_pull.recv_bytes(0)?;
+            let out: StepOutput = rmp_serde::from_slice(&msg)?;
+            eprintln!("step output: {} seqs", out.tokens.len());
+
+            for seq_out in &out.tokens {
+                assert!(
+                    seq_out.token_id >= 0 && (seq_out.token_id as usize) < vocab,
+                    "{} token {} out of range", seq_out.request_id, seq_out.token_id
+                );
+                eprintln!("  {} token={} finished={}", seq_out.request_id, seq_out.token_id, seq_out.finished);
+                if seq_out.finished {
+                    match seq_out.request_id.as_str() {
+                        "req-A" => a_finished = true,
+                        "req-B" => b_finished = true,
+                        other => panic!("unexpected request_id: {}", other),
+                    }
+                }
+            }
+        }
+
+        eprintln!("server_two_requests_continuous_batch: both finished");
+
+        runner.request_shutdown();
+        let _ = runner_handle.join();
+        let _ = server_handle.join();
+        Ok(())
+    }
+
+    /// Slot 复用测试：req1 完成后，用同一个 slot 发 req2，验证不 crash 且结果合法。
+    #[test]
+    #[ignore = "requires LLAMA3_MODEL_PATH and CUDA GPU"]
+    fn server_slot_reuse_after_finish() -> Result<()> {
+        let path = match get_model_path() {
+            Some(p) => p,
+            None => { eprintln!("skipping: no model path"); return Ok(()); }
+        };
+        let device = DeviceType::Cuda(0);
+        let model = Llama3::new(&path, device)?;
+        let vocab = model.config().vocab_size;
+        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
+            .iter().map(|&id| id as i32).collect();
+
+        let max_batch_tokens = 512usize;
+        let max_batch_seqs = 2usize;
+        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+
+        let zmq_ctx = zmq::Context::new();
+        let scheduler_push = zmq_ctx.socket(zmq::PUSH)?;
+        let worker_pull = zmq_ctx.socket(zmq::PULL)?;
+        let worker_push = zmq_ctx.socket(zmq::PUSH)?;
+        let scheduler_pull = zmq_ctx.socket(zmq::PULL)?;
+
+        scheduler_push.bind("inproc://test3-prefill")?;
+        worker_pull.connect("inproc://test3-prefill")?;
+        worker_push.bind("inproc://test3-output")?;
+        scheduler_pull.connect("inproc://test3-output")?;
+
+        let runner_loop = Arc::clone(&runner);
+        let runner_handle = std::thread::spawn(move || runner_loop.run());
+        let server = WorkerServer::new(
+            Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
+        );
+        let server_handle = std::thread::spawn(move || server.run());
+
+        // ─── req1: slot 0, max_tokens=3 ───
+        let toks1: Vec<i32> = runner.model().tokenizer().encode("Hello")?;
+        let cmd1 = PrefillBatchCmd {
+            input_ids: toks1,
+            q_start_loc: vec![0],
+            num_computed_tokens: vec![0],
+            kv_slots: vec![0],
+            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
+            request_metas: vec![RequestMeta { request_id: "first".to_string(), max_tokens: 3 }],
+        };
+        scheduler_push.send(&rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
+
+        // 等 req1 finish
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if std::time::Instant::now() > deadline { panic!("timeout on req1"); }
+            let msg = scheduler_pull.recv_bytes(0)?;
+            let out: StepOutput = rmp_serde::from_slice(&msg)?;
+            if out.tokens.iter().any(|t| t.request_id == "first" && t.finished) {
+                eprintln!("req1 finished");
+                break;
+            }
+        }
+
+        // ─── req2: 复用 slot 0 ───
+        let toks2: Vec<i32> = runner.model().tokenizer().encode("Goodbye")?;
+        let cmd2 = PrefillBatchCmd {
+            input_ids: toks2,
+            q_start_loc: vec![0],
+            num_computed_tokens: vec![0],
+            kv_slots: vec![0], // 同一个 slot!
+            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
+            request_metas: vec![RequestMeta { request_id: "second".to_string(), max_tokens: 3 }],
+        };
+        scheduler_push.send(&rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
+
+        // 等 req2 finish
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if std::time::Instant::now() > deadline { panic!("timeout on req2"); }
+            let msg = scheduler_pull.recv_bytes(0)?;
+            let out: StepOutput = rmp_serde::from_slice(&msg)?;
+            for t in &out.tokens {
+                assert!(
+                    t.token_id >= 0 && (t.token_id as usize) < vocab,
+                    "req2 token {} out of range", t.token_id
+                );
+            }
+            if out.tokens.iter().any(|t| t.request_id == "second" && t.finished) {
+                eprintln!("req2 (slot reuse) finished successfully");
+                break;
+            }
+        }
+
+        runner.request_shutdown();
+        let _ = runner_handle.join();
+        let _ = server_handle.join();
+        Ok(())
+    }
+}
