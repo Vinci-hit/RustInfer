@@ -1,7 +1,7 @@
 //! Zero-copy tensor views.
 //!
 //! Every method in this module returns a new `Tensor` that *shares* its
-//! backing [`Buffer`] with `self`. They manipulate only
+//! backing [`crate::base::buffer::Buffer`] with `self`. They manipulate only
 //! (shape, strides, storage_offset) and are therefore O(ndim) in time and
 //! zero-allocation outside of a small `Dims` on the stack.
 //!
@@ -20,9 +20,32 @@ use super::tensor::Tensor;
 impl Tensor {
     // ──────────────────────── reshape family ──────────────────────────
 
-    /// Strict reshape: requires `self.is_contiguous()` and returns a new
-    /// view with freshly computed row-major strides. Mirrors PyTorch's
-    /// `Tensor::view` semantics.
+    /// Returns a new view with the given shape (zero-copy, strict mode).
+    ///
+    /// Mirrors PyTorch's `Tensor::view` semantics: the tensor **must** be
+    /// contiguous. The returned view shares the same buffer and simply
+    /// recomputes row-major strides for `new_shape`.
+    ///
+    /// One dimension may be passed as `usize::MAX` (analogous to `-1` in
+    /// PyTorch) to be inferred from the others and `numel`.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_shape`: The desired shape. Its product must equal `self.numel()`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `self` is not contiguous (use [`reshape`](Self::reshape) instead).
+    /// - Returns an error if the element count doesn't match.
+    /// - Returns an error if more than one dimension is `usize::MAX`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let v = t.view(&[6, 4])?;
+    /// assert_eq!(v.shape(), &[6, 4]);
+    /// ```
     pub fn view(&self, new_shape: &[usize]) -> Result<Self> {
         let new_shape = normalize_shape_with_infer(new_shape, self.numel())?;
         if !self.is_contiguous() {
@@ -42,8 +65,22 @@ impl Tensor {
         Ok(self.from_view_parts(new_shape, new_strides, self.storage_offset()))
     }
 
-    /// Best-effort reshape: attempts a zero-copy `view`; if the tensor
-    /// isn't contiguous, falls back to a [`Tensor::contiguous`] copy first.
+    /// Reshapes the tensor, falling back to a copy if not contiguous.
+    ///
+    /// Attempts a zero-copy [`view`](Self::view) first. If the tensor is not
+    /// contiguous (e.g. after a transpose), it first calls
+    /// [`contiguous()`](Self::contiguous) to produce a dense copy, then
+    /// applies the view.
+    ///
+    /// This is the "always works" reshape — at the cost of a potential allocation.
+    ///
+    /// # Arguments
+    ///
+    /// - `new_shape`: The desired shape. Same rules as [`view`](Self::view).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the element count doesn't match or allocation fails.
     pub fn reshape(&self, new_shape: &[usize]) -> Result<Self> {
         if self.is_contiguous() {
             return self.view(new_shape);
@@ -53,7 +90,27 @@ impl Tensor {
 
     // ──────────────────────── dim manipulation ────────────────────────
 
-    /// Insert a size-1 dimension at `dim`. Always zero-copy.
+    /// Inserts a size-1 dimension at position `dim` (zero-copy).
+    ///
+    /// The stride for the new axis is set to the stride of the axis that
+    /// follows it (or `1` if appending at the end). This preserves the
+    /// existing memory layout.
+    ///
+    /// # Arguments
+    ///
+    /// - `dim`: Position to insert the new axis. Must be in `[0, ndim]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `dim > self.ndim()`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let u = t.unsqueeze(0)?;
+    /// assert_eq!(u.shape(), &[1, 3, 4]);
+    /// ```
     pub fn unsqueeze(&self, dim: usize) -> Result<Self> {
         let ndim = self.ndim();
         if dim > ndim {
@@ -70,7 +127,27 @@ impl Tensor {
         Ok(self.from_view_parts(shape, strides, self.storage_offset()))
     }
 
-    /// Drop the size-1 dimension at `dim`. Zero-copy.
+    /// Removes the size-1 dimension at position `dim` (zero-copy).
+    ///
+    /// The target dimension must have size exactly 1; otherwise an error
+    /// is returned.
+    ///
+    /// # Arguments
+    ///
+    /// - `dim`: The axis to remove. Must satisfy `shape[dim] == 1`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `dim >= self.ndim()`.
+    /// - Returns an error if `shape[dim] != 1`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[1, 3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let u = t.squeeze(0)?;
+    /// assert_eq!(u.shape(), &[3, 4]);
+    /// ```
     pub fn squeeze(&self, dim: usize) -> Result<Self> {
         let ndim = self.ndim();
         if dim >= ndim {
@@ -90,7 +167,18 @@ impl Tensor {
         Ok(self.from_view_parts(shape, strides, self.storage_offset()))
     }
 
-    /// Drop *all* size-1 dimensions.
+    /// Removes **all** size-1 dimensions from the tensor (zero-copy).
+    ///
+    /// If the tensor has shape `[1, 3, 1, 4]`, the result has shape `[3, 4]`.
+    /// If no dimensions are size-1, the tensor is returned unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[1, 3, 1, 4, 1], DataType::F32, DeviceType::Cpu)?;
+    /// let u = t.squeeze_all()?;
+    /// assert_eq!(u.shape(), &[3, 4]);
+    /// ```
     pub fn squeeze_all(&self) -> Result<Self> {
         let mut shape   = Dims::new();
         let mut strides = Dims::new();
@@ -105,8 +193,30 @@ impl Tensor {
 
     // ───────────────────────── permute / transpose ────────────────────
 
-    /// Zero-copy permute — only the metadata is reordered. The returned
-    /// view is usually non-contiguous; call `.contiguous()` to densify.
+    /// Reorders the dimensions according to `perm` (zero-copy).
+    ///
+    /// Only the metadata (shape and strides) is rearranged — the underlying
+    /// buffer is shared. The result is typically non-contiguous; call
+    /// [`contiguous()`](Self::contiguous) to produce a dense copy if needed.
+    ///
+    /// # Arguments
+    ///
+    /// - `perm`: A permutation of `[0, 1, ..., ndim-1]`. Must be the same
+    ///   length as `ndim` and contain each index exactly once.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `perm.len() != self.ndim()`.
+    /// - Returns an error if `perm` is not a valid permutation (duplicates or out-of-range).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let p = t.permute(&[2, 0, 1])?;
+    /// assert_eq!(p.shape(), &[4, 2, 3]);
+    /// assert!(!p.is_contiguous());
+    /// ```
     pub fn permute(&self, perm: &[usize]) -> Result<Self> {
         let ndim = self.ndim();
         if perm.len() != ndim {
@@ -132,7 +242,26 @@ impl Tensor {
         Ok(self.from_view_parts(shape, strides, self.storage_offset()))
     }
 
-    /// Swap two dimensions. Equivalent to `permute` with a 2-swap.
+    /// Swaps two dimensions in the tensor (zero-copy).
+    ///
+    /// Equivalent to a [`permute`](Self::permute) with a 2-element swap.
+    /// If `d0 == d1`, returns a clone with no change.
+    ///
+    /// # Arguments
+    ///
+    /// - `d0`, `d1`: The two dimension indices to swap. Both must be `< ndim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either dimension index is out of range.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let tr = t.transpose(0, 2)?;
+    /// assert_eq!(tr.shape(), &[4, 3, 2]);
+    /// ```
     pub fn transpose(&self, d0: usize, d1: usize) -> Result<Self> {
         let ndim = self.ndim();
         if d0 >= ndim || d1 >= ndim {
@@ -152,8 +281,33 @@ impl Tensor {
 
     // ───────────────────────────── slice family ────────────────────────
 
-    /// Zero-copy 1-D narrowing: keep `length` entries of `dim` starting at
-    /// `start`. Shape shrinks, strides unchanged, storage offset advances.
+    /// Narrows the tensor along a single dimension (zero-copy).
+    ///
+    /// Returns a view that keeps `length` elements along `dim`, starting at
+    /// index `start`. The shape shrinks on the specified dimension; strides
+    /// are unchanged; the storage offset advances by `start * strides[dim]`.
+    ///
+    /// This is the fundamental building block for all slicing operations
+    /// ([`Self::select`], [`Self::slice`], [`Self::chunk`], [`Self::split`], etc.).
+    ///
+    /// # Arguments
+    ///
+    /// - `dim`: The dimension to narrow along.
+    /// - `start`: The starting index (inclusive).
+    /// - `length`: The number of elements to keep.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `dim >= ndim`.
+    /// - Returns an error if `start + length > shape[dim]`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[10, 5], DataType::F32, DeviceType::Cpu)?;
+    /// let n = t.narrow(0, 2, 3)?; // rows 2..5
+    /// assert_eq!(n.shape(), &[3, 5]);
+    /// ```
     pub fn narrow(&self, dim: usize, start: usize, length: usize) -> Result<Self> {
         let ndim = self.ndim();
         if dim >= ndim {
@@ -181,13 +335,53 @@ impl Tensor {
         Ok(self.from_view_parts(shape, strides, offset))
     }
 
-    /// Select a single index along `dim`, dropping that dimension. Zero-copy.
+    /// Selects a single index along `dim`, reducing the rank by 1 (zero-copy).
+    ///
+    /// Equivalent to `self.narrow(dim, index, 1)?.squeeze(dim)?`. The selected
+    /// dimension is removed from the output shape.
+    ///
+    /// # Arguments
+    ///
+    /// - `dim`: The dimension to index into.
+    /// - `index`: The specific index to select.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `dim` or `index` is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[4, 3], DataType::F32, DeviceType::Cpu)?;
+    /// let row = t.select(0, 2)?; // third row
+    /// assert_eq!(row.shape(), &[3]);
+    /// ```
     pub fn select(&self, dim: usize, index: usize) -> Result<Self> {
         self.narrow(dim, index, 1)?.squeeze(dim)
     }
 
-    /// Multi-dimensional range slice. `ranges.len()` must equal `ndim`.
-    /// Equivalent to a chain of [`Tensor::narrow`] calls.
+    /// Multi-dimensional range slice (zero-copy).
+    ///
+    /// Applies one `Range<usize>` per dimension, equivalent to a chain of
+    /// [`narrow`](Self::narrow) calls. Each range specifies `[start, end)`
+    /// for its corresponding dimension.
+    ///
+    /// # Arguments
+    ///
+    /// - `ranges`: One range per dimension. Must satisfy `ranges.len() == ndim`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `ranges.len() != self.ndim()`.
+    /// - Returns an error if any range has `end < start` or exceeds the dimension size.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[10, 20], DataType::F32, DeviceType::Cpu)?;
+    /// let s = t.slice_ranges(&[2..5, 0..10])?;
+    /// assert_eq!(s.shape(), &[3, 10]);
+    /// ```
     pub fn slice_ranges(&self, ranges: &[Range<usize>]) -> Result<Self> {
         if ranges.len() != self.ndim() {
             return Err(Error::InvalidArgument(format!(
@@ -208,9 +402,21 @@ impl Tensor {
         Ok(out)
     }
 
-    /// Legacy-style offset/shape slice. Equivalent to applying
-    /// [`Tensor::narrow`] along every dimension. Zero-copy, correctness-
-    /// preserving for strided inputs (unlike the old implementation).
+    /// Legacy-style offset/shape slice (zero-copy).
+    ///
+    /// Selects a sub-region by specifying an offset and a new shape for
+    /// each dimension. Equivalent to applying
+    /// [`narrow(dim, offsets[dim], new_shape[dim])`](Self::narrow) for every dimension.
+    ///
+    /// # Arguments
+    ///
+    /// - `offsets`: Starting offset per dimension. Must have length `ndim`.
+    /// - `new_shape`: Desired size per dimension. Must have length `ndim`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `offsets.len()` or `new_shape.len()` differs from `ndim`.
+    /// - Returns an error if any offset + size exceeds the dimension.
     pub fn slice(&self, offsets: &[usize], new_shape: &[usize]) -> Result<Self> {
         let ndim = self.ndim();
         if offsets.len() != ndim || new_shape.len() != ndim {
@@ -226,8 +432,18 @@ impl Tensor {
         Ok(out)
     }
 
-    /// Zero-copy 1-D prefix on a rank-1 tensor — the common case for
-    /// "first `count` elements of a flat buffer".
+    /// Returns the first `count` elements along dimension 0 (zero-copy).
+    ///
+    /// Shorthand for `self.narrow(0, 0, count)`. Commonly used to take a
+    /// prefix of a flat (rank-1) buffer.
+    ///
+    /// # Arguments
+    ///
+    /// - `count`: Number of elements to keep along dimension 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `count > self.shape()[0]`.
     #[inline]
     pub fn view_prefix(&self, count: usize) -> Result<Self> {
         self.narrow(0, 0, count)
@@ -235,8 +451,30 @@ impl Tensor {
 
     // ───────────────────────── split / chunk ──────────────────────────
 
-    /// Split `dim` into `n` contiguous equal-length pieces via zero-copy
-    /// narrowing. `shape[dim]` must be divisible by `n`.
+    /// Splits `dim` into `n` equal-length chunks (zero-copy).
+    ///
+    /// Returns a `Vec` of `n` views, each covering a contiguous sub-range
+    /// of `dim`. The dimension size must be evenly divisible by `n`.
+    ///
+    /// # Arguments
+    ///
+    /// - `n`: Number of chunks. Must be `> 0` and divide `shape[dim]` evenly.
+    /// - `dim`: The dimension to split along.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `n == 0`.
+    /// - Returns an error if `dim` is out of range.
+    /// - Returns an error if `shape[dim] % n != 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[6, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let chunks = t.chunk(3, 0)?;
+    /// assert_eq!(chunks.len(), 3);
+    /// assert_eq!(chunks[0].shape(), &[2, 4]);
+    /// ```
     pub fn chunk(&self, n: usize, dim: usize) -> Result<Vec<Self>> {
         if n == 0 {
             return Err(Error::InvalidArgument("chunk: n must be > 0".into()).into());
@@ -258,7 +496,29 @@ impl Tensor {
         Ok(out)
     }
 
-    /// Split `dim` into chunks whose sizes sum to `shape[dim]`.
+    /// Splits `dim` into chunks of given sizes (zero-copy).
+    ///
+    /// Returns a `Vec` of views whose sizes along `dim` correspond to
+    /// the elements of `sizes`. The sum of `sizes` must equal `shape[dim]`.
+    ///
+    /// # Arguments
+    ///
+    /// - `sizes`: Slice specifying the size of each chunk. Sum must equal `shape[dim]`.
+    /// - `dim`: The dimension to split along.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `dim` is out of range.
+    /// - Returns an error if the sum of `sizes` doesn't equal `shape[dim]`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[10, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let parts = t.split(&[3, 7], 0)?;
+    /// assert_eq!(parts[0].shape(), &[3, 4]);
+    /// assert_eq!(parts[1].shape(), &[7, 4]);
+    /// ```
     pub fn split(&self, sizes: &[usize], dim: usize) -> Result<Vec<Self>> {
         let extent = self.shape().get(dim).copied().ok_or_else(|| {
             Error::InvalidArgument(format!("split: dim {} out of range", dim))
@@ -299,6 +559,12 @@ impl Tensor {
                 "expand: new_ndim {} < self.ndim {}", new_ndim, old_ndim
             )).into());
         }
+        if new_ndim > super::dims::MAX_RANK {
+            return Err(Error::InvalidArgument(format!(
+                "expand: resulting rank {} exceeds MAX_RANK={}",
+                new_ndim, super::dims::MAX_RANK
+            )).into());
+        }
         let pad = new_ndim - old_ndim;
         let mut shape   = Dims::new();
         let mut strides = Dims::new();
@@ -330,9 +596,30 @@ impl Tensor {
 
     // ──────────────────────── flatten / unflatten ─────────────────────
 
-    /// Collapse dimensions `[start, end]` into a single axis, returning a
-    /// zero-copy view when the collapsed region is storage-contiguous,
-    /// otherwise materialising via [`Tensor::contiguous`].
+    /// Collapses consecutive dimensions `[start, end]` into a single axis.
+    ///
+    /// If the collapsed region is storage-contiguous (i.e. the strides form
+    /// a proper row-major sub-sequence), this is zero-copy. Otherwise, the
+    /// tensor is first densified via [`contiguous()`](Self::contiguous) before
+    /// flattening.
+    ///
+    /// # Arguments
+    ///
+    /// - `start`: First dimension to merge (inclusive).
+    /// - `end`: Last dimension to merge (inclusive). Must satisfy `start <= end < ndim`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if the range is invalid.
+    /// - Returns an error if densification fails (allocation error).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let f = t.flatten(1, 2)?; // merge dims 1 and 2
+    /// assert_eq!(f.shape(), &[2, 12]);
+    /// ```
     pub fn flatten(&self, start: usize, end: usize) -> Result<Self> {
         let ndim = self.ndim();
         if start >= ndim || end >= ndim || start > end {
@@ -377,9 +664,29 @@ impl Tensor {
         dense.view(flat_shape.as_slice())
     }
 
-    /// Opposite of [`Tensor::flatten`]: replace `shape[dim]` with
-    /// `sizes[..]` (must multiply to the original extent). Zero-copy when
-    /// `self` is contiguous around `dim`.
+    /// Splits a single dimension into multiple dimensions (inverse of flatten).
+    ///
+    /// Replaces `shape[dim]` with the entries of `sizes` (which must multiply
+    /// to the original extent). Zero-copy when `self` is contiguous around `dim`.
+    ///
+    /// # Arguments
+    ///
+    /// - `dim`: The dimension to split.
+    /// - `sizes`: The new dimensions to replace `dim` with.
+    ///   Must satisfy `sizes.iter().product() == shape[dim]`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `dim >= ndim`.
+    /// - Returns an error if the product of `sizes` doesn't equal `shape[dim]`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::zeros(&[2, 12], DataType::F32, DeviceType::Cpu)?;
+    /// let u = t.unflatten(1, &[3, 4])?;
+    /// assert_eq!(u.shape(), &[2, 3, 4]);
+    /// ```
     pub fn unflatten(&self, dim: usize, sizes: &[usize]) -> Result<Self> {
         if dim >= self.ndim() {
             return Err(Error::InvalidArgument(format!(
@@ -416,9 +723,22 @@ impl Tensor {
 
 // ─────────────────────── shape-inference helper ────────────────────────
 
-/// Resolve a shape with at most one `-1` (encoded as `usize::MAX`) entry,
-/// validating that the product matches `numel`. Currently the codebase
-/// passes fully-specified shapes, so this primarily checks the product.
+/// Resolves a shape containing at most one `usize::MAX` (representing `-1`)
+/// by inferring that dimension's size from `numel`.
+///
+/// If `shape` is fully specified (no `usize::MAX` entries), validates that
+/// its product equals `numel`. If one entry is `usize::MAX`, computes the
+/// inferred value as `numel / product_of_known_dims`.
+///
+/// # Arguments
+///
+/// - `shape`: The requested shape, possibly with one `usize::MAX` entry.
+/// - `numel`: The total number of elements to match.
+///
+/// # Errors
+///
+/// - Returns an error if more than one dimension is `usize::MAX`.
+/// - Returns an error if the known dimensions don't evenly divide `numel`.
 fn normalize_shape_with_infer(shape: &[usize], numel: usize) -> Result<Dims> {
     const INFER: usize = usize::MAX;
     let infer_count = shape.iter().filter(|&&d| d == INFER).count();

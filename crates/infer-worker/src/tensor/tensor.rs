@@ -27,8 +27,58 @@ pub enum Tensor {
     BF16(TypedTensor<bf16>),
 }
 
-/// Dispatch a method call across every `Tensor` variant. All variants must
-/// support the same method signature (typical for `TypedTensor` getters).
+/// Dispatch a method call uniformly across all [`Tensor`] dtype variants.
+///
+/// This is the primary mechanism for implementing dtype-erased methods that need
+/// to invoke the same operation on the underlying [`TypedTensor<T>`]. It performs
+/// an exhaustive match over all five active variants (F32, I32, I8, F16, BF16)
+/// and calls the provided method on each typed tensor.
+///
+/// # Syntax
+///
+/// ```ignore
+/// dispatch_on_tensor!(self, method_name(arg1, arg2, ...))
+/// ```
+///
+/// This expands to:
+/// ```ignore
+/// match self {
+///     Tensor::F32(t)  => t.method_name(arg1, arg2, ...),
+///     Tensor::I32(t)  => t.method_name(arg1, arg2, ...),
+///     Tensor::I8(t)   => t.method_name(arg1, arg2, ...),
+///     Tensor::F16(t)  => t.method_name(arg1, arg2, ...),
+///     Tensor::BF16(t) => t.method_name(arg1, arg2, ...),
+/// }
+/// ```
+///
+/// # Requirements
+///
+/// - All five `TypedTensor<T>` variants must support the method with identical signature
+/// - Return types must be identical (the match expression produces a uniform type)
+/// - Typically used for getter methods that return `&[usize]`, `usize`, `bool`, etc.
+///
+/// # Examples
+///
+/// Getting shape from any dtype tensor:
+/// ```ignore
+/// pub fn shape(&self) -> &[usize] {
+///     dispatch_on_tensor!(self, shape())
+/// }
+/// ```
+///
+/// Getting the number of elements:
+/// ```ignore
+/// pub fn numel(&self) -> usize {
+///     dispatch_on_tensor!(self, numel())
+/// }
+/// ```
+///
+/// # Design Note
+///
+/// This macro is marked `#[macro_export]` so it's available to external crates
+/// for implementing similar dtype-dispatch patterns. It's one of the three
+/// critical mechanisms for the dtype-erasure pattern alongside `typed_ref!`
+/// and `typed_mut!`.
 #[macro_export]
 macro_rules! dispatch_on_tensor {
     ($self:expr, $method:ident ( $($args:expr),* $(,)? )) => {
@@ -123,15 +173,36 @@ impl Tensor {
         out
     }
 
+    /// Returns the number of dimensions (rank) of this tensor.
+    ///
+    /// Equivalent to `self.shape().len()`. A scalar has `ndim() == 0`,
+    /// a vector `ndim() == 1`, a matrix `ndim() == 2`, etc.
     #[inline]
     pub fn ndim(&self) -> usize { dispatch_on_tensor!(self, ndim()) }
 
+    /// Returns the total number of logical elements in this tensor.
+    ///
+    /// Equal to the product of all dimensions in [`shape()`](Self::shape).
+    /// For a rank-0 scalar tensor, `numel() == 1`.
     #[inline]
     pub fn numel(&self) -> usize { dispatch_on_tensor!(self, numel()) }
 
+    /// Returns whether the tensor is stored in C-contiguous (row-major) order.
+    ///
+    /// A contiguous tensor has strides that satisfy `strides[i] == strides[i+1] * shape[i+1]`
+    /// for all valid `i`, with `strides[ndim-1] == 1`.
+    ///
+    /// Many kernel operations require contiguous input. Use
+    /// [`contiguous()`](Self::contiguous) to produce a dense copy if needed.
     #[inline]
     pub fn is_contiguous(&self) -> bool { dispatch_on_tensor!(self, is_contiguous()) }
 
+    /// Returns the element offset from the buffer start to this tensor's
+    /// logical element 0.
+    ///
+    /// Measured in elements (not bytes). For freshly allocated tensors this
+    /// is always 0; views created by [`narrow`](Self::narrow) or
+    /// [`select`](Self::select) may have nonzero offsets.
     #[inline]
     pub fn storage_offset(&self) -> usize { dispatch_on_tensor!(self, offset_elems()) }
 
@@ -211,16 +282,74 @@ impl Tensor {
 
     // ─────────────────── typed accessors (read-only) ────────────────────
 
+    /// Attempts to borrow the inner `TypedTensor<f32>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `F32`.
     pub fn as_f32(&self)  -> Result<&TypedTensor<f32 >> { typed_ref!(self, F32 , "F32") }
+
+    /// Attempts to borrow the inner `TypedTensor<i32>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `I32`.
     pub fn as_i32(&self)  -> Result<&TypedTensor<i32 >> { typed_ref!(self, I32 , "I32") }
+
+    /// Attempts to borrow the inner `TypedTensor<i8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `I8`.
     pub fn as_i8(&self)   -> Result<&TypedTensor<i8  >> { typed_ref!(self, I8  , "I8") }
+
+    /// Attempts to borrow the inner `TypedTensor<f16>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `F16`.
     pub fn as_f16(&self)  -> Result<&TypedTensor<f16 >> { typed_ref!(self, F16 , "F16") }
+
+    /// Attempts to borrow the inner `TypedTensor<bf16>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `BF16`.
     pub fn as_bf16(&self) -> Result<&TypedTensor<bf16>> { typed_ref!(self, BF16, "BF16") }
 
+    /// Attempts to mutably borrow the inner `TypedTensor<f32>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `F32`.
     pub fn as_f32_mut(&mut self)  -> Result<&mut TypedTensor<f32 >> { typed_mut!(self, F32 , "F32") }
+
+    /// Attempts to mutably borrow the inner `TypedTensor<i32>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `I32`.
     pub fn as_i32_mut(&mut self)  -> Result<&mut TypedTensor<i32 >> { typed_mut!(self, I32 , "I32") }
+
+    /// Attempts to mutably borrow the inner `TypedTensor<i8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `I8`.
     pub fn as_i8_mut(&mut self)   -> Result<&mut TypedTensor<i8  >> { typed_mut!(self, I8  , "I8") }
+
+    /// Attempts to mutably borrow the inner `TypedTensor<f16>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `F16`.
     pub fn as_f16_mut(&mut self)  -> Result<&mut TypedTensor<f16 >> { typed_mut!(self, F16 , "F16") }
+
+    /// Attempts to mutably borrow the inner `TypedTensor<bf16>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this tensor's dtype is not `BF16`.
     pub fn as_bf16_mut(&mut self) -> Result<&mut TypedTensor<bf16>> { typed_mut!(self, BF16, "BF16") }
 
     // ───────────────────────── in-place fills ───────────────────────────
@@ -244,15 +373,15 @@ impl Tensor {
             }
             return Ok(());
         }
-        // CUDA path: round-trip through a small CPU tensor then H2D copy.
-        // (Hot-path fills should use dedicated kernels; this is the safe
-        // fallback for rare setup/initialisation code.)
+        // CUDA fill kernel not yet implemented.
         #[cfg(feature = "cuda")]
         {
-            let mut host = Self::empty(self.shape(), self.dtype(), DeviceType::Cpu)?;
-            host.fill_(value)?;
-            self.buffer_mut().copy_from(host.buffer())?;
-            return Ok(());
+            return Err(Error::InvalidArgument(
+                "fill_: CUDA fill kernel not implemented; \
+                 use a CPU tensor or implement a dedicated kernel"
+                    .into(),
+            )
+            .into());
         }
         #[cfg(not(feature = "cuda"))]
         unreachable!()
@@ -282,7 +411,10 @@ impl Tensor {
             ($variant:ident, $t:ty) => {{
                 let buf = match self {
                     Tensor::$variant(tt) => tt.buffer().clone(),
-                    _ => unreachable!(),
+                    // SAFETY: The outer match already resolved the variant;
+                    // the macro is expanded once per arm, so this is unreachable
+                    // by construction.
+                    _ => unreachable!("from_view_parts: variant mismatch (bug)"),
                 };
                 Tensor::$variant(TypedTensor::<$t>::from_parts(buf, shape, strides, offset_elems))
             }};
@@ -313,7 +445,62 @@ impl Tensor {
     }
 }
 
-// ── typed-accessor macros (private) ─────────────────────────────────────
+// ── Typed-accessor macros (crate-private dispatch for type-safe access) ─────
+//
+// These macros provide the inverse operation to `dispatch_on_tensor!`:
+// instead of calling a method uniformly on all variants, they extract a
+// reference (or mutable reference) to the underlying `TypedTensor<T>` for a
+// *specific* dtype, returning an error if the tensor has a different dtype.
+//
+// Both are extensively used in the `.as_f32()`, `.as_i32_mut()`, etc. public
+// methods and in private helpers that need type-specific access.
+
+/// Extract an immutable typed reference, or error if dtype mismatch.
+///
+/// # Syntax
+///
+/// ```ignore
+/// typed_ref!(tensor, F32, "F32")
+/// ```
+///
+/// This expands to:
+/// ```ignore
+/// match tensor {
+///     Tensor::F32(t) => Ok(t),
+///     other => Err(Error::InvalidArgument(format!(
+///         "typed access: expected F32, found {:?}", other.dtype()
+///     )).into()),
+/// }
+/// ```
+///
+/// # Arguments
+///
+/// - `$self`: The tensor to check (usually `self` or `&self`)
+/// - `$variant`: The enum variant name (F32, I32, I8, F16, or BF16) — **without** quotes
+/// - `$name`: A display name for error messages — **must be** a string literal (with quotes)
+///
+/// # Returns
+///
+/// - `Ok(&TypedTensor<T>)` if the tensor's variant matches
+/// - `Err(Error::InvalidArgument)` with a message like "typed access: expected F32, found BF16"
+///
+/// # Usage
+///
+/// Implementing `.as_f32()`:
+/// ```ignore
+/// pub fn as_f32(&self) -> Result<&TypedTensor<f32>> {
+///     typed_ref!(self, F32, "F32")
+/// }
+/// ```
+///
+/// Typically called by users who have a `Tensor` but need element-level access:
+/// ```ignore
+/// let tensor = Tensor::F32(...);
+/// if let Ok(typed) = tensor.as_f32() {
+///     let slice = typed.as_slice()?;
+///     // Now we can work with &[f32]
+/// }
+/// ```
 macro_rules! typed_ref {
     ($self:expr, $variant:ident, $name:literal) => {
         match $self {
@@ -324,6 +511,59 @@ macro_rules! typed_ref {
         }
     };
 }
+
+/// Extract a mutable typed reference, or error if dtype mismatch.
+///
+/// Identical to [`typed_ref!`] but returns `&mut TypedTensor<T>` instead.
+/// Requires the input to be mutable, enabling element modification.
+///
+/// # Syntax
+///
+/// ```ignore
+/// typed_mut!(tensor, F32, "F32")
+/// ```
+///
+/// This expands to:
+/// ```ignore
+/// match tensor {
+///     Tensor::F32(t) => Ok(t),
+///     other => {
+///         let got = other.dtype();
+///         Err(Error::InvalidArgument(format!(
+///             "typed access (mut): expected F32, found {:?}", got
+///         )).into())
+///     }
+/// }
+/// ```
+///
+/// # Arguments
+///
+/// - `$self`: The **mutable** tensor to check (usually `&mut self` or `&mut tensor`)
+/// - `$variant`: The enum variant name (F32, I32, I8, F16, or BF16) — **without** quotes
+/// - `$name`: A display name for error messages — **must be** a string literal (with quotes)
+///
+/// # Returns
+///
+/// - `Ok(&mut TypedTensor<T>)` if the tensor's variant matches
+/// - `Err(Error::InvalidArgument)` if dtype mismatch
+///
+/// # Usage
+///
+/// Implementing `.as_f32_mut()`:
+/// ```ignore
+/// pub fn as_f32_mut(&mut self) -> Result<&mut TypedTensor<f32>> {
+///     typed_mut!(self, F32, "F32")
+/// }
+/// ```
+///
+/// Modifying a typed tensor:
+/// ```ignore
+/// let mut tensor = Tensor::F32(...);
+/// if let Ok(typed) = tensor.as_f32_mut() {
+///     let slice = typed.as_slice_mut()?;
+///     slice[0] = 42.0;  // Modify element 0
+/// }
+/// ```
 macro_rules! typed_mut {
     ($self:expr, $variant:ident, $name:literal) => {
         match $self {

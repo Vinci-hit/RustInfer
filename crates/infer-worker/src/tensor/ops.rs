@@ -20,6 +20,18 @@ use super::tensor::Tensor;
 
 // ─────────────────────── CPU-indexing on f32 tensors ────────────────────
 
+/// Element indexing for CPU-resident, contiguous, F32 tensors.
+///
+/// Provides `tensor[i]` syntax for direct scalar access. This is intended
+/// for debugging and testing — for bulk data access, prefer
+/// [`TypedTensor::as_slice`](super::typed::TypedTensor::as_slice).
+///
+/// # Panics
+///
+/// - If the tensor is not on CPU.
+/// - If the tensor's dtype is not `F32`.
+/// - If the tensor is not contiguous.
+/// - If `index >= self.numel()`.
 impl Index<usize> for Tensor {
     type Output = f32;
 
@@ -37,6 +49,13 @@ impl Index<usize> for Tensor {
     }
 }
 
+/// Mutable element indexing for CPU-resident, contiguous, F32 tensors.
+///
+/// Provides `tensor[i] = val` syntax for direct scalar mutation.
+///
+/// # Panics
+///
+/// Same conditions as the immutable [`Index`] implementation.
 impl IndexMut<usize> for Tensor {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         if self.device().is_cuda() || self.dtype() != DataType::F32 {
@@ -143,44 +162,81 @@ impl MulAssign<f32> for Tensor {
 // ───────────────────── in-place element-wise methods ────────────────────
 
 impl Tensor {
-    /// `self[i] = silu(self[i])`. Panics on kernel failure.
-    pub fn silu_(&mut self) {
-        crate::op::activation::silu_inplace(self)
-            .expect("Tensor::silu_: kernel failed");
-    }
-
-    /// `self[i] = tanh(self[i])`. Panics on kernel failure.
-    pub fn tanh_(&mut self) {
-        crate::op::activation::tanh_inplace(self)
-            .expect("Tensor::tanh_: kernel failed");
-    }
-
-    /// Recoverable SiLU (result-returning variant).
+    /// Applies the SiLU (Sigmoid Linear Unit) activation in place.
+    ///
+    /// `SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))`
+    ///
+    /// Also known as the "swish" activation. Widely used in modern transformer
+    /// architectures (LLaMA, Mistral, etc.) for feed-forward network gating.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dtype/device combination is not supported
+    /// by the SiLU kernel.
     pub fn silu(&mut self) -> Result<()> {
         crate::op::activation::silu_inplace(self)
     }
 
-    /// Recoverable tanh.
+    /// Applies the tanh activation in place.
+    ///
+    /// `tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))`
+    ///
+    /// Maps all values to the range `(-1, 1)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dtype/device combination is not supported
+    /// by the tanh kernel.
     pub fn tanh(&mut self) -> Result<()> {
         crate::op::activation::tanh_inplace(self)
     }
 
-    /// `self[.., j] *= row[j]`, where `row.shape == [self.shape.last()]`.
+    /// Multiplies each row of `self` by the corresponding element of `row`.
+    ///
+    /// Semantics: `self[.., j] *= row[j]` where `row` is a 1-D tensor with
+    /// `row.shape[0] == self.shape[ndim-1]` (the last dimension).
+    ///
+    /// This is commonly used for applying per-channel scaling (e.g. RMSNorm
+    /// weight multiplication).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shapes are incompatible or dtype/device mismatch.
     pub fn mul_row(&mut self, row: &Tensor) -> Result<()> {
         crate::op::broadcast_mul::broadcast_mul_inplace(self, row)
     }
 
-    /// Interleaved RoPE applied in place.
+    /// Applies interleaved Rotary Position Embedding (RoPE) in place.
     ///
-    /// - `self`: `[seq, n_heads, head_dim]` (F32 or BF16 on device).
-    /// - `cos`, `sin`: `[seq, head_dim / 2]` in F32.
+    /// RoPE encodes positional information by rotating pairs of elements
+    /// using precomputed cosine and sine tables.
+    ///
+    /// # Arguments
+    ///
+    /// - `self`: The input tensor with shape `[seq, n_heads, head_dim]` (F32 or BF16).
+    /// - `cos`: Cosine table with shape `[seq, head_dim / 2]` in F32.
+    /// - `sin`: Sine table with shape `[seq, head_dim / 2]` in F32.
+    /// - `head_dim`: The dimension of each attention head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shapes/dtypes are incompatible or the kernel fails.
     pub fn rope_interleaved(&mut self, cos: &Tensor, sin: &Tensor, head_dim: usize) -> Result<()> {
         crate::op::rope_interleaved::apply_rope_interleaved(self, cos, sin, head_dim)
     }
 
-    /// Broadcast multiply: `out[..., j] = self[..., j] * scale[j]`.
+    /// Broadcast-multiplies `self` by a 1-D scale tensor, returning a new tensor.
     ///
-    /// Allocates a fresh contiguous output.
+    /// Semantics: `out[..., j] = self[..., j] * scale[j]` where `scale`
+    /// has the same length as the last dimension of `self`.
+    ///
+    /// Unlike [`mul_row`](Self::mul_row), this allocates a fresh contiguous
+    /// output rather than modifying `self` in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shapes are incompatible, dtype/device mismatch,
+    /// or allocation fails.
     pub fn broadcast_mul(&self, scale: &Tensor) -> Result<Tensor> {
         let mut out = Tensor::empty(self.shape(), self.dtype(), self.device())?;
         crate::op::broadcast_mul::broadcast_mul(self, scale, &mut out)?;

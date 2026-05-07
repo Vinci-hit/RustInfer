@@ -20,16 +20,29 @@ use super::dims::Dims;
 use super::tensor::Tensor;
 
 impl Tensor {
-    /// Return a contiguous copy. If `self` already owns its storage tightly
-    /// (contiguous, zero offset, and the backing buffer is exactly
-    /// `numel * sizeof(dtype)`) this is a cheap metadata clone (the
-    /// underlying buffer `Arc` is shared).
+    /// Returns a contiguous (row-major) tensor, potentially sharing storage.
     ///
-    /// Note that a *prefix-narrowed* view (e.g. `base.narrow(0, 0, n)` with
-    /// `n < base.shape[0]`) is contiguous with `storage_offset == 0` yet
-    /// shares a buffer larger than `numel`; for that case we deliberately
-    /// fall through to the strided-copy path so the returned tensor's
-    /// `buffer.len_bytes()` matches its logical size.
+    /// This is the universal escape hatch that every kernel can rely on to
+    /// get a contiguous input.
+    ///
+    /// # Behavior
+    ///
+    /// - If `self` already **owns its storage tightly** (contiguous, zero
+    ///   offset, buffer sized exactly to `numel * sizeof(dtype)`), returns
+    ///   a cheap `Arc` clone — no data copy.
+    /// - Otherwise, allocates a fresh buffer and gathers elements via the
+    ///   strided-copy path (identity permutation).
+    ///
+    /// # Note on "Tight Ownership"
+    ///
+    /// A *prefix-narrowed* view (e.g. `base.narrow(0, 0, n)` with `n < base.shape[0]`)
+    /// is contiguous with `storage_offset == 0`, yet shares the parent's oversized
+    /// buffer. Such views deliberately fall through to the copy path so the
+    /// returned tensor's `buffer.len_bytes()` matches its logical size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buffer allocation or the strided-copy kernel fails.
     pub fn contiguous(&self) -> Result<Self> {
         if self.owns_storage_tightly() {
             return Ok(self.clone());
@@ -45,10 +58,21 @@ impl Tensor {
         Ok(dst)
     }
 
-    /// Deep copy into a freshly allocated, contiguous, exclusive buffer.
-    /// Unlike [`Tensor::contiguous`] this always allocates, even when the
-    /// source already owns its storage tightly — callers asking for
-    /// `to_owned` want independent storage.
+    /// Creates a deep copy with freshly allocated, exclusive storage.
+    ///
+    /// Unlike [`contiguous()`](Self::contiguous), this **always** allocates a new
+    /// buffer — even if the source already owns its storage tightly. Use this when
+    /// you need independent storage that won't be affected by other views.
+    ///
+    /// # Behavior
+    ///
+    /// - If `self` owns storage tightly: allocates a new buffer and copies bytes.
+    /// - Otherwise (strided, offset, or oversized buffer): produces a contiguous
+    ///   copy via [`contiguous()`](Self::contiguous), which already allocates fresh storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if allocation or the copy operation fails.
     pub fn to_owned(&self) -> Result<Self> {
         if self.owns_storage_tightly() {
             let mut dst = Self::empty(self.shape(), self.dtype(), self.device())?;
@@ -61,9 +85,35 @@ impl Tensor {
         self.contiguous()
     }
 
-    /// `dst = self.permute(perm)` materialised into a caller-provided
-    /// destination. `dst` must already have the correct shape, dtype and
-    /// device. `self` may be contiguous *or* strided.
+    /// Materialises `self.permute(perm)` into a caller-provided destination tensor.
+    ///
+    /// Performs a strided gather: reads elements from `self` according to the
+    /// permuted axis order and writes them contiguously into `dst`. Both
+    /// contiguous and strided sources are supported.
+    ///
+    /// # Arguments
+    ///
+    /// - `perm`: A valid permutation of `[0, 1, ..., ndim-1]`.
+    /// - `dst`: Pre-allocated output tensor. Must satisfy:
+    ///   - Shape equals `self.shape()` permuted by `perm`.
+    ///   - Same dtype and device as `self`.
+    ///   - Contiguous with zero storage offset.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `perm` is invalid (wrong length, duplicates, out-of-range).
+    /// - Returns an error if `dst` shape/dtype/device doesn't match expectations.
+    /// - Returns an error if `dst` is not contiguous or has nonzero offset.
+    /// - Returns an error if the underlying kernel (CPU or CUDA) fails.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let src = Tensor::zeros(&[2, 3, 4], DataType::F32, DeviceType::Cpu)?;
+    /// let mut dst = Tensor::empty(&[4, 2, 3], DataType::F32, DeviceType::Cpu)?;
+    /// src.permute_into(&[2, 0, 1], &mut dst)?;
+    /// assert_eq!(dst.shape(), &[4, 2, 3]);
+    /// ```
     pub fn permute_into(&self, perm: &[usize], dst: &mut Tensor) -> Result<()> {
         let ndim = self.ndim();
         if perm.len() != ndim {
@@ -194,20 +244,13 @@ fn permute_into_cuda(src: &Tensor, perm: &[usize], dst: &mut Tensor) -> Result<(
         src.dtype(),
         DataType::F32 | DataType::BF16 | DataType::F16 | DataType::I32
     ) {
-        // I8: fall back via CPU round-trip. Not hot.
-        let cpu = src.to_device(DeviceType::Cpu)?;
-        let permuted = {
-            let mut tmp = Tensor::empty(
-                &perm.iter().map(|&i| src.shape()[i]).collect::<Vec<_>>(),
-                src.dtype(),
-                DeviceType::Cpu,
-            )?;
-            permute_into_cpu(&cpu, perm, &mut tmp)?;
-            tmp
-        };
-        let uploaded = permuted.to_device(src.device())?;
-        dst.buffer_mut().copy_from(uploaded.buffer())?;
-        return Ok(());
+        // I8 CUDA permute kernel not implemented.
+        return Err(Error::InvalidArgument(format!(
+            "permute_into_cuda: dtype {:?} has no CUDA permute kernel; \
+             implement permute_i8_forward or permute on CPU first",
+            src.dtype()
+        ))
+        .into());
     }
 
     let ndim = src.ndim();

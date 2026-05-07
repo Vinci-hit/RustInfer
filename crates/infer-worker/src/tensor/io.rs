@@ -81,7 +81,17 @@ impl Tensor {
 
     // ─────────────────────────── device moves ─────────────────────────
 
-    /// Migrate to CPU. Already on CPU → cheap clone.
+    /// Migrates this tensor to CPU memory, returning a new tensor.
+    ///
+    /// If the tensor is already on CPU, returns a cheap clone (the underlying
+    /// buffer `Arc` is shared — no data copy occurs).
+    ///
+    /// For CUDA → CPU transfers, the backing storage is first densified
+    /// (if needed) and then copied to a freshly allocated CPU buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if memory allocation or the device-to-host copy fails.
     pub fn to_cpu(&self) -> Result<Self> {
         if self.device() == DeviceType::Cpu {
             return Ok(self.clone());
@@ -104,7 +114,19 @@ impl Tensor {
         Tensor::from_buffer(cpu_buffer, src.shape(), src.dtype())
     }
 
-    /// Migrate to a specific CUDA device. Already there → cheap clone.
+    /// Migrates this tensor to a specific CUDA device, returning a new tensor.
+    ///
+    /// If the tensor is already on the target CUDA device, returns a cheap
+    /// clone (no data copy). Otherwise allocates GPU memory via the caching
+    /// allocator and performs a host-to-device (or device-to-device) copy.
+    ///
+    /// # Arguments
+    ///
+    /// - `device_id`: The CUDA device ordinal (0-based).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CUDA device selection, allocation, or the copy fails.
     #[cfg(feature = "cuda")]
     pub fn to_cuda(&self, device_id: i32) -> Result<Self> {
         if self.device() == DeviceType::Cuda(device_id) {
@@ -125,7 +147,15 @@ impl Tensor {
         Tensor::from_buffer(gpu_buffer, src.shape(), src.dtype())
     }
 
-    /// Convenience: go to any device. Same-device case is an Arc clone.
+    /// Migrates this tensor to an arbitrary device (CPU or CUDA).
+    ///
+    /// Convenience wrapper around [`to_cpu()`](Self::to_cpu) and
+    /// [`to_cuda()`](Self::to_cuda). If the tensor is already on the target
+    /// device, returns a cheap `Arc` clone with no data copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying migration fails.
     pub fn to_device(&self, device: DeviceType) -> Result<Self> {
         if self.device() == device {
             return Ok(self.clone());
@@ -139,8 +169,23 @@ impl Tensor {
 
     // ───────────────────────── dtype conversion ───────────────────────
 
-    /// Return a new tensor with data cast to `target_dtype`. Runs on CPU
-    /// via the generic [`cast_kernel`]; non-CPU sources are round-tripped.
+    /// Casts this tensor to a different data type, returning a new tensor.
+    ///
+    /// If the tensor already has `target_dtype`, returns a cheap clone.
+    /// Otherwise allocates a new tensor and element-wise converts via the
+    /// CPU [`cast_kernel`]. Non-CPU inputs are round-tripped through CPU
+    /// for the cast.
+    ///
+    /// # Supported Casts
+    ///
+    /// Currently supported conversions (extend `op::kernels::cpu::cast` for more):
+    /// - `F32` → `BF16`
+    /// - `BF16` → `F32`
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if the cast pair is not supported.
+    /// - Returns an error if memory allocation or device transfer fails.
     pub fn to_dtype(&self, target_dtype: DataType) -> Result<Self> {
         if self.dtype() == target_dtype {
             return Ok(self.clone());
@@ -183,8 +228,21 @@ impl Tensor {
 
     // ────────────────────────── safetensors ───────────────────────────
 
-    /// Load from a safetensors view, copying into a freshly allocated
-    /// tensor on `device`.
+    /// Loads a tensor from a safetensors [`TensorView`], allocating on `device`.
+    ///
+    /// Copies the raw bytes from the memory-mapped view into a freshly
+    /// allocated buffer. For CUDA targets, the data is first staged on CPU
+    /// then uploaded via [`to_cuda()`](Self::to_cuda).
+    ///
+    /// # Arguments
+    ///
+    /// - `view`: A reference to a safetensors tensor view (typically from an mmap'd file).
+    /// - `device`: The target device for the loaded tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the safetensors dtype is unsupported, allocation fails,
+    /// or the device transfer fails.
     pub fn from_view(view: &TensorView, device: DeviceType) -> Result<Self> {
         let (shape, dtype, data_bytes) = decode_tensor_view(view)?;
         match device {
@@ -202,17 +260,32 @@ impl Tensor {
         }
     }
 
-    /// Convenience: always load to CPU.
+    /// Loads a tensor from a safetensors view, always allocating on CPU.
+    ///
+    /// Convenience wrapper for `Self::from_view(view, DeviceType::Cpu)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the safetensors dtype is unsupported or allocation fails.
     pub fn from_view_on_cpu(view: &TensorView) -> Result<Self> {
         Self::from_view(view, DeviceType::Cpu)
     }
 
-    /// Borrowing zero-copy loader: the returned tensor aliases `view`'s
-    /// bytes.
+    /// Creates a tensor that borrows (zero-copy) from a safetensors view's bytes.
+    ///
+    /// The returned tensor directly aliases the memory of the safetensors
+    /// view without any copy. This is extremely fast for loading but requires
+    /// careful lifetime management.
     ///
     /// # Safety
-    /// The caller must ensure the mmap/storage behind `view` outlives the
-    /// returned Tensor.
+    ///
+    /// The caller must ensure that the underlying storage (typically an mmap'd
+    /// file) outlives the returned `Tensor`. Dropping the mmap while the tensor
+    /// is still in use results in use-after-free.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the safetensors dtype is unsupported.
     pub unsafe fn from_view_borrowed(view: &TensorView) -> Result<Self> {
         let (shape, dtype, data_bytes) = decode_tensor_view(view)?;
         let buffer = unsafe { Buffer::from_external_slice(data_bytes) };
@@ -221,10 +294,22 @@ impl Tensor {
 
     // ─────────────────────── cross-tensor copying ─────────────────────
 
-    /// Copy elements from `src` into `self`. Shapes must have identical
-    /// element counts and dtypes must match. For layout mismatches where
-    /// *either* side is non-contiguous we route through the strided-copy
-    /// (identity-permute) kernel so the call is always safe.
+    /// Copies elements from `src` into `self`.
+    ///
+    /// This is the primary way to move data between tensors. It handles:
+    /// - **Same-device contiguous**: fast bulk `memcpy` / `cudaMemcpy`.
+    /// - **Same-device strided**: routes through the strided-copy kernel.
+    /// - **Cross-device**: migrates `src` to `self`'s device first.
+    ///
+    /// # Requirements
+    ///
+    /// - `self.numel() == src.numel()` (element counts must match).
+    /// - `self.dtype() == src.dtype()` (no implicit casting).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shapes or dtypes are incompatible, or if the
+    /// underlying copy operation fails.
     pub fn copy_from(&mut self, src: &Tensor) -> Result<()> {
         self.validate_copy_compat(src, "copy_from")?;
 
@@ -260,8 +345,22 @@ impl Tensor {
         strided_copy_same_device(&dense, self)
     }
 
-    /// Stream-ordered variant of [`copy_from`](Self::copy_from) for CUDA.
-    /// CPU tensors fall back to the synchronous path.
+    /// Asynchronous (stream-ordered) variant of [`copy_from`](Self::copy_from) for CUDA.
+    ///
+    /// For contiguous same-device CUDA tensors, the copy is enqueued on the
+    /// given `stream` and returns immediately (the host does not wait).
+    /// For strided or cross-device cases, falls back to the synchronous path.
+    ///
+    /// CPU tensors are handled synchronously regardless of the stream argument.
+    ///
+    /// # Arguments
+    ///
+    /// - `src`: Source tensor (same dtype and element count as `self`).
+    /// - `stream`: The CUDA stream on which to enqueue the copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation or the underlying copy fails.
     #[cfg(feature = "cuda")]
     pub fn copy_from_async(
         &mut self,
@@ -286,8 +385,16 @@ impl Tensor {
         self.copy_from(src)
     }
 
-    /// Convenience: stream-ordered on current CUDA stream; plain
-    /// `copy_from` on CPU.
+    /// Copies elements from `src` into `self` on the current CUDA stream.
+    ///
+    /// Convenience method that automatically selects the appropriate strategy:
+    /// - On CUDA: uses [`copy_from_async`](Self::copy_from_async) with the
+    ///   current device stream.
+    /// - On CPU: falls back to synchronous [`copy_from`](Self::copy_from).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation or the underlying copy fails.
     #[inline]
     pub fn copy_from_on_current_stream(&mut self, src: &Tensor) -> Result<()> {
         #[cfg(feature = "cuda")]
@@ -302,8 +409,25 @@ impl Tensor {
 
     // ─────────────────────── raw i32 helpers ──────────────────────────
 
-    /// Write `count` host-side `i32`s into the first `count` slots of this
-    /// tensor's buffer. Used by Runner ↔ Server shared-memory plumbing.
+    /// Writes host-side `i32` values into the beginning of this tensor's buffer.
+    ///
+    /// Copies `count` elements from `src[..count]` into the first `count`
+    /// slots of the tensor's raw buffer (byte offset 0). This is primarily
+    /// used for Runner ↔ Server shared-memory plumbing where token IDs are
+    /// written directly.
+    ///
+    /// # Arguments
+    ///
+    /// - `src`: The host-side source slice (must have at least `count` elements).
+    /// - `count`: Number of `i32` values to copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count > src.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer copy operation fails.
     pub fn write_from_i32_host(&mut self, src: &[i32], count: usize) -> Result<()> {
         assert!(count <= src.len(), "count exceeds src length");
         let copy_bytes = count * std::mem::size_of::<i32>();
@@ -312,8 +436,19 @@ impl Tensor {
         Ok(())
     }
 
-    /// Read the first `count` `i32`s from this tensor's buffer back to a
-    /// host `Vec`.
+    /// Reads `i32` values from the beginning of this tensor's buffer to a host `Vec`.
+    ///
+    /// Copies `count` `i32` elements from the tensor's raw buffer (byte offset 0)
+    /// into a newly allocated `Vec<i32>` on the host. This is the read-side
+    /// counterpart to [`write_from_i32_host`](Self::write_from_i32_host).
+    ///
+    /// # Arguments
+    ///
+    /// - `count`: Number of `i32` values to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer copy operation fails.
     pub fn read_i32_to_host(&self, count: usize) -> Result<Vec<i32>> {
         let copy_bytes = count * std::mem::size_of::<i32>();
         let src_slice = self.buffer().slice(0, copy_bytes)?;
@@ -326,13 +461,22 @@ impl Tensor {
 
     // ───────────────────────── validation helper ──────────────────────
 
+    /// Validates that `self` and `src` are compatible for a copy operation.
+    ///
+    /// Checks that element counts and dtypes match. Used internally by
+    /// [`copy_from`](Self::copy_from) and its async variants.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if `self.numel() != src.numel()`.
+    /// - Returns an error if `self.dtype() != src.dtype()`.
     fn validate_copy_compat(&self, src: &Tensor, ctx: &str) -> Result<()> {
         if self.numel() != src.numel() {
-            anyhow::bail!(
+            return Err(Error::InvalidArgument(format!(
                 "{}: element count mismatch — dst shape {:?} ({} elems), \
                  src shape {:?} ({} elems)",
                 ctx, self.shape(), self.numel(), src.shape(), src.numel()
-            );
+            )).into());
         }
         if self.dtype() != src.dtype() {
             return Err(Error::InvalidArgument(format!(
@@ -346,6 +490,13 @@ impl Tensor {
 
 // ───────────────── module-private helpers ─────────────────
 
+/// Decodes a safetensors [`TensorView`] into its shape, dtype, and raw bytes.
+///
+/// Maps the safetensors-specific dtype enum to our internal [`DataType`].
+///
+/// # Errors
+///
+/// Returns an error if the safetensors dtype has no corresponding `DataType`.
 fn decode_tensor_view<'a>(view: &'a TensorView) -> Result<(&'a [usize], DataType, &'a [u8])> {
     let shape = view.shape();
     let st_dtype = view.dtype();
@@ -363,9 +514,20 @@ fn decode_tensor_view<'a>(view: &'a TensorView) -> Result<(&'a [usize], DataType
     Ok((shape, dtype, bytes))
 }
 
-/// Element-by-element stride-aware copy on a single device (CPU only for
-/// now). The CUDA path bounces through `permute_into`, which already
-/// handles strided src into contiguous dst.
+/// Performs an element-by-element stride-aware copy between two tensors on
+/// the same device (CPU only).
+///
+/// This handles the general case where either source or destination (or both)
+/// may have non-contiguous strides. Iterates over all elements using a
+/// multi-index decomposition, computing source and destination offsets from
+/// their respective strides.
+///
+/// For CUDA tensors, the strided copy goes through [`Tensor::permute_into`] instead,
+/// which already handles arbitrary source strides.
+///
+/// # Errors
+///
+/// Returns an error if invoked on non-CPU tensors or if dtype pair doesn't match.
 fn strided_copy_same_device(src: &Tensor, dst: &mut Tensor) -> Result<()> {
     if src.device() != DeviceType::Cpu {
         return Err(Error::InvalidArgument(

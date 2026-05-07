@@ -23,6 +23,52 @@ pub const MAX_RANK: usize = 8;
 /// - `Copy` — metadata ops never allocate.
 /// - `PartialEq` / `Eq` — shape comparisons are byte-for-byte.
 /// - Transparent `Deref<[usize]>` — plugs into any slice-taking API.
+///
+/// # Memory Layout
+///
+/// ```text
+/// Dims {
+///     data: [usize; 8],   // 64 bytes (on 64-bit platform)
+///     len: u8,            // 1 byte
+///                         // 7 bytes padding (usually)
+/// }
+/// // Total: ~72 bytes — fits comfortably in L1 cache
+/// ```
+///
+/// The `data` array is always allocated (no heap), but only the first `len`
+/// elements are logically valid. The remaining entries are zeroed but should
+/// be ignored.
+///
+/// # Invariants
+///
+/// - `len <= MAX_RANK` (always, enforced by all constructors)
+/// - Only `data[0..len]` is logically valid
+/// - `data[len..]` is zeroed (for determinism and debugging)
+/// - All operations preserve these invariants
+///
+/// # Examples
+///
+/// Creating and using a shape:
+/// ```ignore
+/// let shape = Dims::from_slice(&[2, 3, 4]);
+/// assert_eq!(shape.len(), 3);
+/// assert_eq!(shape.product(), 2 * 3 * 4);
+/// ```
+///
+/// Computing strides:
+/// ```ignore
+/// // For shape [2, 3, 4], row-major strides are [12, 4, 1]
+/// let strides = Dims::contiguous_strides_for(&[2, 3, 4]);
+/// assert_eq!(strides.as_slice(), &[12, 4, 1]);
+/// ```
+///
+/// Dynamic rank operations:
+/// ```ignore
+/// let mut dims = Dims::new();
+/// dims.push(5);
+/// dims.push(10);
+/// assert_eq!(dims.as_slice(), &[5, 10]);
+/// ```
 #[derive(Clone, Copy)]
 pub struct Dims {
     data: [usize; MAX_RANK],
@@ -113,9 +159,16 @@ impl Dims {
     }
 
     /// Product of all entries (1 for rank-0).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the product overflows `usize`. Callers that need graceful
+    /// handling should compute the product manually with `checked_mul`.
     #[inline]
     pub fn product(&self) -> usize {
-        self.as_slice().iter().copied().fold(1usize, usize::saturating_mul)
+        self.as_slice().iter().copied().fold(1usize, |acc, d| {
+            acc.checked_mul(d).expect("Dims::product: overflow")
+        })
     }
 
     /// Row-major (C-contiguous) strides for a given shape.
@@ -137,23 +190,27 @@ impl Default for Dims {
     fn default() -> Self { Self::new() }
 }
 
+/// Borrow as `&[usize]` (deref coercion).
 impl Deref for Dims {
     type Target = [usize];
     #[inline]
     fn deref(&self) -> &[usize] { self.as_slice() }
 }
 
+/// Mutable borrow as `&mut [usize]` (deref coercion).
 impl DerefMut for Dims {
     #[inline]
     fn deref_mut(&mut self) -> &mut [usize] { self.as_mut_slice() }
 }
 
+/// Element indexing by position.
 impl Index<usize> for Dims {
     type Output = usize;
     #[inline]
     fn index(&self, i: usize) -> &usize { &self.as_slice()[i] }
 }
 
+/// Mutable element indexing by position.
 impl IndexMut<usize> for Dims {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut usize {
@@ -161,30 +218,40 @@ impl IndexMut<usize> for Dims {
     }
 }
 
+/// Equality comparison (compares only populated elements).
 impl PartialEq for Dims {
     fn eq(&self, other: &Self) -> bool { self.as_slice() == other.as_slice() }
 }
 impl Eq for Dims {}
 
+/// Compare `Dims` against a slice (compares only populated elements).
 impl PartialEq<[usize]> for Dims {
     fn eq(&self, other: &[usize]) -> bool { self.as_slice() == other }
 }
+
+/// Compare `Dims` against a fixed-size array (compares only populated elements).
 impl<const N: usize> PartialEq<[usize; N]> for Dims {
     fn eq(&self, other: &[usize; N]) -> bool { self.as_slice() == other.as_slice() }
 }
 
+/// Debug formatting shows only populated elements.
 impl fmt::Debug for Dims {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.as_slice()).finish()
     }
 }
 
+/// Convert from slice reference (panics if rank > MAX_RANK).
 impl From<&[usize]> for Dims {
     fn from(s: &[usize]) -> Self { Self::from_slice(s) }
 }
+
+/// Convert from fixed-size array (panics if rank > MAX_RANK).
 impl<const N: usize> From<[usize; N]> for Dims {
     fn from(s: [usize; N]) -> Self { Self::from_slice(&s) }
 }
+
+/// Convert from `Vec` reference (panics if rank > MAX_RANK).
 impl From<&Vec<usize>> for Dims {
     fn from(s: &Vec<usize>) -> Self { Self::from_slice(s) }
 }
