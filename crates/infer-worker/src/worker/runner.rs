@@ -674,7 +674,7 @@ impl<M: LlmModel> ModelRunner<M> {
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 #[cfg(feature = "models")]
-mod tests {
+pub(crate) mod tests {
     //! Runner 端到端测试。
     //!
     //! 测试思路：主线程扮演 server，起 runner 在独立线程上 `run()`，
@@ -851,7 +851,7 @@ mod tests {
     /// 调用方保证 `tokens / positions / kv_lens` slice 在 step 完成前一直有效
     /// （drive_step 在调本函数和 set_input_ready / 等 output 之间持有这些
     /// `Vec`，自然满足）。
-    pub(super) fn fill_inputs_for_step<M: LlmModel>(
+    pub(crate) fn fill_inputs_for_step<M: LlmModel>(
         runner: &Arc<ModelRunner<M>>,
         tokens: &[i32],
         positions: &[i32],
@@ -926,7 +926,7 @@ mod tests {
     /// `past_kv_lens[i]` 是第 i 条 seq **进入本步前**已写在 KV cache 里的 token 数
     /// （= 该 seq 当前 KV 起始位置）。本函数会自动把它加上 q_len 得到 attention
     /// kernel 要求的 "current total KV length (past + new)"，写入 workspace。
-    pub(super) fn drive_step<M: LlmModel>(
+    pub(crate) fn drive_step<M: LlmModel>(
         runner: &Arc<ModelRunner<M>>,
         tokens: &[i32],
         positions: &[i32],
@@ -956,7 +956,7 @@ mod tests {
     }
 
     /// 构造 prefill StepMeta：单 seq，`q_len = prompt_len`，pos 从 0 开始。
-    pub(super) fn make_prefill_meta(slot: i32, prompt_len: usize) -> StepMeta {
+    pub(crate) fn make_prefill_meta(slot: i32, prompt_len: usize) -> StepMeta {
         let mut m = StepMeta::zeroed();
         m.num_prefill = 1;
         m.num_decode = 0;
@@ -969,7 +969,7 @@ mod tests {
     }
 
     /// 构造 single-seq decode StepMeta：一 seq，q_len = 1。
-    pub(super) fn make_single_decode_meta(slot: i32, pos: i32) -> StepMeta {
+    pub(crate) fn make_single_decode_meta(slot: i32, pos: i32) -> StepMeta {
         let mut m = StepMeta::zeroed();
         m.num_prefill = 0;
         m.num_decode = 1;
