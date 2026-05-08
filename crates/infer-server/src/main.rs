@@ -1,77 +1,61 @@
 use anyhow::Result;
-use axum::{Router, routing::{get, post}};
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{CorsLayer, Any};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use infer_server::{AppState, ZmqClient, api};
-
-#[derive(Parser, Debug)]
-#[command(name = "rustinfer-server")]
-#[command(about = "RustInfer API Server")]
-struct Args {
-    /// Server host
-    #[arg(long, default_value = "0.0.0.0", env = "HOST")]
-    host: String,
-
-    /// Server port
-    #[arg(short, long, default_value = "8000", env = "PORT")]
-    port: u16,
-
-    /// Scheduler endpoint (ZMQ地址)
-    #[arg(short, long, default_value = "ipc:///tmp/rustinfer.ipc", env = "SCHEDULER_ENDPOINT")]
-    engine_endpoint: String,
-
-    /// Tokenizer 路径（tokenizer.json 所在目录）
-    #[arg(short, long, env = "TOKENIZER_PATH")]
-    tokenizer: String,
-
-    /// Log level
-    #[arg(long, default_value = "info", env = "RUST_LOG")]
-    log_level: String,
-}
+use infer_server::{
+    AppState, ServerConfig, ZmqClient,
+    router::build_router,
+    state::ModelInfo,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let config = ServerConfig::parse();
 
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.into()),
+                .unwrap_or_else(|_| config.log_level.clone().into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     tracing::info!("RustInfer API Server starting...");
-    tracing::info!("  Scheduler endpoint: {}", args.engine_endpoint);
-    tracing::info!("  Tokenizer: {}", args.tokenizer);
+    tracing::info!("  Scheduler endpoint: {}", config.engine_endpoint);
+    tracing::info!("  Tokenizer: {}", config.tokenizer);
+    tracing::info!("  Model: {}", config.model_name);
 
     // 加载 tokenizer
-    let tokenizer_path = std::path::Path::new(&args.tokenizer).join("tokenizer.json");
+    let tokenizer_path = std::path::Path::new(&config.tokenizer).join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
     tracing::info!("Tokenizer loaded (vocab_size={})", tokenizer.get_vocab_size(true));
 
     // 连接 Scheduler
-    let zmq_client = ZmqClient::new(&args.engine_endpoint).await?;
+    let client = ZmqClient::new(&config.engine_endpoint, config.request_timeout_secs).await?;
     tracing::info!("Connected to scheduler");
 
-    let state = Arc::new(AppState { zmq_client, tokenizer });
+    // 构建应用状态
+    let model_info = ModelInfo {
+        model_id: config.model_name.clone(),
+        owned_by: "rustinfer".to_string(),
+    };
 
-    let app = Router::new()
-        .route("/v1/chat/completions", post(api::openai::chat_completions))
-        .route("/v1/models", get(api::openai::list_models))
-        .route("/health", get(api::health::health_check))
-        .route("/ready", get(api::health::ready_check))
-        .with_state(state)
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+    let state = Arc::new(AppState {
+        client,
+        tokenizer,
+        config: config.clone(),
+        model_info,
+    });
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    tracing::info!("API Server listening on http://{}:{}", args.host, args.port);
+    // 构建 Router
+    let app = build_router(state);
+
+    // 启动服务器
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    tracing::info!("API Server listening on http://{}:{}", config.host, config.port);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)

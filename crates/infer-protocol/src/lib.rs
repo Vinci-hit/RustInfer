@@ -29,6 +29,10 @@ pub struct InferenceRequest {
 
     /// 优先级 (0=normal, 1=high, -1=low)
     pub priority: i32,
+
+    /// Stop sequences（生成遇到这些字符串时停止）
+    #[serde(default)]
+    pub stop_sequences: Vec<String>,
 }
 
 /// Scheduler -> Server 的响应
@@ -42,6 +46,10 @@ pub struct InferenceResponse {
 
     /// 生成的 token ids（Server 负责 decode 为文本）
     pub output_token_ids: Vec<i32>,
+
+    /// 完成原因: "stop" (遇到 EOS/stop sequence) | "length" (达到 max_tokens)
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 
     /// 错误信息
     pub error: Option<String>,

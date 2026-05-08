@@ -302,6 +302,7 @@ impl Scheduler {
                     request_id: seq.request_id.clone(),
                     status: ResponseStatus::Success,
                     output_token_ids: seq.generated_tokens,
+                    finish_reason: None, // TODO: detect "stop" vs "length"
                     error: None,
                     metrics: InferenceMetrics {
                         total_ms: elapsed_ms,

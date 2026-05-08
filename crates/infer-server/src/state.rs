@@ -1,0 +1,31 @@
+//! 共享应用状态
+
+use std::sync::Arc;
+use tokenizers::Tokenizer;
+
+use crate::client::ZmqClient;
+use crate::config::ServerConfig;
+
+/// 模型信息
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    /// 模型 ID（用于 /v1/models 和请求校验）
+    pub model_id: String,
+    /// 模型所有者
+    pub owned_by: String,
+}
+
+/// 共享应用状态，通过 Axum State 注入到所有 handler
+pub struct AppState {
+    /// ZMQ 客户端（与 Scheduler 通信）
+    pub client: ZmqClient,
+    /// Tokenizer（Server 端负责 encode/decode）
+    pub tokenizer: Tokenizer,
+    /// 服务器配置
+    pub config: ServerConfig,
+    /// 加载的模型信息
+    pub model_info: ModelInfo,
+}
+
+/// 方便类型别名
+pub type SharedState = Arc<AppState>;

@@ -6,30 +6,34 @@ use crate::*;
 fn test_protocol_types() {
     let _req = InferenceRequest {
         request_id: "test".to_string(),
-        prompt: "hello".to_string(),
+        input_ids: vec![1, 2, 3],
         max_tokens: 100,
         temperature: 0.7,
         top_p: 0.9,
         top_k: 50,
-        stop_sequences: vec![],
         stream: false,
         priority: 0,
+        stop_sequences: vec!["<|eot_id|>".to_string()],
     };
 
     let _resp = InferenceResponse {
         request_id: "test".to_string(),
         status: ResponseStatus::Success,
-        text: Some("world".to_string()),
-        tokens: None,
-        num_tokens: 5,
+        output_token_ids: vec![10, 20, 30],
+        finish_reason: Some("stop".to_string()),
         error: None,
         metrics: InferenceMetrics {
-            prefill_ms: 100,
-            decode_ms: 200,
-            queue_ms: 10,
-            batch_size: 1,
-            tokens_per_second: 25.0,
-            decode_iterations: 5,
+            total_ms: 300,
+            num_tokens: 3,
+            tokens_per_second: 10.0,
         },
+    };
+
+    let _chunk = StreamChunk {
+        request_id: "test".to_string(),
+        chunk_type: ChunkType::Token,
+        token_id: Some(42),
+        finish_reason: None,
+        metrics: None,
     };
 }

@@ -1,13 +1,20 @@
-use anyhow::Result;
+//! Chat Template 系统
+//!
+//! 将 OpenAI 格式的 messages 转换为模型特定的 prompt 格式。
 
+use anyhow::Result;
+use crate::api::openai::types::ChatMessage;
+
+/// Chat Template trait
 pub trait ChatTemplate: Send + Sync {
-    fn apply(&self, messages: &[crate::api::openai::ChatMessage]) -> Result<String>;
+    fn apply(&self, messages: &[ChatMessage]) -> Result<String>;
 }
 
+/// Llama 3 格式
 pub struct Llama3Template;
 
 impl ChatTemplate for Llama3Template {
-    fn apply(&self, messages: &[crate::api::openai::ChatMessage]) -> Result<String> {
+    fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
         let mut prompt = String::from("<|begin_of_text|>");
 
         for msg in messages {
@@ -38,10 +45,11 @@ impl ChatTemplate for Llama3Template {
     }
 }
 
+/// Qwen 3 格式
 pub struct Qwen3Template;
 
 impl ChatTemplate for Qwen3Template {
-    fn apply(&self, messages: &[crate::api::openai::ChatMessage]) -> Result<String> {
+    fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
         let mut prompt = String::new();
 
         for msg in messages {
@@ -72,6 +80,7 @@ impl ChatTemplate for Qwen3Template {
     }
 }
 
+/// 根据模型名称获取对应的 chat template
 pub fn get_template(model_name: &str) -> Box<dyn ChatTemplate + Send + Sync> {
     match model_name.to_lowercase().as_str() {
         name if name.contains("qwen") => Box::new(Qwen3Template),
