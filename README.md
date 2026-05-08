@@ -39,6 +39,21 @@ RustInfer 采用**分层模块化架构**，核心包括：
 |--|-----------|------|
 | **Decode 吞吐量** | **920 tok/s** | **735 tok/s**  |
 
+### Online Serving（Continuous Batching）
+
+> **测试环境**: A10 GPU, Llama-3.2-1B-Instruct BF16, 1000 请求, concurrency=32, max_tokens=256, arrival_rate=20 req/s, Alpaca 数据集
+
+| 指标 | RustInfer | vLLM 0.11.2 |
+|------|-----------|-------------|
+| **系统吞吐** | 2847 tok/s | 2952 tok/s |
+| **p50 延迟** | **1245ms** | 1767ms |
+| **p90 延迟** | **1948ms** | 2562ms |
+| **p99 延迟** | 3010ms | **2830ms** |
+| **平均延迟** | **1158ms** | 1527ms |
+| **每请求 tps** | **125.4 tok/s** | 103.2 tok/s |
+
+> 系统吞吐持平，RustInfer 延迟全面占优（p50 低 30%，平均低 24%），单请求体感更快。
+
 ### INT4 AWQ 量化推理
 
 > Batch Size=1, compressed-tensors K-packed INT4, BF16 activation
