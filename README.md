@@ -54,6 +54,58 @@ RustInfer 采用**分层模块化架构**，核心包括：
 
 > 系统吞吐持平，RustInfer 延迟全面占优（p50 低 30%，平均低 24%），单请求体感更快。
 
+<details>
+<summary><b>复现步骤</b></summary>
+
+**1. 启动 RustInfer（三进程）**
+
+```bash
+# 构建
+cargo build --release --features cuda,models
+
+# Terminal 1: Worker
+./target/release/rustinfer-worker \
+  --model ~/models/Llama-3.2-1B-Instruct \
+  --model-type llama3 --device cuda:0
+
+# Terminal 2: Scheduler
+./target/release/rustinfer-scheduler \
+  --max-batch-tokens 4096 --max-batch-seqs 32
+
+# Terminal 3: HTTP Server
+./target/release/rustinfer-server \
+  --tokenizer ~/models/Llama-3.2-1B-Instruct \
+  --engine-endpoint ipc:///tmp/rustinfer.ipc
+```
+
+**2. 启动 vLLM**
+
+```bash
+pip install vllm==0.11.2
+vllm serve ~/models/Llama-3.2-1B-Instruct \
+  --port 8000 --max-model-len 4096 \
+  --gpu-memory-utilization 0.9 \
+  --served-model-name llama3
+```
+
+**3. 安装压测依赖并运行**
+
+```bash
+cd bench
+pip install aiohttp
+python bench_online.py \
+  --url http://localhost:8000 \
+  --num-requests 1000 \
+  --concurrency 32 \
+  --max-tokens 256 \
+  --arrival-rate 20 \
+  --dataset bench_prompts.json
+```
+
+> 数据集 `bench_prompts.json` 包含 51906 条 Alpaca prompts，请求按 20 req/s 泊松到达。
+
+</details>
+
 ### INT4 AWQ 量化推理
 
 > Batch Size=1, compressed-tensors K-packed INT4, BF16 activation
