@@ -27,6 +27,6 @@ pub mod metrics;
 pub mod utils;
 
 // Re-export key public types.
-pub use config::{SchedulerConfig, KvCacheMode};
+pub use config::{SchedulerConfig, KvCacheMode, SchedulerMode};
 pub use core::SchedulerEngine;
 pub use error::{SchedulerError, Result};

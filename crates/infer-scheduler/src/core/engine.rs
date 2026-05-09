@@ -10,7 +10,7 @@ use infer_worker::worker::protocol::StepOutput;
 
 use crate::cache::kv_manager::KvManager;
 use crate::cache::traits::CacheState;
-use crate::config::SchedulerConfig;
+use crate::config::{SchedulerConfig, SchedulerMode};
 use crate::error::Result;
 use crate::metrics::MetricsRecorder;
 use crate::policy::traits::{BatchPlan, RunningSet, SchedulingPolicy};
@@ -271,6 +271,14 @@ where
     pub(crate) async fn handle_step_output(&mut self, data: Vec<u8>) -> Result<()> {
         self.worker_busy = false;
 
+        match self.config.mode {
+            SchedulerMode::Llm => self.handle_step_output_llm(data).await,
+            SchedulerMode::Diffusion => self.handle_step_output_diffusion(data).await,
+        }
+    }
+
+    /// LLM mode: process per-token outputs, advance chunks, transition prefill→decode→finish.
+    async fn handle_step_output_llm(&mut self, data: Vec<u8>) -> Result<()> {
         use crate::transport::codec::Codec;
         let output: StepOutput = self.codec.decode(&data)?;
 
@@ -293,12 +301,11 @@ where
         let mut new_decoding = Vec::new();
         let mut remaining_prefilling = Vec::new();
         for mut seq in self.prefilling.drain(..) {
-            // Find the chunk size for this sequence.
             let chunk = chunk_sizes
                 .iter()
                 .find(|(id, _)| *id == seq.meta.id)
                 .map(|(_, size)| *size)
-                .unwrap_or(seq.state.prompt_len); // fallback: assume full prefill
+                .unwrap_or(seq.state.prompt_len);
 
             seq.advance_chunk(chunk);
             if seq.is_complete() {
@@ -318,6 +325,49 @@ where
                 let seq = self.decoding.remove(idx);
                 self.complete_sequence(seq).await?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Diffusion mode: entire batch completes at once. All prefilling → finished directly.
+    async fn handle_step_output_diffusion(&mut self, _data: Vec<u8>) -> Result<()> {
+        // In Diffusion mode, Worker returning means the entire batch is done.
+        // All prefilling sequences go directly to Finished (skip Decoding).
+        for seq in self.prefilling.drain(..) {
+            let request_id = seq.meta.id.clone();
+            let client_id = ClientId(seq.handle.client_id.0.clone());
+
+            // Mark prefill complete so we can transition.
+            let prompt_len = seq.state.prompt_len;
+            let mut seq = seq;
+            seq.advance_chunk(prompt_len);
+
+            // Prefilling → Decoding → Finished (instant transition, no tokens generated).
+            let decoding_seq = seq.start_decode();
+            let kv_alloc = decoding_seq.state.kv_alloc.clone();
+            let finished = decoding_seq.finish(FinishReason::Eos);
+
+            self.kv_manager.free(kv_alloc);
+
+            let elapsed_ms = finished.state.metrics.e2e_latency.as_millis() as u64;
+            let response = InferenceResponse {
+                request_id: request_id.0.clone(),
+                status: ResponseStatus::Success,
+                output_token_ids: vec![], // Diffusion output is image, not tokens
+                finish_reason: Some("stop".to_string()),
+                error: None,
+                metrics: InferenceMetrics {
+                    total_ms: elapsed_ms,
+                    num_tokens: 0,
+                    tokens_per_second: 0.0,
+                },
+            };
+
+            self.frontend.send_response(&client_id, response).await?;
+            self.metrics.record_completion(elapsed_ms, 0);
+
+            tracing::info!("Completed diffusion request {} in {}ms", request_id, elapsed_ms);
         }
 
         Ok(())

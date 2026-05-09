@@ -2,6 +2,22 @@
 
 use std::ops::Range;
 
+/// Scheduler operating mode — determines scheduling behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerMode {
+    /// LLM: prefill → decode, continuous batching, chunked prefill.
+    Llm,
+    /// Diffusion: batch-in batch-out, no KV cache management,
+    /// all requests in a batch finish together.
+    Diffusion,
+}
+
+impl Default for SchedulerMode {
+    fn default() -> Self {
+        Self::Llm
+    }
+}
+
 /// KV Cache management mode — determined at startup, immutable at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvCacheMode {
@@ -63,6 +79,9 @@ pub struct PriorityTier {
 /// Top-level scheduler configuration.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
+    // ─── Mode ───
+    /// Scheduler operating mode (LLM or Diffusion).
+    pub mode: SchedulerMode,
     // ─── Capacity limits ───
     /// Maximum number of concurrent sequences.
     pub max_num_seqs: usize,
@@ -103,6 +122,7 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
+            mode: SchedulerMode::default(),
             max_num_seqs: 32,
             max_batch_tokens: 1024,
             max_model_len: 4096,

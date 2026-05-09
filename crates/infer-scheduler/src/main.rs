@@ -7,9 +7,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use infer_scheduler::cache::kv_manager::KvManager;
 use infer_scheduler::cache::slot_kv_manager::SlotKvManager;
 use infer_scheduler::cache::paged_kv_manager::PagedKvManager;
-use infer_scheduler::config::{KvCacheMode, SchedulerConfig};
+use infer_scheduler::cache::noop_kv_manager::NoopKvManager;
+use infer_scheduler::config::{KvCacheMode, SchedulerConfig, SchedulerMode};
 use infer_scheduler::core::SchedulerEngine;
-use infer_scheduler::policy::ContinuousBatchingPolicy;
+use infer_scheduler::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
 use infer_scheduler::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
 
 #[derive(Parser, Debug)]
@@ -40,7 +41,11 @@ struct Args {
     #[arg(long, default_value = "4096")]
     max_model_len: usize,
 
-    /// KV cache mode: "slot" (default) or "paged:BLOCK_SIZE".
+    /// Scheduler mode: "llm" (default) or "diffusion".
+    #[arg(long, default_value = "llm")]
+    mode: String,
+
+    /// KV cache mode: "slot" (default) or "paged:BLOCK_SIZE". Only for LLM mode.
     #[arg(long, default_value = "slot")]
     kv_cache_mode: String,
 
@@ -81,8 +86,13 @@ async fn main() -> Result<()> {
         .init();
 
     let kv_mode = parse_kv_cache_mode(&args.kv_cache_mode);
+    let scheduler_mode = match args.mode.as_str() {
+        "diffusion" => SchedulerMode::Diffusion,
+        _ => SchedulerMode::Llm,
+    };
 
     tracing::info!("RustInfer Scheduler v0.2.0 starting...");
+    tracing::info!("  Mode: {:?}", scheduler_mode);
     tracing::info!("  Frontend: {}", args.frontend_endpoint);
     tracing::info!("  Worker PUSH: {}", args.worker_push_endpoint);
     tracing::info!("  Worker PULL: {}", args.worker_pull_endpoint);
@@ -94,6 +104,7 @@ async fn main() -> Result<()> {
 
     // Build config.
     let config = SchedulerConfig {
+        mode: scheduler_mode,
         max_num_seqs: args.max_batch_seqs,
         max_batch_tokens: args.max_batch_tokens,
         max_model_len: args.max_model_len,
@@ -105,18 +116,23 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Create KV manager based on mode.
-    let kv_manager: Box<dyn KvManager> = match kv_mode {
-        KvCacheMode::Slot => {
-            Box::new(SlotKvManager::new(args.max_batch_seqs, args.max_model_len))
-        }
-        KvCacheMode::Paged { block_size } => {
-            Box::new(PagedKvManager::new(config.num_gpu_blocks, block_size))
-        }
+    // Create KV manager and policy based on mode.
+    let kv_manager: Box<dyn KvManager> = match scheduler_mode {
+        SchedulerMode::Diffusion => Box::new(NoopKvManager::new()),
+        SchedulerMode::Llm => match kv_mode {
+            KvCacheMode::Slot => {
+                Box::new(SlotKvManager::new(args.max_batch_seqs, args.max_model_len))
+            }
+            KvCacheMode::Paged { block_size } => {
+                Box::new(PagedKvManager::new(config.num_gpu_blocks, block_size))
+            }
+        },
     };
 
-    // Create scheduling policy.
-    let policy = ContinuousBatchingPolicy::new(config.chunked_prefill_size);
+    let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
+        SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(args.max_batch_seqs)),
+        SchedulerMode::Llm => Box::new(ContinuousBatchingPolicy::new(config.chunked_prefill_size)),
+    };
 
     // Create transports.
     let frontend = ZmqFrontendTransport::new(&args.frontend_endpoint)?;

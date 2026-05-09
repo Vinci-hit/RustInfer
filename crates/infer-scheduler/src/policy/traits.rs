@@ -103,3 +103,20 @@ pub trait SchedulingPolicy: Send + Sync {
     /// Policy name for logging/metrics.
     fn name(&self) -> &'static str;
 }
+
+/// Blanket impl: `Box<dyn SchedulingPolicy>` is itself a SchedulingPolicy.
+impl SchedulingPolicy for Box<dyn SchedulingPolicy> {
+    fn schedule(
+        &self,
+        waiting: &WaitingQueue,
+        running: &RunningSet,
+        budget: &TokenBudget,
+        cache_state: &CacheState,
+    ) -> BatchPlan {
+        (**self).schedule(waiting, running, budget, cache_state)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
