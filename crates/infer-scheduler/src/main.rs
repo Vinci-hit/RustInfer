@@ -1,42 +1,77 @@
+//! RustInfer Scheduler binary entry point.
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use infer_scheduler::Scheduler;
+use infer_scheduler::cache::kv_manager::KvManager;
+use infer_scheduler::cache::slot_kv_manager::SlotKvManager;
+use infer_scheduler::cache::paged_kv_manager::PagedKvManager;
+use infer_scheduler::config::{KvCacheMode, SchedulerConfig};
+use infer_scheduler::core::SchedulerEngine;
+use infer_scheduler::policy::ContinuousBatchingPolicy;
+use infer_scheduler::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]
-#[command(about = "RustInfer Scheduler — continuous batching 调度器")]
+#[command(about = "RustInfer Scheduler — production-grade continuous batching scheduler")]
 struct Args {
-    /// ZMQ 前端地址（对接 HTTP Server, ROUTER socket）
+    /// ZMQ frontend endpoint (ROUTER socket, connects to HTTP server).
     #[arg(long, default_value = "ipc:///tmp/rustinfer.ipc")]
     frontend_endpoint: String,
 
-    /// ZMQ Worker PUSH 地址（发 PrefillBatchCmd）
+    /// ZMQ Worker PUSH endpoint (sends batch commands).
     #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-in.ipc")]
     worker_push_endpoint: String,
 
-    /// ZMQ Worker PULL 地址（收 StepOutput）
+    /// ZMQ Worker PULL endpoint (receives step outputs).
     #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-out.ipc")]
     worker_pull_endpoint: String,
 
-    /// 最大 batch tokens
+    /// Maximum batch tokens per iteration.
     #[arg(long, default_value = "1024")]
     max_batch_tokens: usize,
 
-    /// 最大 batch seqs (= slot 数量)
+    /// Maximum concurrent sequences (= slot count in slot mode).
     #[arg(long, default_value = "32")]
     max_batch_seqs: usize,
 
-    /// 日志级别
+    /// Maximum model sequence length (prompt + generation).
+    #[arg(long, default_value = "4096")]
+    max_model_len: usize,
+
+    /// KV cache mode: "slot" (default) or "paged:BLOCK_SIZE".
+    #[arg(long, default_value = "slot")]
+    kv_cache_mode: String,
+
+    /// Chunked prefill: max tokens per prefill chunk.
+    /// None (default) = no chunking (full prompt in one shot).
+    /// Set to e.g. 512 or 2048 to split long prompts across iterations.
+    #[arg(long)]
+    chunked_prefill_size: Option<usize>,
+
+    /// Log level.
     #[arg(long, default_value = "info")]
     log_level: String,
 }
 
-fn main() -> Result<()> {
+fn parse_kv_cache_mode(s: &str) -> KvCacheMode {
+    if s == "slot" {
+        KvCacheMode::Slot
+    } else if let Some(rest) = s.strip_prefix("paged:") {
+        let block_size: usize = rest.parse().unwrap_or(16);
+        KvCacheMode::Paged { block_size }
+    } else {
+        tracing::warn!("Unknown kv-cache-mode '{}', defaulting to slot", s);
+        KvCacheMode::Slot
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 初始化日志
+    // Initialize logging.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -45,42 +80,53 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("RustInfer Scheduler starting...");
+    let kv_mode = parse_kv_cache_mode(&args.kv_cache_mode);
+
+    tracing::info!("RustInfer Scheduler v0.2.0 starting...");
     tracing::info!("  Frontend: {}", args.frontend_endpoint);
     tracing::info!("  Worker PUSH: {}", args.worker_push_endpoint);
     tracing::info!("  Worker PULL: {}", args.worker_pull_endpoint);
     tracing::info!("  max_batch_seqs: {}", args.max_batch_seqs);
     tracing::info!("  max_batch_tokens: {}", args.max_batch_tokens);
+    tracing::info!("  max_model_len: {}", args.max_model_len);
+    tracing::info!("  kv_cache_mode: {:?}", kv_mode);
+    tracing::info!("  chunked_prefill_size: {:?}", args.chunked_prefill_size);
 
-    // 创建 ZMQ sockets
-    let zmq_ctx = zmq::Context::new();
+    // Build config.
+    let config = SchedulerConfig {
+        max_num_seqs: args.max_batch_seqs,
+        max_batch_tokens: args.max_batch_tokens,
+        max_model_len: args.max_model_len,
+        kv_cache_mode: kv_mode,
+        chunked_prefill_size: args.chunked_prefill_size,
+        frontend_endpoint: args.frontend_endpoint.clone(),
+        worker_push_endpoint: args.worker_push_endpoint.clone(),
+        worker_pull_endpoint: args.worker_pull_endpoint.clone(),
+        ..Default::default()
+    };
 
-    // Frontend ROUTER（对接 HTTP Server 的 DEALER）
-    let zmq_frontend = zmq_ctx.socket(zmq::ROUTER)?;
-    zmq_frontend.bind(&args.frontend_endpoint)?;
-    tracing::info!("Frontend ROUTER bound to {}", args.frontend_endpoint);
+    // Create KV manager based on mode.
+    let kv_manager: Box<dyn KvManager> = match kv_mode {
+        KvCacheMode::Slot => {
+            Box::new(SlotKvManager::new(args.max_batch_seqs, args.max_model_len))
+        }
+        KvCacheMode::Paged { block_size } => {
+            Box::new(PagedKvManager::new(config.num_gpu_blocks, block_size))
+        }
+    };
 
-    // Worker PUSH（发 PrefillBatchCmd）
-    let zmq_to_worker = zmq_ctx.socket(zmq::PUSH)?;
-    zmq_to_worker.bind(&args.worker_push_endpoint)?;
-    tracing::info!("Worker PUSH bound to {}", args.worker_push_endpoint);
+    // Create scheduling policy.
+    let policy = ContinuousBatchingPolicy::new(config.chunked_prefill_size);
 
-    // Worker PULL（收 StepOutput）
-    let zmq_from_worker = zmq_ctx.socket(zmq::PULL)?;
-    zmq_from_worker.bind(&args.worker_pull_endpoint)?;
-    tracing::info!("Worker PULL bound to {}", args.worker_pull_endpoint);
+    // Create transports.
+    let frontend = ZmqFrontendTransport::new(&args.frontend_endpoint)?;
+    let worker = ZmqWorkerTransport::new(&args.worker_push_endpoint, &args.worker_pull_endpoint)?;
 
-    // 启动 Scheduler
-    let scheduler = Scheduler::new(
-        zmq_frontend,
-        zmq_to_worker,
-        zmq_from_worker,
-        args.max_batch_tokens,
-        args.max_batch_seqs,
-    );
+    // Build and run engine.
+    let engine = SchedulerEngine::new(config, policy, kv_manager, frontend, worker);
 
-    tracing::info!("Scheduler running...");
-    scheduler.run();
+    tracing::info!("Scheduler engine running...");
+    engine.run().await?;
 
     Ok(())
 }
