@@ -1,6 +1,6 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use crate::state::metrics::SystemMetrics;
+use super::types::*;
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -8,54 +8,19 @@ pub struct ApiClient {
     client: reqwest::Client,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ChatRequest {
-    pub model: String,
-    pub messages: Vec<ChatMessage>,
-    pub max_tokens: Option<usize>,
-    pub stream: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatResponse {
-    #[allow(dead_code)]
-    pub id: String,
-    pub choices: Vec<Choice>,
-    pub usage: Usage,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Choice {
-    pub message: ChatMessage,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
-    pub completion_tokens: u32,
-    pub performance: Option<Performance>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Performance {
-    pub prefill_ms: u64,
-    pub decode_ms: u64,
-    pub tokens_per_second: f64,
-}
-
 impl ApiClient {
-    pub fn new() -> Self {
+    pub fn new(base_url: &str) -> Self {
         Self {
-            base_url: "http://localhost:8000".to_string(),
+            base_url: base_url.to_string(),
             client: reqwest::Client::new(),
         }
     }
 
+    pub fn default() -> Self {
+        Self::new("http://localhost:8000")
+    }
+
+    /// 非流式 chat completion
     pub async fn chat_completion(&self, request: ChatRequest) -> Result<ChatResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self.client
@@ -63,13 +28,53 @@ impl ApiClient {
             .json(&request)
             .send()
             .await?
+            .error_for_status()?
             .json()
             .await?;
         Ok(response)
     }
 
-    pub async fn get_system_metrics(&self) -> Result<SystemMetrics> {
-        let url = format!("{}/v1/metrics", self.base_url);
+    /// 流式 chat completion — 返回 Response 供逐行读取 SSE
+    pub async fn chat_completion_stream(&self, request: ChatRequest) -> Result<reqwest::Response> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let response = self.client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response)
+    }
+
+    /// 解析一行 SSE data
+    pub fn parse_sse_line(line: &str) -> Option<StreamChunk> {
+        let line = line.trim();
+        if line.is_empty() || line == "data: [DONE]" {
+            return None;
+        }
+        if let Some(data) = line.strip_prefix("data: ") {
+            serde_json::from_str(data).ok()
+        } else {
+            None
+        }
+    }
+
+    /// 获取可用模型列表
+    pub async fn list_models(&self) -> Result<Vec<ModelObject>> {
+        let url = format!("{}/v1/models", self.base_url);
+        let resp: ModelListResponse = self.client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.data)
+    }
+
+    /// 获取系统 metrics
+    pub async fn get_metrics(&self) -> Result<SystemMetrics> {
+        let url = format!("{}/metrics", self.base_url);
         let response = self.client
             .get(&url)
             .send()
@@ -77,5 +82,11 @@ impl ApiClient {
             .json()
             .await?;
         Ok(response)
+    }
+
+    /// 健康检查
+    pub async fn health_check(&self) -> bool {
+        let url = format!("{}/health", self.base_url);
+        self.client.get(&url).send().await.is_ok()
     }
 }
