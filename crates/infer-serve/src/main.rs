@@ -126,12 +126,20 @@ async fn main() -> Result<()> {
 
     let pid = std::process::id();
     let devices = args.devices();
+    let assigned_device = devices.first().copied().unwrap_or("cuda:0").to_string();
+    if devices.len() > 1 {
+        tracing::warn!(
+            "Phase 4 currently starts one WorkerGroup rank only; ignoring extra devices: {:?}",
+            &devices[1..],
+        );
+    }
     let model_name = args.effective_model_name();
 
     // Auto-generate IPC endpoints (unique per process to avoid conflicts).
     let frontend_ep = format!("ipc:///tmp/rustinfer-{}-frontend.ipc", pid);
     let worker_in_ep = format!("ipc:///tmp/rustinfer-{}-worker-in.ipc", pid);
     let worker_out_ep = format!("ipc:///tmp/rustinfer-{}-worker-out.ipc", pid);
+    let worker_control_ep = format!("ipc:///tmp/rustinfer-{}-worker-control.ipc", pid);
 
     tracing::info!("╔══════════════════════════════════════════════════╗");
     tracing::info!("║          RustInfer Serve v0.1.0                  ║");
@@ -157,6 +165,10 @@ async fn main() -> Result<()> {
         .arg("--frontend-endpoint").arg(&frontend_ep)
         .arg("--worker-push-endpoint").arg(&worker_in_ep)
         .arg("--worker-pull-endpoint").arg(&worker_out_ep)
+        .arg("--worker-control-endpoint").arg(&worker_control_ep)
+        .arg("--model").arg(&args.model)
+        .arg("--model-type").arg(&args.model_type)
+        .arg("--device").arg(&assigned_device)
         .arg("--max-batch-tokens").arg(args.max_batch_tokens.to_string())
         .arg("--max-batch-seqs").arg(args.max_batch_seqs.to_string())
         .arg("--max-model-len").arg(args.max_model_len.to_string())
@@ -179,29 +191,26 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  2. Start Worker(s) (one per device, connect to scheduler)
+    //  2. Start WorkerGroup rank 0 (single-rank group for now)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    for (idx, device) in devices.iter().enumerate() {
-        tracing::info!("[worker:{}] Starting on {}...", idx, device);
+    tracing::info!("[worker:0] Starting on {}...", assigned_device);
 
-        let worker_child = Command::new("rustinfer-worker")
-            .arg("--model").arg(&args.model)
-            .arg("--model-type").arg(&args.model_type)
-            .arg("--device").arg(device)
-            .arg("--worker-pull-endpoint").arg(&worker_in_ep)
-            .arg("--worker-push-endpoint").arg(&worker_out_ep)
-            .arg("--max-batch-tokens").arg(args.max_batch_tokens.to_string())
-            .arg("--max-batch-seqs").arg(args.max_batch_seqs.to_string())
-            .arg("--log-level").arg(&args.log_level)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context(format!("Failed to spawn rustinfer-worker for {}", device))?;
+    let worker_child = Command::new("rustinfer-worker")
+        .arg("--device").arg(&assigned_device)
+        .arg("--worker-pull-endpoint").arg(&worker_in_ep)
+        .arg("--worker-push-endpoint").arg(&worker_out_ep)
+        .arg("--worker-control-endpoint").arg(&worker_control_ep)
+        .arg("--max-batch-tokens").arg(args.max_batch_tokens.to_string())
+        .arg("--max-batch-seqs").arg(args.max_batch_seqs.to_string())
+        .arg("--log-level").arg(&args.log_level)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context(format!("Failed to spawn rustinfer-worker for {}", assigned_device))?;
 
-        tracing::info!("[worker:{}] PID={}", idx, worker_child.id());
-        children.push(ManagedChild::new(format!("worker:{}", idx), worker_child));
-    }
+    tracing::info!("[worker:0] PID={}", worker_child.id());
+    children.push(ManagedChild::new("worker:0", worker_child));
 
     // Wait for workers to connect and load model.
     tokio::time::sleep(Duration::from_millis(500)).await;

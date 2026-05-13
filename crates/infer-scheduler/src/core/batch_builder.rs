@@ -6,7 +6,10 @@ use crate::error::{Result, SchedulerError};
 use crate::request::lifecycle::{Sequence, Prefilling, Decoding, RequestId};
 use crate::transport::codec::{Codec, MsgPackCodec};
 
-use infer_worker::worker::protocol::{PrefillBatchCmd, SamplingParams as WorkerSamplingParams, RequestMeta as WorkerRequestMeta};
+use infer_worker::worker::protocol::{
+    CancelRequest, PrefillBatchCmd, RequestMeta as WorkerRequestMeta,
+    SamplingParams as WorkerSamplingParams, WorkerCommand,
+};
 
 /// Build a serialized batch command from the current prefilling + decoding sequences.
 ///
@@ -14,6 +17,12 @@ use infer_worker::worker::protocol::{PrefillBatchCmd, SamplingParams as WorkerSa
 /// (input_ids[num_computed_tokens..num_computed_tokens+chunk_size]).
 ///
 /// `chunk_sizes` maps request_id → tokens to process this iteration.
+pub fn build_cancel_request(request_id: &RequestId, codec: &MsgPackCodec) -> Result<Vec<u8>> {
+    codec.encode(&WorkerCommand::Cancel(CancelRequest {
+        request_id: request_id.0.clone(),
+    }))
+}
+
 pub fn build_batch(
     prefilling: &[Sequence<Prefilling>],
     decoding: &[Sequence<Decoding>],

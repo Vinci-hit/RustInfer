@@ -9,6 +9,8 @@
 //! 旧的 `shared_buffers / server / runner_dummy` 一套（基于 ZMQ +
 //! 老 Runner API）暂时从 crate 对外接口下架。待确认新 server 稳定后删除。
 pub mod batch_workspace;
+pub mod control_client;
+pub mod control_protocol;
 pub mod protocol;
 pub mod runner;
 pub mod server_new;

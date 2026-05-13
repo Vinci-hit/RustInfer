@@ -25,8 +25,10 @@ pub mod cache;
 pub mod transport;
 pub mod metrics;
 pub mod utils;
+pub mod worker_group;
 
 // Re-export key public types.
 pub use config::{SchedulerConfig, KvCacheMode, SchedulerMode};
 pub use core::SchedulerEngine;
 pub use error::{SchedulerError, Result};
+pub use worker_group::{WorkerGroup, WorkerGroupState};

@@ -12,6 +12,8 @@ use infer_scheduler::config::{KvCacheMode, SchedulerConfig, SchedulerMode};
 use infer_scheduler::core::SchedulerEngine;
 use infer_scheduler::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
 use infer_scheduler::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
+use infer_scheduler::WorkerGroup;
+use infer_worker::worker::control_protocol::LoadModel;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]
@@ -28,6 +30,26 @@ struct Args {
     /// ZMQ Worker PULL endpoint (receives step outputs).
     #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-out.ipc")]
     worker_pull_endpoint: String,
+
+    /// ZMQ Worker control endpoint (lifecycle handshake and readiness).
+    #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-control.ipc")]
+    worker_control_endpoint: String,
+
+    /// Optional model path to assign to the Worker via LoadModel.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Model type assigned via LoadModel when --model is present.
+    #[arg(long, default_value = "llama3")]
+    model_type: String,
+
+    /// Device assigned via LoadModel when --model is present.
+    #[arg(long, default_value = "cuda:0")]
+    device: String,
+
+    /// Static memory fraction reserved for model runtime planning.
+    #[arg(long, default_value = "1.0")]
+    mem_fraction_static: f32,
 
     /// Maximum batch tokens per iteration.
     #[arg(long, default_value = "1024")]
@@ -96,6 +118,9 @@ async fn main() -> Result<()> {
     tracing::info!("  Frontend: {}", args.frontend_endpoint);
     tracing::info!("  Worker PUSH: {}", args.worker_push_endpoint);
     tracing::info!("  Worker PULL: {}", args.worker_pull_endpoint);
+    tracing::info!("  Worker Control: {}", args.worker_control_endpoint);
+    tracing::info!("  Assigned model: {}", args.model.as_deref().unwrap_or("<worker-cli>"));
+    tracing::info!("  Assigned model type: {}", args.model_type);
     tracing::info!("  max_batch_seqs: {}", args.max_batch_seqs);
     tracing::info!("  max_batch_tokens: {}", args.max_batch_tokens);
     tracing::info!("  max_model_len: {}", args.max_model_len);
@@ -138,8 +163,45 @@ async fn main() -> Result<()> {
     let frontend = ZmqFrontendTransport::new(&args.frontend_endpoint)?;
     let worker = ZmqWorkerTransport::new(&args.worker_push_endpoint, &args.worker_pull_endpoint)?;
 
+    let load_model = args.model.clone().map(|model_path| LoadModel {
+        model_instance_id: "default".to_string(),
+        model_path,
+        model_type: args.model_type.clone(),
+        device: args.device.clone(),
+        max_batch_tokens: args.max_batch_tokens,
+        max_batch_seqs: args.max_batch_seqs,
+        max_model_len: args.max_model_len,
+        mem_fraction_static: args.mem_fraction_static,
+        tp_rank: 0,
+        tp_size: 1,
+        pp_rank: 0,
+        pp_size: 1,
+    });
+
+    // Phase 2 control-plane gate: optionally assign model, then wait for WorkerReady.
+    let ready = infer_scheduler::transport::worker_control::wait_for_worker_ready(
+        &args.worker_control_endpoint,
+        load_model,
+    )?;
+    tracing::info!(
+        "Worker ready gate opened: id={} model_instance_id={} model_type={} device={}",
+        ready.worker_id,
+        ready.model_instance_id,
+        ready.model_type,
+        ready.device,
+    );
+    let worker_group = WorkerGroup::from_single_ready(ready);
+    tracing::info!(
+        "WorkerGroup ready: group_id={} model_instance_id={} ranks={} effective_max_batch_tokens={} effective_max_batch_seqs={}",
+        worker_group.group_id,
+        worker_group.model_instance_id,
+        worker_group.rank_count(),
+        worker_group.effective_capacity.max_batch_tokens,
+        worker_group.effective_capacity.max_batch_seqs,
+    );
+
     // Build and run engine.
-    let engine = SchedulerEngine::new(config, policy, kv_manager, frontend, worker);
+    let engine = SchedulerEngine::new(config, policy, kv_manager, worker_group, frontend, worker);
 
     tracing::info!("Scheduler engine running...");
     engine.run().await?;

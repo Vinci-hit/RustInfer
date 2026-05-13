@@ -6,6 +6,35 @@ use crate::base::error::{Error, Result};
 // 调度器 → Worker (ZMQ_IN, MessagePack)
 // ═══════════════════════════════════════════
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkerCommand {
+    Prefill(PrefillBatchCmd),
+    Cancel(CancelRequest),
+    Drain(DrainWorker),
+    UnloadModel(UnloadModel),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRequest {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainWorker {
+    pub mode: DrainMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DrainMode {
+    Graceful,
+    Immediate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnloadModel {
+    pub model_instance_id: String,
+}
+
 /// 调度器发来的 prefill 请求 batch。
 ///
 /// `input_ids` 是所有请求的 token 拼成的一维数组，
@@ -144,6 +173,17 @@ impl SamplingParams {
 // ═══════════════════════════════════════════
 // Worker → 调度器 (ZMQ_OUT, MessagePack)
 // ═══════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelAck {
+    pub request_id: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainAck {
+    pub remaining_requests: usize,
+}
 
 /// 一步的全量输出，每个活跃序列都包含在内。
 #[derive(Debug, Clone, Serialize, Deserialize)]

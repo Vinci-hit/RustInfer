@@ -62,6 +62,8 @@ pub struct WorkerServer<M: LlmModel> {
     // 序列管理
     active_decodes: Vec<DecodeSeq>,
     pending_prefills: Vec<PrefillBatchCmd>,
+    pending_cancels: Vec<String>,
+    draining: bool,
 }
 
 impl<M: LlmModel> WorkerServer<M> {
@@ -80,6 +82,8 @@ impl<M: LlmModel> WorkerServer<M> {
             zmq_out,
             active_decodes: Vec::new(),
             pending_prefills: Vec::new(),
+            pending_cancels: Vec::new(),
+            draining: false,
         }
     }
 
@@ -132,9 +136,11 @@ impl<M: LlmModel> WorkerServer<M> {
 
             // 5. 判 EOS / max_tokens，发 ZMQ output，移除已完成序列
             self.process_eos_and_send_zmq(&output_tokens);
+            self.apply_pending_cancels();
 
-            // 6. 非阻塞收新 prefill
+            // 6. 非阻塞收新 prefill / cancel
             self.drain_zmq_prefills();
+            self.apply_pending_cancels();
 
             // 7. 组装下一步输入 → signal runner
             if let Err(e) = self.ensure_capacity_and_enqueue() {
@@ -477,20 +483,18 @@ impl<M: LlmModel> WorkerServer<M> {
 
     /// 阻塞等待一个有效的 prefill 消息（每 100ms 检查一次 shutdown）。
     /// 如果 runner 已 shutdown 则返回 None。
-    fn recv_next_prefill_blocking(&self) -> Option<PrefillBatchCmd> {
+    fn recv_next_prefill_blocking(&mut self) -> Option<PrefillBatchCmd> {
         loop {
-            if self.runner.is_shutdown() {
+            if self.runner.is_shutdown() || self.draining {
                 return None;
             }
             // 用 DONTWAIT + sleep 模拟带 shutdown 检测的 blocking recv
             match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
-                Ok(data) => match rmp_serde::from_slice::<PrefillBatchCmd>(&data) {
-                    Ok(cmd) => match self.validate_prefill(&cmd) {
-                        Ok(()) => return Some(cmd),
-                        Err(e) => tracing::error!("Reject invalid PrefillBatchCmd: {}", e),
-                    },
-                    Err(e) => tracing::error!("Failed to deserialize PrefillBatchCmd: {}", e),
-                },
+                Ok(data) => {
+                    if let Some(cmd) = self.handle_data_plane_message(&data) {
+                        return Some(cmd);
+                    }
+                }
                 Err(zmq::Error::EAGAIN) => {
                     // 没有消息，等一小段时间后重试
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -505,12 +509,8 @@ impl<M: LlmModel> WorkerServer<M> {
         loop {
             match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
                 Ok(data) => {
-                    match rmp_serde::from_slice::<PrefillBatchCmd>(&data) {
-                        Ok(cmd) => match self.validate_prefill(&cmd) {
-                            Ok(()) => self.pending_prefills.push(cmd),
-                            Err(e) => tracing::error!("Reject invalid PrefillBatchCmd: {}", e),
-                        },
-                        Err(e) => tracing::error!("Failed to deserialize PrefillBatchCmd: {}", e),
+                    if let Some(cmd) = self.handle_data_plane_message(&data) {
+                        self.pending_prefills.push(cmd);
                     }
                 }
                 Err(zmq::Error::EAGAIN) => break,
@@ -520,6 +520,137 @@ impl<M: LlmModel> WorkerServer<M> {
                 }
             }
         }
+    }
+
+    fn handle_data_plane_message(&mut self, data: &[u8]) -> Option<PrefillBatchCmd> {
+        if let Ok(cmd) = rmp_serde::from_slice::<WorkerCommand>(data) {
+            return self.handle_worker_command(cmd);
+        }
+
+        match rmp_serde::from_slice::<PrefillBatchCmd>(data) {
+            Ok(cmd) => self.accept_prefill(cmd),
+            Err(e) => {
+                tracing::error!("Failed to deserialize worker command or PrefillBatchCmd: {}", e);
+                None
+            }
+        }
+    }
+
+    fn handle_worker_command(&mut self, cmd: WorkerCommand) -> Option<PrefillBatchCmd> {
+        match cmd {
+            WorkerCommand::Prefill(cmd) => self.accept_prefill(cmd),
+            WorkerCommand::Cancel(cancel) => {
+                tracing::info!("CancelRequest queued request_id={}", cancel.request_id);
+                self.pending_cancels.push(cancel.request_id);
+                None
+            }
+            WorkerCommand::Drain(drain) => {
+                tracing::info!("DrainWorker mode={:?}", drain.mode);
+                self.draining = true;
+                if matches!(drain.mode, DrainMode::Immediate) {
+                    self.pending_prefills.clear();
+                    self.active_decodes.clear();
+                    self.runner.request_shutdown();
+                }
+                None
+            }
+            WorkerCommand::UnloadModel(unload) => {
+                tracing::info!("UnloadModel model_instance_id={}", unload.model_instance_id);
+                self.draining = true;
+                self.runner.request_shutdown();
+                None
+            }
+        }
+    }
+
+    fn accept_prefill(&self, cmd: PrefillBatchCmd) -> Option<PrefillBatchCmd> {
+        if self.draining {
+            tracing::warn!("Reject prefill while worker is draining");
+            return None;
+        }
+        match self.validate_prefill(&cmd) {
+            Ok(()) => Some(cmd),
+            Err(e) => {
+                tracing::error!("Reject invalid PrefillBatchCmd: {}", e);
+                None
+            }
+        }
+    }
+
+    fn apply_pending_cancels(&mut self) {
+        let cancels = std::mem::take(&mut self.pending_cancels);
+        for request_id in cancels {
+            let removed = self.cancel_request(&request_id);
+            tracing::info!("CancelRequest applied request_id={} removed={}", request_id, removed);
+        }
+    }
+
+    fn cancel_request(&mut self, request_id: &str) -> bool {
+        let before_active = self.active_decodes.len();
+        self.active_decodes.retain(|seq| seq.request_id != request_id);
+        let removed_active = before_active != self.active_decodes.len();
+
+        let mut removed_pending = false;
+        let pending = std::mem::take(&mut self.pending_prefills);
+        for cmd in pending {
+            match filter_prefill_cmd(cmd, request_id) {
+                Some(cmd) => self.pending_prefills.push(cmd),
+                None => removed_pending = true,
+            }
+        }
+
+        if removed_active || removed_pending {
+            unsafe {
+                self.runner.workspace_mut().invalidate_batch_member_cache();
+            }
+            #[cfg(feature = "cuda")]
+            self.runner.invalidate_decode_graphs();
+        }
+
+        removed_active || removed_pending
+    }
+}
+
+fn filter_prefill_cmd(cmd: PrefillBatchCmd, request_id: &str) -> Option<PrefillBatchCmd> {
+    let n = cmd.num_requests();
+    let mut input_ids = Vec::new();
+    let mut q_start_loc = Vec::new();
+    let mut num_computed_tokens = Vec::new();
+    let mut kv_slots = Vec::new();
+    let mut sampling_params = Vec::new();
+    let mut request_metas = Vec::new();
+
+    for i in 0..n {
+        let start = cmd.q_start_loc[i] as usize;
+        let end = if i + 1 < n {
+            cmd.q_start_loc[i + 1] as usize
+        } else {
+            cmd.input_ids.len()
+        };
+
+        if cmd.request_metas[i].request_id == request_id {
+            continue;
+        }
+
+        q_start_loc.push(input_ids.len() as u32);
+        input_ids.extend_from_slice(&cmd.input_ids[start..end]);
+        num_computed_tokens.push(cmd.num_computed_tokens[i]);
+        kv_slots.push(cmd.kv_slots[i]);
+        sampling_params.push(cmd.sampling_params[i].clone());
+        request_metas.push(cmd.request_metas[i].clone());
+    }
+
+    if q_start_loc.is_empty() {
+        None
+    } else {
+        Some(PrefillBatchCmd {
+            input_ids,
+            q_start_loc,
+            num_computed_tokens,
+            kv_slots,
+            sampling_params,
+            request_metas,
+        })
     }
 }
 

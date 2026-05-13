@@ -4,6 +4,7 @@
 
 pub mod traits;
 pub mod zmq_transport;
+pub mod worker_control;
 pub mod channel_transport;
 pub mod codec;
 

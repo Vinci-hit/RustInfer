@@ -15,11 +15,13 @@ use crate::error::Result;
 use crate::metrics::MetricsRecorder;
 use crate::policy::traits::{BatchPlan, RunningSet, SchedulingPolicy};
 use crate::request::handle::{ClientId, RequestHandle};
+use crate::request::active_table::ActiveRequestTable;
 use crate::request::lifecycle::*;
 use crate::request::queue::WaitingQueue;
 use crate::transport::codec::MsgPackCodec;
 use crate::transport::traits::{FrontendTransport, WorkerTransport};
 use crate::utils::token_budget::TokenBudget;
+use crate::worker_group::WorkerGroup;
 
 /// The main scheduler engine.
 pub struct SchedulerEngine<P, F, W>
@@ -31,11 +33,13 @@ where
     // ─── Subsystems ───
     policy: P,
     kv_manager: Box<dyn KvManager>,
+    worker_group: WorkerGroup,
 
     // ─── Request state ───
     waiting_queue: WaitingQueue,
     prefilling: Vec<Sequence<Prefilling>>,
     decoding: Vec<Sequence<Decoding>>,
+    active_requests: ActiveRequestTable,
 
     // ─── Transport ───
     frontend: F,
@@ -68,13 +72,16 @@ where
         config: SchedulerConfig,
         policy: P,
         kv_manager: Box<dyn KvManager>,
+        worker_group: WorkerGroup,
         frontend: F,
         worker: W,
     ) -> Self {
         tracing::info!(
-            "SchedulerEngine created: policy={}, kv_mode={}, max_seqs={}, max_tokens={}",
+            "SchedulerEngine created: policy={}, kv_mode={}, worker_group={}, ranks={}, max_seqs={}, max_tokens={}",
             policy.name(),
             kv_manager.mode_name(),
+            worker_group.group_id,
+            worker_group.rank_count(),
             config.max_num_seqs,
             config.max_batch_tokens,
         );
@@ -82,9 +89,11 @@ where
         Self {
             policy,
             kv_manager,
+            worker_group,
             waiting_queue: WaitingQueue::new(),
             prefilling: Vec::new(),
             decoding: Vec::new(),
+            active_requests: ActiveRequestTable::new(),
             frontend,
             worker,
             codec: MsgPackCodec,
@@ -136,6 +145,12 @@ where
             stop_sequences: vec![],
             arrival_time: Instant::now(),
         });
+
+        self.active_requests.insert_waiting(
+            meta.id.clone(),
+            meta.input_ids.len(),
+            meta.max_tokens,
+        );
 
         let handle = RequestHandle::new(client_id, request.stream);
         let seq = Sequence::new(meta.clone(), handle);
@@ -253,6 +268,8 @@ where
                     }
                 };
 
+                self.active_requests
+                    .mark_prefilling(&entry.request_id, kv_alloc.clone());
                 let prefilling_seq = seq.start_prefill(kv_alloc);
                 self.prefilling.push(prefilling_seq);
 
@@ -288,6 +305,7 @@ where
         for seq_token in &output.tokens {
             if let Some(seq) = self.decoding.iter_mut().find(|s| s.meta.id.0 == seq_token.request_id) {
                 seq.append_token(seq_token.token_id);
+                self.active_requests.record_generated_token(&seq.meta.id);
                 if seq_token.finished || seq.reached_max_tokens() {
                     if let Some(idx) = self.decoding.iter().position(|s| s.meta.id.0 == seq_token.request_id) {
                         finished_indices.push(idx);
@@ -309,6 +327,7 @@ where
 
             seq.advance_chunk(chunk);
             if seq.is_complete() {
+                self.active_requests.mark_decoding(&seq.meta.id);
                 new_decoding.push(seq.start_decode());
             } else {
                 remaining_prefilling.push(seq);
@@ -349,6 +368,7 @@ where
             let finished = decoding_seq.finish(FinishReason::Eos);
 
             self.kv_manager.free(kv_alloc);
+            let _ = self.active_requests.finish(&request_id);
 
             let elapsed_ms = finished.state.metrics.e2e_latency.as_millis() as u64;
             let response = InferenceResponse {
@@ -377,6 +397,7 @@ where
     async fn complete_sequence(&mut self, seq: Sequence<Decoding>) -> Result<()> {
         let request_id = seq.meta.id.clone();
         let client_id = ClientId(seq.handle.client_id.0.clone());
+        let _ = self.active_requests.finish(&request_id);
 
         let reason = if seq.reached_max_tokens() {
             FinishReason::MaxTokens
@@ -449,6 +470,28 @@ where
 
     pub(crate) fn worker_busy(&self) -> bool {
         self.worker_busy
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn worker_group(&self) -> &WorkerGroup {
+        &self.worker_group
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_request_count(&self) -> usize {
+        self.active_requests.len()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn cancel_request(&mut self, request_id: RequestId) -> Result<()> {
+        self.active_requests.mark_cancelling(&request_id);
+        if self.waiting_queue.remove(&request_id).is_some() {
+            let _ = self.active_requests.finish(&request_id);
+            return Ok(());
+        }
+
+        let data = crate::core::batch_builder::build_cancel_request(&request_id, &self.codec)?;
+        self.worker.send_batch(data).await
     }
 
     #[allow(dead_code)]
