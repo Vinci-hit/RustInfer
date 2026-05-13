@@ -5,7 +5,7 @@ members = [
     "crates/infer-frontend",
     "crates/infer-protocol",
     "crates/infer-scheduler",
-    "crates/infer-serve"
+    "crates/infer-launcher"
 ]
 resolver = "3"
 

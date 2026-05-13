@@ -242,7 +242,7 @@ RustInfer/
 │   │   ├── op/            # 算子库（CPU/CUDA）
 │   │   ├── model/         # 模型实现（Llama3 / Qwen3）
 │   │   └── cuda/          # CUDA集成
-│   ├── infer-server/      # HTTP API服务器（Axum）
+│   ├── infer-server/     # HTTP API服务器（Axum）
 │   │   ├── api/           # OpenAI兼容端点
 │   │   ├── chat/          # 聊天模板
 │   │   └── zmq_client.rs  # ZMQ客户端

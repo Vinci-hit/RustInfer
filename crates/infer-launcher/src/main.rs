@@ -1,6 +1,6 @@
-//! RustInfer Serve — unified entry point for LLM inference serving.
+//! RustInfer Launcher — unified entry point for LLM inference serving.
 //!
-//! Spawns and manages scheduler, worker(s), and HTTP server as child processes.
+//! Spawns and manages scheduler, worker, and HTTP server as child processes.
 //! One command to start the entire inference stack.
 
 use std::process::{Child, Command, Stdio};
@@ -11,8 +11,8 @@ use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
-#[command(name = "rustinfer-serve")]
-#[command(about = "RustInfer Serve — one command to start the full inference stack")]
+#[command(name = "rustinfer-launch")]
+#[command(about = "RustInfer Launcher — one command to start the full inference stack")]
 struct Args {
     /// Model path (directory containing model weights + tokenizer.json).
     #[arg(short, long)]
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
     let worker_control_ep = format!("ipc:///tmp/rustinfer-{}-worker-control.ipc", pid);
 
     tracing::info!("╔══════════════════════════════════════════════════╗");
-    tracing::info!("║          RustInfer Serve v0.1.0                  ║");
+    tracing::info!("║          RustInfer Launcher v0.1.0               ║");
     tracing::info!("╚══════════════════════════════════════════════════╝");
     tracing::info!("  Model: {}", args.model);
     tracing::info!("  Model type: {}", args.model_type);

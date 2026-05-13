@@ -1,10 +1,10 @@
 [package]
-name = "infer-serve"
+name = "infer-launcher"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "rustinfer-serve"
+name = "rustinfer-launch"
 path = "src/main.rs"
 
 [dependencies]

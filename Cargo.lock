@@ -2085,6 +2085,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-launcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "infer-protocol"
 version = "0.1.0"
 dependencies = [
@@ -2112,18 +2124,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zmq",
-]
-
-[[package]]
-name = "infer-serve"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "nix",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
