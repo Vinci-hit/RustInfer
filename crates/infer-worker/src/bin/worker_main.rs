@@ -9,10 +9,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use infer_worker::base::DeviceType;
 use infer_worker::model::llm::LlmModel;
+use infer_protocol::scheduler_to_worker_control::{LoadModel, SchedulerControlMessage};
+use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerState};
 use infer_worker::worker::control_client::WorkerControlClient;
-use infer_worker::worker::control_protocol::{
-    LoadModel, SchedulerControlMessage, WorkerCapacity, WorkerState,
-};
 use infer_worker::worker::runner::ModelRunner;
 use infer_worker::worker::WorkerServer;
 

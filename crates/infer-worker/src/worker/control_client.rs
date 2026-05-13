@@ -1,6 +1,7 @@
 use anyhow::Result;
 
-use crate::worker::control_protocol::*;
+use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+use infer_protocol::worker_to_scheduler_control::*;
 
 /// Minimal ZMQ + MessagePack control-plane client used by the Worker lifecycle.
 pub struct WorkerControlClient {

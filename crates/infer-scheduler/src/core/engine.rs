@@ -5,8 +5,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use infer_protocol::{InferenceRequest, InferenceResponse, InferenceMetrics, ResponseStatus};
-use infer_worker::worker::protocol::StepOutput;
+use infer_protocol::scheduler_to_server::{InferenceMetrics, InferenceResponse, ResponseStatus};
+use infer_protocol::server_to_scheduler::InferenceRequest;
+use infer_protocol::worker_to_scheduler::StepOutput;
 
 use crate::cache::kv_manager::KvManager;
 use crate::cache::traits::CacheState;

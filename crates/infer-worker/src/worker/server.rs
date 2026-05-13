@@ -2,7 +2,8 @@ use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::Arc;
 
 use crate::base::error::{Error, Result};
-use crate::worker::protocol::*;
+use infer_protocol::scheduler_to_worker::*;
+use infer_protocol::worker_to_scheduler::*;
 use crate::worker::shared_buffers::SharedBuffers;
 
 /// 一个活跃的 decode 序列
@@ -62,7 +63,8 @@ impl WorkerServer {
     }
 
     fn validate_prefill(&self, cmd: &PrefillBatchCmd) -> Result<()> {
-        cmd.validate(self.shared.max_batch_tokens, self.shared.max_seqs, self.shared.max_seqs)
+        cmd.validate(self.shared.max_batch_tokens, self.shared.max_seqs, self.shared.max_seqs)?;
+        Ok(())
     }
 
     fn recv_next_prefill_blocking(&mut self) -> PrefillBatchCmd {

@@ -11,9 +11,9 @@ use infer_scheduler::cache::noop_kv_manager::NoopKvManager;
 use infer_scheduler::config::{KvCacheMode, SchedulerConfig, SchedulerMode};
 use infer_scheduler::core::SchedulerEngine;
 use infer_scheduler::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
+use infer_protocol::scheduler_to_worker_control::LoadModel;
 use infer_scheduler::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
 use infer_scheduler::WorkerGroup;
-use infer_worker::worker::control_protocol::LoadModel;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]

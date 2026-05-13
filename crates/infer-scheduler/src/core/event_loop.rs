@@ -54,6 +54,6 @@ where
 
 /// Events that can occur in the scheduler loop.
 pub(crate) enum EngineEvent {
-    NewRequest(crate::error::Result<(crate::request::handle::ClientId, infer_protocol::InferenceRequest)>),
+    NewRequest(crate::error::Result<(crate::request::handle::ClientId, infer_protocol::server_to_scheduler::InferenceRequest)>),
     WorkerOutput(crate::error::Result<Vec<u8>>),
 }

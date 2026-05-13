@@ -10,6 +10,10 @@ _Avoid_: executor process, GPU process
 The process that owns request lifecycle, admission, Worker readiness, and control decisions. It sends requests to ready Workers and receives step outputs, but does not drive each decode step.
 _Avoid_: decode driver
 
+**Protocol Package**:
+The `infer-protocol` crate that owns all wire types shared between RustInfer processes. Protocol files are named by message direction, such as `server_to_scheduler`, `scheduler_to_worker`, and `worker_to_scheduler`.
+_Avoid_: defining wire types inside Worker or Scheduler crates
+
 **Control Plane**:
 The slow-path ZMQ + MessagePack protocol used for Worker lifecycle messages such as hello, ready, heartbeat, load, cancel, drain, and error reporting.
 _Avoid_: management API, admin channel
@@ -38,6 +42,7 @@ _Avoid_: cluster, pool when referring to ranks of one model instance
 
 - A **Scheduler** manages many **Workers**.
 - A **Worker Group** contains one or more **Workers** serving one model instance.
+- The **Protocol Package** defines **Control Plane** and **Data Plane** wire types.
 - The **Control Plane** manages **Worker Lifecycle**.
 - The **Data Plane** carries inference work.
 - **Autonomous Decode** runs inside the **Worker**.

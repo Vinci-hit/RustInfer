@@ -8,7 +8,8 @@ pub mod zmq_client;
 pub use zmq_client::ZmqClient;
 
 use anyhow::Result;
-use infer_protocol::{InferenceRequest, InferenceResponse, StreamChunk};
+use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+use infer_protocol::server_to_scheduler::InferenceRequest;
 use tokio::sync::mpsc;
 
 /// 推理客户端 trait

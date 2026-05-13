@@ -12,6 +12,7 @@ path = "src/bin/worker_main.rs"
 required-features = ["models"]
 
 [dependencies]
+infer-protocol = { path = "../infer-protocol" }
 anyhow = "1.0.100"
 dashmap = "6.1.0"
 half = { version = "2.7.1", features = ["std","num-traits"] }

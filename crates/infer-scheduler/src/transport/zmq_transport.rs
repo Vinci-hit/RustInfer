@@ -2,7 +2,8 @@
 //! with tokio channels bridging to the async world.
 
 use async_trait::async_trait;
-use infer_protocol::{InferenceRequest, InferenceResponse, StreamChunk};
+use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+use infer_protocol::server_to_scheduler::InferenceRequest;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, SchedulerError, TransportError};

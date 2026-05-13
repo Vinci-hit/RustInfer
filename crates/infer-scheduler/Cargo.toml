@@ -10,7 +10,6 @@ path = "src/main.rs"
 [dependencies]
 # Protocol
 infer-protocol = { path = "../infer-protocol" }
-infer-worker = { path = "../infer-worker" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

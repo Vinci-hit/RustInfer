@@ -1,6 +1,11 @@
 //! Worker control plane over ZMQ ROUTER + MessagePack.
 
-use infer_worker::worker::control_protocol::*;
+use infer_protocol::scheduler_to_worker_control::{
+    LoadModel, SchedulerControlMessage, SchedulerHello,
+};
+use infer_protocol::worker_to_scheduler_control::{
+    WorkerControlMessage, WorkerReady, WORKER_CONTROL_PROTOCOL_VERSION,
+};
 
 use crate::error::{Result, SchedulerError, TransportError};
 

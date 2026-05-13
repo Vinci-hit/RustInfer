@@ -7,7 +7,8 @@
 //! - 流式请求用 `tokio::sync::mpsc` 逐 chunk 回传
 
 use anyhow::Result;
-use infer_protocol::{InferenceRequest, InferenceResponse, StreamChunk, ChunkType};
+use infer_protocol::scheduler_to_server::{ChunkType, InferenceResponse, StreamChunk};
+use infer_protocol::server_to_scheduler::InferenceRequest;
 use std::collections::HashMap;
 use std::thread;
 use tokio::sync::{mpsc, oneshot};

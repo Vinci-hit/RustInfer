@@ -4,7 +4,7 @@
 //! Today it contains one rank on one GPU. The shape deliberately matches the
 //! future TP/PP case where multiple ranks must become ready as a group.
 
-use infer_worker::worker::control_protocol::{WorkerCapacity, WorkerReady};
+use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerReady};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerGroupState {

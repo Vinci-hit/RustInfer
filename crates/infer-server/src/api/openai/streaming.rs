@@ -5,7 +5,7 @@
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
-use infer_protocol::{ChunkType, StreamChunk};
+use infer_protocol::scheduler_to_server::{ChunkType, StreamChunk};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokenizers::Tokenizer;

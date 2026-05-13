@@ -38,7 +38,7 @@ pub async fn chat_completions(
 
     // 4. 构建 InferenceRequest
     let request_id = uuid::Uuid::new_v4().to_string();
-    let engine_req = infer_protocol::InferenceRequest {
+    let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         request_id: request_id.clone(),
         input_ids,
         max_tokens: req.max_tokens.unwrap_or(2048),
@@ -77,7 +77,7 @@ pub async fn chat_completions(
             .map_err(AppError::internal)?;
 
         // 检查错误
-        if let infer_protocol::ResponseStatus::Error = engine_resp.status {
+        if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
             return Err(AppError::internal(anyhow::anyhow!(
                 "Engine error: {}",
                 engine_resp.error.unwrap_or_else(|| "Unknown".to_string())

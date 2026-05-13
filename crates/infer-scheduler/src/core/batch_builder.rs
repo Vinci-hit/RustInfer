@@ -6,7 +6,7 @@ use crate::error::{Result, SchedulerError};
 use crate::request::lifecycle::{Sequence, Prefilling, Decoding, RequestId};
 use crate::transport::codec::{Codec, MsgPackCodec};
 
-use infer_worker::worker::protocol::{
+use infer_protocol::scheduler_to_worker::{
     CancelRequest, PrefillBatchCmd, RequestMeta as WorkerRequestMeta,
     SamplingParams as WorkerSamplingParams, WorkerCommand,
 };
@@ -104,5 +104,5 @@ fn build_prefill_batch_cmd(
         request_metas,
     };
 
-    codec.encode(&cmd)
+    codec.encode(&WorkerCommand::Prefill(cmd))
 }

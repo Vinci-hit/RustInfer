@@ -1,7 +1,8 @@
 //! Transport traits — abstract async communication.
 
 use async_trait::async_trait;
-use infer_protocol::{InferenceRequest, InferenceResponse, StreamChunk};
+use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+use infer_protocol::server_to_scheduler::InferenceRequest;
 
 use crate::error::Result;
 use crate::request::handle::ClientId;

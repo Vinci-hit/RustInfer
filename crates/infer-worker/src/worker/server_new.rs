@@ -21,7 +21,8 @@ use crate::base::DeviceType;
 use crate::base::error::{Error, Result};
 use crate::model::llm::LlmModel;
 use crate::model::runtime::InferenceState;
-use crate::worker::protocol::*;
+use infer_protocol::scheduler_to_worker::*;
+use infer_protocol::worker_to_scheduler::*;
 use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta};
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -478,7 +479,8 @@ impl<M: LlmModel> WorkerServer<M> {
     /// 验证 prefill 消息合法性。
     fn validate_prefill(&self, cmd: &PrefillBatchCmd) -> Result<()> {
         let ws = unsafe { self.runner.workspace() };
-        cmd.validate(ws.max_batch_tokens, ws.max_batch_seqs, ws.max_batch_seqs)
+        cmd.validate(ws.max_batch_tokens, ws.max_batch_seqs, ws.max_batch_seqs)?;
+        Ok(())
     }
 
     /// 阻塞等待一个有效的 prefill 消息（每 100ms 检查一次 shutdown）。
