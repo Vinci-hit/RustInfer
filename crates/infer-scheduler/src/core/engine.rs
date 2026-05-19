@@ -5,7 +5,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use infer_protocol::scheduler_to_server::{ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus};
+use infer_protocol::scheduler_to_server::{
+    ChunkType, ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
+};
 use infer_protocol::server_to_scheduler::{InferenceModality, InferenceRequest};
 use infer_protocol::worker_to_scheduler::{DiffusionBatchOutput, DiffusionOutputStatus, StepOutput};
 
@@ -382,10 +384,25 @@ where
 
         // 2. Process generated tokens. Worker owns EOS/max_tokens decision and returns finished.
         let mut finished_indices: Vec<usize> = Vec::new();
+        let mut token_chunks: Vec<(ClientId, StreamChunk)> = Vec::new();
         for token in &output.tokens {
             if let Some(seq) = self.decoding.iter_mut().find(|s| s.meta.sequence_id.0 == token.sequence_id) {
                 seq.append_token(token.token_id);
                 self.active_requests.record_generated_token(&seq.meta.id);
+
+                if seq.meta.stream {
+                    token_chunks.push((
+                        ClientId(seq.handle.client_id.0.clone()),
+                        StreamChunk {
+                            request_id: seq.meta.id.0.clone(),
+                            chunk_type: ChunkType::Token,
+                            token_id: Some(token.token_id),
+                            finish_reason: None,
+                            metrics: None,
+                        },
+                    ));
+                }
+
                 if token.finished || seq.reached_max_tokens() {
                     if let Some(idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == token.sequence_id) {
                         finished_indices.push(idx);
@@ -394,6 +411,11 @@ where
             } else {
                 tracing::warn!("Generated token for unknown sequence_id={}", token.sequence_id);
             }
+        }
+
+        // Send token chunks before done chunks for sequences that finish in this same step.
+        for (client_id, chunk) in token_chunks {
+            self.frontend.send_stream_chunk(&client_id, chunk).await?;
         }
 
         finished_indices.sort_unstable();
@@ -467,6 +489,7 @@ where
     async fn complete_sequence(&mut self, seq: Sequence<Decoding>) -> Result<()> {
         let request_id = seq.meta.id.clone();
         let client_id = ClientId(seq.handle.client_id.0.clone());
+        let stream = seq.meta.stream;
         let _ = self.active_requests.finish(&request_id);
 
         let reason = if seq.reached_max_tokens() {
@@ -493,21 +516,33 @@ where
             0.0
         };
 
-        let response = InferenceResponse {
-            request_id: request_id.0.clone(),
-            status: ResponseStatus::Success,
-            output_token_ids: finished.state.output_tokens,
-            images: vec![],
-            finish_reason: Some("stop".to_string()),
-            error: None,
-            metrics: InferenceMetrics {
-                total_ms: elapsed_ms,
-                num_tokens,
-                tokens_per_second,
-            },
+        let metrics = InferenceMetrics {
+            total_ms: elapsed_ms,
+            num_tokens,
+            tokens_per_second,
         };
 
-        self.frontend.send_response(&client_id, response).await?;
+        if stream {
+            self.frontend.send_stream_chunk(&client_id, StreamChunk {
+                request_id: request_id.0.clone(),
+                chunk_type: ChunkType::Done,
+                token_id: None,
+                finish_reason: Some("stop".to_string()),
+                metrics: Some(metrics.clone()),
+            }).await?;
+        } else {
+            let response = InferenceResponse {
+                request_id: request_id.0.clone(),
+                status: ResponseStatus::Success,
+                output_token_ids: finished.state.output_tokens,
+                images: vec![],
+                finish_reason: Some("stop".to_string()),
+                error: None,
+                metrics: metrics.clone(),
+            };
+            self.frontend.send_response(&client_id, response).await?;
+        }
+
         self.metrics.record_completion(elapsed_ms, num_tokens);
 
         tracing::info!(

@@ -619,7 +619,7 @@
       <ol class="timeline">
         <li><strong>补齐错误响应路径</strong><span>空 input、超长 prompt、KV 分配失败、worker error 等都应返回明确 <code>ResponseStatus::Error</code>，避免客户端悬挂。</span></li>
         <li><strong>把真实 KV 状态接入 <code>CacheState</code></strong><span>至少先让 Slot 模式暴露 free slots / capacity，让策略可以看到资源压力。</span></li>
-        <li><strong>完善 stream 与 stop sequence</strong><span>按 <code>stream=true</code> 发送 <code>StreamChunk</code>；使用协议中的 stop_sequences 做终止判断。</span></li>
+        <li><strong>完善 stop sequence 与高级流式</strong><span>LLM token streaming 已接入；后续需要使用协议中的 stop_sequences 做终止判断，并考虑 diffusion 进度事件流。</span></li>
         <li><strong>实现 Paged KV 的最小闭环</strong><span><code>allocate</code>、<code>extend</code>、<code>free</code>、block table wire format 与 Worker PagedAttention 对齐。</span></li>
         <li><strong>接入 prefix cache 与 preemption</strong><span>先做 NoPrefixCache → RadixTreeCache；再做 recompute preemption，最后考虑 swap。</span></li>
         <li><strong>扩展 WorkerGroup</strong><span>从单 rank ready gate 扩展到多 rank barrier，并用 effective capacity 驱动 SchedulerConfig。</span></li>
