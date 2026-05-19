@@ -13,15 +13,19 @@ mod syntax_test;
 // direction-specific modules above.
 pub use common::{ProtocolError, ProtocolResult};
 pub use scheduler_to_server::{
-    ChunkType, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
+    ChunkType, ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
 };
 pub use scheduler_to_worker::{
-    CancelRequest, DrainMode, DrainWorker, PrefillBatchCmd, PrefillSegmentCompletion,
-    PrefillSegmentMeta, SamplingParams, UnloadModel, WorkerCommand,
+    CancelRequest, DiffusionBatchCmd, DiffusionBatchItem, DrainMode, DrainWorker,
+    PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
+    UnloadModel, WorkerCommand,
 };
 pub use scheduler_to_worker_control::{LoadModel, SchedulerControlMessage, SchedulerHello};
-pub use server_to_scheduler::InferenceRequest;
-pub use worker_to_scheduler::{CancelAck, DrainAck, GeneratedToken, StepOutput};
+pub use server_to_scheduler::{DiffusionRequest, InferenceModality, InferenceRequest};
+pub use worker_to_scheduler::{
+    CancelAck, DiffusionBatchOutput, DiffusionImage, DiffusionOutputItem,
+    DiffusionOutputMetrics, DiffusionOutputStatus, DrainAck, GeneratedToken, StepOutput,
+};
 pub use worker_to_scheduler_control::{
     WorkerCapacity, WorkerControlMessage, WorkerError, WorkerHeartbeat, WorkerHello,
     WorkerProgress, WorkerReady, WorkerState, WORKER_CONTROL_PROTOCOL_VERSION,

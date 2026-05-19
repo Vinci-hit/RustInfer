@@ -154,6 +154,7 @@ mod tests {
                 priority: Priority(0),
                 stream: false,
                 stop_sequences: vec![],
+                diffusion: None,
                 arrival_time: Instant::now(),
             });
             q.push(Sequence::new(meta, RequestHandle::noop()));

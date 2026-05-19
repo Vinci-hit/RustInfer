@@ -105,6 +105,7 @@ mod tests {
             priority: Priority(priority),
             stream: false,
             stop_sequences: vec![],
+            diffusion: None,
             arrival_time: Instant::now(),
         });
         Sequence::new(meta, RequestHandle::noop())

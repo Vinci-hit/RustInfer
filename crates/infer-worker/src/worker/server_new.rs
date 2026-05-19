@@ -543,6 +543,10 @@ impl<M: LlmModel> WorkerServer<M> {
     fn handle_worker_command(&mut self, cmd: WorkerCommand) -> Option<PrefillBatchCmd> {
         match cmd {
             WorkerCommand::Prefill(cmd) => self.accept_prefill(cmd),
+            WorkerCommand::DiffusionBatch(_) => {
+                tracing::error!("LLM worker received DiffusionBatch command");
+                None
+            }
             WorkerCommand::Cancel(cancel) => {
                 tracing::info!("CancelRequest queued sequence_id={}", cancel.sequence_id);
                 self.pending_cancels.push(cancel.sequence_id);

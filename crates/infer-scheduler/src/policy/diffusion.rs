@@ -1,35 +1,33 @@
 //! Diffusion scheduling policy.
 //!
-//! Groups requests by (height, width, num_steps) and dispatches entire batches.
-//! No continuous batching — a batch runs to completion before the next starts.
+//! Groups requests by compatible image generation shape and dispatches an entire
+//! batch to the Worker. No continuous batching — a diffusion batch runs to
+//! completion before the next starts.
 
 use std::collections::HashMap;
 
 use crate::cache::traits::CacheState;
-use crate::policy::traits::{
-    BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy,
-};
-use crate::request::lifecycle::RequestId;
+use crate::policy::traits::{BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy};
 use crate::request::queue::WaitingQueue;
 use crate::utils::token_budget::TokenBudget;
 
-/// Shape key for batching: only requests with identical shape can be batched together.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ShapeKey {
+/// Shape/schedule key for batching: only requests with identical generation
+/// geometry and denoise schedule can share one diffusion batch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiffusionBatchKey {
     height: u32,
     width: u32,
+    num_inference_steps: usize,
+    sigmas_bits: Option<Vec<u32>>,
 }
 
 /// Diffusion scheduling policy.
 ///
-/// Batching constraint: only requests with the **same (height, width)** can share a batch.
-/// Different seeds are fine in the same batch (only affects initial noise).
-///
 /// Behavior:
-/// - Groups waiting requests by shape
-/// - Selects the largest group (or earliest-arriving) to fill the batch
-/// - Entire batch runs all denoising steps to completion
-/// - Worker returns only when the full batch is done
+/// - Groups waiting requests by `(height, width, num_inference_steps, sigmas-kind)`
+/// - Selects the largest compatible group, tie-breaking by earliest queue order
+/// - Dispatches up to `max_batch_size`
+/// - Entire batch runs to completion before the next one starts
 pub struct DiffusionPolicy {
     pub max_batch_size: usize,
 }
@@ -48,42 +46,59 @@ impl SchedulingPolicy for DiffusionPolicy {
         _budget: &TokenBudget,
         _cache_state: &CacheState,
     ) -> BatchPlan {
-        // If worker is still processing a batch, don't schedule anything.
-        // (Engine handles this via worker_busy flag, but double-check here.)
         if running.num_prefilling > 0 {
             return BatchPlan::empty();
         }
-
         if waiting.is_empty() {
             return BatchPlan::empty();
         }
 
-        // Group waiting requests by shape.
-        // We use input_ids.len() as a proxy key since diffusion requests
-        // store shape info in a way the policy can access via meta.
-        // For now, we treat all waiting requests as same-shape (simplification)
-        // and just batch up to max_batch_size in FIFO order.
-        //
-        // TODO: When DiffusionRequestMeta is available with height/width fields,
-        // implement proper shape-based grouping.
+        let mut groups: HashMap<DiffusionBatchKey, Vec<_>> = HashMap::new();
+        let mut key_order: Vec<DiffusionBatchKey> = Vec::new();
 
-        let batch_size = waiting.len().min(self.max_batch_size);
+        for seq in waiting.iter() {
+            let Some(req) = &seq.meta.diffusion else {
+                continue;
+            };
+            let key = DiffusionBatchKey {
+                height: req.height,
+                width: req.width,
+                num_inference_steps: req.num_inference_steps,
+                sigmas_bits: req.sigmas.as_ref().map(|sigmas| {
+                    sigmas.iter().map(|sigma| sigma.to_bits()).collect()
+                }),
+            };
+            if !groups.contains_key(&key) {
+                key_order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(seq.meta.id.clone());
+        }
 
-        let prefill_batch: Vec<PrefillEntry> = waiting
+        let Some(best_key) = key_order
             .iter()
-            .take(batch_size)
-            .map(|seq| PrefillEntry {
-                request_id: seq.meta.id.clone(),
-                token_range: 0..seq.meta.input_ids.len(),
-                is_partial: false, // Diffusion: always full request
+            .max_by_key(|key| groups.get(*key).map(|v| v.len()).unwrap_or(0))
+        else {
+            return BatchPlan::empty();
+        };
+
+        let selected = groups
+            .get(best_key)
+            .map(|ids| ids.iter().take(self.max_batch_size).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let prefill_batch: Vec<PrefillEntry> = selected
+            .into_iter()
+            .map(|request_id| PrefillEntry {
+                request_id,
+                token_range: 0..1, // Diffusion uses a separate WorkerCommand; token range is only a selection marker.
+                is_partial: false,
             })
             .collect();
 
-        let total_tokens = prefill_batch.iter().map(|e| e.token_range.len()).sum();
-
+        let total_tokens = prefill_batch.len();
         BatchPlan {
             prefill_batch,
-            decode_batch: vec![], // Diffusion has no decode phase
+            decode_batch: vec![],
             preemptions: vec![],
             total_tokens,
         }
@@ -97,8 +112,8 @@ impl SchedulingPolicy for DiffusionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::lifecycle::*;
     use crate::request::handle::RequestHandle;
+    use crate::request::lifecycle::*;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -108,12 +123,20 @@ mod tests {
             let meta = Arc::new(RequestMeta {
                 id: RequestId(id.to_string()),
                 sequence_id: SequenceId(1),
-                input_ids: vec![1i32; 10], // dummy prompt tokens
-                max_tokens: 1, // not used for diffusion
+                input_ids: vec![0],
+                max_tokens: 1,
                 sampling: SamplingParams::default(),
                 priority: Priority(0),
                 stream: false,
                 stop_sequences: vec![],
+                diffusion: Some(infer_protocol::server_to_scheduler::DiffusionRequest {
+                    prompt: id.to_string(),
+                    prompt_input_ids: vec![1, 2, 3],
+                    height: 1024,
+                    width: 1024,
+                    num_inference_steps: 8,
+                    ..Default::default()
+                }),
                 arrival_time: Instant::now(),
             });
             q.push(Sequence::new(meta, RequestHandle::noop()));
@@ -159,7 +182,6 @@ mod tests {
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
         let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
-        // max_batch_size = 3, 5 waiting → selects 3
         assert_eq!(plan.prefill_batch.len(), 3);
         assert!(plan.decode_batch.is_empty());
         assert!(!plan.prefill_batch[0].is_partial);
@@ -170,7 +192,7 @@ mod tests {
         let policy = DiffusionPolicy::new(4);
         let waiting = make_waiting(&["a", "b"]);
         let running = RunningSet {
-            num_prefilling: 2, // batch already running
+            num_prefilling: 2,
             num_decoding: 0,
             decode_tokens: 0,
             running_ids: vec![],
@@ -179,7 +201,6 @@ mod tests {
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
         let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
-        // Should not schedule while a batch is still running.
         assert!(!plan.has_work());
     }
 
@@ -191,7 +212,6 @@ mod tests {
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
         let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
-        // Only 2 requests, max_batch=8 → sends 2 (don't wait to fill)
         assert_eq!(plan.prefill_batch.len(), 2);
     }
 }

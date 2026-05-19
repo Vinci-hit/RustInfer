@@ -10,6 +10,7 @@ use std::time::Instant;
 use crate::cache::kv_manager::KvAllocation;
 use crate::cache::traits::PrefixMatch;
 use crate::request::handle::RequestHandle;
+use infer_protocol::server_to_scheduler::DiffusionRequest;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Request Identity & Metadata
@@ -74,6 +75,7 @@ pub struct RequestMeta {
     pub priority: Priority,
     pub stream: bool,
     pub stop_sequences: Vec<Vec<i32>>,
+    pub diffusion: Option<DiffusionRequest>,
     pub arrival_time: Instant,
 }
 

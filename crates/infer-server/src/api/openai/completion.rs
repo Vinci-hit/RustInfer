@@ -43,6 +43,7 @@ pub async fn completions(
     let request_id = uuid::Uuid::new_v4().to_string();
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         request_id: request_id.clone(),
+        modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,
         input_ids,
         max_tokens: req.max_tokens.unwrap_or(2048),
         temperature: req.temperature.unwrap_or(1.0),
@@ -51,6 +52,7 @@ pub async fn completions(
         stream: req.stream,
         priority: 0,
         stop_sequences: req.stop.map(|s| s.into_vec()).unwrap_or_default(),
+        diffusion: None,
     };
 
     // 4. 分流

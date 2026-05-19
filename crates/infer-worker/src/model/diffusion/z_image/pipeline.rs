@@ -231,12 +231,19 @@ impl ZImagePipeline {
 
     // ─────────────────── Step 1: Encode Prompt ───────────────────────
 
-    /// Encode a text prompt into caption embeddings.
+    /// Encode server-tokenized prompt ids into caption embeddings.
     ///
-    /// Returns `[actual_tokens, 2560]` — the text encoder hidden states,
-    /// filtered by attention mask (no padding).
-    fn encode_prompt(&mut self, prompt: &str) -> Result<Tensor> {
-        self.text_encoder.encode(&mut self.text_encoder_state, prompt)
+    /// Returns `[actual_tokens, 2560]` — the text encoder hidden states.
+    fn encode_prompt_ids(&mut self, prompt_input_ids: &[i32]) -> Result<Tensor> {
+        self.text_encoder.encode_token_ids(&mut self.text_encoder_state, prompt_input_ids)
+    }
+
+    /// Local helper used only by warmup/tests. Production requests should send
+    /// server-tokenized prompt ids through the protocol.
+    pub fn tokenize_prompt_for_local_request(&self, prompt: &str) -> Result<Vec<i32>> {
+        let (tokens, mask) = self.text_encoder.tokenize(prompt, 512)?;
+        let actual_len = mask.iter().filter(|&&m| m == 1).count();
+        Ok(tokens[..actual_len].to_vec())
     }
 
     // ─────────────────── Step 2: Prepare Latents ─────────────────────
@@ -695,8 +702,10 @@ impl ZImagePipeline {
         // milliseconds once warm, so we just replay the real path rather
         // than building a bespoke single-step shortcut — that would risk
         // drifting from what `generate()` actually exercises.
+        let warmup_prompt = "a";
         let request = DiffusionRequest {
-            prompt: "a".to_string(),
+            prompt: warmup_prompt.to_string(),
+            prompt_input_ids: self.tokenize_prompt_for_local_request(warmup_prompt)?,
             height,
             width,
             // Use the cheapest schedule (2-step Turbo) regardless of
@@ -751,7 +760,7 @@ impl DiffusionPipeline for ZImagePipeline {
 
         // ── Step 1: Encode prompt ──
         let encode_start = Instant::now();
-        let prompt_embeds = self.encode_prompt(&request.prompt)?;
+        let prompt_embeds = self.encode_prompt_ids(&request.prompt_input_ids)?;
         // Cast to the transformer's weight dtype (text encoder emits F32,
         // CUDA weights are typically BF16).
         let prompt_embeds = cast_dtype(&prompt_embeds, weight_dtype)?;
@@ -904,8 +913,10 @@ mod tests {
         eprintln!("[test] warmup done in {}ms", t_warm.elapsed().as_millis());
 
         // Z-Image-Turbo: 1024x1024 HD, 2-step distilled schedule
+        let prompt = "A majestic snow leopard standing on a cliff edge at sunset, with golden light illuminating its fur, dramatic mountain landscape in the background, photorealistic, 8k detail";
         let request = DiffusionRequest {
-            prompt: "A majestic snow leopard standing on a cliff edge at sunset, with golden light illuminating its fur, dramatic mountain landscape in the background, photorealistic, 8k detail".to_string(),
+            prompt: prompt.to_string(),
+            prompt_input_ids: pipeline.tokenize_prompt_for_local_request(prompt)?,
             height: 1024,
             width: 1024,
             // Keep the original 2-step Turbo schedule so this test
@@ -963,8 +974,10 @@ mod tests {
         eprintln!("[test] warmup done in {}ms", t_warm.elapsed().as_millis());
 
         // Z-Image full model — 1024x1024 HD, 50 denoising steps, CFG=4.5
+        let prompt = "一座古老的中式石拱桥横跨在碧绿的湖面上，桥上有几个身穿汉服的人在散步，远处是连绵的青山和飘浮的白云，湖面倒映着蓝天，岸边有垂柳和粉色的桃花，春天的氛围，水墨风格与写实结合，高清细腻";
         let request = DiffusionRequest {
-            prompt: "一座古老的中式石拱桥横跨在碧绿的湖面上，桥上有几个身穿汉服的人在散步，远处是连绵的青山和飘浮的白云，湖面倒映着蓝天，岸边有垂柳和粉色的桃花，春天的氛围，水墨风格与写实结合，高清细腻".to_string(),
+            prompt: prompt.to_string(),
+            prompt_input_ids: pipeline.tokenize_prompt_for_local_request(prompt)?,
             height: 1024,
             width: 1024,
             num_inference_steps: 50,

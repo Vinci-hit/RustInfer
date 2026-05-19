@@ -122,27 +122,23 @@ impl Qwen3TextEncoder {
 
     // ─────────────────── Encode ──────────────────────────────────────
 
-    /// Encode a text prompt into hidden states.
+    /// Encode already-tokenized text-encoder input ids into hidden states.
     ///
-    /// Returns `Tensor` of shape `[actual_tokens, hidden_dim]` — only
-    /// non-padding tokens (filtered by attention_mask).
-    pub fn encode(
+    /// Tokenization/template application is owned by infer-server. Worker only runs
+    /// the text encoder model on provided ids.
+    pub fn encode_token_ids(
         &self,
         state: &mut InferenceState,
-        prompt: &str,
+        token_ids: &[i32],
     ) -> Result<Tensor> {
-        let (tokens, attention_mask) = self.tokenize(prompt, TEXT_ENCODER_MAX_SEQ_LEN)?;
-
-        let actual_len = attention_mask.iter().filter(|&&m| m == 1).count();
+        let actual_len = token_ids.len().min(TEXT_ENCODER_MAX_SEQ_LEN);
         if actual_len == 0 {
-            return Err(Error::InvalidArgument("Empty prompt after tokenization".to_string()).into());
+            return Err(Error::InvalidArgument("Empty prompt_input_ids".to_string()).into());
         }
 
-        // Only feed actual (non-padding) tokens to the model
         let mut input_tokens = Tensor::new(&[actual_len], DataType::I32, DeviceType::Cpu)?;
-        input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&tokens[..actual_len]);
+        input_tokens.as_i32_mut()?.as_slice_mut()?.copy_from_slice(&token_ids[..actual_len]);
 
-        // Reuse Qwen3's prefill logic, running output_layer_count layers
         let hidden_states = self.model.forward_prefill_hidden_states(
             state,
             &input_tokens,
@@ -150,8 +146,19 @@ impl Qwen3TextEncoder {
             self.output_layer_count,
         )?;
 
-        // hidden_states: [actual_len, dim] — already filtered (no padding fed in)
         Ok(hidden_states)
+    }
+
+    /// Compatibility helper for tests/manual paths. Production should prefer
+    /// `encode_token_ids` with ids provided by infer-server.
+    pub fn encode(
+        &self,
+        state: &mut InferenceState,
+        prompt: &str,
+    ) -> Result<Tensor> {
+        let (tokens, attention_mask) = self.tokenize(prompt, TEXT_ENCODER_MAX_SEQ_LEN)?;
+        let actual_len = attention_mask.iter().filter(|&&m| m == 1).count();
+        self.encode_token_ids(state, &tokens[..actual_len])
     }
 }
 

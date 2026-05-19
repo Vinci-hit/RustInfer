@@ -13,7 +13,7 @@ use infer_protocol::scheduler_to_worker_control::{LoadModel, SchedulerControlMes
 use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerState};
 use infer_worker::worker::control_client::WorkerControlClient;
 use infer_worker::worker::runner::ModelRunner;
-use infer_worker::worker::WorkerServer;
+use infer_worker::worker::{DiffusionWorkerServer, WorkerServer};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker")]
@@ -141,7 +141,21 @@ fn main() -> Result<()> {
                 control,
             )
         }
-        _ => anyhow::bail!("Unsupported model type: {}. Use 'llama3' or 'qwen3'.", load_model.model_type),
+        "zimage" | "z-image" | "z_image" | "z-image-turbo" => {
+            let pipeline = infer_worker::model::diffusion::z_image::pipeline::ZImagePipeline::from_pretrained(
+                &load_model.model_path,
+                device,
+            )?;
+            run_diffusion_worker(
+                pipeline,
+                args.device.clone(),
+                load_model,
+                zmq_pull,
+                zmq_push,
+                control,
+            )
+        }
+        _ => anyhow::bail!("Unsupported model type: {}. Use 'llama3', 'qwen3', or 'zimage'.", load_model.model_type),
     }
 }
 
@@ -209,6 +223,41 @@ fn run_worker<M: LlmModel + 'static>(
 
     runner.request_shutdown();
     let _ = runner_handle.join();
+    Ok(())
+}
+
+fn run_diffusion_worker<P: infer_worker::model::diffusion::pipeline::DiffusionPipeline + 'static>(
+    pipeline: P,
+    device_label: String,
+    load_model: LoadModel,
+    zmq_pull: zmq::Socket,
+    zmq_push: zmq::Socket,
+    control: WorkerControlClient,
+) -> Result<()> {
+    let max_batch_seqs = load_model.max_batch_seqs;
+    control.send_progress(WorkerState::Warmup, "diffusion pipeline loaded; ready for data plane")?;
+    control.send_ready(
+        load_model.model_instance_id,
+        load_model.model_path,
+        load_model.model_type,
+        device_label,
+        WorkerCapacity {
+            max_batch_tokens: load_model.max_batch_tokens,
+            max_batch_seqs,
+            max_running_requests: max_batch_seqs,
+            max_total_kv_tokens: None,
+            free_mem_before_load_gb: None,
+            free_mem_after_load_gb: None,
+            weight_mem_usage_gb: None,
+            workspace_mem_usage_gb: None,
+            graph_mem_usage_gb: None,
+        },
+    )?;
+
+    control.send_progress(WorkerState::Running, "diffusion worker data plane running")?;
+    tracing::info!("Diffusion worker running...");
+    let server = DiffusionWorkerServer::new(pipeline, zmq_pull, zmq_push, max_batch_seqs);
+    server.run();
     Ok(())
 }
 

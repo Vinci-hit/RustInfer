@@ -10,10 +10,12 @@
 //! 老 Runner API）暂时从 crate 对外接口下架。待确认新 server 稳定后删除。
 pub mod batch_workspace;
 pub mod control_client;
+pub mod diffusion_server;
 pub mod runner;
 pub mod server_new;
 
 pub use batch_workspace::BatchWorkspace;
 pub use runner::ModelRunner;
+pub use diffusion_server::DiffusionWorkerServer;
 pub use runner::{StepMeta, SyncFlags, WorkerBatchMeta};
 pub use server_new::WorkerServer;

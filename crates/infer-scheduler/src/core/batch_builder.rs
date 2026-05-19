@@ -9,8 +9,9 @@ use crate::request::lifecycle::{Sequence, Prefilling, Decoding, RequestId};
 use crate::transport::codec::{Codec, MsgPackCodec};
 
 use infer_protocol::scheduler_to_worker::{
-    CancelRequest, PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta,
-    SamplingParams as WorkerSamplingParams, WorkerCommand,
+    CancelRequest, DiffusionBatchCmd, DiffusionBatchItem, PrefillBatchCmd,
+    PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams as WorkerSamplingParams,
+    WorkerCommand,
 };
 
 /// Build a serialized cancel command.
@@ -38,6 +39,50 @@ pub fn build_batch(
     }
 
     build_prefill_batch_cmd(prefilling, codec, scheduled_segments)
+}
+
+pub fn build_diffusion_batch(
+    prefilling: &[Sequence<Prefilling>],
+    codec: &MsgPackCodec,
+    scheduled_requests: &[(RequestId, usize)],
+) -> Result<Vec<u8>> {
+    if scheduled_requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let selected: HashSet<&RequestId> = scheduled_requests.iter().map(|(id, _)| id).collect();
+    let mut requests = Vec::new();
+
+    for seq in prefilling {
+        if !selected.contains(&seq.meta.id) {
+            continue;
+        }
+        let Some(req) = &seq.meta.diffusion else {
+            return Err(SchedulerError::Internal(format!(
+                "scheduled diffusion request {} has no diffusion payload",
+                seq.meta.id
+            )));
+        };
+        requests.push(DiffusionBatchItem {
+            request_id: seq.meta.id.0.clone(),
+            prompt: req.prompt.clone(),
+            prompt_input_ids: req.prompt_input_ids.clone(),
+            negative_prompt: req.negative_prompt.clone(),
+            negative_prompt_input_ids: req.negative_prompt_input_ids.clone(),
+            height: req.height,
+            width: req.width,
+            num_inference_steps: req.num_inference_steps,
+            sigmas: req.sigmas.clone(),
+            guidance_scale: req.guidance_scale,
+            seed: req.seed,
+            output_format: req.output_format.clone(),
+        });
+    }
+
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    codec.encode(&WorkerCommand::DiffusionBatch(DiffusionBatchCmd { requests }))
 }
 
 fn build_prefill_batch_cmd(

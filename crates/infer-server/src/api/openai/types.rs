@@ -198,6 +198,65 @@ pub struct CompletionChunkChoice {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Image Generation 请求/响应 (/v1/images/generations)
+// ═══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    /// Number of images. For binary response this must be 1.
+    pub n: Option<usize>,
+    /// OpenAI-style size string, e.g. "1024x1024".
+    pub size: Option<String>,
+    /// "b64_json" (default) or "binary".
+    pub response_format: Option<ImageResponseFormat>,
+    /// Encoded image format: "png" (default) or "jpeg".
+    pub output_format: Option<ImageOutputFormat>,
+    /// JPEG quality 1..100. Ignored for PNG.
+    pub jpeg_quality: Option<u8>,
+
+    pub num_inference_steps: Option<usize>,
+    pub guidance_scale: Option<f32>,
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub sigmas: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageResponseFormat {
+    B64Json,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageOutputFormat {
+    Png,
+    Jpeg,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageGenerationResponse {
+    pub created: i64,
+    pub data: Vec<ImageData>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 共享类型
 // ═══════════════════════════════════════════════════════════════
 

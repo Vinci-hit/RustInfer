@@ -297,7 +297,7 @@
         <div class="badge-row">
           <span class="badge"><span class="dot green"></span>LLM 连续批处理：主线实现</span>
           <span class="badge"><span class="dot blue"></span>Slot KV：当前可用</span>
-          <span class="badge"><span class="dot yellow"></span>Diffusion：调度框架已放置</span>
+          <span class="badge"><span class="dot yellow"></span>Diffusion：协议/调度/Worker 数据面骨架已接入</span>
           <span class="badge"><span class="dot red"></span>Paged KV / Prefix Cache：未接入</span>
         </div>
       </header>
@@ -346,7 +346,7 @@
           <tr><td>Chunked Prefill</td><td><span class="pill ok">已改造</span></td><td>通过显式 <code>segment_start/segment_end/completion</code> 描述 chunk；Worker 只在 final segment 后进入 decode。</td><td><code>src/policy/continuous_batching.rs</code>, <code>src/core/batch_builder.rs</code>, <code>infer-protocol</code></td></tr>
           <tr><td>Slot KV</td><td><span class="pill ok">已实现</span></td><td>Scheduler 只分配整数 slot id，真实 KV tensor 管理在 Worker 侧。</td><td><code>src/cache/slot_kv_manager.rs</code></td></tr>
           <tr><td>Worker Ready 控制面</td><td><span class="pill ok">已实现单 Worker</span></td><td>启动后先通过 ZMQ ROUTER 等待 Worker Hello/Ready，可选下发 <code>LoadModel</code>。</td><td><code>src/transport/worker_control.rs</code>, <code>src/worker_group.rs</code></td></tr>
-          <tr><td>Diffusion 模式</td><td><span class="pill wip">框架存在</span></td><td>策略会批量选择请求，KV 使用 Noop；但 shape 分组、图片结果协议和真实输出仍不完整。</td><td><code>src/policy/diffusion.rs</code></td></tr>
+          <tr><td>Diffusion 模式</td><td><span class="pill wip">已接入骨架</span></td><td>新增 diffusion 请求/图片响应协议、shape/schedule-aware batching、<code>WorkerCommand::DiffusionBatch</code>、Z-Image 数据面入口和 HTTP <code>/v1/images/generations</code> endpoint。</td><td><code>src/policy/diffusion.rs</code>, <code>infer-protocol</code>, <code>infer-worker/src/worker/diffusion_server.rs</code></td></tr>
           <tr><td>Paged KV / Prefix Cache</td><td><span class="pill stub">stub</span></td><td>类型、allocator、block table、radix tree 接口已放置，但 <code>PagedKvManager::allocate</code> 直接返回 NotImplemented。</td><td><code>src/cache/paged_kv_manager.rs</code>, <code>src/cache/radix_tree.rs</code></td></tr>
           <tr><td>Priority Policy / Preemption</td><td><span class="pill stub">stub</span></td><td>等待队列已经按 priority 排序，但独立 QoS policy 和抢占执行器尚未接入主流程。</td><td><code>src/policy/priority.rs</code>, <code>src/policy/preemption.rs</code></td></tr>
           <tr><td>Streaming 返回</td><td><span class="pill wip">接口存在</span></td><td><code>FrontendTransport</code> 有 <code>send_stream_chunk</code>，但 engine 目前完成后发送完整 <code>InferenceResponse</code>。</td><td><code>src/transport/traits.rs</code>, <code>src/core/engine.rs</code></td></tr>
@@ -492,8 +492,8 @@
       <table>
         <thead><tr><th>策略</th><th>实现</th><th>当前行为</th></tr></thead>
         <tbody>
-          <tr><td><code>ContinuousBatchingPolicy</code></td><td><span class="pill ok">主线</span></td><td>先保留所有 decode 序列的一 token 预算，再调度已在 prefilling 的 continuation chunk，最后从 waiting queue 选择新请求。</td></tr>
-          <tr><td><code>DiffusionPolicy</code></td><td><span class="pill wip">简化版</span></td><td>如果没有运行中 batch，则从 waiting queue 取最多 <code>max_batch_size</code> 个请求；TODO 中计划按 height/width shape 分组。</td></tr>
+          <tr><td><code>ContinuousBatchingPolicy</code></td><td><span class="pill ok">主线</span></td><td>优先调度无 <code>inflight</code> 的 continuation chunk；chunked 模式下新请求可按剩余 token budget 截首段。</td></tr>
+          <tr><td><code>DiffusionPolicy</code></td><td><span class="pill wip">shape-aware</span></td><td>如果没有运行中 batch，会按 <code>height/width/num_inference_steps/sigmas</code> 分组，选择最大兼容组并最多取 <code>max_batch_size</code>。</td></tr>
           <tr><td><code>PriorityPolicy</code></td><td><span class="pill stub">未实现</span></td><td>当前调用会 warn 并返回空计划。实际 priority 目前只体现在 <code>WaitingQueue</code> 排序。</td></tr>
           <tr><td><code>PreemptionStrategy</code></td><td><span class="pill stub">未接入</span></td><td><code>Disabled</code> 返回失败，<code>Recompute</code>/<code>Swap</code> 返回 NotImplemented；Engine 在 KV 分配失败时只是把请求放回队首并停止本轮。</td></tr>
         </tbody>
@@ -550,10 +550,10 @@
       <table>
         <thead><tr><th>链路</th><th>协议/Socket</th><th>消息</th><th>说明</th></tr></thead>
         <tbody>
-          <tr><td>Server → Scheduler</td><td>ZMQ ROUTER, MessagePack</td><td><code>InferenceRequest</code></td><td>包含已 tokenize 的 <code>input_ids</code>、sampling、priority、stream 等。</td></tr>
-          <tr><td>Scheduler → Server</td><td>ZMQ ROUTER reply</td><td><code>InferenceResponse</code> / <code>StreamChunk</code></td><td>当前主流程发送完整响应，stream chunk 接口未实际使用。</td></tr>
-          <tr><td>Scheduler → Worker</td><td>ZMQ PUSH</td><td><code>WorkerCommand::Prefill</code>, <code>Cancel</code></td><td>发送显式 prefill segment；字段包括 flattened input_ids、q_start_loc、sequence_id、kv_slot、segment_start/end、prompt_len、completion。</td></tr>
-          <tr><td>Worker → Scheduler</td><td>ZMQ PULL</td><td><code>StepOutput</code></td><td>热路径精简为 <code>prefill_done: Vec&lt;u64&gt;</code> 与 token 列表：<code>sequence_id</code>, <code>token_id</code>, <code>finished</code>。</td></tr>
+          <tr><td>Server → Scheduler</td><td>ZMQ ROUTER, MessagePack</td><td><code>InferenceRequest</code></td><td>LLM 使用 <code>input_ids</code>；diffusion 使用 <code>modality=Diffusion</code>、<code>DiffusionRequest</code> 和 server-tokenized <code>prompt_input_ids</code>。</td></tr>
+          <tr><td>Scheduler → Server</td><td>ZMQ ROUTER reply</td><td><code>InferenceResponse</code> / <code>StreamChunk</code></td><td>完整响应现在可携带 <code>output_token_ids</code> 或 <code>images: Vec&lt;ImageOutput&gt;</code>。</td></tr>
+          <tr><td>Scheduler → Worker</td><td>ZMQ PUSH</td><td><code>WorkerCommand::Prefill</code>, <code>DiffusionBatch</code>, <code>Cancel</code></td><td>LLM 发送显式 prefill segment；diffusion 发送 <code>DiffusionBatchCmd</code>，其中包含 <code>prompt_input_ids</code> 而不是让 Worker tokenize。</td></tr>
+          <tr><td>Worker → Scheduler</td><td>ZMQ PULL</td><td><code>StepOutput</code> / <code>DiffusionBatchOutput</code></td><td>LLM 回 token/finished；diffusion 回每个 request 的 raw <code>rgb8</code> image 和 metrics。</td></tr>
           <tr><td>Worker 控制面</td><td>ZMQ ROUTER</td><td><code>Hello</code>, <code>Progress</code>, <code>Ready</code>, <code>Error</code></td><td>Scheduler 等待 WorkerReady 后才进入调度循环。</td></tr>
         </tbody>
       </table>
@@ -588,7 +588,7 @@
             <li>Paged KV、prefix cache、priority policy、preemption 都有接口但未完成。</li>
             <li>stop sequences 从协议进来，但 Engine 当前把 <code>stop_sequences</code> 置为空，未处理。</li>
             <li>streaming 接口存在，但当前完成后一次性返回。</li>
-            <li>Diffusion 仍使用 token/request 抽象占位，缺少图片结果协议与 shape-aware batch。</li>
+            <li>Diffusion 已有协议、Worker 数据面和 HTTP images endpoint；当前 Worker 侧仍逐请求调用 pipeline，尚未实现真正的 DiT batch 并行。</li>
           </ul>
         </div>
       </div>
@@ -603,7 +603,8 @@
         <li><code>src/request/queue.rs</code>：priority + FIFO 等待队列。</li>
         <li><code>src/request/active_table.rs</code>：active request ledger。</li>
         <li><code>src/policy/continuous_batching.rs</code>：LLM 主线调度策略。</li>
-        <li><code>src/policy/diffusion.rs</code>：diffusion batch-in batch-out 策略框架。</li>
+        <li><code>src/policy/diffusion.rs</code>：按 shape/schedule 分组的 diffusion batch-in batch-out 策略。</li>
+        <li><code>infer-worker/src/worker/diffusion_server.rs</code>：diffusion Worker 数据面，处理 <code>DiffusionBatchCmd</code>。</li>
         <li><code>src/cache/slot_kv_manager.rs</code>：slot KV 实现。</li>
         <li><code>src/cache/paged_kv_manager.rs</code>：paged KV stub。</li>
         <li><code>src/transport/zmq_transport.rs</code>：生产 ZMQ 数据面。</li>
@@ -622,7 +623,7 @@
         <li><strong>实现 Paged KV 的最小闭环</strong><span><code>allocate</code>、<code>extend</code>、<code>free</code>、block table wire format 与 Worker PagedAttention 对齐。</span></li>
         <li><strong>接入 prefix cache 与 preemption</strong><span>先做 NoPrefixCache → RadixTreeCache；再做 recompute preemption，最后考虑 swap。</span></li>
         <li><strong>扩展 WorkerGroup</strong><span>从单 rank ready gate 扩展到多 rank barrier，并用 effective capacity 驱动 SchedulerConfig。</span></li>
-        <li><strong>Diffusion 独立协议化</strong><span>引入 diffusion request meta、shape-aware batching、image output response，避免复用 token response 的语义缺口。</span></li>
+        <li><strong>完善 Diffusion 端到端产品化</strong><span>继续补真正 DiT batch 并行、更多图片响应格式（如 URL/多图二进制打包）和更完整的错误/metrics 回传。</span></li>
       </ol>
     </section>
 

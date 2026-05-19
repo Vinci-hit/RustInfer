@@ -5,11 +5,26 @@ use serde::{Deserialize, Serialize};
 pub struct InferenceResponse {
     pub request_id: String,
     pub status: ResponseStatus,
+    #[serde(default)]
     pub output_token_ids: Vec<i32>,
+    #[serde(default)]
+    pub images: Vec<ImageOutput>,
     #[serde(default)]
     pub finish_reason: Option<String>,
     pub error: Option<String>,
     pub metrics: InferenceMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageOutput {
+    pub width: u32,
+    pub height: u32,
+    /// Number of channels. Text-to-image currently returns RGB = 3.
+    pub channels: u32,
+    /// Raw image payload format, e.g. "rgb8" or "rgb_f32".
+    pub format: String,
+    /// Raw image payload. For "rgb8", this is interleaved HWC RGB bytes.
+    pub data: Vec<u8>,
 }
 
 /// Scheduler -> Server 的流式响应 chunk。

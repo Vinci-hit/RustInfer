@@ -19,6 +19,7 @@ pub fn build_router(state: SharedState) -> Router {
         // OpenAI 兼容端点
         .route("/v1/chat/completions", post(api::openai::chat::chat_completions))
         .route("/v1/completions", post(api::openai::completion::completions))
+        .route("/v1/images/generations", post(api::openai::images::image_generations))
         .route("/v1/models", get(api::openai::models::list_models))
         // 运维端点
         .route("/health", get(api::health::health_check))

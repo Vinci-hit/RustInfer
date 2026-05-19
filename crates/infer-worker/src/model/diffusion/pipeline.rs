@@ -17,8 +17,12 @@ use crate::tensor::Tensor;
 /// - **video** (future): `prompt`, `height`, `width`, `num_frames`
 #[derive(Debug, Clone)]
 pub struct DiffusionRequest {
+    /// Original prompt text for logging / tests. Tokenization is expected to happen in infer-server.
     pub prompt: String,
+    /// Server-tokenized prompt ids after applying the text-encoder template.
+    pub prompt_input_ids: Vec<i32>,
     pub negative_prompt: Option<String>,
+    pub negative_prompt_input_ids: Option<Vec<i32>>,
 
     // Image / video dimensions
     pub height: usize,
@@ -42,7 +46,9 @@ impl Default for DiffusionRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
+            prompt_input_ids: Vec::new(),
             negative_prompt: None,
+            negative_prompt_input_ids: None,
             height: 1024,
             width: 1024,
             num_inference_steps: 8,

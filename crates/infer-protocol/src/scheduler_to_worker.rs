@@ -6,6 +6,7 @@ use crate::common::{ProtocolError, ProtocolResult};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerCommand {
     Prefill(PrefillBatchCmd),
+    DiffusionBatch(DiffusionBatchCmd),
     Cancel(CancelRequest),
     Drain(DrainWorker),
     UnloadModel(UnloadModel),
@@ -188,6 +189,78 @@ impl PrefillBatchCmd {
                     i, e
                 ))
             })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffusionBatchCmd {
+    pub requests: Vec<DiffusionBatchItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffusionBatchItem {
+    pub request_id: String,
+    /// Original prompt text for logging / response metadata.
+    pub prompt: String,
+    /// Server-tokenized prompt ids consumed by the Worker text encoder.
+    pub prompt_input_ids: Vec<i32>,
+    pub negative_prompt: Option<String>,
+    pub negative_prompt_input_ids: Option<Vec<i32>>,
+    pub height: u32,
+    pub width: u32,
+    pub num_inference_steps: usize,
+    pub sigmas: Option<Vec<f32>>,
+    pub guidance_scale: f32,
+    pub seed: Option<u64>,
+    pub output_format: String,
+}
+
+impl DiffusionBatchCmd {
+    pub fn validate(&self, max_batch_size: usize) -> ProtocolResult<()> {
+        if self.requests.is_empty() {
+            return Err(ProtocolError::invalid_argument(
+                "DiffusionBatchCmd must contain at least one request",
+            ));
+        }
+        if self.requests.len() > max_batch_size {
+            return Err(ProtocolError::invalid_argument(format!(
+                "DiffusionBatchCmd has {} requests, exceeds max_batch_size {}",
+                self.requests.len(), max_batch_size
+            )));
+        }
+        for (i, req) in self.requests.iter().enumerate() {
+            if req.request_id.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} has empty request_id",
+                    i
+                )));
+            }
+            if req.prompt.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} has empty prompt",
+                    i
+                )));
+            }
+            if req.prompt_input_ids.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} has empty server-tokenized prompt_input_ids",
+                    i
+                )));
+            }
+            if req.height == 0 || req.width == 0 || req.height % 16 != 0 || req.width % 16 != 0 {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} invalid shape {}x{}; dimensions must be positive multiples of 16",
+                    i, req.height, req.width
+                )));
+            }
+            if req.num_inference_steps == 0 && req.sigmas.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} needs num_inference_steps > 0 or non-empty sigmas",
+                    i
+                )));
+            }
         }
         Ok(())
     }

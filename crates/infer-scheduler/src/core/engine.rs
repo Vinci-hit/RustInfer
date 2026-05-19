@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use infer_protocol::scheduler_to_server::{InferenceMetrics, InferenceResponse, ResponseStatus};
-use infer_protocol::server_to_scheduler::InferenceRequest;
-use infer_protocol::worker_to_scheduler::StepOutput;
+use infer_protocol::scheduler_to_server::{ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus};
+use infer_protocol::server_to_scheduler::{InferenceModality, InferenceRequest};
+use infer_protocol::worker_to_scheduler::{DiffusionBatchOutput, DiffusionOutputStatus, StepOutput};
 
 use crate::cache::kv_manager::KvManager;
 use crate::cache::traits::CacheState;
@@ -120,28 +120,53 @@ where
 
     /// Handle an incoming request from the frontend.
     pub(crate) fn handle_new_request(&mut self, client_id: ClientId, request: InferenceRequest) {
-        if request.input_ids.is_empty() {
-            tracing::warn!("Rejecting request {}: empty input_ids", request.request_id);
-            return;
-        }
-        if request.input_ids.len() > self.config.max_model_len {
-            tracing::warn!(
-                "Rejecting request {}: prompt length {} exceeds max_model_len {}",
-                request.request_id,
-                request.input_ids.len(),
-                self.config.max_model_len,
-            );
-            return;
+        let is_diffusion = request.modality == InferenceModality::Diffusion
+            || matches!(self.config.mode, SchedulerMode::Diffusion);
+
+        if is_diffusion {
+            let Some(diffusion) = request.diffusion.as_ref() else {
+                tracing::warn!("Rejecting diffusion request {}: missing diffusion payload", request.request_id);
+                return;
+            };
+            if diffusion.prompt.is_empty() {
+                tracing::warn!("Rejecting diffusion request {}: empty prompt", request.request_id);
+                return;
+            }
+            if diffusion.prompt_input_ids.is_empty() {
+                tracing::warn!("Rejecting diffusion request {}: empty server-tokenized prompt_input_ids", request.request_id);
+                return;
+            }
+        } else {
+            if request.input_ids.is_empty() {
+                tracing::warn!("Rejecting request {}: empty input_ids", request.request_id);
+                return;
+            }
+            if request.input_ids.len() > self.config.max_model_len {
+                tracing::warn!(
+                    "Rejecting request {}: prompt length {} exceeds max_model_len {}",
+                    request.request_id,
+                    request.input_ids.len(),
+                    self.config.max_model_len,
+                );
+                return;
+            }
         }
 
         let sequence_id = SequenceId(self.next_sequence_id);
         self.next_sequence_id += 1;
 
+        let input_ids = if is_diffusion && request.input_ids.is_empty() {
+            vec![0]
+        } else {
+            request.input_ids
+        };
+        let max_tokens = if is_diffusion { 1 } else { request.max_tokens };
+
         let meta = Arc::new(RequestMeta {
             id: RequestId(request.request_id.clone()),
             sequence_id,
-            input_ids: request.input_ids,
-            max_tokens: request.max_tokens,
+            input_ids,
+            max_tokens,
             sampling: SamplingParams {
                 temperature: request.temperature,
                 top_p: request.top_p,
@@ -150,6 +175,7 @@ where
             priority: Priority(request.priority),
             stream: request.stream,
             stop_sequences: vec![],
+            diffusion: request.diffusion,
             arrival_time: Instant::now(),
         });
 
@@ -226,13 +252,20 @@ where
         self.execute_plan(&plan)?;
 
         // Build and send batch command.
-        let batch_data = crate::core::batch_builder::build_batch(
-            &self.prefilling,
-            &self.decoding,
-            &self.config,
-            &self.codec,
-            &self.current_chunk_sizes,
-        )?;
+        let batch_data = match self.config.mode {
+            SchedulerMode::Llm => crate::core::batch_builder::build_batch(
+                &self.prefilling,
+                &self.decoding,
+                &self.config,
+                &self.codec,
+                &self.current_chunk_sizes,
+            )?,
+            SchedulerMode::Diffusion => crate::core::batch_builder::build_diffusion_batch(
+                &self.prefilling,
+                &self.codec,
+                &self.current_chunk_sizes,
+            )?,
+        };
 
         if !batch_data.is_empty() {
             self.worker.send_batch(batch_data).await?;
@@ -375,36 +408,48 @@ where
         Ok(())
     }
 
-    /// Diffusion mode: entire batch completes at once. All prefilling → finished directly.
-    async fn handle_step_output_diffusion(&mut self, _data: Vec<u8>) -> Result<()> {
-        // In Diffusion mode, Worker returning means the entire batch is done.
-        // All prefilling sequences go directly to Finished (skip Decoding).
-        for seq in self.prefilling.drain(..) {
+    /// Diffusion mode: entire batch completes at once and returns image results.
+    async fn handle_step_output_diffusion(&mut self, data: Vec<u8>) -> Result<()> {
+        use crate::transport::codec::Codec;
+        let output: DiffusionBatchOutput = self.codec.decode(&data)?;
+
+        for item in output.results {
+            let Some(idx) = self.prefilling.iter().position(|s| s.meta.id.0 == item.request_id) else {
+                tracing::warn!("Diffusion output for unknown request_id={}", item.request_id);
+                continue;
+            };
+            let seq = self.prefilling.remove(idx);
             let request_id = seq.meta.id.clone();
             let client_id = ClientId(seq.handle.client_id.0.clone());
-
-            // Mark prefill complete so we can transition.
-            let prompt_len = seq.state.prompt_len;
-            let mut seq = seq;
-            seq.advance_chunk(prompt_len);
-
-            // Prefilling → Decoding → Finished (instant transition, no tokens generated).
-            let decoding_seq = seq.start_decode();
-            let kv_alloc = decoding_seq.state.kv_alloc.clone();
-            let finished = decoding_seq.finish(FinishReason::Eos);
-
-            self.kv_manager.free(kv_alloc);
+            self.kv_manager.free(seq.state.kv_alloc);
             let _ = self.active_requests.finish(&request_id);
 
-            let elapsed_ms = finished.state.metrics.e2e_latency.as_millis() as u64;
+            let elapsed_ms = seq.meta.arrival_time.elapsed().as_millis() as u64;
+            let (status, images, error) = match item.status {
+                DiffusionOutputStatus::Success => {
+                    let images = item.image.into_iter().map(|image| ImageOutput {
+                        width: image.width,
+                        height: image.height,
+                        channels: image.channels,
+                        format: image.format,
+                        data: image.data,
+                    }).collect();
+                    (ResponseStatus::Success, images, None)
+                }
+                DiffusionOutputStatus::Error => {
+                    (ResponseStatus::Error, vec![], item.error)
+                }
+            };
+
             let response = InferenceResponse {
                 request_id: request_id.0.clone(),
-                status: ResponseStatus::Success,
-                output_token_ids: vec![], // Diffusion output is image, not tokens
+                status,
+                output_token_ids: vec![],
+                images,
                 finish_reason: Some("stop".to_string()),
-                error: None,
+                error,
                 metrics: InferenceMetrics {
-                    total_ms: elapsed_ms,
+                    total_ms: elapsed_ms.max(item.metrics.total_ms),
                     num_tokens: 0,
                     tokens_per_second: 0.0,
                 },
@@ -412,7 +457,6 @@ where
 
             self.frontend.send_response(&client_id, response).await?;
             self.metrics.record_completion(elapsed_ms, 0);
-
             tracing::info!("Completed diffusion request {} in {}ms", request_id, elapsed_ms);
         }
 
@@ -453,6 +497,7 @@ where
             request_id: request_id.0.clone(),
             status: ResponseStatus::Success,
             output_token_ids: finished.state.output_tokens,
+            images: vec![],
             finish_reason: Some("stop".to_string()),
             error: None,
             metrics: InferenceMetrics {

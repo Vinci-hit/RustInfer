@@ -6,6 +6,7 @@ use crate::*;
 fn test_protocol_types() {
     let _req = InferenceRequest {
         request_id: "test".to_string(),
+        modality: InferenceModality::Llm,
         input_ids: vec![1, 2, 3],
         max_tokens: 100,
         temperature: 0.7,
@@ -14,12 +15,14 @@ fn test_protocol_types() {
         stream: false,
         priority: 0,
         stop_sequences: vec!["<|eot_id|>".to_string()],
+        diffusion: None,
     };
 
     let _resp = InferenceResponse {
         request_id: "test".to_string(),
         status: ResponseStatus::Success,
         output_token_ids: vec![10, 20, 30],
+        images: vec![],
         finish_reason: Some("stop".to_string()),
         error: None,
         metrics: InferenceMetrics {
