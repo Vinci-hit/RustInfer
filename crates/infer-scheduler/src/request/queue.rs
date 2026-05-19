@@ -98,6 +98,7 @@ mod tests {
     fn make_seq(id: &str, priority: i32) -> Sequence<Queued> {
         let meta = Arc::new(RequestMeta {
             id: RequestId(id.to_string()),
+            sequence_id: crate::request::lifecycle::SequenceId(1),
             input_ids: vec![1, 2, 3],
             max_tokens: 10,
             sampling: SamplingParams::default(),

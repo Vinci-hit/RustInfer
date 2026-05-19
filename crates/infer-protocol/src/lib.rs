@@ -16,12 +16,12 @@ pub use scheduler_to_server::{
     ChunkType, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
 };
 pub use scheduler_to_worker::{
-    CancelRequest, DrainMode, DrainWorker, PrefillBatchCmd, RequestMeta, SamplingParams,
-    UnloadModel, WorkerCommand,
+    CancelRequest, DrainMode, DrainWorker, PrefillBatchCmd, PrefillSegmentCompletion,
+    PrefillSegmentMeta, SamplingParams, UnloadModel, WorkerCommand,
 };
 pub use scheduler_to_worker_control::{LoadModel, SchedulerControlMessage, SchedulerHello};
 pub use server_to_scheduler::InferenceRequest;
-pub use worker_to_scheduler::{CancelAck, DrainAck, SeqToken, StepOutput};
+pub use worker_to_scheduler::{CancelAck, DrainAck, GeneratedToken, StepOutput};
 pub use worker_to_scheduler_control::{
     WorkerCapacity, WorkerControlMessage, WorkerError, WorkerHeartbeat, WorkerHello,
     WorkerProgress, WorkerReady, WorkerState, WORKER_CONTROL_PROTOCOL_VERSION,

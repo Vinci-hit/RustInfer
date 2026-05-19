@@ -31,18 +31,24 @@ use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta};
 
 #[derive(Clone)]
 struct DecodeSeq {
-    request_id: String,
+    sequence_id: u64,
     kv_slot: usize,
-    /// 下一个 token 写入 KV cache 的 position (= 已有 KV 长度)
+    /// 下一个 decode 输入 token 写入 KV cache 的 position (= 当前 KV 长度)。
     next_position: usize,
-    /// 上一步采样出的 token (本步 decode 输入)
+    /// 上一步采样出的 token (本步 decode 输入)。
     last_token: i32,
-    /// 已生成 token 数
+    /// 已生成 token 数；包含 final prefill 输出的第一个 token。
     generated_count: usize,
     max_tokens: usize,
-    /// 采样参数（后续接入 top_p / temperature / top_k）
+    /// 采样参数（后续接入 top_p / temperature / top_k）。
     #[allow(dead_code)]
     sampling: SamplingParams,
+}
+
+#[derive(Clone)]
+enum StepItem {
+    Decode { sequence_id: u64 },
+    PrefillSegment { segment: PrefillSegmentMeta },
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -63,7 +69,8 @@ pub struct WorkerServer<M: LlmModel> {
     // 序列管理
     active_decodes: Vec<DecodeSeq>,
     pending_prefills: Vec<PrefillBatchCmd>,
-    pending_cancels: Vec<String>,
+    pending_cancels: Vec<u64>,
+    last_step_items: Vec<StepItem>,
     draining: bool,
 }
 
@@ -84,6 +91,7 @@ impl<M: LlmModel> WorkerServer<M> {
             active_decodes: Vec::new(),
             pending_prefills: Vec::new(),
             pending_cancels: Vec::new(),
+            last_step_items: Vec::new(),
             draining: false,
         }
     }
@@ -132,11 +140,8 @@ impl<M: LlmModel> WorkerServer<M> {
             };
             self.runner.set_output_consumed();
 
-            // 4. 更新 decode 状态
-            self.update_decode_tokens(&output_tokens);
-
-            // 5. 判 EOS / max_tokens，发 ZMQ output，移除已完成序列
-            self.process_eos_and_send_zmq(&output_tokens);
+            // 4. 按本 step 语义处理 output：prefill ack、final prefill token、decode token。
+            self.process_step_output_and_send_zmq(&output_tokens);
             self.apply_pending_cancels();
 
             // 6. 非阻塞收新 prefill / cancel
@@ -172,36 +177,29 @@ impl<M: LlmModel> WorkerServer<M> {
     //  写入 Runner workspace + signal（核心改动）
     // ════════════════════════════════════════════════════════════════════════════
 
-    /// 整体流程：ensure_capacity → write_input_buffer → promote prefills → signal 已在 write 内完成
+    /// 整体流程：ensure_capacity → write_input_buffer → 记录本 step 语义 → signal runner。
+    ///
+    /// Prefill segment 不在这里无条件转 decode；必须等 runner output 回来后，
+    /// 根据 segment completion 决定丢弃中间 chunk 的采样 token，或用 final chunk 的
+    /// 输出 token 创建 DecodeSeq。
     fn ensure_capacity_and_enqueue(&mut self) -> Result<()> {
         if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
             return Ok(());
         }
 
-        // 1. ensure KV capacity for pending prefills
         self.ensure_capacity_for_pending_prefills()?;
-        // 2. write workspace (active decodes + pending prefills) + signal runner
         self.write_input_buffer_pre_promote()?;
-        // 3. promote prefills to decode state (之后 output 回来时 active_decodes 包含所有 seq)
-        self.promote_prefills_to_decodes();
         Ok(())
     }
 
-    /// 为 pending prefills 预分配 KV cache 容量。
+    /// 为 pending prefill segments 预分配 KV cache 容量。
     fn ensure_capacity_for_pending_prefills(&mut self) -> Result<()> {
         for cmd in &self.pending_prefills {
             let n = cmd.num_requests();
             for i in 0..n {
-                let slot = cmd.kv_slots[i] as usize;
-                let start = cmd.q_start_loc[i] as usize;
-                let end = if i + 1 < n {
-                    cmd.q_start_loc[i + 1] as usize
-                } else {
-                    cmd.input_ids.len()
-                };
-                let seq_len = end - start;
-                let computed = cmd.num_computed_tokens[i] as usize;
-                let max_total = computed + seq_len + cmd.request_metas[i].max_tokens;
+                let segment = &cmd.segments[i];
+                let slot = segment.kv_slot as usize;
+                let max_total = segment.prompt_len as usize + segment.max_tokens;
 
                 unsafe {
                     self.runner.state_mut(slot).kv_cache.ensure_capacity(max_total)?;
@@ -211,39 +209,10 @@ impl<M: LlmModel> WorkerServer<M> {
         Ok(())
     }
 
-    /// Prefill 写入后，对应序列进入 decode 状态。
-    fn promote_prefills_to_decodes(&mut self) {
-        for cmd in self.pending_prefills.drain(..) {
-            let n = cmd.num_requests();
-            for i in 0..n {
-                let start = cmd.q_start_loc[i] as usize;
-                let end = if i + 1 < n {
-                    cmd.q_start_loc[i + 1] as usize
-                } else {
-                    cmd.input_ids.len()
-                };
-                let seq_len = end - start;
-                let computed = cmd.num_computed_tokens[i] as usize;
-
-                self.active_decodes.push(DecodeSeq {
-                    request_id: cmd.request_metas[i].request_id.clone(),
-                    kv_slot: cmd.kv_slots[i] as usize,
-                    next_position: computed + seq_len,
-                    last_token: 0, // 首个 decode token 来自 Runner 输出
-                    generated_count: 0,
-                    max_tokens: cmd.request_metas[i].max_tokens,
-                    sampling: cmd.sampling_params[i].clone(),
-                });
-            }
-        }
-    }
-
     /// 写入 Runner workspace。
     ///
-    /// 调用时机：promote_prefills 之前。active_decodes 是已有 decode 序列，
-    /// pending_prefills 是本步要做的 prefill。
-    ///
-    /// 布局：decode 在前 (q_len=1 each)，prefill 在后 (q_len=seq_len each)。
+    /// 布局：decode 在前 (q_len=1 each)，prefill segment 在后。
+    /// 同时记录 `last_step_items`，runner output 回来后按这个表解释每一行输出。
     fn write_input_buffer_pre_promote(&mut self) -> Result<()> {
         let num_decode = self.active_decodes.len();
         let num_prefill_seqs: usize = self.pending_prefills.iter()
@@ -271,10 +240,10 @@ impl<M: LlmModel> WorkerServer<M> {
             )).into());
         }
 
-        // ── 1. 组装 host-side 数据 ──
         let mut tokens = Vec::with_capacity(total_tokens);
         let mut positions = Vec::with_capacity(total_tokens);
         let mut kv_lens = Vec::with_capacity(num_seqs);
+        let mut step_items = Vec::with_capacity(num_seqs);
         let mut meta = StepMeta::zeroed();
 
         meta.num_decode = num_decode;
@@ -283,55 +252,50 @@ impl<M: LlmModel> WorkerServer<M> {
         let mut offset: i32 = 0;
         let mut seq_idx = 0usize;
 
-        // Decode 在前 (每条 q_len=1)
+        // Decode 在前 (每条 q_len=1)。
         for d in &self.active_decodes {
             tokens.push(d.last_token);
             positions.push(d.next_position as i32);
-            // kv_lens for attention: past + q_len = next_position + 1
             kv_lens.push(d.next_position as i32 + 1);
 
             meta.q_start_loc[seq_idx] = offset;
             meta.slot_indices[seq_idx] = d.kv_slot as i32;
             meta.positions_start[seq_idx] = d.next_position as i32;
+            step_items.push(StepItem::Decode { sequence_id: d.sequence_id });
 
             offset += 1;
             seq_idx += 1;
         }
 
-        // Prefill 在后
+        // Prefill segments 在后。segment_start/end 是 KV 和 RoPE 的绝对位置。
         for cmd in &self.pending_prefills {
             let n = cmd.num_requests();
             for i in 0..n {
-                let start = cmd.q_start_loc[i] as usize;
-                let end = if i + 1 < n {
-                    cmd.q_start_loc[i + 1] as usize
-                } else {
-                    cmd.input_ids.len()
-                };
-                let seq_len = end - start;
-                let computed = cmd.num_computed_tokens[i] as usize;
-                let slot = cmd.kv_slots[i] as usize;
+                let range = cmd.segment_token_range(i);
+                let segment = cmd.segments[i].clone();
+                let seq_len = range.len();
+                let segment_start = segment.segment_start as usize;
+                let segment_end = segment.segment_end as usize;
+                let slot = segment.kv_slot as usize;
 
-                tokens.extend_from_slice(&cmd.input_ids[start..end]);
-                for pos in computed..(computed + seq_len) {
+                tokens.extend_from_slice(&cmd.input_ids[range]);
+                for pos in segment_start..segment_end {
                     positions.push(pos as i32);
                 }
-                // kv_lens for attention: computed + seq_len (prefill 首次 = seq_len)
-                kv_lens.push((computed + seq_len) as i32);
+                kv_lens.push(segment_end as i32);
 
                 meta.q_start_loc[seq_idx] = offset;
                 meta.slot_indices[seq_idx] = slot as i32;
-                meta.positions_start[seq_idx] = computed as i32;
+                meta.positions_start[seq_idx] = segment_start as i32;
+                step_items.push(StepItem::PrefillSegment { segment });
 
                 offset += seq_len as i32;
                 seq_idx += 1;
             }
         }
-        // 末尾哨兵
         meta.q_start_loc[num_seqs] = offset;
-        meta.total_q_tiles = 0; // runner 内部 refresh_ragged_plan 会覆盖
+        meta.total_q_tiles = 0;
 
-        // ── 2. H2D: input_tokens / input_pos / kv_lens_dev ──
         let ws_mut = unsafe { self.runner.workspace_mut() };
         #[cfg(feature = "cuda")]
         let stream = unsafe { self.runner.cuda_stream() };
@@ -355,16 +319,12 @@ impl<M: LlmModel> WorkerServer<M> {
                 .copy_from_host(&kv_lens)?;
         }
 
-        // ── 3. refresh_scatter_indices ──
         let meta_view = WorkerBatchMeta::from_step(&meta);
         #[cfg(feature = "cuda")]
         ws_mut.refresh_scatter_indices(&meta_view, stream)?;
         #[cfg(not(feature = "cuda"))]
         let _ = &meta_view;
 
-        // ── 4. fill_cache_ptrs_from_states ──
-        //
-        // 收集 state refs（slot 必须互异；由 scheduler 保证）。
         #[cfg(feature = "cuda")]
         {
             let states_all = unsafe { &mut *(self.runner.states_ptr_mut()) };
@@ -381,7 +341,9 @@ impl<M: LlmModel> WorkerServer<M> {
             ws_mut.fill_cache_ptrs_from_states(&slot_ids, &mut refs, stream)?;
         }
 
-        // ── 5. write_meta + set_input_ready ──
+        self.last_step_items = step_items;
+        self.pending_prefills.clear();
+
         unsafe { self.runner.write_meta(meta); }
         self.runner.set_input_ready();
 
@@ -394,72 +356,112 @@ impl<M: LlmModel> WorkerServer<M> {
 
     /// 从 Runner 读本步 output tokens (D2H)。
     fn read_output_tokens(&self) -> Result<Vec<i32>> {
-        let num_seqs = self.active_decodes.len();
+        let num_outputs = self.last_step_items.len();
         let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev() }
             .to_cpu()?
             .as_i32()?
             .as_slice()?
             .iter()
-            .take(num_seqs)
+            .take(num_outputs)
             .copied()
             .collect();
         Ok(tokens_out)
     }
 
-    /// 更新 decode 序列的 last_token 和 position。
-    fn update_decode_tokens(&mut self, tokens: &[i32]) {
-        if tokens.len() != self.active_decodes.len() {
+    /// 按 last_step_items 解释 runner output，更新 Worker 内部 decode 状态并发送精简 StepOutput。
+    fn process_step_output_and_send_zmq(&mut self, tokens: &[i32]) {
+        if tokens.len() != self.last_step_items.len() {
             tracing::error!(
-                "Runner output length {} != active decode length {}",
-                tokens.len(), self.active_decodes.len()
-            );
-            return;
-        }
-        for (seq, &token) in self.active_decodes.iter_mut().zip(tokens) {
-            seq.last_token = token;
-            seq.generated_count += 1;
-            seq.next_position += 1;
-        }
-    }
-
-    /// 判 EOS / max_tokens，移除已结束序列，发 ZMQ output。
-    fn process_eos_and_send_zmq(&mut self, tokens: &[i32]) {
-        if tokens.len() != self.active_decodes.len() {
-            tracing::error!(
-                "Skip EOS processing: output len {} != active len {}",
-                tokens.len(), self.active_decodes.len()
+                "Runner output length {} != last_step_items length {}",
+                tokens.len(), self.last_step_items.len()
             );
             return;
         }
 
+        let step_items = std::mem::take(&mut self.last_step_items);
         let mut step_output = StepOutput {
-            tokens: Vec::with_capacity(tokens.len()),
+            prefill_done: Vec::new(),
+            tokens: Vec::new(),
         };
-        let old_decodes = std::mem::take(&mut self.active_decodes);
+        let mut batch_members_changed = false;
 
-        for (seq, &token_id) in old_decodes.into_iter().zip(tokens) {
-            let finished =
-                self.eos_token_ids.contains(&token_id) || seq.generated_count >= seq.max_tokens;
+        for (item, &token_id) in step_items.into_iter().zip(tokens) {
+            match item {
+                StepItem::Decode { sequence_id } => {
+                    if let Some(idx) = self.active_decodes.iter().position(|s| s.sequence_id == sequence_id) {
+                        let seq = &mut self.active_decodes[idx];
+                        let generated_count = seq.generated_count + 1;
+                        let finished = self.eos_token_ids.contains(&token_id)
+                            || generated_count >= seq.max_tokens;
 
-            step_output.tokens.push(SeqToken {
-                request_id: seq.request_id.clone(),
-                token_id,
-                finished,
-            });
+                        step_output.tokens.push(GeneratedToken {
+                            sequence_id,
+                            token_id,
+                            finished,
+                        });
 
-            if !finished {
-                self.active_decodes.push(seq);
-            } else {
-                // Batch 成员变化 → invalidate KV 指针缓存
-                unsafe {
-                    self.runner.workspace_mut().invalidate_batch_member_cache();
+                        if finished {
+                            self.active_decodes.remove(idx);
+                            batch_members_changed = true;
+                        } else {
+                            let seq = &mut self.active_decodes[idx];
+                            seq.last_token = token_id;
+                            seq.generated_count = generated_count;
+                            seq.next_position += 1;
+                        }
+                    } else {
+                        tracing::warn!("Decode output for unknown sequence_id={}", sequence_id);
+                    }
                 }
-                // 如果启用了 CUDA Graph，batch 组成变化后需要 invalidate
-                #[cfg(feature = "cuda")]
-                self.runner.invalidate_decode_graphs();
+                StepItem::PrefillSegment { segment } => {
+                    let sequence_id = segment.sequence_id;
+                    step_output.prefill_done.push(sequence_id);
+
+                    match segment.completion {
+                        PrefillSegmentCompletion::ContinuePrefill => {
+                            // 中间 chunk 只写 KV，采样 token 无业务语义，直接丢弃。
+                        }
+                        PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
+                            let generated_count = 1usize;
+                            let finished = self.eos_token_ids.contains(&token_id)
+                                || generated_count >= segment.max_tokens;
+
+                            step_output.tokens.push(GeneratedToken {
+                                sequence_id,
+                                token_id,
+                                finished,
+                            });
+
+                            if !finished {
+                                self.active_decodes.push(DecodeSeq {
+                                    sequence_id,
+                                    kv_slot: segment.kv_slot as usize,
+                                    // final prefill 输出 token 还没写入 KV；下一步 decode 写到 prompt_len。
+                                    next_position: segment.prompt_len as usize,
+                                    last_token: token_id,
+                                    generated_count,
+                                    max_tokens: segment.max_tokens,
+                                    sampling: segment.sampling_params,
+                                });
+                                batch_members_changed = true;
+                            }
+                        }
+                    }
+                }
             }
         }
 
+        if batch_members_changed {
+            unsafe {
+                self.runner.workspace_mut().invalidate_batch_member_cache();
+            }
+            #[cfg(feature = "cuda")]
+            self.runner.invalidate_decode_graphs();
+        }
+
+        if step_output.prefill_done.is_empty() && step_output.tokens.is_empty() {
+            return;
+        }
         let data = match rmp_serde::to_vec(&step_output) {
             Ok(data) => data,
             Err(e) => {
@@ -542,8 +544,8 @@ impl<M: LlmModel> WorkerServer<M> {
         match cmd {
             WorkerCommand::Prefill(cmd) => self.accept_prefill(cmd),
             WorkerCommand::Cancel(cancel) => {
-                tracing::info!("CancelRequest queued request_id={}", cancel.request_id);
-                self.pending_cancels.push(cancel.request_id);
+                tracing::info!("CancelRequest queued sequence_id={}", cancel.sequence_id);
+                self.pending_cancels.push(cancel.sequence_id);
                 None
             }
             WorkerCommand::Drain(drain) => {
@@ -581,21 +583,21 @@ impl<M: LlmModel> WorkerServer<M> {
 
     fn apply_pending_cancels(&mut self) {
         let cancels = std::mem::take(&mut self.pending_cancels);
-        for request_id in cancels {
-            let removed = self.cancel_request(&request_id);
-            tracing::info!("CancelRequest applied request_id={} removed={}", request_id, removed);
+        for sequence_id in cancels {
+            let removed = self.cancel_request(sequence_id);
+            tracing::info!("CancelRequest applied sequence_id={} removed={}", sequence_id, removed);
         }
     }
 
-    fn cancel_request(&mut self, request_id: &str) -> bool {
+    fn cancel_request(&mut self, sequence_id: u64) -> bool {
         let before_active = self.active_decodes.len();
-        self.active_decodes.retain(|seq| seq.request_id != request_id);
+        self.active_decodes.retain(|seq| seq.sequence_id != sequence_id);
         let removed_active = before_active != self.active_decodes.len();
 
         let mut removed_pending = false;
         let pending = std::mem::take(&mut self.pending_prefills);
         for cmd in pending {
-            match filter_prefill_cmd(cmd, request_id) {
+            match filter_prefill_cmd(cmd, sequence_id) {
                 Some(cmd) => self.pending_prefills.push(cmd),
                 None => removed_pending = true,
             }
@@ -613,33 +615,21 @@ impl<M: LlmModel> WorkerServer<M> {
     }
 }
 
-fn filter_prefill_cmd(cmd: PrefillBatchCmd, request_id: &str) -> Option<PrefillBatchCmd> {
+fn filter_prefill_cmd(cmd: PrefillBatchCmd, sequence_id: u64) -> Option<PrefillBatchCmd> {
     let n = cmd.num_requests();
     let mut input_ids = Vec::new();
     let mut q_start_loc = Vec::new();
-    let mut num_computed_tokens = Vec::new();
-    let mut kv_slots = Vec::new();
-    let mut sampling_params = Vec::new();
-    let mut request_metas = Vec::new();
+    let mut segments = Vec::new();
 
     for i in 0..n {
-        let start = cmd.q_start_loc[i] as usize;
-        let end = if i + 1 < n {
-            cmd.q_start_loc[i + 1] as usize
-        } else {
-            cmd.input_ids.len()
-        };
-
-        if cmd.request_metas[i].request_id == request_id {
+        let range = cmd.segment_token_range(i);
+        if cmd.segments[i].sequence_id == sequence_id {
             continue;
         }
 
         q_start_loc.push(input_ids.len() as u32);
-        input_ids.extend_from_slice(&cmd.input_ids[start..end]);
-        num_computed_tokens.push(cmd.num_computed_tokens[i]);
-        kv_slots.push(cmd.kv_slots[i]);
-        sampling_params.push(cmd.sampling_params[i].clone());
-        request_metas.push(cmd.request_metas[i].clone());
+        input_ids.extend_from_slice(&cmd.input_ids[range]);
+        segments.push(cmd.segments[i].clone());
     }
 
     if q_start_loc.is_empty() {
@@ -648,10 +638,7 @@ fn filter_prefill_cmd(cmd: PrefillBatchCmd, request_id: &str) -> Option<PrefillB
         Some(PrefillBatchCmd {
             input_ids,
             q_start_loc,
-            num_computed_tokens,
-            kv_slots,
-            sampling_params,
-            request_metas,
+            segments,
         })
     }
 }
@@ -689,6 +676,29 @@ mod tests {
                 ];
                 candidates.into_iter().find(|p| p.exists())
             })
+    }
+
+    fn full_prefill_cmd(
+        sequence_id: u64,
+        input_ids: Vec<i32>,
+        kv_slot: u32,
+        max_tokens: usize,
+    ) -> PrefillBatchCmd {
+        let prompt_len = input_ids.len() as u32;
+        PrefillBatchCmd {
+            input_ids,
+            q_start_loc: vec![0],
+            segments: vec![PrefillSegmentMeta {
+                sequence_id,
+                kv_slot,
+                prompt_len,
+                segment_start: 0,
+                segment_end: prompt_len,
+                max_tokens,
+                sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+                completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+            }],
+        }
     }
 
     /// 单请求端到端：prefill + decode 直到 max_tokens，验证：
@@ -743,21 +753,7 @@ mod tests {
         let toks: Vec<i32> = runner.model().tokenizer().encode(prompt)?;
         let max_tokens = 10usize;
 
-        let cmd = PrefillBatchCmd {
-            input_ids: toks.clone(),
-            q_start_loc: vec![0],
-            num_computed_tokens: vec![0],
-            kv_slots: vec![0],
-            sampling_params: vec![SamplingParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: -1,
-            }],
-            request_metas: vec![RequestMeta {
-                request_id: "req-001".to_string(),
-                max_tokens,
-            }],
-        };
+        let cmd = full_prefill_cmd(1, toks.clone(), 0, max_tokens);
         let data = rmp_serde::to_vec(&cmd).unwrap();
         scheduler_push.send(&data, 0)?;
 
@@ -775,7 +771,7 @@ mod tests {
 
             assert_eq!(output.tokens.len(), 1, "expected 1 seq in output");
             let seq_out = &output.tokens[0];
-            assert_eq!(seq_out.request_id, "req-001");
+            assert_eq!(seq_out.sequence_id, 1);
             assert!(
                 seq_out.token_id >= 0 && (seq_out.token_id as usize) < vocab,
                 "token {} out of vocab range", seq_out.token_id
@@ -848,35 +844,21 @@ mod tests {
         // ─── 发第 1 个请求 (slot 0) ───
         let prompt1 = "Hello world";
         let toks1: Vec<i32> = runner.model().tokenizer().encode(prompt1)?;
-        let cmd1 = PrefillBatchCmd {
-            input_ids: toks1,
-            q_start_loc: vec![0],
-            num_computed_tokens: vec![0],
-            kv_slots: vec![0],
-            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
-            request_metas: vec![RequestMeta { request_id: "req-A".to_string(), max_tokens: 5 }],
-        };
+        let cmd1 = full_prefill_cmd(1, toks1, 0, 5);
         scheduler_push.send(&rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
 
         // 收第一步 output（只有 req-A）
         let msg = scheduler_pull.recv_bytes(0)?;
         let out1: StepOutput = rmp_serde::from_slice(&msg)?;
         assert_eq!(out1.tokens.len(), 1);
-        assert_eq!(out1.tokens[0].request_id, "req-A");
+        assert_eq!(out1.tokens[0].sequence_id, 1);
         assert!(out1.tokens[0].token_id >= 0 && (out1.tokens[0].token_id as usize) < vocab);
         eprintln!("step 1: req-A token={}", out1.tokens[0].token_id);
 
         // ─── 发第 2 个请求 (slot 1)，趁 server 在 drain_zmq_prefills ───
         let prompt2 = "The sky is";
         let toks2: Vec<i32> = runner.model().tokenizer().encode(prompt2)?;
-        let cmd2 = PrefillBatchCmd {
-            input_ids: toks2,
-            q_start_loc: vec![0],
-            num_computed_tokens: vec![0],
-            kv_slots: vec![1],
-            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
-            request_metas: vec![RequestMeta { request_id: "req-B".to_string(), max_tokens: 5 }],
-        };
+        let cmd2 = full_prefill_cmd(2, toks2, 1, 5);
         scheduler_push.send(&rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
 
         // 后续 output 应该包含两条 seq（req-A decode + req-B prefill/decode）
@@ -895,14 +877,14 @@ mod tests {
             for seq_out in &out.tokens {
                 assert!(
                     seq_out.token_id >= 0 && (seq_out.token_id as usize) < vocab,
-                    "{} token {} out of range", seq_out.request_id, seq_out.token_id
+                    "{} token {} out of range", seq_out.sequence_id, seq_out.token_id
                 );
-                eprintln!("  {} token={} finished={}", seq_out.request_id, seq_out.token_id, seq_out.finished);
+                eprintln!("  {} token={} finished={}", seq_out.sequence_id, seq_out.token_id, seq_out.finished);
                 if seq_out.finished {
-                    match seq_out.request_id.as_str() {
-                        "req-A" => a_finished = true,
-                        "req-B" => b_finished = true,
-                        other => panic!("unexpected request_id: {}", other),
+                    match seq_out.sequence_id {
+                        1 => a_finished = true,
+                        2 => b_finished = true,
+                        other => panic!("unexpected sequence_id: {}", other),
                     }
                 }
             }
@@ -954,14 +936,7 @@ mod tests {
 
         // ─── req1: slot 0, max_tokens=3 ───
         let toks1: Vec<i32> = runner.model().tokenizer().encode("Hello")?;
-        let cmd1 = PrefillBatchCmd {
-            input_ids: toks1,
-            q_start_loc: vec![0],
-            num_computed_tokens: vec![0],
-            kv_slots: vec![0],
-            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
-            request_metas: vec![RequestMeta { request_id: "first".to_string(), max_tokens: 3 }],
-        };
+        let cmd1 = full_prefill_cmd(1, toks1, 0, 3);
         scheduler_push.send(&rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
 
         // 等 req1 finish
@@ -970,7 +945,7 @@ mod tests {
             if std::time::Instant::now() > deadline { panic!("timeout on req1"); }
             let msg = scheduler_pull.recv_bytes(0)?;
             let out: StepOutput = rmp_serde::from_slice(&msg)?;
-            if out.tokens.iter().any(|t| t.request_id == "first" && t.finished) {
+            if out.tokens.iter().any(|t| t.sequence_id == 1 && t.finished) {
                 eprintln!("req1 finished");
                 break;
             }
@@ -978,14 +953,7 @@ mod tests {
 
         // ─── req2: 复用 slot 0 ───
         let toks2: Vec<i32> = runner.model().tokenizer().encode("Goodbye")?;
-        let cmd2 = PrefillBatchCmd {
-            input_ids: toks2,
-            q_start_loc: vec![0],
-            num_computed_tokens: vec![0],
-            kv_slots: vec![0], // 同一个 slot!
-            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
-            request_metas: vec![RequestMeta { request_id: "second".to_string(), max_tokens: 3 }],
-        };
+        let cmd2 = full_prefill_cmd(2, toks2, 0, 3); // 同一个 slot!
         scheduler_push.send(&rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
 
         // 等 req2 finish
@@ -1000,7 +968,7 @@ mod tests {
                     "req2 token {} out of range", t.token_id
                 );
             }
-            if out.tokens.iter().any(|t| t.request_id == "second" && t.finished) {
+            if out.tokens.iter().any(|t| t.sequence_id == 2 && t.finished) {
                 eprintln!("req2 (slot reuse) finished successfully");
                 break;
             }
@@ -1023,36 +991,25 @@ mod tests {
         scheduler_pull: &zmq::Socket,
         input_ids: Vec<i32>,
         kv_slot: u32,
-        request_id: &str,
+        sequence_id: u64,
         max_tokens: usize,
     ) -> Result<(Vec<i32>, bool)> {
-        let cmd = PrefillBatchCmd {
-            input_ids,
-            q_start_loc: vec![0],
-            num_computed_tokens: vec![0],
-            kv_slots: vec![kv_slot],
-            sampling_params: vec![SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 }],
-            request_metas: vec![RequestMeta {
-                request_id: request_id.to_string(),
-                max_tokens,
-            }],
-        };
+        let cmd = full_prefill_cmd(sequence_id, input_ids, kv_slot, max_tokens);
         scheduler_push.send(&rmp_serde::to_vec(&cmd).unwrap(), 0)?;
 
         let mut tokens = Vec::new();
-        let mut hit_eos = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if std::time::Instant::now() > deadline {
-                panic!("timeout waiting for request '{}' to finish", request_id);
+                panic!("timeout waiting for sequence_id={} to finish", sequence_id);
             }
             let msg = scheduler_pull.recv_bytes(0)?;
             let out: StepOutput = rmp_serde::from_slice(&msg)?;
             for t in &out.tokens {
-                if t.request_id == request_id {
+                if t.sequence_id == sequence_id {
                     tokens.push(t.token_id);
                     if t.finished {
-                        hit_eos = t.token_id != 0; // 简化判断
+                        let hit_eos = t.token_id != 0; // 简化判断
                         return Ok((tokens, hit_eos));
                     }
                 }
@@ -1155,7 +1112,7 @@ mod tests {
         // 跑第一次
         let (server_tokens_1, _) = run_one_request(
             &scheduler_push, &scheduler_pull,
-            prompt_tokens.clone(), 0, "run1", max_tokens,
+            prompt_tokens.clone(), 0, 1, max_tokens,
         )?;
         let server_text_1 = runner2.model().tokenizer().decode(&server_tokens_1).unwrap_or_default();
         eprintln!("server run1 ({} tokens): {:?}", server_tokens_1.len(), server_text_1);
@@ -1164,7 +1121,7 @@ mod tests {
         // 注意：这里 slot 0 是空闲的（run1 已 finished，被 server 移出 active）
         let (server_tokens_2, _) = run_one_request(
             &scheduler_push, &scheduler_pull,
-            prompt_tokens.clone(), 0, "run2", max_tokens,
+            prompt_tokens.clone(), 0, 2, max_tokens,
         )?;
         let server_text_2 = runner2.model().tokenizer().decode(&server_tokens_2).unwrap_or_default();
         eprintln!("server run2 ({} tokens): {:?}", server_tokens_2.len(), server_text_2);
@@ -1245,11 +1202,11 @@ mod tests {
         // ════ Part 1: 先单独跑两个请求建立 baseline ════
         let (baseline_0, _) = run_one_request(
             &scheduler_push, &scheduler_pull,
-            toks0.clone(), 0, "solo-0", max_tokens,
+            toks0.clone(), 0, 1, max_tokens,
         )?;
         let (baseline_1, _) = run_one_request(
             &scheduler_push, &scheduler_pull,
-            toks1.clone(), 0, "solo-1", max_tokens,
+            toks1.clone(), 0, 2, max_tokens,
         )?;
 
         let text_solo_0 = runner.model().tokenizer().decode(&baseline_0).unwrap_or_default();
@@ -1262,15 +1219,27 @@ mod tests {
         let cmd = PrefillBatchCmd {
             input_ids: combined_input_ids,
             q_start_loc: vec![0, toks0.len() as u32],
-            num_computed_tokens: vec![0, 0],
-            kv_slots: vec![0, 1],
-            sampling_params: vec![
-                SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
-                SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
-            ],
-            request_metas: vec![
-                RequestMeta { request_id: "batch-0".to_string(), max_tokens },
-                RequestMeta { request_id: "batch-1".to_string(), max_tokens },
+            segments: vec![
+                PrefillSegmentMeta {
+                    sequence_id: 10,
+                    kv_slot: 0,
+                    prompt_len: toks0.len() as u32,
+                    segment_start: 0,
+                    segment_end: toks0.len() as u32,
+                    max_tokens,
+                    sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+                    completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+                },
+                PrefillSegmentMeta {
+                    sequence_id: 11,
+                    kv_slot: 1,
+                    prompt_len: toks1.len() as u32,
+                    segment_start: 0,
+                    segment_end: toks1.len() as u32,
+                    max_tokens,
+                    sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+                    completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+                },
             ],
         };
         scheduler_push.send(&rmp_serde::to_vec(&cmd).unwrap(), 0)?;
@@ -1289,16 +1258,16 @@ mod tests {
             let msg = scheduler_pull.recv_bytes(0)?;
             let out: StepOutput = rmp_serde::from_slice(&msg)?;
             for t in &out.tokens {
-                match t.request_id.as_str() {
-                    "batch-0" => {
+                match t.sequence_id {
+                    10 => {
                         tokens_0.push(t.token_id);
                         if t.finished { done_0 = true; }
                     }
-                    "batch-1" => {
+                    11 => {
                         tokens_1.push(t.token_id);
                         if t.finished { done_1 = true; }
                     }
-                    _ => panic!("unexpected request_id: {}", t.request_id),
+                    other => panic!("unexpected sequence_id: {}", other),
                 }
             }
         }

@@ -107,6 +107,7 @@ mod tests {
         for id in ids {
             let meta = Arc::new(RequestMeta {
                 id: RequestId(id.to_string()),
+                sequence_id: SequenceId(1),
                 input_ids: vec![1i32; 10], // dummy prompt tokens
                 max_tokens: 1, // not used for diffusion
                 sampling: SamplingParams::default(),

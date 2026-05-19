@@ -55,10 +55,11 @@ where
 
     // ─── State ───
     iteration_id: u64,
+    /// Diffusion batch-in batch-out gate. LLM mode does not use this as backpressure.
     worker_busy: bool,
-    /// Tokens scheduled for each prefilling sequence in the current batch.
-    /// Used by handle_step_output to know how much to advance each seq.
-    /// Key: request_id, Value: tokens processed this iteration.
+    next_sequence_id: u64,
+    /// Prefill segments scheduled in the current Scheduler iteration.
+    /// Key: request_id, Value: tokens sent in this segment.
     current_chunk_sizes: Vec<(RequestId, usize)>,
 }
 
@@ -102,6 +103,7 @@ where
             config,
             iteration_id: 0,
             worker_busy: false,
+            next_sequence_id: 1,
             current_chunk_sizes: Vec::new(),
         }
     }
@@ -132,8 +134,12 @@ where
             return;
         }
 
+        let sequence_id = SequenceId(self.next_sequence_id);
+        self.next_sequence_id += 1;
+
         let meta = Arc::new(RequestMeta {
             id: RequestId(request.request_id.clone()),
+            sequence_id,
             input_ids: request.input_ids,
             max_tokens: request.max_tokens,
             sampling: SamplingParams {
@@ -169,7 +175,7 @@ where
 
     /// Run one scheduling iteration.
     pub(crate) async fn run_iteration(&mut self) -> Result<()> {
-        if self.worker_busy {
+        if self.config.mode == SchedulerMode::Diffusion && self.worker_busy {
             return Ok(());
         }
         if self.waiting_queue.is_empty() && self.prefilling.is_empty() && self.decoding.is_empty() {
@@ -181,6 +187,7 @@ where
         // Build continuation info for prefilling sequences that need more chunks.
         let prefilling_continuations: Vec<(RequestId, usize)> = self.prefilling
             .iter()
+            .filter(|seq| !seq.has_inflight())
             .map(|seq| (seq.meta.id.clone(), seq.remaining_tokens()))
             .collect();
 
@@ -229,7 +236,9 @@ where
 
         if !batch_data.is_empty() {
             self.worker.send_batch(batch_data).await?;
-            self.worker_busy = true;
+            if self.config.mode == SchedulerMode::Diffusion {
+                self.worker_busy = true;
+            }
         }
 
         Ok(())
@@ -244,11 +253,22 @@ where
             let is_continuation = self.prefilling.iter().any(|s| s.meta.id == entry.request_id);
 
             if is_continuation {
-                // Continuation chunk: record how many tokens to process this iteration.
-                self.current_chunk_sizes.push((
-                    entry.request_id.clone(),
-                    entry.token_range.len(),
-                ));
+                // Continuation chunk: mark exact KV/prompt segment in flight.
+                if let Some(seq) = self.prefilling.iter_mut().find(|s| s.meta.id == entry.request_id) {
+                    if seq.has_inflight() {
+                        continue;
+                    }
+                    let start = seq.state.num_computed_tokens;
+                    let end = (start + entry.token_range.len()).min(seq.state.prompt_len);
+                    if start >= end {
+                        continue;
+                    }
+                    seq.set_inflight(start, end);
+                    self.current_chunk_sizes.push((
+                        entry.request_id.clone(),
+                        end - start,
+                    ));
+                }
             } else {
                 // New request: pop from waiting, allocate KV, move to prefilling.
                 let seq = match self.waiting_queue.remove(&entry.request_id) {
@@ -271,13 +291,18 @@ where
 
                 self.active_requests
                     .mark_prefilling(&entry.request_id, kv_alloc.clone());
-                let prefilling_seq = seq.start_prefill(kv_alloc);
+                let mut prefilling_seq = seq.start_prefill(kv_alloc);
+                let start = 0;
+                let end = entry.token_range.len().min(prefilling_seq.state.prompt_len);
+                if end == 0 {
+                    continue;
+                }
+                prefilling_seq.set_inflight(start, end);
                 self.prefilling.push(prefilling_seq);
 
-                // Record chunk size for this new entry.
                 self.current_chunk_sizes.push((
                     entry.request_id.clone(),
-                    entry.token_range.len(),
+                    end - start,
                 ));
             }
         }
@@ -295,49 +320,49 @@ where
         }
     }
 
-    /// LLM mode: process per-token outputs, advance chunks, transition prefill→decode→finish.
+    /// LLM mode: process prefill segment ACKs and generated tokens from Worker.
     async fn handle_step_output_llm(&mut self, data: Vec<u8>) -> Result<()> {
         use crate::transport::codec::Codec;
         let output: StepOutput = self.codec.decode(&data)?;
 
-        let mut finished_indices: Vec<usize> = Vec::new();
+        // 1. ACK prefill segments. Final segment moves the sequence to decoding before
+        // processing the token generated by that final prefill.
+        for sequence_id in output.prefill_done {
+            let Some(idx) = self.prefilling.iter().position(|s| s.meta.sequence_id.0 == sequence_id) else {
+                tracing::warn!("PrefillDone for unknown sequence_id={}", sequence_id);
+                continue;
+            };
 
-        // Process tokens for decoding sequences.
-        for seq_token in &output.tokens {
-            if let Some(seq) = self.decoding.iter_mut().find(|s| s.meta.id.0 == seq_token.request_id) {
-                seq.append_token(seq_token.token_id);
+            let mut seq = self.prefilling.remove(idx);
+            let Some(inflight) = seq.ack_inflight() else {
+                tracing::warn!("PrefillDone for sequence_id={} without inflight segment", sequence_id);
+                self.prefilling.push(seq);
+                continue;
+            };
+            if inflight.is_final || seq.is_complete() {
+                self.active_requests.mark_decoding(&seq.meta.id);
+                self.decoding.push(seq.start_decode());
+            } else {
+                self.prefilling.push(seq);
+            }
+        }
+
+        // 2. Process generated tokens. Worker owns EOS/max_tokens decision and returns finished.
+        let mut finished_indices: Vec<usize> = Vec::new();
+        for token in &output.tokens {
+            if let Some(seq) = self.decoding.iter_mut().find(|s| s.meta.sequence_id.0 == token.sequence_id) {
+                seq.append_token(token.token_id);
                 self.active_requests.record_generated_token(&seq.meta.id);
-                if seq_token.finished || seq.reached_max_tokens() {
-                    if let Some(idx) = self.decoding.iter().position(|s| s.meta.id.0 == seq_token.request_id) {
+                if token.finished || seq.reached_max_tokens() {
+                    if let Some(idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == token.sequence_id) {
                         finished_indices.push(idx);
                     }
                 }
-            }
-        }
-
-        // Move completed prefilling → decoding using recorded chunk sizes.
-        let chunk_sizes = std::mem::take(&mut self.current_chunk_sizes);
-        let mut new_decoding = Vec::new();
-        let mut remaining_prefilling = Vec::new();
-        for mut seq in self.prefilling.drain(..) {
-            let chunk = chunk_sizes
-                .iter()
-                .find(|(id, _)| *id == seq.meta.id)
-                .map(|(_, size)| *size)
-                .unwrap_or(seq.state.prompt_len);
-
-            seq.advance_chunk(chunk);
-            if seq.is_complete() {
-                self.active_requests.mark_decoding(&seq.meta.id);
-                new_decoding.push(seq.start_decode());
             } else {
-                remaining_prefilling.push(seq);
+                tracing::warn!("Generated token for unknown sequence_id={}", token.sequence_id);
             }
         }
-        self.prefilling = remaining_prefilling;
-        self.decoding.extend(new_decoding);
 
-        // Handle finished sequences.
         finished_indices.sort_unstable();
         finished_indices.dedup();
         for &idx in finished_indices.iter().rev() {
@@ -456,7 +481,7 @@ where
 
     #[allow(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
-        !self.has_pending_work() && !self.worker_busy
+        !self.has_pending_work() && !self.worker_busy()
     }
 
     #[allow(dead_code)]
@@ -470,7 +495,7 @@ where
     }
 
     pub(crate) fn worker_busy(&self) -> bool {
-        self.worker_busy
+        self.config.mode == SchedulerMode::Diffusion && self.worker_busy
     }
 
     #[allow(dead_code)]
@@ -491,8 +516,21 @@ where
             return Ok(());
         }
 
-        let data = crate::core::batch_builder::build_cancel_request(&request_id, &self.codec)?;
-        self.worker.send_batch(data).await
+        let sequence_id = self.prefilling
+            .iter()
+            .find(|s| s.meta.id == request_id)
+            .map(|s| s.meta.sequence_id.0)
+            .or_else(|| self.decoding
+                .iter()
+                .find(|s| s.meta.id == request_id)
+                .map(|s| s.meta.sequence_id.0));
+
+        if let Some(sequence_id) = sequence_id {
+            let data = crate::core::batch_builder::build_cancel_request(sequence_id, &self.codec)?;
+            self.worker.send_batch(data).await
+        } else {
+            Ok(())
+        }
     }
 
     #[allow(dead_code)]
@@ -514,7 +552,7 @@ where
     pub(crate) async fn poll_next_event(&mut self) -> crate::core::event_loop::EngineEvent {
         use crate::core::event_loop::EngineEvent;
 
-        let has_work = self.has_pending_work() || self.worker_busy;
+        let has_work = self.has_pending_work() || self.worker_busy();
 
         if has_work {
             // Both branches active.

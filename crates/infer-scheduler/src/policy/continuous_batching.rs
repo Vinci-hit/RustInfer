@@ -93,10 +93,16 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 }
 
                 let prompt_len = seq.meta.input_ids.len();
-                let tokens_to_prefill = self.chunk_tokens(prompt_len);
-
-                // Check if this chunk fits in the remaining budget.
-                if tokens_to_prefill > token_budget_remaining {
+                let tokens_to_prefill = match self.chunked_prefill_size {
+                    Some(_) => self.chunk_tokens(prompt_len).min(token_budget_remaining),
+                    None => {
+                        if prompt_len > token_budget_remaining {
+                            break;
+                        }
+                        prompt_len
+                    }
+                };
+                if tokens_to_prefill == 0 {
                     break;
                 }
 
@@ -141,6 +147,7 @@ mod tests {
         for (id, len) in ids {
             let meta = Arc::new(RequestMeta {
                 id: RequestId(id.to_string()),
+                sequence_id: SequenceId(1),
                 input_ids: vec![1i32; *len],
                 max_tokens: 100,
                 sampling: SamplingParams::default(),
@@ -241,10 +248,13 @@ mod tests {
 
         let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
         // Continuation chunk takes 10 tokens (chunk_size), leaving 2 for new.
-        // But "new" needs 5 tokens and only 2 remain → can't fit.
-        assert_eq!(plan.prefill_batch.len(), 1);
+        // In chunked mode the new request can consume the remaining 2-token budget.
+        assert_eq!(plan.prefill_batch.len(), 2);
         assert_eq!(plan.prefill_batch[0].request_id.0, "cont");
         assert_eq!(plan.prefill_batch[0].token_range.len(), 10);
+        assert_eq!(plan.prefill_batch[1].request_id.0, "new");
+        assert_eq!(plan.prefill_batch[1].token_range.len(), 2);
+        assert!(plan.prefill_batch[1].is_partial);
     }
 
     #[test]

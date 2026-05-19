@@ -15,11 +15,21 @@ use crate::request::handle::RequestHandle;
 //  Request Identity & Metadata
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Unique request identifier.
+/// Unique request identifier from frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RequestId(pub String);
 
 impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Compact scheduler-assigned id used on the Worker hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SequenceId(pub u64);
+
+impl std::fmt::Display for SequenceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -57,6 +67,7 @@ impl Default for SamplingParams {
 #[derive(Debug, Clone)]
 pub struct RequestMeta {
     pub id: RequestId,
+    pub sequence_id: SequenceId,
     pub input_ids: Vec<i32>,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
@@ -95,12 +106,21 @@ pub struct Queued {
 pub struct Prefilling {
     /// KV allocation for this sequence.
     pub kv_alloc: KvAllocation,
-    /// How many tokens have been prefilled so far (for chunked prefill).
+    /// How many prompt tokens the Worker has acknowledged as written to KV.
     pub num_computed_tokens: usize,
+    /// Segment already sent to Worker but not yet acknowledged.
+    pub inflight: Option<InFlightPrefillSegment>,
     /// Total prompt length.
     pub prompt_len: usize,
     /// Time prefill was first scheduled.
     pub prefill_start: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InFlightPrefillSegment {
+    pub segment_start: usize,
+    pub segment_end: usize,
+    pub is_final: bool,
 }
 
 /// Data for a sequence in the decode phase.
@@ -174,6 +194,7 @@ impl Sequence<Queued> {
             state: Prefilling {
                 kv_alloc,
                 num_computed_tokens: 0,
+                inflight: None,
                 prompt_len,
                 prefill_start: Instant::now(),
             },
@@ -207,6 +228,27 @@ impl Sequence<Prefilling> {
                 preemption_count: 0,
             },
         }
+    }
+
+    /// Mark an in-flight segment as completed by the Worker.
+    pub fn ack_inflight(&mut self) -> Option<InFlightPrefillSegment> {
+        let inflight = self.state.inflight.take()?;
+        self.state.num_computed_tokens = inflight.segment_end;
+        Some(inflight)
+    }
+
+    /// Mark a segment as sent to Worker.
+    pub fn set_inflight(&mut self, segment_start: usize, segment_end: usize) {
+        self.state.inflight = Some(InFlightPrefillSegment {
+            segment_start,
+            segment_end,
+            is_final: segment_end >= self.state.prompt_len,
+        });
+    }
+
+    /// Whether this sequence has a segment in flight.
+    pub fn has_inflight(&self) -> bool {
+        self.state.inflight.is_some()
     }
 
     /// Advance: chunk completed, more to go.
