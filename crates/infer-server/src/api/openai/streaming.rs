@@ -129,12 +129,12 @@ pub fn stream_chat_completion(
                     }
 
                     // [DONE] 标记
-                    yield Ok(Event::default().data("[DONE]".to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 ChunkType::Error => {
                     // 错误时也发 [DONE] 关闭流
-                    yield Ok(Event::default().data("[DONE]".to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
             }
@@ -235,11 +235,11 @@ pub fn stream_completion(
                         ));
                     }
 
-                    yield Ok(Event::default().data("[DONE]".to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 ChunkType::Error => {
-                    yield Ok(Event::default().data("[DONE]".to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
             }

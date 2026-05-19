@@ -99,7 +99,7 @@ fn validate_shapes(a: &Tensor, b: &Tensor, ctx: &str) -> Result<()> {
     }
     if a.dtype() != b.dtype() || a.device() != b.device() {
         return Err(Error::InvalidArgument(
-            format!("{ctx}: dtype/device mismatch").into()).into());
+            format!("{ctx}: dtype/device mismatch")).into());
     }
     Ok(())
 }

@@ -751,7 +751,7 @@ fn normalize_shape_with_infer(shape: &[usize], numel: usize) -> Result<Dims> {
         return Ok(Dims::from_slice(shape));
     }
     let known: usize = shape.iter().filter(|&&d| d != INFER).product();
-    if known == 0 || numel % known != 0 {
+    if known == 0 || !numel.is_multiple_of(known) {
         return Err(Error::InvalidArgument(format!(
             "reshape: cannot infer dimension for shape {:?} with numel {}",
             shape, numel

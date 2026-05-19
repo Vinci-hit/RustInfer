@@ -169,7 +169,7 @@ fn expand_broadcasts_size_one() -> Result<()> {
     let dense = e.contiguous()?;
     let got = dense.as_f32()?.as_slice()?;
     let expected: Vec<f32> = [10.0f32, 20.0, 30.0]
-        .iter().flat_map(|&v| std::iter::repeat(v).take(5)).collect();
+        .iter().flat_map(|&v| std::iter::repeat_n(v, 5)).collect();
     assert_eq!(got, expected.as_slice());
     Ok(())
 }

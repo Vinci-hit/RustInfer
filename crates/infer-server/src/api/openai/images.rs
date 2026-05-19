@@ -27,8 +27,8 @@ pub async fn image_generations(
     validate_image_request(&req)?;
 
     let n = req.n.unwrap_or(1);
-    let response_format = req.response_format.clone().unwrap_or(ImageResponseFormat::B64Json);
-    let output_format = req.output_format.clone().unwrap_or(ImageOutputFormat::Png);
+    let response_format = req.response_format.unwrap_or(ImageResponseFormat::B64Json);
+    let output_format = req.output_format.unwrap_or(ImageOutputFormat::Png);
     let jpeg_quality = req.jpeg_quality.unwrap_or(90);
     let (width, height) = parse_size(req.size.as_deref().unwrap_or("1024x1024"))?;
 
@@ -129,21 +129,18 @@ fn validate_image_request(req: &ImageGenerationRequest) -> Result<(), AppError> 
     if req.prompt.trim().is_empty() {
         return Err(AppError::bad_request("prompt must not be empty"));
     }
-    if let Some(n) = req.n {
-        if n == 0 || n > 16 {
+    if let Some(n) = req.n
+        && (n == 0 || n > 16) {
             return Err(AppError::bad_request("n must be between 1 and 16"));
         }
-    }
-    if let Some(steps) = req.num_inference_steps {
-        if steps == 0 {
+    if let Some(steps) = req.num_inference_steps
+        && steps == 0 {
             return Err(AppError::bad_request("num_inference_steps must be greater than 0"));
         }
-    }
-    if let Some(quality) = req.jpeg_quality {
-        if quality == 0 || quality > 100 {
+    if let Some(quality) = req.jpeg_quality
+        && (quality == 0 || quality > 100) {
             return Err(AppError::bad_request("jpeg_quality must be between 1 and 100"));
         }
-    }
     if let Some(size) = &req.size {
         parse_size(size)?;
     }
@@ -158,7 +155,7 @@ fn parse_size(size: &str) -> Result<(u32, u32), AppError> {
         .map_err(|_| AppError::bad_request("size width must be an integer"))?;
     let height: u32 = h.parse()
         .map_err(|_| AppError::bad_request("size height must be an integer"))?;
-    if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(AppError::bad_request("image width/height must be positive multiples of 16"));
     }
     Ok((width, height))

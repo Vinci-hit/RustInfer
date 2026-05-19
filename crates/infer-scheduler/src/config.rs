@@ -4,68 +4,56 @@ use std::ops::Range;
 
 /// Scheduler operating mode — determines scheduling behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SchedulerMode {
     /// LLM: prefill → decode, continuous batching, chunked prefill.
+    #[default]
     Llm,
     /// Diffusion: batch-in batch-out, no KV cache management,
     /// all requests in a batch finish together.
     Diffusion,
 }
 
-impl Default for SchedulerMode {
-    fn default() -> Self {
-        Self::Llm
-    }
-}
 
 /// KV Cache management mode — determined at startup, immutable at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum KvCacheMode {
     /// Contiguous slot mode: each sequence owns a dedicated slot id.
     /// Worker manages KV tensors internally. Compatible with current worker.
+    #[default]
     Slot,
     /// Paged mode: scheduler maintains block tables, worker uses PagedAttention kernels.
     /// Currently a stub — returns NotImplemented.
     Paged { block_size: usize },
 }
 
-impl Default for KvCacheMode {
-    fn default() -> Self {
-        Self::Slot
-    }
-}
 
 /// Preemption strategy when cache is exhausted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum PreemptionMode {
     /// Drop KV cache, re-prefill later (simpler, less memory).
     Recompute,
     /// Swap KV blocks to CPU memory (stub).
     Swap,
     /// No preemption — reject new requests when full.
+    #[default]
     Disabled,
 }
 
-impl Default for PreemptionMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 /// Scheduling policy selection.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum PolicyConfig {
     /// FCFS continuous batching (default).
+    #[default]
     ContinuousBatching,
     /// Priority-aware multi-tier QoS (stub).
     PriorityAware { tiers: Vec<PriorityTier> },
 }
 
-impl Default for PolicyConfig {
-    fn default() -> Self {
-        Self::ContinuousBatching
-    }
-}
 
 /// A priority tier for QoS scheduling.
 #[derive(Debug, Clone, PartialEq)]

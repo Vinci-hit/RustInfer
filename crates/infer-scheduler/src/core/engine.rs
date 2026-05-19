@@ -403,11 +403,10 @@ where
                     ));
                 }
 
-                if token.finished || seq.reached_max_tokens() {
-                    if let Some(idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == token.sequence_id) {
+                if (token.finished || seq.reached_max_tokens())
+                    && let Some(idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == token.sequence_id) {
                         finished_indices.push(idx);
                     }
-                }
             } else {
                 tracing::warn!("Generated token for unknown sequence_id={}", token.sequence_id);
             }

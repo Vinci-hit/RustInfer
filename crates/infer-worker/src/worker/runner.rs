@@ -556,13 +556,13 @@ impl<M: LlmModel> ModelRunner<M> {
         {
             use crate::cuda::with_cuda_stream;
             let stream = unsafe { (*self.cuda_cfg.get()).stream };
-            return with_cuda_stream(stream, || {
+            with_cuda_stream(stream, || {
                 if self.enable_decode_graph && meta.is_decode_only() {
                     self.forward_via_graph(num_seqs, &mut ctx)
                 } else {
                     self.model.forward(&mut ctx)
                 }
-            });
+            })
         }
         #[cfg(not(feature = "cuda"))]
         self.model.forward(&mut ctx)
@@ -892,7 +892,7 @@ pub(crate) mod tests {
         let mut slot_ids: Vec<usize> = Vec::with_capacity(num_seqs);
         for i in 0..num_seqs {
             let slot = meta.slot_indices[i] as usize;
-            if slot_ids.iter().any(|&s| s == slot) {
+            if slot_ids.contains(&slot) {
                 return Err(Error::InvalidArgument(format!(
                     "fill_inputs_for_step: duplicate slot {} in meta", slot
                 )).into());
@@ -1717,7 +1717,7 @@ mod tests_perf {
         };
 
         // ── 单步 batched decode helper ──
-        let mut step = |last: &mut [i32], kvl: &mut [i32]| -> Result<()> {
+        let step = |last: &mut [i32], kvl: &mut [i32]| -> Result<()> {
             let meta = make_decode_meta(kvl);
             let positions: Vec<i32> = kvl.to_vec();
             let kv_lens_in: Vec<i32> = kvl.to_vec();

@@ -383,7 +383,7 @@ impl<T: Dtype> TypedTensor<T> {
     pub(crate) fn compute_contiguous(shape: &Dims, strides: &Dims) -> bool {
         let n = shape.len();
         if n == 0 { return true; }
-        if shape.iter().any(|&d| d == 0) { return true; }
+        if shape.contains(&0) { return true; }
         let mut expected = 1usize;
         for i in (0..n).rev() {
             let d = shape[i];

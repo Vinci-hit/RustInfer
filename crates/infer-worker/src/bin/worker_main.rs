@@ -182,7 +182,7 @@ fn run_worker<M: LlmModel + 'static>(
         Ok(runner) => Arc::new(runner),
         Err(e) => {
             let _ = control.send_error(WorkerState::Error, format!("ModelRunner::new failed: {e}"));
-            return Err(e.into());
+            return Err(e);
         }
     };
 
@@ -316,7 +316,7 @@ fn parse_device(s: &str) -> Result<DeviceType> {
 }
 
 fn default_worker_id(device: &str) -> String {
-    let safe_device = device.replace(':', "_").replace('/', "_");
+    let safe_device = device.replace([':', '/'], "_");
     format!("worker-{}-{}", std::process::id(), safe_device)
 }
 

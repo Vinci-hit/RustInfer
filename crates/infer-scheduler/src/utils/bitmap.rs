@@ -11,7 +11,7 @@ pub struct Bitmap {
 impl Bitmap {
     /// Create a new bitmap with `len` bits, all clear (0).
     pub fn new(len: usize) -> Self {
-        let num_chunks = (len + 63) / 64;
+        let num_chunks = len.div_ceil(64);
         Self {
             chunks: vec![0u64; num_chunks],
             len,

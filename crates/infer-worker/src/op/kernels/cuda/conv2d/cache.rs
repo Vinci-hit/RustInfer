@@ -134,9 +134,9 @@ impl Conv2dCache {
         handle: ffi::cudnnHandle_t,
         out_shape: [i32; 4],
     ) -> Result<&ConvEntry> {
-        if !self.entries.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.entries.entry(key) {
             let entry = Self::build_entry(key, handle, out_shape)?;
-            self.entries.insert(key, entry);
+            e.insert(entry);
         }
         Ok(&self.entries[&key])
     }

@@ -65,7 +65,7 @@ fn upload_f32_slice_into(dst: &mut Tensor, src: &[f32]) -> Result<()> {
     let stream = crate::cuda::get_current_cuda_stream();
     let dptr = dst.as_f32_mut()?.buffer_mut().as_mut_ptr() as *mut std::ffi::c_void;
     let sptr = src.as_ptr() as *const std::ffi::c_void;
-    let n_bytes = src.len() * std::mem::size_of::<f32>();
+    let n_bytes = std::mem::size_of_val(src);
     unsafe {
         crate::cuda_check!(ffi::cudaMemcpyAsync(
             dptr, sptr, n_bytes,
@@ -643,7 +643,7 @@ impl ZImagePipeline {
             let mut dst = self.pipeline_state.slice_mut(dst_ty, &shape4)?;
             self.scheduler.step(&mut noise_pred, &cur_read, &mut dst)?;
         }
-        let final_ty = if num_steps % 2 == 0 {
+        let final_ty = if num_steps.is_multiple_of(2) {
             crate::model::diffusion::buffer::DiffBufferType::Latents
         } else {
             crate::model::diffusion::buffer::DiffBufferType::LatentsTmp

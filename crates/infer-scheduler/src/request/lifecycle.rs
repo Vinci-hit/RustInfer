@@ -38,13 +38,9 @@ impl std::fmt::Display for SequenceId {
 
 /// Priority level (higher = more important).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default)]
 pub struct Priority(pub i32);
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self(0)
-    }
-}
 
 /// Sampling parameters.
 #[derive(Debug, Clone)]

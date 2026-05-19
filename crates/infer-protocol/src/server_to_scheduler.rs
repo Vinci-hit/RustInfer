@@ -40,16 +40,11 @@ pub struct InferenceRequest {
     pub diffusion: Option<DiffusionRequest>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InferenceModality {
+    #[default]
     Llm,
     Diffusion,
-}
-
-impl Default for InferenceModality {
-    fn default() -> Self {
-        Self::Llm
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

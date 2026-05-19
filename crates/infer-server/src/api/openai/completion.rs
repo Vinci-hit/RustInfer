@@ -118,23 +118,20 @@ pub async fn completions(
 }
 
 fn validate_request(req: &CompletionRequest) -> Result<(), AppError> {
-    if let Some(temp) = req.temperature {
-        if temp < 0.0 || temp > 2.0 {
+    if let Some(temp) = req.temperature
+        && (!(0.0..=2.0).contains(&temp)) {
             return Err(AppError::bad_request("temperature must be between 0 and 2"));
         }
-    }
 
-    if let Some(top_p) = req.top_p {
-        if !(0.0..=1.0).contains(&top_p) {
+    if let Some(top_p) = req.top_p
+        && !(0.0..=1.0).contains(&top_p) {
             return Err(AppError::bad_request("top_p must be between 0 and 1"));
         }
-    }
 
-    if let Some(max_tokens) = req.max_tokens {
-        if max_tokens == 0 {
+    if let Some(max_tokens) = req.max_tokens
+        && max_tokens == 0 {
             return Err(AppError::bad_request("max_tokens must be greater than 0"));
         }
-    }
 
     Ok(())
 }

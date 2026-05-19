@@ -1,4 +1,8 @@
-#![allow(clippy::too_many_arguments)]
+#![allow(
+    clippy::too_many_arguments,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::mut_from_ref,
+)]
 
 pub mod base;
 pub mod op;

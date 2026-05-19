@@ -218,7 +218,7 @@ impl PipelineState {
                 "image height/width must be > 0".into()
             ).into());
         }
-        if height % 16 != 0 || width % 16 != 0 {
+        if !height.is_multiple_of(16) || !width.is_multiple_of(16) {
             return Err(crate::base::error::Error::InvalidArgument(format!(
                 "image size {}x{} must be multiples of 16",
                 height, width
@@ -581,8 +581,8 @@ mod tests {
             cap_feat_dim: 2560,
             patch_size: 2,
             f_patch_size: 1,
-            patch_in_dim: 1 * 2 * 2 * 16, // 64
-            final_out_dim: 2 * 2 * 1 * 16, // 64
+            patch_in_dim: 2 * 2 * 16, // 64
+            final_out_dim: (2 * 2) * 16, // 64
             capacity: ZImageCapacity {
                 max_height: 256,
                 max_width: 256,

@@ -376,12 +376,12 @@ impl Tensor {
         // CUDA fill kernel not yet implemented.
         #[cfg(feature = "cuda")]
         {
-            return Err(Error::InvalidArgument(
+            Err(Error::InvalidArgument(
                 "fill_: CUDA fill kernel not implemented; \
                  use a CPU tensor or implement a dedicated kernel"
                     .into(),
             )
-            .into());
+            .into())
         }
         #[cfg(not(feature = "cuda"))]
         unreachable!()

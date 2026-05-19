@@ -806,7 +806,7 @@ impl ZImageTransformer2DModel {
             let mut dst = state.slice_mut(dst_ty, shape)?;
             block.forward(&src, cos, sin, adaln_c, state, &mut dst, cuda_config)?;
         }
-        Ok(if blocks.len() % 2 == 0 { slots.0 } else { slots.1 })
+        Ok(if blocks.len().is_multiple_of(2) { slots.0 } else { slots.1 })
     }
 
     fn final_layer_forward(

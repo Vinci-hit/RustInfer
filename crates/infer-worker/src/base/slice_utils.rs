@@ -22,13 +22,12 @@ pub fn disjoint_mut<'a, T>(slice: &'a mut [T], indices: &[usize]) -> Result<Vec<
             )).into());
         }
     }
-    if let Some(&max) = sorted.last() {
-        if max >= len {
+    if let Some(&max) = sorted.last()
+        && max >= len {
             return Err(Error::InvalidArgument(format!(
                 "disjoint_mut: index {} out of range (len = {})", max, len
             )).into());
         }
-    }
 
     // SAFETY: 上面校验了 indices 互不重复、且都 < len。
     //         slice 的生命周期 'a 会自然约束返回的每个 &mut T：编译器把它们视作

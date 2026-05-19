@@ -20,7 +20,6 @@ use crate::op::embedding::Embedding;
 use crate::op::matmul::Matmul;
 use crate::op::rmsnorm::RMSNorm;
 use crate::op::rope::RoPEOp;
-use crate::op::swiglu::swiglu;
 use crate::tensor::Tensor;
 
 // ============================================================================

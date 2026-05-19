@@ -6,18 +6,15 @@ use crate::cache::traits::PhysicalBlockId;
 
 /// Eviction policy type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EvictionPolicy {
     /// Least Recently Used.
+    #[default]
     Lru,
     /// Least Frequently Used (stub).
     Lfu,
 }
 
-impl Default for EvictionPolicy {
-    fn default() -> Self {
-        Self::Lru
-    }
-}
 
 /// Evictor tracks block access patterns and determines eviction order.
 ///

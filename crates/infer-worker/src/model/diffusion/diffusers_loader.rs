@@ -41,12 +41,11 @@ impl DiffusersLoader {
         for entry in std::fs::read_dir(model_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.ends_with(".safetensors.index.json") {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                && name.ends_with(".safetensors.index.json") {
                     index_path = Some(path);
                     break;
                 }
-            }
         }
 
         if let Some(idx_path) = index_path {
@@ -69,8 +68,8 @@ impl DiffusersLoader {
             for entry in std::fs::read_dir(model_dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name.ends_with(".safetensors") {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && name.ends_with(".safetensors") {
                         if single.is_some() {
                             return Err(Error::InvalidArgument(format!(
                                 "Multiple .safetensors files but no index.json in {:?}", model_dir
@@ -78,7 +77,6 @@ impl DiffusersLoader {
                         }
                         single = Some(path);
                     }
-                }
             }
             let single = single.ok_or_else(|| {
                 Error::InvalidArgument(format!("No .safetensors file found in {:?}", model_dir))

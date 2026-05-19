@@ -849,7 +849,7 @@ mod tests {
         let prompt1 = "Hello world";
         let toks1: Vec<i32> = runner.model().tokenizer().encode(prompt1)?;
         let cmd1 = full_prefill_cmd(1, toks1, 0, 5);
-        scheduler_push.send(&rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
+        scheduler_push.send(rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
 
         // 收第一步 output（只有 req-A）
         let msg = scheduler_pull.recv_bytes(0)?;
@@ -863,7 +863,7 @@ mod tests {
         let prompt2 = "The sky is";
         let toks2: Vec<i32> = runner.model().tokenizer().encode(prompt2)?;
         let cmd2 = full_prefill_cmd(2, toks2, 1, 5);
-        scheduler_push.send(&rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
+        scheduler_push.send(rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
 
         // 后续 output 应该包含两条 seq（req-A decode + req-B prefill/decode）
         let mut a_finished = false;
@@ -941,7 +941,7 @@ mod tests {
         // ─── req1: slot 0, max_tokens=3 ───
         let toks1: Vec<i32> = runner.model().tokenizer().encode("Hello")?;
         let cmd1 = full_prefill_cmd(1, toks1, 0, 3);
-        scheduler_push.send(&rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
+        scheduler_push.send(rmp_serde::to_vec(&cmd1).unwrap(), 0)?;
 
         // 等 req1 finish
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -958,7 +958,7 @@ mod tests {
         // ─── req2: 复用 slot 0 ───
         let toks2: Vec<i32> = runner.model().tokenizer().encode("Goodbye")?;
         let cmd2 = full_prefill_cmd(2, toks2, 0, 3); // 同一个 slot!
-        scheduler_push.send(&rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
+        scheduler_push.send(rmp_serde::to_vec(&cmd2).unwrap(), 0)?;
 
         // 等 req2 finish
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -999,7 +999,7 @@ mod tests {
         max_tokens: usize,
     ) -> Result<(Vec<i32>, bool)> {
         let cmd = full_prefill_cmd(sequence_id, input_ids, kv_slot, max_tokens);
-        scheduler_push.send(&rmp_serde::to_vec(&cmd).unwrap(), 0)?;
+        scheduler_push.send(rmp_serde::to_vec(&cmd).unwrap(), 0)?;
 
         let mut tokens = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1246,7 +1246,7 @@ mod tests {
                 },
             ],
         };
-        scheduler_push.send(&rmp_serde::to_vec(&cmd).unwrap(), 0)?;
+        scheduler_push.send(rmp_serde::to_vec(&cmd).unwrap(), 0)?;
 
         // 收集两个请求的输出
         let mut tokens_0: Vec<i32> = Vec::new();
