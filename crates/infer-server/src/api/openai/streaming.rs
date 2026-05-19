@@ -13,6 +13,35 @@ use tokio::sync::mpsc;
 
 use super::types::*;
 
+fn incremental_decode_delta(previous: &mut String, full_text: String) -> Option<String> {
+    if full_text == *previous {
+        return None;
+    }
+
+    let mut common_len = 0usize;
+    let mut prev_chars = previous.char_indices();
+    let mut full_chars = full_text.char_indices();
+
+    loop {
+        match (prev_chars.next(), full_chars.next()) {
+            (Some((prev_idx, prev_ch)), Some((full_idx, full_ch))) if prev_ch == full_ch => {
+                common_len = prev_idx + prev_ch.len_utf8();
+                debug_assert_eq!(common_len, full_idx + full_ch.len_utf8());
+            }
+            _ => break,
+        }
+    }
+
+    let delta = full_text[common_len..].to_string();
+    *previous = full_text;
+
+    if delta.is_empty() {
+        None
+    } else {
+        Some(delta)
+    }
+}
+
 /// 构建 Chat Completion SSE 流
 pub fn stream_chat_completion(
     request_id: String,
@@ -46,10 +75,9 @@ pub fn stream_chat_completion(
         };
         yield Ok(Event::default().data(serde_json::to_string(&first_chunk).unwrap()));
 
-        // 逐 chunk 接收并转发
-        // 用于增量 decode 的 buffer
+        // 逐 chunk 接收并转发。
         let mut token_buffer: Vec<u32> = Vec::new();
-        let mut decoded_offset: usize = 0; // 已经发出的文本的字节数
+        let mut decoded_text = String::new();
 
         while let Some(chunk) = rx.recv().await {
             match chunk.chunk_type {
@@ -63,12 +91,7 @@ pub fn stream_chat_completion(
                         let full_text = tokenizer.decode(&token_buffer, true)
                             .unwrap_or_default();
 
-                        if full_text.len() > decoded_offset {
-                            let new_text = &full_text[decoded_offset..];
-                            // 只有在 new_text 是合法 UTF-8 末尾时才发送
-                            // (tokenizer.decode 已保证 UTF-8，直接发)
-                            decoded_offset = full_text.len();
-
+                        if let Some(new_text) = incremental_decode_delta(&mut decoded_text, full_text) {
                             let content_chunk = ChatCompletionChunk {
                                 id: chunk_id.clone(),
                                 object: "chat.completion.chunk".to_string(),
@@ -78,7 +101,7 @@ pub fn stream_chat_completion(
                                     index: 0,
                                     delta: Delta {
                                         role: None,
-                                        content: Some(new_text.to_string()),
+                                        content: Some(new_text),
                                     },
                                     finish_reason: None,
                                 }],
@@ -164,7 +187,7 @@ pub fn stream_completion(
         let mut completion_tokens: u32 = 0;
 
         let mut token_buffer: Vec<u32> = Vec::new();
-        let mut decoded_offset: usize = 0;
+        let mut decoded_text = String::new();
 
         while let Some(chunk) = rx.recv().await {
             match chunk.chunk_type {
@@ -177,10 +200,7 @@ pub fn stream_completion(
                         let full_text = tokenizer.decode(&token_buffer, true)
                             .unwrap_or_default();
 
-                        if full_text.len() > decoded_offset {
-                            let new_text = &full_text[decoded_offset..];
-                            decoded_offset = full_text.len();
-
+                        if let Some(new_text) = incremental_decode_delta(&mut decoded_text, full_text) {
                             let content_chunk = CompletionChunk {
                                 id: chunk_id.clone(),
                                 object: "text_completion".to_string(),
@@ -188,7 +208,7 @@ pub fn stream_completion(
                                 model: model.clone(),
                                 choices: vec![CompletionChunkChoice {
                                     index: 0,
-                                    text: new_text.to_string(),
+                                    text: new_text,
                                     finish_reason: None,
                                 }],
                                 usage: None,

@@ -429,7 +429,7 @@ impl<M: LlmModel> ModelRunner<M> {
                 if self.flags.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                std::hint::spin_loop();
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
 
             // 2. 读 meta、释放输入 slot。
@@ -450,7 +450,7 @@ impl<M: LlmModel> ModelRunner<M> {
                 if self.flags.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                std::hint::spin_loop();
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
         }
     }

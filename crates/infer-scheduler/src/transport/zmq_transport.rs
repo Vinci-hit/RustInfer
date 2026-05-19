@@ -81,7 +81,7 @@ impl ZmqFrontendTransport {
 
         loop {
             // 1. Try to receive requests from HTTP server.
-            match socket.recv_bytes(zmq::DONTWAIT) {
+            match socket.recv_bytes(0) {
                 Ok(identity) => {
                     // ROUTER frame: [identity, empty, data]
                     let _ = socket.recv_bytes(0); // empty delimiter
@@ -218,7 +218,7 @@ impl ZmqWorkerTransport {
             }
 
             // 2. Receive outputs from worker.
-            match pull_socket.recv_bytes(zmq::DONTWAIT) {
+            match pull_socket.recv_bytes(0) {
                 Ok(data) => {
                     if output_tx.blocking_send(data).is_err() {
                         tracing::info!("Worker output channel closed, shutting down");

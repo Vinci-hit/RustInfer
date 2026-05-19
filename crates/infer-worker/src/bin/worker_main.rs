@@ -1,6 +1,6 @@
 //! RustInfer Worker 进程入口。
 //!
-//! 启动 ModelRunner 线程 + WorkerServer 线程，通过 ZMQ 与 Scheduler 通信。
+//! 启动 ModelRunner 线程 + SubScheduler 线程，通过 ZMQ 与 Scheduler 通信。
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,7 +13,7 @@ use infer_protocol::scheduler_to_worker_control::{LoadModel, SchedulerControlMes
 use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerState};
 use infer_worker::worker::control_client::WorkerControlClient;
 use infer_worker::worker::runner::ModelRunner;
-use infer_worker::worker::{DiffusionWorkerServer, WorkerServer};
+use infer_worker::worker::{DiffusionWorkerServer, SubScheduler};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker")]
@@ -209,17 +209,17 @@ fn run_worker<M: LlmModel + 'static>(
     let runner_loop = Arc::clone(&runner);
     let runner_handle = std::thread::spawn(move || runner_loop.run());
 
-    // Server (当前线程)
+    // SubScheduler (当前线程)
     control.send_progress(WorkerState::Running, "worker data plane running")?;
     tracing::info!("Worker running...");
-    let server = WorkerServer::new(
+    let sub_scheduler = SubScheduler::new(
         Arc::clone(&runner),
         device,
         zmq_pull,
         zmq_push,
         eos_token_ids,
     );
-    server.run();
+    sub_scheduler.run();
 
     runner.request_shutdown();
     let _ = runner_handle.join();

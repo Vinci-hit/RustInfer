@@ -105,6 +105,18 @@ pub struct BatchWorkspace {
     #[cfg(feature = "cuda")]
     pub scatter_seq_lens_dev: *mut i32,
 
+    /// Host staging for scatter control arrays. These buffers are owned by the
+    /// workspace and live across runner steps, so async H2D copies never borrow
+    /// stack-local vectors.
+    #[cfg(feature = "cuda")]
+    scatter_slot_indices_host: Vec<i32>,
+    #[cfg(feature = "cuda")]
+    scatter_seq_positions_host: Vec<i32>,
+    #[cfg(feature = "cuda")]
+    scatter_seq_starts_host: Vec<i32>,
+    #[cfg(feature = "cuda")]
+    scatter_seq_lens_host: Vec<i32>,
+
     // ═══ Flash-Decoding split-K workspace ═══
     //
     // Flash-Decoding decode-path 用 split-K 策略并行扫 KV（每 seq × 每 head 分
@@ -325,6 +337,14 @@ impl BatchWorkspace {
             scatter_seq_starts_dev,
             #[cfg(feature = "cuda")]
             scatter_seq_lens_dev,
+            #[cfg(feature = "cuda")]
+            scatter_slot_indices_host: vec![0i32; max_batch_seqs],
+            #[cfg(feature = "cuda")]
+            scatter_seq_positions_host: vec![0i32; max_batch_seqs],
+            #[cfg(feature = "cuda")]
+            scatter_seq_starts_host: vec![0i32; max_batch_seqs],
+            #[cfg(feature = "cuda")]
+            scatter_seq_lens_host: vec![0i32; max_batch_seqs],
 
             #[cfg(feature = "cuda")]
             flash_decode_workspace_dev,
@@ -366,9 +386,8 @@ impl BatchWorkspace {
     /// 调用约定：runner 拿到 meta 后调一次。
     ///
     /// hot-path：4 个小 H2D 走 `cudaMemcpyAsync(stream)` 而非同步 cudaMemcpy。
-    /// host 端用栈上 `Vec<i32>` 暂存，pageable 内存上 `cudaMemcpyAsync` 不能
-    /// 真正 overlap（driver 退化为同步 copy），但避开了同步 cudaMemcpy 强制
-    /// 等齐 GPU pending kernel 的副作用 —— GPU pipeline 不再被打断。
+    /// host 端使用 workspace-owned staging buffer，保证异步 copy 的源内存
+    /// 生命周期覆盖整个 runner step。
     #[cfg(feature = "cuda")]
     pub fn refresh_scatter_indices(
         &mut self,
@@ -385,43 +404,39 @@ impl BatchWorkspace {
                 b, self.max_batch_seqs
             )).into());
         }
-        let mut slots = Vec::with_capacity(b);
-        let mut poses = Vec::with_capacity(b);
-        let mut starts = Vec::with_capacity(b);
-        let mut lens = Vec::with_capacity(b);
         for i in 0..b {
-            slots.push(meta.seq_slot(i) as i32);
-            poses.push(meta.seq_pos(i));
-            starts.push(meta.seq_start(i) as i32);
-            lens.push(meta.seq_len(i) as i32);
+            self.scatter_slot_indices_host[i] = meta.seq_slot(i) as i32;
+            self.scatter_seq_positions_host[i] = meta.seq_pos(i);
+            self.scatter_seq_starts_host[i] = meta.seq_start(i) as i32;
+            self.scatter_seq_lens_host[i] = meta.seq_len(i) as i32;
         }
         let bytes = b * std::mem::size_of::<i32>();
         unsafe {
             use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
             crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_slot_indices_dev as *mut _,
-                slots.as_ptr() as *const _,
+                self.scatter_slot_indices_host.as_ptr() as *const _,
                 bytes,
                 cudaMemcpyKind::cudaMemcpyHostToDevice,
                 stream,
             ))?;
             crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_seq_positions_dev as *mut _,
-                poses.as_ptr() as *const _,
+                self.scatter_seq_positions_host.as_ptr() as *const _,
                 bytes,
                 cudaMemcpyKind::cudaMemcpyHostToDevice,
                 stream,
             ))?;
             crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_seq_starts_dev as *mut _,
-                starts.as_ptr() as *const _,
+                self.scatter_seq_starts_host.as_ptr() as *const _,
                 bytes,
                 cudaMemcpyKind::cudaMemcpyHostToDevice,
                 stream,
             ))?;
             crate::cuda_check!(cudaMemcpyAsync(
                 self.scatter_seq_lens_dev as *mut _,
-                lens.as_ptr() as *const _,
+                self.scatter_seq_lens_host.as_ptr() as *const _,
                 bytes,
                 cudaMemcpyKind::cudaMemcpyHostToDevice,
                 stream,

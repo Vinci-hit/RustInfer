@@ -1,19 +1,19 @@
-//! WorkerServer —— 新版 server，直接持有 `Arc<ModelRunner<M>>` 驱动推理。
+//! SubScheduler —— Worker 内部二级调度器，直接持有 `Arc<ModelRunner<M>>` 驱动推理。
 //!
 //! # 设计
 //!
 //! - ZMQ PULL 收 `PrefillBatchCmd`（来自 Scheduler），ZMQ PUSH 发 `StepOutput`。
-//! - Server 线程与 Runner 共享 `Arc<ModelRunner<M>>`，通过 `SyncFlags` 握手：
-//!   - input_ready=false 时 server 可写 workspace / states / meta；
-//!   - output_ready=true 时 server 可读 output_tokens_dev。
+//! - SubScheduler 线程与 Runner 共享 `Arc<ModelRunner<M>>`，通过 `SyncFlags` 握手：
+//!   - input_ready=false 时 sub-scheduler 可写 workspace / states / meta；
+//!   - output_ready=true 时 sub-scheduler 可读 output_tokens_dev。
 //! - 不再使用 `SharedBuffers` 中间层。
 //!
 //! # 并发模型
 //!
 //! 进程内两线程：
 //! - **Runner 线程**：`ModelRunner::run()`
-//! - **Server 线程**：`WorkerServer::run()`
-//! - ZMQ socket 绑定在 server 线程上（非线程安全，不跨线程）。
+//! - **SubScheduler 线程**：`SubScheduler::run()`
+//! - ZMQ socket 绑定在 sub-scheduler 线程上（非线程安全，不跨线程）。
 
 use std::sync::Arc;
 
@@ -51,12 +51,43 @@ enum StepItem {
     PrefillSegment { segment: PrefillSegmentMeta },
 }
 
+/// Worker-owned host staging for one submitted runner step.
+///
+/// These buffers are intentionally owned by the sub-scheduler instead of being
+/// stack-local `Vec`s. CUDA H2D copies are asynchronous with respect to the host;
+/// keeping the backing storage alive until the runner produces output makes the
+/// lifetime explicit at the Rust object level.
+struct StepHostStaging {
+    input_tokens: Vec<i32>,
+    input_positions: Vec<i32>,
+    kv_lens: Vec<i32>,
+}
+
+impl StepHostStaging {
+    fn new(max_batch_tokens: usize, max_batch_seqs: usize) -> Self {
+        Self {
+            input_tokens: Vec::with_capacity(max_batch_tokens),
+            input_positions: Vec::with_capacity(max_batch_tokens),
+            kv_lens: Vec::with_capacity(max_batch_seqs),
+        }
+    }
+
+    fn reset(&mut self, total_tokens: usize, num_seqs: usize) {
+        self.input_tokens.clear();
+        self.input_positions.clear();
+        self.kv_lens.clear();
+        self.input_tokens.reserve(total_tokens.saturating_sub(self.input_tokens.capacity()));
+        self.input_positions.reserve(total_tokens.saturating_sub(self.input_positions.capacity()));
+        self.kv_lens.reserve(num_seqs.saturating_sub(self.kv_lens.capacity()));
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
-//  WorkerServer
+//  SubScheduler
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// 新版 Worker Server —— 直接使用 `ModelRunner` 新 API 驱动 GPU 推理。
-pub struct WorkerServer<M: LlmModel> {
+/// Worker 内部二级调度器 —— 直接使用 `ModelRunner` 新 API 驱动 GPU 推理。
+pub struct SubScheduler<M: LlmModel> {
     runner: Arc<ModelRunner<M>>,
     #[allow(dead_code)]
     device: DeviceType,
@@ -71,10 +102,11 @@ pub struct WorkerServer<M: LlmModel> {
     pending_prefills: Vec<PrefillBatchCmd>,
     pending_cancels: Vec<u64>,
     last_step_items: Vec<StepItem>,
+    staging: StepHostStaging,
     draining: bool,
 }
 
-impl<M: LlmModel> WorkerServer<M> {
+impl<M: LlmModel> SubScheduler<M> {
     pub fn new(
         runner: Arc<ModelRunner<M>>,
         device: DeviceType,
@@ -82,6 +114,10 @@ impl<M: LlmModel> WorkerServer<M> {
         zmq_out: zmq::Socket,
         eos_token_ids: Vec<i32>,
     ) -> Self {
+        let (max_batch_tokens, max_batch_seqs) = {
+            let ws = unsafe { runner.workspace() };
+            (ws.max_batch_tokens, ws.max_batch_seqs)
+        };
         Self {
             runner,
             device,
@@ -92,6 +128,7 @@ impl<M: LlmModel> WorkerServer<M> {
             pending_prefills: Vec::new(),
             pending_cancels: Vec::new(),
             last_step_items: Vec::new(),
+            staging: StepHostStaging::new(max_batch_tokens, max_batch_seqs),
             draining: false,
         }
     }
@@ -102,10 +139,10 @@ impl<M: LlmModel> WorkerServer<M> {
 
     /// 主循环。调用线程会被阻塞在这里直到 runner shutdown。
     pub fn run(mut self) {
-        tracing::info!("WorkerServer waiting for first prefill...");
+        tracing::info!("SubScheduler waiting for first prefill...");
         let cmd = match self.recv_next_prefill_blocking() {
             Some(c) => c,
-            None => { tracing::info!("WorkerServer: shutdown before first prefill"); return; }
+            None => { tracing::info!("SubScheduler: shutdown before first prefill"); return; }
         };
         self.pending_prefills.push(cmd);
 
@@ -113,7 +150,7 @@ impl<M: LlmModel> WorkerServer<M> {
             tracing::error!("Failed to enqueue first step: {:?}", e);
             return;
         }
-        tracing::info!("WorkerServer started, {} active decodes", self.active_decodes.len());
+        tracing::info!("SubScheduler started, {} active decodes", self.active_decodes.len());
 
         loop {
             // 1. 与 Runner forward 并行：non-blocking 收新 prefill
@@ -123,10 +160,10 @@ impl<M: LlmModel> WorkerServer<M> {
             loop {
                 if self.runner.output_ready() { break; }
                 if self.runner.is_shutdown() {
-                    tracing::info!("WorkerServer: runner shutdown detected, exiting");
+                    tracing::info!("SubScheduler: runner shutdown detected, exiting");
                     return;
                 }
-                std::hint::spin_loop();
+                std::thread::sleep(std::time::Duration::from_micros(50));
             }
 
             // 3. 读 output tokens (D2H)
@@ -161,7 +198,7 @@ impl<M: LlmModel> WorkerServer<M> {
                 tracing::debug!("All sequences finished, waiting for new prefill...");
                 let cmd = match self.recv_next_prefill_blocking() {
                     Some(c) => c,
-                    None => { tracing::info!("WorkerServer: shutdown while idle"); return; }
+                    None => { tracing::info!("SubScheduler: shutdown while idle"); return; }
                 };
                 self.pending_prefills.push(cmd);
                 if let Err(e) = self.ensure_capacity_and_enqueue() {
@@ -240,9 +277,8 @@ impl<M: LlmModel> WorkerServer<M> {
             )).into());
         }
 
-        let mut tokens = Vec::with_capacity(total_tokens);
-        let mut positions = Vec::with_capacity(total_tokens);
-        let mut kv_lens = Vec::with_capacity(num_seqs);
+        self.staging.reset(total_tokens, num_seqs);
+        let staging = &mut self.staging;
         let mut step_items = Vec::with_capacity(num_seqs);
         let mut meta = StepMeta::zeroed();
 
@@ -254,9 +290,9 @@ impl<M: LlmModel> WorkerServer<M> {
 
         // Decode 在前 (每条 q_len=1)。
         for d in &self.active_decodes {
-            tokens.push(d.last_token);
-            positions.push(d.next_position as i32);
-            kv_lens.push(d.next_position as i32 + 1);
+            staging.input_tokens.push(d.last_token);
+            staging.input_positions.push(d.next_position as i32);
+            staging.kv_lens.push(d.next_position as i32 + 1);
 
             meta.q_start_loc[seq_idx] = offset;
             meta.slot_indices[seq_idx] = d.kv_slot as i32;
@@ -278,11 +314,11 @@ impl<M: LlmModel> WorkerServer<M> {
                 let segment_end = segment.segment_end as usize;
                 let slot = segment.kv_slot as usize;
 
-                tokens.extend_from_slice(&cmd.input_ids[range]);
+                staging.input_tokens.extend_from_slice(&cmd.input_ids[range]);
                 for pos in segment_start..segment_end {
-                    positions.push(pos as i32);
+                    staging.input_positions.push(pos as i32);
                 }
-                kv_lens.push(segment_end as i32);
+                staging.kv_lens.push(segment_end as i32);
 
                 meta.q_start_loc[seq_idx] = offset;
                 meta.slot_indices[seq_idx] = slot as i32;
@@ -303,20 +339,20 @@ impl<M: LlmModel> WorkerServer<M> {
         #[cfg(feature = "cuda")]
         {
             ws_mut.input_tokens.as_i32_mut()?.buffer_mut()
-                .copy_from_host_async(&tokens, stream)?;
+                .copy_from_host_async(&staging.input_tokens, stream)?;
             ws_mut.input_pos.as_i32_mut()?.buffer_mut()
-                .copy_from_host_async(&positions, stream)?;
+                .copy_from_host_async(&staging.input_positions, stream)?;
             ws_mut.kv_lens_dev.as_i32_mut()?.buffer_mut()
-                .copy_from_host_async(&kv_lens, stream)?;
+                .copy_from_host_async(&staging.kv_lens, stream)?;
         }
         #[cfg(not(feature = "cuda"))]
         {
             ws_mut.input_tokens.as_i32_mut()?.buffer_mut()
-                .copy_from_host(&tokens)?;
+                .copy_from_host(&staging.input_tokens)?;
             ws_mut.input_pos.as_i32_mut()?.buffer_mut()
-                .copy_from_host(&positions)?;
+                .copy_from_host(&staging.input_positions)?;
             ws_mut.kv_lens_dev.as_i32_mut()?.buffer_mut()
-                .copy_from_host(&kv_lens)?;
+                .copy_from_host(&staging.kv_lens)?;
         }
 
         let meta_view = WorkerBatchMeta::from_step(&meta);
@@ -657,7 +693,7 @@ fn filter_prefill_cmd(cmd: PrefillBatchCmd, sequence_id: u64) -> Option<PrefillB
 mod tests {
     //! Server + Runner 端到端集成测试。
     //!
-    //! 启动 runner 线程 + server 线程，主线程通过 ZMQ inproc 扮演 scheduler：
+    //! 启动 runner 线程 + sub-scheduler 线程，主线程通过 ZMQ inproc 扮演 scheduler：
     //! 发 PrefillBatchCmd，收 StepOutput，验证 token 合法 + finished 正确。
     //!
     //! 需要真实模型权重（LLAMA3_MODEL_PATH 或 well-known 路径）。
@@ -742,8 +778,8 @@ mod tests {
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
-        // ─── 启动 server 线程 ───
-        let server = WorkerServer::new(
+        // ─── 启动 sub-scheduler 线程 ───
+        let server = SubScheduler::new(
             Arc::clone(&runner),
             device,
             worker_pull,
@@ -836,7 +872,7 @@ mod tests {
         // ─── 启动 ───
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
-        let server = WorkerServer::new(
+        let server = SubScheduler::new(
             Arc::clone(&runner),
             device,
             worker_pull,
@@ -933,7 +969,7 @@ mod tests {
 
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
-        let server = WorkerServer::new(
+        let server = SubScheduler::new(
             Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
         );
         let server_handle = std::thread::spawn(move || server.run());
@@ -1108,7 +1144,7 @@ mod tests {
 
         let runner2_loop = Arc::clone(&runner2);
         let runner2_handle = std::thread::spawn(move || runner2_loop.run());
-        let server = WorkerServer::new(
+        let server = SubScheduler::new(
             Arc::clone(&runner2), device, worker_pull, worker_push, eos_token_ids.clone(),
         );
         let server_handle = std::thread::spawn(move || server.run());
@@ -1198,7 +1234,7 @@ mod tests {
 
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
-        let server = WorkerServer::new(
+        let server = SubScheduler::new(
             Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
         );
         let server_handle = std::thread::spawn(move || server.run());

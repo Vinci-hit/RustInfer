@@ -185,6 +185,39 @@ static bool zimage_bf16_gemm_bench_disabled()
     return cached == 1;
 }
 
+static bool zimage_bf16_algo_is_graph_capturable(
+    cublasLtHandle_t handle,
+    cublasLtMatmulDesc_t op,
+    cublasLtMatrixLayout_t A,
+    cublasLtMatrixLayout_t B,
+    cublasLtMatrixLayout_t C,
+    const __nv_bfloat16* bench_A,
+    const __nv_bfloat16* bench_B,
+    __nv_bfloat16* bench_C,
+    cublasLtMatmulAlgo_t* algo,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream)
+{
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    cudaError_t ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
+    if (ce != cudaSuccess) return false;
+
+    cublasStatus_t st = cublasLtMatmul(
+        handle, op, &alpha,
+        bench_B, A, bench_A, B, &beta,
+        bench_C, C, bench_C, C,
+        algo, workspace, workspace_size, stream);
+
+    cudaGraph_t graph = nullptr;
+    ce = cudaStreamEndCapture(stream, &graph);
+    if (graph != nullptr) cudaGraphDestroy(graph);
+
+    return st == CUBLAS_STATUS_SUCCESS && ce == cudaSuccess;
+}
+
 static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     int M, int N, int K, size_t workspaceSize,
     // scratch buffers from the caller — we reuse these for the benchmark
@@ -265,6 +298,12 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
         for (int i = 0; i < returned; ++i) {
             if (hres[i].state != CUBLAS_STATUS_SUCCESS) continue;
             if (hres[i].workspaceSize > workspaceSize) continue;
+            if (!zimage_bf16_algo_is_graph_capturable(
+                    bench_h, e.op, e.A, e.B, e.C,
+                    bench_A, bench_B, bench_C,
+                    &hres[i].algo, bench_ws, workspaceSize, bench_s)) {
+                continue;
+            }
 
             // Warm up; if the algo errors out, skip it.
             cublasStatus_t s = cublasLtMatmul(
@@ -308,15 +347,29 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     }
 
     if (best < 0) {
-        // No bench — take the first viable heuristic result.
+        // No benchmark path: still require CUDA Graph capture compatibility.
+        cublasLtHandle_t test_h = nullptr;
+        cudaStream_t test_s = nullptr;
+        cublasLtCreate(&test_h);
+        cudaStreamCreate(&test_s);
         for (int i = 0; i < returned; ++i) {
-            if (hres[i].state == CUBLAS_STATUS_SUCCESS
-                && hres[i].workspaceSize <= workspaceSize) {
+            if (hres[i].state != CUBLAS_STATUS_SUCCESS) continue;
+            if (hres[i].workspaceSize > workspaceSize) continue;
+            if (zimage_bf16_algo_is_graph_capturable(
+                    test_h, e.op, e.A, e.B, e.C,
+                    bench_A, bench_B, bench_C,
+                    &hres[i].algo, bench_ws, workspaceSize, test_s)) {
                 best = i;
                 break;
             }
         }
-        if (best < 0) best = 0;
+        cudaStreamDestroy(test_s);
+        cublasLtDestroy(test_h);
+    }
+
+    if (best < 0) {
+        printf("cuBLASLt BF16: no CUDA-Graph-capturable algo for M=%d N=%d K=%d\n", M, N, K);
+        return e;
     }
 
     e.algo = hres[best].algo;
