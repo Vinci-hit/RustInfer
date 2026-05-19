@@ -78,7 +78,7 @@ pub fn argmax(logits: &Tensor, output_token: &mut Tensor, cuda_config: Option<&C
         }
         DataType::BF16 => {
             // 提取类型化指针
-            let logits_ptr = logits.as_bf16()?.data_ptr() as *const bf16;
+            let logits_ptr = logits.as_bf16()?.data_ptr();
 
             // 调用 bf16 专用的 FFI 函数
             unsafe {
@@ -143,7 +143,7 @@ pub fn argmax_batch_strided(
     let out_ptr = out.as_i32_mut()?.data_ptr_mut();
     match logits.dtype() {
         DataType::BF16 => unsafe {
-            let base = logits.as_bf16()?.data_ptr() as *const bf16;
+            let base = logits.as_bf16()?.data_ptr();
             argmax_batch_cu_bf16_ffi(
                 base.add(col_offset),
                 batch_size as i32, vocab_size as i32, row_stride as i32,

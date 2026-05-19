@@ -24,19 +24,21 @@ where
         let event = engine.poll_next_event().await;
 
         match event {
-            EngineEvent::NewRequest(Ok((client_id, request))) => {
-                engine.handle_new_request(client_id, request);
-                if !engine.worker_busy() {
-                    engine.run_iteration().await?;
+            EngineEvent::NewRequest(result) => match *result {
+                Ok((client_id, request)) => {
+                    engine.handle_new_request(client_id, request);
+                    if !engine.worker_busy() {
+                        engine.run_iteration().await?;
+                    }
                 }
-            }
-            EngineEvent::NewRequest(Err(crate::error::SchedulerError::Shutdown)) => {
-                tracing::info!("Frontend transport closed, shutting down");
-                return Ok(());
-            }
-            EngineEvent::NewRequest(Err(e)) => {
-                tracing::error!("Frontend recv error: {}", e);
-            }
+                Err(crate::error::SchedulerError::Shutdown) => {
+                    tracing::info!("Frontend transport closed, shutting down");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!("Frontend recv error: {}", e);
+                }
+            },
             EngineEvent::WorkerOutput(Ok(data)) => {
                 engine.handle_step_output(data).await?;
                 engine.run_iteration().await?;
@@ -54,6 +56,9 @@ where
 
 /// Events that can occur in the scheduler loop.
 pub(crate) enum EngineEvent {
-    NewRequest(crate::error::Result<(crate::request::handle::ClientId, infer_protocol::server_to_scheduler::InferenceRequest)>),
+    NewRequest(Box<crate::error::Result<(
+        crate::request::handle::ClientId,
+        infer_protocol::server_to_scheduler::InferenceRequest,
+    )>>),
     WorkerOutput(crate::error::Result<Vec<u8>>),
 }

@@ -641,12 +641,12 @@ where
             tokio::select! {
                 biased;
                 result = worker.recv_step_output() => EngineEvent::WorkerOutput(result),
-                result = frontend.recv_request() => EngineEvent::NewRequest(result),
+                result = frontend.recv_request() => EngineEvent::NewRequest(Box::new(result)),
             }
         } else {
             // Idle: only listen for new requests.
             let result = self.frontend.recv_request().await;
-            EngineEvent::NewRequest(result)
+            EngineEvent::NewRequest(Box::new(result))
         }
     }
 }

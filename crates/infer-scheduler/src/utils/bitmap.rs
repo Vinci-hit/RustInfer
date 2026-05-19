@@ -71,6 +71,11 @@ impl Bitmap {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    /// Whether the bitmap has zero capacity.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[cfg(test)]

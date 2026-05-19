@@ -2,6 +2,14 @@
     clippy::too_many_arguments,
     clippy::not_unsafe_ptr_arg_deref,
     clippy::mut_from_ref,
+    clippy::doc_overindented_list_items,
+    clippy::missing_safety_doc,
+    clippy::needless_range_loop,
+    clippy::wrong_self_convention,
+    clippy::doc_lazy_continuation,
+    clippy::explicit_counter_loop,
+    clippy::manual_memcpy,
+    clippy::module_inception,
 )]
 
 pub mod base;

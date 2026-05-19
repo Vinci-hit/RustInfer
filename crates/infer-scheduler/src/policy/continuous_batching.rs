@@ -85,9 +85,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 
         // Step 3: Select new requests from waiting queue.
         if token_budget_remaining > 0 && seq_budget > 0 && !waiting.is_empty() {
-            let mut seqs_used = 0usize;
-
-            for seq in waiting.iter() {
+            for (seqs_used, seq) in waiting.iter().enumerate() {
                 if seqs_used >= seq_budget || token_budget_remaining == 0 {
                     break;
                 }
@@ -114,7 +112,6 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 });
 
                 token_budget_remaining = token_budget_remaining.saturating_sub(tokens_to_prefill);
-                seqs_used += 1;
             }
         }
 

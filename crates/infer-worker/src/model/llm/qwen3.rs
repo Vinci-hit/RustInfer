@@ -361,7 +361,7 @@ pub struct Qwen3 {
     pub(crate) tokenizer: Box<dyn Tokenizer>,
 
     embed_tokens: Embedding,
-    pub(crate) layers: Vec<DecoderLayer>,
+    layers: Vec<DecoderLayer>,
     norm: RMSNorm,
     lm_head: Matmul,
 }

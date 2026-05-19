@@ -29,9 +29,10 @@ fn main() {
                 cutlass_include
             );
         }
-        // 自动检测 GPU 架构，无需手动修改
+        // 自动检测 GPU 架构，无需手动修改。
         let cuda_arch = detect_cuda_arch();
-        println!("cargo:warning=Detected CUDA arch: {}", cuda_arch);
+        println!("cargo:rustc-env=RUSTINFER_CUDA_ARCH={}", cuda_arch);
+        eprintln!("RustInfer build: detected CUDA arch {}", cuda_arch);
 
         let mut build = cc::Build::new();
         build.cuda(true)
