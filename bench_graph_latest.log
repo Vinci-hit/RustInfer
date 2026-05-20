@@ -1,3 +1,0 @@
-cuBLASLt BF16 matmul failed: status=13 M=1 N=19456 K=2560 workspace=134217728
-[2m2026-05-20T04:07:08.380274Z[0m [31mERROR[0m [2mrustinfer_launch[0m[2m:[0m [worker:0] exited unexpectedly with status: exit status: 1
-Error: Component 'worker:0' crashed (exit: exit status: 1)
