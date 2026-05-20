@@ -106,6 +106,11 @@ pub struct SubScheduler<M: LlmModel> {
     next_step_buffer_id: usize,
     last_step_buffer_id: usize,
     draining: bool,
+    timing_steps: u64,
+    timing_wait_output_us: u128,
+    timing_read_output_us: u128,
+    timing_process_us: u128,
+    timing_enqueue_us: u128,
 }
 
 impl<M: LlmModel> SubScheduler<M> {
@@ -134,6 +139,11 @@ impl<M: LlmModel> SubScheduler<M> {
             next_step_buffer_id: 0,
             last_step_buffer_id: 0,
             draining: false,
+            timing_steps: 0,
+            timing_wait_output_us: 0,
+            timing_read_output_us: 0,
+            timing_process_us: 0,
+            timing_enqueue_us: 0,
         }
     }
 
@@ -161,6 +171,7 @@ impl<M: LlmModel> SubScheduler<M> {
             self.drain_zmq_prefills();
 
             // 2. 等 Runner 完成本步（同时检测 shutdown）
+            let t_wait = std::time::Instant::now();
             loop {
                 if self.runner.output_ready() { break; }
                 if self.runner.is_shutdown() {
@@ -169,8 +180,10 @@ impl<M: LlmModel> SubScheduler<M> {
                 }
                 std::hint::spin_loop();
             }
+            let wait_output_us = t_wait.elapsed().as_micros();
 
             // 3. 读 output tokens (D2H)
+            let t_read = std::time::Instant::now();
             let output_tokens = match self.read_output_tokens() {
                 Ok(t) => t,
                 Err(e) => {
@@ -179,23 +192,29 @@ impl<M: LlmModel> SubScheduler<M> {
                     continue;
                 }
             };
+            let read_output_us = t_read.elapsed().as_micros();
             self.runner.set_output_consumed();
 
             // 4. 按本 step 语义处理 output：prefill ack、final prefill token、decode token。
+            let t_process = std::time::Instant::now();
             self.process_step_output_and_send_zmq(&output_tokens);
             self.apply_pending_cancels();
 
             // 6. 非阻塞收新 prefill / cancel
             self.drain_zmq_prefills();
             self.apply_pending_cancels();
+            let process_us = t_process.elapsed().as_micros();
 
             // 7. 组装下一步输入 → signal runner
+            let t_enqueue = std::time::Instant::now();
             if let Err(e) = self.ensure_capacity_and_enqueue() {
                 tracing::error!("Failed to enqueue next step: {:?}", e);
                 // 安全退出：无法继续推理
                 self.runner.request_shutdown();
                 return;
             }
+            let enqueue_us = t_enqueue.elapsed().as_micros();
+            self.record_timing(wait_output_us, read_output_us, process_us, enqueue_us);
 
             // 8. 空闲时阻塞等新 prefill
             if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
@@ -211,6 +230,32 @@ impl<M: LlmModel> SubScheduler<M> {
                     return;
                 }
             }
+        }
+    }
+
+    fn record_timing(
+        &mut self,
+        wait_output_us: u128,
+        read_output_us: u128,
+        process_us: u128,
+        enqueue_us: u128,
+    ) {
+        self.timing_steps += 1;
+        self.timing_wait_output_us += wait_output_us;
+        self.timing_read_output_us += read_output_us;
+        self.timing_process_us += process_us;
+        self.timing_enqueue_us += enqueue_us;
+
+        if self.timing_steps.is_multiple_of(64) {
+            let n = self.timing_steps as u128;
+            tracing::info!(
+                "sub_scheduler_timing steps={} avg_wait_output_us={} avg_read_output_us={} avg_process_us={} avg_enqueue_us={}",
+                self.timing_steps,
+                self.timing_wait_output_us / n,
+                self.timing_read_output_us / n,
+                self.timing_process_us / n,
+                self.timing_enqueue_us / n,
+            );
         }
     }
 
