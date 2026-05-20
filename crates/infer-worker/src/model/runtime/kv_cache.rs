@@ -3,7 +3,7 @@ use crate::base::{DataType, DeviceType};
 use crate::model::common::config::RuntimeModelConfig;
 use crate::tensor::Tensor;
 
-const DEFAULT_INITIAL_KV_CACHE_LEN: usize = 512;
+const DEFAULT_INITIAL_KV_CACHE_LEN: usize = 2048;
 
 pub struct KvCache {
     cache: Vec<(Tensor, Tensor)>,

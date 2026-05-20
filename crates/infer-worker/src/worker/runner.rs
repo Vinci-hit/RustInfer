@@ -43,6 +43,10 @@ use crate::worker::batch_workspace::BatchWorkspace;
 /// 单步最多能同时处理的 seq 数。决定 `StepMeta` 里定长数组的大小。
 pub const MAX_BATCH_SEQS: usize = 32;
 
+/// Number of fixed step buffers owned by one runner. Each buffer has its own
+/// device addresses and therefore its own CUDA Graph bucket.
+pub const STEP_BUFFER_COUNT: usize = 2;
+
 // ============================================================================
 //  StepMeta —— 每 step 的 host 元信息
 // ============================================================================
@@ -57,6 +61,9 @@ pub const MAX_BATCH_SEQS: usize = 32;
 /// 跨 step 稳定；server 负责填入。
 #[derive(Clone)]
 pub struct StepMeta {
+    /// Which fixed runner step buffer this step uses. CUDA Graph slots include
+    /// this id because graph node parameters capture device addresses.
+    pub step_buffer_id: usize,
     pub num_prefill: usize,
     pub num_decode: usize,
     /// `[num_seqs + 1]`，`q_start_loc[i+1] - q_start_loc[i]` 就是 seq i 的 q_len。
@@ -73,6 +80,7 @@ pub struct StepMeta {
 impl StepMeta {
     pub fn zeroed() -> Self {
         Self {
+            step_buffer_id: 0,
             num_prefill: 0,
             num_decode: 0,
             q_start_loc: [0; MAX_BATCH_SEQS + 1],
@@ -189,27 +197,20 @@ pub struct ModelRunner<M: LlmModel> {
     /// `false` = 永远走 eager 路径（用于性能基线测试 / 调试）。
     enable_decode_graph: bool,
 
-    /// 已经 warm-up 过 eager forward 的 `num_decode` 桶。CUDA Graph capture
-    /// 不允许 cuBLAS / cuDNN 在 default stream 上做 lazy init —— 第一次
-    /// 在某 batch size 上走 forward 时，cuBLASLt 会跑算法选择 + 描述符缓存
-    /// 等隐式工作，触发 `cudaErrorStreamCaptureImplicit`。所以策略是：
-    /// 同一个 num_decode **第一次走 eager**（让所有 lazy init 完成），
-    /// **第二次起才 capture**，**第三次起 replay**。
-    #[cfg(feature = "cuda")]
-    warmed_decode_buckets: UnsafeCell<std::collections::HashSet<usize>>,
-
-    /// 所有跨 step 地址稳定的 device tensor 都在这里。
-    /// 用 `UnsafeCell` 包裹是因为 runner 里 workspace 的某些 `refresh_*` 方法
-    /// 需要 `&mut self`，而 runner 对外只有 `&self`（Arc 共享）。互斥性由
-    /// `SyncFlags` 保证：server 只在 `input_ready=false` 期间访问。
-    workspace: UnsafeCell<BatchWorkspace>,
+    /// Fixed step buffers. Each buffer owns its own device addresses and gets
+    /// separate CUDA Graph captures. SubScheduler chooses the buffer id per step.
+    ///
+    /// Wrapped in `UnsafeCell` because workspace refresh methods need `&mut self`
+    /// while the runner is shared through `Arc`; exclusivity is governed by
+    /// `SyncFlags` and the single producer/consumer protocol.
+    workspaces: UnsafeCell<Vec<BatchWorkspace>>,
 
     // ─── 下面 3 个字段由 runner 读写，用 UnsafeCell 绕 &self → &mut T；
     //     互斥性靠 SyncFlags 语义保证（见顶部注释）。───
     /// per-slot InferenceState，len = max_batch_seqs。index = slot id。
     states: UnsafeCell<Vec<InferenceState>>,
-    /// 本步采样结果，`[max_batch_seqs] i32`，device。
-    output_tokens_dev: UnsafeCell<crate::tensor::Tensor>,
+    /// Per-step-buffer sampling result tensors, `[max_batch_seqs] i32`, device.
+    output_tokens_dev: UnsafeCell<Vec<crate::tensor::Tensor>>,
     /// 当前 step 的 host meta。server 写、runner 读一次就释放 input slot。
     meta_slot: UnsafeCell<StepMeta>,
 
@@ -246,21 +247,25 @@ impl<M: LlmModel> ModelRunner<M> {
             states.push(InferenceState::new(model.config(), device)?);
         }
 
-        // 2. workspace：所有跨 step 地址稳定的 device tensor
-        let mut workspace = BatchWorkspace::new(
-            model.config(),
-            max_batch_tokens,
-            max_batch_seqs,
-            device,
-        )?;
-        model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache)?;
-
-        // 3. 采样输出
-        let output_tokens_dev = crate::tensor::Tensor::new(
-            &[max_batch_seqs],
-            crate::base::DataType::I32,
-            device,
-        )?;
+        // 2. Fixed step buffers: each has distinct device addresses and therefore
+        // distinct CUDA Graph captures.
+        let mut workspaces = Vec::with_capacity(STEP_BUFFER_COUNT);
+        let mut output_tokens_dev = Vec::with_capacity(STEP_BUFFER_COUNT);
+        for _ in 0..STEP_BUFFER_COUNT {
+            let mut workspace = BatchWorkspace::new(
+                model.config(),
+                max_batch_tokens,
+                max_batch_seqs,
+                device,
+            )?;
+            model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache)?;
+            workspaces.push(workspace);
+            output_tokens_dev.push(crate::tensor::Tensor::new(
+                &[max_batch_seqs],
+                crate::base::DataType::I32,
+                device,
+            )?);
+        }
 
         // 4. CUDA config（stream / cublas handle）
         #[cfg(feature = "cuda")]
@@ -271,13 +276,10 @@ impl<M: LlmModel> ModelRunner<M> {
             device,
             #[cfg(feature = "cuda")]
             cuda_cfg: UnsafeCell::new(cuda_cfg),
-            // 默认开启 decode-only CUDA Graph。第一次某 num_decode 走 eager
-            // warm-up（也让 attention kernel 内部的 `cudaFuncSetAttribute`
-            // 一次性 setup 完成），第二次起 capture + replay。
+            // 默认开启 decode-only CUDA Graph。某 num_decode 第一次出现时直接
+            // capture；后续同 batch size 直接 replay。
             enable_decode_graph: true,
-            #[cfg(feature = "cuda")]
-            warmed_decode_buckets: UnsafeCell::new(std::collections::HashSet::new()),
-            workspace: UnsafeCell::new(workspace),
+            workspaces: UnsafeCell::new(workspaces),
             states: UnsafeCell::new(states),
             output_tokens_dev: UnsafeCell::new(output_tokens_dev),
             meta_slot: UnsafeCell::new(StepMeta::zeroed()),
@@ -298,17 +300,14 @@ impl<M: LlmModel> ModelRunner<M> {
 
     /// 清空已 capture 的所有 decode graph slot。
     ///
-    /// 调用时机：调用方（e.g. server）改动了任何 graph 复用所依赖的
-    /// device-side 状态（KV cache 扩容导致 ptr 表变化、batch member 重组等），
-    /// 必须主动调用一次让 runner 在下一步 step 重新 capture。
-    /// 同时清空 warm-up 集合，让相关 batch size 重新走 eager warm-up。
+    /// 仅在 graph 捕获到的固定 device buffer 地址失效时调用，例如 workspace
+    /// 重新分配、model reload 或容量配置变化。普通 batch member / slot mapping
+    /// 变化只会改固定 device buffer 的内容，不需要 invalidate graph。
     #[cfg(feature = "cuda")]
     pub fn invalidate_decode_graphs(&self) {
         let cfg = unsafe { &mut *self.cuda_cfg.get() };
         cfg.graphs
-            .retain(|slot, _| !matches!(slot, crate::cuda::GraphSlot::LlmDecode(_)));
-        let warmed = unsafe { &mut *self.warmed_decode_buckets.get() };
-        warmed.clear();
+            .retain(|slot, _| !matches!(slot, crate::cuda::GraphSlot::LlmDecode { .. }));
     }
 
     // ─── Server 写入接口（ready=false 期间 server 拥有这些 cell 的访问权）───
@@ -323,7 +322,17 @@ impl<M: LlmModel> ModelRunner<M> {
     /// # Safety
     /// 只有持有"ready=false"的 server 线程才能调用（且不能并发持有多个引用）。
     pub unsafe fn workspace(&self) -> &BatchWorkspace {
-        unsafe { &*self.workspace.get() }
+        unsafe { self.workspace_for(0) }
+    }
+
+    /// Workspace for a specific fixed step buffer.
+    ///
+    /// # Safety
+    /// Caller must follow the runner/sub-scheduler phase protocol and must not
+    /// alias this reference with concurrent mutable access.
+    pub unsafe fn workspace_for(&self, buffer_id: usize) -> &BatchWorkspace {
+        let workspaces = unsafe { &*self.workspaces.get() };
+        &workspaces[buffer_id]
     }
 
     /// 等价于 `workspace()`，但返回可变引用 —— 用于调用 workspace 的 `refresh_*`
@@ -332,7 +341,16 @@ impl<M: LlmModel> ModelRunner<M> {
     /// # Safety
     /// 只有持有"ready=false"的 server 线程才能调用。
     pub unsafe fn workspace_mut(&self) -> &mut BatchWorkspace {
-        unsafe { &mut *self.workspace.get() }
+        unsafe { self.workspace_mut_for(0) }
+    }
+
+    /// Mutable workspace for a specific fixed step buffer.
+    ///
+    /// # Safety
+    /// Caller must guarantee exclusive access to that buffer.
+    pub unsafe fn workspace_mut_for(&self, buffer_id: usize) -> &mut BatchWorkspace {
+        let workspaces = unsafe { &mut *self.workspaces.get() };
+        &mut workspaces[buffer_id]
     }
 
     /// 取 worker stream 给 hot-path H2D 用的辅助函数。
@@ -391,7 +409,16 @@ impl<M: LlmModel> ModelRunner<M> {
     /// # Safety
     /// Server 只能在 `output_ready=true` 期间调用。
     pub unsafe fn output_tokens_dev(&self) -> &crate::tensor::Tensor {
-        unsafe { &*self.output_tokens_dev.get() }
+        unsafe { self.output_tokens_dev_for(0) }
+    }
+
+    /// Output token tensor for a specific fixed step buffer.
+    ///
+    /// # Safety
+    /// Server can read it only after that buffer's step has `output_ready=true`.
+    pub unsafe fn output_tokens_dev_for(&self, buffer_id: usize) -> &crate::tensor::Tensor {
+        let outputs = unsafe { &*self.output_tokens_dev.get() };
+        &outputs[buffer_id]
     }
 
     /// 读当前 output_ready。
@@ -429,7 +456,7 @@ impl<M: LlmModel> ModelRunner<M> {
                 if self.flags.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_micros(50));
+                std::hint::spin_loop();
             }
 
             // 2. 读 meta、释放输入 slot。
@@ -450,7 +477,7 @@ impl<M: LlmModel> ModelRunner<M> {
                 if self.flags.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_micros(50));
+                std::hint::spin_loop();
             }
         }
     }
@@ -459,6 +486,12 @@ impl<M: LlmModel> ModelRunner<M> {
         let num_seqs = meta.num_seqs();
         if num_seqs == 0 {
             return Ok(());
+        }
+        if meta.step_buffer_id >= STEP_BUFFER_COUNT {
+            return Err(Error::InvalidArgument(format!(
+                "step_buffer_id {} >= STEP_BUFFER_COUNT {}",
+                meta.step_buffer_id, STEP_BUFFER_COUNT,
+            )).into());
         }
 
         // ── Gather per-slot InferenceState 的 mut refs ──
@@ -493,7 +526,7 @@ impl<M: LlmModel> ModelRunner<M> {
         // ── 刷新 ragged 计划（prefill 才需要）；结果覆盖 plan.total_q_tiles。──
         #[cfg(feature = "cuda")]
         let total_q_tiles: i32 = if meta.num_prefill > 0 {
-            let ws_mut = unsafe { &mut *self.workspace.get() };
+            let ws_mut = unsafe { self.workspace_mut_for(meta.step_buffer_id) };
             ws_mut.refresh_ragged_plan(&meta_view)?
         } else {
             0
@@ -505,7 +538,10 @@ impl<M: LlmModel> ModelRunner<M> {
         let attn_plan = self.build_attention_plan(meta, total_q_tiles)?;
 
         // ── output tensor（&mut via UnsafeCell）──
-        let output_mut = unsafe { &mut *self.output_tokens_dev.get() };
+        let output_mut = unsafe {
+            let outputs = &mut *self.output_tokens_dev.get();
+            &mut outputs[meta.step_buffer_id]
+        };
 
         // ── CudaConfig ──
         //
@@ -521,7 +557,7 @@ impl<M: LlmModel> ModelRunner<M> {
         let cuda_cfg: Option<&crate::OpConfig> = None;
 
         // ── ForwardCtx ──
-        let ws = unsafe { &*self.workspace.get() };
+        let ws = unsafe { self.workspace_for(meta.step_buffer_id) };
         let mut ctx = ForwardCtx::new(
             ws,
             &meta_view,
@@ -549,16 +585,15 @@ impl<M: LlmModel> ModelRunner<M> {
         //    worker stream，不会跑到 default stream（这是 CUDA Graph 的硬性
         //    要求；同时也避免任何隐式跨 stream 的同步）。
         //
-        //    decode-only 路径下分到 `forward_via_graph`：第一次 num_decode
-        //    走 eager warm-up（让所有 host-同步的 lazy init 跑完），
-        //    第二次起进入 stream-capture，第三次起 replay。
+        //    decode-only 路径下分到 `forward_via_graph`：已有 graph 直接 replay；
+        //    没有 graph 时直接 capture 当前 forward。
         #[cfg(feature = "cuda")]
         {
             use crate::cuda::with_cuda_stream;
             let stream = unsafe { (*self.cuda_cfg.get()).stream };
             with_cuda_stream(stream, || {
                 if self.enable_decode_graph && meta.is_decode_only() {
-                    self.forward_via_graph(num_seqs, &mut ctx)
+                    self.forward_via_graph(num_seqs, meta.step_buffer_id, &mut ctx)
                 } else {
                     self.model.forward(&mut ctx)
                 }
@@ -569,10 +604,7 @@ impl<M: LlmModel> ModelRunner<M> {
     }
 
     /// CUDA Graph 路径：按 `num_decode` 分桶，已 capture 则 replay；尚未
-    /// capture 则要求该桶**至少 warm-up 过一次** eager forward（防止 cuBLAS /
-    /// cuDNN 在 capture 期间触发 default stream lazy init），未 warm 时本步
-    /// 直接走 eager 并把桶标记 warmed；已 warm 但未 capture 时本步即为 capture
-    /// step（capture + instantiate + 立刻 replay 一次让本步真正算出来）。
+    /// capture 则直接 capture 当前 forward，并缓存 graph。
     ///
     /// 调用前提：调用方已确认 `meta.is_decode_only() && enable_decode_graph`，
     /// 且 ctx 已构造完成。
@@ -580,9 +612,10 @@ impl<M: LlmModel> ModelRunner<M> {
     fn forward_via_graph(
         &self,
         num_decode: usize,
+        buffer_id: usize,
         ctx: &mut ForwardCtx<'_, '_>,
     ) -> Result<()> {
-        let slot = crate::cuda::GraphSlot::LlmDecode(num_decode);
+        let slot = crate::cuda::GraphSlot::LlmDecode { batch: num_decode, buffer_id };
 
         // 已经 capture 过 → 直接 replay。
         {
@@ -592,18 +625,11 @@ impl<M: LlmModel> ModelRunner<M> {
             }
         }
 
-        // 未 warm-up → 走 eager（让 attention kernel 内部的
-        // `cudaFuncSetAttribute`、cuBLASLt heuristic 等一次性 host-同步 setup
-        // 都跑完），标记 warmed。下一步同 num_decode 才进入 capture。
-        let warmed = unsafe { &mut *self.warmed_decode_buckets.get() };
-        if !warmed.contains(&num_decode) {
-            self.model.forward(ctx)?;
-            warmed.insert(num_decode);
-            return Ok(());
-        }
-
-        // 已 warm 未 capture → 本步即 capture step。
+        // 尚未 capture → 本步直接 capture 当前 forward。Start capture from a
+        // clean stream boundary; prior H2D/control updates were enqueued on the
+        // same stream before `input_ready`.
         let cfg = unsafe { &mut *self.cuda_cfg.get() };
+        cfg.sync_stream()?;
         cfg.capture_begin_relaxed()?;
         let forward_result = self.model.forward(ctx);
         if let Err(e) = forward_result {
@@ -618,8 +644,7 @@ impl<M: LlmModel> ModelRunner<M> {
             return Err(e);
         }
         cfg.capture_end(slot)?;
-        // capture 期间 kernel 不真执行 → 立刻 replay 一次让本步真正算出。
-        cfg.launch(slot)
+        Ok(())
     }
     /// 从 workspace 预填好的 device scratch 构造本步 AttentionPlan。**零 H2D**。
     ///
@@ -633,7 +658,7 @@ impl<M: LlmModel> ModelRunner<M> {
         use crate::op::attention::{AttentionKind, AttentionPlan};
         #[cfg(feature = "cuda")]
         {
-            let ws = unsafe { &*self.workspace.get() };
+            let ws = unsafe { self.workspace_for(meta.step_buffer_id) };
             let cfg = self.model.config();
             let kind = if meta.is_decode_only() {
                 AttentionKind::DecodeOnly

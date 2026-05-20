@@ -139,9 +139,9 @@ pub struct BatchWorkspace {
     // - `block2req_dev`  `[max_q_tiles]`        i32: tile → request；
     // - `block2tile_dev` `[max_q_tiles]`        i32: tile → request 内的第几 tile。
     //
-    // `max_q_tiles` 是本 workspace 所能容纳的上界 `ceil(max_batch_tokens /
-    // RAGGED_Q_TILE)`。Runner 每 step 入口（只在 `num_prefill > 0` 时）调
-    // [`refresh_ragged_plan`] 做一次 host-compute + 3 次小 H2D。
+    // `max_q_tiles` 是本 workspace 所能容纳的 ragged tile 上界。它必须同时
+    // 覆盖 token budget 上界和 seq budget 上界：短 prompt 多并发时每个 seq
+    // 至少占 1 个 tile。
     #[cfg(feature = "cuda")]
     pub ragged_cu_q_lens_dev: *mut i32,
     #[cfg(feature = "cuda")]
@@ -251,7 +251,7 @@ impl BatchWorkspace {
             }
         };
 
-        // Ragged prefill 调度表：按 max_batch_tokens 为上界估算 max_q_tiles。
+        // Ragged prefill 调度表：按 token budget 与 seq budget 共同估算 max_q_tiles。
         #[cfg(feature = "cuda")]
         let (
             ragged_cu_q_lens_dev,
@@ -266,8 +266,10 @@ impl BatchWorkspace {
                 0usize,
             ),
             DeviceType::Cuda(_) => {
-                let max_tiles = max_batch_tokens
-                    .div_ceil(crate::op::attention::ragged::RAGGED_Q_TILE)
+                let max_tiles_by_tokens = max_batch_tokens
+                    .div_ceil(crate::op::attention::ragged::RAGGED_Q_TILE);
+                let max_tiles = max_tiles_by_tokens
+                    .max(max_batch_seqs)
                     .max(1);
                 let cu_bytes = (max_batch_seqs + 1) * std::mem::size_of::<i32>();
                 let tile_bytes = max_tiles * std::mem::size_of::<i32>();

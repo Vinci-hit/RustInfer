@@ -185,39 +185,6 @@ static bool zimage_bf16_gemm_bench_disabled()
     return cached == 1;
 }
 
-static bool zimage_bf16_algo_is_graph_capturable(
-    cublasLtHandle_t handle,
-    cublasLtMatmulDesc_t op,
-    cublasLtMatrixLayout_t A,
-    cublasLtMatrixLayout_t B,
-    cublasLtMatrixLayout_t C,
-    const __nv_bfloat16* bench_A,
-    const __nv_bfloat16* bench_B,
-    __nv_bfloat16* bench_C,
-    cublasLtMatmulAlgo_t* algo,
-    void* workspace,
-    size_t workspace_size,
-    cudaStream_t stream)
-{
-    float alpha = 1.0f;
-    float beta = 0.0f;
-
-    cudaError_t ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed);
-    if (ce != cudaSuccess) return false;
-
-    cublasStatus_t st = cublasLtMatmul(
-        handle, op, &alpha,
-        bench_B, A, bench_A, B, &beta,
-        bench_C, C, bench_C, C,
-        algo, workspace, workspace_size, stream);
-
-    cudaGraph_t graph = nullptr;
-    ce = cudaStreamEndCapture(stream, &graph);
-    if (graph != nullptr) cudaGraphDestroy(graph);
-
-    return st == CUBLAS_STATUS_SUCCESS && ce == cudaSuccess;
-}
-
 static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     int M, int N, int K, size_t workspaceSize,
     // scratch buffers from the caller — we reuse these for the benchmark
@@ -298,12 +265,6 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
         for (int i = 0; i < returned; ++i) {
             if (hres[i].state != CUBLAS_STATUS_SUCCESS) continue;
             if (hres[i].workspaceSize > workspaceSize) continue;
-            if (!zimage_bf16_algo_is_graph_capturable(
-                    bench_h, e.op, e.A, e.B, e.C,
-                    bench_A, bench_B, bench_C,
-                    &hres[i].algo, bench_ws, workspaceSize, bench_s)) {
-                continue;
-            }
 
             // Warm up; if the algo errors out, skip it.
             cublasStatus_t s = cublasLtMatmul(
@@ -347,29 +308,15 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     }
 
     if (best < 0) {
-        // No benchmark path: still require CUDA Graph capture compatibility.
-        cublasLtHandle_t test_h = nullptr;
-        cudaStream_t test_s = nullptr;
-        cublasLtCreate(&test_h);
-        cudaStreamCreate(&test_s);
+        // No bench — take the first viable heuristic result.
         for (int i = 0; i < returned; ++i) {
-            if (hres[i].state != CUBLAS_STATUS_SUCCESS) continue;
-            if (hres[i].workspaceSize > workspaceSize) continue;
-            if (zimage_bf16_algo_is_graph_capturable(
-                    test_h, e.op, e.A, e.B, e.C,
-                    bench_A, bench_B, bench_C,
-                    &hres[i].algo, bench_ws, workspaceSize, test_s)) {
+            if (hres[i].state == CUBLAS_STATUS_SUCCESS
+                && hres[i].workspaceSize <= workspaceSize) {
                 best = i;
                 break;
             }
         }
-        cudaStreamDestroy(test_s);
-        cublasLtDestroy(test_h);
-    }
-
-    if (best < 0) {
-        printf("cuBLASLt BF16: no CUDA-Graph-capturable algo for M=%d N=%d K=%d\n", M, N, K);
-        return e;
+        if (best < 0) best = 0;
     }
 
     e.algo = hres[best].algo;
@@ -394,41 +341,41 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     size_t workspaceSize,
     cudaStream_t stream)
 {
-    ZimageBf16GemmKey key{M, N, K};
-    ZimageBf16GemmEntry entry;
-    {
-        std::lock_guard<std::mutex> lk(g_zimage_bf16_gemm_cache_mu);
-        auto it = g_zimage_bf16_gemm_cache.find(key);
-        if (it == g_zimage_bf16_gemm_cache.end()) {
-            entry = zimage_build_bf16_gemm_entry(
-                M, N, K, workspaceSize, d_A, d_B, d_C, workspace);
-            if (entry.valid) {
-                g_zimage_bf16_gemm_cache.emplace(key, entry);
-            }
-        } else {
-            entry = it->second;
-        }
-    }
+    // Direct cuBLASLt call. No heuristic cache, no benchmarking, no private stream,
+    // no graph compatibility probe. Let cuBLASLt choose its default algorithm.
+    const int m_g = N, n_g = M, k_g = K;
+    cublasOperation_t opA = CUBLAS_OP_T;
+    cublasOperation_t opB = CUBLAS_OP_N;
 
-    if (!entry.valid) {
-        printf("gemm_cublasLt_AxBT_RowMajor_bf16: no valid entry for M=%d N=%d K=%d\n", M, N, K);
-        return;
-    }
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t A = nullptr;
+    cublasLtMatrixLayout_t B = nullptr;
+    cublasLtMatrixLayout_t C = nullptr;
+
+    CHECK_CUBLAS(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g));
 
     float alpha = 1.0f;
     float beta = 0.0f;
-    // Inputs swapped so that output is column-major [N,M] == row-major [M,N].
-    {
-        cublasStatus_t status = cublasLtMatmul(
-            ltHandle, entry.op, &alpha,
-            d_B, entry.A, d_A, entry.B, &beta,
-            d_C, entry.C, d_C, entry.C,
-            &entry.algo, workspace, workspaceSize, stream);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("cuBLASLt BF16 matmul failed: status=%d M=%d N=%d K=%d workspace=%zu\n",
-                   status, M, N, K, workspaceSize);
-            exit(EXIT_FAILURE);
-        }
+    cublasStatus_t status = cublasLtMatmul(
+        ltHandle, op, &alpha,
+        d_B, A, d_A, B, &beta,
+        d_C, C, d_C, C,
+        nullptr, workspace, workspaceSize, stream);
+
+    cublasLtMatrixLayoutDestroy(C);
+    cublasLtMatrixLayoutDestroy(B);
+    cublasLtMatrixLayoutDestroy(A);
+    cublasLtMatmulDescDestroy(op);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("cuBLASLt BF16 direct matmul failed: status=%d M=%d N=%d K=%d workspace=%zu\n",
+               status, M, N, K, workspaceSize);
+        exit(EXIT_FAILURE);
     }
 }
 // ============================================================================

@@ -111,16 +111,32 @@ impl ZmqFrontendTransport {
                 match msg {
                     OutgoingResponse::Full { client_id, response } => {
                         if let Ok(data) = codec.encode(&response) {
-                            let _ = socket.send(&client_id.0, zmq::SNDMORE);
-                            let _ = socket.send(&b""[..], zmq::SNDMORE);
-                            let _ = socket.send(&data, 0);
+                            if let Err(e) = socket.send(&client_id.0, zmq::SNDMORE) {
+                                tracing::error!("ZMQ frontend send identity failed for request {}: {:?}", response.request_id, e);
+                                continue;
+                            }
+                            if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
+                                tracing::error!("ZMQ frontend send delimiter failed for request {}: {:?}", response.request_id, e);
+                                continue;
+                            }
+                            if let Err(e) = socket.send(&data, 0) {
+                                tracing::error!("ZMQ frontend send response failed for request {}: {:?}", response.request_id, e);
+                            }
                         }
                     }
                     OutgoingResponse::Chunk { client_id, chunk } => {
                         if let Ok(data) = codec.encode(&chunk) {
-                            let _ = socket.send(&client_id.0, zmq::SNDMORE);
-                            let _ = socket.send(&b""[..], zmq::SNDMORE);
-                            let _ = socket.send(&data, 0);
+                            if let Err(e) = socket.send(&client_id.0, zmq::SNDMORE) {
+                                tracing::error!("ZMQ frontend send identity failed for stream {}: {:?}", chunk.request_id, e);
+                                continue;
+                            }
+                            if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
+                                tracing::error!("ZMQ frontend send delimiter failed for stream {}: {:?}", chunk.request_id, e);
+                                continue;
+                            }
+                            if let Err(e) = socket.send(&data, 0) {
+                                tracing::error!("ZMQ frontend send stream chunk failed for {}: {:?}", chunk.request_id, e);
+                            }
                         }
                     }
                 }
@@ -164,16 +180,18 @@ impl FrontendTransport for ZmqFrontendTransport {
 /// Worker transport backed by ZMQ PUSH/PULL sockets.
 pub struct ZmqWorkerTransport {
     /// Receive channel: ZMQ thread sends worker outputs here.
-    output_rx: mpsc::Receiver<Vec<u8>>,
+    output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     /// Send channel: scheduler sends batch commands here.
-    command_tx: mpsc::Sender<Vec<u8>>,
+    command_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl ZmqWorkerTransport {
     /// Spawn the ZMQ I/O thread and return the transport handle.
     pub fn new(push_endpoint: &str, pull_endpoint: &str) -> Result<Self> {
-        let (output_tx, output_rx) = mpsc::channel(1); // bounded(1) for backpressure
-        let (command_tx, command_rx) = mpsc::channel(1);
+        // ZMQ I/O thread must never block on the Tokio bridge: blocking here can
+        // deadlock command sending against worker output receiving under load.
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let push_ep = push_endpoint.to_string();
         let pull_ep = pull_endpoint.to_string();
 
@@ -195,8 +213,8 @@ impl ZmqWorkerTransport {
     fn zmq_thread(
         push_endpoint: String,
         pull_endpoint: String,
-        output_tx: mpsc::Sender<Vec<u8>>,
-        mut command_rx: mpsc::Receiver<Vec<u8>>,
+        output_tx: mpsc::UnboundedSender<Vec<u8>>,
+        mut command_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = zmq::Context::new();
 
@@ -220,7 +238,7 @@ impl ZmqWorkerTransport {
             // 2. Receive outputs from worker.
             match pull_socket.recv_bytes(0) {
                 Ok(data) => {
-                    if output_tx.blocking_send(data).is_err() {
+                    if output_tx.send(data).is_err() {
                         tracing::info!("Worker output channel closed, shutting down");
                         return Ok(());
                     }
@@ -237,7 +255,6 @@ impl WorkerTransport for ZmqWorkerTransport {
     async fn send_batch(&mut self, cmd: Vec<u8>) -> Result<()> {
         self.command_tx
             .send(cmd)
-            .await
             .map_err(|_| SchedulerError::Shutdown)
     }
 

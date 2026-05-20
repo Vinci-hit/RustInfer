@@ -13,8 +13,7 @@ const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
 /// 形状的 graph；同一 key 里只保存一张 graph（后 capture 的覆盖前一张）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
-    LlmDecode(usize),
-    LlmDecodeWithOutput { batch: usize, output_ptr: usize },
+    LlmDecode { batch: usize, buffer_id: usize },
     LlmMixedPreAttn(usize),
     LlmMixedPostAttn(usize),
     Denoise {
@@ -174,12 +173,11 @@ impl CudaConfig {
     // 用 `GraphSlot` 区分用途与 shape（对 LlmDecode 还带 batch_size 细分）。
     //
     // 使用范式（首次 capture + 之后 replay）：
-    //     let slot = GraphSlot::LlmDecode(batch_size);
+    //     let slot = GraphSlot::LlmDecode { batch: batch_size, buffer_id };
     //     if !cfg.graph_ready(slot) {
     //         cfg.capture_begin()?;              // 开 stream capture
-    //         run_forward_once_in_capture(...)?; // 只记录、不执行
+    //         run_forward_once_in_capture(...)?; // capture 当前 forward
     //         cfg.capture_end(slot)?;            // 结束 + instantiate，塞进 graphs[slot]
-    //         cfg.launch(slot)?;                 // 立刻 replay 一次，让本步真正算出来
     //     } else {
     //         cfg.launch(slot)?;                 // 直接 replay
     //     }

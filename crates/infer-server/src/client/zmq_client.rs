@@ -153,7 +153,9 @@ impl ZmqClient {
             if let Some(pending_req) = pending.remove(&request_id) {
                 match pending_req {
                     PendingRequest::Oneshot(tx) => {
-                        let _ = tx.send(response);
+                        if tx.send(response).is_err() {
+                            tracing::warn!("Response receiver already dropped for request {}", request_id);
+                        }
                     }
                     PendingRequest::Stream(tx) => {
                         // Scheduler 发了完整响应给一个流式请求
@@ -213,6 +215,7 @@ impl ZmqClient {
 impl InferClient for ZmqClient {
     /// 非流式推理
     async fn infer(&self, req: InferenceRequest) -> Result<InferenceResponse> {
+        let request_id = req.request_id.clone();
         let (tx, rx) = oneshot::channel();
 
         self.request_tx
@@ -227,7 +230,8 @@ impl InferClient for ZmqClient {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(anyhow::anyhow!("Response channel closed")),
             Err(_) => Err(anyhow::anyhow!(
-                "Request timeout after {}s",
+                "Request {} timeout after {}s",
+                request_id,
                 self.timeout.as_secs()
             )),
         }

@@ -23,7 +23,7 @@ use crate::model::llm::LlmModel;
 use crate::model::runtime::InferenceState;
 use infer_protocol::scheduler_to_worker::*;
 use infer_protocol::worker_to_scheduler::*;
-use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta};
+use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta, STEP_BUFFER_COUNT};
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  DecodeSeq —— 一个活跃的 decode 序列
@@ -103,6 +103,8 @@ pub struct SubScheduler<M: LlmModel> {
     pending_cancels: Vec<u64>,
     last_step_items: Vec<StepItem>,
     staging: StepHostStaging,
+    next_step_buffer_id: usize,
+    last_step_buffer_id: usize,
     draining: bool,
 }
 
@@ -115,7 +117,7 @@ impl<M: LlmModel> SubScheduler<M> {
         eos_token_ids: Vec<i32>,
     ) -> Self {
         let (max_batch_tokens, max_batch_seqs) = {
-            let ws = unsafe { runner.workspace() };
+            let ws = unsafe { runner.workspace_for(0) };
             (ws.max_batch_tokens, ws.max_batch_seqs)
         };
         Self {
@@ -129,6 +131,8 @@ impl<M: LlmModel> SubScheduler<M> {
             pending_cancels: Vec::new(),
             last_step_items: Vec::new(),
             staging: StepHostStaging::new(max_batch_tokens, max_batch_seqs),
+            next_step_buffer_id: 0,
+            last_step_buffer_id: 0,
             draining: false,
         }
     }
@@ -163,7 +167,7 @@ impl<M: LlmModel> SubScheduler<M> {
                     tracing::info!("SubScheduler: runner shutdown detected, exiting");
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_micros(50));
+                std::hint::spin_loop();
             }
 
             // 3. 读 output tokens (D2H)
@@ -265,7 +269,8 @@ impl<M: LlmModel> SubScheduler<M> {
             return Ok(());
         }
 
-        let ws = unsafe { self.runner.workspace() };
+        let step_buffer_id = self.next_step_buffer_id;
+        let ws = unsafe { self.runner.workspace_for(step_buffer_id) };
         if total_tokens > ws.max_batch_tokens {
             return Err(Error::InvalidArgument(format!(
                 "total_tokens {} > max_batch_tokens {}", total_tokens, ws.max_batch_tokens
@@ -282,6 +287,7 @@ impl<M: LlmModel> SubScheduler<M> {
         let mut step_items = Vec::with_capacity(num_seqs);
         let mut meta = StepMeta::zeroed();
 
+        meta.step_buffer_id = step_buffer_id;
         meta.num_decode = num_decode;
         meta.num_prefill = num_prefill_seqs;
 
@@ -332,7 +338,7 @@ impl<M: LlmModel> SubScheduler<M> {
         meta.q_start_loc[num_seqs] = offset;
         meta.total_q_tiles = 0;
 
-        let ws_mut = unsafe { self.runner.workspace_mut() };
+        let ws_mut = unsafe { self.runner.workspace_mut_for(step_buffer_id) };
         #[cfg(feature = "cuda")]
         let stream = unsafe { self.runner.cuda_stream() };
 
@@ -378,8 +384,19 @@ impl<M: LlmModel> SubScheduler<M> {
         }
 
         self.last_step_items = step_items;
+        self.last_step_buffer_id = step_buffer_id;
+        self.next_step_buffer_id = (step_buffer_id + 1) % STEP_BUFFER_COUNT;
         self.pending_prefills.clear();
 
+        tracing::info!(
+            "sub_scheduler_submit_step buffer={} decode={} prefill={} total_tokens={} seqs={} pending_prefill_cmds={}",
+            step_buffer_id,
+            num_decode,
+            num_prefill_seqs,
+            total_tokens,
+            num_seqs,
+            self.pending_prefills.len(),
+        );
         unsafe { self.runner.write_meta(meta); }
         self.runner.set_input_ready();
 
@@ -393,7 +410,7 @@ impl<M: LlmModel> SubScheduler<M> {
     /// 从 Runner 读本步 output tokens (D2H)。
     fn read_output_tokens(&self) -> Result<Vec<i32>> {
         let num_outputs = self.last_step_items.len();
-        let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev() }
+        let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev_for(self.last_step_buffer_id) }
             .to_cpu()?
             .as_i32()?
             .as_slice()?
@@ -488,16 +505,22 @@ impl<M: LlmModel> SubScheduler<M> {
         }
 
         if batch_members_changed {
-            unsafe {
-                self.runner.workspace_mut().invalidate_batch_member_cache();
+            for buffer_id in 0..STEP_BUFFER_COUNT {
+                unsafe {
+                    self.runner.workspace_mut_for(buffer_id).invalidate_batch_member_cache();
+                }
             }
-            #[cfg(feature = "cuda")]
-            self.runner.invalidate_decode_graphs();
         }
 
         if step_output.prefill_done.is_empty() && step_output.tokens.is_empty() {
             return;
         }
+        tracing::info!(
+            "sub_scheduler_step_output prefill_done={} tokens={} finished={}",
+            step_output.prefill_done.len(),
+            step_output.tokens.len(),
+            step_output.tokens.iter().filter(|token| token.finished).count(),
+        );
         let data = match rmp_serde::to_vec(&step_output) {
             Ok(data) => data,
             Err(e) => {
@@ -644,11 +667,11 @@ impl<M: LlmModel> SubScheduler<M> {
         }
 
         if removed_active || removed_pending {
-            unsafe {
-                self.runner.workspace_mut().invalidate_batch_member_cache();
+            for buffer_id in 0..STEP_BUFFER_COUNT {
+                unsafe {
+                    self.runner.workspace_mut_for(buffer_id).invalidate_batch_member_cache();
+                }
             }
-            #[cfg(feature = "cuda")]
-            self.runner.invalidate_decode_graphs();
         }
 
         removed_active || removed_pending
