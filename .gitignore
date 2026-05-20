@@ -12,3 +12,5 @@
 *.sqlite
 *.nsys-rep.bak
 crates/infer-worker/.codex
+*.log
+*.json

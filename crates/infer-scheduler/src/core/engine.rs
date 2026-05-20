@@ -190,15 +190,6 @@ where
         let handle = RequestHandle::new(client_id, request.stream);
         let seq = Sequence::new(meta.clone(), handle);
 
-        tracing::info!(
-            "request_enqueued request_id={} sequence_id={} input_tokens={} max_tokens={} stream={}",
-            meta.id,
-            meta.sequence_id,
-            meta.input_ids.len(),
-            meta.max_tokens,
-            meta.stream,
-        );
-
         self.waiting_queue.push(seq);
         self.metrics.record_enqueue();
     }
@@ -272,14 +263,6 @@ where
         };
 
         if !batch_data.is_empty() {
-            tracing::info!(
-                "scheduler_send_batch iteration={} scheduled_segments={} decoding={} prefilling={} waiting={}",
-                self.iteration_id,
-                self.current_chunk_sizes.len(),
-                self.decoding.len(),
-                self.prefilling.len(),
-                self.waiting_queue.len(),
-            );
             self.worker.send_batch(batch_data).await?;
             if self.config.mode == SchedulerMode::Diffusion {
                 self.worker_busy = true;
@@ -549,12 +532,6 @@ where
                 error: None,
                 metrics: metrics.clone(),
             };
-            tracing::info!(
-                "scheduler_send_response request_id={} tokens={} elapsed_ms={}",
-                request_id,
-                num_tokens,
-                elapsed_ms,
-            );
             self.frontend.send_response(&client_id, response).await?;
         }
 
