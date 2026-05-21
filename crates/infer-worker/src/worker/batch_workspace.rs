@@ -306,11 +306,16 @@ impl BatchWorkspace {
                 0usize,
             ),
             DeviceType::Cuda(_) => {
-                let max_tiles_by_tokens = max_batch_tokens
-                    .div_ceil(crate::op::attention::ragged::RAGGED_Q_TILE);
-                let max_tiles = max_tiles_by_tokens
-                    .max(max_batch_seqs)
-                    .max(1);
+                // Worst case for Σ ceil(q_len_i / TILE) under total token budget
+                // happens when every active seq contributes one partial tile, then
+                // the remaining tokens add full extra tiles. Example: T=512,S=4,
+                // TILE=128 can be [129,129,129,125] -> 7 tiles, not ceil(512/128)=4.
+                let tile = crate::op::attention::ragged::RAGGED_Q_TILE;
+                let active_seq_upper = max_batch_seqs.min(max_batch_tokens).max(1);
+                let max_extra_tiles = max_batch_tokens
+                    .saturating_sub(active_seq_upper)
+                    / tile;
+                let max_tiles = (active_seq_upper + max_extra_tiles).max(1);
                 let cu_bytes = (max_batch_seqs + 1) * std::mem::size_of::<i32>();
                 let tile_bytes = max_tiles * std::mem::size_of::<i32>();
                 let mut p_cu: *mut std::ffi::c_void = std::ptr::null_mut();

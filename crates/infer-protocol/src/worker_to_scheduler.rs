@@ -21,6 +21,15 @@ pub struct StepOutput {
     pub tokens: Vec<GeneratedToken>,
     #[serde(default)]
     pub need_blocks: Vec<NeedBlocksRequest>,
+    #[serde(default)]
+    pub error: Option<WorkerStepError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStepError {
+    pub sequence_ids: Vec<u64>,
+    pub message: String,
+    pub fatal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

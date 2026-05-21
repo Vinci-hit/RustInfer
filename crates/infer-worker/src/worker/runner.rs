@@ -28,6 +28,7 @@
 //! 数组、输入 token、KV cache 指针表等）地址稳定，server 直接写入。
 
 use std::cell::UnsafeCell;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::base::DeviceType;
@@ -217,6 +218,9 @@ pub struct ModelRunner<M: LlmModel> {
     /// Optional global Paged KV physical pool. Slot mode leaves this empty.
     paged_kv_pool: UnsafeCell<Option<PagedKvPool>>,
 
+    /// Last fatal runner error, consumed by SubScheduler and returned to Scheduler.
+    error_slot: Mutex<Option<String>>,
+
     flags: SyncFlags,
 }
 
@@ -287,6 +291,7 @@ impl<M: LlmModel> ModelRunner<M> {
             output_tokens_dev: UnsafeCell::new(output_tokens_dev),
             meta_slots: UnsafeCell::new((0..STEP_BUFFER_COUNT).map(|_| StepMeta::zeroed()).collect()),
             paged_kv_pool: UnsafeCell::new(None),
+            error_slot: Mutex::new(None),
             flags: SyncFlags::new(),
         })
     }
@@ -495,6 +500,16 @@ impl<M: LlmModel> ModelRunner<M> {
         pool.as_ref().map(|p| (p.block_size(), p.num_blocks(), p.bytes_allocated()))
     }
 
+    pub fn take_error(&self) -> Option<String> {
+        self.error_slot.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    fn set_error(&self, message: String) {
+        if let Ok(mut guard) = self.error_slot.lock() {
+            *guard = Some(message);
+        }
+    }
+
     // ─── Runner 主循环 ───
 
     /// 常驻 loop。调用线程会被阻塞在这里直到 `request_shutdown()`。
@@ -532,9 +547,12 @@ impl<M: LlmModel> ModelRunner<M> {
             let meta: StepMeta = unsafe { (&*self.meta_slots.get())[buffer_id].clone() };
             self.flags.input_ready[buffer_id].store(false, Ordering::Release);
 
-            // 3. 执行 forward。错误 → panic。
+            // 3. 执行 forward。错误写入 error slot，由 SubScheduler 回传 Scheduler。
             if let Err(e) = self.forward_one_step(&meta) {
-                panic!("ModelRunner::run forward error: {:?}", e);
+                self.set_error(format!("ModelRunner::run forward error: {e:?}"));
+                self.flags.output_ready[buffer_id].store(true, Ordering::Release);
+                self.flags.shutdown.store(true, Ordering::Release);
+                return;
             }
 
             // 4. 只标记该 buffer output 可读；不等待 CPU 消费，继续寻找其它 ready buffer。

@@ -55,12 +55,13 @@ enum DecodeKv {
 
 #[allow(dead_code)]
 impl DecodeKv {
-    fn slot_for_legacy_workspace(&self) -> usize {
+    fn slot_for_legacy_workspace(&self, batch_idx: usize) -> usize {
         match self {
             DecodeKv::Slot { kv_slot } => *kv_slot,
-            // Paged kernels will use block_table instead of slot. Until the paged
-            // attention/scatter path is wired, keep a stable placeholder for host meta.
-            DecodeKv::Paged { .. } => 0,
+            // Paged kernels use block tables instead of slot ids. Still, Runner
+            // builds temporary state refs from StepMeta and requires slot_indices
+            // to be unique, so use the current batch row as a stable placeholder.
+            DecodeKv::Paged { .. } => batch_idx,
         }
     }
 
@@ -201,6 +202,17 @@ mod paged_kv_helper_tests {
         let draft = kv.maybe_request_blocks(7, 8, 16, 1, 0, 1).unwrap();
         assert_eq!(draft.required_blocks, 3);
         assert!(kv.is_blocked_on_blocks());
+    }
+
+    #[test]
+    fn paged_legacy_workspace_slots_use_unique_batch_rows() {
+        let kv0 = decode_kv_from_segment(&paged_segment());
+        let mut seg1 = paged_segment();
+        seg1.sequence_id = 8;
+        seg1.kv = Some(KvPlacement::Paged { block_table: vec![20, 21], block_size: 4 });
+        let kv1 = decode_kv_from_segment(&seg1);
+        assert_eq!(kv0.slot_for_legacy_workspace(0), 0);
+        assert_eq!(kv1.slot_for_legacy_workspace(1), 1);
     }
 }
 
@@ -390,6 +402,14 @@ impl<M: LlmModel> SubScheduler<M> {
                 std::hint::spin_loop();
             }
 
+            if let Some(err) = self.runner.take_error() {
+                self.runner.set_output_consumed_for(output_buffer_id);
+                self.step_in_flight = false;
+                self.send_fatal_error(err);
+                self.runner.request_shutdown();
+                return;
+            }
+
             // 3. 读该 buffer output tokens (D2H)，读完立即释放该 output buffer。
             let output_tokens = match self.read_output_tokens(output_buffer_id) {
                 Ok(t) => t,
@@ -536,7 +556,7 @@ impl<M: LlmModel> SubScheduler<M> {
             staging.kv_lens.push(d.next_position as i32 + 1);
 
             meta.q_start_loc[seq_idx] = offset;
-            meta.slot_indices[seq_idx] = d.kv.slot_for_legacy_workspace() as i32;
+            meta.slot_indices[seq_idx] = d.kv.slot_for_legacy_workspace(seq_idx) as i32;
             meta.positions_start[seq_idx] = d.next_position as i32;
             step_items.push(StepItem::Decode { sequence_id: d.sequence_id });
             paged_tables.push(d.kv.paged_block_table().map(|t| t.to_vec()));
@@ -557,8 +577,9 @@ impl<M: LlmModel> SubScheduler<M> {
                 let placement = segment.kv_placement();
                 let (slot, paged_table) = match placement {
                     KvPlacement::Slot { kv_slot } => (kv_slot as usize, None),
-                    // Paged kernels will consume block tables. Keep placeholder slot in StepMeta.
-                    KvPlacement::Paged { block_table, .. } => (0usize, Some(block_table)),
+                    // Paged kernels consume block tables. Use batch row as unique
+                    // placeholder slot to satisfy Runner's state-ref uniqueness.
+                    KvPlacement::Paged { block_table, .. } => (seq_idx, Some(block_table)),
                 };
 
                 staging.input_tokens.extend_from_slice(&cmd.input_ids[range]);
@@ -676,6 +697,7 @@ impl<M: LlmModel> SubScheduler<M> {
             prefill_done: Vec::new(),
             tokens: Vec::new(),
             need_blocks: Vec::new(),
+            error: None,
         };
         let mut batch_members_changed = false;
 
@@ -807,6 +829,47 @@ impl<M: LlmModel> SubScheduler<M> {
             }
         } else {
             tracing::debug!("GrantBlocks for inactive sequence_id={}", grant.sequence_id);
+        }
+    }
+
+    fn collect_all_sequence_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.active_decodes.iter().map(|seq| seq.sequence_id).collect();
+        for cmd in &self.pending_prefills {
+            ids.extend(cmd.segments.iter().map(|segment| segment.sequence_id));
+        }
+        for items in &self.step_items_by_buffer {
+            for item in items {
+                match item {
+                    StepItem::Decode { sequence_id } => ids.push(*sequence_id),
+                    StepItem::PrefillSegment { segment } => ids.push(segment.sequence_id),
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn send_fatal_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        tracing::error!("Worker fatal error: {}", message);
+        let output = StepOutput {
+            prefill_done: Vec::new(),
+            tokens: Vec::new(),
+            need_blocks: Vec::new(),
+            error: Some(WorkerStepError {
+                sequence_ids: self.collect_all_sequence_ids(),
+                message,
+                fatal: true,
+            }),
+        };
+        match rmp_serde::to_vec(&output) {
+            Ok(data) => {
+                if let Err(e) = self.zmq_out.send(&data, 0) {
+                    tracing::error!("ZMQ send fatal StepError failed: {}", e);
+                }
+            }
+            Err(e) => tracing::error!("serialize fatal StepError failed: {}", e),
         }
     }
 
