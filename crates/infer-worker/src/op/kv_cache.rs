@@ -26,7 +26,7 @@
 use crate::OpConfig;
 use crate::base::DeviceType;
 use crate::base::error::Result;
-use crate::model::runtime::InferenceState;
+use crate::model::runtime::{InferenceState, PagedKvPool};
 use crate::tensor::Tensor;
 use crate::worker::batch_workspace::BatchWorkspace;
 use crate::worker::runner::WorkerBatchMeta;
@@ -60,18 +60,20 @@ pub fn scatter(
     states: &mut [&mut InferenceState],
     meta: &WorkerBatchMeta<'_>,
     workspace: &BatchWorkspace,
+    paged_kv_pool: Option<&PagedKvPool>,
     cuda_cfg: Option<&OpConfig>,
 ) -> Result<()> {
     match k.device() {
         DeviceType::Cpu => {
             let _ = workspace;
+            let _ = paged_kv_pool;
             let _ = cuda_cfg;
             scatter_cpu(k, v, layer_idx, states, meta)
         }
         #[cfg(feature = "cuda")]
         DeviceType::Cuda(_) => {
             let _ = states;
-            scatter_cuda(k, v, layer_idx, meta, workspace, cuda_cfg)
+            scatter_cuda(k, v, layer_idx, meta, workspace, paged_kv_pool, cuda_cfg)
         }
     }
 }
@@ -112,6 +114,7 @@ fn scatter_cuda(
     layer_idx: usize,
     meta: &WorkerBatchMeta<'_>,
     workspace: &BatchWorkspace,
+    paged_kv_pool: Option<&PagedKvPool>,
     cuda_cfg: Option<&OpConfig>,
 ) -> Result<()> {
     use std::ffi::c_void;
@@ -120,11 +123,40 @@ fn scatter_cuda(
         return Ok(());
     }
     let kv_dim = k.shape()[1];
-    // cache 是连续分配的 `[capacity, kv_dim]`，行步长 = kv_dim。
-    let dst_row_stride = kv_dim;
     let k_src_row_stride = k.strides()[0];
     let v_src_row_stride = v.strides()[0];
 
+    if workspace.paged_active {
+        let pool = paged_kv_pool.ok_or_else(|| crate::base::error::Error::InvalidArgument(
+            "paged KV scatter requested but PagedKvPool is not initialized".into(),
+        ))?;
+        let layer = pool.layers().get(layer_idx).ok_or_else(|| crate::base::error::Error::InvalidArgument(format!(
+            "paged KV scatter layer_idx {} out of bounds {}",
+            layer_idx,
+            pool.layers().len(),
+        )))?;
+        return unsafe {
+            crate::op::kernels::cuda::kv_scatter_paged(
+                k, v,
+                &layer.k,
+                &layer.v,
+                workspace.paged_block_tables_dev,
+                workspace.paged_max_blocks_per_seq,
+                pool.block_size(),
+                workspace.scatter_seq_positions_dev,
+                workspace.scatter_seq_starts_dev,
+                workspace.scatter_seq_lens_dev,
+                batch,
+                kv_dim,
+                k_src_row_stride,
+                v_src_row_stride,
+                cuda_cfg,
+            )
+        };
+    }
+
+    // cache 是连续分配的 `[capacity, kv_dim]`，行步长 = kv_dim。
+    let dst_row_stride = kv_dim;
     unsafe {
         crate::op::kernels::cuda::kv_scatter_batched(
             k, v,
@@ -297,7 +329,7 @@ mod tests {
         {
             let mut refs: Vec<&mut InferenceState> =
                 vec![&mut state0, &mut state1, &mut state2];
-            scatter(&k_src, &v_src, 0, &mut refs, &meta, &workspace, None)?;
+            scatter(&k_src, &v_src, 0, &mut refs, &meta, &workspace, None, None)?;
         }
 
         for (seq_i, len) in seq_lens.iter().copied().enumerate() {
@@ -338,7 +370,7 @@ mod tests {
         {
             let mut refs: Vec<&mut InferenceState> =
                 vec![&mut state0, &mut state1, &mut state2];
-            scatter(&k_src, &v_src, 1, &mut refs, &meta, &workspace, None)?;
+            scatter(&k_src, &v_src, 1, &mut refs, &meta, &workspace, None, None)?;
         }
         for (seq_i, _len) in seq_lens.iter().copied().enumerate() {
             let pos = seq_poses[seq_i] as usize;
@@ -466,7 +498,7 @@ mod tests {
         }
         {
             let mut refs: Vec<&mut InferenceState> = vec![&mut s0, &mut s1];
-            scatter(&k_view, &v_view, 0, &mut refs, &meta, &ws_a, None)?;
+            scatter(&k_view, &v_view, 0, &mut refs, &meta, &ws_a, None, None)?;
         }
 
         // --- B. dense scatter: 先物理 copy 到 [T, kv_dim] 再 scatter ---
@@ -493,7 +525,7 @@ mod tests {
         }
         {
             let mut refs_b: Vec<&mut InferenceState> = vec![&mut s0b, &mut s1b];
-            scatter(&k_dense, &v_dense, 0, &mut refs_b, &meta, &ws_b, None)?;
+            scatter(&k_dense, &v_dense, 0, &mut refs_b, &meta, &ws_b, None, None)?;
         }
 
         // --- 比对：两路径每 seq 在写入段的内容必须逐 bit 相等 ---

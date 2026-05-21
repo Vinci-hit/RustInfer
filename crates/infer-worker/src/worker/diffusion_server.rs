@@ -88,6 +88,10 @@ impl<P: DiffusionPipeline> DiffusionWorkerServer<P> {
                 tracing::info!("Diffusion CancelRequest ignored sequence_id={}", cancel.sequence_id);
                 None
             }
+            WorkerCommand::GrantBlocks(grant) => {
+                tracing::debug!("Diffusion GrantBlocks ignored sequence_id={}", grant.sequence_id);
+                None
+            }
             WorkerCommand::Prefill(_) => {
                 tracing::error!("Diffusion worker received LLM Prefill command");
                 None

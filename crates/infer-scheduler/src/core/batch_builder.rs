@@ -3,13 +3,13 @@
 use std::collections::HashSet;
 
 use crate::cache::kv_manager::KvAllocation;
-use crate::config::SchedulerConfig;
+use crate::config::{KvCacheMode, SchedulerConfig};
 use crate::error::{Result, SchedulerError};
 use crate::request::lifecycle::{Sequence, Prefilling, Decoding, RequestId};
 use crate::transport::codec::{Codec, MsgPackCodec};
 
 use infer_protocol::scheduler_to_worker::{
-    CancelRequest, DiffusionBatchCmd, DiffusionBatchItem, PrefillBatchCmd,
+    CancelRequest, DiffusionBatchCmd, DiffusionBatchItem, KvPlacement, PrefillBatchCmd,
     PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams as WorkerSamplingParams,
     WorkerCommand,
 };
@@ -27,7 +27,7 @@ pub fn build_cancel_request(sequence_id: u64, codec: &MsgPackCodec) -> Result<Ve
 pub fn build_batch(
     prefilling: &[Sequence<Prefilling>],
     decoding: &[Sequence<Decoding>],
-    _config: &SchedulerConfig,
+    config: &SchedulerConfig,
     codec: &MsgPackCodec,
     scheduled_segments: &[(RequestId, usize)],
 ) -> Result<Vec<u8>> {
@@ -38,7 +38,7 @@ pub fn build_batch(
         return Ok(Vec::new());
     }
 
-    build_prefill_batch_cmd(prefilling, codec, scheduled_segments)
+    build_prefill_batch_cmd(prefilling, config, codec, scheduled_segments)
 }
 
 pub fn build_diffusion_batch(
@@ -87,6 +87,7 @@ pub fn build_diffusion_batch(
 
 fn build_prefill_batch_cmd(
     prefilling: &[Sequence<Prefilling>],
+    config: &SchedulerConfig,
     codec: &MsgPackCodec,
     scheduled_segments: &[(RequestId, usize)],
 ) -> Result<Vec<u8>> {
@@ -121,18 +122,31 @@ fn build_prefill_batch_cmd(
         q_start_loc.push(input_ids_all.len() as u32);
         input_ids_all.extend_from_slice(&seq.meta.input_ids[start..end]);
 
-        let kv_slot = match &seq.state.kv_alloc {
-            KvAllocation::Slot(id) => *id,
-            KvAllocation::Blocks(_) => {
-                return Err(SchedulerError::Internal(
-                    "build_prefill_batch_cmd called with Blocks allocation".into(),
-                ));
+        let (kv_slot, kv) = match &seq.state.kv_alloc {
+            KvAllocation::Slot(id) => (*id, None),
+            KvAllocation::Blocks(blocks) => {
+                let block_size = match config.kv_cache_mode {
+                    KvCacheMode::Paged { block_size } => block_size as u32,
+                    KvCacheMode::Slot => {
+                        return Err(SchedulerError::Internal(
+                            "Blocks allocation used while config.kv_cache_mode is Slot".into(),
+                        ));
+                    }
+                };
+                (
+                    0,
+                    Some(KvPlacement::Paged {
+                        block_table: blocks.iter().map(|b| b.0).collect(),
+                        block_size,
+                    }),
+                )
             }
         };
 
         segments.push(PrefillSegmentMeta {
             sequence_id: seq.meta.sequence_id.0,
             kv_slot,
+            kv,
             prompt_len: seq.state.prompt_len as u32,
             segment_start: start as u32,
             segment_end: end as u32,
@@ -161,4 +175,74 @@ fn build_prefill_batch_cmd(
     };
 
     codec.encode(&WorkerCommand::Prefill(cmd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::cache::traits::PhysicalBlockId;
+    use crate::request::handle::RequestHandle;
+    use crate::request::lifecycle::{InFlightPrefillSegment, Priority, RequestMeta, SamplingParams, SequenceId};
+    use infer_protocol::scheduler_to_worker::WorkerCommand;
+
+    fn make_prefilling_with_blocks() -> Sequence<Prefilling> {
+        let meta = Arc::new(RequestMeta {
+            id: RequestId("req-paged".to_string()),
+            sequence_id: SequenceId(42),
+            input_ids: vec![11, 22, 33, 44],
+            max_tokens: 128,
+            sampling: SamplingParams::default(),
+            priority: Priority::default(),
+            stream: false,
+            stop_sequences: vec![],
+            diffusion: None,
+            arrival_time: Instant::now(),
+        });
+        Sequence {
+            meta,
+            handle: RequestHandle::noop(),
+            state: Prefilling {
+                kv_alloc: KvAllocation::Blocks(vec![PhysicalBlockId(7), PhysicalBlockId(8)]),
+                num_computed_tokens: 0,
+                inflight: Some(InFlightPrefillSegment {
+                    segment_start: 0,
+                    segment_end: 4,
+                    is_final: true,
+                }),
+                prompt_len: 4,
+                prefill_start: Instant::now(),
+            },
+        }
+    }
+
+    #[test]
+    fn build_prefill_batch_with_paged_placement() {
+        let config = SchedulerConfig {
+            kv_cache_mode: KvCacheMode::Paged { block_size: 16 },
+            max_model_len: 4096,
+            ..Default::default()
+        };
+        let codec = MsgPackCodec;
+        let seq = make_prefilling_with_blocks();
+        let request_id = seq.meta.id.clone();
+
+        let bytes = build_batch(&[seq], &[], &config, &codec, &[(request_id, 4)]).unwrap();
+        let cmd: WorkerCommand = codec.decode(&bytes).unwrap();
+        let WorkerCommand::Prefill(prefill) = cmd else {
+            panic!("expected prefill command");
+        };
+        assert_eq!(prefill.segments.len(), 1);
+        let segment = &prefill.segments[0];
+        assert_eq!(segment.kv_slot, 0);
+        match segment.kv_placement() {
+            KvPlacement::Paged { block_table, block_size } => {
+                assert_eq!(block_size, 16);
+                assert_eq!(block_table, vec![7, 8]);
+            }
+            other => panic!("expected paged placement, got {other:?}"),
+        }
+    }
 }

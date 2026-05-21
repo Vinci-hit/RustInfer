@@ -35,6 +35,10 @@ pub enum AttentionKind {
     /// 变长 `q_len_i` —— 走 [`FlashAttnRagged`]。
     /// 混合 batch（有些 seq q_len>1、有些 q_len==1）也归这里。
     Ragged,
+    /// Paged KV decode path.
+    PagedDecode,
+    /// Paged KV ragged prefill / mixed path.
+    PagedRagged,
 }
 
 /// 一次 forward step 的 attention 调度计划。
@@ -64,6 +68,8 @@ pub struct AttentionPlan {
     /// 指针表中每层占用的列数（= `BatchWorkspace::max_batch_seqs`），用于按
     /// `layer_idx` 偏移定位本层对应行的起始指针。
     pub max_batch_seqs: usize,
+    /// Current number of sequences in the batch.
+    pub batch: usize,
 
     // DecodeOnly 专用
     pub workspace: *mut f32,
@@ -73,6 +79,16 @@ pub struct AttentionPlan {
     pub block2req_dev: *const i32,
     pub block2tile_dev: *const i32,
     pub total_q_tiles: i32,
+
+    // Paged KV 专用。地址由 BatchWorkspace 固定持有，Graph-capturable。
+    pub paged_block_tables_dev: *const u32,
+    pub paged_block_counts_dev: *const i32,
+    pub paged_max_blocks_per_seq: usize,
+    /// Host-side device addresses for each layer's global paged K/V pool.
+    /// Values are stable after PagedKvPool initialization.
+    pub paged_k_pool_ptrs: Vec<usize>,
+    pub paged_v_pool_ptrs: Vec<usize>,
+    pub paged_block_size: usize,
 }
 
 // 裸指针不自动 Send/Sync；此结构由单 runner 线程构造、传递给各层共用，
@@ -96,11 +112,18 @@ impl AttentionPlan {
             req_to_slot_dev: std::ptr::null(),
             kv_lens_dev: std::ptr::null(),
             max_batch_seqs: 0,
+            batch: 0,
             workspace: std::ptr::null_mut(),
             cu_q_lens_dev: std::ptr::null(),
             block2req_dev: std::ptr::null(),
             block2tile_dev: std::ptr::null(),
             total_q_tiles: 0,
+            paged_block_tables_dev: std::ptr::null(),
+            paged_block_counts_dev: std::ptr::null(),
+            paged_max_blocks_per_seq: 0,
+            paged_k_pool_ptrs: Vec::new(),
+            paged_v_pool_ptrs: Vec::new(),
+            paged_block_size: 0,
         }
     }
 }
@@ -183,6 +206,54 @@ impl Attention {
                     plan.block2req_dev,
                     plan.block2tile_dev,
                     plan.total_q_tiles,
+                    o,
+                    cuda_cfg,
+                )
+            },
+            AttentionKind::PagedDecode => unsafe {
+                let k_pool = *plan.paged_k_pool_ptrs.get(layer_idx).ok_or_else(|| {
+                    crate::base::error::Error::InvalidArgument(format!(
+                        "PagedDecode missing K pool pointer for layer {}", layer_idx
+                    ))
+                })? as *const c_void;
+                let v_pool = *plan.paged_v_pool_ptrs.get(layer_idx).ok_or_else(|| {
+                    crate::base::error::Error::InvalidArgument(format!(
+                        "PagedDecode missing V pool pointer for layer {}", layer_idx
+                    ))
+                })? as *const c_void;
+                self.decode.forward_paged(
+                    q,
+                    k_pool,
+                    v_pool,
+                    plan.paged_block_tables_dev,
+                    plan.paged_max_blocks_per_seq,
+                    plan.paged_block_size,
+                    plan.kv_lens_dev,
+                    o,
+                    cuda_cfg,
+                )
+            },
+            AttentionKind::PagedRagged => unsafe {
+                let k_pool = *plan.paged_k_pool_ptrs.get(layer_idx).ok_or_else(|| {
+                    crate::base::error::Error::InvalidArgument(format!(
+                        "PagedRagged missing K pool pointer for layer {}", layer_idx
+                    ))
+                })? as *const c_void;
+                let v_pool = *plan.paged_v_pool_ptrs.get(layer_idx).ok_or_else(|| {
+                    crate::base::error::Error::InvalidArgument(format!(
+                        "PagedRagged missing V pool pointer for layer {}", layer_idx
+                    ))
+                })? as *const c_void;
+                self.ragged.forward_paged(
+                    q,
+                    k_pool,
+                    v_pool,
+                    plan.paged_block_tables_dev,
+                    plan.paged_max_blocks_per_seq,
+                    plan.paged_block_size,
+                    plan.kv_lens_dev,
+                    plan.cu_q_lens_dev,
+                    plan.batch,
                     o,
                     cuda_cfg,
                 )

@@ -65,6 +65,74 @@ unsafe extern "C" {
         stream: cuda::ffi::cudaStream_t,
     );
 
+    pub fn launch_flash_attn_paged_decode_bf16(
+        q: *const half::bf16, qsb: i64, qsh: i64,
+        k_pool: *const half::bf16,
+        v_pool: *const half::bf16,
+        o: *mut half::bf16, osb: i64, osh: i64,
+        block_tables: *const u32,
+        max_blocks_per_seq: i32,
+        block_size: i32,
+        kv_lens: *const i32,
+        batch: i32, num_q_heads: i32, num_kv_heads: i32, head_dim: i32,
+        softmax_scale: f32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn launch_flash_attn_paged_decode_fp16(
+        q: *const half::f16, qsb: i64, qsh: i64,
+        k_pool: *const half::f16,
+        v_pool: *const half::f16,
+        o: *mut half::f16, osb: i64, osh: i64,
+        block_tables: *const u32,
+        max_blocks_per_seq: i32,
+        block_size: i32,
+        kv_lens: *const i32,
+        batch: i32, num_q_heads: i32, num_kv_heads: i32, head_dim: i32,
+        softmax_scale: f32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn launch_flash_attn_paged_ragged_bf16(
+        q: *const half::bf16, qss: i64, qsh: i64,
+        k_pool: *const half::bf16,
+        v_pool: *const half::bf16,
+        o: *mut half::bf16, oss: i64, osh: i64,
+        block_tables: *const u32,
+        max_blocks_per_seq: i32,
+        block_size: i32,
+        kv_lens: *const i32,
+        cu_q_lens: *const i32,
+        batch: i32,
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        is_causal: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn launch_flash_attn_paged_ragged_fp16(
+        q: *const half::f16, qss: i64, qsh: i64,
+        k_pool: *const half::f16,
+        v_pool: *const half::f16,
+        o: *mut half::f16, oss: i64, osh: i64,
+        block_tables: *const u32,
+        max_blocks_per_seq: i32,
+        block_size: i32,
+        kv_lens: *const i32,
+        cu_q_lens: *const i32,
+        batch: i32,
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        is_causal: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
     // ---- Ragged attention (variable q_len / kv_len per request) ----
     pub fn launch_flash_attn_ragged_bf16(
         q: *const half::bf16, qss: i64, qsh: i64,
@@ -448,6 +516,199 @@ pub unsafe fn flash_attn_ragged(
         other => {
             return Err(Error::InvalidArgument(format!(
                 "flash_attn_ragged: unsupported dtype {:?} (only BF16 / F16)", other
+            )).into());
+        }
+    }
+    Ok(())
+}
+
+/// Paged Flash-Decoding (q_len = 1) over a global KV pool.
+///
+/// K/V pool layout is `[num_blocks, block_size, num_kv_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_paged_decode(
+    q: &Tensor,
+    k_pool: *const std::ffi::c_void,
+    v_pool: *const std::ffi::c_void,
+    o: &mut Tensor,
+    block_tables_dev: *const u32,
+    max_blocks_per_seq: usize,
+    block_size: usize,
+    kv_lens_dev: *const i32,
+    batch: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    let dtype = q.dtype();
+    if dtype != o.dtype() {
+        return Err(Error::InvalidArgument(
+            "flash_attn_paged_decode: q and o must share dtype".into()
+        ).into());
+    }
+    if q.shape().len() != 3 || o.shape().len() != 3 {
+        return Err(Error::InvalidArgument(format!(
+            "flash_attn_paged_decode: q/o must be 3-D [batch, num_q_heads, head_dim] \
+             (got q={:?}, o={:?})", q.shape(), o.shape()
+        )).into());
+    }
+    if q.shape()[0] != batch || o.shape()[0] != batch {
+        return Err(Error::InvalidArgument(format!(
+            "paged decode batch mismatch: q.shape[0]={}, o.shape[0]={}, batch={}",
+            q.shape()[0], o.shape()[0], batch,
+        )).into());
+    }
+    if q.shape()[1] != num_q_heads || q.shape()[2] != head_dim {
+        return Err(Error::InvalidArgument(format!(
+            "paged decode q shape mismatch: got {:?}, expected [_, {}, {}]",
+            q.shape(), num_q_heads, head_dim,
+        )).into());
+    }
+    let stream = CudaConfig::resolve_stream(cuda_config);
+    let qsb = q.strides()[0] as i64;
+    let qsh = q.strides()[1] as i64;
+    let osb = o.strides()[0] as i64;
+    let osh = o.strides()[1] as i64;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    match dtype {
+        crate::base::DataType::BF16 => unsafe {
+            launch_flash_attn_paged_decode_bf16(
+                q.as_bf16()?.data_ptr(), qsb, qsh,
+                k_pool as *const half::bf16,
+                v_pool as *const half::bf16,
+                o.as_bf16_mut()?.data_ptr_mut(), osb, osh,
+                block_tables_dev,
+                max_blocks_per_seq as i32,
+                block_size as i32,
+                kv_lens_dev,
+                batch as i32, num_q_heads as i32, num_kv_heads as i32, head_dim as i32,
+                scale,
+                stream,
+            );
+        },
+        crate::base::DataType::F16 => unsafe {
+            launch_flash_attn_paged_decode_fp16(
+                q.as_f16()?.data_ptr(), qsb, qsh,
+                k_pool as *const half::f16,
+                v_pool as *const half::f16,
+                o.as_f16_mut()?.data_ptr_mut(), osb, osh,
+                block_tables_dev,
+                max_blocks_per_seq as i32,
+                block_size as i32,
+                kv_lens_dev,
+                batch as i32, num_q_heads as i32, num_kv_heads as i32, head_dim as i32,
+                scale,
+                stream,
+            );
+        },
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "flash_attn_paged_decode: unsupported dtype {:?} (only BF16 / F16 supported)", other
+            )).into());
+        }
+    }
+    Ok(())
+}
+
+/// Paged ragged/prefill attention over a global KV pool.
+///
+/// Q/O layout: `[total_q_tokens, num_q_heads, head_dim]`.
+/// K/V pool layout: `[num_blocks, block_size, num_kv_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_paged_ragged(
+    q: &Tensor,
+    k_pool: *const std::ffi::c_void,
+    v_pool: *const std::ffi::c_void,
+    o: &mut Tensor,
+    block_tables_dev: *const u32,
+    max_blocks_per_seq: usize,
+    block_size: usize,
+    kv_lens_dev: *const i32,
+    cu_q_lens_dev: *const i32,
+    batch: usize,
+    total_q_tokens: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    is_causal: bool,
+    cuda_config: Option<&CudaConfig>,
+) -> Result<()> {
+    let dtype = q.dtype();
+    if dtype != o.dtype() {
+        return Err(Error::InvalidArgument(
+            "flash_attn_paged_ragged: q and o must share dtype".into()
+        ).into());
+    }
+    if q.shape().len() != 3 || o.shape().len() != 3 {
+        return Err(Error::InvalidArgument(format!(
+            "flash_attn_paged_ragged: q/o must be 3-D [total_q_tokens, num_q_heads, head_dim] \
+             (got q={:?}, o={:?})", q.shape(), o.shape()
+        )).into());
+    }
+    if q.shape()[0] != total_q_tokens || o.shape()[0] != total_q_tokens {
+        return Err(Error::InvalidArgument(format!(
+            "paged ragged token mismatch: q.shape[0]={}, o.shape[0]={}, total_q_tokens={}",
+            q.shape()[0], o.shape()[0], total_q_tokens,
+        )).into());
+    }
+    if q.shape()[1] != num_q_heads || q.shape()[2] != head_dim {
+        return Err(Error::InvalidArgument(format!(
+            "paged ragged q shape mismatch: got {:?}, expected [_, {}, {}]",
+            q.shape(), num_q_heads, head_dim,
+        )).into());
+    }
+    let stream = CudaConfig::resolve_stream(cuda_config);
+    let qss = q.strides()[0] as i64;
+    let qsh = q.strides()[1] as i64;
+    let oss = o.strides()[0] as i64;
+    let osh = o.strides()[1] as i64;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let causal_i = if is_causal { 1 } else { 0 };
+
+    match dtype {
+        crate::base::DataType::BF16 => unsafe {
+            launch_flash_attn_paged_ragged_bf16(
+                q.as_bf16()?.data_ptr(), qss, qsh,
+                k_pool as *const half::bf16,
+                v_pool as *const half::bf16,
+                o.as_bf16_mut()?.data_ptr_mut(), oss, osh,
+                block_tables_dev,
+                max_blocks_per_seq as i32,
+                block_size as i32,
+                kv_lens_dev,
+                cu_q_lens_dev,
+                batch as i32,
+                total_q_tokens as i32,
+                num_q_heads as i32, num_kv_heads as i32, head_dim as i32,
+                scale,
+                causal_i,
+                stream,
+            );
+        },
+        crate::base::DataType::F16 => unsafe {
+            launch_flash_attn_paged_ragged_fp16(
+                q.as_f16()?.data_ptr(), qss, qsh,
+                k_pool as *const half::f16,
+                v_pool as *const half::f16,
+                o.as_f16_mut()?.data_ptr_mut(), oss, osh,
+                block_tables_dev,
+                max_blocks_per_seq as i32,
+                block_size as i32,
+                kv_lens_dev,
+                cu_q_lens_dev,
+                batch as i32,
+                total_q_tokens as i32,
+                num_q_heads as i32, num_kv_heads as i32, head_dim as i32,
+                scale,
+                causal_i,
+                stream,
+            );
+        },
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "flash_attn_paged_ragged: unsupported dtype {:?} (only BF16 / F16 supported)", other
             )).into());
         }
     }

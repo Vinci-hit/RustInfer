@@ -25,14 +25,189 @@ use infer_protocol::scheduler_to_worker::*;
 use infer_protocol::worker_to_scheduler::*;
 use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta, STEP_BUFFER_COUNT};
 
+const DEFAULT_DECODE_BLOCK_PREFETCH_MARGIN: usize = 4;
+const DEFAULT_DECODE_BLOCK_REQUEST_BLOCKS: usize = 1;
+
 // ════════════════════════════════════════════════════════════════════════════════
 //  DecodeSeq —— 一个活跃的 decode 序列
 // ════════════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PendingBlockRequest {
+    required_blocks: usize,
+    requested_blocks: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum DecodeKv {
+    Slot {
+        kv_slot: usize,
+    },
+    Paged {
+        block_table: Vec<u32>,
+        block_size: usize,
+        pending_request: Option<PendingBlockRequest>,
+        blocked_on_blocks: bool,
+    },
+}
+
+#[allow(dead_code)]
+impl DecodeKv {
+    fn slot_for_legacy_workspace(&self) -> usize {
+        match self {
+            DecodeKv::Slot { kv_slot } => *kv_slot,
+            // Paged kernels will use block_table instead of slot. Until the paged
+            // attention/scatter path is wired, keep a stable placeholder for host meta.
+            DecodeKv::Paged { .. } => 0,
+        }
+    }
+
+    fn paged_block_table(&self) -> Option<&[u32]> {
+        match self {
+            DecodeKv::Paged { block_table, .. } => Some(block_table),
+            DecodeKv::Slot { .. } => None,
+        }
+    }
+
+    fn maybe_request_blocks(
+        &mut self,
+        sequence_id: u64,
+        next_position: usize,
+        max_tokens: usize,
+        generated_count: usize,
+        prefetch_margin: usize,
+        request_blocks: usize,
+    ) -> Option<NeedBlocksDraft> {
+        let DecodeKv::Paged {
+            block_table,
+            block_size,
+            pending_request,
+            blocked_on_blocks,
+        } = self else {
+            return None;
+        };
+        if generated_count >= max_tokens || pending_request.is_some() {
+            return None;
+        }
+
+        let future_pos = next_position.saturating_add(prefetch_margin);
+        let required_blocks = future_pos / *block_size + 1;
+        if required_blocks <= block_table.len() {
+            return None;
+        }
+
+        let missing = required_blocks - block_table.len();
+        let requested_blocks = missing.max(request_blocks.max(1));
+        *pending_request = Some(PendingBlockRequest { required_blocks, requested_blocks });
+
+        let current_required = next_position / *block_size + 1;
+        if current_required > block_table.len() {
+            *blocked_on_blocks = true;
+        }
+
+        Some(NeedBlocksDraft {
+            sequence_id,
+            current_blocks: block_table.len(),
+            required_blocks,
+            request_blocks: requested_blocks,
+        })
+    }
+
+    fn append_granted_blocks(&mut self, block_ids: &[u32]) -> bool {
+        let DecodeKv::Paged {
+            block_table,
+            pending_request,
+            blocked_on_blocks,
+            ..
+        } = self else {
+            return false;
+        };
+        block_table.extend_from_slice(block_ids);
+        *pending_request = None;
+        *blocked_on_blocks = false;
+        true
+    }
+
+    fn is_blocked_on_blocks(&self) -> bool {
+        matches!(self, DecodeKv::Paged { blocked_on_blocks: true, .. })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NeedBlocksDraft {
+    sequence_id: u64,
+    current_blocks: usize,
+    required_blocks: usize,
+    request_blocks: usize,
+}
+
+#[cfg(test)]
+mod paged_kv_helper_tests {
+    use super::*;
+
+    fn paged_segment() -> PrefillSegmentMeta {
+        PrefillSegmentMeta {
+            sequence_id: 7,
+            kv_slot: 0,
+            kv: Some(KvPlacement::Paged {
+                block_table: vec![10, 11],
+                block_size: 4,
+            }),
+            prompt_len: 8,
+            segment_start: 0,
+            segment_end: 8,
+            max_tokens: 16,
+            sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+            completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+        }
+    }
+
+    #[test]
+    fn decode_kv_from_paged_segment_keeps_block_table() {
+        let kv = decode_kv_from_segment(&paged_segment());
+        match kv {
+            DecodeKv::Paged { block_table, block_size, pending_request, blocked_on_blocks } => {
+                assert_eq!(block_table, vec![10, 11]);
+                assert_eq!(block_size, 4);
+                assert!(pending_request.is_none());
+                assert!(!blocked_on_blocks);
+            }
+            DecodeKv::Slot { .. } => panic!("expected paged decode kv"),
+        }
+    }
+
+    #[test]
+    fn decode_block_request_triggers_before_boundary() {
+        let mut kv = decode_kv_from_segment(&paged_segment());
+        let draft = kv.maybe_request_blocks(7, 7, 16, 1, 1, 2).unwrap();
+        assert_eq!(draft, NeedBlocksDraft {
+            sequence_id: 7,
+            current_blocks: 2,
+            required_blocks: 3,
+            request_blocks: 2,
+        });
+        assert!(!kv.is_blocked_on_blocks());
+
+        assert!(kv.append_granted_blocks(&[12, 13]));
+        assert_eq!(kv.paged_block_table().unwrap(), &[10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn decode_block_request_blocks_when_current_position_exceeds_capacity() {
+        let mut kv = decode_kv_from_segment(&paged_segment());
+        let draft = kv.maybe_request_blocks(7, 8, 16, 1, 0, 1).unwrap();
+        assert_eq!(draft.required_blocks, 3);
+        assert!(kv.is_blocked_on_blocks());
+    }
+}
+
 #[derive(Clone)]
 struct DecodeSeq {
     sequence_id: u64,
-    kv_slot: usize,
+    kv: DecodeKv,
     /// 下一个 decode 输入 token 写入 KV cache 的 position (= 当前 KV 长度)。
     next_position: usize,
     /// 上一步采样出的 token (本步 decode 输入)。
@@ -43,6 +218,18 @@ struct DecodeSeq {
     /// 采样参数（后续接入 top_p / temperature / top_k）。
     #[allow(dead_code)]
     sampling: SamplingParams,
+}
+
+fn decode_kv_from_segment(segment: &PrefillSegmentMeta) -> DecodeKv {
+    match segment.kv_placement() {
+        KvPlacement::Slot { kv_slot } => DecodeKv::Slot { kv_slot: kv_slot as usize },
+        KvPlacement::Paged { block_table, block_size } => DecodeKv::Paged {
+            block_table,
+            block_size: block_size as usize,
+            pending_request: None,
+            blocked_on_blocks: false,
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -101,10 +288,11 @@ pub struct SubScheduler<M: LlmModel> {
     active_decodes: Vec<DecodeSeq>,
     pending_prefills: Vec<PrefillBatchCmd>,
     pending_cancels: Vec<u64>,
-    last_step_items: Vec<StepItem>,
+    step_items_by_buffer: Vec<Vec<StepItem>>,
     staging: StepHostStaging,
     next_step_buffer_id: usize,
-    last_step_buffer_id: usize,
+    next_output_buffer_id: usize,
+    step_in_flight: bool,
     draining: bool,
 }
 
@@ -129,10 +317,11 @@ impl<M: LlmModel> SubScheduler<M> {
             active_decodes: Vec::new(),
             pending_prefills: Vec::new(),
             pending_cancels: Vec::new(),
-            last_step_items: Vec::new(),
+            step_items_by_buffer: (0..STEP_BUFFER_COUNT).map(|_| Vec::new()).collect(),
             staging: StepHostStaging::new(max_batch_tokens, max_batch_seqs),
             next_step_buffer_id: 0,
-            last_step_buffer_id: 0,
+            next_output_buffer_id: 0,
+            step_in_flight: false,
             draining: false,
         }
     }
@@ -157,12 +346,43 @@ impl<M: LlmModel> SubScheduler<M> {
         tracing::info!("SubScheduler started, {} active decodes", self.active_decodes.len());
 
         loop {
-            // 1. 与 Runner forward 并行：non-blocking 收新 prefill
+            // 1. 与 Runner forward 并行：non-blocking 收新 prefill / GrantBlocks / cancel
             self.drain_zmq_prefills();
+            self.apply_pending_cancels();
 
-            // 2. 等 Runner 完成本步（同时检测 shutdown）
+            // 如果上一轮没有提交 step（例如所有 paged decode 都在等 GrantBlocks），
+            // 不要等待 output_ready；继续 drain 控制消息并尝试重新提交。
+            if !self.step_in_flight {
+                if let Err(e) = self.ensure_capacity_and_enqueue() {
+                    tracing::error!("Failed to enqueue while idle/no-inflight: {:?}", e);
+                    self.runner.request_shutdown();
+                    return;
+                }
+                if !self.step_in_flight {
+                    if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
+                        tracing::debug!("All sequences finished, waiting for new prefill...");
+                        let cmd = match self.recv_next_prefill_blocking() {
+                            Some(c) => c,
+                            None => { tracing::info!("SubScheduler: shutdown while idle"); return; }
+                        };
+                        self.pending_prefills.push(cmd);
+                        if let Err(e) = self.ensure_capacity_and_enqueue() {
+                            tracing::error!("Failed to enqueue after idle: {:?}", e);
+                            self.runner.request_shutdown();
+                            return;
+                        }
+                    }
+                    if !self.step_in_flight {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                }
+            }
+
+            // 2. 等待按提交顺序的 output buffer 完成；其它 buffer 的 output 不会阻塞 runner。
+            let output_buffer_id = self.next_output_buffer_id;
             loop {
-                if self.runner.output_ready() { break; }
+                if self.runner.output_ready_for(output_buffer_id) { break; }
                 if self.runner.is_shutdown() {
                     tracing::info!("SubScheduler: runner shutdown detected, exiting");
                     return;
@@ -170,19 +390,23 @@ impl<M: LlmModel> SubScheduler<M> {
                 std::hint::spin_loop();
             }
 
-            // 3. 读 output tokens (D2H)
-            let output_tokens = match self.read_output_tokens() {
+            // 3. 读该 buffer output tokens (D2H)，读完立即释放该 output buffer。
+            let output_tokens = match self.read_output_tokens(output_buffer_id) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("Failed to read output tokens: {:?}", e);
-                    self.runner.set_output_consumed();
+                    self.runner.set_output_consumed_for(output_buffer_id);
+                    self.step_in_flight = false;
+                    self.next_output_buffer_id = (output_buffer_id + 1) % STEP_BUFFER_COUNT;
                     continue;
                 }
             };
-            self.runner.set_output_consumed();
+            self.runner.set_output_consumed_for(output_buffer_id);
+            self.step_in_flight = false;
+            self.next_output_buffer_id = (output_buffer_id + 1) % STEP_BUFFER_COUNT;
 
             // 4. 按本 step 语义处理 output：prefill ack、final prefill token、decode token。
-            self.process_step_output_and_send_zmq(&output_tokens);
+            self.process_step_output_and_send_zmq(output_buffer_id, &output_tokens);
             self.apply_pending_cancels();
 
             // 6. 非阻塞收新 prefill / cancel
@@ -223,14 +447,17 @@ impl<M: LlmModel> SubScheduler<M> {
     /// Prefill segment 不在这里无条件转 decode；必须等 runner output 回来后，
     /// 根据 segment completion 决定丢弃中间 chunk 的采样 token，或用 final chunk 的
     /// 输出 token 创建 DecodeSeq。
-    fn ensure_capacity_and_enqueue(&mut self) -> Result<()> {
+    fn ensure_capacity_and_enqueue(&mut self) -> Result<bool> {
         if self.active_decodes.is_empty() && self.pending_prefills.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.ensure_capacity_for_pending_prefills()?;
-        self.write_input_buffer_pre_promote()?;
-        Ok(())
+        let submitted = self.write_input_buffer_pre_promote()?;
+        if submitted {
+            self.step_in_flight = true;
+        }
+        Ok(submitted)
     }
 
     /// 为 pending prefill segments 预分配 KV cache 容量。
@@ -239,11 +466,13 @@ impl<M: LlmModel> SubScheduler<M> {
             let n = cmd.num_requests();
             for i in 0..n {
                 let segment = &cmd.segments[i];
-                let slot = segment.kv_slot as usize;
-                let max_total = segment.prompt_len as usize + segment.max_tokens;
+                if let KvPlacement::Slot { kv_slot } = segment.kv_placement() {
+                    let slot = kv_slot as usize;
+                    let max_total = segment.prompt_len as usize + segment.max_tokens;
 
-                unsafe {
-                    self.runner.state_mut(slot).kv_cache.ensure_capacity(max_total)?;
+                    unsafe {
+                        self.runner.state_mut(slot).kv_cache.ensure_capacity(max_total)?;
+                    }
                 }
             }
         }
@@ -253,9 +482,11 @@ impl<M: LlmModel> SubScheduler<M> {
     /// 写入 Runner workspace。
     ///
     /// 布局：decode 在前 (q_len=1 each)，prefill segment 在后。
-    /// 同时记录 `last_step_items`，runner output 回来后按这个表解释每一行输出。
-    fn write_input_buffer_pre_promote(&mut self) -> Result<()> {
-        let num_decode = self.active_decodes.len();
+    /// 同时按 buffer 记录 `step_items`，runner output 回来后按对应 buffer 的表解释每一行输出。
+    fn write_input_buffer_pre_promote(&mut self) -> Result<bool> {
+        let num_decode = self.active_decodes.iter()
+            .filter(|seq| !seq.kv.is_blocked_on_blocks())
+            .count();
         let num_prefill_seqs: usize = self.pending_prefills.iter()
             .map(|p| p.num_requests())
             .sum();
@@ -266,7 +497,7 @@ impl<M: LlmModel> SubScheduler<M> {
         let num_seqs = num_decode + num_prefill_seqs;
 
         if num_seqs == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let step_buffer_id = self.next_step_buffer_id;
@@ -285,6 +516,7 @@ impl<M: LlmModel> SubScheduler<M> {
         self.staging.reset(total_tokens, num_seqs);
         let staging = &mut self.staging;
         let mut step_items = Vec::with_capacity(num_seqs);
+        let mut paged_tables: Vec<Option<Vec<u32>>> = Vec::with_capacity(num_seqs);
         let mut meta = StepMeta::zeroed();
 
         meta.step_buffer_id = step_buffer_id;
@@ -296,14 +528,18 @@ impl<M: LlmModel> SubScheduler<M> {
 
         // Decode 在前 (每条 q_len=1)。
         for d in &self.active_decodes {
+            if d.kv.is_blocked_on_blocks() {
+                continue;
+            }
             staging.input_tokens.push(d.last_token);
             staging.input_positions.push(d.next_position as i32);
             staging.kv_lens.push(d.next_position as i32 + 1);
 
             meta.q_start_loc[seq_idx] = offset;
-            meta.slot_indices[seq_idx] = d.kv_slot as i32;
+            meta.slot_indices[seq_idx] = d.kv.slot_for_legacy_workspace() as i32;
             meta.positions_start[seq_idx] = d.next_position as i32;
             step_items.push(StepItem::Decode { sequence_id: d.sequence_id });
+            paged_tables.push(d.kv.paged_block_table().map(|t| t.to_vec()));
 
             offset += 1;
             seq_idx += 1;
@@ -318,7 +554,12 @@ impl<M: LlmModel> SubScheduler<M> {
                 let seq_len = range.len();
                 let segment_start = segment.segment_start as usize;
                 let segment_end = segment.segment_end as usize;
-                let slot = segment.kv_slot as usize;
+                let placement = segment.kv_placement();
+                let (slot, paged_table) = match placement {
+                    KvPlacement::Slot { kv_slot } => (kv_slot as usize, None),
+                    // Paged kernels will consume block tables. Keep placeholder slot in StepMeta.
+                    KvPlacement::Paged { block_table, .. } => (0usize, Some(block_table)),
+                };
 
                 staging.input_tokens.extend_from_slice(&cmd.input_ids[range]);
                 for pos in segment_start..segment_end {
@@ -330,6 +571,7 @@ impl<M: LlmModel> SubScheduler<M> {
                 meta.slot_indices[seq_idx] = slot as i32;
                 meta.positions_start[seq_idx] = segment_start as i32;
                 step_items.push(StepItem::PrefillSegment { segment });
+                paged_tables.push(paged_table);
 
                 offset += seq_len as i32;
                 seq_idx += 1;
@@ -364,8 +606,16 @@ impl<M: LlmModel> SubScheduler<M> {
         let meta_view = WorkerBatchMeta::from_step(&meta);
         #[cfg(feature = "cuda")]
         ws_mut.refresh_scatter_indices(&meta_view, stream)?;
+        #[cfg(feature = "cuda")]
+        {
+            let paged_refs: Vec<Option<&[u32]>> = paged_tables
+                .iter()
+                .map(|entry| entry.as_deref())
+                .collect();
+            ws_mut.refresh_paged_block_tables(&paged_refs, stream)?;
+        }
         #[cfg(not(feature = "cuda"))]
-        let _ = &meta_view;
+        let _ = (&meta_view, &paged_tables);
 
         #[cfg(feature = "cuda")]
         {
@@ -383,25 +633,24 @@ impl<M: LlmModel> SubScheduler<M> {
             ws_mut.fill_cache_ptrs_from_states(&slot_ids, &mut refs, stream)?;
         }
 
-        self.last_step_items = step_items;
-        self.last_step_buffer_id = step_buffer_id;
+        self.step_items_by_buffer[step_buffer_id] = step_items;
         self.next_step_buffer_id = (step_buffer_id + 1) % STEP_BUFFER_COUNT;
         self.pending_prefills.clear();
 
-        unsafe { self.runner.write_meta(meta); }
-        self.runner.set_input_ready();
+        unsafe { self.runner.write_meta_for(step_buffer_id, meta); }
+        self.runner.set_input_ready_for(step_buffer_id);
 
-        Ok(())
+        Ok(true)
     }
 
     // ════════════════════════════════════════════════════════════════════════════
     //  输出处理
     // ════════════════════════════════════════════════════════════════════════════
 
-    /// 从 Runner 读本步 output tokens (D2H)。
-    fn read_output_tokens(&self) -> Result<Vec<i32>> {
-        let num_outputs = self.last_step_items.len();
-        let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev_for(self.last_step_buffer_id) }
+    /// 从指定 Runner buffer 读本步 output tokens (D2H)。
+    fn read_output_tokens(&self, buffer_id: usize) -> Result<Vec<i32>> {
+        let num_outputs = self.step_items_by_buffer[buffer_id].len();
+        let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev_for(buffer_id) }
             .to_cpu()?
             .as_i32()?
             .as_slice()?
@@ -412,20 +661,21 @@ impl<M: LlmModel> SubScheduler<M> {
         Ok(tokens_out)
     }
 
-    /// 按 last_step_items 解释 runner output，更新 Worker 内部 decode 状态并发送精简 StepOutput。
-    fn process_step_output_and_send_zmq(&mut self, tokens: &[i32]) {
-        if tokens.len() != self.last_step_items.len() {
+    /// 按指定 buffer 的 step_items 解释 runner output，更新 Worker 内部 decode 状态并发送精简 StepOutput。
+    fn process_step_output_and_send_zmq(&mut self, buffer_id: usize, tokens: &[i32]) {
+        if tokens.len() != self.step_items_by_buffer[buffer_id].len() {
             tracing::error!(
-                "Runner output length {} != last_step_items length {}",
-                tokens.len(), self.last_step_items.len()
+                "Runner output length {} != buffer {} step_items length {}",
+                tokens.len(), buffer_id, self.step_items_by_buffer[buffer_id].len()
             );
             return;
         }
 
-        let step_items = std::mem::take(&mut self.last_step_items);
+        let step_items = std::mem::take(&mut self.step_items_by_buffer[buffer_id]);
         let mut step_output = StepOutput {
             prefill_done: Vec::new(),
             tokens: Vec::new(),
+            need_blocks: Vec::new(),
         };
         let mut batch_members_changed = false;
 
@@ -479,7 +729,7 @@ impl<M: LlmModel> SubScheduler<M> {
                             if !finished {
                                 self.active_decodes.push(DecodeSeq {
                                     sequence_id,
-                                    kv_slot: segment.kv_slot as usize,
+                                    kv: decode_kv_from_segment(&segment),
                                     // final prefill 输出 token 还没写入 KV；下一步 decode 写到 prompt_len。
                                     next_position: segment.prompt_len as usize,
                                     last_token: token_id,
@@ -495,6 +745,15 @@ impl<M: LlmModel> SubScheduler<M> {
             }
         }
 
+        for draft in self.collect_need_blocks_drafts() {
+            step_output.need_blocks.push(NeedBlocksRequest {
+                sequence_id: draft.sequence_id,
+                current_blocks: draft.current_blocks as u32,
+                required_blocks: draft.required_blocks as u32,
+                request_blocks: draft.request_blocks as u32,
+            });
+        }
+
         if batch_members_changed {
             for buffer_id in 0..STEP_BUFFER_COUNT {
                 unsafe {
@@ -503,7 +762,7 @@ impl<M: LlmModel> SubScheduler<M> {
             }
         }
 
-        if step_output.prefill_done.is_empty() && step_output.tokens.is_empty() {
+        if step_output.prefill_done.is_empty() && step_output.tokens.is_empty() && step_output.need_blocks.is_empty() {
             return;
         }
         let data = match rmp_serde::to_vec(&step_output) {
@@ -515,6 +774,39 @@ impl<M: LlmModel> SubScheduler<M> {
         };
         if let Err(e) = self.zmq_out.send(&data, 0) {
             tracing::error!("ZMQ send failed: {}", e);
+        }
+    }
+
+    fn collect_need_blocks_drafts(&mut self) -> Vec<NeedBlocksDraft> {
+        let mut drafts = Vec::new();
+        for seq in &mut self.active_decodes {
+            if let Some(draft) = seq.kv.maybe_request_blocks(
+                seq.sequence_id,
+                seq.next_position,
+                seq.max_tokens,
+                seq.generated_count,
+                DEFAULT_DECODE_BLOCK_PREFETCH_MARGIN,
+                DEFAULT_DECODE_BLOCK_REQUEST_BLOCKS,
+            ) {
+                drafts.push(draft);
+            }
+        }
+        drafts
+    }
+
+    fn apply_block_grant(&mut self, grant: BlockGrantCmd) {
+        if let Some(seq) = self.active_decodes.iter_mut().find(|s| s.sequence_id == grant.sequence_id) {
+            if seq.kv.append_granted_blocks(&grant.block_ids) {
+                tracing::debug!(
+                    "GrantBlocks applied: sequence_id={} blocks={}",
+                    grant.sequence_id,
+                    grant.block_ids.len(),
+                );
+            } else {
+                tracing::warn!("GrantBlocks for non-paged sequence_id={}", grant.sequence_id);
+            }
+        } else {
+            tracing::debug!("GrantBlocks for inactive sequence_id={}", grant.sequence_id);
         }
     }
 
@@ -589,6 +881,10 @@ impl<M: LlmModel> SubScheduler<M> {
             WorkerCommand::Prefill(cmd) => self.accept_prefill(cmd),
             WorkerCommand::DiffusionBatch(_) => {
                 tracing::error!("LLM worker received DiffusionBatch command");
+                None
+            }
+            WorkerCommand::GrantBlocks(grant) => {
+                self.apply_block_grant(grant);
                 None
             }
             WorkerCommand::Cancel(cancel) => {
@@ -739,6 +1035,7 @@ mod tests {
             segments: vec![PrefillSegmentMeta {
                 sequence_id,
                 kv_slot,
+                kv: None,
                 prompt_len,
                 segment_start: 0,
                 segment_end: prompt_len,
@@ -1271,6 +1568,7 @@ mod tests {
                 PrefillSegmentMeta {
                     sequence_id: 10,
                     kv_slot: 0,
+                    kv: None,
                     prompt_len: toks0.len() as u32,
                     segment_start: 0,
                     segment_end: toks0.len() as u32,
@@ -1281,6 +1579,7 @@ mod tests {
                 PrefillSegmentMeta {
                     sequence_id: 11,
                     kv_slot: 1,
+                    kv: None,
                     prompt_len: toks1.len() as u32,
                     segment_start: 0,
                     segment_end: toks1.len() as u32,

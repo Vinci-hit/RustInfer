@@ -7,24 +7,24 @@
 //! - Runner 的 step **无参**：外部（同进程 server 线程 / 测试）通过 Runner
 //!   暴露的 getter 把数据写到各 device tensor，然后用一对 `SyncFlags` 握手
 //!   通知 Runner。
-//! - Runner 常驻 loop：spin 等 `input_ready=true` → 读 meta → 置
-//!   `input_ready=false` → forward → 置 `output_ready=true` → 等 server 消费
-//!   → 循环。
+//! - Runner 常驻 loop：spin 等任一 step buffer `input_ready=true` → 读该 buffer
+//!   meta → 置该 buffer `input_ready=false` → forward → 置该 buffer
+//!   `output_ready=true`，然后立即寻找其它 ready buffer，不等待 output 消费。
 //!
 //! # 并发模型
 //!
 //! 单进程两线程：
 //! - **Server 线程**：tokenize / 调度 / 填 Runner 的输入 buffer / 读 output。
 //! - **Runner 线程**：`ModelRunner::run()`。
-//! - 共享 `Arc<ModelRunner>`。内部可变状态（states / output / meta slot）用
-//!   `UnsafeCell` 包裹；互斥性靠 `SyncFlags` 的 Acquire/Release 语义保证：
-//!   server 只在 `input_ready=false` 时写、`output_ready=true` 时读，其他阶段
-//!   runner 独占。
+//! - 共享 `Arc<ModelRunner>`。内部可变状态（states / output / meta slots）用
+//!   `UnsafeCell` 包裹；互斥性靠 per-buffer `SyncFlags` 的 Acquire/Release 语义保证：
+//!   server 只写空闲 input buffer、只读已完成 output buffer；runner 不因其它
+//!   buffer 的 output 未消费而停住。
 //!
 //! # StepMeta
 //!
-//! 每次 forward 所需的 host 元信息（定长数组 + 标量）。runner 读一份就置
-//! `input_ready=false`，server 即可填下一步。device 上的 tensor（per-seq i32
+//! 每次 forward 所需的 host 元信息（定长数组 + 标量）。runner 读某个 buffer 的
+//! meta 后只释放该 buffer 的 `input_ready`。device 上的 tensor（per-seq i32
 //! 数组、输入 token、KV cache 指针表等）地址稳定，server 直接写入。
 
 use std::cell::UnsafeCell;
@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::base::DeviceType;
 use crate::base::error::{Error, Result};
 use crate::model::llm::{ForwardCtx, LlmModel};
-use crate::model::runtime::InferenceState;
+use crate::model::runtime::{InferenceState, PagedKvPool};
 use crate::worker::batch_workspace::BatchWorkspace;
 
 // ============================================================================
@@ -150,19 +150,19 @@ impl<'a> WorkerBatchMeta<'a> {
 //  SyncFlags —— server / runner 单生产者单消费者握手
 // ============================================================================
 
-/// 两个原子 bool 组成的信号位。
+/// 每个 step buffer 一组原子信号位。
 ///
 /// 约定：
-/// - `input_ready = true`：server 已经把所有输入（device tensor + host meta）
-///   写完，runner 可以启动本 step；
-/// - runner 消费完后置 `input_ready = false`；
-/// - forward 结束 runner 置 `output_ready = true`；
-/// - server 读完 output 后置 `output_ready = false`，开启下一轮。
+/// - `input_ready[bid] = true`：server 已经把该 buffer 的输入（device tensor + host meta）
+///   写完，runner 可以启动这个 step；
+/// - runner 消费该 buffer 后置 `input_ready[bid] = false`；
+/// - forward 结束 runner 置 `output_ready[bid] = true`，但不等待 server 消费；
+/// - server 读完该 buffer output 后置 `output_ready[bid] = false`，该 buffer 可重新填充。
 ///
-/// 握手保证 runner 读/写 runner 内可变资源时 server 不会并发读/写。
+/// 握手保证 runner/server 不会并发读写同一个 step buffer。
 pub struct SyncFlags {
-    pub input_ready: AtomicBool,
-    pub output_ready: AtomicBool,
+    pub input_ready: [AtomicBool; STEP_BUFFER_COUNT],
+    pub output_ready: [AtomicBool; STEP_BUFFER_COUNT],
     /// 可选的优雅退出信号。置 true 时 runner 的 `run()` 循环会在下一轮开始处返回。
     pub shutdown: AtomicBool,
 }
@@ -170,8 +170,8 @@ pub struct SyncFlags {
 impl SyncFlags {
     fn new() -> Self {
         Self {
-            input_ready: AtomicBool::new(false),
-            output_ready: AtomicBool::new(false),
+            input_ready: std::array::from_fn(|_| AtomicBool::new(false)),
+            output_ready: std::array::from_fn(|_| AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -211,8 +211,11 @@ pub struct ModelRunner<M: LlmModel> {
     states: UnsafeCell<Vec<InferenceState>>,
     /// Per-step-buffer sampling result tensors, `[max_batch_seqs] i32`, device.
     output_tokens_dev: UnsafeCell<Vec<crate::tensor::Tensor>>,
-    /// 当前 step 的 host meta。server 写、runner 读一次就释放 input slot。
-    meta_slot: UnsafeCell<StepMeta>,
+    /// 每个 step buffer 对应的 host meta。server 写、runner 读一次就释放该 buffer 的 input slot。
+    meta_slots: UnsafeCell<Vec<StepMeta>>,
+
+    /// Optional global Paged KV physical pool. Slot mode leaves this empty.
+    paged_kv_pool: UnsafeCell<Option<PagedKvPool>>,
 
     flags: SyncFlags,
 }
@@ -282,7 +285,8 @@ impl<M: LlmModel> ModelRunner<M> {
             workspaces: UnsafeCell::new(workspaces),
             states: UnsafeCell::new(states),
             output_tokens_dev: UnsafeCell::new(output_tokens_dev),
-            meta_slot: UnsafeCell::new(StepMeta::zeroed()),
+            meta_slots: UnsafeCell::new((0..STEP_BUFFER_COUNT).map(|_| StepMeta::zeroed()).collect()),
+            paged_kv_pool: UnsafeCell::new(None),
             flags: SyncFlags::new(),
         })
     }
@@ -383,22 +387,45 @@ impl<M: LlmModel> ModelRunner<M> {
         self.states.get()
     }
 
-    /// 写 host-side meta。必须在 `set_input_ready()` 之前调用。
+    /// 写 host-side meta。必须在对应 buffer 的 `set_input_ready_for()` 之前调用。
     ///
     /// # Safety
-    /// Server 只能在 `input_ready=false` 期间调用。
+    /// Server 只能在该 buffer 未被 runner 读取期间调用。
     pub unsafe fn write_meta(&self, meta: StepMeta) {
-        unsafe { *self.meta_slot.get() = meta; }
+        unsafe { self.write_meta_for(meta.step_buffer_id, meta); }
     }
 
-    /// 告诉 runner：输入已就绪，开始执行。
+    /// 写指定 buffer 的 host-side meta。
+    ///
+    /// # Safety
+    /// 调用方必须保证该 buffer 没有被 runner 读取，也没有未消费 output。
+    pub unsafe fn write_meta_for(&self, buffer_id: usize, mut meta: StepMeta) {
+        debug_assert!(buffer_id < STEP_BUFFER_COUNT);
+        meta.step_buffer_id = buffer_id;
+        let slots = unsafe { &mut *self.meta_slots.get() };
+        slots[buffer_id] = meta;
+    }
+
+    /// 告诉 runner：buffer 0 输入已就绪。兼容测试旧接口。
     pub fn set_input_ready(&self) {
-        self.flags.input_ready.store(true, Ordering::Release);
+        self.set_input_ready_for(0);
     }
 
-    /// 读当前 input_ready（调试/轮询用）。
+    /// 告诉 runner：指定 buffer 输入已就绪。
+    pub fn set_input_ready_for(&self, buffer_id: usize) {
+        debug_assert!(buffer_id < STEP_BUFFER_COUNT);
+        self.flags.input_ready[buffer_id].store(true, Ordering::Release);
+    }
+
+    /// 读 buffer 0 的 input_ready（调试/轮询用）。
     pub fn input_ready(&self) -> bool {
-        self.flags.input_ready.load(Ordering::Acquire)
+        self.input_ready_for(0)
+    }
+
+    /// 读指定 buffer 的 input_ready。
+    pub fn input_ready_for(&self, buffer_id: usize) -> bool {
+        debug_assert!(buffer_id < STEP_BUFFER_COUNT);
+        self.flags.input_ready[buffer_id].load(Ordering::Acquire)
     }
 
     // ─── Server 读取输出接口（output_ready=true 期间）───
@@ -421,14 +448,26 @@ impl<M: LlmModel> ModelRunner<M> {
         &outputs[buffer_id]
     }
 
-    /// 读当前 output_ready。
+    /// 读任意 buffer 是否有 output_ready。兼容测试旧接口。
     pub fn output_ready(&self) -> bool {
-        self.flags.output_ready.load(Ordering::Acquire)
+        (0..STEP_BUFFER_COUNT).any(|buffer_id| self.output_ready_for(buffer_id))
     }
 
-    /// 告诉 runner：server 已读完 output，可以开始下一轮了。
+    /// 读指定 buffer 的 output_ready。
+    pub fn output_ready_for(&self, buffer_id: usize) -> bool {
+        debug_assert!(buffer_id < STEP_BUFFER_COUNT);
+        self.flags.output_ready[buffer_id].load(Ordering::Acquire)
+    }
+
+    /// 告诉 runner：server 已读完 buffer 0 output。兼容测试旧接口。
     pub fn set_output_consumed(&self) {
-        self.flags.output_ready.store(false, Ordering::Release);
+        self.set_output_consumed_for(0);
+    }
+
+    /// 告诉 runner：server 已读完指定 buffer output，该 buffer 可以被 CPU 重新填充。
+    pub fn set_output_consumed_for(&self, buffer_id: usize) {
+        debug_assert!(buffer_id < STEP_BUFFER_COUNT);
+        self.flags.output_ready[buffer_id].store(false, Ordering::Release);
     }
 
     /// 请求 runner 在下一轮 loop 起点退出 `run()`。
@@ -443,6 +482,19 @@ impl<M: LlmModel> ModelRunner<M> {
 
     pub fn model(&self) -> &M { &self.model }
 
+    /// Initialize the global Paged KV physical pool. Must be called before the
+    /// runner thread starts using paged mode.
+    pub fn init_paged_kv_pool(&self, block_size: usize, num_blocks: usize) -> Result<()> {
+        let pool = PagedKvPool::new(self.model.config(), self.device, block_size, num_blocks)?;
+        unsafe { *self.paged_kv_pool.get() = Some(pool); }
+        Ok(())
+    }
+
+    pub fn paged_kv_pool_summary(&self) -> Option<(usize, usize, usize)> {
+        let pool = unsafe { &*self.paged_kv_pool.get() };
+        pool.as_ref().map(|p| (p.block_size(), p.num_blocks(), p.bytes_allocated()))
+    }
+
     // ─── Runner 主循环 ───
 
     /// 常驻 loop。调用线程会被阻塞在这里直到 `request_shutdown()`。
@@ -450,35 +502,43 @@ impl<M: LlmModel> ModelRunner<M> {
     /// 任一步错误直接 panic —— runner 线程退出即意味着 server 永远拿不到
     /// output_ready=true，进程必须同时终止。
     pub fn run(&self) {
+        let mut next_buffer_id = 0usize;
         loop {
-            // 1. 等输入 ready。spin 等待；热路径预期 server 几 µs 内 ready。
-            while !self.flags.input_ready.load(Ordering::Acquire) {
+            // 1. 等任意可运行 buffer。只要求该 buffer input_ready=true 且没有未消费 output；
+            //    runner 不再因为其它 buffer 的 output 未被 CPU 消费而阻塞。
+            let buffer_id = loop {
                 if self.flags.shutdown.load(Ordering::Acquire) {
                     return;
                 }
+                let mut found = None;
+                for offset in 0..STEP_BUFFER_COUNT {
+                    let id = (next_buffer_id + offset) % STEP_BUFFER_COUNT;
+                    if self.flags.input_ready[id].load(Ordering::Acquire)
+                        && !self.flags.output_ready[id].load(Ordering::Acquire)
+                    {
+                        found = Some(id);
+                        break;
+                    }
+                }
+                if let Some(id) = found {
+                    break id;
+                }
                 std::hint::spin_loop();
-            }
+            };
+            next_buffer_id = (buffer_id + 1) % STEP_BUFFER_COUNT;
 
-            // 2. 读 meta、释放输入 slot。
+            // 2. 读该 buffer 的 meta、释放该 input slot。
             //    meta 是 Copy-ish（定长 [i32; N] + 标量），clone 一份离线处理。
-            let meta: StepMeta = unsafe { (*self.meta_slot.get()).clone() };
-            self.flags.input_ready.store(false, Ordering::Release);
+            let meta: StepMeta = unsafe { (&*self.meta_slots.get())[buffer_id].clone() };
+            self.flags.input_ready[buffer_id].store(false, Ordering::Release);
 
             // 3. 执行 forward。错误 → panic。
             if let Err(e) = self.forward_one_step(&meta) {
                 panic!("ModelRunner::run forward error: {:?}", e);
             }
 
-            // 4. 通知 server。
-            self.flags.output_ready.store(true, Ordering::Release);
-
-            // 5. 等 server 消费 output。
-            while self.flags.output_ready.load(Ordering::Acquire) {
-                if self.flags.shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                std::hint::spin_loop();
-            }
+            // 4. 只标记该 buffer output 可读；不等待 CPU 消费，继续寻找其它 ready buffer。
+            self.flags.output_ready[buffer_id].store(true, Ordering::Release);
         }
     }
 
@@ -558,6 +618,7 @@ impl<M: LlmModel> ModelRunner<M> {
 
         // ── ForwardCtx ──
         let ws = unsafe { self.workspace_for(meta.step_buffer_id) };
+        let paged_pool_ref = unsafe { (&*self.paged_kv_pool.get()).as_ref() };
         let mut ctx = ForwardCtx::new(
             ws,
             &meta_view,
@@ -567,6 +628,7 @@ impl<M: LlmModel> ModelRunner<M> {
             self.model.config(),
             attn_plan,
             output_mut,
+            paged_pool_ref,
         )?;
 
         // ── Forward：decode-only 路径下走 CUDA Graph capture / replay ──
@@ -660,13 +722,29 @@ impl<M: LlmModel> ModelRunner<M> {
         {
             let ws = unsafe { self.workspace_for(meta.step_buffer_id) };
             let cfg = self.model.config();
-            let kind = if meta.is_decode_only() {
+            let paged_pool_ref = unsafe { (&*self.paged_kv_pool.get()).as_ref() };
+            let kind = if ws.paged_active {
+                if meta.is_decode_only() {
+                    AttentionKind::PagedDecode
+                } else {
+                    AttentionKind::PagedRagged
+                }
+            } else if meta.is_decode_only() {
                 AttentionKind::DecodeOnly
             } else {
                 AttentionKind::Ragged
             };
             let kv_stride_s = cfg.kv_dim as i64;
             let kv_stride_h = cfg.head_size as i64;
+            let (paged_k_pool_ptrs, paged_v_pool_ptrs, paged_block_size) = if let Some(pool) = paged_pool_ref {
+                (
+                    pool.layers().iter().map(|layer| layer.k.data_ptr() as usize).collect(),
+                    pool.layers().iter().map(|layer| layer.v.data_ptr() as usize).collect(),
+                    pool.block_size(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), 0usize)
+            };
 
             Ok(AttentionPlan {
                 kind,
@@ -677,11 +755,18 @@ impl<M: LlmModel> ModelRunner<M> {
                 req_to_slot_dev: ws.scatter_slot_indices_dev,
                 kv_lens_dev: ws.kv_lens_dev.as_i32()?.data_ptr(),
                 max_batch_seqs: ws.max_batch_seqs,
+                batch: meta.num_seqs(),
                 workspace: ws.flash_decode_workspace_dev,
                 cu_q_lens_dev: ws.ragged_cu_q_lens_dev,
                 block2req_dev: ws.ragged_block2req_dev,
                 block2tile_dev: ws.ragged_block2tile_dev,
                 total_q_tiles,
+                paged_block_tables_dev: ws.paged_block_tables_dev,
+                paged_block_counts_dev: ws.paged_block_counts_dev,
+                paged_max_blocks_per_seq: ws.paged_max_blocks_per_seq,
+                paged_k_pool_ptrs,
+                paged_v_pool_ptrs,
+                paged_block_size,
             })
         }
         #[cfg(not(feature = "cuda"))]

@@ -60,4 +60,55 @@ void scatter_kv_batch_f32(
     int          dst_row_stride_elems,
     cudaStream_t stream);
 
+void scatter_kv_paged_bf16(
+    const void*  k_src,
+    const void*  v_src,
+    void*        k_pool,
+    void*        v_pool,
+    const unsigned int* block_tables,
+    int          max_blocks_per_seq,
+    int          block_size,
+    const int*   seq_positions,
+    const int*   seq_starts,
+    const int*   seq_lens,
+    int          batch,
+    int          kv_dim,
+    int          k_src_row_stride_elems,
+    int          v_src_row_stride_elems,
+    cudaStream_t stream);
+
+void scatter_kv_paged_fp16(
+    const void*  k_src,
+    const void*  v_src,
+    void*        k_pool,
+    void*        v_pool,
+    const unsigned int* block_tables,
+    int          max_blocks_per_seq,
+    int          block_size,
+    const int*   seq_positions,
+    const int*   seq_starts,
+    const int*   seq_lens,
+    int          batch,
+    int          kv_dim,
+    int          k_src_row_stride_elems,
+    int          v_src_row_stride_elems,
+    cudaStream_t stream);
+
+void scatter_kv_paged_f32(
+    const void*  k_src,
+    const void*  v_src,
+    void*        k_pool,
+    void*        v_pool,
+    const unsigned int* block_tables,
+    int          max_blocks_per_seq,
+    int          block_size,
+    const int*   seq_positions,
+    const int*   seq_starts,
+    const int*   seq_lens,
+    int          batch,
+    int          kv_dim,
+    int          k_src_row_stride_elems,
+    int          v_src_row_stride_elems,
+    cudaStream_t stream);
+
 } // extern "C"

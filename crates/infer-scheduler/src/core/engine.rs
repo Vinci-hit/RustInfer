@@ -308,8 +308,8 @@ where
                 };
 
                 let prompt_len = seq.meta.input_ids.len();
-                let kv_alloc = match self.kv_manager.allocate(prompt_len) {
-                    Ok(alloc) => alloc,
+                let (kv_alloc, prefix_match) = match self.kv_manager.allocate_with_prefix(prompt_len, &seq.meta.input_ids) {
+                    Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("KV allocation failed for {}: {}", entry.request_id, e);
                         self.waiting_queue.push_front(seq);
@@ -320,9 +320,12 @@ where
                 self.active_requests
                     .mark_prefilling(&entry.request_id, kv_alloc.clone());
                 let mut prefilling_seq = seq.start_prefill(kv_alloc);
-                let start = 0;
-                let end = entry.token_range.len().min(prefilling_seq.state.prompt_len);
-                if end == 0 {
+                prefilling_seq.state.num_computed_tokens = prefix_match.num_cached_tokens.min(prefilling_seq.state.prompt_len);
+                let start = prefilling_seq.state.num_computed_tokens;
+                let scheduled_len = entry.token_range.len();
+                let end = (start + scheduled_len).min(prefilling_seq.state.prompt_len);
+                if end == 0 || start >= end {
+                    self.prefilling.push(prefilling_seq);
                     continue;
                 }
                 prefilling_seq.set_inflight(start, end);
@@ -351,6 +354,7 @@ where
     /// LLM mode: process prefill segment ACKs and generated tokens from Worker.
     async fn handle_step_output_llm(&mut self, data: Vec<u8>) -> Result<()> {
         use crate::transport::codec::Codec;
+        use infer_protocol::scheduler_to_worker::{BlockGrantCmd, WorkerCommand};
         let output: StepOutput = self.codec.decode(&data)?;
 
         // 1. ACK prefill segments. Final segment moves the sequence to decoding before
@@ -372,6 +376,34 @@ where
                 self.decoding.push(seq.start_decode());
             } else {
                 self.prefilling.push(seq);
+            }
+        }
+
+        for need in &output.need_blocks {
+            let Some(seq_idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == need.sequence_id) else {
+                tracing::debug!("NeedBlocks for non-decoding sequence_id={}", need.sequence_id);
+                continue;
+            };
+            match self.kv_manager.allocate_decode_blocks(need.request_blocks as usize) {
+                Ok(blocks) => {
+                    if let crate::cache::kv_manager::KvAllocation::Blocks(existing) = &mut self.decoding[seq_idx].state.kv_alloc {
+                        existing.extend(blocks.iter().copied());
+                    }
+                    let cmd = WorkerCommand::GrantBlocks(BlockGrantCmd {
+                        sequence_id: need.sequence_id,
+                        block_ids: blocks.iter().map(|b| b.0).collect(),
+                    });
+                    let bytes = self.codec.encode(&cmd)?;
+                    self.worker.send_batch(bytes).await?;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "NeedBlocks denied: sequence_id={} request_blocks={} error={}",
+                        need.sequence_id,
+                        need.request_blocks,
+                        e,
+                    );
+                }
             }
         }
 
@@ -490,14 +522,15 @@ where
             FinishReason::Eos
         };
 
-        // Extract KV allocation to free BEFORE consuming the sequence.
+        // Extract KV allocation and prompt tokens BEFORE consuming the sequence.
         let kv_alloc = seq.state.kv_alloc.clone();
+        let prompt_tokens = seq.meta.input_ids.clone();
 
         // Transition: Decoding → Finished.
         let finished = seq.finish(reason);
 
-        // Free KV resources.
-        self.kv_manager.free(kv_alloc);
+        // Free KV resources, or keep full prompt blocks in prefix cache for paged mode.
+        self.kv_manager.free_finished(&prompt_tokens, kv_alloc);
 
         // Build response.
         let elapsed_ms = finished.state.metrics.e2e_latency.as_millis() as u64;
@@ -641,5 +674,167 @@ where
             let result = self.frontend.recv_request().await;
             EngineEvent::NewRequest(Box::new(result))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use infer_protocol::scheduler_to_worker::WorkerCommand;
+    use infer_protocol::worker_to_scheduler::{GeneratedToken, NeedBlocksRequest, StepOutput};
+
+    use crate::cache::kv_manager::KvAllocation;
+    use crate::cache::paged_kv_manager::PagedKvManager;
+    use crate::cache::traits::PhysicalBlockId;
+    use crate::config::{KvCacheMode, SchedulerConfig};
+    use crate::policy::ContinuousBatchingPolicy;
+    use crate::request::handle::{ClientId, RequestHandle};
+    use crate::request::lifecycle::{InFlightPrefillSegment, Prefilling, Priority, RequestId, RequestMeta, SamplingParams, Sequence, SequenceId};
+    use crate::transport::codec::{Codec, MsgPackCodec};
+    use crate::transport::traits::{FrontendTransport, WorkerTransport};
+    use crate::worker_group::WorkerGroup;
+    use infer_protocol::server_to_scheduler::InferenceRequest;
+    use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+    use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerReady};
+
+    #[derive(Default)]
+    struct MockFrontend;
+
+    #[async_trait]
+    impl FrontendTransport for MockFrontend {
+        async fn recv_request(&mut self) -> Result<(ClientId, InferenceRequest)> {
+            Err(crate::error::SchedulerError::Shutdown)
+        }
+
+        async fn send_response(&mut self, _client: &ClientId, _response: InferenceResponse) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send_stream_chunk(&mut self, _client: &ClientId, _chunk: StreamChunk) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MockWorker {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl WorkerTransport for MockWorker {
+        async fn send_batch(&mut self, cmd: Vec<u8>) -> Result<()> {
+            self.sent.lock().unwrap().push(cmd);
+            Ok(())
+        }
+
+        async fn recv_step_output(&mut self) -> Result<Vec<u8>> {
+            Err(crate::error::SchedulerError::Shutdown)
+        }
+    }
+
+    fn worker_group() -> WorkerGroup {
+        WorkerGroup::from_single_ready(WorkerReady {
+            worker_id: "worker-test".to_string(),
+            model_instance_id: "default".to_string(),
+            model_path: "model".to_string(),
+            model_type: "llama3".to_string(),
+            device: "cuda:0".to_string(),
+            capacity: WorkerCapacity {
+                max_batch_tokens: 256,
+                max_batch_seqs: 4,
+                max_running_requests: 4,
+                max_total_kv_tokens: Some(32),
+                free_mem_before_load_gb: None,
+                free_mem_after_load_gb: None,
+                weight_mem_usage_gb: None,
+                workspace_mem_usage_gb: None,
+                graph_mem_usage_gb: None,
+            },
+        })
+    }
+
+    fn prefilling_sequence() -> Sequence<Prefilling> {
+        let meta = Arc::new(RequestMeta {
+            id: RequestId("req-need-blocks".to_string()),
+            sequence_id: SequenceId(7),
+            input_ids: vec![1, 2, 3, 4],
+            max_tokens: 8,
+            sampling: SamplingParams::default(),
+            priority: Priority::default(),
+            stream: false,
+            stop_sequences: vec![],
+            diffusion: None,
+            arrival_time: Instant::now(),
+        });
+        Sequence {
+            meta,
+            handle: RequestHandle::noop(),
+            state: Prefilling {
+                kv_alloc: KvAllocation::Blocks(vec![PhysicalBlockId(0)]),
+                num_computed_tokens: 0,
+                inflight: Some(InFlightPrefillSegment {
+                    segment_start: 0,
+                    segment_end: 4,
+                    is_final: true,
+                }),
+                prompt_len: 4,
+                prefill_start: Instant::now(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn step_output_final_prefill_need_blocks_grants_after_decode_transition() -> Result<()> {
+        let config = SchedulerConfig {
+            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            num_gpu_blocks: 4,
+            ..Default::default()
+        };
+        let worker = MockWorker::default();
+        let sent = Arc::clone(&worker.sent);
+        let mut engine = SchedulerEngine::new(
+            config,
+            Box::new(ContinuousBatchingPolicy::new(None)),
+            Box::new(PagedKvManager::new(4, 4)),
+            worker_group(),
+            MockFrontend,
+            worker,
+        );
+        engine.prefilling.push(prefilling_sequence());
+
+        let codec = MsgPackCodec;
+        let output = StepOutput {
+            prefill_done: vec![7],
+            tokens: vec![GeneratedToken { sequence_id: 7, token_id: 42, finished: false }],
+            need_blocks: vec![NeedBlocksRequest {
+                sequence_id: 7,
+                current_blocks: 1,
+                required_blocks: 2,
+                request_blocks: 1,
+            }],
+        };
+        engine.handle_step_output_llm(codec.encode(&output)?).await?;
+
+        assert!(engine.prefilling.is_empty());
+        assert_eq!(engine.decoding.len(), 1);
+        assert_eq!(engine.decoding[0].state.output_tokens, vec![42]);
+        let KvAllocation::Blocks(blocks) = &engine.decoding[0].state.kv_alloc else {
+            panic!("expected paged blocks allocation");
+        };
+        assert_eq!(blocks.len(), 2);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let cmd: WorkerCommand = codec.decode(&sent[0])?;
+        let WorkerCommand::GrantBlocks(grant) = cmd else {
+            panic!("expected GrantBlocks command");
+        };
+        assert_eq!(grant.sequence_id, 7);
+        assert_eq!(grant.block_ids.len(), 1);
+        Ok(())
     }
 }

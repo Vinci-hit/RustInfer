@@ -19,6 +19,16 @@ pub struct DrainAck {
 pub struct StepOutput {
     pub prefill_done: Vec<u64>,
     pub tokens: Vec<GeneratedToken>,
+    #[serde(default)]
+    pub need_blocks: Vec<NeedBlocksRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeedBlocksRequest {
+    pub sequence_id: u64,
+    pub current_blocks: u32,
+    pub required_blocks: u32,
+    pub request_blocks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -146,6 +146,48 @@ impl FlashAttnRagged {
             )
         }
     }
+
+    /// Paged ragged/prefill attention forward.
+    ///
+    /// # Safety
+    /// Raw pool pointers and block table pointers must be valid device pointers.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_paged(
+        &self,
+        q: &Tensor,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        block_tables_dev: *const u32,
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        kv_lens_dev: *const i32,
+        cu_q_lens_dev: *const i32,
+        batch: usize,
+        o: &mut Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
+        let total_q_tokens = q.shape()[0];
+        unsafe {
+            kernels::cuda::flash_attn_paged_ragged(
+                q,
+                k_pool,
+                v_pool,
+                o,
+                block_tables_dev,
+                max_blocks_per_seq,
+                block_size,
+                kv_lens_dev,
+                cu_q_lens_dev,
+                batch,
+                total_q_tokens,
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.causal,
+                cuda_config,
+            )
+        }
+    }
 }
 
 // ============================================================================

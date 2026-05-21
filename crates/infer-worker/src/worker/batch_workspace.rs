@@ -117,6 +117,25 @@ pub struct BatchWorkspace {
     #[cfg(feature = "cuda")]
     scatter_seq_lens_host: Vec<i32>,
 
+    // ═══ Paged KV block tables（device 常驻，step 入口 refresh）═══
+    /// [max_batch_seqs, paged_max_blocks_per_seq] u32 physical block ids.
+    #[cfg(feature = "cuda")]
+    pub paged_block_tables_dev: *mut u32,
+    /// [max_batch_seqs] i32, each seq's block count.
+    #[cfg(feature = "cuda")]
+    pub paged_block_counts_dev: *mut i32,
+    #[cfg(feature = "cuda")]
+    paged_block_tables_host: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    paged_block_counts_host: Vec<i32>,
+    /// Conservative upper bound. Uses max_seq_len so the address is stable before
+    /// the runtime block_size is known; actual kernels use the populated count.
+    #[cfg(feature = "cuda")]
+    pub paged_max_blocks_per_seq: usize,
+    /// Whether current step has at least one paged sequence.
+    #[cfg(feature = "cuda")]
+    pub(crate) paged_active: bool,
+
     // ═══ Flash-Decoding split-K workspace ═══
     //
     // Flash-Decoding decode-path 用 split-K 策略并行扫 KV（每 seq × 每 head 分
@@ -225,6 +244,27 @@ impl BatchWorkspace {
                     crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut p3, bytes))?;
                 }
                 (p0 as *mut i32, p1 as *mut i32, p2 as *mut i32, p3 as *mut i32)
+            }
+        };
+
+        // Paged KV block table workspace. Allocate conservatively by max_seq_len
+        // because block_size is a runtime Scheduler choice.
+        #[cfg(feature = "cuda")]
+        let (paged_block_tables_dev, paged_block_counts_dev, paged_max_blocks_per_seq) = match device {
+            DeviceType::Cpu => (std::ptr::null_mut::<u32>(), std::ptr::null_mut::<i32>(), 0usize),
+            DeviceType::Cuda(_) => {
+                let max_blocks = max_seq_len.max(1);
+                let table_bytes = max_batch_seqs * max_blocks * std::mem::size_of::<u32>();
+                let count_bytes = max_batch_seqs * std::mem::size_of::<i32>();
+                let mut table_p: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut count_p: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut table_p, table_bytes))?;
+                    crate::cuda_check!(crate::cuda::ffi::cudaMalloc(&mut count_p, count_bytes))?;
+                    crate::cuda_check!(crate::cuda::ffi::cudaMemset(table_p, 0, table_bytes))?;
+                    crate::cuda_check!(crate::cuda::ffi::cudaMemset(count_p, 0, count_bytes))?;
+                }
+                (table_p as *mut u32, count_p as *mut i32, max_blocks)
             }
         };
 
@@ -349,6 +389,19 @@ impl BatchWorkspace {
             scatter_seq_lens_host: vec![0i32; max_batch_seqs],
 
             #[cfg(feature = "cuda")]
+            paged_block_tables_dev,
+            #[cfg(feature = "cuda")]
+            paged_block_counts_dev,
+            #[cfg(feature = "cuda")]
+            paged_block_tables_host: vec![0u32; max_batch_seqs * paged_max_blocks_per_seq],
+            #[cfg(feature = "cuda")]
+            paged_block_counts_host: vec![0i32; max_batch_seqs],
+            #[cfg(feature = "cuda")]
+            paged_max_blocks_per_seq,
+            #[cfg(feature = "cuda")]
+            paged_active: false,
+
+            #[cfg(feature = "cuda")]
             flash_decode_workspace_dev,
 
             #[cfg(feature = "cuda")]
@@ -440,6 +493,58 @@ impl BatchWorkspace {
                 self.scatter_seq_lens_dev as *mut _,
                 self.scatter_seq_lens_host.as_ptr() as *const _,
                 bytes,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Refresh paged KV block tables for the current step. `tables[i] == None`
+    /// means sequence i is not paged; its block count is set to 0.
+    #[cfg(feature = "cuda")]
+    pub fn refresh_paged_block_tables(
+        &mut self,
+        tables: &[Option<&[u32]>],
+        stream: crate::cuda::ffi::cudaStream_t,
+    ) -> crate::base::error::Result<()> {
+        if tables.len() > self.max_batch_seqs {
+            return Err(crate::base::error::Error::InvalidArgument(format!(
+                "refresh_paged_block_tables: batch {} > max_batch_seqs {}",
+                tables.len(), self.max_batch_seqs
+            )).into());
+        }
+        self.paged_block_counts_host.fill(0);
+        self.paged_block_tables_host.fill(0);
+        self.paged_active = false;
+        for (seq_idx, maybe_table) in tables.iter().enumerate() {
+            let Some(table) = maybe_table else { continue; };
+            if table.len() > self.paged_max_blocks_per_seq {
+                return Err(crate::base::error::Error::InvalidArgument(format!(
+                    "refresh_paged_block_tables: seq {} blocks {} > max {}",
+                    seq_idx, table.len(), self.paged_max_blocks_per_seq
+                )).into());
+            }
+            self.paged_active = true;
+            self.paged_block_counts_host[seq_idx] = table.len() as i32;
+            let start = seq_idx * self.paged_max_blocks_per_seq;
+            self.paged_block_tables_host[start..start + table.len()].copy_from_slice(table);
+        }
+        let table_bytes = self.max_batch_seqs * self.paged_max_blocks_per_seq * std::mem::size_of::<u32>();
+        let count_bytes = self.max_batch_seqs * std::mem::size_of::<i32>();
+        unsafe {
+            use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
+            crate::cuda_check!(cudaMemcpyAsync(
+                self.paged_block_tables_dev as *mut _,
+                self.paged_block_tables_host.as_ptr() as *const _,
+                table_bytes,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
+            ))?;
+            crate::cuda_check!(cudaMemcpyAsync(
+                self.paged_block_counts_dev as *mut _,
+                self.paged_block_counts_host.as_ptr() as *const _,
+                count_bytes,
                 cudaMemcpyKind::cudaMemcpyHostToDevice,
                 stream,
             ))?;
@@ -581,6 +686,8 @@ impl Drop for BatchWorkspace {
                 self.scatter_seq_positions_dev as *mut std::ffi::c_void,
                 self.scatter_seq_starts_dev as *mut std::ffi::c_void,
                 self.scatter_seq_lens_dev as *mut std::ffi::c_void,
+                self.paged_block_tables_dev as *mut std::ffi::c_void,
+                self.paged_block_counts_dev as *mut std::ffi::c_void,
                 self.flash_decode_workspace_dev as *mut std::ffi::c_void,
                 self.ragged_cu_q_lens_dev as *mut std::ffi::c_void,
                 self.ragged_block2req_dev as *mut std::ffi::c_void,

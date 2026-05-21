@@ -20,3 +20,13 @@ pub fn set_current_device(device_id: i32) -> Result<()> {
     // 我们返回 Ok(()) 表示成功且没有返回值。
     Ok(())
 }
+
+#[cfg(feature = "cuda")]
+pub fn mem_get_info() -> Result<(usize, usize)> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    unsafe {
+        crate::cuda_check!(ffi::cudaMemGetInfo(&mut free, &mut total))?;
+    }
+    Ok((free, total))
+}

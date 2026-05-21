@@ -77,6 +77,10 @@ struct Args {
     #[arg(long)]
     chunked_prefill_size: Option<usize>,
 
+    /// Enable RadixTree prefix caching. Only meaningful in paged KV mode.
+    #[arg(long, default_value_t = false)]
+    enable_prefix_caching: bool,
+
     /// Log level.
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -126,37 +130,21 @@ async fn main() -> Result<()> {
     tracing::info!("  max_model_len: {}", args.max_model_len);
     tracing::info!("  kv_cache_mode: {:?}", kv_mode);
     tracing::info!("  chunked_prefill_size: {:?}", args.chunked_prefill_size);
+    tracing::info!("  enable_prefix_caching: {}", args.enable_prefix_caching);
 
     // Build config.
-    let config = SchedulerConfig {
+    let mut config = SchedulerConfig {
         mode: scheduler_mode,
         max_num_seqs: args.max_batch_seqs,
         max_batch_tokens: args.max_batch_tokens,
         max_model_len: args.max_model_len,
         kv_cache_mode: kv_mode,
         chunked_prefill_size: args.chunked_prefill_size,
+        enable_prefix_caching: args.enable_prefix_caching,
         frontend_endpoint: args.frontend_endpoint.clone(),
         worker_push_endpoint: args.worker_push_endpoint.clone(),
         worker_pull_endpoint: args.worker_pull_endpoint.clone(),
         ..Default::default()
-    };
-
-    // Create KV manager and policy based on mode.
-    let kv_manager: Box<dyn KvManager> = match scheduler_mode {
-        SchedulerMode::Diffusion => Box::new(NoopKvManager::new()),
-        SchedulerMode::Llm => match kv_mode {
-            KvCacheMode::Slot => {
-                Box::new(SlotKvManager::new(args.max_batch_seqs, args.max_model_len))
-            }
-            KvCacheMode::Paged { block_size } => {
-                Box::new(PagedKvManager::new(config.num_gpu_blocks, block_size))
-            }
-        },
-    };
-
-    let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
-        SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(args.max_batch_seqs)),
-        SchedulerMode::Llm => Box::new(ContinuousBatchingPolicy::new(config.chunked_prefill_size)),
     };
 
     // Create transports.
@@ -176,6 +164,8 @@ async fn main() -> Result<()> {
         tp_size: 1,
         pp_rank: 0,
         pp_size: 1,
+        kv_cache_mode: Some(args.kv_cache_mode.clone()),
+        kv_cache_memory_fraction: Some(args.mem_fraction_static),
     });
 
     // Phase 2 control-plane gate: optionally assign model, then wait for WorkerReady.
@@ -199,6 +189,39 @@ async fn main() -> Result<()> {
         worker_group.effective_capacity.max_batch_tokens,
         worker_group.effective_capacity.max_batch_seqs,
     );
+
+    if let KvCacheMode::Paged { block_size } = kv_mode
+        && let Some(max_total_kv_tokens) = worker_group.effective_capacity.max_total_kv_tokens {
+            config.num_gpu_blocks = max_total_kv_tokens / block_size;
+            tracing::info!(
+                "Paged KV capacity from worker profile: num_gpu_blocks={} block_size={} max_total_kv_tokens={}",
+                config.num_gpu_blocks,
+                block_size,
+                max_total_kv_tokens,
+            );
+        }
+
+    // Create KV manager and policy based on the effective worker capacity.
+    let kv_manager: Box<dyn KvManager> = match scheduler_mode {
+        SchedulerMode::Diffusion => Box::new(NoopKvManager::new()),
+        SchedulerMode::Llm => match kv_mode {
+            KvCacheMode::Slot => {
+                Box::new(SlotKvManager::new(args.max_batch_seqs, args.max_model_len))
+            }
+            KvCacheMode::Paged { block_size } => {
+                Box::new(PagedKvManager::new_with_prefix_cache(
+                    config.num_gpu_blocks,
+                    block_size,
+                    config.enable_prefix_caching,
+                ))
+            }
+        },
+    };
+
+    let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
+        SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(args.max_batch_seqs)),
+        SchedulerMode::Llm => Box::new(ContinuousBatchingPolicy::new(config.chunked_prefill_size)),
+    };
 
     // Build and run engine.
     let engine = SchedulerEngine::new(config, policy, kv_manager, worker_group, frontend, worker);

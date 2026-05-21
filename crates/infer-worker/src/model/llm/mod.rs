@@ -12,7 +12,7 @@ use crate::base::DeviceType;
 use crate::base::error::Result;
 use crate::model::common::config::RuntimeModelConfig;
 use crate::model::common::tokenizer::Tokenizer;
-use crate::model::runtime::InferenceState;
+use crate::model::runtime::{InferenceState, PagedKvPool};
 use crate::tensor::Tensor;
 use crate::worker::batch_workspace::BatchWorkspace;
 use crate::worker::runner::WorkerBatchMeta;
@@ -167,6 +167,8 @@ pub struct ForwardCtx<'a, 's> {
     /// scratch 的 op**（目前是 `op::kv_cache::scatter`）访问其指针表字段。
     /// 模型层不直接读写它，只作为 op 的载体。
     pub workspace: &'a BatchWorkspace,
+    /// Optional global paged KV pool. Slot mode leaves it empty.
+    pub paged_kv_pool: Option<&'a PagedKvPool>,
 }
 
 impl<'a, 's> ForwardCtx<'a, 's> {
@@ -184,6 +186,7 @@ impl<'a, 's> ForwardCtx<'a, 's> {
         _config: &RuntimeModelConfig,
         attn_plan: crate::op::attention::AttentionPlan,
         output_tokens: &'a mut Tensor,
+        paged_kv_pool: Option<&'a PagedKvPool>,
     ) -> Result<Self> {
         let num_seqs = meta.num_seqs();
         let total_tokens = meta.seq_end(num_seqs - 1);
@@ -231,6 +234,7 @@ impl<'a, 's> ForwardCtx<'a, 's> {
             cos_cache: workspace.cos_cache.clone(),
             output_tokens,
             workspace,
+            paged_kv_pool,
         })
     }
 }

@@ -1,7 +1,7 @@
 //! Worker control plane over ZMQ ROUTER + MessagePack.
 
 use infer_protocol::scheduler_to_worker_control::{
-    LoadModel, SchedulerControlMessage, SchedulerHello,
+    InitPagedKv, LoadModel, SchedulerControlMessage, SchedulerHello,
 };
 use infer_protocol::worker_to_scheduler_control::{
     WorkerControlMessage, WorkerReady, WORKER_CONTROL_PROTOCOL_VERSION,
@@ -78,6 +78,66 @@ pub fn wait_for_worker_ready(endpoint: &str, load_model: Option<LoadModel>) -> R
                     heartbeat.active_requests,
                 );
             }
+            WorkerControlMessage::MemoryProfile(profile) => {
+                tracing::info!(
+                    "WorkerMemoryProfile: id={} device={} free_after_dummy={} suggested_kv_budget={}",
+                    profile.worker_id,
+                    profile.device,
+                    profile.free_mem_after_dummy_bytes,
+                    profile.suggested_kv_budget_bytes,
+                );
+                if let Some(cmd) = &load_model
+                    && let Some(block_size) = paged_block_size(cmd) {
+                        let bytes_per_block = profile.layer_num as u64
+                            * 2
+                            * block_size as u64
+                            * profile.kv_head_num as u64
+                            * profile.head_size as u64
+                            * profile.dtype_size as u64;
+                        if bytes_per_block == 0 {
+                            return Err(SchedulerError::WorkerError(
+                                "invalid worker memory profile: bytes_per_block=0".into(),
+                            ));
+                        }
+                        let num_blocks = (profile.suggested_kv_budget_bytes / bytes_per_block) as u32;
+                        if num_blocks == 0 {
+                            return Err(SchedulerError::WorkerError(format!(
+                                "insufficient KV budget: budget={} bytes_per_block={}",
+                                profile.suggested_kv_budget_bytes, bytes_per_block,
+                            )));
+                        }
+                        let max_blocks_per_seq = (cmd.max_model_len as u32).div_ceil(block_size).max(1);
+                        send_init_paged_kv(&socket, identity, InitPagedKv {
+                            model_instance_id: cmd.model_instance_id.clone(),
+                            block_size,
+                            initial_num_blocks: num_blocks,
+                            max_num_blocks: num_blocks,
+                            max_blocks_per_seq,
+                            decode_block_request_blocks: 1,
+                            decode_block_prefetch_margin: 4,
+                        })?;
+                    }
+            }
+            WorkerControlMessage::PagedKvReady(ready) => {
+                tracing::info!(
+                    "PagedKvReady: id={} blocks={}/{} block_size={} bytes={}",
+                    ready.worker_id,
+                    ready.initial_num_blocks,
+                    ready.max_num_blocks,
+                    ready.block_size,
+                    ready.bytes_allocated,
+                );
+            }
+            WorkerControlMessage::NeedBlocks(need) => {
+                tracing::debug!(
+                    "NeedBlocks before ready gate: id={} seq={} current={} required={} request={}",
+                    need.worker_id,
+                    need.sequence_id,
+                    need.current_blocks,
+                    need.required_blocks,
+                    need.request_blocks,
+                );
+            }
             WorkerControlMessage::Error(err) => {
                 return Err(SchedulerError::WorkerError(format!(
                     "worker {} failed in {:?}: {}",
@@ -104,6 +164,22 @@ fn send_load_model(socket: &zmq::Socket, identity: &[u8], cmd: &LoadModel) -> Re
         cmd.model_path,
     );
     send_scheduler_msg(socket, identity, &SchedulerControlMessage::LoadModel(cmd.clone()))
+}
+
+fn send_init_paged_kv(socket: &zmq::Socket, identity: &[u8], init: InitPagedKv) -> Result<()> {
+    tracing::info!(
+        "Sending InitPagedKv: model_instance_id={} block_size={} blocks={}",
+        init.model_instance_id,
+        init.block_size,
+        init.initial_num_blocks,
+    );
+    send_scheduler_msg(socket, identity, &SchedulerControlMessage::InitPagedKv(init))
+}
+
+fn paged_block_size(cmd: &LoadModel) -> Option<u32> {
+    let mode = cmd.kv_cache_mode.as_deref()?;
+    let rest = mode.strip_prefix("paged:")?;
+    rest.parse::<u32>().ok().filter(|&v| v > 0)
 }
 
 fn send_scheduler_msg(

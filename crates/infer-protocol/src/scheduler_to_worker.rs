@@ -7,9 +7,16 @@ use crate::common::{ProtocolError, ProtocolResult};
 pub enum WorkerCommand {
     Prefill(PrefillBatchCmd),
     DiffusionBatch(DiffusionBatchCmd),
+    GrantBlocks(BlockGrantCmd),
     Cancel(CancelRequest),
     Drain(DrainWorker),
     UnloadModel(UnloadModel),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockGrantCmd {
+    pub sequence_id: u64,
+    pub block_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,15 +53,36 @@ pub struct PrefillBatchCmd {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum KvPlacement {
+    Slot {
+        kv_slot: u32,
+    },
+    Paged {
+        block_table: Vec<u32>,
+        block_size: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefillSegmentMeta {
     pub sequence_id: u64,
+    /// 兼容旧 Slot 模式字段；Paged 模式使用 `kv`。
     pub kv_slot: u32,
+    /// 新 KV placement 描述。None 时等价于 `Slot { kv_slot }`。
+    #[serde(default)]
+    pub kv: Option<KvPlacement>,
     pub prompt_len: u32,
     pub segment_start: u32,
     pub segment_end: u32,
     pub max_tokens: usize,
     pub sampling_params: SamplingParams,
     pub completion: PrefillSegmentCompletion,
+}
+
+impl PrefillSegmentMeta {
+    pub fn kv_placement(&self) -> KvPlacement {
+        self.kv.clone().unwrap_or(KvPlacement::Slot { kv_slot: self.kv_slot })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

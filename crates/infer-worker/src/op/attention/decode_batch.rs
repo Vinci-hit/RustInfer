@@ -116,6 +116,56 @@ impl FlashAttnDecodeBatch {
             )
         }
     }
+
+    /// Paged decode forward. Correctness-first implementation; optimized split-K
+    /// paged decode can replace the CUDA kernel behind this wrapper later.
+    ///
+    /// # Safety
+    /// Raw pool pointers and block table pointers must be valid device pointers.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_paged(
+        &self,
+        q: &Tensor,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        block_tables_dev: *const u32,
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        kv_lens_dev: *const i32,
+        o: &mut Tensor,
+        cuda_config: Option<&OpConfig>,
+    ) -> Result<()> {
+        if q.shape().len() != 3 || o.shape().len() != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "FlashAttnDecodeBatch::forward_paged expects q/o [batch, num_q_heads, head_dim] \
+                 (got q={:?}, o={:?})", q.shape(), o.shape()
+            )).into());
+        }
+        let batch = q.shape()[0];
+        if q.shape()[1] != self.num_q_heads || q.shape()[2] != self.head_dim {
+            return Err(Error::InvalidArgument(format!(
+                "q shape {:?} incompatible with paged operator [_, {}, {}]",
+                q.shape(), self.num_q_heads, self.head_dim,
+            )).into());
+        }
+        unsafe {
+            kernels::cuda::flash_attn_paged_decode(
+                q,
+                k_pool,
+                v_pool,
+                o,
+                block_tables_dev,
+                max_blocks_per_seq,
+                block_size,
+                kv_lens_dev,
+                batch,
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                cuda_config,
+            )
+        }
+    }
 }
 
 // ============================================================================

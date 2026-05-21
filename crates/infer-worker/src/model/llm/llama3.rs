@@ -95,7 +95,7 @@ impl Attention {
 
         // ── scatter K/V → per-seq KV cache ──（op 层负责循环 / kernel 化）
         crate::op::kv_cache::scatter(
-            &k, &v, layer_idx, ctx.states, ctx.meta, ctx.workspace, cuda_cfg,
+            &k, &v, layer_idx, ctx.states, ctx.meta, ctx.workspace, ctx.paged_kv_pool, cuda_cfg,
         )?;
 
         // ── flash attention (one launch for the whole batch) ──

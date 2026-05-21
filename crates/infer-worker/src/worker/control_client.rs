@@ -67,6 +67,14 @@ impl WorkerControlClient {
         }))
     }
 
+    pub fn send_memory_profile(&self, profile: WorkerMemoryProfile) -> Result<()> {
+        self.send(WorkerControlMessage::MemoryProfile(profile))
+    }
+
+    pub fn send_paged_kv_ready(&self, ready: PagedKvReady) -> Result<()> {
+        self.send(WorkerControlMessage::PagedKvReady(ready))
+    }
+
     pub fn recv_scheduler_message(&self) -> Result<SchedulerControlMessage> {
         let data = self.socket.recv_bytes(0)?;
         Ok(rmp_serde::from_slice(&data)?)

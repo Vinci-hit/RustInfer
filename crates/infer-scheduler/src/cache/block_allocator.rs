@@ -49,6 +49,51 @@ impl PagedBlockAllocator {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    /// Retain cached blocks for a new active sequence. If a block was sitting in
+    /// the free list because it was previously released as cache, remove it from
+    /// the free list before increasing its refcount.
+    pub fn retain_blocks(&mut self, blocks: &[PhysicalBlockId]) {
+        for &block_id in blocks {
+            let idx = block_id.0 as usize;
+            if idx >= self.num_blocks {
+                continue;
+            }
+            if self.ref_counts[idx] == 0 {
+                self.free_list.retain(|&b| b != block_id);
+                self.eviction_order.retain(|&b| b != block_id);
+            }
+            self.ref_counts[idx] = self.ref_counts[idx].saturating_add(1);
+        }
+    }
+
+    /// Release blocks to prefix cache instead of immediately making them
+    /// allocatable. Blocks whose refcount reaches zero must be evicted by the
+    /// prefix cache LRU before returning to the free list.
+    pub fn release_to_cache(&mut self, blocks: &[PhysicalBlockId]) {
+        for &block_id in blocks {
+            let idx = block_id.0 as usize;
+            if idx >= self.num_blocks {
+                continue;
+            }
+            if self.ref_counts[idx] > 0 {
+                self.ref_counts[idx] -= 1;
+            }
+            if self.ref_counts[idx] == 0 {
+                self.free_list.retain(|&b| b != block_id);
+            }
+        }
+    }
+
+    /// Return LRU-evicted cached blocks to the free list.
+    pub fn free_cached_blocks(&mut self, blocks: &[PhysicalBlockId]) {
+        for &block_id in blocks {
+            let idx = block_id.0 as usize;
+            if idx < self.num_blocks && self.ref_counts[idx] == 0 && !self.free_list.contains(&block_id) {
+                self.free_list.push(block_id);
+            }
+        }
+    }
 }
 
 impl BlockAllocator for PagedBlockAllocator {

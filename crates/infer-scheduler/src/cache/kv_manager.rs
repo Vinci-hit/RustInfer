@@ -3,7 +3,7 @@
 //! Abstracts over Slot (non-paged) and Paged modes so the scheduler engine
 //! can work with either without knowing the concrete type at compile time.
 
-use crate::cache::traits::PhysicalBlockId;
+use crate::cache::traits::{PhysicalBlockId, PrefixMatch};
 use crate::error::Result;
 
 /// KV allocation result — tells the batch builder what to send to the worker.
@@ -55,6 +55,29 @@ pub trait KvManager: Send + Sync {
     /// - Slot mode: no-op (worker handles growth internally).
     /// - Paged mode: allocates additional blocks as needed.
     fn extend(&mut self, alloc: &mut KvAllocation, additional_tokens: usize) -> Result<()>;
+
+    /// Allocate KV resources for a new sequence and optionally reuse a cached prefix.
+    /// Default implementation does no prefix reuse.
+    fn allocate_with_prefix(&mut self, num_tokens: usize, _tokens: &[i32]) -> Result<(KvAllocation, PrefixMatch)> {
+        Ok((self.allocate(num_tokens)?, PrefixMatch::none()))
+    }
+
+    /// Allocate exact physical blocks for a worker decode-time block-table extension.
+    fn allocate_decode_blocks(&mut self, _num_blocks: usize) -> Result<Vec<PhysicalBlockId>> {
+        Err(crate::error::SchedulerError::Internal(
+            "decode block grants are only supported in paged KV mode".into(),
+        ))
+    }
+
+    /// Insert a completed sequence into prefix cache. Default is no-op.
+    fn insert_prefix_cache(&mut self, _tokens: &[i32], _alloc: &KvAllocation) {}
+
+    /// Release KV resources for a normally finished sequence. Paged mode may keep
+    /// full prompt blocks in the prefix cache instead of immediately freeing them.
+    fn free_finished(&mut self, tokens: &[i32], alloc: KvAllocation) {
+        self.insert_prefix_cache(tokens, &alloc);
+        self.free(alloc);
+    }
 
     /// Release KV resources when a sequence finishes or is preempted.
     fn free(&mut self, alloc: KvAllocation);

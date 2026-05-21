@@ -9,8 +9,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use infer_worker::base::DeviceType;
 use infer_worker::model::llm::LlmModel;
-use infer_protocol::scheduler_to_worker_control::{LoadModel, SchedulerControlMessage};
-use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerState};
+use infer_protocol::scheduler_to_worker_control::{InitPagedKv, LoadModel, SchedulerControlMessage};
+use infer_protocol::worker_to_scheduler_control::{PagedKvReady, WorkerCapacity, WorkerMemoryProfile, WorkerState};
 use infer_worker::worker::control_client::WorkerControlClient;
 use infer_worker::worker::runner::ModelRunner;
 use infer_worker::worker::{DiffusionWorkerServer, SubScheduler};
@@ -186,6 +186,44 @@ fn run_worker<M: LlmModel + 'static>(
         }
     };
 
+    let mut max_total_kv_tokens = None;
+    let mut free_mem_after_load_gb = None;
+    let mut workspace_mem_usage_gb = None;
+
+    if load_model.kv_cache_mode.as_deref().is_some_and(|mode| mode.starts_with("paged:")) {
+        control.send_progress(WorkerState::ProfilingMemory, "profiling memory for paged KV")?;
+        let profile = build_memory_profile(
+            &runner,
+            &control,
+            &load_model,
+            &device_label,
+            device,
+        )?;
+        free_mem_after_load_gb = Some(bytes_to_gb(profile.free_mem_after_dummy_bytes));
+        control.send_memory_profile(profile)?;
+
+        let init = wait_for_init_paged_kv(&control, &load_model.model_instance_id)?;
+        control.send_progress(
+            WorkerState::AllocatingRuntime,
+            format!("allocating paged KV pool: blocks={} block_size={}", init.initial_num_blocks, init.block_size),
+        )?;
+        runner.init_paged_kv_pool(init.block_size as usize, init.initial_num_blocks as usize)?;
+        let (_, _, bytes_allocated) = runner
+            .paged_kv_pool_summary()
+            .ok_or_else(|| anyhow::anyhow!("paged KV pool summary missing after init"))?;
+        workspace_mem_usage_gb = Some(bytes_to_gb(bytes_allocated as u64));
+        max_total_kv_tokens = Some(init.initial_num_blocks as usize * init.block_size as usize);
+        control.send_paged_kv_ready(PagedKvReady {
+            worker_id: control.worker_id().to_string(),
+            model_instance_id: load_model.model_instance_id.clone(),
+            block_size: init.block_size,
+            initial_num_blocks: init.initial_num_blocks,
+            max_num_blocks: init.max_num_blocks,
+            max_blocks_per_seq: init.max_blocks_per_seq,
+            bytes_allocated: bytes_allocated as u64,
+        })?;
+    }
+
     control.send_progress(WorkerState::Warmup, "runtime allocated; ready for runner thread")?;
     control.send_ready(
         load_model.model_instance_id,
@@ -196,11 +234,11 @@ fn run_worker<M: LlmModel + 'static>(
             max_batch_tokens,
             max_batch_seqs,
             max_running_requests: max_batch_seqs,
-            max_total_kv_tokens: None,
+            max_total_kv_tokens,
             free_mem_before_load_gb: None,
-            free_mem_after_load_gb: None,
+            free_mem_after_load_gb,
             weight_mem_usage_gb: None,
-            workspace_mem_usage_gb: None,
+            workspace_mem_usage_gb,
             graph_mem_usage_gb: None,
         },
     )?;
@@ -261,6 +299,91 @@ fn run_diffusion_worker<P: infer_worker::model::diffusion::pipeline::DiffusionPi
     Ok(())
 }
 
+fn build_memory_profile<M: LlmModel>(
+    runner: &Arc<ModelRunner<M>>,
+    control: &WorkerControlClient,
+    load_model: &LoadModel,
+    device_label: &str,
+    device: DeviceType,
+) -> Result<WorkerMemoryProfile> {
+    let (free_after_dummy_bytes, total_mem_bytes) = device_mem_info(device)?;
+    let fraction = load_model
+        .kv_cache_memory_fraction
+        .unwrap_or(0.95)
+        .clamp(0.0, 1.0);
+    let suggested_kv_budget_bytes = (free_after_dummy_bytes as f64 * fraction as f64) as u64;
+    let cfg = runner.model().config();
+    let dtype_size = cfg.runtime_float_dtype(device)?.size_in_bytes() as u32;
+
+    Ok(WorkerMemoryProfile {
+        worker_id: control.worker_id().to_string(),
+        model_instance_id: load_model.model_instance_id.clone(),
+        device: device_label.to_string(),
+        total_mem_bytes,
+        free_mem_before_load_bytes: 0,
+        free_mem_after_dummy_bytes: free_after_dummy_bytes,
+        layer_num: cfg.layer_num as u32,
+        kv_head_num: cfg.kv_head_num as u32,
+        head_size: cfg.head_size as u32,
+        dtype_size,
+        max_batch_tokens: load_model.max_batch_tokens as u32,
+        max_batch_seqs: load_model.max_batch_seqs as u32,
+        max_model_len: load_model.max_model_len as u32,
+        suggested_kv_budget_bytes,
+    })
+}
+
+fn wait_for_init_paged_kv(control: &WorkerControlClient, model_instance_id: &str) -> Result<InitPagedKv> {
+    loop {
+        match control.recv_scheduler_message()? {
+            SchedulerControlMessage::InitPagedKv(init) if init.model_instance_id == model_instance_id => {
+                return Ok(init);
+            }
+            SchedulerControlMessage::InitPagedKv(init) => {
+                tracing::warn!(
+                    "Ignoring InitPagedKv for model_instance_id={} while waiting for {}",
+                    init.model_instance_id,
+                    model_instance_id,
+                );
+            }
+            SchedulerControlMessage::Hello(hello) => {
+                tracing::debug!(
+                    "SchedulerHello while waiting InitPagedKv: protocol={} heartbeat_interval_ms={}",
+                    hello.protocol_version,
+                    hello.heartbeat_interval_ms,
+                );
+            }
+            SchedulerControlMessage::LoadModel(_) => {
+                tracing::warn!("Ignoring duplicate LoadModel while waiting InitPagedKv");
+            }
+            SchedulerControlMessage::GrantBlocks(grant) => {
+                tracing::debug!("Ignoring GrantBlocks before Running: sequence_id={}", grant.sequence_id);
+            }
+            SchedulerControlMessage::GrantBlocksDenied(denied) => {
+                tracing::debug!("Ignoring GrantBlocksDenied before Running: sequence_id={} reason={:?}", denied.sequence_id, denied.reason);
+            }
+        }
+    }
+}
+
+fn device_mem_info(device: DeviceType) -> Result<(u64, u64)> {
+    match device {
+        DeviceType::Cpu => Ok((0, 0)),
+        #[cfg(feature = "cuda")]
+        DeviceType::Cuda(id) => {
+            infer_worker::cuda::device::set_current_device(id)?;
+            let (free, total) = infer_worker::cuda::device::mem_get_info()?;
+            Ok((free as u64, total as u64))
+        }
+        #[cfg(not(feature = "cuda"))]
+        DeviceType::Cuda(_) => anyhow::bail!("cuda device requested but cuda feature is disabled"),
+    }
+}
+
+fn bytes_to_gb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
 fn cli_load_model(args: &Args) -> Option<LoadModel> {
     args.model.clone().map(|model_path| LoadModel {
         model_instance_id: "default".to_string(),
@@ -275,6 +398,8 @@ fn cli_load_model(args: &Args) -> Option<LoadModel> {
         tp_size: 1,
         pp_rank: 0,
         pp_size: 1,
+        kv_cache_mode: Some("slot".to_string()),
+        kv_cache_memory_fraction: Some(0.95),
     })
 }
 
@@ -299,6 +424,29 @@ fn wait_for_load_model(control: &WorkerControlClient) -> Result<LoadModel> {
                     cmd.max_batch_seqs,
                 );
                 return Ok(cmd);
+            }
+            SchedulerControlMessage::InitPagedKv(init) => {
+                tracing::debug!(
+                    "Ignoring InitPagedKv before LoadModel: model_instance_id={} blocks={}/{} block_size={}",
+                    init.model_instance_id,
+                    init.initial_num_blocks,
+                    init.max_num_blocks,
+                    init.block_size,
+                );
+            }
+            SchedulerControlMessage::GrantBlocks(grant) => {
+                tracing::debug!(
+                    "Ignoring GrantBlocks before LoadModel: sequence_id={} blocks={}",
+                    grant.sequence_id,
+                    grant.block_ids.len(),
+                );
+            }
+            SchedulerControlMessage::GrantBlocksDenied(denied) => {
+                tracing::debug!(
+                    "Ignoring GrantBlocksDenied before LoadModel: sequence_id={} reason={:?}",
+                    denied.sequence_id,
+                    denied.reason,
+                );
             }
         }
     }
