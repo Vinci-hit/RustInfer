@@ -3,6 +3,7 @@
 /.cargo
 /.claude
 /.codex
+/.codebuddy
 /crates/infer-frontend/node_modules
 /crates/infer-frontend/assets/output.css
 /crates/infer-frontend/dist
