@@ -1,4 +1,5 @@
 #include <cuda_runtime_api.h>
+#include <cuda_profiler_api.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cudnn.h>

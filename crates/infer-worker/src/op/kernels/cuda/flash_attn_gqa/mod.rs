@@ -133,6 +133,52 @@ unsafe extern "C" {
         stream: cuda::ffi::cudaStream_t,
     );
 
+    pub fn launch_flash_attn_paged_ragged_cute_bf16(
+        q: *const half::bf16, qss: i64, qsh: i64,
+        k_pool: *const half::bf16,
+        v_pool: *const half::bf16,
+        o: *mut half::bf16, oss: i64, osh: i64,
+        block_tables: *const u32,
+        max_blocks_per_seq: i32,
+        block_size: i32,
+        kv_lens: *const i32,
+        cu_q_lens: *const i32,
+        block2req: *const i32,
+        block2tile: *const i32,
+        total_q_tiles: i32,
+        batch: i32,
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        is_causal: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
+    pub fn launch_flash_attn_paged_ragged_cute_fp16(
+        q: *const half::f16, qss: i64, qsh: i64,
+        k_pool: *const half::f16,
+        v_pool: *const half::f16,
+        o: *mut half::f16, oss: i64, osh: i64,
+        block_tables: *const u32,
+        max_blocks_per_seq: i32,
+        block_size: i32,
+        kv_lens: *const i32,
+        cu_q_lens: *const i32,
+        block2req: *const i32,
+        block2tile: *const i32,
+        total_q_tiles: i32,
+        batch: i32,
+        total_q_tokens: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        is_causal: i32,
+        stream: cuda::ffi::cudaStream_t,
+    );
+
     // ---- Ragged attention (variable q_len / kv_len per request) ----
     pub fn launch_flash_attn_ragged_bf16(
         q: *const half::bf16, qss: i64, qsh: i64,
@@ -627,6 +673,9 @@ pub unsafe fn flash_attn_paged_ragged(
     block_size: usize,
     kv_lens_dev: *const i32,
     cu_q_lens_dev: *const i32,
+    block2req_dev: *const i32,
+    block2tile_dev: *const i32,
+    total_q_tiles: i32,
     batch: usize,
     total_q_tokens: usize,
     num_q_heads: usize,
@@ -669,7 +718,7 @@ pub unsafe fn flash_attn_paged_ragged(
 
     match dtype {
         crate::base::DataType::BF16 => unsafe {
-            launch_flash_attn_paged_ragged_bf16(
+            launch_flash_attn_paged_ragged_cute_bf16(
                 q.as_bf16()?.data_ptr(), qss, qsh,
                 k_pool as *const half::bf16,
                 v_pool as *const half::bf16,
@@ -679,6 +728,9 @@ pub unsafe fn flash_attn_paged_ragged(
                 block_size as i32,
                 kv_lens_dev,
                 cu_q_lens_dev,
+                block2req_dev,
+                block2tile_dev,
+                total_q_tiles,
                 batch as i32,
                 total_q_tokens as i32,
                 num_q_heads as i32, num_kv_heads as i32, head_dim as i32,
@@ -688,7 +740,7 @@ pub unsafe fn flash_attn_paged_ragged(
             );
         },
         crate::base::DataType::F16 => unsafe {
-            launch_flash_attn_paged_ragged_fp16(
+            launch_flash_attn_paged_ragged_cute_fp16(
                 q.as_f16()?.data_ptr(), qss, qsh,
                 k_pool as *const half::f16,
                 v_pool as *const half::f16,
@@ -698,6 +750,9 @@ pub unsafe fn flash_attn_paged_ragged(
                 block_size as i32,
                 kv_lens_dev,
                 cu_q_lens_dev,
+                block2req_dev,
+                block2tile_dev,
+                total_q_tiles,
                 batch as i32,
                 total_q_tokens as i32,
                 num_q_heads as i32, num_kv_heads as i32, head_dim as i32,

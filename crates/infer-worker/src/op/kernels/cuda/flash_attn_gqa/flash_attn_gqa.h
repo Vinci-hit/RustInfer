@@ -200,6 +200,42 @@ void launch_flash_attn_paged_ragged_fp16(
     float softmax_scale, int is_causal,
     cudaStream_t stream);
 
+void launch_flash_attn_paged_ragged_cute_bf16(
+    const __nv_bfloat16* q, int64_t qss, int64_t qsh,
+    const __nv_bfloat16* k_pool,
+    const __nv_bfloat16* v_pool,
+          __nv_bfloat16* o, int64_t oss, int64_t osh,
+    const uint32_t* block_tables,
+    int max_blocks_per_seq,
+    int block_size,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int batch, int total_q_tokens,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream);
+
+void launch_flash_attn_paged_ragged_cute_fp16(
+    const __half* q, int64_t qss, int64_t qsh,
+    const __half* k_pool,
+    const __half* v_pool,
+          __half* o, int64_t oss, int64_t osh,
+    const uint32_t* block_tables,
+    int max_blocks_per_seq,
+    int block_size,
+    const int32_t* kv_lens,
+    const int32_t* cu_q_lens,
+    const int32_t* block2req,
+    const int32_t* block2tile,
+    int total_q_tiles,
+    int batch, int total_q_tokens,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale, int is_causal,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

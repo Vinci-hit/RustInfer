@@ -30,3 +30,19 @@ pub fn mem_get_info() -> Result<(usize, usize)> {
     }
     Ok((free, total))
 }
+
+#[cfg(feature = "cuda")]
+pub fn profiler_start() -> Result<()> {
+    unsafe {
+        crate::cuda_check!(ffi::cudaProfilerStart())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub fn profiler_stop() -> Result<()> {
+    unsafe {
+        crate::cuda_check!(ffi::cudaProfilerStop())?;
+    }
+    Ok(())
+}

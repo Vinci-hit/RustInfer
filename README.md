@@ -311,6 +311,148 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 
 ---
 
+## 🔬 Nsight Systems Profile 方法
+
+> 目标：RustInfer 是三进程架构，端到端 profile 会混入 HTTP / Scheduler / ZMQ 等控制面开销。分析 GPU 性能时优先只 profile `rustinfer-worker`，因为真正 CUDA kernel 都在 Worker 进程内。
+
+### 1. Worker-only 服务 profile
+
+先启动 Scheduler（不被 nsys profile）：
+
+```bash
+cd /root/RustInfer
+mkdir -p result
+
+MODEL=/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b
+
+PATH=/root/RustInfer/target/release:$PATH \
+./target/release/rustinfer-scheduler \
+  --frontend-endpoint ipc:///tmp/rustinfer-nsys-frontend.ipc \
+  --worker-push-endpoint ipc:///tmp/rustinfer-nsys-worker-in.ipc \
+  --worker-pull-endpoint ipc:///tmp/rustinfer-nsys-worker-out.ipc \
+  --worker-control-endpoint ipc:///tmp/rustinfer-nsys-worker-control.ipc \
+  --model ${MODEL} \
+  --model-type llama3 \
+  --device cuda:0 \
+  --max-batch-tokens 512 \
+  --max-batch-seqs 4 \
+  --max-model-len 1024 \
+  --kv-cache-mode paged:16 \
+  --mem-fraction-static 0.05 \
+  --enable-prefix-caching \
+  --log-level warn
+```
+
+再用 `nsys` 启动 Worker。当前 Worker 支持 `--profile-cuda-steps=N`：第一次提交推理 step 前调用 `cudaProfilerStart()`，完成 N 个 worker step 后调用 `cudaProfilerStop()`。因此可以使用 `--capture-range=cudaProfilerApi` 精确采集请求阶段，而不用猜 `--delay`。
+
+```bash
+PROFILE_STEPS=200
+
+PATH=/root/RustInfer/target/release:$PATH \
+nsys profile \
+  --trace=cuda,nvtx,osrt,cudnn,cublas \
+  --cuda-graph-trace=node \
+  --cuda-trace-all-apis=true \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=stop-shutdown \
+  --sample=none \
+  --cpuctxsw=none \
+  --kill=none \
+  --force-overwrite=true \
+  --output=/root/RustInfer/result/nsys_paged_worker \
+  ./target/release/rustinfer-worker \
+    --device cuda:0 \
+    --worker-pull-endpoint ipc:///tmp/rustinfer-nsys-worker-in.ipc \
+    --worker-push-endpoint ipc:///tmp/rustinfer-nsys-worker-out.ipc \
+    --worker-control-endpoint ipc:///tmp/rustinfer-nsys-worker-control.ipc \
+    --max-batch-tokens 512 \
+    --max-batch-seqs 4 \
+    --profile-cuda-steps ${PROFILE_STEPS} \
+    --log-level warn
+```
+
+如果不想使用 profiler API，也可以退回 `--delay/--duration` 模式，但要确保窗口覆盖实际请求而不是模型加载：
+
+```bash
+nsys profile \
+  --trace=cuda,nvtx,osrt,cudnn,cublas \
+  --cuda-graph-trace=node \
+  --cuda-trace-all-apis=true \
+  --delay=60 \
+  --duration=120 \
+  --sample=none \
+  --cpuctxsw=none \
+  --kill=none \
+  --force-overwrite=true \
+  --output=/root/RustInfer/result/nsys_paged_worker_delay \
+  ./target/release/rustinfer-worker ...
+```
+
+最后启动 HTTP Server 并发起压测：
+
+```bash
+PATH=/root/RustInfer/target/release:$PATH \
+./target/release/rustinfer-server \
+  --port 8014 \
+  --engine-endpoint ipc:///tmp/rustinfer-nsys-frontend.ipc \
+  --tokenizer ${MODEL} \
+  --model-name llama3.2-1b \
+  --log-level warn
+
+python bench/bench_real_arrival.py \
+  --url http://127.0.0.1:8014 \
+  --model llama3.2-1b \
+  --label RustInfer-PagedPrefix-Llama3.2-1B-nsys \
+  --warmup-requests 2 \
+  --num-requests 8 \
+  --concurrency 2 \
+  --arrival-rate 2 \
+  --max-tokens 32 \
+  --seed 20260521 \
+  --verbose
+```
+
+生成统计：
+
+```bash
+rm -f /root/RustInfer/result/nsys_paged_worker.sqlite
+nsys stats \
+  --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum,osrt_sum \
+  /root/RustInfer/result/nsys_paged_worker.nsys-rep
+```
+
+### 2. Operator 级 profile（用于验证 nsys 能采到 kernel）
+
+服务进程 profile 容易因 `--delay/--duration` 窗口没覆盖请求而只采到初始化。可以先用确定会执行 CUDA kernel 的测试二进制验证 nsys：
+
+```bash
+cd /root/RustInfer
+cargo test -p infer-worker --features cuda,models --no-run
+BIN=$(ls -t target/debug/deps/infer_worker-* | grep -v '\.d$' | head -n1)
+
+nsys profile \
+  --trace=cuda,cublas,nvtx,osrt \
+  --cuda-trace-all-apis=true \
+  --sample=none \
+  --cpuctxsw=none \
+  --force-overwrite=true \
+  --output=/root/RustInfer/result/nsys_op_decode \
+  ${BIN} test_flash_attn_decode_batch --nocapture
+
+nsys stats \
+  --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum \
+  /root/RustInfer/result/nsys_op_decode.nsys-rep
+```
+
+### 3. 当前验证状态
+
+- `bench_real_arrival.py` 的 Paged + prefix cache 小规模真实请求已经能跑通，无 timeout / panic。
+- 直接 profile `infer_worker` 测试二进制可以成功采集 CUDA kernel，例如 `flash_batched_decode::pass1_kernel`。
+- Worker-only serving profile 已接入 `--profile-cuda-steps=N`，可配合 `--capture-range=cudaProfilerApi` 精确采集请求阶段。
+- 若未设置 `--profile-cuda-steps`，使用 `--delay/--duration` 时需要准确覆盖请求窗口；否则可能只采到初始化 kernel（如 `sin_cos_calc_bf16`）和 H2D memcpy。
+
+---
+
 ## 📦 支持的模型
 
 ### Llama 3 系列

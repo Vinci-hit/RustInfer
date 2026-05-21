@@ -162,6 +162,9 @@ impl FlashAttnRagged {
         block_size: usize,
         kv_lens_dev: *const i32,
         cu_q_lens_dev: *const i32,
+        block2req_dev: *const i32,
+        block2tile_dev: *const i32,
+        total_q_tiles: i32,
         batch: usize,
         o: &mut Tensor,
         cuda_config: Option<&OpConfig>,
@@ -178,6 +181,9 @@ impl FlashAttnRagged {
                 block_size,
                 kv_lens_dev,
                 cu_q_lens_dev,
+                block2req_dev,
+                block2tile_dev,
+                total_q_tiles,
                 batch,
                 total_q_tokens,
                 self.num_q_heads,
@@ -439,6 +445,162 @@ mod tests {
             "ragged mismatch: max_err={:.4e}, bad={}/{} (allowed ≤ {})",
             max_err, bad, n, allowed_bad,
         );
+        Ok(())
+    }
+
+    fn run_paged_case(
+        dt: DT,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_lens: &[i32],
+        kv_lens: &[i32],
+        causal: bool,
+        block_size: usize,
+    ) -> Result<()> {
+        assert_eq!(q_lens.len(), kv_lens.len(), "q_lens / kv_lens must share B");
+        let device = DeviceType::Cuda(0);
+        let batch = q_lens.len();
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let total_q = q_lens.iter().sum::<i32>() as usize;
+        let max_kv = *kv_lens.iter().max().unwrap() as usize;
+        let max_blocks_per_seq = max_kv.div_ceil(block_size).max(1);
+        let num_blocks = batch * max_blocks_per_seq;
+
+        let q_f = rand_f32(total_q * q_dim, 0x411 + head_dim + (causal as usize) * 9);
+        let k_pool_f = rand_f32(num_blocks * block_size * kv_dim, 0x422 + head_dim);
+        let v_pool_f = rand_f32(num_blocks * block_size * kv_dim, 0x433 + head_dim);
+
+        let mut block_tables = vec![0i32; batch * max_blocks_per_seq];
+        for b in 0..batch {
+            for logical in 0..max_blocks_per_seq {
+                block_tables[b * max_blocks_per_seq + logical] =
+                    (b * max_blocks_per_seq + (max_blocks_per_seq - 1 - logical)) as i32;
+            }
+        }
+
+        let q_tensor = match dt {
+            DT::Bf16 => upload_bf16(&[total_q, num_q_heads, head_dim], &q_f)?,
+            DT::Fp16 => upload_fp16(&[total_q, num_q_heads, head_dim], &q_f)?,
+        };
+        let k_pool = match dt {
+            DT::Bf16 => upload_bf16(&[num_blocks, block_size, num_kv_heads, head_dim], &k_pool_f)?,
+            DT::Fp16 => upload_fp16(&[num_blocks, block_size, num_kv_heads, head_dim], &k_pool_f)?,
+        };
+        let v_pool = match dt {
+            DT::Bf16 => upload_bf16(&[num_blocks, block_size, num_kv_heads, head_dim], &v_pool_f)?,
+            DT::Fp16 => upload_fp16(&[num_blocks, block_size, num_kv_heads, head_dim], &v_pool_f)?,
+        };
+
+        let (cu_q_lens_host, block2req_host, block2tile_host) = plan_ragged_tiles(q_lens);
+        let total_tiles = block2req_host.len() as i32;
+        let mut block_dev     = Tensor::new(&[batch * max_blocks_per_seq], DataType::I32, device)?;
+        let mut kvlens_dev    = Tensor::new(&[batch], DataType::I32, device)?;
+        let mut cu_q_lens_dev = Tensor::new(&[cu_q_lens_host.len()], DataType::I32, device)?;
+        let mut b2req_dev     = Tensor::new(&[block2req_host.len().max(1)], DataType::I32, device)?;
+        let mut b2tile_dev    = Tensor::new(&[block2tile_host.len().max(1)], DataType::I32, device)?;
+        block_dev.write_from_i32_host(&block_tables, block_tables.len())?;
+        kvlens_dev.write_from_i32_host(kv_lens, batch)?;
+        cu_q_lens_dev.write_from_i32_host(&cu_q_lens_host, cu_q_lens_host.len())?;
+        if !block2req_host.is_empty() {
+            b2req_dev.write_from_i32_host(&block2req_host, block2req_host.len())?;
+            b2tile_dev.write_from_i32_host(&block2tile_host, block2tile_host.len())?;
+        }
+
+        let out_dtype = match dt { DT::Bf16 => DataType::BF16, DT::Fp16 => DataType::F16 };
+        let mut o_tensor = Tensor::new(&[total_q, num_q_heads, head_dim], out_dtype, device)?;
+        let op = FlashAttnRagged::new(num_q_heads, num_kv_heads, head_dim, causal)?;
+        let cfg = CudaConfig::new()?;
+        unsafe {
+            op.forward_paged(
+                &q_tensor,
+                k_pool.data_ptr() as *const c_void,
+                v_pool.data_ptr() as *const c_void,
+                block_dev.as_i32()?.data_ptr() as *const u32,
+                max_blocks_per_seq,
+                block_size,
+                kvlens_dev.as_i32()?.data_ptr(),
+                cu_q_lens_dev.as_i32()?.data_ptr(),
+                b2req_dev.as_i32()?.data_ptr(),
+                b2tile_dev.as_i32()?.data_ptr(),
+                total_tiles,
+                batch,
+                &mut o_tensor,
+                Some(&cfg),
+            )?;
+            crate::cuda_check!(crate::cuda::ffi::cudaStreamSynchronize(cfg.stream))?;
+        }
+
+        let o_cpu = o_tensor.to_cpu()?;
+        let (atol, rtol) = match dt {
+            DT::Bf16 => (7e-2f32, 1e-2f32),
+            DT::Fp16 => (1e-2f32, 5e-3f32),
+        };
+        let mut max_err = 0.0f32;
+        let mut bad = 0usize;
+        let mut n = 0usize;
+        let mut q_off = 0usize;
+        for b in 0..batch {
+            let q_len_b = q_lens[b] as usize;
+            let kv_len_b = kv_lens[b] as usize;
+            let mut k_seq = vec![0.0f32; kv_len_b * kv_dim];
+            let mut v_seq = vec![0.0f32; kv_len_b * kv_dim];
+            for t in 0..kv_len_b {
+                let logical = t / block_size;
+                let off = t % block_size;
+                let phys = block_tables[b * max_blocks_per_seq + logical] as usize;
+                let src = (phys * block_size + off) * kv_dim;
+                let dst = t * kv_dim;
+                k_seq[dst..dst + kv_dim].copy_from_slice(&k_pool_f[src..src + kv_dim]);
+                v_seq[dst..dst + kv_dim].copy_from_slice(&v_pool_f[src..src + kv_dim]);
+            }
+            let q_slice = &q_f[q_off * q_dim .. (q_off + q_len_b) * q_dim];
+            let ref_out = naive_attn_ref_f32(
+                q_slice, &k_seq, &v_seq,
+                num_q_heads, num_kv_heads, head_dim,
+                q_len_b, kv_len_b, causal, scale,
+            );
+            for i in 0..q_len_b {
+                for qh in 0..num_q_heads {
+                    for d in 0..head_dim {
+                        let rel_ref = (i * num_q_heads + qh) * head_dim + d;
+                        let rel_got = ((q_off + i) * num_q_heads + qh) * head_dim + d;
+                        let got = match dt {
+                            DT::Bf16 => o_cpu.as_bf16()?.as_slice()?[rel_got].to_f32(),
+                            DT::Fp16 => o_cpu.as_f16()?.as_slice()?[rel_got].to_f32(),
+                        };
+                        let r = ref_out[rel_ref];
+                        let e = (got - r).abs();
+                        let tol = atol + rtol * r.abs();
+                        if e > tol { bad += 1; }
+                        if e > max_err { max_err = e; }
+                        n += 1;
+                    }
+                }
+            }
+            q_off += q_len_b;
+        }
+        println!(
+            "paged-ragged dt={} Hq={} Hkv={} HD={} block={} q_lens={:?} kv_lens={:?} causal={} max_err={:.4e} bad={}/{}",
+            match dt { DT::Bf16 => "bf16", DT::Fp16 => "fp16" },
+            num_q_heads, num_kv_heads, head_dim, block_size, q_lens, kv_lens, causal, max_err, bad, n,
+        );
+        let allowed_bad = (n as f64 * 1e-4).ceil() as usize;
+        assert!(
+            bad <= allowed_bad,
+            "paged-ragged mismatch: max_err={:.4e}, bad={}/{} (allowed ≤ {})",
+            max_err, bad, n, allowed_bad,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_flash_attn_paged_ragged_prefill() -> Result<()> {
+        run_paged_case(DT::Bf16, 8, 2, 64, &[128, 65], &[128, 129], true, 16)?;
+        run_paged_case(DT::Fp16, 4, 2, 64, &[64, 1], &[96, 33], true, 16)?;
+        run_paged_case(DT::Bf16, 8, 2, 128, &[100, 32], &[160, 80], false, 32)?;
         Ok(())
     }
 

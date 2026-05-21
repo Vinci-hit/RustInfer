@@ -58,6 +58,10 @@ struct Args {
     /// 日志级别
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Start CUDA profiler on the first submitted step and stop after N completed steps (0=disabled).
+    #[arg(long, default_value_t = 0)]
+    profile_cuda_steps: usize,
 }
 
 fn main() -> Result<()> {
@@ -127,6 +131,7 @@ fn main() -> Result<()> {
                 zmq_pull,
                 zmq_push,
                 control,
+                args.profile_cuda_steps,
             )
         }
         "qwen3" | "qwen" => {
@@ -139,6 +144,7 @@ fn main() -> Result<()> {
                 zmq_pull,
                 zmq_push,
                 control,
+                args.profile_cuda_steps,
             )
         }
         "zimage" | "z-image" | "z_image" | "z-image-turbo" => {
@@ -159,6 +165,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker<M: LlmModel + 'static>(
     model: M,
     device: DeviceType,
@@ -167,6 +174,7 @@ fn run_worker<M: LlmModel + 'static>(
     zmq_pull: zmq::Socket,
     zmq_push: zmq::Socket,
     control: WorkerControlClient,
+    profile_cuda_steps: usize,
 ) -> Result<()> {
     let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
         .iter().map(|&id| id as i32).collect();
@@ -256,6 +264,7 @@ fn run_worker<M: LlmModel + 'static>(
         zmq_pull,
         zmq_push,
         eos_token_ids,
+        profile_cuda_steps,
     );
     sub_scheduler.run();
 

@@ -305,6 +305,10 @@ pub struct SubScheduler<M: LlmModel> {
     next_step_buffer_id: usize,
     next_output_buffer_id: usize,
     step_in_flight: bool,
+    profile_cuda_steps: usize,
+    profile_started: bool,
+    profile_stopped: bool,
+    profiled_steps: usize,
     draining: bool,
 }
 
@@ -315,6 +319,7 @@ impl<M: LlmModel> SubScheduler<M> {
         zmq_in: zmq::Socket,
         zmq_out: zmq::Socket,
         eos_token_ids: Vec<i32>,
+        profile_cuda_steps: usize,
     ) -> Self {
         let (max_batch_tokens, max_batch_seqs) = {
             let ws = unsafe { runner.workspace_for(0) };
@@ -334,6 +339,10 @@ impl<M: LlmModel> SubScheduler<M> {
             next_step_buffer_id: 0,
             next_output_buffer_id: 0,
             step_in_flight: false,
+            profile_cuda_steps,
+            profile_started: false,
+            profile_stopped: false,
+            profiled_steps: 0,
             draining: false,
         }
     }
@@ -405,6 +414,7 @@ impl<M: LlmModel> SubScheduler<M> {
             if let Some(err) = self.runner.take_error() {
                 self.runner.set_output_consumed_for(output_buffer_id);
                 self.step_in_flight = false;
+                self.maybe_stop_cuda_profiler_after_step();
                 self.send_fatal_error(err);
                 self.runner.request_shutdown();
                 return;
@@ -417,12 +427,14 @@ impl<M: LlmModel> SubScheduler<M> {
                     tracing::error!("Failed to read output tokens: {:?}", e);
                     self.runner.set_output_consumed_for(output_buffer_id);
                     self.step_in_flight = false;
+                    self.maybe_stop_cuda_profiler_after_step();
                     self.next_output_buffer_id = (output_buffer_id + 1) % STEP_BUFFER_COUNT;
                     continue;
                 }
             };
             self.runner.set_output_consumed_for(output_buffer_id);
             self.step_in_flight = false;
+            self.maybe_stop_cuda_profiler_after_step();
             self.next_output_buffer_id = (output_buffer_id + 1) % STEP_BUFFER_COUNT;
 
             // 4. 按本 step 语义处理 output：prefill ack、final prefill token、decode token。
@@ -659,9 +671,54 @@ impl<M: LlmModel> SubScheduler<M> {
         self.pending_prefills.clear();
 
         unsafe { self.runner.write_meta_for(step_buffer_id, meta); }
+        self.maybe_start_cuda_profiler();
         self.runner.set_input_ready_for(step_buffer_id);
 
         Ok(true)
+    }
+
+    fn maybe_start_cuda_profiler(&mut self) {
+        if self.profile_cuda_steps == 0 || self.profile_started {
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            match crate::cuda::device::profiler_start() {
+                Ok(()) => {
+                    self.profile_started = true;
+                    tracing::info!("CUDA profiler started for {} worker steps", self.profile_cuda_steps);
+                }
+                Err(e) => tracing::error!("cudaProfilerStart failed: {:?}", e),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.profile_started = true;
+        }
+    }
+
+    fn maybe_stop_cuda_profiler_after_step(&mut self) {
+        if self.profile_cuda_steps == 0 || !self.profile_started || self.profile_stopped {
+            return;
+        }
+        self.profiled_steps += 1;
+        if self.profiled_steps < self.profile_cuda_steps {
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            match crate::cuda::device::profiler_stop() {
+                Ok(()) => {
+                    self.profile_stopped = true;
+                    tracing::info!("CUDA profiler stopped after {} worker steps", self.profiled_steps);
+                }
+                Err(e) => tracing::error!("cudaProfilerStop failed: {:?}", e),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.profile_stopped = true;
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -1153,6 +1210,7 @@ mod tests {
             worker_pull,
             worker_push,
             eos_token_ids.clone(),
+            0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1246,6 +1304,7 @@ mod tests {
             worker_pull,
             worker_push,
             eos_token_ids.clone(),
+            0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1339,6 +1398,7 @@ mod tests {
         let runner_handle = std::thread::spawn(move || runner_loop.run());
         let server = SubScheduler::new(
             Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
+            0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1514,6 +1574,7 @@ mod tests {
         let runner2_handle = std::thread::spawn(move || runner2_loop.run());
         let server = SubScheduler::new(
             Arc::clone(&runner2), device, worker_pull, worker_push, eos_token_ids.clone(),
+            0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1604,6 +1665,7 @@ mod tests {
         let runner_handle = std::thread::spawn(move || runner_loop.run());
         let server = SubScheduler::new(
             Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
+            0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 

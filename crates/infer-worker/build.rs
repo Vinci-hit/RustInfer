@@ -48,6 +48,9 @@ fn main() {
             build.file(path);
             println!("cargo:rerun-if-changed={}", path.display());
         }
+        for path in find_files("src/op/kernels/cuda", "cuh") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
         build.compile("infer_kernels");
         println!("cargo:rustc-link-lib=static=infer_kernels");
         println!("cargo:rustc-link-lib=cudart");
@@ -75,6 +78,8 @@ fn main() {
             .allowlist_function("cudaMemset")
             .allowlist_function("cudaMemsetAsync")
             .allowlist_function("cudaMemGetInfo")
+            .allowlist_function("cudaProfilerStart")
+            .allowlist_function("cudaProfilerStop")
             .allowlist_function("cudaGetErrorString")
             .allowlist_function("cudaGetErrorName")
             .allowlist_function("cudaGetDevice")
