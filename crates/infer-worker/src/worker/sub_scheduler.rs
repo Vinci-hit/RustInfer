@@ -15,15 +15,16 @@
 //! - **SubScheduler 线程**：`SubScheduler::run()`
 //! - ZMQ socket 绑定在 sub-scheduler 线程上（非线程安全，不跨线程）。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::base::DeviceType;
 use crate::base::error::{Error, Result};
 use crate::model::llm::LlmModel;
 use crate::model::runtime::InferenceState;
+use crate::worker::runner::{ModelRunner, STEP_BUFFER_COUNT, StepMeta, WorkerBatchMeta};
 use infer_protocol::scheduler_to_worker::*;
 use infer_protocol::worker_to_scheduler::*;
-use crate::worker::runner::{ModelRunner, StepMeta, WorkerBatchMeta, STEP_BUFFER_COUNT};
 
 const DEFAULT_DECODE_BLOCK_PREFETCH_MARGIN: usize = 4;
 const DEFAULT_DECODE_BLOCK_REQUEST_BLOCKS: usize = 1;
@@ -86,7 +87,8 @@ impl DecodeKv {
             block_size,
             pending_request,
             blocked_on_blocks,
-        } = self else {
+        } = self
+        else {
             return None;
         };
         if generated_count >= max_tokens || pending_request.is_some() {
@@ -101,7 +103,10 @@ impl DecodeKv {
 
         let missing = required_blocks - block_table.len();
         let requested_blocks = missing.max(request_blocks.max(1));
-        *pending_request = Some(PendingBlockRequest { required_blocks, requested_blocks });
+        *pending_request = Some(PendingBlockRequest {
+            required_blocks,
+            requested_blocks,
+        });
 
         let current_required = next_position / *block_size + 1;
         if current_required > block_table.len() {
@@ -122,7 +127,8 @@ impl DecodeKv {
             pending_request,
             blocked_on_blocks,
             ..
-        } = self else {
+        } = self
+        else {
             return false;
         };
         block_table.extend_from_slice(block_ids);
@@ -132,7 +138,13 @@ impl DecodeKv {
     }
 
     fn is_blocked_on_blocks(&self) -> bool {
-        matches!(self, DecodeKv::Paged { blocked_on_blocks: true, .. })
+        matches!(
+            self,
+            DecodeKv::Paged {
+                blocked_on_blocks: true,
+                ..
+            }
+        )
     }
 }
 
@@ -161,7 +173,11 @@ mod paged_kv_helper_tests {
             segment_start: 0,
             segment_end: 8,
             max_tokens: 16,
-            sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+            sampling_params: SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: -1,
+            },
             completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
         }
     }
@@ -170,7 +186,12 @@ mod paged_kv_helper_tests {
     fn decode_kv_from_paged_segment_keeps_block_table() {
         let kv = decode_kv_from_segment(&paged_segment());
         match kv {
-            DecodeKv::Paged { block_table, block_size, pending_request, blocked_on_blocks } => {
+            DecodeKv::Paged {
+                block_table,
+                block_size,
+                pending_request,
+                blocked_on_blocks,
+            } => {
                 assert_eq!(block_table, vec![10, 11]);
                 assert_eq!(block_size, 4);
                 assert!(pending_request.is_none());
@@ -184,12 +205,15 @@ mod paged_kv_helper_tests {
     fn decode_block_request_triggers_before_boundary() {
         let mut kv = decode_kv_from_segment(&paged_segment());
         let draft = kv.maybe_request_blocks(7, 7, 16, 1, 1, 2).unwrap();
-        assert_eq!(draft, NeedBlocksDraft {
-            sequence_id: 7,
-            current_blocks: 2,
-            required_blocks: 3,
-            request_blocks: 2,
-        });
+        assert_eq!(
+            draft,
+            NeedBlocksDraft {
+                sequence_id: 7,
+                current_blocks: 2,
+                required_blocks: 3,
+                request_blocks: 2,
+            }
+        );
         assert!(!kv.is_blocked_on_blocks());
 
         assert!(kv.append_granted_blocks(&[12, 13]));
@@ -209,7 +233,10 @@ mod paged_kv_helper_tests {
         let kv0 = decode_kv_from_segment(&paged_segment());
         let mut seg1 = paged_segment();
         seg1.sequence_id = 8;
-        seg1.kv = Some(KvPlacement::Paged { block_table: vec![20, 21], block_size: 4 });
+        seg1.kv = Some(KvPlacement::Paged {
+            block_table: vec![20, 21],
+            block_size: 4,
+        });
         let kv1 = decode_kv_from_segment(&seg1);
         assert_eq!(kv0.slot_for_legacy_workspace(0), 0);
         assert_eq!(kv1.slot_for_legacy_workspace(1), 1);
@@ -234,8 +261,13 @@ struct DecodeSeq {
 
 fn decode_kv_from_segment(segment: &PrefillSegmentMeta) -> DecodeKv {
     match segment.kv_placement() {
-        KvPlacement::Slot { kv_slot } => DecodeKv::Slot { kv_slot: kv_slot as usize },
-        KvPlacement::Paged { block_table, block_size } => DecodeKv::Paged {
+        KvPlacement::Slot { kv_slot } => DecodeKv::Slot {
+            kv_slot: kv_slot as usize,
+        },
+        KvPlacement::Paged {
+            block_table,
+            block_size,
+        } => DecodeKv::Paged {
             block_table,
             block_size: block_size as usize,
             pending_request: None,
@@ -248,6 +280,7 @@ fn decode_kv_from_segment(segment: &PrefillSegmentMeta) -> DecodeKv {
 enum StepItem {
     Decode { sequence_id: u64 },
     PrefillSegment { segment: PrefillSegmentMeta },
+    Cancelled { sequence_id: u64 },
 }
 
 /// Worker-owned host staging for one submitted runner step.
@@ -275,9 +308,12 @@ impl StepHostStaging {
         self.input_tokens.clear();
         self.input_positions.clear();
         self.kv_lens.clear();
-        self.input_tokens.reserve(total_tokens.saturating_sub(self.input_tokens.capacity()));
-        self.input_positions.reserve(total_tokens.saturating_sub(self.input_positions.capacity()));
-        self.kv_lens.reserve(num_seqs.saturating_sub(self.kv_lens.capacity()));
+        self.input_tokens
+            .reserve(total_tokens.saturating_sub(self.input_tokens.capacity()));
+        self.input_positions
+            .reserve(total_tokens.saturating_sub(self.input_positions.capacity()));
+        self.kv_lens
+            .reserve(num_seqs.saturating_sub(self.kv_lens.capacity()));
     }
 }
 
@@ -300,6 +336,7 @@ pub struct SubScheduler<M: LlmModel> {
     active_decodes: Vec<DecodeSeq>,
     pending_prefills: Vec<PrefillBatchCmd>,
     pending_cancels: Vec<u64>,
+    cancelled_sequences: HashSet<u64>,
     step_items_by_buffer: Vec<Vec<StepItem>>,
     staging: StepHostStaging,
     next_step_buffer_id: usize,
@@ -334,6 +371,7 @@ impl<M: LlmModel> SubScheduler<M> {
             active_decodes: Vec::new(),
             pending_prefills: Vec::new(),
             pending_cancels: Vec::new(),
+            cancelled_sequences: HashSet::new(),
             step_items_by_buffer: (0..STEP_BUFFER_COUNT).map(|_| Vec::new()).collect(),
             staging: StepHostStaging::new(max_batch_tokens, max_batch_seqs),
             next_step_buffer_id: 0,
@@ -356,7 +394,10 @@ impl<M: LlmModel> SubScheduler<M> {
         tracing::info!("SubScheduler waiting for first prefill...");
         let cmd = match self.recv_next_prefill_blocking() {
             Some(c) => c,
-            None => { tracing::info!("SubScheduler: shutdown before first prefill"); return; }
+            None => {
+                tracing::info!("SubScheduler: shutdown before first prefill");
+                return;
+            }
         };
         self.pending_prefills.push(cmd);
 
@@ -364,7 +405,10 @@ impl<M: LlmModel> SubScheduler<M> {
             tracing::error!("Failed to enqueue first step: {:?}", e);
             return;
         }
-        tracing::info!("SubScheduler started, {} active decodes", self.active_decodes.len());
+        tracing::info!(
+            "SubScheduler started, {} active decodes",
+            self.active_decodes.len()
+        );
 
         loop {
             // 1. 与 Runner forward 并行：non-blocking 收新 prefill / GrantBlocks / cancel
@@ -384,7 +428,10 @@ impl<M: LlmModel> SubScheduler<M> {
                         tracing::debug!("All sequences finished, waiting for new prefill...");
                         let cmd = match self.recv_next_prefill_blocking() {
                             Some(c) => c,
-                            None => { tracing::info!("SubScheduler: shutdown while idle"); return; }
+                            None => {
+                                tracing::info!("SubScheduler: shutdown while idle");
+                                return;
+                            }
                         };
                         self.pending_prefills.push(cmd);
                         if let Err(e) = self.ensure_capacity_and_enqueue() {
@@ -394,7 +441,7 @@ impl<M: LlmModel> SubScheduler<M> {
                         }
                     }
                     if !self.step_in_flight {
-                        std::hint::spin_loop();
+                        std::thread::yield_now();
                         continue;
                     }
                 }
@@ -403,12 +450,14 @@ impl<M: LlmModel> SubScheduler<M> {
             // 2. 等待按提交顺序的 output buffer 完成；其它 buffer 的 output 不会阻塞 runner。
             let output_buffer_id = self.next_output_buffer_id;
             loop {
-                if self.runner.output_ready_for(output_buffer_id) { break; }
+                if self.runner.output_ready_for(output_buffer_id) {
+                    break;
+                }
                 if self.runner.is_shutdown() {
                     tracing::info!("SubScheduler: runner shutdown detected, exiting");
                     return;
                 }
-                std::hint::spin_loop();
+                std::thread::yield_now();
             }
 
             if let Some(err) = self.runner.take_error() {
@@ -458,7 +507,10 @@ impl<M: LlmModel> SubScheduler<M> {
                 tracing::debug!("All sequences finished, waiting for new prefill...");
                 let cmd = match self.recv_next_prefill_blocking() {
                     Some(c) => c,
-                    None => { tracing::info!("SubScheduler: shutdown while idle"); return; }
+                    None => {
+                        tracing::info!("SubScheduler: shutdown while idle");
+                        return;
+                    }
                 };
                 self.pending_prefills.push(cmd);
                 if let Err(e) = self.ensure_capacity_and_enqueue() {
@@ -503,7 +555,10 @@ impl<M: LlmModel> SubScheduler<M> {
                     let max_total = segment.prompt_len as usize + segment.max_tokens;
 
                     unsafe {
-                        self.runner.state_mut(slot).kv_cache.ensure_capacity(max_total)?;
+                        self.runner
+                            .state_mut(slot)
+                            .kv_cache
+                            .ensure_capacity(max_total)?;
                     }
                 }
             }
@@ -516,13 +571,15 @@ impl<M: LlmModel> SubScheduler<M> {
     /// 布局：decode 在前 (q_len=1 each)，prefill segment 在后。
     /// 同时按 buffer 记录 `step_items`，runner output 回来后按对应 buffer 的表解释每一行输出。
     fn write_input_buffer_pre_promote(&mut self) -> Result<bool> {
-        let num_decode = self.active_decodes.iter()
+        let num_decode = self
+            .active_decodes
+            .iter()
             .filter(|seq| !seq.kv.is_blocked_on_blocks())
             .count();
-        let num_prefill_seqs: usize = self.pending_prefills.iter()
-            .map(|p| p.num_requests())
-            .sum();
-        let num_prefill_tokens: usize = self.pending_prefills.iter()
+        let num_prefill_seqs: usize = self.pending_prefills.iter().map(|p| p.num_requests()).sum();
+        let num_prefill_tokens: usize = self
+            .pending_prefills
+            .iter()
             .map(|p| p.input_ids.len())
             .sum();
         let total_tokens = num_decode + num_prefill_tokens;
@@ -536,13 +593,17 @@ impl<M: LlmModel> SubScheduler<M> {
         let ws = unsafe { self.runner.workspace_for(step_buffer_id) };
         if total_tokens > ws.max_batch_tokens {
             return Err(Error::InvalidArgument(format!(
-                "total_tokens {} > max_batch_tokens {}", total_tokens, ws.max_batch_tokens
-            )).into());
+                "total_tokens {} > max_batch_tokens {}",
+                total_tokens, ws.max_batch_tokens
+            ))
+            .into());
         }
         if num_seqs > ws.max_batch_seqs {
             return Err(Error::InvalidArgument(format!(
-                "num_seqs {} > max_batch_seqs {}", num_seqs, ws.max_batch_seqs
-            )).into());
+                "num_seqs {} > max_batch_seqs {}",
+                num_seqs, ws.max_batch_seqs
+            ))
+            .into());
         }
 
         self.staging.reset(total_tokens, num_seqs);
@@ -552,14 +613,18 @@ impl<M: LlmModel> SubScheduler<M> {
         let mut meta = StepMeta::zeroed();
 
         meta.step_buffer_id = step_buffer_id;
-        meta.num_decode = num_decode;
-        meta.num_prefill = num_prefill_seqs;
 
         let mut offset: i32 = 0;
         let mut seq_idx = 0usize;
 
+        let mut scheduled_sequence_ids = HashSet::with_capacity(num_seqs);
+
         // Decode 在前 (每条 q_len=1)。
         for d in &self.active_decodes {
+            if !scheduled_sequence_ids.insert(d.sequence_id) {
+                tracing::warn!("Skipping duplicate active decode sequence_id={}", d.sequence_id);
+                continue;
+            }
             if d.kv.is_blocked_on_blocks() {
                 continue;
             }
@@ -570,12 +635,16 @@ impl<M: LlmModel> SubScheduler<M> {
             meta.q_start_loc[seq_idx] = offset;
             meta.slot_indices[seq_idx] = d.kv.slot_for_legacy_workspace(seq_idx) as i32;
             meta.positions_start[seq_idx] = d.next_position as i32;
-            step_items.push(StepItem::Decode { sequence_id: d.sequence_id });
+            step_items.push(StepItem::Decode {
+                sequence_id: d.sequence_id,
+            });
             paged_tables.push(d.kv.paged_block_table().map(|t| t.to_vec()));
 
             offset += 1;
             seq_idx += 1;
         }
+
+        let actual_num_decode = seq_idx;
 
         // Prefill segments 在后。segment_start/end 是 KV 和 RoPE 的绝对位置。
         for cmd in &self.pending_prefills {
@@ -583,6 +652,13 @@ impl<M: LlmModel> SubScheduler<M> {
             for i in 0..n {
                 let range = cmd.segment_token_range(i);
                 let segment = cmd.segments[i].clone();
+                if !scheduled_sequence_ids.insert(segment.sequence_id) {
+                    tracing::warn!(
+                        "Skipping duplicate prefill segment sequence_id={}",
+                        segment.sequence_id
+                    );
+                    continue;
+                }
                 let seq_len = range.len();
                 let segment_start = segment.segment_start as usize;
                 let segment_end = segment.segment_end as usize;
@@ -594,7 +670,9 @@ impl<M: LlmModel> SubScheduler<M> {
                     KvPlacement::Paged { block_table, .. } => (seq_idx, Some(block_table)),
                 };
 
-                staging.input_tokens.extend_from_slice(&cmd.input_ids[range]);
+                staging
+                    .input_tokens
+                    .extend_from_slice(&cmd.input_ids[range]);
                 for pos in segment_start..segment_end {
                     staging.input_positions.push(pos as i32);
                 }
@@ -610,7 +688,14 @@ impl<M: LlmModel> SubScheduler<M> {
                 seq_idx += 1;
             }
         }
-        meta.q_start_loc[num_seqs] = offset;
+        let actual_num_seqs = seq_idx;
+        if actual_num_seqs == 0 {
+            self.pending_prefills.clear();
+            return Ok(false);
+        }
+        meta.num_decode = actual_num_decode;
+        meta.num_prefill = actual_num_seqs - actual_num_decode;
+        meta.q_start_loc[actual_num_seqs] = offset;
         meta.total_q_tiles = 0;
 
         let ws_mut = unsafe { self.runner.workspace_mut_for(step_buffer_id) };
@@ -619,20 +704,38 @@ impl<M: LlmModel> SubScheduler<M> {
 
         #[cfg(feature = "cuda")]
         {
-            ws_mut.input_tokens.as_i32_mut()?.buffer_mut()
+            ws_mut
+                .input_tokens
+                .as_i32_mut()?
+                .buffer_mut()
                 .copy_from_host_async(&staging.input_tokens, stream)?;
-            ws_mut.input_pos.as_i32_mut()?.buffer_mut()
+            ws_mut
+                .input_pos
+                .as_i32_mut()?
+                .buffer_mut()
                 .copy_from_host_async(&staging.input_positions, stream)?;
-            ws_mut.kv_lens_dev.as_i32_mut()?.buffer_mut()
+            ws_mut
+                .kv_lens_dev
+                .as_i32_mut()?
+                .buffer_mut()
                 .copy_from_host_async(&staging.kv_lens, stream)?;
         }
         #[cfg(not(feature = "cuda"))]
         {
-            ws_mut.input_tokens.as_i32_mut()?.buffer_mut()
+            ws_mut
+                .input_tokens
+                .as_i32_mut()?
+                .buffer_mut()
                 .copy_from_host(&staging.input_tokens)?;
-            ws_mut.input_pos.as_i32_mut()?.buffer_mut()
+            ws_mut
+                .input_pos
+                .as_i32_mut()?
+                .buffer_mut()
                 .copy_from_host(&staging.input_positions)?;
-            ws_mut.kv_lens_dev.as_i32_mut()?.buffer_mut()
+            ws_mut
+                .kv_lens_dev
+                .as_i32_mut()?
+                .buffer_mut()
                 .copy_from_host(&staging.kv_lens)?;
         }
 
@@ -641,10 +744,8 @@ impl<M: LlmModel> SubScheduler<M> {
         ws_mut.refresh_scatter_indices(&meta_view, stream)?;
         #[cfg(feature = "cuda")]
         {
-            let paged_refs: Vec<Option<&[u32]>> = paged_tables
-                .iter()
-                .map(|entry| entry.as_deref())
-                .collect();
+            let paged_refs: Vec<Option<&[u32]>> =
+                paged_tables.iter().map(|entry| entry.as_deref()).collect();
             ws_mut.refresh_paged_block_tables(&paged_refs, stream)?;
         }
         #[cfg(not(feature = "cuda"))]
@@ -653,10 +754,10 @@ impl<M: LlmModel> SubScheduler<M> {
         #[cfg(feature = "cuda")]
         {
             let states_all = unsafe { &mut *(self.runner.states_ptr_mut()) };
-            let mut refs: Vec<&mut InferenceState> = Vec::with_capacity(num_seqs);
-            let mut slot_ids: Vec<usize> = Vec::with_capacity(num_seqs);
+            let mut refs: Vec<&mut InferenceState> = Vec::with_capacity(actual_num_seqs);
+            let mut slot_ids: Vec<usize> = Vec::with_capacity(actual_num_seqs);
 
-            for i in 0..num_seqs {
+            for i in 0..actual_num_seqs {
                 let slot = meta.slot_indices[i] as usize;
                 slot_ids.push(slot);
                 let p = &mut states_all[slot] as *mut InferenceState;
@@ -670,7 +771,9 @@ impl<M: LlmModel> SubScheduler<M> {
         self.next_step_buffer_id = (step_buffer_id + 1) % STEP_BUFFER_COUNT;
         self.pending_prefills.clear();
 
-        unsafe { self.runner.write_meta_for(step_buffer_id, meta); }
+        unsafe {
+            self.runner.write_meta_for(step_buffer_id, meta);
+        }
         self.maybe_start_cuda_profiler();
         self.runner.set_input_ready_for(step_buffer_id);
 
@@ -686,7 +789,10 @@ impl<M: LlmModel> SubScheduler<M> {
             match crate::cuda::device::profiler_start() {
                 Ok(()) => {
                     self.profile_started = true;
-                    tracing::info!("CUDA profiler started for {} worker steps", self.profile_cuda_steps);
+                    tracing::info!(
+                        "CUDA profiler started for {} worker steps",
+                        self.profile_cuda_steps
+                    );
                 }
                 Err(e) => tracing::error!("cudaProfilerStart failed: {:?}", e),
             }
@@ -710,7 +816,10 @@ impl<M: LlmModel> SubScheduler<M> {
             match crate::cuda::device::profiler_stop() {
                 Ok(()) => {
                     self.profile_stopped = true;
-                    tracing::info!("CUDA profiler stopped after {} worker steps", self.profiled_steps);
+                    tracing::info!(
+                        "CUDA profiler stopped after {} worker steps",
+                        self.profiled_steps
+                    );
                 }
                 Err(e) => tracing::error!("cudaProfilerStop failed: {:?}", e),
             }
@@ -741,10 +850,12 @@ impl<M: LlmModel> SubScheduler<M> {
 
     /// 按指定 buffer 的 step_items 解释 runner output，更新 Worker 内部 decode 状态并发送精简 StepOutput。
     fn process_step_output_and_send_zmq(&mut self, buffer_id: usize, tokens: &[i32]) {
-        if tokens.len() != self.step_items_by_buffer[buffer_id].len() {
+        if tokens.len() < self.step_items_by_buffer[buffer_id].len() {
             tracing::error!(
-                "Runner output length {} != buffer {} step_items length {}",
-                tokens.len(), buffer_id, self.step_items_by_buffer[buffer_id].len()
+                "Runner output length {} < buffer {} step_items length {}",
+                tokens.len(),
+                buffer_id,
+                self.step_items_by_buffer[buffer_id].len()
             );
             return;
         }
@@ -761,7 +872,18 @@ impl<M: LlmModel> SubScheduler<M> {
         for (item, &token_id) in step_items.into_iter().zip(tokens) {
             match item {
                 StepItem::Decode { sequence_id } => {
-                    if let Some(idx) = self.active_decodes.iter().position(|s| s.sequence_id == sequence_id) {
+                    if self.cancelled_sequences.contains(&sequence_id) {
+                        tracing::debug!(
+                            "Dropping late decode output for cancelled sequence_id={}",
+                            sequence_id
+                        );
+                        continue;
+                    }
+                    if let Some(idx) = self
+                        .active_decodes
+                        .iter()
+                        .position(|s| s.sequence_id == sequence_id)
+                    {
                         let seq = &mut self.active_decodes[idx];
                         let generated_count = seq.generated_count + 1;
                         let finished = self.eos_token_ids.contains(&token_id)
@@ -788,6 +910,13 @@ impl<M: LlmModel> SubScheduler<M> {
                 }
                 StepItem::PrefillSegment { segment } => {
                     let sequence_id = segment.sequence_id;
+                    if self.cancelled_sequences.contains(&sequence_id) {
+                        tracing::debug!(
+                            "Dropping late prefill output for cancelled sequence_id={}",
+                            sequence_id
+                        );
+                        continue;
+                    }
                     step_output.prefill_done.push(sequence_id);
 
                     match segment.completion {
@@ -806,20 +935,33 @@ impl<M: LlmModel> SubScheduler<M> {
                             });
 
                             if !finished {
-                                self.active_decodes.push(DecodeSeq {
-                                    sequence_id,
-                                    kv: decode_kv_from_segment(&segment),
-                                    // final prefill 输出 token 还没写入 KV；下一步 decode 写到 prompt_len。
-                                    next_position: segment.prompt_len as usize,
-                                    last_token: token_id,
-                                    generated_count,
-                                    max_tokens: segment.max_tokens,
-                                    sampling: segment.sampling_params,
-                                });
-                                batch_members_changed = true;
+                                if self.active_decodes.iter().any(|seq| seq.sequence_id == sequence_id) {
+                                    tracing::warn!(
+                                        "Ignoring duplicate decode activation sequence_id={}",
+                                        sequence_id
+                                    );
+                                } else {
+                                    self.active_decodes.push(DecodeSeq {
+                                        sequence_id,
+                                        kv: decode_kv_from_segment(&segment),
+                                        // final prefill 输出 token 还没写入 KV；下一步 decode 写到 prompt_len。
+                                        next_position: segment.prompt_len as usize,
+                                        last_token: token_id,
+                                        generated_count,
+                                        max_tokens: segment.max_tokens,
+                                        sampling: segment.sampling_params,
+                                    });
+                                    batch_members_changed = true;
+                                }
                             }
                         }
                     }
+                }
+                StepItem::Cancelled { sequence_id } => {
+                    tracing::debug!(
+                        "Dropping output row for cancelled sequence_id={}",
+                        sequence_id
+                    );
                 }
             }
         }
@@ -836,12 +978,17 @@ impl<M: LlmModel> SubScheduler<M> {
         if batch_members_changed {
             for buffer_id in 0..STEP_BUFFER_COUNT {
                 unsafe {
-                    self.runner.workspace_mut_for(buffer_id).invalidate_batch_member_cache();
+                    self.runner
+                        .workspace_mut_for(buffer_id)
+                        .invalidate_batch_member_cache();
                 }
             }
         }
 
-        if step_output.prefill_done.is_empty() && step_output.tokens.is_empty() && step_output.need_blocks.is_empty() {
+        if step_output.prefill_done.is_empty()
+            && step_output.tokens.is_empty()
+            && step_output.need_blocks.is_empty()
+        {
             return;
         }
         let data = match rmp_serde::to_vec(&step_output) {
@@ -874,7 +1021,11 @@ impl<M: LlmModel> SubScheduler<M> {
     }
 
     fn apply_block_grant(&mut self, grant: BlockGrantCmd) {
-        if let Some(seq) = self.active_decodes.iter_mut().find(|s| s.sequence_id == grant.sequence_id) {
+        if let Some(seq) = self
+            .active_decodes
+            .iter_mut()
+            .find(|s| s.sequence_id == grant.sequence_id)
+        {
             if seq.kv.append_granted_blocks(&grant.block_ids) {
                 tracing::debug!(
                     "GrantBlocks applied: sequence_id={} blocks={}",
@@ -882,7 +1033,10 @@ impl<M: LlmModel> SubScheduler<M> {
                     grant.block_ids.len(),
                 );
             } else {
-                tracing::warn!("GrantBlocks for non-paged sequence_id={}", grant.sequence_id);
+                tracing::warn!(
+                    "GrantBlocks for non-paged sequence_id={}",
+                    grant.sequence_id
+                );
             }
         } else {
             tracing::debug!("GrantBlocks for inactive sequence_id={}", grant.sequence_id);
@@ -890,7 +1044,11 @@ impl<M: LlmModel> SubScheduler<M> {
     }
 
     fn collect_all_sequence_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.active_decodes.iter().map(|seq| seq.sequence_id).collect();
+        let mut ids: Vec<u64> = self
+            .active_decodes
+            .iter()
+            .map(|seq| seq.sequence_id)
+            .collect();
         for cmd in &self.pending_prefills {
             ids.extend(cmd.segments.iter().map(|segment| segment.sequence_id));
         }
@@ -899,6 +1057,7 @@ impl<M: LlmModel> SubScheduler<M> {
                 match item {
                     StepItem::Decode { sequence_id } => ids.push(*sequence_id),
                     StepItem::PrefillSegment { segment } => ids.push(segment.sequence_id),
+                    StepItem::Cancelled { sequence_id } => ids.push(*sequence_id),
                 }
             }
         }
@@ -954,6 +1113,7 @@ impl<M: LlmModel> SubScheduler<M> {
                     if let Some(cmd) = self.handle_data_plane_message(&data) {
                         return Some(cmd);
                     }
+                    self.apply_pending_cancels();
                 }
                 Err(zmq::Error::EAGAIN) => {
                     // 没有消息，等一小段时间后重试
@@ -990,7 +1150,10 @@ impl<M: LlmModel> SubScheduler<M> {
         match rmp_serde::from_slice::<PrefillBatchCmd>(data) {
             Ok(cmd) => self.accept_prefill(cmd),
             Err(e) => {
-                tracing::error!("Failed to deserialize worker command or PrefillBatchCmd: {}", e);
+                tracing::error!(
+                    "Failed to deserialize worker command or PrefillBatchCmd: {}",
+                    e
+                );
                 None
             }
         }
@@ -1049,13 +1212,20 @@ impl<M: LlmModel> SubScheduler<M> {
         let cancels = std::mem::take(&mut self.pending_cancels);
         for sequence_id in cancels {
             let removed = self.cancel_request(sequence_id);
-            tracing::info!("CancelRequest applied sequence_id={} removed={}", sequence_id, removed);
+            tracing::info!(
+                "CancelRequest applied sequence_id={} removed={}",
+                sequence_id,
+                removed
+            );
         }
     }
 
     fn cancel_request(&mut self, sequence_id: u64) -> bool {
+        self.cancelled_sequences.insert(sequence_id);
+
         let before_active = self.active_decodes.len();
-        self.active_decodes.retain(|seq| seq.sequence_id != sequence_id);
+        self.active_decodes
+            .retain(|seq| seq.sequence_id != sequence_id);
         let removed_active = before_active != self.active_decodes.len();
 
         let mut removed_pending = false;
@@ -1067,15 +1237,32 @@ impl<M: LlmModel> SubScheduler<M> {
             }
         }
 
-        if removed_active || removed_pending {
-            for buffer_id in 0..STEP_BUFFER_COUNT {
-                unsafe {
-                    self.runner.workspace_mut_for(buffer_id).invalidate_batch_member_cache();
+        let mut removed_inflight = false;
+        for items in &mut self.step_items_by_buffer {
+            for item in items {
+                let item_sequence_id = match item {
+                    StepItem::Decode { sequence_id } => *sequence_id,
+                    StepItem::PrefillSegment { segment } => segment.sequence_id,
+                    StepItem::Cancelled { sequence_id } => *sequence_id,
+                };
+                if item_sequence_id == sequence_id {
+                    *item = StepItem::Cancelled { sequence_id };
+                    removed_inflight = true;
                 }
             }
         }
 
-        removed_active || removed_pending
+        if removed_active || removed_pending || removed_inflight {
+            for buffer_id in 0..STEP_BUFFER_COUNT {
+                unsafe {
+                    self.runner
+                        .workspace_mut_for(buffer_id)
+                        .invalidate_batch_member_cache();
+                }
+            }
+        }
+
+        removed_active || removed_pending || removed_inflight
     }
 }
 
@@ -1123,8 +1310,8 @@ mod tests {
     //! 需要真实模型权重（LLAMA3_MODEL_PATH 或 well-known 路径）。
     use super::*;
     use crate::base::DeviceType;
-    use crate::model::llm::llama3::Llama3;
     use crate::model::llm::LlmModel;
+    use crate::model::llm::llama3::Llama3;
     use std::sync::Arc;
 
     fn get_model_path() -> Option<std::path::PathBuf> {
@@ -1160,7 +1347,11 @@ mod tests {
                 segment_start: 0,
                 segment_end: prompt_len,
                 max_tokens,
-                sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+                sampling_params: SamplingParams {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: -1,
+                },
                 completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
             }],
         }
@@ -1175,17 +1366,29 @@ mod tests {
     fn server_single_request_e2e() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
         let vocab = model.config().vocab_size;
-        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
-            .iter().map(|&id| id as i32).collect();
+        let eos_token_ids: Vec<i32> = model
+            .tokenizer()
+            .eos_token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 4usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
 
         // ─── ZMQ inproc sockets ───
         let zmq_ctx = zmq::Context::new();
@@ -1240,7 +1443,8 @@ mod tests {
             assert_eq!(seq_out.sequence_id, 1);
             assert!(
                 seq_out.token_id >= 0 && (seq_out.token_id as usize) < vocab,
-                "token {} out of vocab range", seq_out.token_id
+                "token {} out of vocab range",
+                seq_out.token_id
             );
             all_tokens.push(seq_out.token_id);
             total_steps += 1;
@@ -1250,10 +1454,17 @@ mod tests {
             }
         }
 
-        eprintln!("server_single_request_e2e: {} steps, tokens={:?}", total_steps, all_tokens);
+        eprintln!(
+            "server_single_request_e2e: {} steps, tokens={:?}",
+            total_steps, all_tokens
+        );
         // prefill 输出 1 token，decode max_tokens-1 步 → 总共 max_tokens 步
         // 或者提前 EOS
-        assert!(total_steps <= max_tokens + 1, "too many steps: {}", total_steps);
+        assert!(
+            total_steps <= max_tokens + 1,
+            "too many steps: {}",
+            total_steps
+        );
         assert!(total_steps >= 1, "no tokens generated");
 
         // ─── Shutdown ───
@@ -1271,17 +1482,29 @@ mod tests {
     fn server_two_requests_continuous_batch() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
         let vocab = model.config().vocab_size;
-        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
-            .iter().map(|&id| id as i32).collect();
+        let eos_token_ids: Vec<i32> = model
+            .tokenizer()
+            .eos_token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 4usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
 
         // ─── ZMQ inproc sockets ───
         let zmq_ctx = zmq::Context::new();
@@ -1344,9 +1567,14 @@ mod tests {
             for seq_out in &out.tokens {
                 assert!(
                     seq_out.token_id >= 0 && (seq_out.token_id as usize) < vocab,
-                    "{} token {} out of range", seq_out.sequence_id, seq_out.token_id
+                    "{} token {} out of range",
+                    seq_out.sequence_id,
+                    seq_out.token_id
                 );
-                eprintln!("  {} token={} finished={}", seq_out.sequence_id, seq_out.token_id, seq_out.finished);
+                eprintln!(
+                    "  {} token={} finished={}",
+                    seq_out.sequence_id, seq_out.token_id, seq_out.finished
+                );
                 if seq_out.finished {
                     match seq_out.sequence_id {
                         1 => a_finished = true,
@@ -1371,17 +1599,29 @@ mod tests {
     fn server_slot_reuse_after_finish() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
         let vocab = model.config().vocab_size;
-        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
-            .iter().map(|&id| id as i32).collect();
+        let eos_token_ids: Vec<i32> = model
+            .tokenizer()
+            .eos_token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 2usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
 
         let zmq_ctx = zmq::Context::new();
         let scheduler_push = zmq_ctx.socket(zmq::PUSH)?;
@@ -1397,7 +1637,11 @@ mod tests {
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
         let server = SubScheduler::new(
-            Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
+            Arc::clone(&runner),
+            device,
+            worker_pull,
+            worker_push,
+            eos_token_ids.clone(),
             0,
         );
         let server_handle = std::thread::spawn(move || server.run());
@@ -1410,7 +1654,9 @@ mod tests {
         // 等 req1 finish
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if std::time::Instant::now() > deadline { panic!("timeout on req1"); }
+            if std::time::Instant::now() > deadline {
+                panic!("timeout on req1");
+            }
             let msg = scheduler_pull.recv_bytes(0)?;
             let out: StepOutput = rmp_serde::from_slice(&msg)?;
             if out.tokens.iter().any(|t| t.sequence_id == 1 && t.finished) {
@@ -1427,13 +1673,16 @@ mod tests {
         // 等 req2 finish
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if std::time::Instant::now() > deadline { panic!("timeout on req2"); }
+            if std::time::Instant::now() > deadline {
+                panic!("timeout on req2");
+            }
             let msg = scheduler_pull.recv_bytes(0)?;
             let out: StepOutput = rmp_serde::from_slice(&msg)?;
             for t in &out.tokens {
                 assert!(
                     t.token_id >= 0 && (t.token_id as usize) < vocab,
-                    "req2 token {} out of range", t.token_id
+                    "req2 token {} out of range",
+                    t.token_id
                 );
             }
             if out.tokens.iter().any(|t| t.sequence_id == 2 && t.finished) {
@@ -1492,11 +1741,16 @@ mod tests {
     #[test]
     #[ignore = "requires LLAMA3_MODEL_PATH and CUDA GPU"]
     fn server_output_text_correctness() -> Result<()> {
-        use crate::worker::runner::tests::{drive_step, make_prefill_meta, make_single_decode_meta};
+        use crate::worker::runner::tests::{
+            drive_step, make_prefill_meta, make_single_decode_meta,
+        };
 
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_tokens = 20usize;
@@ -1507,16 +1761,30 @@ mod tests {
         let prompt = "The capital of France is";
         let prompt_tokens: Vec<i32> = model.tokenizer().encode(prompt)?;
         let p_len = prompt_tokens.len();
-        let eos_token_ids: Vec<i32> = model.tokenizer().eos_token_ids()
-            .iter().map(|&id| id as i32).collect();
+        let eos_token_ids: Vec<i32> = model
+            .tokenizer()
+            .eos_token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
 
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
 
         // ════ Part 1: 用 runner 直驱在 slot 0 跑 baseline ════
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
-        unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p_len + max_tokens)?; }
+        unsafe {
+            runner
+                .state_mut(0)
+                .kv_cache
+                .ensure_capacity(p_len + max_tokens)?;
+        }
         let meta = make_prefill_meta(0, p_len);
         let pos: Vec<i32> = (0..p_len as i32).collect();
         let out = drive_step(&runner, &prompt_tokens, &pos, &[0i32], &meta)?;
@@ -1535,16 +1803,26 @@ mod tests {
         runner.request_shutdown();
         let _ = runner_handle.join();
 
-        let baseline_text = runner.model().tokenizer().decode(&baseline_tokens).unwrap_or_default();
-        eprintln!("baseline ({} tokens): {:?}", baseline_tokens.len(), baseline_text);
-        assert!(!baseline_text.trim().is_empty(), "baseline decoded to empty string");
+        let baseline_text = runner
+            .model()
+            .tokenizer()
+            .decode(&baseline_tokens)
+            .unwrap_or_default();
+        eprintln!(
+            "baseline ({} tokens): {:?}",
+            baseline_tokens.len(),
+            baseline_text
+        );
+        assert!(
+            !baseline_text.trim().is_empty(),
+            "baseline decoded to empty string"
+        );
 
         // ════ Part 2: 用 **同一个 runner** 重新跑 server（reset slot 0）════
         // 重置 slot 0 的 KV cache（新的 InferenceState 覆盖）
         {
-            let new_state = crate::model::runtime::InferenceState::new(
-                runner.model().config(), device,
-            )?;
+            let new_state =
+                crate::model::runtime::InferenceState::new(runner.model().config(), device)?;
             let slot_mut = unsafe { runner.state_mut(0) };
             *slot_mut = new_state;
         }
@@ -1557,7 +1835,12 @@ mod tests {
         drop(runner);
 
         let model2 = Llama3::new(&path, device)?;
-        let runner2 = Arc::new(ModelRunner::new(model2, device, max_batch_tokens, max_batch_seqs)?);
+        let runner2 = Arc::new(ModelRunner::new(
+            model2,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
 
         let zmq_ctx = zmq::Context::new();
         let scheduler_push = zmq_ctx.socket(zmq::PUSH)?;
@@ -1573,27 +1856,55 @@ mod tests {
         let runner2_loop = Arc::clone(&runner2);
         let runner2_handle = std::thread::spawn(move || runner2_loop.run());
         let server = SubScheduler::new(
-            Arc::clone(&runner2), device, worker_pull, worker_push, eos_token_ids.clone(),
+            Arc::clone(&runner2),
+            device,
+            worker_pull,
+            worker_push,
+            eos_token_ids.clone(),
             0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 
         // 跑第一次
         let (server_tokens_1, _) = run_one_request(
-            &scheduler_push, &scheduler_pull,
-            prompt_tokens.clone(), 0, 1, max_tokens,
+            &scheduler_push,
+            &scheduler_pull,
+            prompt_tokens.clone(),
+            0,
+            1,
+            max_tokens,
         )?;
-        let server_text_1 = runner2.model().tokenizer().decode(&server_tokens_1).unwrap_or_default();
-        eprintln!("server run1 ({} tokens): {:?}", server_tokens_1.len(), server_text_1);
+        let server_text_1 = runner2
+            .model()
+            .tokenizer()
+            .decode(&server_tokens_1)
+            .unwrap_or_default();
+        eprintln!(
+            "server run1 ({} tokens): {:?}",
+            server_tokens_1.len(),
+            server_text_1
+        );
 
         // 重置 slot 0 再跑第二次（验证确定性）
         // 注意：这里 slot 0 是空闲的（run1 已 finished，被 server 移出 active）
         let (server_tokens_2, _) = run_one_request(
-            &scheduler_push, &scheduler_pull,
-            prompt_tokens.clone(), 0, 2, max_tokens,
+            &scheduler_push,
+            &scheduler_pull,
+            prompt_tokens.clone(),
+            0,
+            2,
+            max_tokens,
         )?;
-        let server_text_2 = runner2.model().tokenizer().decode(&server_tokens_2).unwrap_or_default();
-        eprintln!("server run2 ({} tokens): {:?}", server_tokens_2.len(), server_text_2);
+        let server_text_2 = runner2
+            .model()
+            .tokenizer()
+            .decode(&server_tokens_2)
+            .unwrap_or_default();
+        eprintln!(
+            "server run2 ({} tokens): {:?}",
+            server_tokens_2.len(),
+            server_text_2
+        );
 
         // ── 验证 ──
         // 1. 文本可读
@@ -1630,25 +1941,33 @@ mod tests {
     fn server_batch_does_not_corrupt_output() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_tokens = 15usize;
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 4usize;
 
-        let prompts = [
-            "The capital of France is",
-            "Once upon a time",
-        ];
+        let prompts = ["The capital of France is", "Once upon a time"];
 
         let model = Llama3::new(&path, device)?;
         let tokenizer_ref = model.tokenizer();
-        let eos_token_ids: Vec<i32> = tokenizer_ref.eos_token_ids()
-            .iter().map(|&id| id as i32).collect();
+        let eos_token_ids: Vec<i32> = tokenizer_ref
+            .eos_token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
         let toks0: Vec<i32> = tokenizer_ref.encode(prompts[0])?;
         let toks1: Vec<i32> = tokenizer_ref.encode(prompts[1])?;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
 
         let zmq_ctx = zmq::Context::new();
         let scheduler_push = zmq_ctx.socket(zmq::PUSH)?;
@@ -1664,23 +1983,43 @@ mod tests {
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
         let server = SubScheduler::new(
-            Arc::clone(&runner), device, worker_pull, worker_push, eos_token_ids.clone(),
+            Arc::clone(&runner),
+            device,
+            worker_pull,
+            worker_push,
+            eos_token_ids.clone(),
             0,
         );
         let server_handle = std::thread::spawn(move || server.run());
 
         // ════ Part 1: 先单独跑两个请求建立 baseline ════
         let (baseline_0, _) = run_one_request(
-            &scheduler_push, &scheduler_pull,
-            toks0.clone(), 0, 1, max_tokens,
+            &scheduler_push,
+            &scheduler_pull,
+            toks0.clone(),
+            0,
+            1,
+            max_tokens,
         )?;
         let (baseline_1, _) = run_one_request(
-            &scheduler_push, &scheduler_pull,
-            toks1.clone(), 0, 2, max_tokens,
+            &scheduler_push,
+            &scheduler_pull,
+            toks1.clone(),
+            0,
+            2,
+            max_tokens,
         )?;
 
-        let text_solo_0 = runner.model().tokenizer().decode(&baseline_0).unwrap_or_default();
-        let text_solo_1 = runner.model().tokenizer().decode(&baseline_1).unwrap_or_default();
+        let text_solo_0 = runner
+            .model()
+            .tokenizer()
+            .decode(&baseline_0)
+            .unwrap_or_default();
+        let text_solo_1 = runner
+            .model()
+            .tokenizer()
+            .decode(&baseline_1)
+            .unwrap_or_default();
         eprintln!("solo[0] '{}' → {:?}", prompts[0], text_solo_0);
         eprintln!("solo[1] '{}' → {:?}", prompts[1], text_solo_1);
 
@@ -1698,7 +2037,11 @@ mod tests {
                     segment_start: 0,
                     segment_end: toks0.len() as u32,
                     max_tokens,
-                    sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+                    sampling_params: SamplingParams {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        top_k: -1,
+                    },
                     completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
                 },
                 PrefillSegmentMeta {
@@ -1709,7 +2052,11 @@ mod tests {
                     segment_start: 0,
                     segment_end: toks1.len() as u32,
                     max_tokens,
-                    sampling_params: SamplingParams { temperature: 0.0, top_p: 1.0, top_k: -1 },
+                    sampling_params: SamplingParams {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        top_k: -1,
+                    },
                     completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
                 },
             ],
@@ -1733,19 +2080,31 @@ mod tests {
                 match t.sequence_id {
                     10 => {
                         tokens_0.push(t.token_id);
-                        if t.finished { done_0 = true; }
+                        if t.finished {
+                            done_0 = true;
+                        }
                     }
                     11 => {
                         tokens_1.push(t.token_id);
-                        if t.finished { done_1 = true; }
+                        if t.finished {
+                            done_1 = true;
+                        }
                     }
                     other => panic!("unexpected sequence_id: {}", other),
                 }
             }
         }
 
-        let text_batch_0 = runner.model().tokenizer().decode(&tokens_0).unwrap_or_default();
-        let text_batch_1 = runner.model().tokenizer().decode(&tokens_1).unwrap_or_default();
+        let text_batch_0 = runner
+            .model()
+            .tokenizer()
+            .decode(&tokens_0)
+            .unwrap_or_default();
+        let text_batch_1 = runner
+            .model()
+            .tokenizer()
+            .decode(&tokens_1)
+            .unwrap_or_default();
         eprintln!("batch[0] ({} tokens): {:?}", tokens_0.len(), text_batch_0);
         eprintln!("batch[1] ({} tokens): {:?}", tokens_1.len(), text_batch_1);
 
@@ -1771,12 +2130,14 @@ mod tests {
         let full_0 = format!("{}{}", prompts[0], text_batch_0);
         assert!(
             full_0.to_lowercase().contains("paris"),
-            "batch[0] doesn't mention 'Paris': {:?}", full_0,
+            "batch[0] doesn't mention 'Paris': {:?}",
+            full_0,
         );
         // prompt[1] "Once upon a time" 应该生成叙事性文本，不应包含乱码
         assert!(
             text_batch_1.len() > 10,
-            "batch[1] text too short: {:?}", text_batch_1,
+            "batch[1] text too short: {:?}",
+            text_batch_1,
         );
 
         runner.request_shutdown();

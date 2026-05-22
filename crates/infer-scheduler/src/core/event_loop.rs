@@ -3,7 +3,7 @@
 use crate::core::engine::SchedulerEngine;
 use crate::error::Result;
 use crate::policy::traits::SchedulingPolicy;
-use crate::transport::traits::{FrontendTransport, WorkerTransport};
+use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
 /// Run the main event loop.
 ///
@@ -24,9 +24,20 @@ where
         let event = engine.poll_next_event().await;
 
         match event {
-            EngineEvent::NewRequest(result) => match *result {
-                Ok((client_id, request)) => {
+            EngineEvent::Frontend(result) => match *result {
+                Ok(FrontendEvent::Infer { client_id, request }) => {
                     engine.handle_new_request(client_id, request);
+                    if !engine.worker_busy() {
+                        engine.run_iteration().await?;
+                    }
+                }
+                Ok(FrontendEvent::Cancel { request_id, reason }) => {
+                    tracing::debug!(
+                        "Frontend cancel request_id={} reason={:?}",
+                        request_id,
+                        reason
+                    );
+                    engine.cancel_request(request_id).await?;
                     if !engine.worker_busy() {
                         engine.run_iteration().await?;
                     }
@@ -56,9 +67,6 @@ where
 
 /// Events that can occur in the scheduler loop.
 pub(crate) enum EngineEvent {
-    NewRequest(Box<crate::error::Result<(
-        crate::request::handle::ClientId,
-        infer_protocol::server_to_scheduler::InferenceRequest,
-    )>>),
+    Frontend(Box<crate::error::Result<FrontendEvent>>),
     WorkerOutput(crate::error::Result<Vec<u8>>),
 }

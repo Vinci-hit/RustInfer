@@ -3,23 +3,18 @@
 
 use async_trait::async_trait;
 use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
-use infer_protocol::server_to_scheduler::InferenceRequest;
+use infer_protocol::server_to_scheduler::ServerCommand;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, SchedulerError, TransportError};
 use crate::request::handle::ClientId;
+use crate::request::lifecycle::RequestId;
 use crate::transport::codec::{Codec, MsgPackCodec};
-use crate::transport::traits::{FrontendTransport, WorkerTransport};
+use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ZMQ Frontend Transport
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Message from ZMQ thread → scheduler.
-pub struct IncomingRequest {
-    pub client_id: ClientId,
-    pub request: InferenceRequest,
-}
 
 /// Message from scheduler → ZMQ thread.
 pub enum OutgoingResponse {
@@ -39,7 +34,7 @@ pub enum OutgoingResponse {
 /// Communication with the async scheduler is via tokio mpsc channels.
 pub struct ZmqFrontendTransport {
     /// Receive channel: ZMQ thread sends incoming requests here.
-    incoming_rx: mpsc::UnboundedReceiver<IncomingRequest>,
+    incoming_rx: mpsc::UnboundedReceiver<FrontendEvent>,
     /// Send channel: scheduler sends responses here, ZMQ thread drains.
     outgoing_tx: mpsc::UnboundedSender<OutgoingResponse>,
 }
@@ -58,17 +53,23 @@ impl ZmqFrontendTransport {
                     tracing::error!("ZMQ frontend thread exited: {:?}", e);
                 }
             })
-            .map_err(|e| SchedulerError::Transport(TransportError::ConnectionFailed(
-                format!("Failed to spawn ZMQ frontend thread: {}", e)
-            )))?;
+            .map_err(|e| {
+                SchedulerError::Transport(TransportError::ConnectionFailed(format!(
+                    "Failed to spawn ZMQ frontend thread: {}",
+                    e
+                )))
+            })?;
 
-        Ok(Self { incoming_rx, outgoing_tx })
+        Ok(Self {
+            incoming_rx,
+            outgoing_tx,
+        })
     }
 
     /// ZMQ I/O thread — blocking, owns the ROUTER socket.
     fn zmq_thread(
         endpoint: String,
-        incoming_tx: mpsc::UnboundedSender<IncomingRequest>,
+        incoming_tx: mpsc::UnboundedSender<FrontendEvent>,
         mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingResponse>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = zmq::Context::new();
@@ -86,19 +87,23 @@ impl ZmqFrontendTransport {
                     // ROUTER frame: [identity, empty, data]
                     let _ = socket.recv_bytes(0); // empty delimiter
                     match socket.recv_bytes(0) {
-                        Ok(data) => {
-                            match codec.decode::<InferenceRequest>(&data) {
-                                Ok(request) => {
-                                    let _ = incoming_tx.send(IncomingRequest {
-                                        client_id: ClientId(identity),
-                                        request,
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to decode request: {}", e);
-                                }
+                        Ok(data) => match codec.decode::<ServerCommand>(&data) {
+                            Ok(ServerCommand::Infer(request)) => {
+                                let _ = incoming_tx.send(FrontendEvent::Infer {
+                                    client_id: ClientId(identity),
+                                    request,
+                                });
                             }
-                        }
+                            Ok(ServerCommand::Cancel(cancel)) => {
+                                let _ = incoming_tx.send(FrontendEvent::Cancel {
+                                    request_id: RequestId(cancel.request_id),
+                                    reason: cancel.reason,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to decode ServerCommand: {}", e);
+                            }
+                        },
                         Err(e) => tracing::error!("ZMQ recv data frame error: {:?}", e),
                     }
                 }
@@ -109,33 +114,60 @@ impl ZmqFrontendTransport {
             // 2. Try to send responses (non-blocking drain).
             while let Ok(msg) = outgoing_rx.try_recv() {
                 match msg {
-                    OutgoingResponse::Full { client_id, response } => {
+                    OutgoingResponse::Full {
+                        client_id,
+                        response,
+                    } => {
                         if let Ok(data) = codec.encode(&response) {
                             if let Err(e) = socket.send(&client_id.0, zmq::SNDMORE) {
-                                tracing::error!("ZMQ frontend send identity failed for request {}: {:?}", response.request_id, e);
+                                tracing::error!(
+                                    "ZMQ frontend send identity failed for request {}: {:?}",
+                                    response.request_id,
+                                    e
+                                );
                                 continue;
                             }
                             if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
-                                tracing::error!("ZMQ frontend send delimiter failed for request {}: {:?}", response.request_id, e);
+                                tracing::error!(
+                                    "ZMQ frontend send delimiter failed for request {}: {:?}",
+                                    response.request_id,
+                                    e
+                                );
                                 continue;
                             }
                             if let Err(e) = socket.send(&data, 0) {
-                                tracing::error!("ZMQ frontend send response failed for request {}: {:?}", response.request_id, e);
+                                tracing::error!(
+                                    "ZMQ frontend send response failed for request {}: {:?}",
+                                    response.request_id,
+                                    e
+                                );
                             }
                         }
                     }
                     OutgoingResponse::Chunk { client_id, chunk } => {
                         if let Ok(data) = codec.encode(&chunk) {
                             if let Err(e) = socket.send(&client_id.0, zmq::SNDMORE) {
-                                tracing::error!("ZMQ frontend send identity failed for stream {}: {:?}", chunk.request_id, e);
+                                tracing::error!(
+                                    "ZMQ frontend send identity failed for stream {}: {:?}",
+                                    chunk.request_id,
+                                    e
+                                );
                                 continue;
                             }
                             if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
-                                tracing::error!("ZMQ frontend send delimiter failed for stream {}: {:?}", chunk.request_id, e);
+                                tracing::error!(
+                                    "ZMQ frontend send delimiter failed for stream {}: {:?}",
+                                    chunk.request_id,
+                                    e
+                                );
                                 continue;
                             }
                             if let Err(e) = socket.send(&data, 0) {
-                                tracing::error!("ZMQ frontend send stream chunk failed for {}: {:?}", chunk.request_id, e);
+                                tracing::error!(
+                                    "ZMQ frontend send stream chunk failed for {}: {:?}",
+                                    chunk.request_id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -147,14 +179,18 @@ impl ZmqFrontendTransport {
 
 #[async_trait]
 impl FrontendTransport for ZmqFrontendTransport {
-    async fn recv_request(&mut self) -> Result<(ClientId, InferenceRequest)> {
-        match self.incoming_rx.recv().await {
-            Some(msg) => Ok((msg.client_id, msg.request)),
-            None => Err(SchedulerError::Shutdown),
-        }
+    async fn recv_event(&mut self) -> Result<FrontendEvent> {
+        self.incoming_rx
+            .recv()
+            .await
+            .ok_or(SchedulerError::Shutdown)
     }
 
-    async fn send_response(&mut self, client: &ClientId, response: InferenceResponse) -> Result<()> {
+    async fn send_response(
+        &mut self,
+        client: &ClientId,
+        response: InferenceResponse,
+    ) -> Result<()> {
         self.outgoing_tx
             .send(OutgoingResponse::Full {
                 client_id: ClientId(client.0.clone()),
@@ -202,11 +238,17 @@ impl ZmqWorkerTransport {
                     tracing::error!("ZMQ worker thread exited: {:?}", e);
                 }
             })
-            .map_err(|e| SchedulerError::Transport(TransportError::ConnectionFailed(
-                format!("Failed to spawn ZMQ worker thread: {}", e)
-            )))?;
+            .map_err(|e| {
+                SchedulerError::Transport(TransportError::ConnectionFailed(format!(
+                    "Failed to spawn ZMQ worker thread: {}",
+                    e
+                )))
+            })?;
 
-        Ok(Self { output_rx, command_tx })
+        Ok(Self {
+            output_rx,
+            command_tx,
+        })
     }
 
     /// ZMQ I/O thread — blocking, owns PUSH+PULL sockets.

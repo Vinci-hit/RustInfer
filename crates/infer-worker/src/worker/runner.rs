@@ -118,11 +118,21 @@ impl<'a> WorkerBatchMeta<'a> {
         Self { meta }
     }
 
-    pub fn num_seqs(&self) -> usize { self.meta.num_seqs() }
-    pub fn num_decode(&self) -> usize { self.meta.num_decode }
-    pub fn num_prefill(&self) -> usize { self.meta.num_prefill }
-    pub fn is_decode_only(&self) -> bool { self.meta.is_decode_only() }
-    pub fn total_tokens(&self) -> usize { self.meta.total_tokens() }
+    pub fn num_seqs(&self) -> usize {
+        self.meta.num_seqs()
+    }
+    pub fn num_decode(&self) -> usize {
+        self.meta.num_decode
+    }
+    pub fn num_prefill(&self) -> usize {
+        self.meta.num_prefill
+    }
+    pub fn is_decode_only(&self) -> bool {
+        self.meta.is_decode_only()
+    }
+    pub fn total_tokens(&self) -> usize {
+        self.meta.total_tokens()
+    }
 
     pub fn seq_slot(&self, i: usize) -> usize {
         self.meta.slot_indices[i] as usize
@@ -245,7 +255,8 @@ impl<M: LlmModel> ModelRunner<M> {
         assert!(
             max_batch_seqs <= MAX_BATCH_SEQS,
             "ModelRunner::new: max_batch_seqs {} > MAX_BATCH_SEQS {}",
-            max_batch_seqs, MAX_BATCH_SEQS,
+            max_batch_seqs,
+            MAX_BATCH_SEQS,
         );
 
         // 1. per-slot InferenceState
@@ -259,12 +270,8 @@ impl<M: LlmModel> ModelRunner<M> {
         let mut workspaces = Vec::with_capacity(STEP_BUFFER_COUNT);
         let mut output_tokens_dev = Vec::with_capacity(STEP_BUFFER_COUNT);
         for _ in 0..STEP_BUFFER_COUNT {
-            let mut workspace = BatchWorkspace::new(
-                model.config(),
-                max_batch_tokens,
-                max_batch_seqs,
-                device,
-            )?;
+            let mut workspace =
+                BatchWorkspace::new(model.config(), max_batch_tokens, max_batch_seqs, device)?;
             model.fill_rope_cache(&mut workspace.sin_cache, &mut workspace.cos_cache)?;
             workspaces.push(workspace);
             output_tokens_dev.push(crate::tensor::Tensor::new(
@@ -283,13 +290,16 @@ impl<M: LlmModel> ModelRunner<M> {
             device,
             #[cfg(feature = "cuda")]
             cuda_cfg: UnsafeCell::new(cuda_cfg),
-            // 默认开启 decode-only CUDA Graph。某 num_decode 第一次出现时直接
-            // capture；后续同 batch size 直接 replay。
+            // Decode CUDA Graph is enabled by default. Graph cache keys include
+            // the decode batch's KV slot signature, so replay is only reused for
+            // the same buffer and same state-pointer layout.
             enable_decode_graph: true,
             workspaces: UnsafeCell::new(workspaces),
             states: UnsafeCell::new(states),
             output_tokens_dev: UnsafeCell::new(output_tokens_dev),
-            meta_slots: UnsafeCell::new((0..STEP_BUFFER_COUNT).map(|_| StepMeta::zeroed()).collect()),
+            meta_slots: UnsafeCell::new(
+                (0..STEP_BUFFER_COUNT).map(|_| StepMeta::zeroed()).collect(),
+            ),
             paged_kv_pool: UnsafeCell::new(None),
             error_slot: Mutex::new(None),
             flags: SyncFlags::new(),
@@ -397,7 +407,9 @@ impl<M: LlmModel> ModelRunner<M> {
     /// # Safety
     /// Server 只能在该 buffer 未被 runner 读取期间调用。
     pub unsafe fn write_meta(&self, meta: StepMeta) {
-        unsafe { self.write_meta_for(meta.step_buffer_id, meta); }
+        unsafe {
+            self.write_meta_for(meta.step_buffer_id, meta);
+        }
     }
 
     /// 写指定 buffer 的 host-side meta。
@@ -485,23 +497,31 @@ impl<M: LlmModel> ModelRunner<M> {
         self.flags.shutdown.load(Ordering::Acquire)
     }
 
-    pub fn model(&self) -> &M { &self.model }
+    pub fn model(&self) -> &M {
+        &self.model
+    }
 
     /// Initialize the global Paged KV physical pool. Must be called before the
     /// runner thread starts using paged mode.
     pub fn init_paged_kv_pool(&self, block_size: usize, num_blocks: usize) -> Result<()> {
         let pool = PagedKvPool::new(self.model.config(), self.device, block_size, num_blocks)?;
-        unsafe { *self.paged_kv_pool.get() = Some(pool); }
+        unsafe {
+            *self.paged_kv_pool.get() = Some(pool);
+        }
         Ok(())
     }
 
     pub fn paged_kv_pool_summary(&self) -> Option<(usize, usize, usize)> {
         let pool = unsafe { &*self.paged_kv_pool.get() };
-        pool.as_ref().map(|p| (p.block_size(), p.num_blocks(), p.bytes_allocated()))
+        pool.as_ref()
+            .map(|p| (p.block_size(), p.num_blocks(), p.bytes_allocated()))
     }
 
     pub fn take_error(&self) -> Option<String> {
-        self.error_slot.lock().ok().and_then(|mut guard| guard.take())
+        self.error_slot
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     fn set_error(&self, message: String) {
@@ -538,7 +558,7 @@ impl<M: LlmModel> ModelRunner<M> {
                 if let Some(id) = found {
                     break id;
                 }
-                std::hint::spin_loop();
+                std::thread::yield_now();
             };
             next_buffer_id = (buffer_id + 1) % STEP_BUFFER_COUNT;
 
@@ -569,7 +589,8 @@ impl<M: LlmModel> ModelRunner<M> {
             return Err(Error::InvalidArgument(format!(
                 "step_buffer_id {} >= STEP_BUFFER_COUNT {}",
                 meta.step_buffer_id, STEP_BUFFER_COUNT,
-            )).into());
+            ))
+            .into());
         }
 
         // ── Gather per-slot InferenceState 的 mut refs ──
@@ -588,7 +609,8 @@ impl<M: LlmModel> ModelRunner<M> {
                     return Err(Error::InvalidArgument(format!(
                         "slot_indices not unique: {:?}",
                         &meta.slot_indices[..num_seqs]
-                    )).into());
+                    ))
+                    .into());
                 }
             }
         }
@@ -673,7 +695,8 @@ impl<M: LlmModel> ModelRunner<M> {
             let stream = unsafe { (*self.cuda_cfg.get()).stream };
             with_cuda_stream(stream, || {
                 if self.enable_decode_graph && meta.is_decode_only() {
-                    self.forward_via_graph(num_seqs, meta.step_buffer_id, &mut ctx)
+                    let slot_signature = Self::decode_slot_signature(meta, num_seqs);
+                    self.forward_via_graph(num_seqs, meta.step_buffer_id, slot_signature, &mut ctx)
                 } else {
                     self.model.forward(&mut ctx)
                 }
@@ -683,8 +706,17 @@ impl<M: LlmModel> ModelRunner<M> {
         self.model.forward(&mut ctx)
     }
 
-    /// CUDA Graph 路径：按 `num_decode` 分桶，已 capture 则 replay；尚未
-    /// capture 则直接 capture 当前 forward，并缓存 graph。
+    fn decode_slot_signature(meta: &StepMeta, num_decode: usize) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for &slot in &meta.slot_indices[..num_decode] {
+            hash ^= slot as u32 as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    /// CUDA Graph 路径：按 decode batch 的 buffer 和 KV slot layout 分桶，已
+    /// capture 则 replay；尚未 capture 则直接 capture 当前 forward，并缓存 graph。
     ///
     /// 调用前提：调用方已确认 `meta.is_decode_only() && enable_decode_graph`，
     /// 且 ctx 已构造完成。
@@ -693,9 +725,14 @@ impl<M: LlmModel> ModelRunner<M> {
         &self,
         num_decode: usize,
         buffer_id: usize,
+        slot_signature: u64,
         ctx: &mut ForwardCtx<'_, '_>,
     ) -> Result<()> {
-        let slot = crate::cuda::GraphSlot::LlmDecode { batch: num_decode, buffer_id };
+        let slot = crate::cuda::GraphSlot::LlmDecode {
+            batch: num_decode,
+            buffer_id,
+            slot_signature,
+        };
 
         // 已经 capture 过 → 直接 replay。
         {
@@ -754,15 +791,22 @@ impl<M: LlmModel> ModelRunner<M> {
             };
             let kv_stride_s = cfg.kv_dim as i64;
             let kv_stride_h = cfg.head_size as i64;
-            let (paged_k_pool_ptrs, paged_v_pool_ptrs, paged_block_size) = if let Some(pool) = paged_pool_ref {
-                (
-                    pool.layers().iter().map(|layer| layer.k.data_ptr() as usize).collect(),
-                    pool.layers().iter().map(|layer| layer.v.data_ptr() as usize).collect(),
-                    pool.block_size(),
-                )
-            } else {
-                (Vec::new(), Vec::new(), 0usize)
-            };
+            let (paged_k_pool_ptrs, paged_v_pool_ptrs, paged_block_size) =
+                if let Some(pool) = paged_pool_ref {
+                    (
+                        pool.layers()
+                            .iter()
+                            .map(|layer| layer.k.data_ptr() as usize)
+                            .collect(),
+                        pool.layers()
+                            .iter()
+                            .map(|layer| layer.v.data_ptr() as usize)
+                            .collect(),
+                        pool.block_size(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), 0usize)
+                };
 
             Ok(AttentionPlan {
                 kind,
@@ -840,9 +884,7 @@ pub(crate) mod tests {
         let path = match get_model_path() {
             Some(p) => p,
             None => {
-                eprintln!(
-                    "runner_prefill_decode_smoke: LLAMA3_MODEL_PATH not set; skipping"
-                );
+                eprintln!("runner_prefill_decode_smoke: LLAMA3_MODEL_PATH not set; skipping");
                 return Ok(());
             }
         };
@@ -876,7 +918,9 @@ pub(crate) mod tests {
 
         // ─── Slot 0 的 kv_cache ensure capacity ───
         let max_total = prompt_len + 16;
-        unsafe { runner.state_mut(0).kv_cache.ensure_capacity(max_total)?; }
+        unsafe {
+            runner.state_mut(0).kv_cache.ensure_capacity(max_total)?;
+        }
 
         // ─── Step 1: Prefill ───
         //   - input_tokens / input_pos / kv_lens_dev 写 device
@@ -904,12 +948,14 @@ pub(crate) mod tests {
             &[0i32],
             &prefill_meta,
         )?;
-        unsafe { runner.write_meta(prefill_meta.clone()); }
+        unsafe {
+            runner.write_meta(prefill_meta.clone());
+        }
         runner.set_input_ready();
 
         // 等 runner 完成
         while !runner.output_ready() {
-            std::hint::spin_loop();
+            std::thread::yield_now();
         }
         let first_token = unsafe { runner.output_tokens_dev() }
             .to_cpu()?
@@ -919,7 +965,8 @@ pub(crate) mod tests {
         assert!(
             first_token >= 0 && (first_token as usize) < vocab,
             "prefill first_token {} out of range [0, {})",
-            first_token, vocab
+            first_token,
+            vocab
         );
         eprintln!("prefill first_token = {}", first_token);
 
@@ -940,18 +987,14 @@ pub(crate) mod tests {
                 m.total_q_tiles = 0;
                 m
             };
-            fill_inputs_for_step(
-                &runner,
-                &[last_tok],
-                &[pos],
-                &[pos],
-                &decode_meta,
-            )?;
-            unsafe { runner.write_meta(decode_meta.clone()); }
+            fill_inputs_for_step(&runner, &[last_tok], &[pos], &[pos], &decode_meta)?;
+            unsafe {
+                runner.write_meta(decode_meta.clone());
+            }
             runner.set_input_ready();
 
             while !runner.output_ready() {
-                std::hint::spin_loop();
+                std::thread::yield_now();
             }
             let tok = unsafe { runner.output_tokens_dev() }
                 .to_cpu()?
@@ -960,7 +1003,9 @@ pub(crate) mod tests {
             runner.set_output_consumed();
             assert!(
                 tok >= 0 && (tok as usize) < vocab,
-                "decode step {} token {} out of range", step_i, tok
+                "decode step {} token {} out of range",
+                step_i,
+                tok
             );
             generated.push(tok);
         }
@@ -993,15 +1038,33 @@ pub(crate) mod tests {
         // 1. input_tokens / input_pos / kv_lens device H2D（async on worker stream）
         #[cfg(feature = "cuda")]
         {
-            ws.input_tokens.as_i32_mut()?.buffer_mut().copy_from_host_async(tokens, stream)?;
-            ws.input_pos.as_i32_mut()?.buffer_mut().copy_from_host_async(positions, stream)?;
-            ws.kv_lens_dev.as_i32_mut()?.buffer_mut().copy_from_host_async(kv_lens, stream)?;
+            ws.input_tokens
+                .as_i32_mut()?
+                .buffer_mut()
+                .copy_from_host_async(tokens, stream)?;
+            ws.input_pos
+                .as_i32_mut()?
+                .buffer_mut()
+                .copy_from_host_async(positions, stream)?;
+            ws.kv_lens_dev
+                .as_i32_mut()?
+                .buffer_mut()
+                .copy_from_host_async(kv_lens, stream)?;
         }
         #[cfg(not(feature = "cuda"))]
         {
-            ws.input_tokens.as_i32_mut()?.buffer_mut().copy_from_host(tokens)?;
-            ws.input_pos.as_i32_mut()?.buffer_mut().copy_from_host(positions)?;
-            ws.kv_lens_dev.as_i32_mut()?.buffer_mut().copy_from_host(kv_lens)?;
+            ws.input_tokens
+                .as_i32_mut()?
+                .buffer_mut()
+                .copy_from_host(tokens)?;
+            ws.input_pos
+                .as_i32_mut()?
+                .buffer_mut()
+                .copy_from_host(positions)?;
+            ws.kv_lens_dev
+                .as_i32_mut()?
+                .buffer_mut()
+                .copy_from_host(kv_lens)?;
         }
 
         // 2. per-seq scatter 控制数组 —— 直接从 meta 做一份 meta view，调 workspace 的 refresh
@@ -1022,8 +1085,10 @@ pub(crate) mod tests {
             let slot = meta.slot_indices[i] as usize;
             if slot_ids.contains(&slot) {
                 return Err(Error::InvalidArgument(format!(
-                    "fill_inputs_for_step: duplicate slot {} in meta", slot
-                )).into());
+                    "fill_inputs_for_step: duplicate slot {} in meta",
+                    slot
+                ))
+                .into());
             }
             slot_ids.push(slot);
             let p = &mut slots_all[slot] as *mut InferenceState;
@@ -1066,10 +1131,12 @@ pub(crate) mod tests {
             .map(|i| past_kv_lens[i] + meta.q_start_loc[i + 1] - meta.q_start_loc[i])
             .collect();
         fill_inputs_for_step(runner, tokens, positions, &total_kv_lens, meta)?;
-        unsafe { runner.write_meta(meta.clone()); }
+        unsafe {
+            runner.write_meta(meta.clone());
+        }
         runner.set_input_ready();
         while !runner.output_ready() {
-            std::hint::spin_loop();
+            std::thread::yield_now();
         }
         let tokens_out: Vec<i32> = unsafe { runner.output_tokens_dev() }
             .to_cpu()?
@@ -1123,7 +1190,10 @@ pub(crate) mod tests {
     fn runner_two_requests_decode_only() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
@@ -1131,7 +1201,12 @@ pub(crate) mod tests {
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 2usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1143,7 +1218,9 @@ pub(crate) mod tests {
         for (slot, prompt) in prompts.iter().enumerate() {
             let toks: Vec<i32> = runner.model().tokenizer().encode(prompt)?;
             let p_len = toks.len();
-            unsafe { runner.state_mut(slot).kv_cache.ensure_capacity(p_len + 8)?; }
+            unsafe {
+                runner.state_mut(slot).kv_cache.ensure_capacity(p_len + 8)?;
+            }
 
             let meta = make_prefill_meta(slot as i32, p_len);
             let positions: Vec<i32> = (0..p_len as i32).collect();
@@ -1178,7 +1255,9 @@ pub(crate) mod tests {
         for (i, &t) in out.iter().enumerate() {
             assert!(
                 t >= 0 && (t as usize) < vocab,
-                "batched decode seq {} token {} out of range", i, t
+                "batched decode seq {} token {} out of range",
+                i,
+                t
             );
         }
 
@@ -1198,7 +1277,10 @@ pub(crate) mod tests {
     fn runner_mixed_prefill_decode() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
@@ -1206,7 +1288,12 @@ pub(crate) mod tests {
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 2usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1214,7 +1301,9 @@ pub(crate) mod tests {
         let prompt0 = "The quick brown fox jumps";
         let toks0: Vec<i32> = runner.model().tokenizer().encode(prompt0)?;
         let p0_len = toks0.len();
-        unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p0_len + 16)?; }
+        unsafe {
+            runner.state_mut(0).kv_cache.ensure_capacity(p0_len + 16)?;
+        }
 
         let meta = make_prefill_meta(0, p0_len);
         let pos: Vec<i32> = (0..p0_len as i32).collect();
@@ -1236,7 +1325,9 @@ pub(crate) mod tests {
         let prompt1 = "I love to";
         let toks1: Vec<i32> = runner.model().tokenizer().encode(prompt1)?;
         let p1_len = toks1.len();
-        unsafe { runner.state_mut(1).kv_cache.ensure_capacity(p1_len + 8)?; }
+        unsafe {
+            runner.state_mut(1).kv_cache.ensure_capacity(p1_len + 8)?;
+        }
 
         let total_tokens = 1 + p1_len;
         let meta = {
@@ -1260,7 +1351,9 @@ pub(crate) mod tests {
         tokens.extend_from_slice(&toks1);
         let mut positions = Vec::with_capacity(total_tokens);
         positions.push(kv0);
-        for i in 0..p1_len { positions.push(i as i32); }
+        for i in 0..p1_len {
+            positions.push(i as i32);
+        }
         let kv_lens = [kv0, 0i32];
 
         let out = drive_step(&runner, &tokens, &positions, &kv_lens, &meta)?;
@@ -1269,7 +1362,9 @@ pub(crate) mod tests {
         for (i, &t) in out.iter().enumerate() {
             assert!(
                 t >= 0 && (t as usize) < vocab,
-                "mixed step seq {} token {} out of range", i, t
+                "mixed step seq {} token {} out of range",
+                i,
+                t
             );
         }
 
@@ -1293,7 +1388,10 @@ pub(crate) mod tests {
     fn runner_long_prompt_triggers_kv_grow() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
@@ -1301,7 +1399,12 @@ pub(crate) mod tests {
 
         let max_batch_tokens = 1024usize;
         let max_batch_seqs = 1usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1310,12 +1413,23 @@ pub(crate) mod tests {
         let big_prompt = "the ".repeat(600);
         let toks: Vec<i32> = runner.model().tokenizer().encode(&big_prompt)?;
         let p_len = toks.len();
-        assert!(p_len > 512, "prompt length {} not long enough to trigger KV grow", p_len);
-        assert!(p_len <= max_batch_tokens, "prompt {} > max_batch_tokens {}", p_len, max_batch_tokens);
+        assert!(
+            p_len > 512,
+            "prompt length {} not long enough to trigger KV grow",
+            p_len
+        );
+        assert!(
+            p_len <= max_batch_tokens,
+            "prompt {} > max_batch_tokens {}",
+            p_len,
+            max_batch_tokens
+        );
         eprintln!("long prompt tokenized to {} tokens", p_len);
 
         // ensure_capacity 将触发 reallocation：old cap = 512 → new cap ≥ p_len。
-        unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p_len + 4)?; }
+        unsafe {
+            runner.state_mut(0).kv_cache.ensure_capacity(p_len + 4)?;
+        }
 
         let meta = make_prefill_meta(0, p_len);
         let positions: Vec<i32> = (0..p_len as i32).collect();
@@ -1323,7 +1437,8 @@ pub(crate) mod tests {
         assert_eq!(out.len(), 1);
         assert!(
             out[0] >= 0 && (out[0] as usize) < vocab,
-            "long prefill token {} out of range", out[0]
+            "long prefill token {} out of range",
+            out[0]
         );
         eprintln!("long prompt prefill first_token = {}", out[0]);
 
@@ -1332,7 +1447,8 @@ pub(crate) mod tests {
         let out = drive_step(&runner, &[out[0]], &[p_len as i32], &[p_len as i32], &meta)?;
         assert!(
             out[0] >= 0 && (out[0] as usize) < vocab,
-            "post-grow decode token {} out of range", out[0]
+            "post-grow decode token {} out of range",
+            out[0]
         );
         eprintln!("post-grow decode token = {}", out[0]);
 
@@ -1359,7 +1475,10 @@ pub(crate) mod tests {
     fn runner_generate_sentences() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Llama3::new(&path, device)?;
@@ -1367,7 +1486,12 @@ pub(crate) mod tests {
 
         let max_batch_tokens = 256usize;
         let max_batch_seqs = 1usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1389,10 +1513,7 @@ pub(crate) mod tests {
             {
                 // Input-ready 必须是 false 时才能改 state
                 assert!(!runner.input_ready());
-                let new_state = InferenceState::new(
-                    runner.model().config(),
-                    device,
-                )?;
+                let new_state = InferenceState::new(runner.model().config(), device)?;
                 let slot_mut = unsafe { runner.state_mut(0) };
                 *slot_mut = new_state;
             }
@@ -1402,9 +1523,15 @@ pub(crate) mod tests {
             assert!(
                 p_len > 0 && p_len + max_new_tokens <= max_batch_tokens,
                 "prompt '{}' tokenized to {} tokens, overflows budget",
-                prompt, p_len,
+                prompt,
+                p_len,
             );
-            unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p_len + max_new_tokens)?; }
+            unsafe {
+                runner
+                    .state_mut(0)
+                    .kv_cache
+                    .ensure_capacity(p_len + max_new_tokens)?;
+            }
 
             // Prefill
             let meta = make_prefill_meta(0, p_len);
@@ -1415,9 +1542,8 @@ pub(crate) mod tests {
 
             // Decode 循环
             let tokenizer = runner.model().tokenizer();
-            let eos_candidates: Vec<i32> = (0..vocab as i32)
-                .filter(|&t| tokenizer.is_eos(t))
-                .collect();
+            let eos_candidates: Vec<i32> =
+                (0..vocab as i32).filter(|&t| tokenizer.is_eos(t)).collect();
             let mut hit_eos = false;
 
             for _ in 0..(max_new_tokens - 1) {
@@ -1430,7 +1556,9 @@ pub(crate) mod tests {
                 let out = drive_step(&runner, &[last], &[kv_len], &[kv_len], &meta)?;
                 assert!(
                     out[0] >= 0 && (out[0] as usize) < vocab,
-                    "prompt #{}: decoded token {} out of vocab", idx, out[0]
+                    "prompt #{}: decoded token {} out of vocab",
+                    idx,
+                    out[0]
                 );
                 generated.push(out[0]);
                 kv_len += 1;
@@ -1439,14 +1567,19 @@ pub(crate) mod tests {
             let decoded = tokenizer.decode(&generated).unwrap_or_default();
             assert!(
                 !decoded.trim().is_empty(),
-                "prompt #{} ('{}') → empty decoded string", idx, prompt
+                "prompt #{} ('{}') → empty decoded string",
+                idx,
+                prompt
             );
             eprintln!("─────────────────────────────────────────");
             eprintln!("[{}] prompt: {:?}", idx, prompt);
             eprintln!("[{}] tokens ({}): {:?}", idx, generated.len(), generated);
-            eprintln!("[{}] decoded: {}{}",
-                idx, decoded,
-                if hit_eos { " <EOS>" } else { "" });
+            eprintln!(
+                "[{}] decoded: {}{}",
+                idx,
+                decoded,
+                if hit_eos { " <EOS>" } else { "" }
+            );
         }
         eprintln!("─────────────────────────────────────────");
 
@@ -1464,8 +1597,8 @@ mod tests_qwen3 {
     //! 测试同形：smoke / two_requests_decode_only / mixed_prefill_decode /
     //! generate_sentences。模型路径取 `QWEN3_MODEL_PATH`，不存在就 fallback
     //! 到 `/apdcephfs_qy2/.../qwen3-4b-instruct`（4B BF16，含 q_norm/k_norm）。
-    use super::*;
     use super::tests::{drive_step, make_prefill_meta, make_single_decode_meta};
+    use super::*;
     use crate::base::DeviceType;
     use crate::model::llm::qwen3::Qwen3;
     use std::sync::Arc;
@@ -1488,7 +1621,10 @@ mod tests_qwen3 {
     fn runner_qwen3_prefill_decode_smoke() -> Result<()> {
         let path = match get_qwen3_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no qwen3 model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no qwen3 model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Qwen3::new(&path, device)?;
@@ -1496,14 +1632,21 @@ mod tests_qwen3 {
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 1usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
         let prompt = "The capital of France is";
         let toks: Vec<i32> = runner.model().tokenizer().encode(prompt)?;
         let p_len = toks.len();
-        unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p_len + 16)?; }
+        unsafe {
+            runner.state_mut(0).kv_cache.ensure_capacity(p_len + 16)?;
+        }
 
         let meta = make_prefill_meta(0, p_len);
         let pos: Vec<i32> = (0..p_len as i32).collect();
@@ -1534,7 +1677,10 @@ mod tests_qwen3 {
     fn runner_qwen3_two_requests_decode_only() -> Result<()> {
         let path = match get_qwen3_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no qwen3 model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no qwen3 model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Qwen3::new(&path, device)?;
@@ -1542,7 +1688,12 @@ mod tests_qwen3 {
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 2usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1553,7 +1704,9 @@ mod tests_qwen3 {
         for (i, prompt) in prompts.iter().enumerate() {
             let toks: Vec<i32> = runner.model().tokenizer().encode(prompt)?;
             let p_len = toks.len();
-            unsafe { runner.state_mut(i).kv_cache.ensure_capacity(p_len + 4)?; }
+            unsafe {
+                runner.state_mut(i).kv_cache.ensure_capacity(p_len + 4)?;
+            }
             let meta = make_prefill_meta(i as i32, p_len);
             let pos: Vec<i32> = (0..p_len as i32).collect();
             let out = drive_step(&runner, &toks, &pos, &[0i32], &meta)?;
@@ -1595,7 +1748,10 @@ mod tests_qwen3 {
     fn runner_qwen3_generate_sentences() -> Result<()> {
         let path = match get_qwen3_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no qwen3 model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no qwen3 model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Qwen3::new(&path, device)?;
@@ -1603,7 +1759,12 @@ mod tests_qwen3 {
 
         let max_batch_tokens = 256usize;
         let max_batch_seqs = 1usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1628,9 +1789,15 @@ mod tests_qwen3 {
             assert!(
                 p_len > 0 && p_len + max_new_tokens <= max_batch_tokens,
                 "prompt '{}' tokenized to {} tokens, overflows budget",
-                prompt, p_len,
+                prompt,
+                p_len,
             );
-            unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p_len + max_new_tokens)?; }
+            unsafe {
+                runner
+                    .state_mut(0)
+                    .kv_cache
+                    .ensure_capacity(p_len + max_new_tokens)?;
+            }
 
             let meta = make_prefill_meta(0, p_len);
             let pos: Vec<i32> = (0..p_len as i32).collect();
@@ -1639,9 +1806,8 @@ mod tests_qwen3 {
             let mut kv_len = p_len as i32;
 
             let tokenizer = runner.model().tokenizer();
-            let eos_candidates: Vec<i32> = (0..vocab as i32)
-                .filter(|&t| tokenizer.is_eos(t))
-                .collect();
+            let eos_candidates: Vec<i32> =
+                (0..vocab as i32).filter(|&t| tokenizer.is_eos(t)).collect();
             let mut hit_eos = false;
 
             for _ in 0..(max_new_tokens - 1) {
@@ -1654,7 +1820,9 @@ mod tests_qwen3 {
                 let out = drive_step(&runner, &[last], &[kv_len], &[kv_len], &meta)?;
                 assert!(
                     out[0] >= 0 && (out[0] as usize) < vocab,
-                    "prompt #{}: decoded token {} out of vocab", idx, out[0]
+                    "prompt #{}: decoded token {} out of vocab",
+                    idx,
+                    out[0]
                 );
                 generated.push(out[0]);
                 kv_len += 1;
@@ -1663,14 +1831,19 @@ mod tests_qwen3 {
             let decoded = tokenizer.decode(&generated).unwrap_or_default();
             assert!(
                 !decoded.trim().is_empty(),
-                "prompt #{} ('{}') → empty decoded string", idx, prompt
+                "prompt #{} ('{}') → empty decoded string",
+                idx,
+                prompt
             );
             eprintln!("─────────────────────────────────────────");
             eprintln!("[{}] prompt: {:?}", idx, prompt);
             eprintln!("[{}] tokens ({}): {:?}", idx, generated.len(), generated);
-            eprintln!("[{}] decoded: {}{}",
-                idx, decoded,
-                if hit_eos { " <EOS>" } else { "" });
+            eprintln!(
+                "[{}] decoded: {}{}",
+                idx,
+                decoded,
+                if hit_eos { " <EOS>" } else { "" }
+            );
         }
         eprintln!("─────────────────────────────────────────");
 
@@ -1686,7 +1859,10 @@ mod tests_qwen3 {
     fn runner_qwen3_mixed_prefill_decode() -> Result<()> {
         let path = match get_qwen3_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no qwen3 model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no qwen3 model path");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let model = Qwen3::new(&path, device)?;
@@ -1694,7 +1870,12 @@ mod tests_qwen3 {
 
         let max_batch_tokens = 512usize;
         let max_batch_seqs = 2usize;
-        let runner = Arc::new(ModelRunner::new(model, device, max_batch_tokens, max_batch_seqs)?);
+        let runner = Arc::new(ModelRunner::new(
+            model,
+            device,
+            max_batch_tokens,
+            max_batch_seqs,
+        )?);
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
@@ -1702,7 +1883,9 @@ mod tests_qwen3 {
         let prompt0 = "The quick brown fox jumps";
         let toks0: Vec<i32> = runner.model().tokenizer().encode(prompt0)?;
         let p0_len = toks0.len();
-        unsafe { runner.state_mut(0).kv_cache.ensure_capacity(p0_len + 16)?; }
+        unsafe {
+            runner.state_mut(0).kv_cache.ensure_capacity(p0_len + 16)?;
+        }
         let meta = make_prefill_meta(0, p0_len);
         let pos: Vec<i32> = (0..p0_len as i32).collect();
         let out = drive_step(&runner, &toks0, &pos, &[0i32], &meta)?;
@@ -1721,7 +1904,9 @@ mod tests_qwen3 {
         let prompt1 = "I love to";
         let toks1: Vec<i32> = runner.model().tokenizer().encode(prompt1)?;
         let p1_len = toks1.len();
-        unsafe { runner.state_mut(1).kv_cache.ensure_capacity(p1_len + 8)?; }
+        unsafe {
+            runner.state_mut(1).kv_cache.ensure_capacity(p1_len + 8)?;
+        }
 
         let total_tokens = 1 + p1_len;
         let meta = {
@@ -1743,7 +1928,9 @@ mod tests_qwen3 {
         tokens.extend_from_slice(&toks1);
         let mut positions = Vec::with_capacity(total_tokens);
         positions.push(kv0);
-        for i in 0..p1_len { positions.push(i as i32); }
+        for i in 0..p1_len {
+            positions.push(i as i32);
+        }
         let kv_lens = [kv0, 0i32];
 
         let out = drive_step(&runner, &tokens, &positions, &kv_lens, &meta)?;
@@ -1751,7 +1938,9 @@ mod tests_qwen3 {
         for (i, &t) in out[..2].iter().enumerate() {
             assert!(
                 t >= 0 && (t as usize) < vocab,
-                "qwen3 mixed step seq {} token {} out of range", i, t
+                "qwen3 mixed step seq {} token {} out of range",
+                i,
+                t
             );
         }
 
@@ -1760,7 +1949,6 @@ mod tests_qwen3 {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 #[cfg(feature = "cuda")]
@@ -1779,10 +1967,8 @@ mod tests_perf {
     //! （`runner_decode_graph_compare` 里另测）的结果一并打印。
     //!
     //! 跳过条件：模型路径不可达。
+    use super::tests::{drive_step, get_model_path, make_prefill_meta};
     use super::*;
-    use super::tests::{
-        drive_step, get_model_path, make_prefill_meta,
-    };
     use crate::base::DeviceType;
     use crate::model::llm::llama3::Llama3;
     use crate::model::llm::qwen3::Qwen3;
@@ -1821,7 +2007,9 @@ mod tests_perf {
         let mut last_tok = vec![0i32; batch];
         let mut kv_len = vec![0i32; batch];
         for slot in 0..batch {
-            unsafe { runner.state_mut(slot).kv_cache.ensure_capacity(cap)?; }
+            unsafe {
+                runner.state_mut(slot).kv_cache.ensure_capacity(cap)?;
+            }
             let meta = make_prefill_meta(slot as i32, p_len);
             let pos: Vec<i32> = (0..p_len as i32).collect();
             let out = drive_step(runner, &toks, &pos, &[0i32], &meta)?;
@@ -1890,19 +2078,18 @@ mod tests_perf {
 
         eprintln!();
         eprintln!("══════════════════════════════════════════════════════════════════");
-        eprintln!("  {} —— decode benchmark (steps={})", model_name, DECODE_STEPS);
-        eprintln!("══════════════════════════════════════════════════════════════════");
         eprintln!(
-            "{:>6}  {:>14}",
-            "batch", "graph tok/s"
+            "  {} —— decode benchmark (steps={})",
+            model_name, DECODE_STEPS
         );
+        eprintln!("══════════════════════════════════════════════════════════════════");
+        eprintln!("{:>6}  {:>14}", "batch", "graph tok/s");
         eprintln!("{:>6}  {:>14}", "─────", "──────────────");
 
         for &batch in batches {
             // graph only (skip eager to save time)
             let model_b = new_model(path, device)?;
-            let runner_b_owned =
-                ModelRunner::new(model_b, device, max_batch_tokens, batch)?;
+            let runner_b_owned = ModelRunner::new(model_b, device, max_batch_tokens, batch)?;
             let runner_b = Arc::new(runner_b_owned);
             let runner_b_loop = Arc::clone(&runner_b);
             let handle_b = std::thread::spawn(move || runner_b_loop.run());
@@ -1910,10 +2097,7 @@ mod tests_perf {
             runner_b.request_shutdown();
             let _ = handle_b.join();
 
-            eprintln!(
-                "{:>6}  {:>14.1}",
-                batch, graph_tps
-            );
+            eprintln!("{:>6}  {:>14.1}", batch, graph_tps);
         }
         eprintln!("══════════════════════════════════════════════════════════════════");
         Ok(())
@@ -1924,17 +2108,16 @@ mod tests_perf {
     fn perf_llama3_decode_matrix() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no LLAMA3_MODEL_PATH");
+                return Ok(());
+            }
         };
         // max_batch_tokens 要 ≥ batch * 1（每步 batch 个 token）以及 prefill 的 prompt_len。
         // 取 1024 兼顾 batch=8 + prompt 长度。
-        run_matrix::<Llama3, _>(
-            "Llama3-1B",
-            &path,
-            BATCH_SIZES,
-            1024,
-            |p, d| Llama3::new(p, d),
-        )
+        run_matrix::<Llama3, _>("Llama3-1B", &path, BATCH_SIZES, 1024, |p, d| {
+            Llama3::new(p, d)
+        })
     }
 
     #[test]
@@ -1942,15 +2125,14 @@ mod tests_perf {
     fn perf_qwen3_decode_matrix() -> Result<()> {
         let path = match qwen3_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no QWEN3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no QWEN3_MODEL_PATH");
+                return Ok(());
+            }
         };
-        run_matrix::<Qwen3, _>(
-            "Qwen3-4B",
-            &path,
-            BATCH_SIZES,
-            1024,
-            |p, d| Qwen3::new(p, d),
-        )
+        run_matrix::<Qwen3, _>("Qwen3-4B", &path, BATCH_SIZES, 1024, |p, d| {
+            Qwen3::new(p, d)
+        })
     }
 
     /// 只跑 Llama3 BS=1 graph 路径的纯 decode loop（无 eager pass）。
@@ -1960,7 +2142,10 @@ mod tests_perf {
     fn perf_llama3_b1_graph_profile() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no LLAMA3_MODEL_PATH");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_batch_tokens = 1024usize;
@@ -1988,7 +2173,10 @@ mod tests_perf {
     fn perf_llama3_b1_eager_profile() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no LLAMA3_MODEL_PATH");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_batch_tokens = 1024usize;
@@ -2015,7 +2203,10 @@ mod tests_perf {
     fn perf_llama3_b4_eager_profile() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no LLAMA3_MODEL_PATH");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_batch_tokens = 1024usize;
@@ -2042,7 +2233,10 @@ mod tests_perf {
     fn perf_llama3_b4_graph_profile() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no LLAMA3_MODEL_PATH");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_batch_tokens = 1024usize;
@@ -2068,7 +2262,10 @@ mod tests_perf {
     fn perf_llama3_b8_graph_profile() -> Result<()> {
         let path = match get_model_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no LLAMA3_MODEL_PATH"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no LLAMA3_MODEL_PATH");
+                return Ok(());
+            }
         };
         let device = DeviceType::Cuda(0);
         let max_batch_tokens = 1024usize;
@@ -2121,15 +2318,14 @@ mod tests_perf {
     fn perf_llama3_awq_decode_matrix() -> Result<()> {
         let path = match llama3_awq_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no Llama3-AWQ model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no Llama3-AWQ model path");
+                return Ok(());
+            }
         };
-        run_matrix::<Llama3, _>(
-            "Llama3-1B-AWQ",
-            &path,
-            BATCH_SIZES,
-            1024,
-            |p, d| Llama3::new(p, d),
-        )
+        run_matrix::<Llama3, _>("Llama3-1B-AWQ", &path, BATCH_SIZES, 1024, |p, d| {
+            Llama3::new(p, d)
+        })
     }
 
     #[test]
@@ -2137,14 +2333,13 @@ mod tests_perf {
     fn perf_qwen3_awq_decode_matrix() -> Result<()> {
         let path = match qwen3_awq_path() {
             Some(p) => p,
-            None => { eprintln!("skipping: no Qwen3-AWQ model path"); return Ok(()); }
+            None => {
+                eprintln!("skipping: no Qwen3-AWQ model path");
+                return Ok(());
+            }
         };
-        run_matrix::<Qwen3, _>(
-            "Qwen3-4B-AWQ",
-            &path,
-            BATCH_SIZES,
-            1024,
-            |p, d| Qwen3::new(p, d),
-        )
+        run_matrix::<Qwen3, _>("Qwen3-4B-AWQ", &path, BATCH_SIZES, 1024, |p, d| {
+            Qwen3::new(p, d)
+        })
     }
 }

@@ -1,165 +1,208 @@
 //! ZMQ 客户端 — 通过 ZMQ DEALER socket 与 Scheduler 通信
-//!
-//! 架构：
-//! - Tokio handler 通过 `std::sync::mpsc` 向 ZMQ 专用线程发送请求
-//! - ZMQ 线程维护 pending 请求表，按 request_id 匹配响应
-//! - 非流式请求用 `oneshot` 回传完整响应
-//! - 流式请求用 `tokio::sync::mpsc` 逐 chunk 回传
 
 use anyhow::Result;
-use infer_protocol::scheduler_to_server::{ChunkType, InferenceResponse, StreamChunk};
-use infer_protocol::server_to_scheduler::InferenceRequest;
+use infer_protocol::scheduler_to_server::{
+    ChunkType, InferenceMetrics, InferenceResponse, StreamChunk,
+};
+use infer_protocol::server_to_scheduler::{
+    CancelReason, CancelRequest as ServerCancelRequest, InferenceRequest, ServerCommand,
+};
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::TrySendError as TokioTrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 use super::InferClient;
 
-/// 发送到 ZMQ 线程的请求信封
+const CLIENT_COMMAND_BUFFER: usize = 1024;
+const STREAM_CHUNK_BUFFER: usize = 64;
+
 enum RequestEnvelope {
-    /// 非流式：完整响应通过 oneshot 回传
     Oneshot {
         request: InferenceRequest,
         reply_tx: oneshot::Sender<InferenceResponse>,
     },
-    /// 流式：逐 chunk 通过 mpsc 回传
     Stream {
         request: InferenceRequest,
         chunk_tx: mpsc::Sender<StreamChunk>,
     },
+    Cancel {
+        request_id: String,
+        reason: CancelReason,
+    },
 }
 
-/// ZMQ pending 请求记录
 enum PendingRequest {
     Oneshot(oneshot::Sender<InferenceResponse>),
-    Stream(mpsc::Sender<StreamChunk>),
+    Stream {
+        tx: mpsc::Sender<StreamChunk>,
+        deadline: Instant,
+    },
 }
 
-/// ZMQ 客户端
+pub struct StreamHandle {
+    request_id: String,
+    rx: mpsc::Receiver<StreamChunk>,
+    command_tx: SyncSender<RequestEnvelope>,
+    finished: bool,
+}
+
+impl StreamHandle {
+    pub async fn recv(&mut self) -> Option<StreamChunk> {
+        self.rx.recv().await
+    }
+
+    pub fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = self.command_tx.try_send(RequestEnvelope::Cancel {
+            request_id: self.request_id.clone(),
+            reason: CancelReason::ClientDisconnected,
+        });
+    }
+}
+
 pub struct ZmqClient {
-    /// 向 ZMQ 线程发送请求的通道
-    request_tx: std::sync::mpsc::Sender<RequestEnvelope>,
-    /// 请求超时时间
-    timeout: std::time::Duration,
+    command_tx: SyncSender<RequestEnvelope>,
+    timeout: Duration,
 }
 
 impl ZmqClient {
-    /// 创建新的 ZMQ 客户端并启动后台线程
     pub async fn new(endpoint: &str, timeout_secs: u64) -> Result<Self> {
         let endpoint = endpoint.to_string();
-        let (request_tx, request_rx) = std::sync::mpsc::channel::<RequestEnvelope>();
+        let timeout = Duration::from_secs(timeout_secs);
+        let (command_tx, command_rx) =
+            std::sync::mpsc::sync_channel::<RequestEnvelope>(CLIENT_COMMAND_BUFFER);
 
-        // 在专用线程中运行 ZMQ 操作（ZMQ socket 不是 Send，不能跨线程）
         thread::Builder::new()
             .name("zmq-client".to_string())
             .spawn(move || {
-                if let Err(e) = Self::zmq_thread(endpoint, request_rx) {
+                if let Err(e) = Self::zmq_thread(endpoint, command_rx, timeout) {
                     tracing::error!("ZMQ thread exited with error: {:?}", e);
                 }
             })?;
 
         Ok(Self {
-            request_tx,
-            timeout: std::time::Duration::from_secs(timeout_secs),
+            command_tx,
+            timeout,
         })
     }
 
-    /// ZMQ 专用线程 — 处理所有 ZMQ socket 操作
     fn zmq_thread(
         endpoint: String,
-        request_rx: std::sync::mpsc::Receiver<RequestEnvelope>,
+        command_rx: Receiver<RequestEnvelope>,
+        timeout: Duration,
     ) -> Result<()> {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::DEALER)?;
         socket.connect(&endpoint)?;
-        // 非阻塞接收超时 (10ms)
         socket.set_rcvtimeo(10)?;
 
         tracing::info!("ZMQ client connected to {}", endpoint);
-
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
 
         loop {
-            // 1. 从 Tokio 侧接收新请求（非阻塞）
-            while let Ok(envelope) = request_rx.try_recv() {
-                match envelope {
-                    RequestEnvelope::Oneshot { request, reply_tx } => {
+            loop {
+                match command_rx.try_recv() {
+                    Ok(RequestEnvelope::Oneshot { request, reply_tx }) => {
                         let request_id = request.request_id.clone();
                         pending.insert(request_id.clone(), PendingRequest::Oneshot(reply_tx));
-                        Self::send_request(&socket, &request);
+                        if let Err(e) = Self::send_command(&socket, &ServerCommand::Infer(request))
+                        {
+                            tracing::error!("Failed to send request {}: {:?}", request_id, e);
+                            pending.remove(&request_id);
+                        }
                     }
-                    RequestEnvelope::Stream { request, chunk_tx } => {
+                    Ok(RequestEnvelope::Stream { request, chunk_tx }) => {
                         let request_id = request.request_id.clone();
-                        pending.insert(request_id.clone(), PendingRequest::Stream(chunk_tx));
-                        Self::send_request(&socket, &request);
+                        pending.insert(
+                            request_id.clone(),
+                            PendingRequest::Stream {
+                                tx: chunk_tx,
+                                deadline: Instant::now() + timeout,
+                            },
+                        );
+                        if let Err(e) = Self::send_command(&socket, &ServerCommand::Infer(request))
+                        {
+                            tracing::error!(
+                                "Failed to send stream request {}: {:?}",
+                                request_id,
+                                e
+                            );
+                            pending.remove(&request_id);
+                        }
                     }
+                    Ok(RequestEnvelope::Cancel { request_id, reason }) => {
+                        pending.remove(&request_id);
+                        if let Err(e) = Self::send_cancel(&socket, &request_id, reason) {
+                            tracing::error!("Failed to send cancel {}: {:?}", request_id, e);
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
                 }
             }
 
-            // 2. 从 Scheduler 接收响应（非阻塞，10ms 超时）
             match socket.recv_bytes(0) {
-                Ok(_empty_frame) => {
-                    // DEALER: [empty delimiter, data]
-                    match socket.recv_bytes(0) {
-                        Ok(data) => {
-                            Self::handle_response(&mut pending, &data);
-                        }
-                        Err(zmq::Error::EAGAIN) => {}
-                        Err(e) => {
-                            tracing::error!("ZMQ recv data error: {:?}", e);
-                        }
-                    }
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    // 超时，继续循环
-                }
-                Err(e) => {
-                    tracing::error!("ZMQ recv error: {:?}", e);
-                }
+                Ok(_) => match socket.recv_bytes(0) {
+                    Ok(data) => Self::handle_response(&socket, &mut pending, &data),
+                    Err(zmq::Error::EAGAIN) => {}
+                    Err(e) => tracing::error!("ZMQ recv data error: {:?}", e),
+                },
+                Err(zmq::Error::EAGAIN) => {}
+                Err(e) => tracing::error!("ZMQ recv error: {:?}", e),
             }
+
+            Self::cancel_timed_out_streams(&socket, &mut pending);
         }
     }
 
-    /// 序列化并发送请求到 ZMQ socket
-    fn send_request(socket: &zmq::Socket, request: &InferenceRequest) {
-        let data = match rmp_serde::to_vec(request) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("Failed to serialize request {}: {:?}", request.request_id, e);
-                return;
-            }
-        };
-
-        // DEALER 发送: [empty frame, data]
-        if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
-            tracing::error!("ZMQ send empty frame error: {:?}", e);
-            return;
-        }
-        if let Err(e) = socket.send(&data, 0) {
-            tracing::error!("ZMQ send data error: {:?}", e);
-            return;
-        }
-
-        tracing::debug!("Sent request: {}", request.request_id);
+    fn send_command(socket: &zmq::Socket, command: &ServerCommand) -> Result<()> {
+        let data = rmp_serde::to_vec(command)?;
+        socket.send(&b""[..], zmq::SNDMORE)?;
+        socket.send(&data, 0)?;
+        Ok(())
     }
 
-    /// 处理从 Scheduler 收到的响应数据
-    fn handle_response(pending: &mut HashMap<String, PendingRequest>, data: &[u8]) {
-        // 尝试解析为 InferenceResponse (非流式完整响应)
+    fn send_cancel(socket: &zmq::Socket, request_id: &str, reason: CancelReason) -> Result<()> {
+        Self::send_command(
+            socket,
+            &ServerCommand::Cancel(ServerCancelRequest {
+                request_id: request_id.to_string(),
+                reason,
+            }),
+        )
+    }
+
+    fn handle_response(
+        socket: &zmq::Socket,
+        pending: &mut HashMap<String, PendingRequest>,
+        data: &[u8],
+    ) {
         if let Ok(response) = rmp_serde::from_slice::<InferenceResponse>(data) {
             let request_id = response.request_id.clone();
-            tracing::debug!("Received response: {}", request_id);
-
             if let Some(pending_req) = pending.remove(&request_id) {
                 match pending_req {
                     PendingRequest::Oneshot(tx) => {
                         if tx.send(response).is_err() {
-                            tracing::warn!("Response receiver already dropped for request {}", request_id);
+                            tracing::debug!("Response receiver dropped for request {}", request_id);
+                            let _ = Self::send_cancel(
+                                socket,
+                                &request_id,
+                                CancelReason::ClientDisconnected,
+                            );
                         }
                     }
-                    PendingRequest::Stream(tx) => {
-                        // Scheduler 发了完整响应给一个流式请求
-                        // 转换为 Done chunk 后关闭
+                    PendingRequest::Stream { tx, .. } => {
                         let chunk = StreamChunk {
                             request_id: request_id.clone(),
                             chunk_type: ChunkType::Done,
@@ -167,87 +210,139 @@ impl ZmqClient {
                             finish_reason: response.finish_reason.clone(),
                             metrics: Some(response.metrics),
                         };
-                        let _ = tx.blocking_send(chunk);
+                        if tx.try_send(chunk).is_err() {
+                            let _ = Self::send_cancel(
+                                socket,
+                                &request_id,
+                                CancelReason::ClientDisconnected,
+                            );
+                        }
                     }
                 }
             } else {
-                tracing::warn!("Received response for unknown request: {}", request_id);
+                tracing::debug!("Received response for inactive request: {}", request_id);
             }
             return;
         }
 
-        // 尝试解析为 StreamChunk (流式逐 token 响应)
         if let Ok(chunk) = rmp_serde::from_slice::<StreamChunk>(data) {
             let request_id = chunk.request_id.clone();
             let is_done = matches!(chunk.chunk_type, ChunkType::Done | ChunkType::Error);
 
-            tracing::debug!("Received stream chunk: {} (done={})", request_id, is_done);
-
-            if let Some(pending_req) = pending.get(&request_id) {
-                match pending_req {
-                    PendingRequest::Stream(tx) => {
-                        if tx.blocking_send(chunk).is_err() {
-                            // 客户端已断开，清理 pending
-                            tracing::debug!("Stream receiver dropped for {}", request_id);
-                            pending.remove(&request_id);
-                            return;
-                        }
+            let mut cancel_reason = None;
+            if let Some(PendingRequest::Stream { tx, deadline }) = pending.get_mut(&request_id) {
+                *deadline = Instant::now() + Duration::from_secs(180);
+                match tx.try_send(chunk) {
+                    Ok(()) => {}
+                    Err(TokioTrySendError::Full(_)) => {
+                        cancel_reason = Some(CancelReason::StreamTimeout)
                     }
-                    PendingRequest::Oneshot(_) => {
-                        tracing::warn!("Received stream chunk for non-stream request: {}", request_id);
+                    Err(TokioTrySendError::Closed(_)) => {
+                        cancel_reason = Some(CancelReason::ClientDisconnected)
                     }
                 }
-
-                // Done/Error 后清理
-                if is_done {
-                    pending.remove(&request_id);
-                }
+            } else if pending.contains_key(&request_id) {
+                tracing::warn!(
+                    "Received stream chunk for non-stream request: {}",
+                    request_id
+                );
             } else {
-                tracing::warn!("Received chunk for unknown request: {}", request_id);
+                tracing::debug!("Received chunk for inactive request: {}", request_id);
+            }
+
+            if is_done || cancel_reason.is_some() {
+                pending.remove(&request_id);
+            }
+            if let Some(reason) = cancel_reason {
+                let _ = Self::send_cancel(socket, &request_id, reason);
             }
             return;
         }
 
-        tracing::error!("Failed to deserialize response (neither InferenceResponse nor StreamChunk)");
+        tracing::error!(
+            "Failed to deserialize response (neither InferenceResponse nor StreamChunk)"
+        );
+    }
+
+    fn cancel_timed_out_streams(
+        socket: &zmq::Socket,
+        pending: &mut HashMap<String, PendingRequest>,
+    ) {
+        let now = Instant::now();
+        let timed_out: Vec<String> = pending
+            .iter()
+            .filter_map(|(request_id, pending_req)| match pending_req {
+                PendingRequest::Stream { deadline, .. } if *deadline <= now => {
+                    Some(request_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        for request_id in timed_out {
+            if let Some(PendingRequest::Stream { tx, .. }) = pending.remove(&request_id) {
+                let _ = tx.try_send(StreamChunk {
+                    request_id: request_id.clone(),
+                    chunk_type: ChunkType::Error,
+                    token_id: None,
+                    finish_reason: Some("stream timeout".to_string()),
+                    metrics: Some(InferenceMetrics {
+                        total_ms: 0,
+                        num_tokens: 0,
+                        tokens_per_second: 0.0,
+                    }),
+                });
+                let _ = Self::send_cancel(socket, &request_id, CancelReason::StreamTimeout);
+            }
+        }
     }
 }
 
 impl InferClient for ZmqClient {
-    /// 非流式推理
     async fn infer(&self, req: InferenceRequest) -> Result<InferenceResponse> {
         let request_id = req.request_id.clone();
         let (tx, rx) = oneshot::channel();
 
-        self.request_tx
-            .send(RequestEnvelope::Oneshot {
+        self.command_tx
+            .try_send(RequestEnvelope::Oneshot {
                 request: req,
                 reply_tx: tx,
             })
-            .map_err(|_| anyhow::anyhow!("ZMQ thread disconnected"))?;
+            .map_err(|_| anyhow::anyhow!("ZMQ command channel full or disconnected"))?;
 
-        // 等待响应（带超时）
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(anyhow::anyhow!("Response channel closed")),
-            Err(_) => Err(anyhow::anyhow!(
-                "Request {} timeout after {}s",
-                request_id,
-                self.timeout.as_secs()
-            )),
+            Err(_) => {
+                let _ = self.command_tx.try_send(RequestEnvelope::Cancel {
+                    request_id: request_id.clone(),
+                    reason: CancelReason::StreamTimeout,
+                });
+                Err(anyhow::anyhow!(
+                    "Request {} timeout after {}s",
+                    request_id,
+                    self.timeout.as_secs()
+                ))
+            }
         }
     }
 
-    /// 流式推理
-    async fn infer_stream(&self, req: InferenceRequest) -> Result<mpsc::Receiver<StreamChunk>> {
-        let (tx, rx) = mpsc::channel(64);
+    async fn infer_stream(&self, req: InferenceRequest) -> Result<StreamHandle> {
+        let request_id = req.request_id.clone();
+        let (tx, rx) = mpsc::channel(STREAM_CHUNK_BUFFER);
 
-        self.request_tx
-            .send(RequestEnvelope::Stream {
+        self.command_tx
+            .try_send(RequestEnvelope::Stream {
                 request: req,
                 chunk_tx: tx,
             })
-            .map_err(|_| anyhow::anyhow!("ZMQ thread disconnected"))?;
+            .map_err(|_| anyhow::anyhow!("ZMQ command channel full or disconnected"))?;
 
-        Ok(rx)
+        Ok(StreamHandle {
+            request_id,
+            rx,
+            command_tx: self.command_tx.clone(),
+            finished: false,
+        })
     }
 }

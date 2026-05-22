@@ -3,13 +3,13 @@
 //! 将 `mpsc::Receiver<StreamChunk>` 转换为 Axum SSE 流。
 //! 处理增量 UTF-8 decode，确保不发出不完整的字符。
 
+use crate::client::StreamHandle;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
-use infer_protocol::scheduler_to_server::{ChunkType, StreamChunk};
+use infer_protocol::scheduler_to_server::ChunkType;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokenizers::Tokenizer;
-use tokio::sync::mpsc;
 
 use super::types::*;
 
@@ -35,11 +35,7 @@ fn incremental_decode_delta(previous: &mut String, full_text: String) -> Option<
     let delta = full_text[common_len..].to_string();
     *previous = full_text;
 
-    if delta.is_empty() {
-        None
-    } else {
-        Some(delta)
-    }
+    if delta.is_empty() { None } else { Some(delta) }
 }
 
 /// 构建 Chat Completion SSE 流
@@ -47,11 +43,10 @@ pub fn stream_chat_completion(
     request_id: String,
     model: String,
     prompt_tokens: u32,
-    mut rx: mpsc::Receiver<StreamChunk>,
+    mut stream_handle: StreamHandle,
     tokenizer: Tokenizer,
     include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-
     let stream = async_stream::stream! {
         let created = chrono::Utc::now().timestamp();
         let chunk_id = format!("chatcmpl-{}", request_id);
@@ -79,7 +74,7 @@ pub fn stream_chat_completion(
         let mut token_buffer: Vec<u32> = Vec::new();
         let mut decoded_text = String::new();
 
-        while let Some(chunk) = rx.recv().await {
+        while let Some(chunk) = stream_handle.recv().await {
             match chunk.chunk_type {
                 ChunkType::Token => {
                     completion_tokens += 1;
@@ -151,11 +146,13 @@ pub fn stream_chat_completion(
                         ));
                     }
 
+                    stream_handle.mark_finished();
                     // [DONE] 标记
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 ChunkType::Error => {
+                    stream_handle.mark_finished();
                     // 错误时也发 [DONE] 关闭流
                     yield Ok(Event::default().data("[DONE]"));
                     break;
@@ -164,11 +161,7 @@ pub fn stream_chat_completion(
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("")
-    )
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text(""))
 }
 
 /// 构建 Text Completion SSE 流
@@ -176,11 +169,10 @@ pub fn stream_completion(
     request_id: String,
     model: String,
     prompt_tokens: u32,
-    mut rx: mpsc::Receiver<StreamChunk>,
+    mut stream_handle: StreamHandle,
     tokenizer: Tokenizer,
     include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-
     let stream = async_stream::stream! {
         let created = chrono::Utc::now().timestamp();
         let chunk_id = format!("cmpl-{}", request_id);
@@ -189,7 +181,7 @@ pub fn stream_completion(
         let mut token_buffer: Vec<u32> = Vec::new();
         let mut decoded_text = String::new();
 
-        while let Some(chunk) = rx.recv().await {
+        while let Some(chunk) = stream_handle.recv().await {
             match chunk.chunk_type {
                 ChunkType::Token => {
                     completion_tokens += 1;
@@ -255,10 +247,12 @@ pub fn stream_completion(
                         ));
                     }
 
+                    stream_handle.mark_finished();
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 ChunkType::Error => {
+                    stream_handle.mark_finished();
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
@@ -266,9 +260,5 @@ pub fn stream_completion(
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("")
-    )
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text(""))
 }

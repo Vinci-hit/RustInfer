@@ -5,12 +5,11 @@
 
 pub mod zmq_client;
 
-pub use zmq_client::ZmqClient;
+pub use zmq_client::{StreamHandle, ZmqClient};
 
 use anyhow::Result;
-use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+use infer_protocol::scheduler_to_server::InferenceResponse;
 use infer_protocol::server_to_scheduler::InferenceRequest;
-use tokio::sync::mpsc;
 
 /// 推理客户端 trait
 ///
@@ -23,12 +22,9 @@ pub trait InferClient: Send + Sync + 'static {
         req: InferenceRequest,
     ) -> impl std::future::Future<Output = Result<InferenceResponse>> + Send;
 
-    /// 流式推理：发送请求，返回 chunk 接收通道
-    ///
-    /// Scheduler 每生成一个 token 就通过 ZMQ 回传一个 StreamChunk，
-    /// 收到 ChunkType::Done 后通道关闭。
+    /// 流式推理：发送请求，返回带 Drop 取消语义的 stream handle。
     fn infer_stream(
         &self,
         req: InferenceRequest,
-    ) -> impl std::future::Future<Output = Result<mpsc::Receiver<StreamChunk>>> + Send;
+    ) -> impl std::future::Future<Output = Result<StreamHandle>> + Send;
 }

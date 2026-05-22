@@ -9,7 +9,9 @@ use infer_protocol::scheduler_to_server::{
     ChunkType, ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
 };
 use infer_protocol::server_to_scheduler::{InferenceModality, InferenceRequest};
-use infer_protocol::worker_to_scheduler::{DiffusionBatchOutput, DiffusionOutputStatus, StepOutput, WorkerStepError};
+use infer_protocol::worker_to_scheduler::{
+    DiffusionBatchOutput, DiffusionOutputStatus, StepOutput, WorkerStepError,
+};
 
 use crate::cache::kv_manager::KvManager;
 use crate::cache::traits::CacheState;
@@ -17,12 +19,12 @@ use crate::config::{SchedulerConfig, SchedulerMode};
 use crate::error::{Result, SchedulerError};
 use crate::metrics::MetricsRecorder;
 use crate::policy::traits::{BatchPlan, RunningSet, SchedulingPolicy};
-use crate::request::handle::{ClientId, RequestHandle};
 use crate::request::active_table::ActiveRequestTable;
+use crate::request::handle::{ClientId, RequestHandle};
 use crate::request::lifecycle::*;
 use crate::request::queue::WaitingQueue;
 use crate::transport::codec::MsgPackCodec;
-use crate::transport::traits::{FrontendTransport, WorkerTransport};
+use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 use crate::utils::token_budget::TokenBudget;
 use crate::worker_group::WorkerGroup;
 
@@ -127,15 +129,24 @@ where
 
         if is_diffusion {
             let Some(diffusion) = request.diffusion.as_ref() else {
-                tracing::warn!("Rejecting diffusion request {}: missing diffusion payload", request.request_id);
+                tracing::warn!(
+                    "Rejecting diffusion request {}: missing diffusion payload",
+                    request.request_id
+                );
                 return;
             };
             if diffusion.prompt.is_empty() {
-                tracing::warn!("Rejecting diffusion request {}: empty prompt", request.request_id);
+                tracing::warn!(
+                    "Rejecting diffusion request {}: empty prompt",
+                    request.request_id
+                );
                 return;
             }
             if diffusion.prompt_input_ids.is_empty() {
-                tracing::warn!("Rejecting diffusion request {}: empty server-tokenized prompt_input_ids", request.request_id);
+                tracing::warn!(
+                    "Rejecting diffusion request {}: empty server-tokenized prompt_input_ids",
+                    request.request_id
+                );
                 return;
             }
         } else {
@@ -181,11 +192,8 @@ where
             arrival_time: Instant::now(),
         });
 
-        self.active_requests.insert_waiting(
-            meta.id.clone(),
-            meta.input_ids.len(),
-            meta.max_tokens,
-        );
+        self.active_requests
+            .insert_waiting(meta.id.clone(), meta.input_ids.len(), meta.max_tokens);
 
         let handle = RequestHandle::new(client_id, request.stream);
         let seq = Sequence::new(meta.clone(), handle);
@@ -206,7 +214,8 @@ where
         self.iteration_id += 1;
 
         // Build continuation info for prefilling sequences that need more chunks.
-        let prefilling_continuations: Vec<(RequestId, usize)> = self.prefilling
+        let prefilling_continuations: Vec<(RequestId, usize)> = self
+            .prefilling
             .iter()
             .filter(|seq| !seq.has_inflight())
             .map(|seq| (seq.meta.id.clone(), seq.remaining_tokens()))
@@ -232,12 +241,9 @@ where
             evictable_blocks: 0,
         };
 
-        let plan = self.policy.schedule(
-            &self.waiting_queue,
-            &running_set,
-            &budget,
-            &cache_state,
-        );
+        let plan = self
+            .policy
+            .schedule(&self.waiting_queue, &running_set, &budget, &cache_state);
 
         if !plan.has_work() && self.decoding.is_empty() && self.prefilling.is_empty() {
             return Ok(());
@@ -278,11 +284,18 @@ where
 
         for entry in &plan.prefill_batch {
             // Check if this is a continuation (already in prefilling).
-            let is_continuation = self.prefilling.iter().any(|s| s.meta.id == entry.request_id);
+            let is_continuation = self
+                .prefilling
+                .iter()
+                .any(|s| s.meta.id == entry.request_id);
 
             if is_continuation {
                 // Continuation chunk: mark exact KV/prompt segment in flight.
-                if let Some(seq) = self.prefilling.iter_mut().find(|s| s.meta.id == entry.request_id) {
+                if let Some(seq) = self
+                    .prefilling
+                    .iter_mut()
+                    .find(|s| s.meta.id == entry.request_id)
+                {
                     if seq.has_inflight() {
                         continue;
                     }
@@ -292,10 +305,8 @@ where
                         continue;
                     }
                     seq.set_inflight(start, end);
-                    self.current_chunk_sizes.push((
-                        entry.request_id.clone(),
-                        end - start,
-                    ));
+                    self.current_chunk_sizes
+                        .push((entry.request_id.clone(), end - start));
                 }
             } else {
                 // New request: pop from waiting, allocate KV, move to prefilling.
@@ -308,7 +319,10 @@ where
                 };
 
                 let prompt_len = seq.meta.input_ids.len();
-                let (kv_alloc, prefix_match) = match self.kv_manager.allocate_with_prefix(prompt_len, &seq.meta.input_ids) {
+                let (kv_alloc, prefix_match) = match self
+                    .kv_manager
+                    .allocate_with_prefix(prompt_len, &seq.meta.input_ids)
+                {
                     Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("KV allocation failed for {}: {}", entry.request_id, e);
@@ -320,7 +334,9 @@ where
                 self.active_requests
                     .mark_prefilling(&entry.request_id, kv_alloc.clone());
                 let mut prefilling_seq = seq.start_prefill(kv_alloc);
-                prefilling_seq.state.num_computed_tokens = prefix_match.num_cached_tokens.min(prefilling_seq.state.prompt_len);
+                prefilling_seq.state.num_computed_tokens = prefix_match
+                    .num_cached_tokens
+                    .min(prefilling_seq.state.prompt_len);
                 let start = prefilling_seq.state.num_computed_tokens;
                 let scheduled_len = entry.token_range.len();
                 let end = (start + scheduled_len).min(prefilling_seq.state.prompt_len);
@@ -331,10 +347,8 @@ where
                 prefilling_seq.set_inflight(start, end);
                 self.prefilling.push(prefilling_seq);
 
-                self.current_chunk_sizes.push((
-                    entry.request_id.clone(),
-                    end - start,
-                ));
+                self.current_chunk_sizes
+                    .push((entry.request_id.clone(), end - start));
             }
         }
 
@@ -367,14 +381,21 @@ where
         // 1. ACK prefill segments. Final segment moves the sequence to decoding before
         // processing the token generated by that final prefill.
         for sequence_id in output.prefill_done {
-            let Some(idx) = self.prefilling.iter().position(|s| s.meta.sequence_id.0 == sequence_id) else {
+            let Some(idx) = self
+                .prefilling
+                .iter()
+                .position(|s| s.meta.sequence_id.0 == sequence_id)
+            else {
                 tracing::warn!("PrefillDone for unknown sequence_id={}", sequence_id);
                 continue;
             };
 
             let mut seq = self.prefilling.remove(idx);
             let Some(inflight) = seq.ack_inflight() else {
-                tracing::warn!("PrefillDone for sequence_id={} without inflight segment", sequence_id);
+                tracing::warn!(
+                    "PrefillDone for sequence_id={} without inflight segment",
+                    sequence_id
+                );
                 self.prefilling.push(seq);
                 continue;
             };
@@ -387,13 +408,25 @@ where
         }
 
         for need in &output.need_blocks {
-            let Some(seq_idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == need.sequence_id) else {
-                tracing::debug!("NeedBlocks for non-decoding sequence_id={}", need.sequence_id);
+            let Some(seq_idx) = self
+                .decoding
+                .iter()
+                .position(|s| s.meta.sequence_id.0 == need.sequence_id)
+            else {
+                tracing::debug!(
+                    "NeedBlocks for non-decoding sequence_id={}",
+                    need.sequence_id
+                );
                 continue;
             };
-            match self.kv_manager.allocate_decode_blocks(need.request_blocks as usize) {
+            match self
+                .kv_manager
+                .allocate_decode_blocks(need.request_blocks as usize)
+            {
                 Ok(blocks) => {
-                    if let crate::cache::kv_manager::KvAllocation::Blocks(existing) = &mut self.decoding[seq_idx].state.kv_alloc {
+                    if let crate::cache::kv_manager::KvAllocation::Blocks(existing) =
+                        &mut self.decoding[seq_idx].state.kv_alloc
+                    {
                         existing.extend(blocks.iter().copied());
                     }
                     let cmd = WorkerCommand::GrantBlocks(BlockGrantCmd {
@@ -414,11 +447,18 @@ where
             }
         }
 
-        // 2. Process generated tokens. Worker owns EOS/max_tokens decision and returns finished.
+        // 2. Process generated tokens. Worker owns EOS/max_tokens decision and
+        // is the only component allowed to end decode. Scheduler mirrors the
+        // worker-reported lifecycle instead of racing it with a second max-token
+        // check.
         let mut finished_indices: Vec<usize> = Vec::new();
         let mut token_chunks: Vec<(ClientId, StreamChunk)> = Vec::new();
         for token in &output.tokens {
-            if let Some(seq) = self.decoding.iter_mut().find(|s| s.meta.sequence_id.0 == token.sequence_id) {
+            if let Some(seq) = self
+                .decoding
+                .iter_mut()
+                .find(|s| s.meta.sequence_id.0 == token.sequence_id)
+            {
                 seq.append_token(token.token_id);
                 self.active_requests.record_generated_token(&seq.meta.id);
 
@@ -435,12 +475,19 @@ where
                     ));
                 }
 
-                if (token.finished || seq.reached_max_tokens())
-                    && let Some(idx) = self.decoding.iter().position(|s| s.meta.sequence_id.0 == token.sequence_id) {
-                        finished_indices.push(idx);
-                    }
+                if token.finished
+                    && let Some(idx) = self
+                        .decoding
+                        .iter()
+                        .position(|s| s.meta.sequence_id.0 == token.sequence_id)
+                {
+                    finished_indices.push(idx);
+                }
             } else {
-                tracing::warn!("Generated token for unknown sequence_id={}", token.sequence_id);
+                tracing::warn!(
+                    "Generated token for unknown sequence_id={}",
+                    token.sequence_id
+                );
             }
         }
 
@@ -471,12 +518,20 @@ where
         failed_ids.dedup();
 
         for sequence_id in failed_ids {
-            if let Some(idx) = self.prefilling.iter().position(|seq| seq.meta.sequence_id.0 == sequence_id) {
+            if let Some(idx) = self
+                .prefilling
+                .iter()
+                .position(|seq| seq.meta.sequence_id.0 == sequence_id)
+            {
                 let seq = self.prefilling.remove(idx);
                 self.fail_prefilling_sequence(seq, &err.message).await?;
                 continue;
             }
-            if let Some(idx) = self.decoding.iter().position(|seq| seq.meta.sequence_id.0 == sequence_id) {
+            if let Some(idx) = self
+                .decoding
+                .iter()
+                .position(|seq| seq.meta.sequence_id.0 == sequence_id)
+            {
                 let seq = self.decoding.remove(idx);
                 self.fail_decoding_sequence(seq, &err.message).await?;
             }
@@ -484,23 +539,39 @@ where
         Ok(())
     }
 
-    async fn fail_prefilling_sequence(&mut self, seq: Sequence<Prefilling>, message: &str) -> Result<()> {
+    async fn fail_prefilling_sequence(
+        &mut self,
+        seq: Sequence<Prefilling>,
+        message: &str,
+    ) -> Result<()> {
         let request_id = seq.meta.id.clone();
         let client_id = ClientId(seq.handle.client_id.0.clone());
         let stream = seq.meta.stream;
         self.kv_manager.free(seq.state.kv_alloc);
         let _ = self.active_requests.finish(&request_id);
-        self.send_request_error(client_id, request_id, stream, message.to_string(), 0).await
+        self.send_request_error(client_id, request_id, stream, message.to_string(), 0)
+            .await
     }
 
-    async fn fail_decoding_sequence(&mut self, seq: Sequence<Decoding>, message: &str) -> Result<()> {
+    async fn fail_decoding_sequence(
+        &mut self,
+        seq: Sequence<Decoding>,
+        message: &str,
+    ) -> Result<()> {
         let request_id = seq.meta.id.clone();
         let client_id = ClientId(seq.handle.client_id.0.clone());
         let stream = seq.meta.stream;
         let num_tokens = seq.state.output_tokens.len() as u32;
         self.kv_manager.free(seq.state.kv_alloc);
         let _ = self.active_requests.finish(&request_id);
-        self.send_request_error(client_id, request_id, stream, message.to_string(), num_tokens).await
+        self.send_request_error(
+            client_id,
+            request_id,
+            stream,
+            message.to_string(),
+            num_tokens,
+        )
+        .await
     }
 
     async fn send_request_error(
@@ -517,23 +588,33 @@ where
             tokens_per_second: 0.0,
         };
         if stream {
-            self.frontend.send_stream_chunk(&client_id, StreamChunk {
-                request_id: request_id.0.clone(),
-                chunk_type: ChunkType::Error,
-                token_id: None,
-                finish_reason: Some(message),
-                metrics: Some(metrics),
-            }).await
+            self.frontend
+                .send_stream_chunk(
+                    &client_id,
+                    StreamChunk {
+                        request_id: request_id.0.clone(),
+                        chunk_type: ChunkType::Error,
+                        token_id: None,
+                        finish_reason: Some(message),
+                        metrics: Some(metrics),
+                    },
+                )
+                .await
         } else {
-            self.frontend.send_response(&client_id, InferenceResponse {
-                request_id: request_id.0.clone(),
-                status: ResponseStatus::Error,
-                output_token_ids: vec![],
-                images: vec![],
-                finish_reason: Some("error".to_string()),
-                error: Some(message),
-                metrics,
-            }).await
+            self.frontend
+                .send_response(
+                    &client_id,
+                    InferenceResponse {
+                        request_id: request_id.0.clone(),
+                        status: ResponseStatus::Error,
+                        output_token_ids: vec![],
+                        images: vec![],
+                        finish_reason: Some("error".to_string()),
+                        error: Some(message),
+                        metrics,
+                    },
+                )
+                .await
         }
     }
 
@@ -543,8 +624,15 @@ where
         let output: DiffusionBatchOutput = self.codec.decode(&data)?;
 
         for item in output.results {
-            let Some(idx) = self.prefilling.iter().position(|s| s.meta.id.0 == item.request_id) else {
-                tracing::warn!("Diffusion output for unknown request_id={}", item.request_id);
+            let Some(idx) = self
+                .prefilling
+                .iter()
+                .position(|s| s.meta.id.0 == item.request_id)
+            else {
+                tracing::warn!(
+                    "Diffusion output for unknown request_id={}",
+                    item.request_id
+                );
                 continue;
             };
             let seq = self.prefilling.remove(idx);
@@ -556,18 +644,20 @@ where
             let elapsed_ms = seq.meta.arrival_time.elapsed().as_millis() as u64;
             let (status, images, error) = match item.status {
                 DiffusionOutputStatus::Success => {
-                    let images = item.image.into_iter().map(|image| ImageOutput {
-                        width: image.width,
-                        height: image.height,
-                        channels: image.channels,
-                        format: image.format,
-                        data: image.data,
-                    }).collect();
+                    let images = item
+                        .image
+                        .into_iter()
+                        .map(|image| ImageOutput {
+                            width: image.width,
+                            height: image.height,
+                            channels: image.channels,
+                            format: image.format,
+                            data: image.data,
+                        })
+                        .collect();
                     (ResponseStatus::Success, images, None)
                 }
-                DiffusionOutputStatus::Error => {
-                    (ResponseStatus::Error, vec![], item.error)
-                }
+                DiffusionOutputStatus::Error => (ResponseStatus::Error, vec![], item.error),
             };
 
             let response = InferenceResponse {
@@ -586,7 +676,11 @@ where
 
             self.frontend.send_response(&client_id, response).await?;
             self.metrics.record_completion(elapsed_ms, 0);
-            tracing::info!("Completed diffusion request {} in {}ms", request_id, elapsed_ms);
+            tracing::info!(
+                "Completed diffusion request {} in {}ms",
+                request_id,
+                elapsed_ms
+            );
         }
 
         Ok(())
@@ -631,13 +725,18 @@ where
         };
 
         if stream {
-            self.frontend.send_stream_chunk(&client_id, StreamChunk {
-                request_id: request_id.0.clone(),
-                chunk_type: ChunkType::Done,
-                token_id: None,
-                finish_reason: Some("stop".to_string()),
-                metrics: Some(metrics.clone()),
-            }).await?;
+            self.frontend
+                .send_stream_chunk(
+                    &client_id,
+                    StreamChunk {
+                        request_id: request_id.0.clone(),
+                        chunk_type: ChunkType::Done,
+                        token_id: None,
+                        finish_reason: Some("stop".to_string()),
+                        metrics: Some(metrics.clone()),
+                    },
+                )
+                .await?;
         } else {
             let response = InferenceResponse {
                 request_id: request_id.0.clone(),
@@ -655,7 +754,10 @@ where
 
         tracing::info!(
             "Completed {}: {} tokens in {}ms ({:.1} tok/s)",
-            request_id, num_tokens, elapsed_ms, tokens_per_second,
+            request_id,
+            num_tokens,
+            elapsed_ms,
+            tokens_per_second,
         );
 
         Ok(())
@@ -699,32 +801,39 @@ where
     #[allow(dead_code)]
     pub(crate) async fn cancel_request(&mut self, request_id: RequestId) -> Result<()> {
         self.active_requests.mark_cancelling(&request_id);
+
         if self.waiting_queue.remove(&request_id).is_some() {
-            let _ = self.active_requests.finish(&request_id);
+            self.active_requests.finish(&request_id);
             return Ok(());
         }
 
-        let sequence_id = self.prefilling
-            .iter()
-            .find(|s| s.meta.id == request_id)
-            .map(|s| s.meta.sequence_id.0)
-            .or_else(|| self.decoding
-                .iter()
-                .find(|s| s.meta.id == request_id)
-                .map(|s| s.meta.sequence_id.0));
-
-        if let Some(sequence_id) = sequence_id {
+        if let Some(idx) = self.prefilling.iter().position(|s| s.meta.id == request_id) {
+            let seq = self.prefilling.remove(idx);
+            let sequence_id = seq.meta.sequence_id.0;
+            self.kv_manager.free(seq.state.kv_alloc);
+            self.active_requests.finish(&request_id);
             let data = crate::core::batch_builder::build_cancel_request(sequence_id, &self.codec)?;
-            self.worker.send_batch(data).await
-        } else {
-            Ok(())
+            return self.worker.send_batch(data).await;
         }
+
+        if let Some(idx) = self.decoding.iter().position(|s| s.meta.id == request_id) {
+            let seq = self.decoding.remove(idx);
+            let sequence_id = seq.meta.sequence_id.0;
+            let prompt_tokens = seq.meta.input_ids.clone();
+            self.kv_manager
+                .free_finished(&prompt_tokens, seq.state.kv_alloc);
+            self.active_requests.finish(&request_id);
+            let data = crate::core::batch_builder::build_cancel_request(sequence_id, &self.codec)?;
+            return self.worker.send_batch(data).await;
+        }
+
+        Ok(())
     }
 
     #[allow(dead_code)]
-    /// Receive a request from the frontend transport.
-    pub(crate) async fn recv_frontend_request(&mut self) -> Result<(ClientId, InferenceRequest)> {
-        self.frontend.recv_request().await
+    /// Receive an event from the frontend transport.
+    pub(crate) async fn recv_frontend_event(&mut self) -> Result<FrontendEvent> {
+        self.frontend.recv_event().await
     }
 
     #[allow(dead_code)]
@@ -743,19 +852,16 @@ where
         let has_work = self.has_pending_work() || self.worker_busy();
 
         if has_work {
-            // Both branches active.
             let frontend = &mut self.frontend;
             let worker = &mut self.worker;
 
             tokio::select! {
-                biased;
                 result = worker.recv_step_output() => EngineEvent::WorkerOutput(result),
-                result = frontend.recv_request() => EngineEvent::NewRequest(Box::new(result)),
+                result = frontend.recv_event() => EngineEvent::Frontend(Box::new(result)),
             }
         } else {
-            // Idle: only listen for new requests.
-            let result = self.frontend.recv_request().await;
-            EngineEvent::NewRequest(Box::new(result))
+            let result = self.frontend.recv_event().await;
+            EngineEvent::Frontend(Box::new(result))
         }
     }
 }
@@ -776,11 +882,13 @@ mod tests {
     use crate::config::{KvCacheMode, SchedulerConfig};
     use crate::policy::ContinuousBatchingPolicy;
     use crate::request::handle::{ClientId, RequestHandle};
-    use crate::request::lifecycle::{InFlightPrefillSegment, Prefilling, Priority, RequestId, RequestMeta, SamplingParams, Sequence, SequenceId};
+    use crate::request::lifecycle::{
+        InFlightPrefillSegment, Prefilling, Priority, RequestId, RequestMeta, SamplingParams,
+        Sequence, SequenceId,
+    };
     use crate::transport::codec::{Codec, MsgPackCodec};
-    use crate::transport::traits::{FrontendTransport, WorkerTransport};
+    use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
     use crate::worker_group::WorkerGroup;
-    use infer_protocol::server_to_scheduler::InferenceRequest;
     use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
     use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerReady};
 
@@ -789,15 +897,23 @@ mod tests {
 
     #[async_trait]
     impl FrontendTransport for MockFrontend {
-        async fn recv_request(&mut self) -> Result<(ClientId, InferenceRequest)> {
+        async fn recv_event(&mut self) -> Result<FrontendEvent> {
             Err(crate::error::SchedulerError::Shutdown)
         }
 
-        async fn send_response(&mut self, _client: &ClientId, _response: InferenceResponse) -> Result<()> {
+        async fn send_response(
+            &mut self,
+            _client: &ClientId,
+            _response: InferenceResponse,
+        ) -> Result<()> {
             Ok(())
         }
 
-        async fn send_stream_chunk(&mut self, _client: &ClientId, _chunk: StreamChunk) -> Result<()> {
+        async fn send_stream_chunk(
+            &mut self,
+            _client: &ClientId,
+            _chunk: StreamChunk,
+        ) -> Result<()> {
             Ok(())
         }
     }
@@ -892,7 +1008,11 @@ mod tests {
         let codec = MsgPackCodec;
         let output = StepOutput {
             prefill_done: vec![7],
-            tokens: vec![GeneratedToken { sequence_id: 7, token_id: 42, finished: false }],
+            tokens: vec![GeneratedToken {
+                sequence_id: 7,
+                token_id: 42,
+                finished: false,
+            }],
             need_blocks: vec![NeedBlocksRequest {
                 sequence_id: 7,
                 current_blocks: 1,
@@ -901,7 +1021,9 @@ mod tests {
             }],
             error: None,
         };
-        engine.handle_step_output_llm(codec.encode(&output)?).await?;
+        engine
+            .handle_step_output_llm(codec.encode(&output)?)
+            .await?;
 
         assert!(engine.prefilling.is_empty());
         assert_eq!(engine.decoding.len(), 1);

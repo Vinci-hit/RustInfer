@@ -4,12 +4,11 @@
 
 use async_trait::async_trait;
 use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
-use infer_protocol::server_to_scheduler::InferenceRequest;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, SchedulerError};
 use crate::request::handle::ClientId;
-use crate::transport::traits::{FrontendTransport, WorkerTransport};
+use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Channel Frontend Transport
@@ -17,31 +16,31 @@ use crate::transport::traits::{FrontendTransport, WorkerTransport};
 
 /// Frontend transport using in-process channels (for testing).
 pub struct ChannelFrontendTransport {
-    request_rx: mpsc::UnboundedReceiver<(ClientId, InferenceRequest)>,
+    event_rx: mpsc::UnboundedReceiver<FrontendEvent>,
     response_tx: mpsc::UnboundedSender<(ClientId, InferenceResponse)>,
     chunk_tx: mpsc::UnboundedSender<(ClientId, StreamChunk)>,
 }
 
 /// Handle for the test harness to send requests and receive responses.
 pub struct ChannelFrontendHandle {
-    pub request_tx: mpsc::UnboundedSender<(ClientId, InferenceRequest)>,
+    pub event_tx: mpsc::UnboundedSender<FrontendEvent>,
     pub response_rx: mpsc::UnboundedReceiver<(ClientId, InferenceResponse)>,
     pub chunk_rx: mpsc::UnboundedReceiver<(ClientId, StreamChunk)>,
 }
 
 /// Create a paired frontend transport and test handle.
 pub fn channel_frontend() -> (ChannelFrontendTransport, ChannelFrontendHandle) {
-    let (req_tx, req_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (resp_tx, resp_rx) = mpsc::unbounded_channel();
     let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
 
     let transport = ChannelFrontendTransport {
-        request_rx: req_rx,
+        event_rx,
         response_tx: resp_tx,
         chunk_tx,
     };
     let handle = ChannelFrontendHandle {
-        request_tx: req_tx,
+        event_tx,
         response_rx: resp_rx,
         chunk_rx,
     };
@@ -50,14 +49,15 @@ pub fn channel_frontend() -> (ChannelFrontendTransport, ChannelFrontendHandle) {
 
 #[async_trait]
 impl FrontendTransport for ChannelFrontendTransport {
-    async fn recv_request(&mut self) -> Result<(ClientId, InferenceRequest)> {
-        self.request_rx
-            .recv()
-            .await
-            .ok_or(SchedulerError::Shutdown)
+    async fn recv_event(&mut self) -> Result<FrontendEvent> {
+        self.event_rx.recv().await.ok_or(SchedulerError::Shutdown)
     }
 
-    async fn send_response(&mut self, client: &ClientId, response: InferenceResponse) -> Result<()> {
+    async fn send_response(
+        &mut self,
+        client: &ClientId,
+        response: InferenceResponse,
+    ) -> Result<()> {
         self.response_tx
             .send((ClientId(client.0.clone()), response))
             .map_err(|_| SchedulerError::Shutdown)
@@ -112,9 +112,6 @@ impl WorkerTransport for ChannelWorkerTransport {
     }
 
     async fn recv_step_output(&mut self) -> Result<Vec<u8>> {
-        self.output_rx
-            .recv()
-            .await
-            .ok_or(SchedulerError::Shutdown)
+        self.output_rx.recv().await.ok_or(SchedulerError::Shutdown)
     }
 }

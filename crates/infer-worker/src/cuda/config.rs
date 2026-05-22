@@ -13,7 +13,11 @@ const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
 /// 形状的 graph；同一 key 里只保存一张 graph（后 capture 的覆盖前一张）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
-    LlmDecode { batch: usize, buffer_id: usize },
+    LlmDecode {
+        batch: usize,
+        buffer_id: usize,
+        slot_signature: u64,
+    },
     LlmMixedPreAttn(usize),
     LlmMixedPostAttn(usize),
     Denoise {

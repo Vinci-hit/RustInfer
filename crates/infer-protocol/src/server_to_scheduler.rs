@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ServerCommand {
+    Infer(InferenceRequest),
+    Cancel(CancelRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRequest {
+    pub request_id: String,
+    pub reason: CancelReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancelReason {
+    ClientDisconnected,
+    StreamTimeout,
+    ServerShutdown,
+}
+
 /// Server -> Scheduler 的推理请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -93,11 +112,27 @@ impl Default for DiffusionRequest {
     }
 }
 
-fn default_max_tokens() -> usize { 2048 }
-fn default_temperature() -> f32 { 1.0 }
-fn default_top_p() -> f32 { 1.0 }
-fn default_top_k() -> i32 { -1 }
-fn default_image_height() -> u32 { 1024 }
-fn default_image_width() -> u32 { 1024 }
-fn default_num_inference_steps() -> usize { 8 }
-fn default_output_format() -> String { "rgb8".to_string() }
+fn default_max_tokens() -> usize {
+    2048
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
+fn default_top_k() -> i32 {
+    -1
+}
+fn default_image_height() -> u32 {
+    1024
+}
+fn default_image_width() -> u32 {
+    1024
+}
+fn default_num_inference_steps() -> usize {
+    8
+}
+fn default_output_format() -> String {
+    "rgb8".to_string()
+}
