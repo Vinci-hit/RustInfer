@@ -229,6 +229,7 @@ impl Attention {
                     plan.paged_max_blocks_per_seq,
                     plan.paged_block_size,
                     plan.kv_lens_dev,
+                    plan.workspace,
                     o,
                     cuda_cfg,
                 )

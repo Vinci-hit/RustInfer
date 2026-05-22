@@ -132,6 +132,7 @@ impl FlashAttnDecodeBatch {
         max_blocks_per_seq: usize,
         block_size: usize,
         kv_lens_dev: *const i32,
+        workspace: *mut f32,
         o: &mut Tensor,
         cuda_config: Option<&OpConfig>,
     ) -> Result<()> {
@@ -158,6 +159,7 @@ impl FlashAttnDecodeBatch {
                 max_blocks_per_seq,
                 block_size,
                 kv_lens_dev,
+                workspace,
                 batch,
                 self.num_q_heads,
                 self.num_kv_heads,
@@ -439,6 +441,10 @@ mod tests {
         let mut kvlen_dev = Tensor::new(&[batch], DataType::I32, device)?;
         kvlen_dev.write_from_i32_host(kv_lens, batch)?;
 
+        let ws_bytes = FlashAttnDecodeBatch::workspace_bytes(batch, num_q_heads, head_dim);
+        let ws_len = ws_bytes.div_ceil(std::mem::size_of::<f32>());
+        let workspace = Tensor::new(&[ws_len], DataType::F32, device)?;
+
         let out_dtype = match dt { DT::Bf16 => DataType::BF16, DT::Fp16 => DataType::F16 };
         let mut o_tensor = Tensor::new(&[batch, num_q_heads, head_dim], out_dtype, device)?;
         let op = FlashAttnDecodeBatch::new(num_q_heads, num_kv_heads, head_dim)?;
@@ -452,6 +458,7 @@ mod tests {
                 max_blocks_per_seq,
                 block_size,
                 kvlen_dev.as_i32()?.data_ptr(),
+                workspace.as_f32()?.data_ptr() as *mut f32,
                 &mut o_tensor,
                 Some(&cfg),
             )?;
@@ -516,6 +523,7 @@ mod tests {
         run_paged_case(DT::Bf16, 8, 2, 128, &[0, 17, 33], 16)?;
         run_paged_case(DT::Fp16, 4, 2, 64, &[1, 19, 32], 16)?;
         run_paged_case(DT::Bf16, 8, 2, 256, &[7, 18], 16)?;
+        run_paged_case(DT::Bf16, 16, 4, 128, &[100, 2048, 500, 99], 16)?;
         Ok(())
     }
 

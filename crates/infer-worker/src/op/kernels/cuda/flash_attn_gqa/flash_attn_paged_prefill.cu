@@ -2,10 +2,9 @@
 // -----------------------------------------------------------------------------
 // Paged ragged/prefill attention over a global KV pool.
 //
-// Public legacy wrappers keep the original one-query-row fallback ABI.  The
-// optimized wrappers below use CuTe/SM80 MMA and a ragged Q-tile schedule:
-// one CTA per (request, q_tile, q_head).  Q/O are packed affine tensors, while
-// K/V are gathered from a paged pool through block_tables.
+// Optimized wrappers use CuTe/SM80 MMA and a ragged Q-tile schedule: one CTA
+// per (request, q_tile, q_head).  Q/O are packed affine tensors, while K/V are
+// gathered from a paged pool through block_tables.
 // -----------------------------------------------------------------------------
 
 #include "flash_attn_gqa.h"
@@ -22,132 +21,6 @@
 #include <cstdio>
 #include <cmath>
 #include <mutex>
-
-// =============================================================================
-// Legacy correctness fallback: one CTA per (packed query token, q_head), thread 0.
-// =============================================================================
-template <typename Elem>
-__global__ void paged_prefill_naive_kernel(
-    const Elem* __restrict__ q,
-    int64_t qss,
-    int64_t qsh,
-    const Elem* __restrict__ k_pool,
-    const Elem* __restrict__ v_pool,
-    Elem* __restrict__ o,
-    int64_t oss,
-    int64_t osh,
-    const uint32_t* __restrict__ block_tables,
-    int max_blocks_per_seq,
-    int block_size,
-    const int32_t* __restrict__ kv_lens,
-    const int32_t* __restrict__ cu_q_lens,
-    int batch,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    float softmax_scale,
-    int is_causal)
-{
-    const int q_row_idx = blockIdx.x;
-    const int qh = blockIdx.y;
-    if (threadIdx.x != 0) return;
-
-    int seq = 0;
-    while (seq + 1 < batch && q_row_idx >= cu_q_lens[seq + 1]) ++seq;
-    if (seq >= batch) return;
-
-    const int q_start = cu_q_lens[seq];
-    const int q_end = cu_q_lens[seq + 1];
-    const int local_q = q_row_idx - q_start;
-    const int q_len = q_end - q_start;
-    const int kv_len = kv_lens[seq];
-
-    Elem* o_row = o + static_cast<int64_t>(q_row_idx) * oss + static_cast<int64_t>(qh) * osh;
-    if (kv_len <= 0 || q_len <= 0) {
-        for (int d = 0; d < head_dim; ++d) o_row[d] = PagedET<Elem>::from_f(0.0f);
-        return;
-    }
-
-    const int kvh = qh / (num_q_heads / num_kv_heads);
-    const Elem* q_row = q + static_cast<int64_t>(q_row_idx) * qss + static_cast<int64_t>(qh) * qsh;
-
-    int k_upper = kv_len;
-    if (is_causal) {
-        const int past = kv_len - q_len;
-        k_upper = past + local_q + 1;
-        if (k_upper < 0) k_upper = 0;
-        if (k_upper > kv_len) k_upper = kv_len;
-    }
-    if (k_upper <= 0) {
-        for (int d = 0; d < head_dim; ++d) o_row[d] = PagedET<Elem>::from_f(0.0f);
-        return;
-    }
-
-    float row_max = -INFINITY;
-    for (int t = 0; t < k_upper; ++t) {
-        const int block_idx = t / block_size;
-        const int block_off = t - block_idx * block_size;
-        const uint32_t physical_block = block_tables[seq * max_blocks_per_seq + block_idx];
-        const Elem* k_row = paged_kv_row(k_pool, physical_block, block_off, block_size, num_kv_heads, kvh, head_dim);
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += PagedET<Elem>::to_f(q_row[d]) * PagedET<Elem>::to_f(k_row[d]);
-        }
-        row_max = fmaxf(row_max, score * softmax_scale);
-    }
-
-    for (int d = 0; d < head_dim; ++d) {
-        float denom = 0.0f;
-        float acc = 0.0f;
-        for (int t = 0; t < k_upper; ++t) {
-            const int block_idx = t / block_size;
-            const int block_off = t - block_idx * block_size;
-            const uint32_t physical_block = block_tables[seq * max_blocks_per_seq + block_idx];
-            const Elem* k_row = paged_kv_row(k_pool, physical_block, block_off, block_size, num_kv_heads, kvh, head_dim);
-            const Elem* v_row = paged_kv_row(v_pool, physical_block, block_off, block_size, num_kv_heads, kvh, head_dim);
-            float score = 0.0f;
-            for (int qd = 0; qd < head_dim; ++qd) {
-                score += PagedET<Elem>::to_f(q_row[qd]) * PagedET<Elem>::to_f(k_row[qd]);
-            }
-            const float w = expf(score * softmax_scale - row_max);
-            denom += w;
-            acc += w * PagedET<Elem>::to_f(v_row[d]);
-        }
-        o_row[d] = PagedET<Elem>::from_f(denom == 0.0f ? 0.0f : acc / denom);
-    }
-}
-
-template <typename Elem>
-static inline cudaError_t launch_paged_prefill_naive(
-    const Elem* q,
-    int64_t qss,
-    int64_t qsh,
-    const Elem* k_pool,
-    const Elem* v_pool,
-    Elem* o,
-    int64_t oss,
-    int64_t osh,
-    const uint32_t* block_tables,
-    int max_blocks_per_seq,
-    int block_size,
-    const int32_t* kv_lens,
-    const int32_t* cu_q_lens,
-    int batch,
-    int total_q_tokens,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    float softmax_scale,
-    int is_causal,
-    cudaStream_t stream)
-{
-    if (batch <= 0 || total_q_tokens <= 0) return cudaSuccess;
-    paged_prefill_naive_kernel<Elem><<<dim3(total_q_tokens, num_q_heads), dim3(1), 0, stream>>>(
-        q, qss, qsh, k_pool, v_pool, o, oss, osh,
-        block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,
-        batch, num_q_heads, num_kv_heads, head_dim, softmax_scale, is_causal);
-    return cudaGetLastError();
-}
 
 namespace flash_attn_paged_prefill {
 
@@ -741,11 +614,8 @@ static cudaError_t launch_dispatch(
                                      kv_lens,cu_q_lens,block2req,block2tile,total_q_tiles,
                                      num_q_heads,num_kv_heads,softmax_scale,is_causal,stream);
     default:
-        return launch_paged_prefill_naive<Elem>(
-            q, qss, qsh, k_pool, v_pool, o, oss, osh,
-            block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,
-            batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
-            softmax_scale, is_causal, stream);
+        fprintf(stderr, "[flash_attn_paged_ragged_cute] unsupported head_dim=%d (supported: 64, 128, 192, 256)\n", head_dim);
+        return cudaErrorInvalidValue;
     }
 }
 
@@ -766,14 +636,11 @@ extern "C" void launch_flash_attn_paged_ragged_bf16(
     float softmax_scale, int is_causal,
     cudaStream_t stream)
 {
-    cudaError_t err = launch_paged_prefill_naive<__nv_bfloat16>(
-        q, qss, qsh, k_pool, v_pool, o, oss, osh,
-        block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,
-        batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
-        softmax_scale, is_causal, stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[flash_attn_paged_ragged_bf16] launch error: %s\n", cudaGetErrorString(err));
-    }
+    (void)q; (void)qss; (void)qsh; (void)k_pool; (void)v_pool; (void)o; (void)oss; (void)osh;
+    (void)block_tables; (void)max_blocks_per_seq; (void)block_size; (void)kv_lens; (void)cu_q_lens;
+    (void)batch; (void)total_q_tokens; (void)num_q_heads; (void)num_kv_heads; (void)head_dim;
+    (void)softmax_scale; (void)is_causal; (void)stream;
+    fprintf(stderr, "[flash_attn_paged_ragged_bf16] legacy ABI removed; use launch_flash_attn_paged_ragged_cute_bf16 with block2req/block2tile\n");
 }
 
 extern "C" void launch_flash_attn_paged_ragged_fp16(
@@ -791,14 +658,11 @@ extern "C" void launch_flash_attn_paged_ragged_fp16(
     float softmax_scale, int is_causal,
     cudaStream_t stream)
 {
-    cudaError_t err = launch_paged_prefill_naive<__half>(
-        q, qss, qsh, k_pool, v_pool, o, oss, osh,
-        block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,
-        batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
-        softmax_scale, is_causal, stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[flash_attn_paged_ragged_fp16] launch error: %s\n", cudaGetErrorString(err));
-    }
+    (void)q; (void)qss; (void)qsh; (void)k_pool; (void)v_pool; (void)o; (void)oss; (void)osh;
+    (void)block_tables; (void)max_blocks_per_seq; (void)block_size; (void)kv_lens; (void)cu_q_lens;
+    (void)batch; (void)total_q_tokens; (void)num_q_heads; (void)num_kv_heads; (void)head_dim;
+    (void)softmax_scale; (void)is_causal; (void)stream;
+    fprintf(stderr, "[flash_attn_paged_ragged_fp16] legacy ABI removed; use launch_flash_attn_paged_ragged_cute_fp16 with block2req/block2tile\n");
 }
 
 extern "C" void launch_flash_attn_paged_ragged_cute_bf16(

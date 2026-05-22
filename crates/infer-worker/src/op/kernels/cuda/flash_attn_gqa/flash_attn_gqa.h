@@ -153,6 +153,7 @@ void launch_flash_attn_paged_decode_bf16(
     int max_blocks_per_seq,
     int block_size,
     const int32_t* kv_lens,
+    float* workspace,
     int batch, int num_q_heads, int num_kv_heads, int head_dim,
     float softmax_scale,
     cudaStream_t stream);
@@ -166,6 +167,7 @@ void launch_flash_attn_paged_decode_fp16(
     int max_blocks_per_seq,
     int block_size,
     const int32_t* kv_lens,
+    float* workspace,
     int batch, int num_q_heads, int num_kv_heads, int head_dim,
     float softmax_scale,
     cudaStream_t stream);
