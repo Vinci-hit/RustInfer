@@ -892,15 +892,11 @@ impl<M: LlmModel> SubScheduler<M> {
     /// 从指定 Runner buffer 读本步 output tokens (D2H)。
     fn read_output_tokens(&self, buffer_id: usize) -> Result<Vec<i32>> {
         let num_outputs = self.step_items_by_buffer[buffer_id].len();
-        let tokens_out: Vec<i32> = unsafe { self.runner.output_tokens_dev_for(buffer_id) }
-            .to_cpu()?
-            .as_i32()?
-            .as_slice()?
-            .iter()
-            .take(num_outputs)
-            .copied()
-            .collect();
-        Ok(tokens_out)
+        // Read from pre-copied host buffer — no CUDA API call, no legacy stream
+        // dependency. Runner already did D2H via cudaMemcpyAsync on the worker
+        // stream and sync'd before signaling output_ready.
+        let host_slice = unsafe { self.runner.output_tokens_host_for(buffer_id) };
+        Ok(host_slice.iter().take(num_outputs).copied().collect())
     }
 
     /// 按指定 buffer 的 step_items 解释 runner output，更新 Worker 内部 decode 状态并发送精简 StepOutput。

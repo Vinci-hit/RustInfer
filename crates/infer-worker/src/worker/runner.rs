@@ -237,6 +237,11 @@ pub struct ModelRunner<M: LlmModel> {
     states: UnsafeCell<Vec<InferenceState>>,
     /// Per-step-buffer sampling result tensors, `[max_batch_seqs] i32`, device.
     output_tokens_dev: UnsafeCell<Vec<crate::tensor::Tensor>>,
+    /// Per-step-buffer host-side output tokens, pre-copied by runner via
+    /// cudaMemcpyAsync on the worker stream. Sub_scheduler reads these directly
+    /// without any CUDA API call, eliminating legacy-stream conflicts during
+    /// CUDA Graph capture on other buffers.
+    output_tokens_host: UnsafeCell<Vec<Vec<i32>>>,
     /// 每个 step buffer 对应的 host meta。server 写、runner 读一次就释放该 buffer 的 input slot。
     meta_slots: UnsafeCell<Vec<StepMeta>>,
 
@@ -295,6 +300,9 @@ impl<M: LlmModel> ModelRunner<M> {
                 device,
             )?);
         }
+        let output_tokens_host: Vec<Vec<i32>> = (0..STEP_BUFFER_COUNT)
+            .map(|_| vec![0i32; max_batch_seqs])
+            .collect();
 
         // 4. CUDA config（stream / cublas handle）
         #[cfg(feature = "cuda")]
@@ -312,6 +320,7 @@ impl<M: LlmModel> ModelRunner<M> {
             workspaces: UnsafeCell::new(workspaces),
             states: UnsafeCell::new(states),
             output_tokens_dev: UnsafeCell::new(output_tokens_dev),
+            output_tokens_host: UnsafeCell::new(output_tokens_host),
             meta_slots: UnsafeCell::new(
                 (0..STEP_BUFFER_COUNT).map(|_| StepMeta::zeroed()).collect(),
             ),
@@ -481,6 +490,17 @@ impl<M: LlmModel> ModelRunner<M> {
         &outputs[buffer_id]
     }
 
+    /// Pre-copied host output tokens for a specific buffer. Runner copies D2H
+    /// on the worker stream before signaling output_ready, so this slice is
+    /// safe to read from any thread without CUDA calls once output_ready=true.
+    ///
+    /// # Safety
+    /// Caller must only access after `output_ready[buffer_id]=true`.
+    pub unsafe fn output_tokens_host_for(&self, buffer_id: usize) -> &[i32] {
+        let hosts = unsafe { &*self.output_tokens_host.get() };
+        &hosts[buffer_id]
+    }
+
     /// 读任意 buffer 是否有 output_ready。兼容测试旧接口。
     pub fn output_ready(&self) -> bool {
         (0..STEP_BUFFER_COUNT).any(|buffer_id| self.output_ready_for(buffer_id))
@@ -639,14 +659,41 @@ impl<M: LlmModel> ModelRunner<M> {
                 return;
             }
 
-            // 3.5. Sync worker stream before signaling output_ready. This ensures
-            // all GPU kernels (including graph replay) have completed writing to
-            // the output buffer. Without this, the sub_scheduler's D2H cudaMemcpy
-            // (on the legacy/default stream) can conflict with a concurrent CUDA
-            // Graph capture on the worker stream for another buffer.
+            // 3.5. D2H output tokens on worker stream, then sync.
+            // This ensures sub_scheduler can read output from host memory directly
+            // without any CUDA API call — eliminating legacy-stream conflicts
+            // during concurrent CUDA Graph capture on other buffers.
             #[cfg(feature = "cuda")]
             {
                 let cfg = unsafe { &*self.cuda_cfg.get() };
+                let output_dev = unsafe {
+                    let outputs = &*self.output_tokens_dev.get();
+                    &outputs[meta.step_buffer_id]
+                };
+                let host_buf = unsafe {
+                    let hosts = &mut *self.output_tokens_host.get();
+                    &mut hosts[meta.step_buffer_id]
+                };
+                let num_seqs = meta.num_seqs();
+                let nbytes = num_seqs * std::mem::size_of::<i32>();
+                if nbytes > 0 {
+                    let rc = unsafe {
+                        crate::cuda::ffi::cudaMemcpyAsync(
+                            host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            output_dev.data_ptr() as *const std::ffi::c_void,
+                            nbytes,
+                            crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                            cfg.stream,
+                        )
+                    };
+                    if rc != crate::cuda::ffi::cudaError_cudaSuccess {
+                        self.set_error(format!("D2H cudaMemcpyAsync failed: {:?}", rc));
+                        self.flags.output_ready[buffer_id].store(true, Ordering::Release);
+                        self.flags.output_cv.notify_all();
+                        self.request_shutdown();
+                        return;
+                    }
+                }
                 if let Err(e) = cfg.sync_stream() {
                     self.set_error(format!("ModelRunner::run stream sync error: {e:?}"));
                     self.flags.output_ready[buffer_id].store(true, Ordering::Release);
@@ -654,6 +701,10 @@ impl<M: LlmModel> ModelRunner<M> {
                     self.request_shutdown();
                     return;
                 }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                // CPU path: no async copy needed, to_cpu is a no-op.
             }
 
             // 4. 只标记该 buffer output 可读；不等待 CPU 消费，继续寻找其它 ready buffer。
