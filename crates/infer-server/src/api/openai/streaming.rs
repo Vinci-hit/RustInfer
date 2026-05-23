@@ -119,6 +119,12 @@ pub fn stream_chat_completion(
                     }
                 }
                 ChunkType::Done => {
+                    // 提前标记完成：scheduler 已发 Done，逻辑上请求已结束。
+                    // 若放在 yield 之后，客户端在收到 finish_chunk 后立即关闭连接（常见行为）
+                    // 会触发 stream future drop → StreamHandle::Drop → 向 scheduler 发出
+                    // 一个不必要的 cancel。
+                    stream_handle.mark_finished();
+
                     // 发送 finish chunk
                     let finish_reason = chunk.finish_reason.unwrap_or_else(|| "stop".to_string());
                     let finish_chunk = ChatCompletionChunk {
@@ -156,7 +162,6 @@ pub fn stream_chat_completion(
                         ));
                     }
 
-                    stream_handle.mark_finished();
                     // [DONE] 标记
                     yield Ok(Event::default().data("[DONE]"));
                     break;
@@ -222,6 +227,10 @@ pub fn stream_completion(
                     }
                 }
                 ChunkType::Done => {
+                    // 提前标记完成，避免客户端在收到 finish_chunk 后立即关闭连接时
+                    // 误触发 StreamHandle::Drop 发出不必要的 cancel。
+                    stream_handle.mark_finished();
+
                     let finish_reason = chunk.finish_reason.unwrap_or_else(|| "stop".to_string());
                     let finish_chunk = CompletionChunk {
                         id: chunk_id.clone(),
@@ -257,7 +266,6 @@ pub fn stream_completion(
                         ));
                     }
 
-                    stream_handle.mark_finished();
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }

@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustInfer API Server 架构设计文档</title>
+    <style>
+        :root {
+            --primary: #1d4ed8;
+            --primary-light: #eff6ff;
+            --text-main: #1f2937;
+            --text-muted: #6b7280;
+            --border: #e5e7eb;
+            --bg-body: #f9fafb;
+            --bg-card: #ffffff;
+            --code-bg: #f3f4f6;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: var(--text-main);
+            background-color: var(--bg-body);
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: var(--bg-card);
+            padding: 3rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+
+        header {
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 2rem;
+            margin-bottom: 2rem;
+            text-align: center;
+        }
+
+        h1 {
+            color: var(--primary);
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+
+        h2 {
+            color: var(--text-main);
+            font-size: 1.8rem;
+            margin: 2.5rem 0 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h3 {
+            color: var(--text-main);
+            font-size: 1.4rem;
+            margin: 1.5rem 0 1rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+        }
+
+        ul, ol {
+            margin-bottom: 1rem;
+            padding-left: 2rem;
+        }
+
+        li {
+            margin-bottom: 0.5rem;
+        }
+
+        code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            background: var(--code-bg);
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.9em;
+            color: #db2777;
+        }
+
+        pre {
+            background: #1f2937;
+            color: #f8f8f2;
+            padding: 1.5rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 1rem 0;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h4 {
+            color: var(--primary);
+            font-size: 1.2rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .architecture-diagram {
+            background: #fff;
+            padding: 2rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin: 2rem 0;
+            font-family: monospace;
+            white-space: pre;
+            overflow-x: auto;
+            text-align: center;
+            font-size: 1.1rem;
+            line-height: 2;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            background: var(--primary-light);
+            color: var(--primary);
+            margin-right: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .highlight-box {
+            background: #fffbeb;
+            border-left: 4px solid #f59e0b;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+            border-radius: 0 8px 8px 0;
+        }
+
+        .highlight-box h4 {
+            color: #b45309;
+            margin-bottom: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>RustInfer API Server 架构设计文档</h1>
+            <p class="subtitle">OpenAI 兼容的 HTTP 网关层实现规范</p>
+        </header>
+
+        <section>
+            <h2>系统定位</h2>
+            <p><code>infer-server</code> 是 RustInfer 推理系统的前端网关。它对外暴露完全兼容 OpenAI 规范的 RESTful HTTP API，对内通过 ZMQ 与底层的 Scheduler 推理引擎进行高性能通信。作为协议转换层和流量出入口，它的设计目标是：<strong>高并发、低延迟、可观测、标准兼容</strong>。</p>
+            
+            <div class="architecture-diagram">
+HTTP Client 
+     │
+     ▼ (Axum Router)
+[ Middleware (Trace, CORS, ReqID) ]
+     │
+     ▼ (Handlers)
+[ Chat / Completions / Images API ]
+     │
+     ▼ (Domain Logic)
+[ Chat Template ] ──► [ Tokenizer ]
+     │
+     ▼ (Async-Sync Bridge)
+[ ZMQ Client Thread ]
+     │
+     ▼ (IPC / TCP)
+[ Scheduler Backend ]</div>
+        </section>
+
+        <section>
+            <h2>核心模块职责说明</h2>
+            
+            <div class="card-grid">
+                <div class="card">
+                    <h4>🚀 核心启动 (main.rs / lib.rs)</h4>
+                    <p><strong>职责：</strong> 应用程序生命周期管理与依赖注入。</p>
+                    <ul>
+                        <li>解析 CLI 参数与环境变量</li>
+                        <li>初始化 Tracing 日志系统</li>
+                        <li>构建 <code>AppState</code> 共享状态 (依赖注入)</li>
+                        <li>绑定端口并启动 Axum 异步服务器</li>
+                        <li>处理优雅停机 (Graceful Shutdown)</li>
+                    </ul>
+                </div>
+
+                <div class="card">
+                    <h4>⚙️ 状态与配置 (state.rs / config.rs)</h4>
+                    <p><strong>职责：</strong> 运行环境抽象与线程安全的数据共享。</p>
+                    <ul>
+                        <li>符合 12-Factor 原则的环境变量配置</li>
+                        <li><code>AppState</code> 封装 ZMQ Client、Tokenizer、ModelInfo 等核心依赖</li>
+                        <li>使用 <code>Arc&lt;AppState&gt;</code> 在所有 HTTP Handler 间实现无锁并发读取</li>
+                    </ul>
+                </div>
+
+                <div class="card">
+                    <h4>🌐 路由与中间件 (router.rs / middleware/)</h4>
+                    <p><strong>职责：</strong> HTTP 流量路由分配与请求拦截。</p>
+                    <ul>
+                        <li>注册 OpenAI 兼容的端点 (<code>/v1/chat/completions</code> 等)</li>
+                        <li>提供运维端点 (<code>/health</code>, <code>/ready</code>, <code>/metrics</code>)</li>
+                        <li><code>RequestId</code> 中间件：为每个请求注入 UUID，实现全链路追踪</li>
+                        <li>配置 CORS 与 HTTP Trace 记录</li>
+                    </ul>
+                </div>
+
+                <div class="card">
+                    <h4>📡 客户端层 (client/)</h4>
+                    <p><strong>职责：</strong> 屏蔽底层通信细节，抽象推理接口。</p>
+                    <ul>
+                        <li>定义 <code>InferClient</code> Trait，实现解耦</li>
+                        <li><strong>ZmqClient 实现</strong>：采用独立 Worker 线程模式，隔离 ZMQ 的同步阻塞与 Tokio 的异步调度</li>
+                        <li>支持 <code>Oneshot</code> (非流式) 和 <code>Stream</code> (流式) 两种交互协议</li>
+                        <li>实现基于 <code>Drop</code> trait 的自动取消机制，防止客户端断开导致的资源泄漏</li>
+                    </ul>
+                </div>
+
+                <div class="card">
+                    <h4>🔌 API 控制器层 (api/)</h4>
+                    <p><strong>职责：</strong> OpenAI 协议解析与业务逻辑串联。</p>
+                    <ul>
+                        <li><strong>Chat/Completion</strong>：验证请求 -> 应用 Chat Template -> 分词(Tokenize) -> 发起推理 -> 结果封装</li>
+                        <li><strong>Streaming</strong>：基于 Server-Sent Events (SSE) 的流式响应</li>
+                        <li>处理增量 UTF-8 解码，防止多字节字符被截断导致乱码</li>
+                        <li><strong>Images</strong>：处理 Diffusion 模型的图像生成与 Base64 编码</li>
+                    </ul>
+                </div>
+
+                <div class="card">
+                    <h4>🛡️ 错误处理 (error.rs)</h4>
+                    <p><strong>职责：</strong> 统一异常捕获与标准化响应。</p>
+                    <ul>
+                        <li>定义 <code>AppError</code> 枚举，映射领域错误到 HTTP 状态码 (400, 404, 429, 500)</li>
+                        <li>实现 <code>IntoResponse</code>，自动将内部错误转换为 OpenAI 标准的错误 JSON 格式</li>
+                        <li>收敛所有 Result 错误处理，避免 Panic</li>
+                    </ul>
+                </div>
+
+                <div class="card">
+                    <h4>📝 提示词模板 (chat/)</h4>
+                    <p><strong>职责：</strong> OpenAI 消息格式到模型特定格式的转换。</p>
+                    <ul>
+                        <li>定义 <code>ChatTemplate</code> Trait</li>
+                        <li>实现 Llama 3 格式 (<code>&lt;|start_header_id|&gt;</code>)</li>
+                        <li>实现 Qwen 3 格式 (<code>&lt;|im_start|&gt;</code>)</li>
+                        <li>基于策略模式，易于扩展新模型</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <section>
+            <h2>关键设计模式与工程实践</h2>
+
+            <div class="highlight-box">
+                <h4>1. 异步-同步桥接 (Async-Sync Bridge) 设计</h4>
+                <p>ZMQ API 是同步阻塞的，而 Axum 运行在 Tokio 异步运行时中。直接在 Handler 中调用 ZMQ 会阻塞 Tokio 调度线程 (Thread Starvation)。</p>
+                <p><strong>解决方案：</strong> 采用专门的 ZMQ Worker 线程。Tokio 任务通过 <code>tokio::sync::mpsc</code> 发送消息给 Worker 线程，Worker 线程执行 ZMQ 调用后，通过 <code>oneshot</code> (单次) 或 <code>std::sync::mpsc</code> (流式) 将结果异步回调给 Tokio 任务。实现了完美的 IO 隔离。</p>
+            </div>
+
+            <div class="highlight-box">
+                <h4>2. RAII 与资源自动回收 (Graceful Degradation)</h4>
+                <p>在流式请求中，如果客户端中途断开连接 (例如用户刷新页面)，系统必须通知后端引擎停止生成，避免浪费显卡算力。</p>
+                <p><strong>解决方案：</strong> 设计了 <code>StreamHandle</code>。它包装了接收通道，并实现了 <code>Drop</code> Trait。当 HTTP 连接断开，Axum 释放资源触发 Drop 时，自动向后端发送 Cancel 指令，做到了业务代码无侵入的资源回收。</p>
+            </div>
+
+            <div class="highlight-box">
+                <h4>3. 渐进式 UTF-8 安全解码 (Incremental UTF-8 Decoding)</h4>
+                <p>大模型是按 Token 吐出结果的，一个中文汉字通常被编码为 3 个字节，可能被拆分在两个连续的 Token 中。直接对部分 Token 转换为 String 会导致解析失败或乱码。</p>
+                <p><strong>解决方案：</strong> 在 <code>streaming.rs</code> 中维护解码缓冲区，仅当收集到完整的 UTF-8 字符序列时才进行 String 转换并下发 SSE Chunk，保证了客户端看到的总是合法字符。</p>
+            </div>
+            
+            <div class="highlight-box">
+                <h4>4. 面向接口编程 (Trait-based Abstraction)</h4>
+                <p>核心业务逻辑只依赖 <code>InferClient</code> 和 <code>ChatTemplate</code> 这两个 Trait。这使得 HTTP 层与具体的通信协议 (ZMQ) 和具体的模型 (Llama/Qwen) 完全解耦。未来如果需要迁移到 gRPC，或者接入新的模型结构，只需要新增实现类，无需修改 API 控制器层代码，符合开闭原则 (OCP)。</p>
+            </div>
+        </section>
+    </div>
+</body>
+</html>
