@@ -168,9 +168,6 @@ async fn main() -> Result<()> {
         .context("Failed to spawn rustinfer-scheduler. Is it in PATH?")?;
 
     children.push(ManagedChild::new("scheduler", scheduler_child));
-    tracing::info!("[scheduler] PID={}", children.last().unwrap().child.id());
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  2. Start WorkerGroup rank 0
@@ -190,6 +187,7 @@ async fn main() -> Result<()> {
         .spawn()
         .context(format!("Failed to spawn rustinfer-worker for {}", assigned_device))?;
 
+    tracing::info!("[scheduler] PID={}", children.last().unwrap().child.id());
     tracing::info!("[worker:0] PID={}", worker_child.id());
     children.push(ManagedChild::new("worker:0", worker_child));
 

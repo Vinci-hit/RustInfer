@@ -1,7 +1,8 @@
 //! SSE 流式输出逻辑
 //!
 //! 将 `mpsc::Receiver<StreamChunk>` 转换为 Axum SSE 流。
-//! 处理增量 UTF-8 decode，确保不发出不完整的字符。
+//! UTF-8 安全的渐进式解码由 [`super::decoder::IncrementalDecoder`] 负责，本模块只
+//! 关心 SSE chunk 的协议封装与流终止语义。
 
 use crate::client::StreamHandle;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -11,32 +12,8 @@ use std::convert::Infallible;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
+use super::decoder::IncrementalDecoder;
 use super::types::*;
-
-fn incremental_decode_delta(previous: &mut String, full_text: String) -> Option<String> {
-    if full_text == *previous {
-        return None;
-    }
-
-    let mut common_len = 0usize;
-    let mut prev_chars = previous.char_indices();
-    let mut full_chars = full_text.char_indices();
-
-    loop {
-        match (prev_chars.next(), full_chars.next()) {
-            (Some((prev_idx, prev_ch)), Some((full_idx, full_ch))) if prev_ch == full_ch => {
-                common_len = prev_idx + prev_ch.len_utf8();
-                debug_assert_eq!(common_len, full_idx + full_ch.len_utf8());
-            }
-            _ => break,
-        }
-    }
-
-    let delta = full_text[common_len..].to_string();
-    *previous = full_text;
-
-    if delta.is_empty() { None } else { Some(delta) }
-}
 
 /// 构建 Chat Completion SSE 流
 pub fn stream_chat_completion(
@@ -53,6 +30,7 @@ pub fn stream_chat_completion(
         let chunk_id = format!("chatcmpl-{}", request_id);
         let mut completion_tokens: u32 = 0;
         let mut first_content_sent = false;
+        let mut decoder = IncrementalDecoder::new(tokenizer);
 
         // 第一个 chunk: 发送 role
         let first_chunk = ChatCompletionChunk {
@@ -72,38 +50,28 @@ pub fn stream_chat_completion(
         };
         yield Ok(Event::default().data(serde_json::to_string(&first_chunk).unwrap()));
 
-        // 逐 chunk 接收并转发。
-        let mut token_buffer: Vec<u32> = Vec::new();
-        let mut decoded_text = String::new();
+        // 闭包工厂：构造一个内容增量 chunk。重复使用避免代码碎片化。
+        let make_content_chunk = |chunk_id: &str, model: &str, content: String| ChatCompletionChunk {
+            id: chunk_id.to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model.to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta { role: None, content: Some(content) },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
 
         while let Some(chunk) = stream_handle.recv().await {
             match chunk.chunk_type {
                 ChunkType::Token => {
                     completion_tokens += 1;
+                    let Some(token_id) = chunk.token_id else { continue };
 
-                    if let Some(token_id) = chunk.token_id {
-                        token_buffer.push(token_id as u32);
-
-                        // 增量 decode：尝试 decode 整个 buffer，取新增部分
-                        let full_text = tokenizer.decode(&token_buffer, true)
-                            .unwrap_or_default();
-
-                        if let Some(new_text) = incremental_decode_delta(&mut decoded_text, full_text) {
-                            let content_chunk = ChatCompletionChunk {
-                                id: chunk_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created,
-                                model: model.clone(),
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: Delta {
-                                        role: None,
-                                        content: Some(new_text),
-                                    },
-                                    finish_reason: None,
-                                }],
-                                usage: None,
-                            };
+                    match decoder.push(token_id as u32) {
+                        Ok(Some(delta)) => {
                             if !first_content_sent {
                                 first_content_sent = true;
                                 tracing::debug!(
@@ -112,9 +80,39 @@ pub fn stream_chat_completion(
                                     "chat stream first content chunk"
                                 );
                             }
+                            let payload = make_content_chunk(&chunk_id, &model, delta);
                             yield Ok(Event::default().data(
-                                serde_json::to_string(&content_chunk).unwrap()
+                                serde_json::to_string(&payload).unwrap()
                             ));
+                        }
+                        Ok(None) => {
+                            // 当前 token 仅扩展了未确认尾部（如多字节字符的中间字节），不下发。
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "tokenizer decode failed; terminating stream"
+                            );
+                            stream_handle.mark_finished();
+                            // 给客户端一个最低限度的错误信号：一条带 finish_reason 的 chunk + [DONE]
+                            let err_chunk = ChatCompletionChunk {
+                                id: chunk_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta::default(),
+                                    finish_reason: Some("error".to_string()),
+                                }],
+                                usage: None,
+                            };
+                            yield Ok(Event::default().data(
+                                serde_json::to_string(&err_chunk).unwrap()
+                            ));
+                            yield Ok(Event::default().data("[DONE]"));
+                            return;
                         }
                     }
                 }
@@ -125,7 +123,16 @@ pub fn stream_chat_completion(
                     // 一个不必要的 cancel。
                     stream_handle.mark_finished();
 
-                    // 发送 finish chunk
+                    // 流结束前 flush decoder：把任何被滞留的「未确认」字符吐出去。
+                    // 走到这里说明流自然结束，残留的 U+FFFD 是真实的不可解码序列，
+                    // 应当下发给客户端而不是丢弃。
+                    if let Ok(Some(tail)) = decoder.flush() {
+                        let payload = make_content_chunk(&chunk_id, &model, tail);
+                        yield Ok(Event::default().data(
+                            serde_json::to_string(&payload).unwrap()
+                        ));
+                    }
+
                     let finish_reason = chunk.finish_reason.unwrap_or_else(|| "stop".to_string());
                     let finish_chunk = ChatCompletionChunk {
                         id: chunk_id.clone(),
@@ -143,7 +150,6 @@ pub fn stream_chat_completion(
                         serde_json::to_string(&finish_chunk).unwrap()
                     ));
 
-                    // 如果 include_usage，发送 usage chunk
                     if include_usage {
                         let usage_chunk = ChatCompletionChunk {
                             id: chunk_id.clone(),
@@ -162,13 +168,11 @@ pub fn stream_chat_completion(
                         ));
                     }
 
-                    // [DONE] 标记
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 ChunkType::Error => {
                     stream_handle.mark_finished();
-                    // 错误时也发 [DONE] 关闭流
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
@@ -192,44 +196,71 @@ pub fn stream_completion(
         let created = chrono::Utc::now().timestamp();
         let chunk_id = format!("cmpl-{}", request_id);
         let mut completion_tokens: u32 = 0;
+        let mut decoder = IncrementalDecoder::new(tokenizer);
 
-        let mut token_buffer: Vec<u32> = Vec::new();
-        let mut decoded_text = String::new();
+        let make_content_chunk = |chunk_id: &str, model: &str, text: String| CompletionChunk {
+            id: chunk_id.to_string(),
+            object: "text_completion".to_string(),
+            created,
+            model: model.to_string(),
+            choices: vec![CompletionChunkChoice {
+                index: 0,
+                text,
+                finish_reason: None,
+            }],
+            usage: None,
+        };
 
         while let Some(chunk) = stream_handle.recv().await {
             match chunk.chunk_type {
                 ChunkType::Token => {
                     completion_tokens += 1;
+                    let Some(token_id) = chunk.token_id else { continue };
 
-                    if let Some(token_id) = chunk.token_id {
-                        token_buffer.push(token_id as u32);
-
-                        let full_text = tokenizer.decode(&token_buffer, true)
-                            .unwrap_or_default();
-
-                        if let Some(new_text) = incremental_decode_delta(&mut decoded_text, full_text) {
-                            let content_chunk = CompletionChunk {
+                    match decoder.push(token_id as u32) {
+                        Ok(Some(delta)) => {
+                            let payload = make_content_chunk(&chunk_id, &model, delta);
+                            yield Ok(Event::default().data(
+                                serde_json::to_string(&payload).unwrap()
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "tokenizer decode failed; terminating stream"
+                            );
+                            stream_handle.mark_finished();
+                            let err_chunk = CompletionChunk {
                                 id: chunk_id.clone(),
                                 object: "text_completion".to_string(),
                                 created,
                                 model: model.clone(),
                                 choices: vec![CompletionChunkChoice {
                                     index: 0,
-                                    text: new_text,
-                                    finish_reason: None,
+                                    text: String::new(),
+                                    finish_reason: Some("error".to_string()),
                                 }],
                                 usage: None,
                             };
                             yield Ok(Event::default().data(
-                                serde_json::to_string(&content_chunk).unwrap()
+                                serde_json::to_string(&err_chunk).unwrap()
                             ));
+                            yield Ok(Event::default().data("[DONE]"));
+                            return;
                         }
                     }
                 }
                 ChunkType::Done => {
-                    // 提前标记完成，避免客户端在收到 finish_chunk 后立即关闭连接时
-                    // 误触发 StreamHandle::Drop 发出不必要的 cancel。
                     stream_handle.mark_finished();
+
+                    if let Ok(Some(tail)) = decoder.flush() {
+                        let payload = make_content_chunk(&chunk_id, &model, tail);
+                        yield Ok(Event::default().data(
+                            serde_json::to_string(&payload).unwrap()
+                        ));
+                    }
 
                     let finish_reason = chunk.finish_reason.unwrap_or_else(|| "stop".to_string());
                     let finish_chunk = CompletionChunk {
