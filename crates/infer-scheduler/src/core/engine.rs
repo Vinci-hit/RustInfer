@@ -19,10 +19,9 @@ use crate::config::{SchedulerConfig, SchedulerMode};
 use crate::error::{Result, SchedulerError};
 use crate::metrics::MetricsRecorder;
 use crate::policy::traits::{BatchPlan, RunningSet, SchedulingPolicy};
-use crate::request::active_table::ActiveRequestTable;
 use crate::request::handle::{ClientId, RequestHandle};
 use crate::request::lifecycle::*;
-use crate::request::queue::WaitingQueue;
+use crate::request::{CancelOutcome, FailedOutcome, PrefillAckOutcome, PrefillStartOutcome, RequestLocation, RequestTable, TerminalReason};
 use crate::transport::codec::MsgPackCodec;
 use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 use crate::utils::token_budget::TokenBudget;
@@ -41,10 +40,7 @@ where
     worker_group: WorkerGroup,
 
     // ─── Request state ───
-    waiting_queue: WaitingQueue,
-    prefilling: Vec<Sequence<Prefilling>>,
-    decoding: Vec<Sequence<Decoding>>,
-    active_requests: ActiveRequestTable,
+    requests: RequestTable,
 
     // ─── Transport ───
     frontend: F,
@@ -96,10 +92,7 @@ where
             policy,
             kv_manager,
             worker_group,
-            waiting_queue: WaitingQueue::new(),
-            prefilling: Vec::new(),
-            decoding: Vec::new(),
-            active_requests: ActiveRequestTable::new(),
+            requests: RequestTable::new(),
             frontend,
             worker,
             codec: MsgPackCodec,
@@ -191,15 +184,16 @@ where
             diffusion: request.diffusion,
             arrival_time: Instant::now(),
         });
-
-        self.active_requests
-            .insert_waiting(meta.id.clone(), meta.input_ids.len(), meta.max_tokens);
+        tracing::info!(
+            request_id = %meta.id,
+            "TTFT_TRACE: scheduler received request"
+        );
 
         let handle = RequestHandle::new(client_id, request.stream);
-        let seq = Sequence::new(meta.clone(), handle);
-
-        self.waiting_queue.push(seq);
-        self.metrics.record_enqueue();
+        match self.requests.insert_new(meta.clone(), handle) {
+            Ok(()) => self.metrics.record_enqueue(),
+            Err(e) => tracing::error!("failed to insert request {}: {}", meta.id, e),
+        }
     }
 
     /// Run one scheduling iteration.
@@ -207,26 +201,23 @@ where
         if self.config.mode == SchedulerMode::Diffusion && self.worker_busy {
             return Ok(());
         }
-        if self.waiting_queue.is_empty() && self.prefilling.is_empty() && self.decoding.is_empty() {
+        if !self.requests.has_pending_work() {
             return Ok(());
         }
 
         self.iteration_id += 1;
 
-        // Build continuation info for prefilling sequences that need more chunks.
-        let prefilling_continuations: Vec<(RequestId, usize)> = self
-            .prefilling
-            .iter()
-            .filter(|seq| !seq.has_inflight())
-            .map(|seq| (seq.meta.id.clone(), seq.remaining_tokens()))
-            .collect();
-
         let running_set = RunningSet {
-            num_prefilling: self.prefilling.len(),
-            num_decoding: self.decoding.len(),
-            decode_tokens: self.decoding.len(),
-            running_ids: self.decoding.iter().map(|s| s.meta.id.clone()).collect(),
-            prefilling_continuations,
+            num_prefilling: self.requests.prefilling().len(),
+            num_decoding: self.requests.decoding().len(),
+            decode_tokens: self.requests.decoding().len(),
+            running_ids: self
+                .requests
+                .decoding()
+                .iter()
+                .map(|s| s.meta.id.clone())
+                .collect(),
+            prefilling_continuations: self.requests.prefilling_continuations(),
         };
 
         let budget = TokenBudget {
@@ -243,9 +234,12 @@ where
 
         let plan = self
             .policy
-            .schedule(&self.waiting_queue, &running_set, &budget, &cache_state);
+            .schedule(self.requests.waiting(), &running_set, &budget, &cache_state);
 
-        if !plan.has_work() && self.decoding.is_empty() && self.prefilling.is_empty() {
+        if !plan.has_work()
+            && self.requests.decoding().is_empty()
+            && self.requests.prefilling().is_empty()
+        {
             return Ok(());
         }
 
@@ -255,20 +249,28 @@ where
         // Build and send batch command.
         let batch_data = match self.config.mode {
             SchedulerMode::Llm => crate::core::batch_builder::build_batch(
-                &self.prefilling,
-                &self.decoding,
+                self.requests.prefilling(),
+                self.requests.decoding(),
                 &self.config,
                 &self.codec,
                 &self.current_chunk_sizes,
             )?,
             SchedulerMode::Diffusion => crate::core::batch_builder::build_diffusion_batch(
-                &self.prefilling,
+                self.requests.prefilling(),
                 &self.codec,
                 &self.current_chunk_sizes,
             )?,
         };
 
         if !batch_data.is_empty() {
+            if let Some(first_prefill) = self.requests.prefilling().first() {
+                let sched_latency = first_prefill.meta.arrival_time.elapsed();
+                tracing::info!(
+                    request_id = %first_prefill.meta.id,
+                    sched_latency_ms = sched_latency.as_secs_f64() * 1000.0,
+                    "TTFT_TRACE: batch sent to worker"
+                );
+            }
             self.worker.send_batch(batch_data).await?;
             if self.config.mode == SchedulerMode::Diffusion {
                 self.worker_busy = true;
@@ -283,37 +285,32 @@ where
         self.current_chunk_sizes.clear();
 
         for entry in &plan.prefill_batch {
-            // Check if this is a continuation (already in prefilling).
-            let is_continuation = self
-                .prefilling
-                .iter()
-                .any(|s| s.meta.id == entry.request_id);
+            let scheduled_len = entry.token_range.len();
+            if scheduled_len == 0 {
+                tracing::warn!("Plan produced zero-length prefill for {}", entry.request_id);
+                continue;
+            }
+
+            let is_continuation = self.requests.location_for_request(&entry.request_id)
+                == Some(RequestLocation::Prefilling);
 
             if is_continuation {
-                // Continuation chunk: mark exact KV/prompt segment in flight.
-                if let Some(seq) = self
-                    .prefilling
-                    .iter_mut()
-                    .find(|s| s.meta.id == entry.request_id)
-                {
-                    if seq.has_inflight() {
-                        continue;
-                    }
-                    let start = seq.state.num_computed_tokens;
-                    let end = (start + entry.token_range.len()).min(seq.state.prompt_len);
-                    if start >= end {
-                        continue;
-                    }
-                    seq.set_inflight(start, end);
-                    self.current_chunk_sizes
-                        .push((entry.request_id.clone(), end - start));
+                match self.requests.set_prefill_inflight(&entry.request_id, scheduled_len) {
+                    Ok(segment) => self.current_chunk_sizes.push((
+                        entry.request_id.clone(),
+                        segment.segment_end - segment.segment_start,
+                    )),
+                    Err(e) => tracing::warn!(
+                        "Failed to set prefill continuation for {}: {}",
+                        entry.request_id,
+                        e
+                    ),
                 }
             } else {
-                // New request: pop from waiting, allocate KV, move to prefilling.
-                let seq = match self.waiting_queue.remove(&entry.request_id) {
-                    Some(s) => s,
-                    None => {
-                        tracing::warn!("Plan references unknown request: {}", entry.request_id);
+                let seq = match self.requests.take_waiting(&entry.request_id) {
+                    Ok(seq) => seq,
+                    Err(e) => {
+                        tracing::warn!("Plan references non-waiting request {}: {}", entry.request_id, e);
                         continue;
                     }
                 };
@@ -326,29 +323,23 @@ where
                     Ok(result) => result,
                     Err(e) => {
                         tracing::warn!("KV allocation failed for {}: {}", entry.request_id, e);
-                        self.waiting_queue.push_front(seq);
+                        self.requests.restore_waiting_front(seq)?;
                         break;
                     }
                 };
 
-                self.active_requests
-                    .mark_prefilling(&entry.request_id, kv_alloc.clone());
-                let mut prefilling_seq = seq.start_prefill(kv_alloc);
-                prefilling_seq.state.num_computed_tokens = prefix_match
-                    .num_cached_tokens
-                    .min(prefilling_seq.state.prompt_len);
-                let start = prefilling_seq.state.num_computed_tokens;
-                let scheduled_len = entry.token_range.len();
-                let end = (start + scheduled_len).min(prefilling_seq.state.prompt_len);
-                if end == 0 || start >= end {
-                    self.prefilling.push(prefilling_seq);
-                    continue;
+                match self.requests.commit_prefill_start(seq, kv_alloc, prefix_match, scheduled_len)? {
+                    PrefillStartOutcome::Scheduled { request_id, segment, .. } => {
+                        self.current_chunk_sizes
+                            .push((request_id, segment.segment_end - segment.segment_start));
+                    }
+                    PrefillStartOutcome::DecodeReady { request_id, .. } => {
+                        tracing::debug!(
+                            "Request {} moved directly to decoding from prefix cache",
+                            request_id
+                        );
+                    }
                 }
-                prefilling_seq.set_inflight(start, end);
-                self.prefilling.push(prefilling_seq);
-
-                self.current_chunk_sizes
-                    .push((entry.request_id.clone(), end - start));
             }
         }
 
@@ -381,53 +372,26 @@ where
         // 1. ACK prefill segments. Final segment moves the sequence to decoding before
         // processing the token generated by that final prefill.
         for sequence_id in output.prefill_done {
-            let Some(idx) = self
-                .prefilling
-                .iter()
-                .position(|s| s.meta.sequence_id.0 == sequence_id)
-            else {
-                tracing::warn!("PrefillDone for unknown sequence_id={}", sequence_id);
-                continue;
-            };
-
-            let mut seq = self.prefilling.remove(idx);
-            let Some(inflight) = seq.ack_inflight() else {
-                tracing::warn!(
-                    "PrefillDone for sequence_id={} without inflight segment",
-                    sequence_id
-                );
-                self.prefilling.push(seq);
-                continue;
-            };
-            if inflight.is_final || seq.is_complete() {
-                self.active_requests.mark_decoding(&seq.meta.id);
-                self.decoding.push(seq.start_decode());
-            } else {
-                self.prefilling.push(seq);
+            match self.requests.ack_prefill(SequenceId(sequence_id)) {
+                Ok(PrefillAckOutcome::MovedToDecoding { .. })
+                | Ok(PrefillAckOutcome::Continue { .. }) => {}
+                Err(e) => tracing::warn!("PrefillDone for sequence_id={} failed: {}", sequence_id, e),
             }
         }
 
         for need in &output.need_blocks {
-            let Some(seq_idx) = self
-                .decoding
-                .iter()
-                .position(|s| s.meta.sequence_id.0 == need.sequence_id)
-            else {
-                tracing::debug!(
-                    "NeedBlocks for non-decoding sequence_id={}",
-                    need.sequence_id
-                );
-                continue;
-            };
             match self
                 .kv_manager
                 .allocate_decode_blocks(need.request_blocks as usize)
             {
                 Ok(blocks) => {
-                    if let crate::cache::kv_manager::KvAllocation::Blocks(existing) =
-                        &mut self.decoding[seq_idx].state.kv_alloc
-                    {
-                        existing.extend(blocks.iter().copied());
+                    if let Err(e) = self.requests.extend_decode_kv(SequenceId(need.sequence_id), blocks.clone()) {
+                        tracing::debug!(
+                            "NeedBlocks for non-decoding sequence_id={} ignored: {}",
+                            need.sequence_id,
+                            e
+                        );
+                        continue;
                     }
                     let cmd = WorkerCommand::GrantBlocks(BlockGrantCmd {
                         sequence_id: need.sequence_id,
@@ -451,43 +415,36 @@ where
         // is the only component allowed to end decode. Scheduler mirrors the
         // worker-reported lifecycle instead of racing it with a second max-token
         // check.
-        let mut finished_indices: Vec<usize> = Vec::new();
+        let mut finished_sequence_ids: Vec<SequenceId> = Vec::new();
         let mut token_chunks: Vec<(ClientId, StreamChunk)> = Vec::new();
         for token in &output.tokens {
-            if let Some(seq) = self
-                .decoding
-                .iter_mut()
-                .find(|s| s.meta.sequence_id.0 == token.sequence_id)
-            {
-                seq.append_token(token.token_id);
-                self.active_requests.record_generated_token(&seq.meta.id);
-
-                if seq.meta.stream {
-                    token_chunks.push((
-                        ClientId(seq.handle.client_id.0.clone()),
-                        StreamChunk {
-                            request_id: seq.meta.id.0.clone(),
-                            chunk_type: ChunkType::Token,
-                            token_id: Some(token.token_id),
-                            finish_reason: None,
-                            metrics: None,
-                        },
-                    ));
+            match self.requests.append_generated_token(
+                SequenceId(token.sequence_id),
+                token.token_id,
+                token.finished,
+            ) {
+                Ok(outcome) => {
+                    if outcome.stream {
+                        token_chunks.push((
+                            outcome.client_id,
+                            StreamChunk {
+                                request_id: outcome.request_id.0,
+                                chunk_type: ChunkType::Token,
+                                token_id: Some(outcome.token_id),
+                                finish_reason: None,
+                                metrics: None,
+                            },
+                        ));
+                    }
+                    if outcome.worker_finished {
+                        finished_sequence_ids.push(outcome.sequence_id);
+                    }
                 }
-
-                if token.finished
-                    && let Some(idx) = self
-                        .decoding
-                        .iter()
-                        .position(|s| s.meta.sequence_id.0 == token.sequence_id)
-                {
-                    finished_indices.push(idx);
-                }
-            } else {
-                tracing::warn!(
-                    "Generated token for unknown sequence_id={}",
-                    token.sequence_id
-                );
+                Err(e) => tracing::warn!(
+                    "Generated token for sequence_id={} failed: {}",
+                    token.sequence_id,
+                    e
+                ),
             }
         }
 
@@ -496,13 +453,11 @@ where
             self.frontend.send_stream_chunk(&client_id, chunk).await?;
         }
 
-        finished_indices.sort_unstable();
-        finished_indices.dedup();
-        for &idx in finished_indices.iter().rev() {
-            if idx < self.decoding.len() {
-                let seq = self.decoding.remove(idx);
-                self.complete_sequence(seq).await?;
-            }
+        finished_sequence_ids.sort_unstable_by_key(|id| id.0);
+        finished_sequence_ids.dedup();
+        for sequence_id in finished_sequence_ids {
+            let seq = self.requests.finish_decoding(sequence_id)?;
+            self.complete_sequence(seq).await?;
         }
 
         Ok(())
@@ -511,29 +466,20 @@ where
     async fn handle_worker_step_error(&mut self, err: WorkerStepError) -> Result<()> {
         let mut failed_ids = err.sequence_ids.clone();
         if err.fatal || failed_ids.is_empty() {
-            failed_ids.extend(self.prefilling.iter().map(|seq| seq.meta.sequence_id.0));
-            failed_ids.extend(self.decoding.iter().map(|seq| seq.meta.sequence_id.0));
+            failed_ids.extend(self.requests.running_sequence_ids().into_iter().map(|id| id.0));
         }
         failed_ids.sort_unstable();
         failed_ids.dedup();
 
         for sequence_id in failed_ids {
-            if let Some(idx) = self
-                .prefilling
-                .iter()
-                .position(|seq| seq.meta.sequence_id.0 == sequence_id)
-            {
-                let seq = self.prefilling.remove(idx);
-                self.fail_prefilling_sequence(seq, &err.message).await?;
-                continue;
-            }
-            if let Some(idx) = self
-                .decoding
-                .iter()
-                .position(|seq| seq.meta.sequence_id.0 == sequence_id)
-            {
-                let seq = self.decoding.remove(idx);
-                self.fail_decoding_sequence(seq, &err.message).await?;
+            match self.requests.fail_sequence(SequenceId(sequence_id), &err.message)? {
+                FailedOutcome::RemovedPrefilling { sequence, .. } => {
+                    self.fail_prefilling_sequence(sequence, &err.message).await?;
+                }
+                FailedOutcome::RemovedDecoding { sequence, .. } => {
+                    self.fail_decoding_sequence(sequence, &err.message).await?;
+                }
+                FailedOutcome::NotFound { .. } => {}
             }
         }
         Ok(())
@@ -548,7 +494,6 @@ where
         let client_id = ClientId(seq.handle.client_id.0.clone());
         let stream = seq.meta.stream;
         self.kv_manager.free(seq.state.kv_alloc);
-        let _ = self.active_requests.finish(&request_id);
         self.send_request_error(client_id, request_id, stream, message.to_string(), 0)
             .await
     }
@@ -563,7 +508,6 @@ where
         let stream = seq.meta.stream;
         let num_tokens = seq.state.output_tokens.len() as u32;
         self.kv_manager.free(seq.state.kv_alloc);
-        let _ = self.active_requests.finish(&request_id);
         self.send_request_error(
             client_id,
             request_id,
@@ -624,22 +568,24 @@ where
         let output: DiffusionBatchOutput = self.codec.decode(&data)?;
 
         for item in output.results {
-            let Some(idx) = self
-                .prefilling
-                .iter()
-                .position(|s| s.meta.id.0 == item.request_id)
-            else {
+            let item_request_id = RequestId(item.request_id.clone());
+            let Some(seq) = self.requests.take_prefilling_by_request(
+                &item_request_id,
+                if matches!(item.status, DiffusionOutputStatus::Success) {
+                    TerminalReason::Finished
+                } else {
+                    TerminalReason::Failed(item.error.clone().unwrap_or_else(|| "diffusion error".to_string()))
+                },
+            )? else {
                 tracing::warn!(
                     "Diffusion output for unknown request_id={}",
                     item.request_id
                 );
                 continue;
             };
-            let seq = self.prefilling.remove(idx);
             let request_id = seq.meta.id.clone();
             let client_id = ClientId(seq.handle.client_id.0.clone());
             self.kv_manager.free(seq.state.kv_alloc);
-            let _ = self.active_requests.finish(&request_id);
 
             let elapsed_ms = seq.meta.arrival_time.elapsed().as_millis() as u64;
             let (status, images, error) = match item.status {
@@ -691,7 +637,6 @@ where
         let request_id = seq.meta.id.clone();
         let client_id = ClientId(seq.handle.client_id.0.clone());
         let stream = seq.meta.stream;
-        let _ = self.active_requests.finish(&request_id);
 
         let reason = if seq.reached_max_tokens() {
             FinishReason::MaxTokens
@@ -766,7 +711,7 @@ where
     // ─── Accessors for event_loop ───
 
     pub(crate) fn has_pending_work(&self) -> bool {
-        !self.waiting_queue.is_empty() || !self.prefilling.is_empty() || !self.decoding.is_empty()
+        self.requests.has_pending_work()
     }
 
     #[allow(dead_code)]
@@ -795,39 +740,33 @@ where
 
     #[allow(dead_code)]
     pub(crate) fn active_request_count(&self) -> usize {
-        self.active_requests.len()
+        self.requests.active_count()
     }
 
     #[allow(dead_code)]
     pub(crate) async fn cancel_request(&mut self, request_id: RequestId) -> Result<()> {
-        self.active_requests.mark_cancelling(&request_id);
-
-        if self.waiting_queue.remove(&request_id).is_some() {
-            self.active_requests.finish(&request_id);
-            return Ok(());
+        match self.requests.cancel_request(&request_id)? {
+            CancelOutcome::RemovedWaiting { .. } | CancelOutcome::NotFound => Ok(()),
+            CancelOutcome::RemovedPrefilling {
+                sequence_id,
+                kv_alloc,
+                ..
+            } => {
+                self.kv_manager.free(kv_alloc);
+                let data = crate::core::batch_builder::build_cancel_request(sequence_id.0, &self.codec)?;
+                self.worker.send_batch(data).await
+            }
+            CancelOutcome::RemovedDecoding {
+                sequence_id,
+                prompt_tokens,
+                kv_alloc,
+                ..
+            } => {
+                self.kv_manager.free_finished(&prompt_tokens, kv_alloc);
+                let data = crate::core::batch_builder::build_cancel_request(sequence_id.0, &self.codec)?;
+                self.worker.send_batch(data).await
+            }
         }
-
-        if let Some(idx) = self.prefilling.iter().position(|s| s.meta.id == request_id) {
-            let seq = self.prefilling.remove(idx);
-            let sequence_id = seq.meta.sequence_id.0;
-            self.kv_manager.free(seq.state.kv_alloc);
-            self.active_requests.finish(&request_id);
-            let data = crate::core::batch_builder::build_cancel_request(sequence_id, &self.codec)?;
-            return self.worker.send_batch(data).await;
-        }
-
-        if let Some(idx) = self.decoding.iter().position(|s| s.meta.id == request_id) {
-            let seq = self.decoding.remove(idx);
-            let sequence_id = seq.meta.sequence_id.0;
-            let prompt_tokens = seq.meta.input_ids.clone();
-            self.kv_manager
-                .free_finished(&prompt_tokens, seq.state.kv_alloc);
-            self.active_requests.finish(&request_id);
-            let data = crate::core::batch_builder::build_cancel_request(sequence_id, &self.codec)?;
-            return self.worker.send_batch(data).await;
-        }
-
-        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1003,7 +942,18 @@ mod tests {
             MockFrontend,
             worker,
         );
-        engine.prefilling.push(prefilling_sequence());
+        let seq = prefilling_sequence();
+        let request_id = seq.meta.id.clone();
+        engine
+            .requests
+            .insert_new(Arc::clone(&seq.meta), RequestHandle::noop())?;
+        let queued = engine.requests.take_waiting(&request_id)?;
+        engine.requests.commit_prefill_start(
+            queued,
+            KvAllocation::Blocks(vec![PhysicalBlockId(0)]),
+            crate::cache::traits::PrefixMatch::none(),
+            4,
+        )?;
 
         let codec = MsgPackCodec;
         let output = StepOutput {
@@ -1025,10 +975,10 @@ mod tests {
             .handle_step_output_llm(codec.encode(&output)?)
             .await?;
 
-        assert!(engine.prefilling.is_empty());
-        assert_eq!(engine.decoding.len(), 1);
-        assert_eq!(engine.decoding[0].state.output_tokens, vec![42]);
-        let KvAllocation::Blocks(blocks) = &engine.decoding[0].state.kv_alloc else {
+        assert!(engine.requests.prefilling().is_empty());
+        assert_eq!(engine.requests.decoding().len(), 1);
+        assert_eq!(engine.requests.decoding()[0].state.output_tokens, vec![42]);
+        let KvAllocation::Blocks(blocks) = &engine.requests.decoding()[0].state.kv_alloc else {
             panic!("expected paged blocks allocation");
         };
         assert_eq!(blocks.len(), 2);

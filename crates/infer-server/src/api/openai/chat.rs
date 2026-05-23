@@ -12,6 +12,7 @@ use crate::client::InferClient;
 use crate::error::AppError;
 use crate::state::SharedState;
 use crate::chat::get_template;
+use std::time::Instant;
 
 use super::streaming;
 use super::types::*;
@@ -22,6 +23,8 @@ pub async fn chat_completions(
     State(state): State<SharedState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, AppError> {
+    let request_start = Instant::now();
+
     // 1. 校验请求
     validate_request(&req)?;
 
@@ -38,6 +41,13 @@ pub async fn chat_completions(
 
     // 4. 构建 InferenceRequest
     let request_id = uuid::Uuid::new_v4().to_string();
+    let tokenize_elapsed = request_start.elapsed();
+    tracing::info!(
+        request_id = %request_id,
+        prompt_tokens,
+        tokenize_ms = tokenize_elapsed.as_secs_f64() * 1000.0,
+        "TTFT_TRACE: server tokenized"
+    );
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         request_id: request_id.clone(),
         modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,
@@ -57,6 +67,11 @@ pub async fn chat_completions(
         // 流式路径 → SSE
         let rx = state.client.infer_stream(engine_req).await
             .map_err(AppError::internal)?;
+        tracing::info!(
+            request_id = %request_id,
+            submit_ms = request_start.elapsed().as_secs_f64() * 1000.0,
+            "TTFT_TRACE: stream submitted to scheduler"
+        );
 
         let include_usage = req.stream_options
             .as_ref()
@@ -77,6 +92,11 @@ pub async fn chat_completions(
         // 非流式路径
         let engine_resp = state.client.infer(engine_req).await
             .map_err(AppError::internal)?;
+        tracing::debug!(
+            request_id = %request_id,
+            elapsed_ms = request_start.elapsed().as_millis(),
+            "chat response received"
+        );
 
         // 检查错误
         if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {

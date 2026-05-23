@@ -8,7 +8,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use infer_protocol::scheduler_to_server::ChunkType;
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
 use super::types::*;
@@ -48,9 +48,11 @@ pub fn stream_chat_completion(
     include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
+        let stream_started = Instant::now();
         let created = chrono::Utc::now().timestamp();
         let chunk_id = format!("chatcmpl-{}", request_id);
         let mut completion_tokens: u32 = 0;
+        let mut first_content_sent = false;
 
         // 第一个 chunk: 发送 role
         let first_chunk = ChatCompletionChunk {
@@ -102,6 +104,14 @@ pub fn stream_chat_completion(
                                 }],
                                 usage: None,
                             };
+                            if !first_content_sent {
+                                first_content_sent = true;
+                                tracing::debug!(
+                                    request_id = %request_id,
+                                    elapsed_ms = stream_started.elapsed().as_millis(),
+                                    "chat stream first content chunk"
+                                );
+                            }
                             yield Ok(Event::default().data(
                                 serde_json::to_string(&content_chunk).unwrap()
                             ));

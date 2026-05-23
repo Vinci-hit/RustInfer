@@ -28,8 +28,9 @@
 //! 数组、输入 token、KV cache 指针表等）地址稳定，server 直接写入。
 
 use std::cell::UnsafeCell;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use crate::base::DeviceType;
 use crate::base::error::{Error, Result};
@@ -71,6 +72,10 @@ pub struct StepMeta {
     pub q_start_loc: [i32; MAX_BATCH_SEQS + 1],
     /// `[num_seqs]`，每 seq 对应的 slot id（= runner.states 里的下标）。
     pub slot_indices: [i32; MAX_BATCH_SEQS],
+    /// `[num_seqs]`，scheduler/worker 分配的 sequence id。CUDA Graph decode
+    /// key uses this identity to avoid replaying a graph captured for an older
+    /// request that happened to reuse the same KV slot layout.
+    pub sequence_ids: [u64; MAX_BATCH_SEQS],
     /// `[num_seqs]`，每 seq 在 input_tokens/pos 缓冲中的起始 token idx
     /// （等价于 q_start_loc[..num_seqs]，为了让模型层 /op 层读取无歧义单独存）。
     pub positions_start: [i32; MAX_BATCH_SEQS],
@@ -86,6 +91,7 @@ impl StepMeta {
             num_decode: 0,
             q_start_loc: [0; MAX_BATCH_SEQS + 1],
             slot_indices: [0; MAX_BATCH_SEQS],
+            sequence_ids: [0; MAX_BATCH_SEQS],
             positions_start: [0; MAX_BATCH_SEQS],
             total_q_tiles: 0,
         }
@@ -174,6 +180,12 @@ impl<'a> WorkerBatchMeta<'a> {
 pub struct SyncFlags {
     pub input_ready: [AtomicBool; STEP_BUFFER_COUNT],
     pub output_ready: [AtomicBool; STEP_BUFFER_COUNT],
+    /// Condvar-backed edge notification for the SPSC step protocol. Atomics are
+    /// still the shared truth; the condvars remove hot spinning from the wait
+    /// path and make the handoff explicit.
+    wait_lock: Mutex<()>,
+    input_cv: Condvar,
+    output_cv: Condvar,
     /// 可选的优雅退出信号。置 true 时 runner 的 `run()` 循环会在下一轮开始处返回。
     pub shutdown: AtomicBool,
 }
@@ -183,6 +195,9 @@ impl SyncFlags {
         Self {
             input_ready: std::array::from_fn(|_| AtomicBool::new(false)),
             output_ready: std::array::from_fn(|_| AtomicBool::new(false)),
+            wait_lock: Mutex::new(()),
+            input_cv: Condvar::new(),
+            output_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -432,6 +447,7 @@ impl<M: LlmModel> ModelRunner<M> {
     pub fn set_input_ready_for(&self, buffer_id: usize) {
         debug_assert!(buffer_id < STEP_BUFFER_COUNT);
         self.flags.input_ready[buffer_id].store(true, Ordering::Release);
+        self.flags.input_cv.notify_one();
     }
 
     /// 读 buffer 0 的 input_ready（调试/轮询用）。
@@ -485,11 +501,39 @@ impl<M: LlmModel> ModelRunner<M> {
     pub fn set_output_consumed_for(&self, buffer_id: usize) {
         debug_assert!(buffer_id < STEP_BUFFER_COUNT);
         self.flags.output_ready[buffer_id].store(false, Ordering::Release);
+        self.flags.input_cv.notify_one();
+    }
+
+    /// Block until the requested output buffer becomes readable or shutdown is requested.
+    pub fn wait_output_ready_for(&self, buffer_id: usize) -> bool {
+        debug_assert!(buffer_id < STEP_BUFFER_COUNT);
+        loop {
+            if self.output_ready_for(buffer_id) {
+                return true;
+            }
+            if self.is_shutdown() {
+                return false;
+            }
+            let guard = self.flags.wait_lock.lock().expect("runner wait mutex poisoned");
+            if self.output_ready_for(buffer_id) {
+                return true;
+            }
+            if self.is_shutdown() {
+                return false;
+            }
+            let _ = self
+                .flags
+                .output_cv
+                .wait_timeout(guard, Duration::from_millis(1))
+                .expect("runner output condvar poisoned");
+        }
     }
 
     /// 请求 runner 在下一轮 loop 起点退出 `run()`。
     pub fn request_shutdown(&self) {
         self.flags.shutdown.store(true, Ordering::Release);
+        self.flags.input_cv.notify_all();
+        self.flags.output_cv.notify_all();
     }
 
     /// 检查 shutdown 信号是否已被设置。
@@ -530,6 +574,41 @@ impl<M: LlmModel> ModelRunner<M> {
         }
     }
 
+    fn find_runnable_buffer(&self, next_buffer_id: usize) -> Option<usize> {
+        for offset in 0..STEP_BUFFER_COUNT {
+            let id = (next_buffer_id + offset) % STEP_BUFFER_COUNT;
+            if self.flags.input_ready[id].load(Ordering::Acquire)
+                && !self.flags.output_ready[id].load(Ordering::Acquire)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn wait_runnable_buffer(&self, next_buffer_id: usize) -> Option<usize> {
+        loop {
+            if self.flags.shutdown.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(id) = self.find_runnable_buffer(next_buffer_id) {
+                return Some(id);
+            }
+            let guard = self.flags.wait_lock.lock().expect("runner wait mutex poisoned");
+            if self.flags.shutdown.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(id) = self.find_runnable_buffer(next_buffer_id) {
+                return Some(id);
+            }
+            let _ = self
+                .flags
+                .input_cv
+                .wait_timeout(guard, Duration::from_millis(1))
+                .expect("runner input condvar poisoned");
+        }
+    }
+
     // ─── Runner 主循环 ───
 
     /// 常驻 loop。调用线程会被阻塞在这里直到 `request_shutdown()`。
@@ -541,24 +620,8 @@ impl<M: LlmModel> ModelRunner<M> {
         loop {
             // 1. 等任意可运行 buffer。只要求该 buffer input_ready=true 且没有未消费 output；
             //    runner 不再因为其它 buffer 的 output 未被 CPU 消费而阻塞。
-            let buffer_id = loop {
-                if self.flags.shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                let mut found = None;
-                for offset in 0..STEP_BUFFER_COUNT {
-                    let id = (next_buffer_id + offset) % STEP_BUFFER_COUNT;
-                    if self.flags.input_ready[id].load(Ordering::Acquire)
-                        && !self.flags.output_ready[id].load(Ordering::Acquire)
-                    {
-                        found = Some(id);
-                        break;
-                    }
-                }
-                if let Some(id) = found {
-                    break id;
-                }
-                std::thread::yield_now();
+            let Some(buffer_id) = self.wait_runnable_buffer(next_buffer_id) else {
+                return;
             };
             next_buffer_id = (buffer_id + 1) % STEP_BUFFER_COUNT;
 
@@ -571,12 +634,31 @@ impl<M: LlmModel> ModelRunner<M> {
             if let Err(e) = self.forward_one_step(&meta) {
                 self.set_error(format!("ModelRunner::run forward error: {e:?}"));
                 self.flags.output_ready[buffer_id].store(true, Ordering::Release);
-                self.flags.shutdown.store(true, Ordering::Release);
+                self.flags.output_cv.notify_all();
+                self.request_shutdown();
                 return;
+            }
+
+            // 3.5. Sync worker stream before signaling output_ready. This ensures
+            // all GPU kernels (including graph replay) have completed writing to
+            // the output buffer. Without this, the sub_scheduler's D2H cudaMemcpy
+            // (on the legacy/default stream) can conflict with a concurrent CUDA
+            // Graph capture on the worker stream for another buffer.
+            #[cfg(feature = "cuda")]
+            {
+                let cfg = unsafe { &*self.cuda_cfg.get() };
+                if let Err(e) = cfg.sync_stream() {
+                    self.set_error(format!("ModelRunner::run stream sync error: {e:?}"));
+                    self.flags.output_ready[buffer_id].store(true, Ordering::Release);
+                    self.flags.output_cv.notify_all();
+                    self.request_shutdown();
+                    return;
+                }
             }
 
             // 4. 只标记该 buffer output 可读；不等待 CPU 消费，继续寻找其它 ready buffer。
             self.flags.output_ready[buffer_id].store(true, Ordering::Release);
+            self.flags.output_cv.notify_all();
         }
     }
 
@@ -626,8 +708,9 @@ impl<M: LlmModel> ModelRunner<M> {
         // ── 刷新 ragged 计划（prefill 才需要）；结果覆盖 plan.total_q_tiles。──
         #[cfg(feature = "cuda")]
         let total_q_tiles: i32 = if meta.num_prefill > 0 {
+            let stream = unsafe { (*self.cuda_cfg.get()).stream };
             let ws_mut = unsafe { self.workspace_mut_for(meta.step_buffer_id) };
-            ws_mut.refresh_ragged_plan(&meta_view)?
+            ws_mut.refresh_ragged_plan(&meta_view, stream)?
         } else {
             0
         };
@@ -708,8 +791,10 @@ impl<M: LlmModel> ModelRunner<M> {
 
     fn decode_slot_signature(meta: &StepMeta, num_decode: usize) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
-        for &slot in &meta.slot_indices[..num_decode] {
-            hash ^= slot as u32 as u64;
+        for i in 0..num_decode {
+            hash ^= meta.slot_indices[i] as u32 as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            hash ^= meta.sequence_ids[i];
             hash = hash.wrapping_mul(0x100000001b3);
         }
         hash

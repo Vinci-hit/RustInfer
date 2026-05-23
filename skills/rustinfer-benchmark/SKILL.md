@@ -63,7 +63,7 @@ For Qwen3:
 
 ```bash
 cd /root/RustInfer
-QWEN3_MODEL_PATH=/apdcephfs_qy2/share_303432435/vinciiliu/models/Qwen3-0.6B \
+QWEN3_MODEL_PATH=/apdcephfs_qy2/share_303432435/vinciiliu/models/checkpoint-800-1 \
 cargo test -p infer-worker --release --features cuda,models \
   tests_perf::perf_qwen3_decode_matrix -- --ignored --nocapture
 ```
@@ -83,8 +83,8 @@ cargo test -p infer-worker --release --features cuda,models \
 cd /root/RustInfer
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python scripts/bench_vllm_decode.py \
-  --model /apdcephfs_qy2/share_303432435/vinciiliu/models/Qwen3-0.6B \
-  --label Qwen3-0.6B \
+  --model /apdcephfs_qy2/share_303432435/vinciiliu/models/checkpoint-800-1 \
+  --label checkpoint-800-1 \
   --decode-steps 256 \
   --batches 1,2,4,8 \
   --max-model-len 1024 \

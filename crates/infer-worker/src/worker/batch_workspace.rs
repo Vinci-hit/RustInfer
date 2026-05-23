@@ -169,6 +169,15 @@ pub struct BatchWorkspace {
     pub ragged_block2tile_dev: *mut i32,
     #[cfg(feature = "cuda")]
     pub ragged_max_q_tiles: usize,
+    /// Host staging for ragged prefill dispatch tables. These buffers make the
+    /// H2D copies stream-ordered and lifetime-safe instead of borrowing
+    /// stack-local Vecs across `cudaMemcpyAsync`.
+    #[cfg(feature = "cuda")]
+    ragged_cu_q_lens_host: Vec<i32>,
+    #[cfg(feature = "cuda")]
+    ragged_block2req_host: Vec<i32>,
+    #[cfg(feature = "cuda")]
+    ragged_block2tile_host: Vec<i32>,
 
     /// layer_num（初始化时由模型 config 传入）
     pub layer_num: usize,
@@ -417,6 +426,12 @@ impl BatchWorkspace {
             ragged_block2tile_dev,
             #[cfg(feature = "cuda")]
             ragged_max_q_tiles,
+            #[cfg(feature = "cuda")]
+            ragged_cu_q_lens_host: vec![0i32; max_batch_seqs + 1],
+            #[cfg(feature = "cuda")]
+            ragged_block2req_host: vec![0i32; ragged_max_q_tiles],
+            #[cfg(feature = "cuda")]
+            ragged_block2tile_host: vec![0i32; ragged_max_q_tiles],
 
             layer_num: config.layer_num,
 
@@ -633,6 +648,7 @@ impl BatchWorkspace {
     pub fn refresh_ragged_plan(
         &mut self,
         meta: &crate::worker::runner::WorkerBatchMeta<'_>,
+        stream: crate::cuda::ffi::cudaStream_t,
     ) -> crate::base::error::Result<i32> {
         let b = meta.num_seqs();
         if b == 0 {
@@ -652,24 +668,32 @@ impl BatchWorkspace {
             ))
             .into());
         }
+        self.ragged_cu_q_lens_host[..cu_q_lens.len()].copy_from_slice(&cu_q_lens);
+        self.ragged_block2req_host[..block2req.len()].copy_from_slice(&block2req);
+        self.ragged_block2tile_host[..block2tile.len()].copy_from_slice(&block2tile);
+
         unsafe {
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            use crate::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind};
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.ragged_cu_q_lens_dev as *mut _,
-                cu_q_lens.as_ptr() as *const _,
+                self.ragged_cu_q_lens_host.as_ptr() as *const _,
                 cu_q_lens.len() * std::mem::size_of::<i32>(),
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.ragged_block2req_dev as *mut _,
-                block2req.as_ptr() as *const _,
+                self.ragged_block2req_host.as_ptr() as *const _,
                 block2req.len() * std::mem::size_of::<i32>(),
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
-            crate::cuda_check!(crate::cuda::ffi::cudaMemcpy(
+            crate::cuda_check!(cudaMemcpyAsync(
                 self.ragged_block2tile_dev as *mut _,
-                block2tile.as_ptr() as *const _,
+                self.ragged_block2tile_host.as_ptr() as *const _,
                 block2tile.len() * std::mem::size_of::<i32>(),
-                crate::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
             ))?;
         }
         Ok(total_q_tiles as i32)

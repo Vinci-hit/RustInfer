@@ -259,6 +259,69 @@ struct DecodeSeq {
     sampling: SamplingParams,
 }
 
+struct ActiveDecodes {
+    seqs: Vec<DecodeSeq>,
+}
+
+impl ActiveDecodes {
+    fn new() -> Self {
+        Self { seqs: Vec::new() }
+    }
+
+    fn len(&self) -> usize {
+        self.seqs.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.seqs.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &DecodeSeq> {
+        self.seqs.iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut DecodeSeq> {
+        self.seqs.iter_mut()
+    }
+
+    fn iter_runnable(&self) -> impl Iterator<Item = &DecodeSeq> {
+        self.seqs.iter().filter(|seq| !seq.kv.is_blocked_on_blocks())
+    }
+
+    fn contains(&self, sequence_id: u64) -> bool {
+        self.seqs.iter().any(|seq| seq.sequence_id == sequence_id)
+    }
+
+    fn get_mut(&mut self, sequence_id: u64) -> Option<&mut DecodeSeq> {
+        self.seqs.iter_mut().find(|seq| seq.sequence_id == sequence_id)
+    }
+
+    fn insert(&mut self, seq: DecodeSeq) -> Result<()> {
+        if self.contains(seq.sequence_id) {
+            return Err(Error::InvalidArgument(format!(
+                "duplicate active decode sequence_id={}",
+                seq.sequence_id
+            ))
+            .into());
+        }
+        self.seqs.push(seq);
+        Ok(())
+    }
+
+    fn remove(&mut self, sequence_id: u64) -> Option<DecodeSeq> {
+        let idx = self.seqs.iter().position(|seq| seq.sequence_id == sequence_id)?;
+        Some(self.seqs.remove(idx))
+    }
+
+    fn cancel(&mut self, sequence_id: u64) -> bool {
+        self.remove(sequence_id).is_some()
+    }
+
+    fn clear(&mut self) {
+        self.seqs.clear();
+    }
+}
+
 fn decode_kv_from_segment(segment: &PrefillSegmentMeta) -> DecodeKv {
     match segment.kv_placement() {
         KvPlacement::Slot { kv_slot } => DecodeKv::Slot {
@@ -333,7 +396,7 @@ pub struct SubScheduler<M: LlmModel> {
     zmq_out: zmq::Socket,
 
     // 序列管理
-    active_decodes: Vec<DecodeSeq>,
+    active_decodes: ActiveDecodes,
     pending_prefills: Vec<PrefillBatchCmd>,
     pending_cancels: Vec<u64>,
     cancelled_sequences: HashSet<u64>,
@@ -368,7 +431,7 @@ impl<M: LlmModel> SubScheduler<M> {
             eos_token_ids,
             zmq_in,
             zmq_out,
-            active_decodes: Vec::new(),
+            active_decodes: ActiveDecodes::new(),
             pending_prefills: Vec::new(),
             pending_cancels: Vec::new(),
             cancelled_sequences: HashSet::new(),
@@ -449,15 +512,9 @@ impl<M: LlmModel> SubScheduler<M> {
 
             // 2. 等待按提交顺序的 output buffer 完成；其它 buffer 的 output 不会阻塞 runner。
             let output_buffer_id = self.next_output_buffer_id;
-            loop {
-                if self.runner.output_ready_for(output_buffer_id) {
-                    break;
-                }
-                if self.runner.is_shutdown() {
-                    tracing::info!("SubScheduler: runner shutdown detected, exiting");
-                    return;
-                }
-                std::thread::yield_now();
+            if !self.runner.wait_output_ready_for(output_buffer_id) {
+                tracing::info!("SubScheduler: runner shutdown detected, exiting");
+                return;
             }
 
             if let Some(err) = self.runner.take_error() {
@@ -573,8 +630,7 @@ impl<M: LlmModel> SubScheduler<M> {
     fn write_input_buffer_pre_promote(&mut self) -> Result<bool> {
         let num_decode = self
             .active_decodes
-            .iter()
-            .filter(|seq| !seq.kv.is_blocked_on_blocks())
+            .iter_runnable()
             .count();
         let num_prefill_seqs: usize = self.pending_prefills.iter().map(|p| p.num_requests()).sum();
         let num_prefill_tokens: usize = self
@@ -620,12 +676,9 @@ impl<M: LlmModel> SubScheduler<M> {
         let mut scheduled_sequence_ids = HashSet::with_capacity(num_seqs);
 
         // Decode 在前 (每条 q_len=1)。
-        for d in &self.active_decodes {
+        for d in self.active_decodes.iter_runnable() {
             if !scheduled_sequence_ids.insert(d.sequence_id) {
                 tracing::warn!("Skipping duplicate active decode sequence_id={}", d.sequence_id);
-                continue;
-            }
-            if d.kv.is_blocked_on_blocks() {
                 continue;
             }
             staging.input_tokens.push(d.last_token);
@@ -634,6 +687,7 @@ impl<M: LlmModel> SubScheduler<M> {
 
             meta.q_start_loc[seq_idx] = offset;
             meta.slot_indices[seq_idx] = d.kv.slot_for_legacy_workspace(seq_idx) as i32;
+            meta.sequence_ids[seq_idx] = d.sequence_id;
             meta.positions_start[seq_idx] = d.next_position as i32;
             step_items.push(StepItem::Decode {
                 sequence_id: d.sequence_id,
@@ -680,6 +734,7 @@ impl<M: LlmModel> SubScheduler<M> {
 
                 meta.q_start_loc[seq_idx] = offset;
                 meta.slot_indices[seq_idx] = slot as i32;
+                meta.sequence_ids[seq_idx] = segment.sequence_id;
                 meta.positions_start[seq_idx] = segment_start as i32;
                 step_items.push(StepItem::PrefillSegment { segment });
                 paged_tables.push(paged_table);
@@ -879,12 +934,7 @@ impl<M: LlmModel> SubScheduler<M> {
                         );
                         continue;
                     }
-                    if let Some(idx) = self
-                        .active_decodes
-                        .iter()
-                        .position(|s| s.sequence_id == sequence_id)
-                    {
-                        let seq = &mut self.active_decodes[idx];
+                    if let Some(seq) = self.active_decodes.get_mut(sequence_id) {
                         let generated_count = seq.generated_count + 1;
                         let finished = self.eos_token_ids.contains(&token_id)
                             || generated_count >= seq.max_tokens;
@@ -896,10 +946,9 @@ impl<M: LlmModel> SubScheduler<M> {
                         });
 
                         if finished {
-                            self.active_decodes.remove(idx);
+                            self.active_decodes.remove(sequence_id);
                             batch_members_changed = true;
                         } else {
-                            let seq = &mut self.active_decodes[idx];
                             seq.last_token = token_id;
                             seq.generated_count = generated_count;
                             seq.next_position += 1;
@@ -935,23 +984,22 @@ impl<M: LlmModel> SubScheduler<M> {
                             });
 
                             if !finished {
-                                if self.active_decodes.iter().any(|seq| seq.sequence_id == sequence_id) {
-                                    tracing::warn!(
-                                        "Ignoring duplicate decode activation sequence_id={}",
-                                        sequence_id
-                                    );
-                                } else {
-                                    self.active_decodes.push(DecodeSeq {
+                                match self.active_decodes.insert(DecodeSeq {
+                                    sequence_id,
+                                    kv: decode_kv_from_segment(&segment),
+                                    // final prefill 输出 token 还没写入 KV；下一步 decode 写到 prompt_len。
+                                    next_position: segment.prompt_len as usize,
+                                    last_token: token_id,
+                                    generated_count,
+                                    max_tokens: segment.max_tokens,
+                                    sampling: segment.sampling_params,
+                                }) {
+                                    Ok(()) => batch_members_changed = true,
+                                    Err(e) => tracing::warn!(
+                                        "Ignoring duplicate decode activation sequence_id={} error={:?}",
                                         sequence_id,
-                                        kv: decode_kv_from_segment(&segment),
-                                        // final prefill 输出 token 还没写入 KV；下一步 decode 写到 prompt_len。
-                                        next_position: segment.prompt_len as usize,
-                                        last_token: token_id,
-                                        generated_count,
-                                        max_tokens: segment.max_tokens,
-                                        sampling: segment.sampling_params,
-                                    });
-                                    batch_members_changed = true;
+                                        e
+                                    ),
                                 }
                             }
                         }
@@ -1005,7 +1053,7 @@ impl<M: LlmModel> SubScheduler<M> {
 
     fn collect_need_blocks_drafts(&mut self) -> Vec<NeedBlocksDraft> {
         let mut drafts = Vec::new();
-        for seq in &mut self.active_decodes {
+        for seq in self.active_decodes.iter_mut() {
             if let Some(draft) = seq.kv.maybe_request_blocks(
                 seq.sequence_id,
                 seq.next_position,
@@ -1117,7 +1165,7 @@ impl<M: LlmModel> SubScheduler<M> {
                 }
                 Err(zmq::Error::EAGAIN) => {
                     // 没有消息，等一小段时间后重试
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(e) => tracing::error!("ZMQ recv error while waiting for prefill: {}", e),
             }
@@ -1223,10 +1271,7 @@ impl<M: LlmModel> SubScheduler<M> {
     fn cancel_request(&mut self, sequence_id: u64) -> bool {
         self.cancelled_sequences.insert(sequence_id);
 
-        let before_active = self.active_decodes.len();
-        self.active_decodes
-            .retain(|seq| seq.sequence_id != sequence_id);
-        let removed_active = before_active != self.active_decodes.len();
+        let removed_active = self.active_decodes.cancel(sequence_id);
 
         let mut removed_pending = false;
         let pending = std::mem::take(&mut self.pending_prefills);

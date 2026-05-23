@@ -4,27 +4,22 @@
 #include "scatter_kv_batch.h"
 
 // -----------------------------------------------------------------------------
-// Batched K/V scatter.
+// Batched K/V scatter — vectorized per-token copy (inspired by vLLM
+// reshape_and_cache_flash).
 //
-// 调用者不再传 "已加 pos 偏移的 dst 指针数组"：kernel 自己用
-//   cache_ptrs[layer_idx * max_slots + slot_indices[seq]]
-// 拿到该 seq 在本层的 cache base，再用 `seq_positions[seq] * dst_row_stride`
-// 算到写入起点。
+// 设计核心改进（相比旧 per-seq scalar kernel）：
+//   - 每个 token 行用 float4 (16B = 8 bf16) 向量化拷贝，带宽利用率 ~8x 提升。
+//   - 去掉了内层的 idx/kv_dim 整数除法。
+//   - Grid = (batch, token_blocks): blockIdx.x = seq, blockIdx.y 分摊行数。
+//     当 seq_len 长时，多个 y-blocks 协作，所有 SM 都能参与。
 //
-// 这样 kernel 只依赖两类 device scratch：
-//   1. `*_cache_ptrs`            —— `[layer_num, max_slots]` u64 表；
-//                                   runner 在扩容 / 成员变化时填一次，
-//                                   scatter 和 attention 共用。
-//   2. `slot_indices / seq_positions / seq_starts / seq_lens`
-//                                —— `[B]` 小数组；runner 在 step 入口
-//                                   一次性 H2D，所有层共用。
-//
-// 因此 op 内部 **零 malloc / 零 sync / 零 per-step H2D**，并且指针地址全部
-// step 作用域稳定，天然 CUDA-Graph-capturable。K/V 合一次 launch。
+// 保持 API 完全兼容，仍然 **零 malloc / 零 sync / 零 per-step H2D**。
+// CUDA-Graph-capturable（grid 大小和指针地址 step 间稳定）。
 // -----------------------------------------------------------------------------
 
 template <typename T>
-__global__ void scatter_kv_batch_kernel(
+__global__ __launch_bounds__(256)
+void scatter_kv_batch_kernel(
     const T*          k_src,
     const T*          v_src,
     void* const* __restrict__ k_cache_ptrs,
@@ -49,23 +44,54 @@ __global__ void scatter_kv_batch_kernel(
     const int start = seq_starts[seq];
 
     const int table_off = layer_idx * max_slots + slot;
-    T* k_dst = reinterpret_cast<T*>(k_cache_ptrs[table_off]) + pos * dst_row_stride;
-    T* v_dst = reinterpret_cast<T*>(v_cache_ptrs[table_off]) + pos * dst_row_stride;
+    T* k_dst_base = reinterpret_cast<T*>(k_cache_ptrs[table_off]) + pos * dst_row_stride;
+    T* v_dst_base = reinterpret_cast<T*>(v_cache_ptrs[table_off]) + pos * dst_row_stride;
 
-    const int total = len * kv_dim;
-    const int tid   = threadIdx.x;
-    const int step  = blockDim.x;
+    constexpr int ELEMS_PER_VEC = 16 / sizeof(T); // 8 for bf16/fp16, 4 for f32
+    const int vecs_per_row = kv_dim / ELEMS_PER_VEC;
 
-    for (int idx = tid; idx < total; idx += step) {
-        const int token = idx / kv_dim;
-        const int dim   = idx - token * kv_dim;
+    const int tid = threadIdx.x;
+    const int block_threads = blockDim.x;
 
+    // y-dimension distributes tokens across multiple blocks for long sequences
+    const int y_blocks = gridDim.y;
+    const int token_start = blockIdx.y;
+
+    const bool k_contig = (k_src_row_stride == kv_dim);
+    const bool v_contig = (v_src_row_stride == kv_dim);
+    const bool dst_contig = (dst_row_stride == kv_dim);
+    const bool all_contig = k_contig && v_contig && dst_contig;
+
+    for (int token = token_start; token < len; token += y_blocks) {
         const int src_row = start + token;
-        const T k_val = k_src[src_row * k_src_row_stride + dim];
-        const T v_val = v_src[src_row * v_src_row_stride + dim];
+        const T* k_row = k_src + src_row * k_src_row_stride;
+        const T* v_row = v_src + src_row * v_src_row_stride;
+        T* k_dst = k_dst_base + token * dst_row_stride;
+        T* v_dst = v_dst_base + token * dst_row_stride;
 
-        k_dst[token * dst_row_stride + dim] = k_val;
-        v_dst[token * dst_row_stride + dim] = v_val;
+        if (all_contig) {
+            // Fast path: float4 vectorized copy
+            const float4* k_src_v = reinterpret_cast<const float4*>(k_row);
+            const float4* v_src_v = reinterpret_cast<const float4*>(v_row);
+            float4* k_dst_v = reinterpret_cast<float4*>(k_dst);
+            float4* v_dst_v = reinterpret_cast<float4*>(v_dst);
+
+            for (int i = tid; i < vecs_per_row; i += block_threads) {
+                k_dst_v[i] = k_src_v[i];
+                v_dst_v[i] = v_src_v[i];
+            }
+            // Tail (kv_dim not divisible by ELEMS_PER_VEC — rare for real models)
+            for (int i = vecs_per_row * ELEMS_PER_VEC + tid; i < kv_dim; i += block_threads) {
+                k_dst[i] = k_row[i];
+                v_dst[i] = v_row[i];
+            }
+        } else {
+            // Strided path (qkv narrow view): element-wise
+            for (int i = tid; i < kv_dim; i += block_threads) {
+                k_dst[i] = k_row[i];
+                v_dst[i] = v_row[i];
+            }
+        }
     }
 }
 
@@ -89,7 +115,14 @@ static inline void launch_scatter_kv_batch(
     cudaStream_t stream)
 {
     if (batch <= 0) return;
-    dim3 grid(batch);
+    // y-blocks: let multiple blocks share long sequences to fill SMs.
+    // For H20 (80 SMs), use enough y-blocks so that batch * y_blocks >= 80.
+    // Cap at 32 to avoid over-subscription for short sequences.
+    int y_blocks = 1;
+    if (batch < 32) {
+        y_blocks = min(32, max(1, 80 / batch));
+    }
+    dim3 grid(batch, y_blocks);
     dim3 block(256);
     scatter_kv_batch_kernel<T><<<grid, block, 0, stream>>>(
         k_src, v_src,
@@ -197,10 +230,12 @@ extern "C" void scatter_kv_batch_f32(
 // Writes K/V rows into a global paged pool laid out as
 //   [num_blocks, block_size, kv_dim]
 // using per-sequence block tables [batch, max_blocks_per_seq].
+// Vectorized per-token with y-block parallelism (same pattern as batched).
 // -----------------------------------------------------------------------------
 
 template <typename T>
-__global__ void scatter_kv_paged_kernel(
+__global__ __launch_bounds__(256)
+void scatter_kv_paged_kernel(
     const T* __restrict__ k_src,
     const T* __restrict__ v_src,
     T* __restrict__ k_pool,
@@ -221,24 +256,50 @@ __global__ void scatter_kv_paged_kernel(
 
     const int base_pos = seq_positions[seq];
     const int start = seq_starts[seq];
-    const int total = len * kv_dim;
     const int tid = threadIdx.x;
-    const int step = blockDim.x;
+    const int block_threads = blockDim.x;
+    const int y_blocks = gridDim.y;
 
-    for (int idx = tid; idx < total; idx += step) {
-        const int token = idx / kv_dim;
-        const int dim = idx - token * kv_dim;
+    constexpr int ELEMS_PER_VEC = 16 / sizeof(T);
+    const int vecs_per_row = kv_dim / ELEMS_PER_VEC;
+    // Paged dst stride is always kv_dim (contiguous within a page slot)
+    const bool src_contig = (k_src_row_stride == kv_dim) && (v_src_row_stride == kv_dim);
+
+    for (int token = static_cast<int>(blockIdx.y); token < len; token += y_blocks) {
         const int logical_pos = base_pos + token;
-        const int block_idx = logical_pos / block_size;
-        const int block_off = logical_pos - block_idx * block_size;
-        const unsigned int physical_block = block_tables[seq * max_blocks_per_seq + block_idx];
+        const int blk_idx = logical_pos / block_size;
+        const int blk_off = logical_pos - blk_idx * block_size;
+        const unsigned int physical_block = block_tables[seq * max_blocks_per_seq + blk_idx];
 
         const int src_row = start + token;
-        const T k_val = k_src[src_row * k_src_row_stride + dim];
-        const T v_val = v_src[src_row * v_src_row_stride + dim];
-        const size_t dst = (static_cast<size_t>(physical_block) * block_size + block_off) * kv_dim + dim;
-        k_pool[dst] = k_val;
-        v_pool[dst] = v_val;
+        const T* k_row = k_src + src_row * k_src_row_stride;
+        const T* v_row = v_src + src_row * v_src_row_stride;
+
+        const size_t dst_offset = (static_cast<size_t>(physical_block) * block_size + blk_off) * kv_dim;
+        T* k_dst = k_pool + dst_offset;
+        T* v_dst = v_pool + dst_offset;
+
+        if (src_contig) {
+            // Vectorized path
+            const float4* k_src_v = reinterpret_cast<const float4*>(k_row);
+            const float4* v_src_v = reinterpret_cast<const float4*>(v_row);
+            float4* k_dst_v = reinterpret_cast<float4*>(k_dst);
+            float4* v_dst_v = reinterpret_cast<float4*>(v_dst);
+
+            for (int i = tid; i < vecs_per_row; i += block_threads) {
+                k_dst_v[i] = k_src_v[i];
+                v_dst_v[i] = v_src_v[i];
+            }
+            for (int i = vecs_per_row * ELEMS_PER_VEC + tid; i < kv_dim; i += block_threads) {
+                k_dst[i] = k_row[i];
+                v_dst[i] = v_row[i];
+            }
+        } else {
+            for (int i = tid; i < kv_dim; i += block_threads) {
+                k_dst[i] = k_row[i];
+                v_dst[i] = v_row[i];
+            }
+        }
     }
 }
 
@@ -261,7 +322,11 @@ static inline void launch_scatter_kv_paged(
     cudaStream_t stream)
 {
     if (batch <= 0) return;
-    dim3 grid(batch);
+    int y_blocks = 1;
+    if (batch < 32) {
+        y_blocks = min(32, max(1, 80 / batch));
+    }
+    dim3 grid(batch, y_blocks);
     dim3 block(256);
     scatter_kv_paged_kernel<T><<<grid, block, 0, stream>>>(
         k_src, v_src, k_pool, v_pool, block_tables, max_blocks_per_seq, block_size,

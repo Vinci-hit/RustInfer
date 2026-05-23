@@ -66,7 +66,9 @@ impl ZmqFrontendTransport {
         })
     }
 
-    /// ZMQ I/O thread — blocking, owns the ROUTER socket.
+    /// ZMQ I/O thread — epoll-driven, zero-latency wakeup.
+    ///
+    /// 用 zmq_poll 同时监听 ROUTER + inproc PAIR，任一有数据立即唤醒。
     fn zmq_thread(
         endpoint: String,
         incoming_tx: mpsc::UnboundedSender<FrontendEvent>,
@@ -75,100 +77,96 @@ impl ZmqFrontendTransport {
         let ctx = zmq::Context::new();
         let socket = ctx.socket(zmq::ROUTER)?;
         socket.bind(&endpoint)?;
-        socket.set_rcvtimeo(10)?; // 10ms non-blocking poll
+        socket.set_rcvtimeo(0)?;
+
+        // inproc wakeup: main thread binds, helper thread connects (after barrier).
+        let wakeup_rx = ctx.socket(zmq::PAIR)?;
+        wakeup_rx.bind("inproc://fe-wakeup")?;
+        wakeup_rx.set_rcvtimeo(0)?;
 
         tracing::info!("ZMQ frontend ROUTER bound to {}", endpoint);
         let codec = MsgPackCodec;
 
-        loop {
-            // 1. Try to receive requests from HTTP server.
-            match socket.recv_bytes(0) {
-                Ok(identity) => {
-                    // ROUTER frame: [identity, empty, data]
-                    let _ = socket.recv_bytes(0); // empty delimiter
-                    match socket.recv_bytes(0) {
-                        Ok(data) => match codec.decode::<ServerCommand>(&data) {
-                            Ok(ServerCommand::Infer(request)) => {
-                                let _ = incoming_tx.send(FrontendEvent::Infer {
-                                    client_id: ClientId(identity),
-                                    request,
-                                });
-                            }
-                            Ok(ServerCommand::Cancel(cancel)) => {
-                                let _ = incoming_tx.send(FrontendEvent::Cancel {
-                                    request_id: RequestId(cancel.request_id),
-                                    reason: cancel.reason,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to decode ServerCommand: {}", e);
-                            }
-                        },
-                        Err(e) => tracing::error!("ZMQ recv data frame error: {:?}", e),
+        // Helper: bridge outgoing_rx → std channel + inproc wakeup.
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<OutgoingResponse>();
+        let ctx_clone = ctx.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        std::thread::Builder::new()
+            .name("fe-outgoing-bridge".into())
+            .spawn(move || {
+                // Create wakeup_tx in THIS thread (ZMQ socket thread-affinity).
+                let wakeup_tx = ctx_clone.socket(zmq::PAIR).unwrap();
+                wakeup_tx.connect("inproc://fe-wakeup").unwrap();
+                barrier2.wait(); // signal main thread that connect is done
+
+                loop {
+                    match outgoing_rx.blocking_recv() {
+                        Some(msg) => {
+                            let _ = msg_tx.send(msg);
+                            let _ = wakeup_tx.send(&[1u8][..], zmq::DONTWAIT);
+                        }
+                        None => return,
                     }
                 }
-                Err(zmq::Error::EAGAIN) => {} // No message ready.
-                Err(e) => tracing::error!("ZMQ recv error: {:?}", e),
+            })?;
+
+        barrier.wait(); // wait for helper to connect inproc
+
+        loop {
+            // Block until ROUTER has data OR wakeup fires.
+            let mut poll_items = [
+                socket.as_poll_item(zmq::POLLIN),
+                wakeup_rx.as_poll_item(zmq::POLLIN),
+            ];
+            let _ = zmq::poll(&mut poll_items, -1);
+
+            // 1. Drain incoming.
+            loop {
+                match socket.recv_bytes(0) {
+                    Ok(identity) => {
+                        let _ = socket.recv_bytes(0);
+                        match socket.recv_bytes(0) {
+                            Ok(data) => match codec.decode::<ServerCommand>(&data) {
+                                Ok(ServerCommand::Infer(request)) => {
+                                    let _ = incoming_tx.send(FrontendEvent::Infer {
+                                        client_id: ClientId(identity),
+                                        request,
+                                    });
+                                }
+                                Ok(ServerCommand::Cancel(cancel)) => {
+                                    let _ = incoming_tx.send(FrontendEvent::Cancel {
+                                        request_id: RequestId(cancel.request_id),
+                                        reason: cancel.reason,
+                                    });
+                                }
+                                Err(e) => tracing::error!("Decode: {}", e),
+                            },
+                            Err(e) => tracing::error!("ZMQ recv data: {:?}", e),
+                        }
+                    }
+                    Err(zmq::Error::EAGAIN) => break,
+                    Err(e) => { tracing::error!("ZMQ recv: {:?}", e); break; }
+                }
             }
 
-            // 2. Try to send responses (non-blocking drain).
-            while let Ok(msg) = outgoing_rx.try_recv() {
+            // 2. Drain wakeup + send outgoing.
+            while wakeup_rx.recv_bytes(zmq::DONTWAIT).is_ok() {}
+            while let Ok(msg) = msg_rx.try_recv() {
                 match msg {
-                    OutgoingResponse::Full {
-                        client_id,
-                        response,
-                    } => {
+                    OutgoingResponse::Full { client_id, response } => {
                         if let Ok(data) = codec.encode(&response) {
-                            if let Err(e) = socket.send(&client_id.0, zmq::SNDMORE) {
-                                tracing::error!(
-                                    "ZMQ frontend send identity failed for request {}: {:?}",
-                                    response.request_id,
-                                    e
-                                );
-                                continue;
-                            }
-                            if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
-                                tracing::error!(
-                                    "ZMQ frontend send delimiter failed for request {}: {:?}",
-                                    response.request_id,
-                                    e
-                                );
-                                continue;
-                            }
-                            if let Err(e) = socket.send(&data, 0) {
-                                tracing::error!(
-                                    "ZMQ frontend send response failed for request {}: {:?}",
-                                    response.request_id,
-                                    e
-                                );
-                            }
+                            let _ = socket.send(&client_id.0, zmq::SNDMORE);
+                            let _ = socket.send(&b""[..], zmq::SNDMORE);
+                            let _ = socket.send(&data, 0);
                         }
                     }
                     OutgoingResponse::Chunk { client_id, chunk } => {
                         if let Ok(data) = codec.encode(&chunk) {
-                            if let Err(e) = socket.send(&client_id.0, zmq::SNDMORE) {
-                                tracing::error!(
-                                    "ZMQ frontend send identity failed for stream {}: {:?}",
-                                    chunk.request_id,
-                                    e
-                                );
-                                continue;
-                            }
-                            if let Err(e) = socket.send(&b""[..], zmq::SNDMORE) {
-                                tracing::error!(
-                                    "ZMQ frontend send delimiter failed for stream {}: {:?}",
-                                    chunk.request_id,
-                                    e
-                                );
-                                continue;
-                            }
-                            if let Err(e) = socket.send(&data, 0) {
-                                tracing::error!(
-                                    "ZMQ frontend send stream chunk failed for {}: {:?}",
-                                    chunk.request_id,
-                                    e
-                                );
-                            }
+                            let _ = socket.send(&client_id.0, zmq::SNDMORE);
+                            let _ = socket.send(&b""[..], zmq::SNDMORE);
+                            let _ = socket.send(&data, 0);
                         }
                     }
                 }
@@ -251,7 +249,7 @@ impl ZmqWorkerTransport {
         })
     }
 
-    /// ZMQ I/O thread — blocking, owns PUSH+PULL sockets.
+    /// ZMQ I/O thread — epoll-driven with inproc wakeup for commands.
     fn zmq_thread(
         push_endpoint: String,
         pull_endpoint: String,
@@ -266,27 +264,65 @@ impl ZmqWorkerTransport {
 
         let pull_socket = ctx.socket(zmq::PULL)?;
         pull_socket.bind(&pull_endpoint)?;
-        pull_socket.set_rcvtimeo(10)?; // 10ms poll
+        pull_socket.set_rcvtimeo(0)?;
         tracing::info!("ZMQ worker PULL bound to {}", pull_endpoint);
 
+        // inproc wakeup for commands.
+        let wakeup_rx = ctx.socket(zmq::PAIR)?;
+        wakeup_rx.bind("inproc://wk-cmd-wakeup")?;
+        wakeup_rx.set_rcvtimeo(0)?;
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let ctx_clone = ctx.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        std::thread::Builder::new()
+            .name("wk-cmd-bridge".into())
+            .spawn(move || {
+                let wakeup_tx = ctx_clone.socket(zmq::PAIR).unwrap();
+                wakeup_tx.connect("inproc://wk-cmd-wakeup").unwrap();
+                barrier2.wait();
+
+                loop {
+                    match command_rx.blocking_recv() {
+                        Some(cmd) => {
+                            let _ = cmd_tx.send(cmd);
+                            let _ = wakeup_tx.send(&[1u8][..], zmq::DONTWAIT);
+                        }
+                        None => return,
+                    }
+                }
+            })?;
+
+        barrier.wait();
+
         loop {
-            // 1. Send commands to worker (non-blocking drain).
-            while let Ok(cmd) = command_rx.try_recv() {
+            let mut poll_items = [
+                pull_socket.as_poll_item(zmq::POLLIN),
+                wakeup_rx.as_poll_item(zmq::POLLIN),
+            ];
+            let _ = zmq::poll(&mut poll_items, -1);
+
+            // 1. Send queued commands.
+            while wakeup_rx.recv_bytes(zmq::DONTWAIT).is_ok() {}
+            while let Ok(cmd) = cmd_rx.try_recv() {
                 if let Err(e) = push_socket.send(&cmd, 0) {
-                    tracing::error!("ZMQ PUSH send error: {:?}", e);
+                    tracing::error!("ZMQ PUSH send: {:?}", e);
                 }
             }
 
-            // 2. Receive outputs from worker.
-            match pull_socket.recv_bytes(0) {
-                Ok(data) => {
-                    if output_tx.send(data).is_err() {
-                        tracing::info!("Worker output channel closed, shutting down");
-                        return Ok(());
+            // 2. Drain worker outputs.
+            loop {
+                match pull_socket.recv_bytes(0) {
+                    Ok(data) => {
+                        if output_tx.send(data).is_err() {
+                            return Ok(());
+                        }
                     }
+                    Err(zmq::Error::EAGAIN) => break,
+                    Err(e) => { tracing::error!("ZMQ PULL: {:?}", e); break; }
                 }
-                Err(zmq::Error::EAGAIN) => {} // No message ready.
-                Err(e) => tracing::error!("ZMQ PULL recv error: {:?}", e),
             }
         }
     }
