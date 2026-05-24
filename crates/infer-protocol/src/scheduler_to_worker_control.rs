@@ -1,3 +1,9 @@
+//! Scheduler → Worker **control plane** messages.
+//!
+//! Spans bootstrap (Hello, LoadModel, InitPagedKv) and runtime (KV grants,
+//! cancel, drain, unload, liveness). Wrapped in [`crate::ControlEnvelope`]
+//! on the wire.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,11 +68,51 @@ pub enum BlockGrantDeniedReason {
     WorkerNotReady,
 }
 
+/// Cancel an in-flight sequence. Migrated from the data plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelSequence {
+    pub sequence_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrainMode {
+    Graceful,
+    Immediate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainWorker {
+    pub mode: DrainMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnloadModel {
+    pub model_instance_id: String,
+}
+
+/// Top-level scheduler-originated control message.
+///
+/// Bootstrap variants are emitted by `ControlPlane<Bootstrapping>::bootstrap`;
+/// runtime variants by `ControlPlaneCmdTx`. RPC variants (`Ping`, `Drain`,
+/// `UnloadModel`) carry a non-zero `RequestId` in their envelope and are
+/// matched against pending calls by the scheduler when the worker replies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SchedulerControlMessage {
+    // ── bootstrap ──
     Hello(SchedulerHello),
     LoadModel(LoadModel),
     InitPagedKv(InitPagedKv),
+
+    // ── runtime: KV grants ──
     GrantBlocks(GrantBlocks),
     GrantBlocksDenied(GrantBlocksDenied),
+
+    // ── runtime: lifecycle ──
+    Cancel(CancelSequence),
+    Drain(DrainWorker),
+    UnloadModel(UnloadModel),
+
+    // ── liveness / shutdown ──
+    Ping,
+    Shutdown,
 }

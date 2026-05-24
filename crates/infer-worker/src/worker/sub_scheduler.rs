@@ -17,14 +17,23 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 
 use crate::base::DeviceType;
 use crate::base::error::{Error, Result};
 use crate::model::llm::LlmModel;
 use crate::model::runtime::InferenceState;
+use crate::worker::control_pump::WorkerLiveState;
 use crate::worker::runner::{ModelRunner, STEP_BUFFER_COUNT, StepMeta, WorkerBatchMeta};
-use infer_protocol::scheduler_to_worker::*;
-use infer_protocol::worker_to_scheduler::*;
+use infer_protocol::scheduler_to_worker_control::{
+    BlockGrantDeniedReason, CancelSequence, DrainMode, DrainWorker, GrantBlocks,
+    GrantBlocksDenied, SchedulerControlMessage, UnloadModel,
+};
+use infer_protocol::scheduler_to_worker_data::*;
+use infer_protocol::worker_to_scheduler_control::{
+    NeedBlocks, NeedBlocksReason, WorkerControlMessage, WorkerState, WorkerStepError,
+};
+use infer_protocol::worker_to_scheduler_data::{GeneratedToken, StepOutput};
 
 const DEFAULT_DECODE_BLOCK_PREFETCH_MARGIN: usize = 4;
 const DEFAULT_DECODE_BLOCK_REQUEST_BLOCKS: usize = 1;
@@ -391,9 +400,19 @@ pub struct SubScheduler<M: LlmModel> {
     device: DeviceType,
     eos_token_ids: Vec<i32>,
 
-    // ZMQ (与 Scheduler 通信)
+    // ZMQ data plane (Scheduler 通信)
     zmq_in: zmq::Socket,
     zmq_out: zmq::Socket,
+
+    // Control plane handles (跨线程 mpsc 与 ControlPump 对接)
+    control_down_rx: Receiver<SchedulerControlMessage>,
+    control_up_tx: SyncSender<WorkerControlMessage>,
+    /// Liveness atomics read by the pump on every heartbeat tick.
+    live: WorkerLiveState,
+    /// Worker id (for embedding in upstream control messages).
+    worker_id: String,
+    /// Model instance id (for embedding in upstream control messages).
+    model_instance_id: String,
 
     // 序列管理
     active_decodes: ActiveDecodes,
@@ -420,17 +439,29 @@ impl<M: LlmModel> SubScheduler<M> {
         zmq_out: zmq::Socket,
         eos_token_ids: Vec<i32>,
         profile_cuda_steps: usize,
+        control_down_rx: Receiver<SchedulerControlMessage>,
+        control_up_tx: SyncSender<WorkerControlMessage>,
+        live: WorkerLiveState,
+        worker_id: String,
+        model_instance_id: String,
     ) -> Self {
         let (max_batch_tokens, max_batch_seqs) = {
             let ws = unsafe { runner.workspace_for(0) };
             (ws.max_batch_tokens, ws.max_batch_seqs)
         };
+        live.set_state(WorkerState::Running);
+        live.set_active_requests(0);
         Self {
             runner,
             device,
             eos_token_ids,
             zmq_in,
             zmq_out,
+            control_down_rx,
+            control_up_tx,
+            live,
+            worker_id,
+            model_instance_id,
             active_decodes: ActiveDecodes::new(),
             pending_prefills: Vec::new(),
             pending_cancels: Vec::new(),
@@ -915,8 +946,6 @@ impl<M: LlmModel> SubScheduler<M> {
         let mut step_output = StepOutput {
             prefill_done: Vec::new(),
             tokens: Vec::new(),
-            need_blocks: Vec::new(),
-            error: None,
         };
         let mut batch_members_changed = false;
 
@@ -1010,13 +1039,18 @@ impl<M: LlmModel> SubScheduler<M> {
             }
         }
 
+        // NeedBlocks now travel on the control plane (one message per request).
         for draft in self.collect_need_blocks_drafts() {
-            step_output.need_blocks.push(NeedBlocksRequest {
+            let need = NeedBlocks {
+                worker_id: self.worker_id.clone(),
+                model_instance_id: self.model_instance_id.clone(),
                 sequence_id: draft.sequence_id,
                 current_blocks: draft.current_blocks as u32,
                 required_blocks: draft.required_blocks as u32,
                 request_blocks: draft.request_blocks as u32,
-            });
+                reason: NeedBlocksReason::DecodeExtend,
+            };
+            self.send_control_upstream(WorkerControlMessage::NeedBlocks(need));
         }
 
         if batch_members_changed {
@@ -1029,10 +1063,10 @@ impl<M: LlmModel> SubScheduler<M> {
             }
         }
 
-        if step_output.prefill_done.is_empty()
-            && step_output.tokens.is_empty()
-            && step_output.need_blocks.is_empty()
-        {
+        // Update liveness counters for the pump.
+        self.live.set_active_requests(self.active_decodes.len());
+
+        if step_output.prefill_done.is_empty() && step_output.tokens.is_empty() {
             return;
         }
         let data = match rmp_serde::to_vec(&step_output) {
@@ -1064,7 +1098,7 @@ impl<M: LlmModel> SubScheduler<M> {
         drafts
     }
 
-    fn apply_block_grant(&mut self, grant: BlockGrantCmd) {
+    fn apply_block_grant(&mut self, grant: GrantBlocks) {
         if let Some(seq) = self
             .active_decodes
             .iter_mut()
@@ -1085,6 +1119,19 @@ impl<M: LlmModel> SubScheduler<M> {
         } else {
             tracing::debug!("GrantBlocks for inactive sequence_id={}", grant.sequence_id);
         }
+    }
+
+    fn apply_block_grant_denied(&mut self, denied: GrantBlocksDenied) {
+        tracing::warn!(
+            "GrantBlocksDenied: sequence_id={} reason={:?}",
+            denied.sequence_id,
+            denied.reason
+        );
+        // Phase 1: deny is informational; the sub-scheduler will retry on the
+        // next NeedBlocks tick. Cache exhausted denials should ultimately
+        // surface as a sequence error, but that's policy logic for the
+        // scheduler, not the worker.
+        let _ = BlockGrantDeniedReason::CacheExhausted; // ensure import lives
     }
 
     fn collect_all_sequence_ids(&self) -> Vec<u64> {
@@ -1113,23 +1160,28 @@ impl<M: LlmModel> SubScheduler<M> {
     fn send_fatal_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         tracing::error!("Worker fatal error: {}", message);
-        let output = StepOutput {
-            prefill_done: Vec::new(),
-            tokens: Vec::new(),
-            need_blocks: Vec::new(),
-            error: Some(WorkerStepError {
-                sequence_ids: self.collect_all_sequence_ids(),
-                message,
-                fatal: true,
-            }),
+        let err = WorkerStepError {
+            sequence_ids: self.collect_all_sequence_ids(),
+            message,
+            fatal: true,
         };
-        match rmp_serde::to_vec(&output) {
-            Ok(data) => {
-                if let Err(e) = self.zmq_out.send(&data, 0) {
-                    tracing::error!("ZMQ send fatal StepError failed: {}", e);
-                }
+        self.send_control_upstream(WorkerControlMessage::StepError(err));
+        self.live.set_state(WorkerState::Error);
+    }
+
+    /// Push a [`WorkerControlMessage`] to the [`super::control_pump::ControlPump`]
+    /// for serialization and DEALER send. Drops on full channel; the pump will
+    /// log a warning. The synchronous failure mode is preferred over blocking
+    /// the sub-scheduler thread.
+    fn send_control_upstream(&self, msg: WorkerControlMessage) {
+        match self.control_up_tx.try_send(msg) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("control up channel full; dropping message");
             }
-            Err(e) => tracing::error!("serialize fatal StepError failed: {}", e),
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::error!("control up channel disconnected; pump exited");
+            }
         }
     }
 
@@ -1151,6 +1203,9 @@ impl<M: LlmModel> SubScheduler<M> {
             if self.runner.is_shutdown() || self.draining {
                 return None;
             }
+            // Drain control plane on every iteration so GrantBlocks / Cancel /
+            // Drain arrive even when the data plane is idle.
+            self.drain_control_plane();
             // 用 DONTWAIT + sleep 模拟带 shutdown 检测的 blocking recv
             match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
                 Ok(data) => {
@@ -1170,6 +1225,9 @@ impl<M: LlmModel> SubScheduler<M> {
 
     /// 非阻塞收所有待处理的 prefill。
     fn drain_zmq_prefills(&mut self) {
+        // 每轮先把控制面消息消费干净，保证 GrantBlocks 等先于下一批 prefill
+        // 应用到 active_decodes。
+        self.drain_control_plane();
         loop {
             match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
                 Ok(data) => {
@@ -1186,54 +1244,66 @@ impl<M: LlmModel> SubScheduler<M> {
         }
     }
 
+    /// 数据面只承载 BatchCommand。控制语义已迁到 control plane。
     fn handle_data_plane_message(&mut self, data: &[u8]) -> Option<PrefillBatchCmd> {
-        if let Ok(cmd) = rmp_serde::from_slice::<WorkerCommand>(data) {
-            return self.handle_worker_command(cmd);
-        }
-
-        match rmp_serde::from_slice::<PrefillBatchCmd>(data) {
-            Ok(cmd) => self.accept_prefill(cmd),
+        match rmp_serde::from_slice::<BatchCommand>(data) {
+            Ok(BatchCommand::Prefill(cmd)) => self.accept_prefill(cmd),
+            Ok(BatchCommand::DiffusionBatch(_)) => {
+                tracing::error!("LLM worker received DiffusionBatch on data plane");
+                None
+            }
             Err(e) => {
-                tracing::error!(
-                    "Failed to deserialize worker command or PrefillBatchCmd: {}",
-                    e
-                );
+                tracing::error!("Failed to deserialize BatchCommand: {}", e);
                 None
             }
         }
     }
 
-    fn handle_worker_command(&mut self, cmd: WorkerCommand) -> Option<PrefillBatchCmd> {
-        match cmd {
-            WorkerCommand::Prefill(cmd) => self.accept_prefill(cmd),
-            WorkerCommand::DiffusionBatch(_) => {
-                tracing::error!("LLM worker received DiffusionBatch command");
-                None
+    /// 排空 control_down_rx 中所有 pending 控制消息。每轮 step 前调用。
+    fn drain_control_plane(&mut self) {
+        while let Ok(msg) = self.control_down_rx.try_recv() {
+            self.handle_control_message(msg);
+        }
+    }
+
+    /// Dispatch a single control-plane message into worker state.
+    fn handle_control_message(&mut self, msg: SchedulerControlMessage) {
+        match msg {
+            SchedulerControlMessage::GrantBlocks(g) => self.apply_block_grant(g),
+            SchedulerControlMessage::GrantBlocksDenied(d) => self.apply_block_grant_denied(d),
+            SchedulerControlMessage::Cancel(CancelSequence { sequence_id }) => {
+                tracing::info!("CancelSequence queued sequence_id={}", sequence_id);
+                self.pending_cancels.push(sequence_id);
             }
-            WorkerCommand::GrantBlocks(grant) => {
-                self.apply_block_grant(grant);
-                None
-            }
-            WorkerCommand::Cancel(cancel) => {
-                tracing::info!("CancelRequest queued sequence_id={}", cancel.sequence_id);
-                self.pending_cancels.push(cancel.sequence_id);
-                None
-            }
-            WorkerCommand::Drain(drain) => {
-                tracing::info!("DrainWorker mode={:?}", drain.mode);
+            SchedulerControlMessage::Drain(DrainWorker { mode }) => {
+                tracing::info!("DrainWorker mode={:?}", mode);
                 self.draining = true;
-                if matches!(drain.mode, DrainMode::Immediate) {
+                self.live.set_state(WorkerState::Draining);
+                if matches!(mode, DrainMode::Immediate) {
                     self.pending_prefills.clear();
                     self.active_decodes.clear();
                     self.runner.request_shutdown();
                 }
-                None
             }
-            WorkerCommand::UnloadModel(unload) => {
-                tracing::info!("UnloadModel model_instance_id={}", unload.model_instance_id);
+            SchedulerControlMessage::UnloadModel(UnloadModel { model_instance_id }) => {
+                tracing::info!("UnloadModel model_instance_id={}", model_instance_id);
                 self.draining = true;
                 self.runner.request_shutdown();
-                None
+            }
+            SchedulerControlMessage::Shutdown => {
+                tracing::info!("Worker received Shutdown");
+                self.draining = true;
+                self.runner.request_shutdown();
+            }
+            // The following are bootstrap-only or never targeted at sub-scheduler:
+            SchedulerControlMessage::Hello(_)
+            | SchedulerControlMessage::LoadModel(_)
+            | SchedulerControlMessage::InitPagedKv(_)
+            | SchedulerControlMessage::Ping => {
+                tracing::warn!(
+                    "sub_scheduler received unexpected control message: {:?}",
+                    std::mem::discriminant(&msg)
+                );
             }
         }
     }
@@ -1375,9 +1445,9 @@ mod tests {
         input_ids: Vec<i32>,
         kv_slot: u32,
         max_tokens: usize,
-    ) -> PrefillBatchCmd {
+    ) -> BatchCommand {
         let prompt_len = input_ids.len() as u32;
-        PrefillBatchCmd {
+        BatchCommand::Prefill(PrefillBatchCmd {
             input_ids,
             q_start_loc: vec![0],
             segments: vec![PrefillSegmentMeta {
@@ -1395,7 +1465,31 @@ mod tests {
                 },
                 completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
             }],
-        }
+        })
+    }
+
+    /// Test helper: build a stub `(down_rx, up_tx, live, …)` quartet so each
+    /// `SubScheduler::new` call site doesn't need to spawn a real ControlPump.
+    fn stub_control_handles() -> (
+        std::sync::mpsc::Receiver<SchedulerControlMessage>,
+        std::sync::mpsc::SyncSender<WorkerControlMessage>,
+        WorkerLiveState,
+        std::sync::mpsc::Sender<SchedulerControlMessage>,
+        std::sync::mpsc::Receiver<WorkerControlMessage>,
+    ) {
+        let (down_tx, down_rx) = std::sync::mpsc::channel::<SchedulerControlMessage>();
+        // Wrap into the SyncSender shape that the SubScheduler expects.
+        // We use a (sync_tx, _) split where the test side gets the unbounded
+        // Sender; SubScheduler reads from `down_rx`.
+        let (_unused_tx, _unused_rx) = std::sync::mpsc::sync_channel::<SchedulerControlMessage>(0);
+        // Convert `down_tx` to a typed proxy: expose Sender to test, but keep
+        // the SubScheduler reading `down_rx` directly.
+        let _ = _unused_tx;
+        let _ = _unused_rx;
+
+        let (up_tx, up_rx) = std::sync::mpsc::sync_channel::<WorkerControlMessage>(64);
+        let live = WorkerLiveState::new();
+        (down_rx, up_tx, live, down_tx, up_rx)
     }
 
     /// 单请求端到端：prefill + decode 直到 max_tokens，验证：
@@ -1448,6 +1542,7 @@ mod tests {
         let runner_handle = std::thread::spawn(move || runner_loop.run());
 
         // ─── 启动 sub-scheduler 线程 ───
+        let (stub_down_rx, stub_up_tx, stub_live, _stub_down_tx, _stub_up_rx) = stub_control_handles();
         let server = SubScheduler::new(
             Arc::clone(&runner),
             device,
@@ -1455,6 +1550,11 @@ mod tests {
             worker_push,
             eos_token_ids.clone(),
             0,
+            stub_down_rx,
+            stub_up_tx,
+            stub_live,
+            "test-worker".to_string(),
+            "test-model".to_string(),
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1562,6 +1662,7 @@ mod tests {
         // ─── 启动 ───
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
+        let (stub_down_rx, stub_up_tx, stub_live, _stub_down_tx, _stub_up_rx) = stub_control_handles();
         let server = SubScheduler::new(
             Arc::clone(&runner),
             device,
@@ -1569,6 +1670,11 @@ mod tests {
             worker_push,
             eos_token_ids.clone(),
             0,
+            stub_down_rx,
+            stub_up_tx,
+            stub_live,
+            "test-worker".to_string(),
+            "test-model".to_string(),
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1677,6 +1783,7 @@ mod tests {
 
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
+        let (stub_down_rx, stub_up_tx, stub_live, _stub_down_tx, _stub_up_rx) = stub_control_handles();
         let server = SubScheduler::new(
             Arc::clone(&runner),
             device,
@@ -1684,6 +1791,11 @@ mod tests {
             worker_push,
             eos_token_ids.clone(),
             0,
+            stub_down_rx,
+            stub_up_tx,
+            stub_live,
+            "test-worker".to_string(),
+            "test-model".to_string(),
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -1896,6 +2008,7 @@ mod tests {
 
         let runner2_loop = Arc::clone(&runner2);
         let runner2_handle = std::thread::spawn(move || runner2_loop.run());
+        let (stub_down_rx, stub_up_tx, stub_live, _stub_down_tx, _stub_up_rx) = stub_control_handles();
         let server = SubScheduler::new(
             Arc::clone(&runner2),
             device,
@@ -1903,6 +2016,11 @@ mod tests {
             worker_push,
             eos_token_ids.clone(),
             0,
+            stub_down_rx,
+            stub_up_tx,
+            stub_live,
+            "test-worker".to_string(),
+            "test-model".to_string(),
         );
         let server_handle = std::thread::spawn(move || server.run());
 
@@ -2023,6 +2141,7 @@ mod tests {
 
         let runner_loop = Arc::clone(&runner);
         let runner_handle = std::thread::spawn(move || runner_loop.run());
+        let (stub_down_rx, stub_up_tx, stub_live, _stub_down_tx, _stub_up_rx) = stub_control_handles();
         let server = SubScheduler::new(
             Arc::clone(&runner),
             device,
@@ -2030,6 +2149,11 @@ mod tests {
             worker_push,
             eos_token_ids.clone(),
             0,
+            stub_down_rx,
+            stub_up_tx,
+            stub_live,
+            "test-worker".to_string(),
+            "test-model".to_string(),
         );
         let server_handle = std::thread::spawn(move || server.run());
 

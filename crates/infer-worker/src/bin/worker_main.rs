@@ -233,6 +233,7 @@ fn run_worker<M: LlmModel + 'static>(
     }
 
     control.send_progress(WorkerState::Warmup, "runtime allocated; ready for runner thread")?;
+    let model_instance_id_for_sub = load_model.model_instance_id.clone();
     control.send_ready(
         load_model.model_instance_id,
         load_model.model_path,
@@ -255,9 +256,18 @@ fn run_worker<M: LlmModel + 'static>(
     let runner_loop = Arc::clone(&runner);
     let runner_handle = std::thread::spawn(move || runner_loop.run());
 
-    // SubScheduler (当前线程)
+    // Hand the control client off to the runtime ControlPump, which takes
+    // ownership of the DEALER socket and runs in its own std thread. The
+    // sub-scheduler talks to the pump via two mpsc channels.
     control.send_progress(WorkerState::Running, "worker data plane running")?;
     tracing::info!("Worker running...");
+    let worker_id = control.worker_id().to_string();
+    let (pump, handles) = infer_worker::worker::control_pump::ControlPump::from_bootstrapped_client(
+        control,
+        std::time::Duration::from_millis(1_000),
+    );
+    let pump_handle = pump.spawn();
+
     let sub_scheduler = SubScheduler::new(
         Arc::clone(&runner),
         device,
@@ -265,11 +275,17 @@ fn run_worker<M: LlmModel + 'static>(
         zmq_push,
         eos_token_ids,
         profile_cuda_steps,
+        handles.down_rx,
+        handles.up_tx,
+        handles.live,
+        worker_id,
+        model_instance_id_for_sub,
     );
     sub_scheduler.run();
 
     runner.request_shutdown();
     let _ = runner_handle.join();
+    let _ = pump_handle.join();
     Ok(())
 }
 
@@ -303,8 +319,21 @@ fn run_diffusion_worker<P: infer_worker::model::diffusion::pipeline::DiffusionPi
 
     control.send_progress(WorkerState::Running, "diffusion worker data plane running")?;
     tracing::info!("Diffusion worker running...");
-    let server = DiffusionWorkerServer::new(pipeline, zmq_pull, zmq_push, max_batch_seqs);
+    let (pump, handles) = infer_worker::worker::control_pump::ControlPump::from_bootstrapped_client(
+        control,
+        std::time::Duration::from_millis(1_000),
+    );
+    let pump_handle = pump.spawn();
+
+    let server = DiffusionWorkerServer::new(
+        pipeline,
+        zmq_pull,
+        zmq_push,
+        handles.down_rx,
+        max_batch_seqs,
+    );
     server.run();
+    let _ = pump_handle.join();
     Ok(())
 }
 
@@ -370,6 +399,27 @@ fn wait_for_init_paged_kv(control: &WorkerControlClient, model_instance_id: &str
             }
             SchedulerControlMessage::GrantBlocksDenied(denied) => {
                 tracing::debug!("Ignoring GrantBlocksDenied before Running: sequence_id={} reason={:?}", denied.sequence_id, denied.reason);
+            }
+            SchedulerControlMessage::Cancel(c) => {
+                tracing::debug!("Ignoring Cancel before Running: sequence_id={}", c.sequence_id);
+            }
+            SchedulerControlMessage::Drain(d) => {
+                tracing::warn!("Drain received before InitPagedKv: mode={:?}", d.mode);
+                anyhow::bail!("worker drained during bootstrap");
+            }
+            SchedulerControlMessage::UnloadModel(u) => {
+                tracing::warn!(
+                    "UnloadModel received before InitPagedKv: model_instance_id={}",
+                    u.model_instance_id
+                );
+                anyhow::bail!("worker asked to unload during bootstrap");
+            }
+            SchedulerControlMessage::Ping => {
+                tracing::debug!("Ping received during bootstrap; ignoring (pump not yet up)");
+            }
+            SchedulerControlMessage::Shutdown => {
+                tracing::warn!("Shutdown received during bootstrap");
+                anyhow::bail!("worker asked to shutdown during bootstrap");
             }
         }
     }
@@ -456,6 +506,27 @@ fn wait_for_load_model(control: &WorkerControlClient) -> Result<LoadModel> {
                     denied.sequence_id,
                     denied.reason,
                 );
+            }
+            SchedulerControlMessage::Cancel(c) => {
+                tracing::debug!(
+                    "Ignoring Cancel before LoadModel: sequence_id={}",
+                    c.sequence_id
+                );
+            }
+            SchedulerControlMessage::Drain(d) => {
+                anyhow::bail!("Drain received before LoadModel: mode={:?}", d.mode);
+            }
+            SchedulerControlMessage::UnloadModel(u) => {
+                anyhow::bail!(
+                    "UnloadModel received before LoadModel: model_instance_id={}",
+                    u.model_instance_id
+                );
+            }
+            SchedulerControlMessage::Ping => {
+                tracing::debug!("Ping during bootstrap (pre-LoadModel)");
+            }
+            SchedulerControlMessage::Shutdown => {
+                anyhow::bail!("Shutdown received before LoadModel");
             }
         }
     }

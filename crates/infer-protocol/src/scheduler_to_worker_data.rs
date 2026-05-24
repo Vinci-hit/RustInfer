@@ -1,43 +1,18 @@
+//! Scheduler → Worker **data plane** commands.
+//!
+//! Only batch execution payloads cross this channel. Lifecycle and KV control
+//! semantics (cancel, drain, unload, KV grant) live on the control plane —
+//! see [`crate::scheduler_to_worker_control::SchedulerControlMessage`].
+
 use serde::{Deserialize, Serialize};
 
 use crate::common::{ProtocolError, ProtocolResult};
 
-/// Scheduler -> Worker 的数据面命令。
+/// Scheduler → Worker batch command. The data plane carries nothing else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerCommand {
+pub enum BatchCommand {
     Prefill(PrefillBatchCmd),
     DiffusionBatch(DiffusionBatchCmd),
-    GrantBlocks(BlockGrantCmd),
-    Cancel(CancelRequest),
-    Drain(DrainWorker),
-    UnloadModel(UnloadModel),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockGrantCmd {
-    pub sequence_id: u64,
-    pub block_ids: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelRequest {
-    pub sequence_id: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DrainWorker {
-    pub mode: DrainMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DrainMode {
-    Graceful,
-    Immediate,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnloadModel {
-    pub model_instance_id: String,
 }
 
 /// Scheduler -> Worker 的 prefill segment batch。
@@ -81,7 +56,9 @@ pub struct PrefillSegmentMeta {
 
 impl PrefillSegmentMeta {
     pub fn kv_placement(&self) -> KvPlacement {
-        self.kv.clone().unwrap_or(KvPlacement::Slot { kv_slot: self.kv_slot })
+        self.kv
+            .clone()
+            .unwrap_or(KvPlacement::Slot { kv_slot: self.kv_slot })
     }
 }
 
@@ -129,13 +106,15 @@ impl PrefillBatchCmd {
         if self.input_ids.len() > max_batch_tokens {
             return Err(ProtocolError::invalid_argument(format!(
                 "PrefillBatchCmd has {} tokens, exceeds max_batch_tokens {}",
-                self.input_ids.len(), max_batch_tokens
+                self.input_ids.len(),
+                max_batch_tokens
             )));
         }
         if self.q_start_loc.len() != n {
             return Err(ProtocolError::invalid_argument(format!(
                 "q_start_loc length {} != segments length {}",
-                self.q_start_loc.len(), n
+                self.q_start_loc.len(),
+                n
             )));
         }
 
@@ -144,7 +123,10 @@ impl PrefillBatchCmd {
             if range.start > range.end || range.end > self.input_ids.len() {
                 return Err(ProtocolError::invalid_argument(format!(
                     "PrefillBatchCmd segment {} has invalid token range [{}..{}) for input len {}",
-                    i, range.start, range.end, self.input_ids.len()
+                    i,
+                    range.start,
+                    range.end,
+                    self.input_ids.len()
                 )));
             }
             if range.is_empty() {
@@ -184,7 +166,9 @@ impl PrefillBatchCmd {
             if segment_len != range.len() {
                 return Err(ProtocolError::invalid_argument(format!(
                     "PrefillBatchCmd segment {} token len {} != segment len {}",
-                    i, range.len(), segment_len
+                    i,
+                    range.len(),
+                    segment_len
                 )));
             }
             match segment.completion {
@@ -255,7 +239,8 @@ impl DiffusionBatchCmd {
         if self.requests.len() > max_batch_size {
             return Err(ProtocolError::invalid_argument(format!(
                 "DiffusionBatchCmd has {} requests, exceeds max_batch_size {}",
-                self.requests.len(), max_batch_size
+                self.requests.len(),
+                max_batch_size
             )));
         }
         for (i, req) in self.requests.iter().enumerate() {
@@ -277,13 +262,19 @@ impl DiffusionBatchCmd {
                     i
                 )));
             }
-            if req.height == 0 || req.width == 0 || req.height % 16 != 0 || req.width % 16 != 0 {
+            if req.height == 0
+                || req.width == 0
+                || req.height % 16 != 0
+                || req.width % 16 != 0
+            {
                 return Err(ProtocolError::invalid_argument(format!(
                     "DiffusionBatchCmd request {} invalid shape {}x{}; dimensions must be positive multiples of 16",
                     i, req.height, req.width
                 )));
             }
-            if req.num_inference_steps == 0 && req.sigmas.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            if req.num_inference_steps == 0
+                && req.sigmas.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+            {
                 return Err(ProtocolError::invalid_argument(format!(
                     "DiffusionBatchCmd request {} needs num_inference_steps > 0 or non-empty sigmas",
                     i

@@ -8,16 +8,10 @@ use crate::error::{Result, SchedulerError};
 use crate::request::lifecycle::{Sequence, Prefilling, Decoding, RequestId};
 use crate::transport::codec::{Codec, MsgPackCodec};
 
-use infer_protocol::scheduler_to_worker::{
-    CancelRequest, DiffusionBatchCmd, DiffusionBatchItem, KvPlacement, PrefillBatchCmd,
+use infer_protocol::scheduler_to_worker_data::{
+    BatchCommand, DiffusionBatchCmd, DiffusionBatchItem, KvPlacement, PrefillBatchCmd,
     PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams as WorkerSamplingParams,
-    WorkerCommand,
 };
-
-/// Build a serialized cancel command.
-pub fn build_cancel_request(sequence_id: u64, codec: &MsgPackCodec) -> Result<Vec<u8>> {
-    codec.encode(&WorkerCommand::Cancel(CancelRequest { sequence_id }))
-}
 
 /// Build a serialized prefill segment batch from the currently scheduled prefilling sequences.
 ///
@@ -82,7 +76,7 @@ pub fn build_diffusion_batch(
         return Ok(Vec::new());
     }
 
-    codec.encode(&WorkerCommand::DiffusionBatch(DiffusionBatchCmd { requests }))
+    codec.encode(&BatchCommand::DiffusionBatch(DiffusionBatchCmd { requests }))
 }
 
 fn build_prefill_batch_cmd(
@@ -174,7 +168,7 @@ fn build_prefill_batch_cmd(
         segments,
     };
 
-    codec.encode(&WorkerCommand::Prefill(cmd))
+    codec.encode(&BatchCommand::Prefill(cmd))
 }
 
 #[cfg(test)]
@@ -186,7 +180,7 @@ mod tests {
     use crate::cache::traits::PhysicalBlockId;
     use crate::request::handle::RequestHandle;
     use crate::request::lifecycle::{InFlightPrefillSegment, Priority, RequestMeta, SamplingParams, SequenceId};
-    use infer_protocol::scheduler_to_worker::WorkerCommand;
+    use infer_protocol::scheduler_to_worker_data::BatchCommand;
 
     fn make_prefilling_with_blocks() -> Sequence<Prefilling> {
         let meta = Arc::new(RequestMeta {
@@ -230,8 +224,8 @@ mod tests {
         let request_id = seq.meta.id.clone();
 
         let bytes = build_batch(&[seq], &[], &config, &codec, &[(request_id, 4)]).unwrap();
-        let cmd: WorkerCommand = codec.decode(&bytes).unwrap();
-        let WorkerCommand::Prefill(prefill) = cmd else {
+        let cmd: BatchCommand = codec.decode(&bytes).unwrap();
+        let BatchCommand::Prefill(prefill) = cmd else {
             panic!("expected prefill command");
         };
         assert_eq!(prefill.segments.len(), 1);

@@ -12,8 +12,8 @@ use infer_scheduler::config::{KvCacheMode, SchedulerConfig, SchedulerMode};
 use infer_scheduler::core::SchedulerEngine;
 use infer_scheduler::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
 use infer_protocol::scheduler_to_worker_control::LoadModel;
+use infer_scheduler::transport::control_plane::{ControlPlane, ControlPlaneConfig};
 use infer_scheduler::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
-use infer_scheduler::WorkerGroup;
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]
@@ -168,19 +168,11 @@ async fn main() -> Result<()> {
         kv_cache_memory_fraction: Some(args.mem_fraction_static),
     });
 
-    // Phase 2 control-plane gate: optionally assign model, then wait for WorkerReady.
-    let ready = infer_scheduler::transport::worker_control::wait_for_worker_ready(
-        &args.worker_control_endpoint,
-        load_model,
-    )?;
-    tracing::info!(
-        "Worker ready gate opened: id={} model_instance_id={} model_type={} device={}",
-        ready.worker_id,
-        ready.model_instance_id,
-        ready.model_type,
-        ready.device,
-    );
-    let worker_group = WorkerGroup::from_single_ready(ready);
+    // Phase 2 control-plane gate: bind ROUTER, optionally assign model, then
+    // wait for WorkerReady. Same socket continues to serve runtime control.
+    let cp_cfg = ControlPlaneConfig::default();
+    let (mut control_plane, worker_group) =
+        ControlPlane::bootstrap(&args.worker_control_endpoint, load_model, cp_cfg).await?;
     tracing::info!(
         "WorkerGroup ready: group_id={} model_instance_id={} ranks={} effective_max_batch_tokens={} effective_max_batch_seqs={}",
         worker_group.group_id,
@@ -189,6 +181,17 @@ async fn main() -> Result<()> {
         worker_group.effective_capacity.max_batch_tokens,
         worker_group.effective_capacity.max_batch_seqs,
     );
+    let workers = control_plane.workers();
+    let default_worker = workers
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("control plane reports no workers after bootstrap"))?;
+    let control_cmd = control_plane.cmd_tx();
+    let control_events = control_plane.take_event_rx();
+    // Hand the ControlPlane to the engine via a leak — the engine's lifetime
+    // matches the process lifetime, and ControlPlane's Drop performs graceful
+    // shutdown. Boxing + leaking keeps it alive for the duration of run().
+    let _control_plane_handle: &'static ControlPlane = Box::leak(Box::new(control_plane));
 
     if let KvCacheMode::Paged { block_size } = kv_mode
         && let Some(max_total_kv_tokens) = worker_group.effective_capacity.max_total_kv_tokens {
@@ -224,7 +227,17 @@ async fn main() -> Result<()> {
     };
 
     // Build and run engine.
-    let engine = SchedulerEngine::new(config, policy, kv_manager, worker_group, frontend, worker);
+    let engine = SchedulerEngine::new(
+        config,
+        policy,
+        kv_manager,
+        worker_group,
+        frontend,
+        worker,
+        control_cmd,
+        control_events,
+        default_worker,
+    );
 
     tracing::info!("Scheduler engine running...");
     engine.run().await?;

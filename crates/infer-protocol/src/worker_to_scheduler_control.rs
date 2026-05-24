@@ -1,3 +1,9 @@
+//! Worker → Scheduler **control plane** messages.
+//!
+//! Spans bootstrap (Hello/Progress/Ready/MemoryProfile/PagedKvReady) and
+//! runtime (Heartbeat, NeedBlocks, StepError, ACKs). Wrapped in
+//! [`crate::ControlEnvelope`] on the wire.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +105,8 @@ pub struct PagedKvReady {
     pub bytes_allocated: u64,
 }
 
+/// Worker requesting more KV blocks for a sequence. Migrated from the
+/// data-plane `StepOutput.need_blocks` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeedBlocks {
     pub worker_id: String,
@@ -116,16 +124,59 @@ pub enum NeedBlocksReason {
     PrefillExtend,
 }
 
+/// Per-step execution error. Migrated from `StepOutput.error`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStepError {
+    pub sequence_ids: Vec<u64>,
+    pub message: String,
+    pub fatal: bool,
+}
+
+/// Reply to `SchedulerControlMessage::Cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelAck {
+    pub sequence_id: u64,
+    pub removed: bool,
+}
+
+/// Reply to `SchedulerControlMessage::Drain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainAck {
+    pub remaining_requests: usize,
+}
+
+/// Reply to `SchedulerControlMessage::UnloadModel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnloadAck {
+    pub model_instance_id: String,
+}
+
+/// Top-level worker-originated control message.
+///
+/// RPC replies (`Pong`, `CancelAck`, `DrainAck`, `UnloadAck`) carry the same
+/// `RequestId` as the originating scheduler message. Spontaneous events
+/// (`Heartbeat`, `NeedBlocks`, `StepError`, bootstrap progress) carry
+/// `RequestId::NONE`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerControlMessage {
+    // ── bootstrap ──
     Hello(WorkerHello),
     Progress(WorkerProgress),
     Ready(WorkerReady),
-    Heartbeat(WorkerHeartbeat),
-    Error(WorkerError),
     MemoryProfile(WorkerMemoryProfile),
     PagedKvReady(PagedKvReady),
+
+    // ── runtime: spontaneous ──
+    Heartbeat(WorkerHeartbeat),
     NeedBlocks(NeedBlocks),
+    StepError(WorkerStepError),
+    Error(WorkerError),
+
+    // ── runtime: RPC replies ──
+    Pong,
+    CancelAck(CancelAck),
+    DrainAck(DrainAck),
+    UnloadAck(UnloadAck),
 }
 
-pub const WORKER_CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_CONTROL_PROTOCOL_VERSION: u32 = 2;

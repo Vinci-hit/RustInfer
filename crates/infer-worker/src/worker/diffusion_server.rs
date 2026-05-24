@@ -1,11 +1,16 @@
 //! Diffusion Worker data plane.
 //!
-//! This server handles `WorkerCommand::DiffusionBatch` and returns
-//! `DiffusionBatchOutput`. It intentionally does not use LLM `ModelRunner`, KV
-//! cache, or decode state.
+//! Handles [`BatchCommand::DiffusionBatch`] on the data plane and returns
+//! [`DiffusionBatchOutput`]. Lifecycle messages (Drain, UnloadModel, Cancel)
+//! arrive over the control plane via [`ControlPumpHandles`].
 
-use infer_protocol::scheduler_to_worker::{DiffusionBatchCmd, WorkerCommand};
-use infer_protocol::worker_to_scheduler::{
+use std::sync::mpsc::Receiver;
+
+use infer_protocol::scheduler_to_worker_control::{
+    DrainMode, DrainWorker, SchedulerControlMessage, UnloadModel,
+};
+use infer_protocol::scheduler_to_worker_data::{BatchCommand, DiffusionBatchCmd};
+use infer_protocol::worker_to_scheduler_data::{
     DiffusionBatchOutput, DiffusionImage, DiffusionOutputItem, DiffusionOutputMetrics,
     DiffusionOutputStatus,
 };
@@ -18,6 +23,8 @@ pub struct DiffusionWorkerServer<P: DiffusionPipeline> {
     pipeline: P,
     zmq_in: zmq::Socket,
     zmq_out: zmq::Socket,
+    /// Control plane downward stream (from `ControlPump`).
+    control_down_rx: Receiver<SchedulerControlMessage>,
     max_batch_size: usize,
     draining: bool,
 }
@@ -27,12 +34,14 @@ impl<P: DiffusionPipeline> DiffusionWorkerServer<P> {
         pipeline: P,
         zmq_in: zmq::Socket,
         zmq_out: zmq::Socket,
+        control_down_rx: Receiver<SchedulerControlMessage>,
         max_batch_size: usize,
     ) -> Self {
         Self {
             pipeline,
             zmq_in,
             zmq_out,
+            control_down_rx,
             max_batch_size,
             draining: false,
         }
@@ -41,8 +50,19 @@ impl<P: DiffusionPipeline> DiffusionWorkerServer<P> {
     pub fn run(mut self) {
         tracing::info!("DiffusionWorkerServer running: pipeline={}", self.pipeline.name());
         while !self.draining {
-            let data = match self.zmq_in.recv_bytes(0) {
+            // Drain control plane first so Drain / UnloadModel cuts in promptly.
+            self.drain_control_plane();
+            if self.draining {
+                break;
+            }
+            // Non-blocking data-plane poll with a small sleep so the control
+            // plane gets a chance to fire even when the data plane is idle.
+            let data = match self.zmq_in.recv_bytes(zmq::DONTWAIT) {
                 Ok(data) => data,
+                Err(zmq::Error::EAGAIN) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
                 Err(e) => {
                     tracing::error!("Diffusion worker ZMQ recv error: {}", e);
                     continue;
@@ -63,36 +83,67 @@ impl<P: DiffusionPipeline> DiffusionWorkerServer<P> {
         }
     }
 
+    fn drain_control_plane(&mut self) {
+        while let Ok(msg) = self.control_down_rx.try_recv() {
+            match msg {
+                SchedulerControlMessage::Drain(DrainWorker { mode }) => {
+                    tracing::info!("Diffusion Drain mode={:?}", mode);
+                    self.draining = true;
+                    if matches!(mode, DrainMode::Immediate) {
+                        return;
+                    }
+                }
+                SchedulerControlMessage::UnloadModel(UnloadModel { model_instance_id }) => {
+                    tracing::info!(
+                        "Diffusion UnloadModel model_instance_id={}",
+                        model_instance_id
+                    );
+                    self.draining = true;
+                }
+                SchedulerControlMessage::Cancel(c) => {
+                    tracing::debug!(
+                        "Diffusion Cancel ignored sequence_id={}",
+                        c.sequence_id
+                    );
+                }
+                SchedulerControlMessage::GrantBlocks(g) => {
+                    tracing::debug!(
+                        "Diffusion GrantBlocks ignored sequence_id={}",
+                        g.sequence_id
+                    );
+                }
+                SchedulerControlMessage::GrantBlocksDenied(d) => {
+                    tracing::debug!(
+                        "Diffusion GrantBlocksDenied ignored sequence_id={}",
+                        d.sequence_id
+                    );
+                }
+                SchedulerControlMessage::Shutdown => {
+                    tracing::info!("Diffusion Shutdown");
+                    self.draining = true;
+                }
+                SchedulerControlMessage::Hello(_)
+                | SchedulerControlMessage::LoadModel(_)
+                | SchedulerControlMessage::InitPagedKv(_)
+                | SchedulerControlMessage::Ping => {
+                    tracing::debug!("Diffusion ignoring bootstrap-phase control message");
+                }
+            }
+        }
+    }
+
     fn handle_data_plane_message(&mut self, data: &[u8]) -> Option<DiffusionBatchOutput> {
-        let cmd: WorkerCommand = match rmp_serde::from_slice(data) {
+        let cmd: BatchCommand = match rmp_serde::from_slice(data) {
             Ok(cmd) => cmd,
             Err(e) => {
-                tracing::error!("Failed to decode WorkerCommand for diffusion worker: {}", e);
+                tracing::error!("Failed to decode BatchCommand for diffusion worker: {}", e);
                 return None;
             }
         };
 
         match cmd {
-            WorkerCommand::DiffusionBatch(batch) => Some(self.handle_diffusion_batch(batch)),
-            WorkerCommand::Drain(drain) => {
-                tracing::info!("Diffusion DrainWorker mode={:?}", drain.mode);
-                self.draining = true;
-                None
-            }
-            WorkerCommand::UnloadModel(unload) => {
-                tracing::info!("Diffusion UnloadModel model_instance_id={}", unload.model_instance_id);
-                self.draining = true;
-                None
-            }
-            WorkerCommand::Cancel(cancel) => {
-                tracing::info!("Diffusion CancelRequest ignored sequence_id={}", cancel.sequence_id);
-                None
-            }
-            WorkerCommand::GrantBlocks(grant) => {
-                tracing::debug!("Diffusion GrantBlocks ignored sequence_id={}", grant.sequence_id);
-                None
-            }
-            WorkerCommand::Prefill(_) => {
+            BatchCommand::DiffusionBatch(batch) => Some(self.handle_diffusion_batch(batch)),
+            BatchCommand::Prefill(_) => {
                 tracing::error!("Diffusion worker received LLM Prefill command");
                 None
             }

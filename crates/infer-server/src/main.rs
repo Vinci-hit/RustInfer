@@ -161,6 +161,15 @@ async fn main() -> Result<()> {
         scheduler_cmd.arg("--chunked-prefill-size").arg(chunk_size.to_string());
     }
 
+    // Forward KV-cache and runtime planning flags so paged mode can be exercised
+    // end-to-end via the all-in-one launcher.
+    scheduler_cmd
+        .arg("--kv-cache-mode").arg(&config.kv_cache_mode)
+        .arg("--mem-fraction-static").arg(config.mem_fraction_static.to_string());
+    if config.enable_prefix_caching {
+        scheduler_cmd.arg("--enable-prefix-caching");
+    }
+
     let scheduler_child = scheduler_cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

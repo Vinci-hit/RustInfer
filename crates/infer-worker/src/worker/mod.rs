@@ -9,11 +9,13 @@
 //! 旧的 `shared_buffers / server / runner_dummy` 老 Runner API 已删除。
 pub mod batch_workspace;
 pub mod control_client;
+pub mod control_pump;
 pub mod diffusion_server;
 pub mod runner;
 pub mod sub_scheduler;
 
 pub use batch_workspace::BatchWorkspace;
+pub use control_pump::{ControlPump, ControlPumpHandles, WorkerLiveState};
 pub use runner::ModelRunner;
 pub use diffusion_server::DiffusionWorkerServer;
 pub use runner::{StepMeta, SyncFlags, WorkerBatchMeta};

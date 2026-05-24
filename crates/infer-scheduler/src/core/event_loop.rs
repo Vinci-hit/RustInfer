@@ -3,13 +3,14 @@
 use crate::core::engine::SchedulerEngine;
 use crate::error::Result;
 use crate::policy::traits::SchedulingPolicy;
+use crate::transport::control_plane::ControlEvent;
 use crate::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
 /// Run the main event loop.
 ///
 /// The design uses a two-step approach to avoid borrow checker issues with
 /// `tokio::select!` needing multiple `&mut` borrows:
-/// 1. Poll transports with split borrows via `poll_event`
+/// 1. Poll transports with split borrows via `poll_next_event`
 /// 2. Process the event with full `&mut self` access
 pub async fn run_event_loop<P, F, W>(engine: &mut SchedulerEngine<P, F, W>) -> Result<()>
 where
@@ -20,7 +21,6 @@ where
     tracing::info!("Event loop starting...");
 
     loop {
-        // Wait for next event from either frontend or worker.
         let event = engine.poll_next_event().await;
 
         match event {
@@ -61,6 +61,12 @@ where
             EngineEvent::WorkerOutput(Err(e)) => {
                 tracing::error!("Worker recv error: {}", e);
             }
+            EngineEvent::Control(ev) => {
+                engine.on_control_event(ev).await?;
+                if !engine.worker_busy() {
+                    engine.run_iteration().await?;
+                }
+            }
         }
     }
 }
@@ -69,4 +75,5 @@ where
 pub(crate) enum EngineEvent {
     Frontend(Box<crate::error::Result<FrontendEvent>>),
     WorkerOutput(crate::error::Result<Vec<u8>>),
+    Control(ControlEvent),
 }

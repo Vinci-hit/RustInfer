@@ -4,9 +4,13 @@
 
 pub mod traits;
 pub mod zmq_transport;
-pub mod worker_control;
+pub mod control_plane;
 pub mod channel_transport;
 pub mod codec;
 
 pub use traits::{FrontendTransport, WorkerTransport};
 pub use codec::{Codec, MsgPackCodec};
+pub use control_plane::{
+    ControlError, ControlEvent, ControlPlane, ControlPlaneCmdTx, ControlPlaneConfig,
+    ControlPlaneEventRx, ControlResult, WorkerId,
+};
