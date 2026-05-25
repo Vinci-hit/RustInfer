@@ -13,8 +13,11 @@ use crate::op::matmul::Matmul;
 use crate::op::sdpa::scaled_dot_product_attention;
 use crate::tensor::Tensor;
 
-/// Deep-copy a tensor.
-fn tu_clone(src: &Tensor) -> crate::base::error::Result<Tensor> { src.contiguous() }
+/// Deep-copy a tensor (always allocates fresh storage; `contiguous()` would
+/// return a buffer-sharing clone for already-tight tensors, which is not
+/// what callers like `clone_tensor(x)` followed by an in-place add need —
+/// that path would mutate `x`'s underlying storage).
+fn tu_clone(src: &Tensor) -> crate::base::error::Result<Tensor> { src.to_owned() }
 /// Materialize (ensure contiguous).
 fn tu_materialize(src: &Tensor) -> crate::base::error::Result<Tensor> { src.contiguous() }
 /// Permute dims.
@@ -193,7 +196,9 @@ impl AttnBlock {
         // Reshape [B*N, C] → [B, H, W, C] → permute → [B, C, H, W]
         let bhwc = proj.reshape(&[b, h, w, c])?;
         let bhwc_mat = tu_materialize(&bhwc)?;
-        let bchw = permute_nd(&bhwc_mat, &[0, 3, 1, 2])?;
+        // `permute_nd` returns a strided view; in-place add reads through
+        // `as_slice()` which requires contiguous storage, so materialize.
+        let bchw = tu_materialize(&permute_nd(&bhwc_mat, &[0, 3, 1, 2])?)?;
 
         // Add residual
         let mut out = clone_tensor(x)?;

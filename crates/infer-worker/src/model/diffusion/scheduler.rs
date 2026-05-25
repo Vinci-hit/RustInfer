@@ -309,8 +309,11 @@ mod tests {
         let mut noise = Tensor::new(&[8], DataType::F32, DeviceType::Cpu)?;
         noise.as_f32_mut()?.as_slice_mut()?.copy_from_slice(&[1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]);
 
-        // velocity = a copy of noise (since step() will mutate velocity).
-        let mut velocity = noise.contiguous()?;
+        // velocity = a deep copy of noise (since step() will mutate velocity).
+        // `contiguous()` on an already-tightly-owned tensor returns a clone
+        // that shares the Arc-backed buffer — `to_owned()` allocates fresh
+        // storage, which is what we need here.
+        let mut velocity = noise.to_owned()?;
 
         let mut dst = Tensor::new(&[8], DataType::F32, DeviceType::Cpu)?;
         sched.step(&mut velocity, &noise, &mut dst)?;

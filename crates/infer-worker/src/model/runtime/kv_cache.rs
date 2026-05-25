@@ -186,7 +186,10 @@ mod tests {
 
     #[test]
     fn kv_cache_grows_and_preserves_prefix() -> Result<()> {
-        let cfg = test_config(1024);
+        // seq_len must be >= DEFAULT_INITIAL_KV_CACHE_LEN so the initial
+        // capacity equals the default (the constructor clamps to seq_len).
+        let max_capacity = DEFAULT_INITIAL_KV_CACHE_LEN * 2;
+        let cfg = test_config(max_capacity);
         let mut cache = KvCache::new(&cfg, &DeviceType::Cpu)?;
         assert_eq!(cache.capacity(), DEFAULT_INITIAL_KV_CACHE_LEN);
 
@@ -197,11 +200,12 @@ mod tests {
         }
 
         assert!(cache.ensure_capacity(DEFAULT_INITIAL_KV_CACHE_LEN + 1)?);
-        assert_eq!(cache.capacity(), 1024);
+        // Growth doubles 2048 -> 4096, which equals max_capacity.
+        assert_eq!(cache.capacity(), max_capacity);
 
         let (k, v) = cache.get(0)?;
         assert_eq!(k.dtype(), DataType::F32);
-        assert_eq!(k.shape(), &[1024, 4]);
+        assert_eq!(k.shape(), &[max_capacity, 4]);
         assert_eq!(k.as_f32()?.as_slice()?[0], 42.0);
         assert_eq!(v.as_f32()?.as_slice()?[0], 24.0);
         Ok(())

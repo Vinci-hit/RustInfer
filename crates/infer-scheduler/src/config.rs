@@ -1,7 +1,5 @@
 //! Scheduler configuration.
 
-use std::ops::Range;
-
 /// Scheduler operating mode — determines scheduling behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
@@ -16,53 +14,26 @@ pub enum SchedulerMode {
 
 
 /// KV Cache management mode — determined at startup, immutable at runtime.
+///
+/// Slot mode has been removed in the paged-only refactor; this enum
+/// is retained as a single-variant placeholder so existing call
+/// sites that destructure `kv_cache_mode` keep compiling. A future
+/// step will replace the field with a plain `paged_block_size:
+/// BlockSize` on [`SchedulerConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
 pub enum KvCacheMode {
-    /// Contiguous slot mode: each sequence owns a dedicated slot id.
-    /// Worker manages KV tensors internally. Compatible with current worker.
-    #[default]
-    Slot,
     /// Paged mode: scheduler maintains block tables, worker uses PagedAttention kernels.
-    /// Currently a stub — returns NotImplemented.
     Paged { block_size: usize },
 }
 
-
-/// Preemption strategy when cache is exhausted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
-pub enum PreemptionMode {
-    /// Drop KV cache, re-prefill later (simpler, less memory).
-    Recompute,
-    /// Swap KV blocks to CPU memory (stub).
-    Swap,
-    /// No preemption — reject new requests when full.
-    #[default]
-    Disabled,
+impl Default for KvCacheMode {
+    fn default() -> Self {
+        // Sensible default for benchmark / smoke runs. Production
+        // bootstrap overrides this from the worker handshake.
+        Self::Paged { block_size: 16 }
+    }
 }
 
-
-/// Scheduling policy selection.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
-pub enum PolicyConfig {
-    /// FCFS continuous batching (default).
-    #[default]
-    ContinuousBatching,
-    /// Priority-aware multi-tier QoS (stub).
-    PriorityAware { tiers: Vec<PriorityTier> },
-}
-
-
-/// A priority tier for QoS scheduling.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PriorityTier {
-    pub name: String,
-    pub priority_range: Range<i32>,
-    pub max_concurrency: Option<usize>,
-    pub timeout_ms: Option<u64>,
-}
 
 /// Top-level scheduler configuration.
 #[derive(Debug, Clone)]
@@ -85,14 +56,10 @@ pub struct SchedulerConfig {
     pub num_gpu_blocks: usize,
 
     // ─── Scheduling ───
-    /// Which scheduling policy to use.
-    pub policy: PolicyConfig,
     /// Max tokens per prefill chunk (None = no chunking).
     pub chunked_prefill_size: Option<usize>,
     /// Whether prefix caching is enabled (requires Paged mode).
     pub enable_prefix_caching: bool,
-    /// Preemption strategy.
-    pub preemption_mode: PreemptionMode,
 
     // ─── Transport ───
     /// ZMQ frontend endpoint (ROUTER socket, connects to HTTP server).
@@ -116,10 +83,8 @@ impl Default for SchedulerConfig {
             max_model_len: 4096,
             kv_cache_mode: KvCacheMode::default(),
             num_gpu_blocks: 256,
-            policy: PolicyConfig::default(),
             chunked_prefill_size: None,
             enable_prefix_caching: false,
-            preemption_mode: PreemptionMode::default(),
             frontend_endpoint: "ipc:///tmp/rustinfer.ipc".to_string(),
             worker_push_endpoint: "ipc:///tmp/rustinfer-worker-in.ipc".to_string(),
             worker_pull_endpoint: "ipc:///tmp/rustinfer-worker-out.ipc".to_string(),

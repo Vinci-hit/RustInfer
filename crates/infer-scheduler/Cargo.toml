@@ -35,6 +35,7 @@ clap = { version = "4.5", features = ["derive"] }
 # Utils
 uuid = { version = "1.19", features = ["v4"] }
 hashbrown = "0.15"
+slotmap = "1"
 
 # Async trait
 async-trait = "0.1"

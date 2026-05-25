@@ -43,8 +43,8 @@ pub struct ServerConfig {
     #[arg(long, env = "CHUNKED_PREFILL_SIZE")]
     pub chunked_prefill_size: Option<usize>,
 
-    /// KV cache mode forwarded to the scheduler. "slot" or "paged:<block_size>".
-    #[arg(long, default_value = "slot", env = "KV_CACHE_MODE")]
+    /// KV cache mode forwarded to the scheduler. Only "paged:<block_size>" is supported.
+    #[arg(long, default_value = "paged:16", env = "KV_CACHE_MODE")]
     pub kv_cache_mode: String,
 
     /// Enable RadixTree prefix caching (paged mode only). Forwarded to scheduler.

@@ -1,34 +1,57 @@
 //! RustInfer Scheduler — production-grade continuous batching scheduler.
 //!
-//! ## Architecture
+//! ## Hexagonal architecture (DDD three-layer)
 //!
-//! The scheduler is the central orchestrator for LLM inference:
-//! - Receives tokenized requests from the HTTP server (via ZMQ)
-//! - Manages KV cache allocation (Slot or Paged mode)
-//! - Applies pluggable scheduling policies (continuous batching, priority, etc.)
-//! - Sends batch commands to the GPU worker
-//! - Processes step outputs and dispatches responses
+//! ```text
+//! src/
+//! ├── domain/         pure business types — aggregate roots, value
+//! │                   objects, NewType identifiers, policy traits.
+//! │                   No IO, no async runtime.
+//! ├── application/    orchestrators — SchedulerEngine + 5 Systems
+//! │                   (Ingestion / Planning / Dispatch /
+//! │                   OutputProcessing / ControlEvent) + the
+//! │                   tokio event loop that drives them.
+//! ├── infrastructure/ IO and runtime — ZMQ transports, Prometheus
+//! │                   metrics, paged-KV physical block algorithms,
+//! │                   control-plane router thread.
+//! ├── config.rs       SchedulerConfig + KvCacheMode (paged-only)
+//! ├── error.rs        SchedulerError + Result alias
+//! ├── lib.rs          public surface
+//! └── main.rs         binary bootstrap
+//! ```
 //!
-//! ## Key Design Principles
+//! ## Engine entrypoint
 //!
-//! - **Type-state lifecycle**: requests transition through compile-time verified states
-//! - **Async event-driven**: tokio select! loop with zero-lock main task
-//! - **Pluggable policies**: scheduling, caching, and transport are all trait-based
-//! - **Dual KV mode**: Slot (non-paged) for current compat, Paged for future PagedAttention
+//! [`SchedulerEngine`] is the only top-level type required to spin
+//! up the scheduler binary; it is constructed from boxed
+//! transport / KV / policy implementations and run via
+//! [`SchedulerEngine::run`](application::SchedulerEngine::run).
+//!
+//! ## Key design principles
+//!
+//! - **Paged-only KV**: contiguous slot mode has been removed; all KV
+//!   resource management goes through the paged
+//!   [`KvCachePool`](domain::KvCachePool) trait + [`KvLease`](domain::KvLease)
+//!   RAII guard.
+//! - **Typestate lifecycle**: requests transition through compile-time
+//!   verified states ([`InferenceSession<S>`](domain::InferenceSession)).
+//! - **Async event-driven**: a single tokio `select!` loop with no
+//!   shared mutable state on the hot path.
+//! - **Pluggable policies**: [`SchedulingPolicy`](domain::policy::SchedulingPolicy),
+//!   [`FrontendTransport`](infrastructure::transport::FrontendTransport),
+//!   [`WorkerTransport`](infrastructure::transport::WorkerTransport) are
+//!   all `Box<dyn>`.
 
+// ─── Architectural rings ─────────────────────────────────────────────
+pub mod application;
+pub mod domain;
+pub mod infrastructure;
+
+// ─── Foundation ──────────────────────────────────────────────────────
 pub mod config;
 pub mod error;
-pub mod core;
-pub mod request;
-pub mod policy;
-pub mod cache;
-pub mod transport;
-pub mod metrics;
-pub mod utils;
-pub mod worker_group;
 
-// Re-export key public types.
-pub use config::{SchedulerConfig, KvCacheMode, SchedulerMode};
-pub use core::SchedulerEngine;
-pub use error::{SchedulerError, Result};
-pub use worker_group::{WorkerGroup, WorkerGroupState};
+// ─── Stable public API ───────────────────────────────────────────────
+pub use application::SchedulerEngine;
+pub use config::{KvCacheMode, SchedulerConfig, SchedulerMode};
+pub use error::{Result, SchedulerError};

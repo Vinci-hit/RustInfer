@@ -14,23 +14,11 @@ pub enum SchedulerError {
     #[error("sequence too long: {length} exceeds max_model_len {max}")]
     SequenceTooLong { length: usize, max: usize },
 
-    #[error("invalid request: {0}")]
-    InvalidRequest(String),
-
     #[error("worker error: {0}")]
     WorkerError(String),
 
-    #[error("preemption failed: {0}")]
-    PreemptionFailed(String),
-
-    #[error("codec error: {0}")]
-    Codec(String),
-
     #[error("internal: {0}")]
     Internal(String),
-
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
 
     #[error("shutdown")]
     Shutdown,

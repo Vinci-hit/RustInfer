@@ -15,9 +15,9 @@ pub enum BatchCommand {
     DiffusionBatch(DiffusionBatchCmd),
 }
 
-/// Scheduler -> Worker 的 prefill segment batch。
+/// Scheduler -> Worker 的 prefill segment batch (paged-only).
 ///
-/// 每个 segment 明确描述：写入哪个 KV slot、写入 prompt/KV 的哪个绝对区间，
+/// 每个 segment 明确描述：写入哪个 paged block table、写入 prompt/KV 的哪个绝对区间，
 /// 以及该 segment 完成后是否进入 decode。`q_start_loc` 只表示该 segment 在
 /// `input_ids` 扁平数组中的起点，不承载 KV 语义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,39 +27,23 @@ pub struct PrefillBatchCmd {
     pub segments: Vec<PrefillSegmentMeta>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum KvPlacement {
-    Slot {
-        kv_slot: u32,
-    },
-    Paged {
-        block_table: Vec<u32>,
-        block_size: u32,
-    },
-}
-
+/// Per-segment KV placement (paged-only).
+///
+/// `block_table` is the list of physical block ids assigned by the scheduler;
+/// `block_size` is the token count per block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefillSegmentMeta {
     pub sequence_id: u64,
-    /// 兼容旧 Slot 模式字段；Paged 模式使用 `kv`。
-    pub kv_slot: u32,
-    /// 新 KV placement 描述。None 时等价于 `Slot { kv_slot }`。
-    #[serde(default)]
-    pub kv: Option<KvPlacement>,
+    /// Paged KV block table for this sequence.
+    pub block_table: Vec<u32>,
+    /// Tokens per paged block.
+    pub block_size: u32,
     pub prompt_len: u32,
     pub segment_start: u32,
     pub segment_end: u32,
     pub max_tokens: usize,
     pub sampling_params: SamplingParams,
     pub completion: PrefillSegmentCompletion,
-}
-
-impl PrefillSegmentMeta {
-    pub fn kv_placement(&self) -> KvPlacement {
-        self.kv
-            .clone()
-            .unwrap_or(KvPlacement::Slot { kv_slot: self.kv_slot })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +73,6 @@ impl PrefillBatchCmd {
         &self,
         max_batch_tokens: usize,
         max_seqs: usize,
-        max_kv_slots: usize,
     ) -> ProtocolResult<()> {
         let n = self.num_requests();
         if n == 0 {
@@ -143,11 +126,16 @@ impl PrefillBatchCmd {
                     i
                 )));
             }
-            let kv_slot = segment.kv_slot as usize;
-            if kv_slot >= max_kv_slots {
+            if segment.block_table.is_empty() {
                 return Err(ProtocolError::invalid_argument(format!(
-                    "PrefillBatchCmd segment {} kv_slot {} out of range {}",
-                    i, kv_slot, max_kv_slots
+                    "PrefillBatchCmd segment {} has empty block_table",
+                    i
+                )));
+            }
+            if segment.block_size == 0 {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has block_size=0",
+                    i
                 )));
             }
             if segment.segment_end <= segment.segment_start {

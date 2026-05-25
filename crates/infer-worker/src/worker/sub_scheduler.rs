@@ -49,37 +49,31 @@ struct PendingBlockRequest {
     requested_blocks: usize,
 }
 
+/// Per-sequence paged decode KV state.
+///
+/// Paged-only: `block_table` is the list of physical block ids, `block_size`
+/// is the token count per block, and `pending_request` / `blocked_on_blocks`
+/// drive `NeedBlocks`/`GrantBlocks` flow control.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-enum DecodeKv {
-    Slot {
-        kv_slot: usize,
-    },
-    Paged {
-        block_table: Vec<u32>,
-        block_size: usize,
-        pending_request: Option<PendingBlockRequest>,
-        blocked_on_blocks: bool,
-    },
+struct DecodeKv {
+    block_table: Vec<u32>,
+    block_size: usize,
+    pending_request: Option<PendingBlockRequest>,
+    blocked_on_blocks: bool,
 }
 
 #[allow(dead_code)]
 impl DecodeKv {
+    /// Runner builds temporary state refs from StepMeta and requires
+    /// `slot_indices` to be unique; use the current batch row as the
+    /// placeholder slot id (paged kernels look up KV via block_table).
     fn slot_for_legacy_workspace(&self, batch_idx: usize) -> usize {
-        match self {
-            DecodeKv::Slot { kv_slot } => *kv_slot,
-            // Paged kernels use block tables instead of slot ids. Still, Runner
-            // builds temporary state refs from StepMeta and requires slot_indices
-            // to be unique, so use the current batch row as a stable placeholder.
-            DecodeKv::Paged { .. } => batch_idx,
-        }
+        batch_idx
     }
 
     fn paged_block_table(&self) -> Option<&[u32]> {
-        match self {
-            DecodeKv::Paged { block_table, .. } => Some(block_table),
-            DecodeKv::Slot { .. } => None,
-        }
+        Some(&self.block_table)
     }
 
     fn maybe_request_blocks(
@@ -91,69 +85,45 @@ impl DecodeKv {
         prefetch_margin: usize,
         request_blocks: usize,
     ) -> Option<NeedBlocksDraft> {
-        let DecodeKv::Paged {
-            block_table,
-            block_size,
-            pending_request,
-            blocked_on_blocks,
-        } = self
-        else {
-            return None;
-        };
-        if generated_count >= max_tokens || pending_request.is_some() {
+        if generated_count >= max_tokens || self.pending_request.is_some() {
             return None;
         }
 
         let future_pos = next_position.saturating_add(prefetch_margin);
-        let required_blocks = future_pos / *block_size + 1;
-        if required_blocks <= block_table.len() {
+        let required_blocks = future_pos / self.block_size + 1;
+        if required_blocks <= self.block_table.len() {
             return None;
         }
 
-        let missing = required_blocks - block_table.len();
+        let missing = required_blocks - self.block_table.len();
         let requested_blocks = missing.max(request_blocks.max(1));
-        *pending_request = Some(PendingBlockRequest {
+        self.pending_request = Some(PendingBlockRequest {
             required_blocks,
             requested_blocks,
         });
 
-        let current_required = next_position / *block_size + 1;
-        if current_required > block_table.len() {
-            *blocked_on_blocks = true;
+        let current_required = next_position / self.block_size + 1;
+        if current_required > self.block_table.len() {
+            self.blocked_on_blocks = true;
         }
 
         Some(NeedBlocksDraft {
             sequence_id,
-            current_blocks: block_table.len(),
+            current_blocks: self.block_table.len(),
             required_blocks,
             request_blocks: requested_blocks,
         })
     }
 
     fn append_granted_blocks(&mut self, block_ids: &[u32]) -> bool {
-        let DecodeKv::Paged {
-            block_table,
-            pending_request,
-            blocked_on_blocks,
-            ..
-        } = self
-        else {
-            return false;
-        };
-        block_table.extend_from_slice(block_ids);
-        *pending_request = None;
-        *blocked_on_blocks = false;
+        self.block_table.extend_from_slice(block_ids);
+        self.pending_request = None;
+        self.blocked_on_blocks = false;
         true
     }
 
     fn is_blocked_on_blocks(&self) -> bool {
-        matches!(
-            self,
-            DecodeKv::Paged {
-                blocked_on_blocks: true,
-                ..
-            }
-        )
+        self.blocked_on_blocks
     }
 }
 
@@ -173,11 +143,8 @@ mod paged_kv_helper_tests {
     fn paged_segment() -> PrefillSegmentMeta {
         PrefillSegmentMeta {
             sequence_id: 7,
-            kv_slot: 0,
-            kv: Some(KvPlacement::Paged {
-                block_table: vec![10, 11],
-                block_size: 4,
-            }),
+            block_table: vec![10, 11],
+            block_size: 4,
             prompt_len: 8,
             segment_start: 0,
             segment_end: 8,
@@ -194,20 +161,10 @@ mod paged_kv_helper_tests {
     #[test]
     fn decode_kv_from_paged_segment_keeps_block_table() {
         let kv = decode_kv_from_segment(&paged_segment());
-        match kv {
-            DecodeKv::Paged {
-                block_table,
-                block_size,
-                pending_request,
-                blocked_on_blocks,
-            } => {
-                assert_eq!(block_table, vec![10, 11]);
-                assert_eq!(block_size, 4);
-                assert!(pending_request.is_none());
-                assert!(!blocked_on_blocks);
-            }
-            DecodeKv::Slot { .. } => panic!("expected paged decode kv"),
-        }
+        assert_eq!(kv.block_table, vec![10, 11]);
+        assert_eq!(kv.block_size, 4);
+        assert!(kv.pending_request.is_none());
+        assert!(!kv.blocked_on_blocks);
     }
 
     #[test]
@@ -242,10 +199,8 @@ mod paged_kv_helper_tests {
         let kv0 = decode_kv_from_segment(&paged_segment());
         let mut seg1 = paged_segment();
         seg1.sequence_id = 8;
-        seg1.kv = Some(KvPlacement::Paged {
-            block_table: vec![20, 21],
-            block_size: 4,
-        });
+        seg1.block_table = vec![20, 21];
+        seg1.block_size = 4;
         let kv1 = decode_kv_from_segment(&seg1);
         assert_eq!(kv0.slot_for_legacy_workspace(0), 0);
         assert_eq!(kv1.slot_for_legacy_workspace(1), 1);
@@ -332,19 +287,11 @@ impl ActiveDecodes {
 }
 
 fn decode_kv_from_segment(segment: &PrefillSegmentMeta) -> DecodeKv {
-    match segment.kv_placement() {
-        KvPlacement::Slot { kv_slot } => DecodeKv::Slot {
-            kv_slot: kv_slot as usize,
-        },
-        KvPlacement::Paged {
-            block_table,
-            block_size,
-        } => DecodeKv::Paged {
-            block_table,
-            block_size: block_size as usize,
-            pending_request: None,
-            blocked_on_blocks: false,
-        },
+    DecodeKv {
+        block_table: segment.block_table.clone(),
+        block_size: segment.block_size as usize,
+        pending_request: None,
+        blocked_on_blocks: false,
     }
 }
 
@@ -636,19 +583,9 @@ impl<M: LlmModel> SubScheduler<M> {
     fn ensure_capacity_for_pending_prefills(&mut self) -> Result<()> {
         for cmd in &self.pending_prefills {
             let n = cmd.num_requests();
-            for i in 0..n {
-                let segment = &cmd.segments[i];
-                if let KvPlacement::Slot { kv_slot } = segment.kv_placement() {
-                    let slot = kv_slot as usize;
-                    let max_total = segment.prompt_len as usize + segment.max_tokens;
-
-                    unsafe {
-                        self.runner
-                            .state_mut(slot)
-                            .kv_cache
-                            .ensure_capacity(max_total)?;
-                    }
-                }
+            for _i in 0..n {
+                // Paged-only: KV capacity comes from block_table, runner handles blocks内部.
+                // Per-slot ensure_capacity was a Slot-mode helper, no longer needed.
             }
         }
         Ok(())
@@ -747,13 +684,10 @@ impl<M: LlmModel> SubScheduler<M> {
                 let seq_len = range.len();
                 let segment_start = segment.segment_start as usize;
                 let segment_end = segment.segment_end as usize;
-                let placement = segment.kv_placement();
-                let (slot, paged_table) = match placement {
-                    KvPlacement::Slot { kv_slot } => (kv_slot as usize, None),
-                    // Paged kernels consume block tables. Use batch row as unique
-                    // placeholder slot to satisfy Runner's state-ref uniqueness.
-                    KvPlacement::Paged { block_table, .. } => (seq_idx, Some(block_table)),
-                };
+                // Paged-only: block_table is required;
+                // batch row is the unique placeholder slot for Runner state-ref.
+                let slot = seq_idx;
+                let paged_table = Some(segment.block_table.clone());
 
                 staging
                     .input_tokens
@@ -1192,7 +1126,7 @@ impl<M: LlmModel> SubScheduler<M> {
     /// 验证 prefill 消息合法性。
     fn validate_prefill(&self, cmd: &PrefillBatchCmd) -> Result<()> {
         let ws = unsafe { self.runner.workspace() };
-        cmd.validate(ws.max_batch_tokens, ws.max_batch_seqs, ws.max_batch_seqs)?;
+        cmd.validate(ws.max_batch_tokens, ws.max_batch_seqs)?;
         Ok(())
     }
 
@@ -1446,14 +1380,15 @@ mod tests {
         kv_slot: u32,
         max_tokens: usize,
     ) -> BatchCommand {
+        let _ = kv_slot; // legacy parameter, paged-only build ignores
         let prompt_len = input_ids.len() as u32;
         BatchCommand::Prefill(PrefillBatchCmd {
             input_ids,
             q_start_loc: vec![0],
             segments: vec![PrefillSegmentMeta {
                 sequence_id,
-                kv_slot,
-                kv: None,
+                block_table: vec![0],
+                block_size: 16,
                 prompt_len,
                 segment_start: 0,
                 segment_end: prompt_len,
@@ -2196,8 +2131,8 @@ mod tests {
             segments: vec![
                 PrefillSegmentMeta {
                     sequence_id: 10,
-                    kv_slot: 0,
-                    kv: None,
+                    block_table: vec![0],
+                    block_size: 16,
                     prompt_len: toks0.len() as u32,
                     segment_start: 0,
                     segment_end: toks0.len() as u32,
@@ -2211,8 +2146,8 @@ mod tests {
                 },
                 PrefillSegmentMeta {
                     sequence_id: 11,
-                    kv_slot: 1,
-                    kv: None,
+                    block_table: vec![1],
+                    block_size: 16,
                     prompt_len: toks1.len() as u32,
                     segment_start: 0,
                     segment_end: toks1.len() as u32,

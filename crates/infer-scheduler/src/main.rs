@@ -4,16 +4,13 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use infer_scheduler::cache::kv_manager::KvManager;
-use infer_scheduler::cache::slot_kv_manager::SlotKvManager;
-use infer_scheduler::cache::paged_kv_manager::PagedKvManager;
-use infer_scheduler::cache::noop_kv_manager::NoopKvManager;
+use infer_scheduler::application::SchedulerEngine;
 use infer_scheduler::config::{KvCacheMode, SchedulerConfig, SchedulerMode};
-use infer_scheduler::core::SchedulerEngine;
-use infer_scheduler::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
+use infer_scheduler::domain::kv_cache_pool::{KvCachePool, NoopKvPool, PagedKvPool};
+use infer_scheduler::domain::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
 use infer_protocol::scheduler_to_worker_control::LoadModel;
-use infer_scheduler::transport::control_plane::{ControlPlane, ControlPlaneConfig};
-use infer_scheduler::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
+use infer_scheduler::infrastructure::transport::control_plane::{ControlPlane, ControlPlaneConfig};
+use infer_scheduler::infrastructure::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]
@@ -55,7 +52,7 @@ struct Args {
     #[arg(long, default_value = "1024")]
     max_batch_tokens: usize,
 
-    /// Maximum concurrent sequences (= slot count in slot mode).
+    /// Maximum concurrent sequences in flight.
     #[arg(long, default_value = "32")]
     max_batch_seqs: usize,
 
@@ -67,8 +64,8 @@ struct Args {
     #[arg(long, default_value = "llm")]
     mode: String,
 
-    /// KV cache mode: "slot" (default) or "paged:BLOCK_SIZE". Only for LLM mode.
-    #[arg(long, default_value = "slot")]
+    /// KV cache mode: "paged:BLOCK_SIZE" (only paged is supported). Default block size is 16.
+    #[arg(long, default_value = "paged:16")]
     kv_cache_mode: String,
 
     /// Chunked prefill: max tokens per prefill chunk.
@@ -87,14 +84,15 @@ struct Args {
 }
 
 fn parse_kv_cache_mode(s: &str) -> KvCacheMode {
-    if s == "slot" {
-        KvCacheMode::Slot
-    } else if let Some(rest) = s.strip_prefix("paged:") {
+    // Slot mode has been removed; only paged is supported.
+    if let Some(rest) = s.strip_prefix("paged:") {
         let block_size: usize = rest.parse().unwrap_or(16);
         KvCacheMode::Paged { block_size }
     } else {
-        tracing::warn!("Unknown kv-cache-mode '{}', defaulting to slot", s);
-        KvCacheMode::Slot
+        if !s.is_empty() && s != "paged" {
+            tracing::warn!("Unknown kv-cache-mode '{}', defaulting to paged:16", s);
+        }
+        KvCacheMode::Paged { block_size: 16 }
     }
 }
 
@@ -204,21 +202,19 @@ async fn main() -> Result<()> {
             );
         }
 
-    // Create KV manager and policy based on the effective worker capacity.
-    let kv_manager: Box<dyn KvManager> = match scheduler_mode {
-        SchedulerMode::Diffusion => Box::new(NoopKvManager::new()),
-        SchedulerMode::Llm => match kv_mode {
-            KvCacheMode::Slot => {
-                Box::new(SlotKvManager::new(args.max_batch_seqs, args.max_model_len))
-            }
-            KvCacheMode::Paged { block_size } => {
-                Box::new(PagedKvManager::new_with_prefix_cache(
-                    config.num_gpu_blocks,
-                    block_size,
-                    config.enable_prefix_caching,
-                ))
-            }
-        },
+    // Build the KV cache pool. Diffusion mode uses the no-op pool
+    // (worker manages any model-internal caches itself); LLM mode
+    // uses the paged pool with optional prefix caching.
+    let kv_pool: Box<dyn KvCachePool> = match scheduler_mode {
+        SchedulerMode::Diffusion => Box::new(NoopKvPool::new()),
+        SchedulerMode::Llm => {
+            let KvCacheMode::Paged { block_size } = kv_mode;
+            Box::new(PagedKvPool::with_prefix_cache(
+                config.num_gpu_blocks,
+                block_size,
+                config.enable_prefix_caching,
+            ))
+        }
     };
 
     let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
@@ -230,7 +226,7 @@ async fn main() -> Result<()> {
     let engine = SchedulerEngine::new(
         config,
         policy,
-        kv_manager,
+        kv_pool,
         worker_group,
         frontend,
         worker,

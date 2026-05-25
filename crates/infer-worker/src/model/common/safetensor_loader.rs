@@ -69,16 +69,27 @@ mod tests {
     use super::*;
     #[test]
     fn safetensor_test() {
-        let filename = "/mnt/d/llama3.2_1B_Instruct/Llama-3.2-1B-Instruct/model.safetensors"; // 将此替换为你的模型文件路径
+        // Optional integration test: requires a real safetensors file on disk.
+        // Set RUSTINFER_SAFETENSOR_TEST_PATH to enable; otherwise the test is
+        // a no-op so the suite runs cleanly on machines without the artefact.
+        let filename = match std::env::var("RUSTINFER_SAFETENSOR_TEST_PATH") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "safetensor_test skipped: set RUSTINFER_SAFETENSOR_TEST_PATH \
+                     to a model.safetensors file to enable."
+                );
+                return;
+            }
+        };
 
-        // 检查文件是否存在
-        if !Path::new(filename).exists() {
+        if !Path::new(&filename).exists() {
             panic!("Error: File '{}' not found. Please ensure the model file is in the correct path.", filename);
         }
 
         // 1. 通过内存映射加载文件
         eprintln!("Loading model from '{}'...", filename);
-        let buffer = match load_and_mmap(Path::new(filename)) {
+        let buffer = match load_and_mmap(Path::new(&filename)) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("Failed to load and map file: {}", e);
