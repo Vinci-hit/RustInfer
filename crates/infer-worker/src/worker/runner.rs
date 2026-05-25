@@ -897,6 +897,12 @@ impl<M: LlmModel> ModelRunner<M> {
             return Err(e);
         }
         cfg.capture_end(slot)?;
+        // CUDA stream capture only RECORDS kernels — it does not execute
+        // them. Without launching the graph for this step, this step's
+        // KV writes / output tokens never actually run, and downstream
+        // reads see stale buffer contents (e.g. the prefill step's
+        // last token leaks into decode-1's output).
+        cfg.launch(slot)?;
         Ok(())
     }
     /// 从 workspace 预填好的 device scratch 构造本步 AttentionPlan。**零 H2D**。

@@ -15,14 +15,38 @@ pub struct Llama3Template;
 
 impl ChatTemplate for Llama3Template {
     fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
-        let mut prompt = String::from("<|begin_of_text|>");
+        // BOS (`<|begin_of_text|>`) is added automatically by the tokenizer
+        // via `add_special_tokens=true` in `GenericHfTokenizer::encode`.
+        // Embedding it in the template here would produce a duplicated BOS
+        // (e.g. `[128000, 128000, ...]`), pushing the prompt off the
+        // training distribution.
+        let mut prompt = String::new();
+
+        // Llama 3.2's bundled jinja chat_template ALWAYS emits a system
+        // header — even when the caller provided no system message — and
+        // injects "Cutting Knowledge Date" + "Today Date". Mirror that here
+        // so RustInfer's prompt is byte-equivalent to HF's
+        // `apply_chat_template(messages, add_generation_prompt=True)`.
+        //
+        // Date is fixed to the HF template's hard-coded fallback ("26 Jul 2024")
+        // — matches HF's behavior when `strftime_now` is unavailable, and
+        // keeps token sequences stable across days for reproducibility.
+        let user_system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.trim().to_string())
+            .unwrap_or_default();
+
+        prompt.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
+        prompt.push_str("Cutting Knowledge Date: December 2023\n");
+        prompt.push_str("Today Date: 26 Jul 2024\n\n");
+        prompt.push_str(&user_system);
+        prompt.push_str("<|eot_id|>");
 
         for msg in messages {
             match msg.role.as_str() {
                 "system" => {
-                    prompt.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
-                    prompt.push_str(&msg.content);
-                    prompt.push_str("<|eot_id|>");
+                    // Already consumed above into the leading system block.
                 }
                 "user" => {
                     prompt.push_str("<|start_header_id|>user<|end_header_id|>\n\n");
