@@ -1,39 +1,28 @@
-#![allow(
-    clippy::too_many_arguments,
-    clippy::not_unsafe_ptr_arg_deref,
-    clippy::mut_from_ref,
-    clippy::doc_overindented_list_items,
-    clippy::missing_safety_doc,
-    clippy::needless_range_loop,
-    clippy::wrong_self_convention,
-    clippy::doc_lazy_continuation,
-    clippy::explicit_counter_loop,
-    clippy::manual_memcpy,
-    clippy::module_inception,
-)]
+//! # `infer-worker` — GPU Inference Runtime
+//!
+//! Internal architecture follows DDD (Domain-Driven Design):
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │ process/          进程入口 (main, ZMQ)                   │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ app/              应用层 (Runner, Scheduler, Graph)       │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ models/           具体模型 (Qwen3, Llama3)               │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ domain/           域层 — 纯的，零 FFI，零 I/O             │
+//! │   types, tensor, ports, ops, model trait, runtime        │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ infra/            基础设施 — 实现 domain 的 trait          │
+//! │   cuda/, cpu/, buffer, io                                │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! **依赖方向**: domain ← infra ← app ← models ← process
+//! domain 不 `use` infra 的任何东西（通过 trait 反转依赖）。
 
-pub mod base;
-pub mod op;
-pub mod tensor;
-
-// Higher-level model and worker code is currently paused while we rebuild
-// the tensor/stride foundation. Gate it behind `models` so the base
-// infrastructure (tensor + kernels + cuda) can build and test alone.
-#[cfg(feature = "models")]
-pub mod model;
-#[cfg(feature = "models")]
-pub mod worker;
-#[cfg(feature = "models")]
-pub use model::runtime;
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-
-/// 统一算子配置类型，所有算子接口使用 `Option<&OpConfig>` 作为参数。
-/// - cuda 编译: `OpConfig = cuda::CudaConfig`（cublas/cudnn handle, stream 等）
-/// - 纯 CPU 编译: `OpConfig = ()`（零开销）
-/// CPU 路径传 `None` 即可。
-#[cfg(feature = "cuda")]
-pub type OpConfig = cuda::CudaConfig;
-#[cfg(not(feature = "cuda"))]
-pub type OpConfig = ();
+pub mod domain;
+pub mod infra;
+pub mod app;
+pub mod models;
+pub mod process;

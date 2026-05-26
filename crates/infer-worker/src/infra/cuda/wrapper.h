@@ -1,0 +1,11 @@
+#include <cuda_runtime_api.h>
+#include <cuda_profiler_api.h>
+#include <cublasLt.h>
+#include <cublas_v2.h>
+#include <cudnn.h>
+#include "kernels/total_head.h"
+
+#ifndef cublasCreate_v2
+#define cublasCreate_v2 cublasCreate
+#define cublasDestroy_v2 cublasDestroy
+#endif
