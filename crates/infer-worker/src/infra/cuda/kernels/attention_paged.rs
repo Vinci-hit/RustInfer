@@ -107,13 +107,15 @@ pub fn attention_paged<T: Dtype>(
     let stream = device.config.stream;
     let batch = plan.batch as i32;
 
-    // Q / O layout: [num_tokens, num_q_heads * head_dim] contiguous.
-    //   stride seq  = num_q_heads * head_dim
+    // Q / O layout: [num_tokens, num_q_heads * head_dim]; q may be a
+    // strided view (zero-copy slice of a fused QKV buffer), so read its
+    // row stride directly. O is always contiguous (workspace-owned).
+    //   stride seq  = q's row stride (== num_q_heads * head_dim if contig)
     //   stride head = head_dim
-    let q_stride_seq = (head_num * head_dim) as i64;
+    let q_stride_seq = q.strides().as_slice()[0] as i64;
     let q_stride_head = head_dim as i64;
-    let o_stride_seq = q_stride_seq;
-    let o_stride_head = q_stride_head;
+    let o_stride_seq = (head_num * head_dim) as i64;
+    let o_stride_head = head_dim as i64;
 
     // Pool layout: [num_blocks, block_size, kv_dim]; the kernels handle
     // their own indexing through block_tables + block_size, so we only pass

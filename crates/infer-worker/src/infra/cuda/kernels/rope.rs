@@ -33,8 +33,11 @@ unsafe extern "C" {
 }
 
 /// Apply RoPE in-place to Q and K tensors.
-/// q: [num_tokens, q_dim] = [num_tokens, head_num*head_dim]  (contiguous)
-/// k: [num_tokens, kv_dim] = [num_tokens, kv_head_num*head_dim]  (contiguous)
+/// q: [num_tokens, q_dim] = [num_tokens, head_num*head_dim]
+/// k: [num_tokens, kv_dim] = [num_tokens, kv_head_num*head_dim]
+/// q/k may be **strided views** (e.g. zero-copy slices of a fused QKV
+/// buffer) — we read each tensor's row stride directly, so the kernel
+/// works whether or not q/k are contiguous along the row dimension.
 /// sin/cos: [max_seq_len, head_dim/2]
 /// positions: device pointer to [num_tokens] i32
 pub fn rope_inplace<T: Dtype>(
@@ -50,6 +53,9 @@ pub fn rope_inplace<T: Dtype>(
 ) -> OpResult<()> {
     let q_dim = head_num * head_dim;
     let kv_dim = kv_head_num * head_dim;
+    // Row stride from tensor: stride[0] for a 2D [rows, cols] view.
+    let q_row_stride = q.strides().as_slice()[0] as i32;
+    let k_row_stride = k.strides().as_slice()[0] as i32;
     let stream = q.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
@@ -64,7 +70,7 @@ pub fn rope_inplace<T: Dtype>(
                 q_dim, kv_dim, head_dim,
                 q.data_ptr_mut() as _, k.data_ptr_mut() as _,
                 positions_dev, num_tokens,
-                q_dim, kv_dim,
+                q_row_stride, k_row_stride,
                 sin.data_ptr() as _, cos.data_ptr() as _,
                 stream,
             ),
@@ -72,7 +78,7 @@ pub fn rope_inplace<T: Dtype>(
                 q_dim, kv_dim, head_dim,
                 q.data_ptr_mut() as _, k.data_ptr_mut() as _,
                 positions_dev, num_tokens,
-                q_dim, kv_dim,
+                q_row_stride, k_row_stride,
                 sin.data_ptr() as _, cos.data_ptr() as _,
                 stream,
             ),

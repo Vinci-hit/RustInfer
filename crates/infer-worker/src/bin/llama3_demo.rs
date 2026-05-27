@@ -259,7 +259,7 @@ fn main() -> Result<()> {
     let mut runner = ModelRunner::new(
         model, cuda, pool_blocks, block_size, max_blocks_per_seq, args.max_seq_len,
         cap_num_tokens, cap_batch, flash_decode_capacity_f32,
-        vec![1, 2, 4, 8, 16],
+        vec![1, 2, 4, 8, 16, 32],
     ).map_err(|e| anyhow!("ModelRunner::new: {:?}", e))?;
 
     // Prime CUDA Graphs (decode-only).
@@ -347,6 +347,20 @@ fn main() -> Result<()> {
         "[demo] generated {} tokens in {:.2}s ({:.1} tok/s)",
         new_tokens.len(), elapsed, new_tokens.len() as f32 / elapsed,
     );
+    if std::env::var("RUSTINFER_PROFILE_GPU").is_ok() && runner.prof_step_count > 0 {
+        let n = runner.prof_step_count as f64;
+        let wall_us  = runner.prof_step_wall_ns as f64 / 1000.0 / n;
+        let gpu_us   = runner.prof_graph_gpu_ns as f64 / 1000.0 / n;
+        let host_us  = wall_us - gpu_us;
+        eprintln!(
+            "[profile] decode steps={}  wall={:.1}µs/tok  gpu_graph={:.1}µs/tok  host_overhead={:.1}µs/tok ({:.1}%)",
+            runner.prof_step_count, wall_us, gpu_us, host_us, 100.0 * host_us / wall_us,
+        );
+        eprintln!(
+            "[profile] tok/s ceiling if host_overhead → 0: {:.1}",
+            1.0e6 / gpu_us,
+        );
+    }
 
     // 7. Decode and print.
     let mut all_ids: Vec<u32> = prompt_ids.iter().map(|&i| i as u32).collect();

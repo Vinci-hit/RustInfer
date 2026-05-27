@@ -343,6 +343,9 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
 {
     // Direct cuBLASLt call. No heuristic cache, no benchmarking, no private stream,
     // no graph compatibility probe. Let cuBLASLt choose its default algorithm.
+    // NOTE: passing nullptr for algo lets cuBLASLt's internal runtime pick the
+    // optimal kernel for the given (M,N,K) — empirically faster than any
+    // heuristic-selected or benchmarked algo for the M=1 decode case.
     const int m_g = N, n_g = M, k_g = K;
     cublasOperation_t opA = CUBLAS_OP_T;
     cublasOperation_t opB = CUBLAS_OP_N;

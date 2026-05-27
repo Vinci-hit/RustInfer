@@ -1,7 +1,7 @@
 //! Qwen3 model — same as Llama3 + QK-norm before RoPE.
 
 use crate::domain::ports::{OpBackend, OpResult};
-use crate::domain::types::{Dtype, Shape};
+use crate::domain::types::{Dtype, Shape, Strides};
 use crate::domain::tensor::Tensor;
 use crate::domain::model::{LlmModel, ForwardContext};
 use super::layers::{Linear, RMSNorm, Embedding};
@@ -11,8 +11,8 @@ pub struct Qwen3Layer<T: Dtype, D: OpBackend> {
     pub post_attention_layernorm: RMSNorm<T, D>,
     pub qkv_proj: Linear<T, D>,
     pub o_proj: Linear<T, D>,
-    pub gate_proj: Linear<T, D>,
-    pub up_proj: Linear<T, D>,
+    /// Fused [2*intermediate_size, dim] = vstack(gate_proj, up_proj).
+    pub gate_up_proj: Linear<T, D>,
     pub down_proj: Linear<T, D>,
     pub q_norm: Option<RMSNorm<T, D>>,
     pub k_norm: Option<RMSNorm<T, D>>,
@@ -50,8 +50,8 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
         let mut h        = ctx.workspace.h_view(num_tokens);
         let mut qkv_buf  = ctx.workspace.qkv_view(num_tokens);
         let mut attn_out = ctx.workspace.attn_out_view(num_tokens);
+        let mut gate_up  = ctx.workspace.gate_up_view(num_tokens);
         let mut gate_buf = ctx.workspace.gate_view(num_tokens);
-        let mut up_buf   = ctx.workspace.up_view(num_tokens);
         let mut ffn_out  = ctx.workspace.ffn_view(num_tokens);
         let mut o_out    = ctx.workspace.o_out_view(num_tokens);
         let logits       = ctx.workspace.logits_view(num_tokens);
@@ -68,23 +68,35 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
             // ── QKV projection ──
             layer.qkv_proj.forward(&h, &mut qkv_buf)?;
 
-            let mut q = ctx.workspace.q_view(num_tokens);
-            let mut k = ctx.workspace.k_view(num_tokens);
-            let mut v = ctx.workspace.v_view(num_tokens);
-            D::split_qkv(&qkv_buf, &mut q, &mut k, &mut v, num_tokens, q_dim, kv_dim)?;
+            // Zero-copy QKV split via strided views (saves 3 split_cols launches).
+            let qkv_cols = q_dim + 2 * kv_dim;
+            let mut q = qkv_buf.narrow(1, 0, q_dim)?;
+            let mut k = qkv_buf.narrow(1, q_dim, kv_dim)?;
+            let v       = qkv_buf.narrow(1, q_dim + kv_dim, kv_dim)?;
 
             // ── QK-norm (Qwen3 specific) ──
+            //
+            // RMSNorm kernel natively accepts a strided 3D
+            // `[T, head_num, head_size]` view; we rewrite the strided
+            // `[T, q_dim]` Q into `[T, head_num, head_size]` via raw_view
+            // (strides `[qkv_cols, head_size, 1]`). No copy.
             if let Some(ref qn) = layer.q_norm {
-                let mut q_reshaped = q.view_contiguous(
-                    Shape::from_slice(&[num_tokens * self.head_num, self.head_dim]),
-                )?;
-                qn.forward_inplace(&mut q_reshaped)?;
+                let mut q3 = q.view_raw(
+                    Shape::from_slice(&[num_tokens, self.head_num, self.head_dim]),
+                    Strides::from_slice(&[qkv_cols, self.head_dim, 1]),
+                    q.offset_elems(),
+                    false,
+                );
+                qn.forward_inplace(&mut q3)?;
             }
             if let Some(ref kn) = layer.k_norm {
-                let mut k_reshaped = k.view_contiguous(
-                    Shape::from_slice(&[num_tokens * self.kv_head_num, self.head_dim]),
-                )?;
-                kn.forward_inplace(&mut k_reshaped)?;
+                let mut k3 = k.view_raw(
+                    Shape::from_slice(&[num_tokens, self.kv_head_num, self.head_dim]),
+                    Strides::from_slice(&[qkv_cols, self.head_dim, 1]),
+                    k.offset_elems(),
+                    false,
+                );
+                kn.forward_inplace(&mut k3)?;
             }
 
             // ── RoPE ──
@@ -129,10 +141,9 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
                 &layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps,
             )?;
 
-            // ── MLP (SwiGLU) ──
-            layer.gate_proj.forward(&h, &mut gate_buf)?;
-            layer.up_proj.forward(&h, &mut up_buf)?;
-            D::swiglu_inplace(&mut gate_buf, &up_buf)?;
+            // ── MLP (fused gate_up + swiglu_packed) ──
+            layer.gate_up_proj.forward(&h, &mut gate_up)?;
+            D::swiglu_packed(&gate_up, &mut gate_buf, num_tokens, self.intermediate_size)?;
             layer.down_proj.forward(&gate_buf, &mut ffn_out)?;
 
             // ── Residual + next norm (fused) ──

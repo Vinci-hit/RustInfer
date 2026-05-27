@@ -149,6 +149,63 @@ impl<'a> WeightLoader<'a> {
         Ok(Linear::new(fused, None))
     }
 
+    /// Load fused gate_up: concatenate gate_proj, up_proj along rows
+    /// → `[2*intermediate_size, dim]`.
+    ///
+    /// One GEMV computes both gate and up in a single launch; downstream
+    /// `swiglu_packed` consumes the fused output without splitting.
+    pub fn load_fused_gate_up<T: Dtype, D: OpBackend>(
+        &self, layer_idx: usize, intermediate_size: usize, dim: usize, device: &D,
+    ) -> OpResult<Linear<T, D>> {
+        let g_view = self.reader.read_view(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
+            .map_err(|e| OpError::Kernel(format!("gate_proj layer {}: {}", layer_idx, e)))?;
+        let u_view = self.reader.read_view(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
+            .map_err(|e| OpError::Kernel(format!("up_proj layer {}: {}", layer_idx, e)))?;
+
+        let total_rows = 2 * intermediate_size;
+        let elem = T::SIZE_BYTES;
+        let total_bytes = total_rows * dim * elem;
+        let mut host = vec![0u8; total_bytes];
+
+        let mut cast_into = |view: &TensorView, row_offset: usize, expected_rows: usize| -> OpResult<()> {
+            let shape: Vec<usize> = view.shape().to_vec();
+            if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
+                return Err(OpError::Shape(format!(
+                    "fused_gate_up layer {}: expected [{}, {}], got {:?}",
+                    layer_idx, expected_rows, dim, shape,
+                )));
+            }
+            let src = view.data();
+            let src_dt = match view.dtype() {
+                safetensors::Dtype::F32 => DataType::F32,
+                safetensors::Dtype::F16 => DataType::F16,
+                safetensors::Dtype::BF16 => DataType::BF16,
+                safetensors::Dtype::I32 => DataType::I32,
+                safetensors::Dtype::I8 => DataType::I8,
+                other => return Err(OpError::Kernel(format!("unsupported dtype: {:?}", other))),
+            };
+            let numel = expected_rows * dim;
+            let dst = unsafe { host.as_mut_ptr().add(row_offset * dim * elem) };
+            if src_dt == T::DATA_TYPE {
+                let n = numel * elem;
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len())); }
+            } else {
+                cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
+            }
+            Ok(())
+        };
+
+        cast_into(&g_view, 0, intermediate_size)?;
+        cast_into(&u_view, intermediate_size, intermediate_size)?;
+
+        let fused = Tensor::<T, D>::from_host_bytes(
+            &host,
+            Shape::from_slice(&[total_rows, dim]),
+            device,
+        )?;
+        Ok(Linear::new(fused, None))
+    }
+
     /// Load a complete Llama3 model.
     pub fn load_llama3<T: Dtype, D: OpBackend>(&self, cfg: &LoadConfig, device: &D) -> OpResult<Llama3Model<T, D>> {
         let embed_tokens = self.load_embedding("model.embed_tokens.weight", device)?;
@@ -168,8 +225,7 @@ impl<'a> WeightLoader<'a> {
                 post_attention_layernorm: self.load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), device, cfg.rms_norm_eps)?,
                 qkv_proj: self.load_fused_qkv(i, cfg.head_num * cfg.head_dim, cfg.kv_head_num * cfg.head_dim, cfg.dim, device)?,
                 o_proj: self.load_linear(&format!("model.layers.{}.self_attn.o_proj.weight", i), None, device)?,
-                gate_proj: self.load_linear(&format!("model.layers.{}.mlp.gate_proj.weight", i), None, device)?,
-                up_proj: self.load_linear(&format!("model.layers.{}.mlp.up_proj.weight", i), None, device)?,
+                gate_up_proj: self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?,
                 down_proj: self.load_linear(&format!("model.layers.{}.mlp.down_proj.weight", i), None, device)?,
             });
         }
@@ -211,8 +267,7 @@ impl<'a> WeightLoader<'a> {
                 post_attention_layernorm: self.load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), device, cfg.rms_norm_eps)?,
                 qkv_proj: self.load_fused_qkv(i, cfg.head_num * cfg.head_dim, cfg.kv_head_num * cfg.head_dim, cfg.dim, device)?,
                 o_proj: self.load_linear(&format!("model.layers.{}.self_attn.o_proj.weight", i), None, device)?,
-                gate_proj: self.load_linear(&format!("model.layers.{}.mlp.gate_proj.weight", i), None, device)?,
-                up_proj: self.load_linear(&format!("model.layers.{}.mlp.up_proj.weight", i), None, device)?,
+                gate_up_proj: self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?,
                 down_proj: self.load_linear(&format!("model.layers.{}.mlp.down_proj.weight", i), None, device)?,
                 q_norm,
                 k_norm,

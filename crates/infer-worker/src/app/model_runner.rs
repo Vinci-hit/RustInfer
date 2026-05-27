@@ -55,6 +55,18 @@ pub struct ModelRunner<T: Dtype, D: OpBackend, M: LlmModel<T, D>> {
     /// While `None`, `step_batch` always falls back to eager execution.
     #[cfg(feature = "cuda")]
     pub graph_runner: Option<CudaGraphRunner>,
+
+    /// Wall-clock time (ns) spent inside `step_batch_with_graph` (full
+    /// wrapper: build_plan + launch + D2H). Includes GPU sync.
+    #[cfg(feature = "cuda")]
+    pub prof_step_wall_ns: u64,
+    /// GPU-side time (ns) of `cudaGraphLaunch` (measured by cudaEvent
+    /// pair around the launch; excludes D2H and host bookkeeping).
+    #[cfg(feature = "cuda")]
+    pub prof_graph_gpu_ns: u64,
+    /// Number of decode steps profiled.
+    #[cfg(feature = "cuda")]
+    pub prof_step_count: u64,
 }
 
 impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
@@ -128,6 +140,12 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             capture_sizes,
             #[cfg(feature = "cuda")]
             graph_runner: None,
+            #[cfg(feature = "cuda")]
+            prof_step_wall_ns: 0,
+            #[cfg(feature = "cuda")]
+            prof_graph_gpu_ns: 0,
+            #[cfg(feature = "cuda")]
+            prof_step_count: 0,
         })
     }
 
@@ -164,6 +182,32 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
         plan.block_size = self.block_size;
         let batch = plan.batch;
 
+        // Profiling hook: same shape as the graph path so A/B numbers
+        // share metric definitions.
+        #[cfg(feature = "cuda")]
+        let prof = std::env::var("RUSTINFER_PROFILE_GPU").is_ok();
+        #[cfg(feature = "cuda")]
+        let wall_t0 = std::time::Instant::now();
+        #[cfg(feature = "cuda")]
+        let mut ev_t0: crate::infra::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
+        #[cfg(feature = "cuda")]
+        let mut ev_t1: crate::infra::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
+        #[cfg(feature = "cuda")]
+        if prof {
+            // SAFETY: cuda feature gates a Cuda-specific code path; the
+            // generic `D` is Cuda here when this branch is taken at the
+            // call site. The events are stream-scoped and harmless on
+            // non-Cuda builds (this whole block is excluded then).
+            // We only care about the case where D is Cuda — see callers.
+            unsafe {
+                use crate::infra::cuda::ffi as cf;
+                cf::cudaEventCreate(&mut ev_t0);
+                cf::cudaEventCreate(&mut ev_t1);
+                // Stream comes from the output tensor's device handle.
+                // For non-Cuda backends this branch is never taken.
+            }
+        }
+
         let logits = {
             let mut ctx = ForwardContext {
                 kv_pool: &mut self.kv_pool,
@@ -172,7 +216,28 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             };
             self.model.forward(&input_ids_dev, &mut ctx)?
         };
-        D::argmax_batched(&logits, &plan.cu_q_lens, batch)
+        let result = D::argmax_batched(&logits, &plan.cu_q_lens, batch);
+
+        #[cfg(feature = "cuda")]
+        if prof {
+            // Best-effort: capture wall-clock since model.forward + argmax
+            // includes its own stream sync inside argmax_batched.
+            self.prof_step_wall_ns += wall_t0.elapsed().as_nanos() as u64;
+            // We don't have a clean GPU-only timing here without threading
+            // events through every kernel; report 0 to signal "eager
+            // path (graph not used)". Use the graph path for GPU timing.
+            self.prof_step_count += 1;
+            unsafe {
+                if !ev_t0.is_null() {
+                    crate::infra::cuda::ffi::cudaEventDestroy(ev_t0);
+                }
+                if !ev_t1.is_null() {
+                    crate::infra::cuda::ffi::cudaEventDestroy(ev_t1);
+                }
+            }
+        }
+
+        result
     }
 
     /// Convenience: prefill a single prompt then greedily decode up to
@@ -310,17 +375,27 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         // independent of `self` and avoids aliasing during the closure.
         let cuda_config = self.device.config.clone();
 
-        graph_runner.warmup_and_capture_all(&*cuda_config, 2, |size| {
-            self.run_decode_only_step(&dummy_steps[..size])
-        })?;
+        graph_runner.warmup_and_capture_all(
+            &*cuda_config,
+            2,
+            |size, is_capture| {
+                if is_capture {
+                    // Capture pass: forward + argmax ONLY (no H2D memcpy).
+                    // Device buffers already hold valid data from warmup.
+                    self.run_decode_forward_only(size)
+                } else {
+                    // Warmup pass: full path including H2D upload.
+                    self.run_decode_only_step(&dummy_steps[..size])
+                }
+            },
+        )?;
 
         self.graph_runner = Some(graph_runner);
         Ok(())
     }
 
     /// Run a single decode-only forward into `forward_ws.argmax_out_dev`.
-    /// Used both by `prime_graphs_cuda` (during capture) and by
-    /// `step_batch_with_graph` (the eager fallback).
+    /// Includes build_plan (H2D upload). Used for warmup passes and eager fallback.
     fn run_decode_only_step(&mut self, seqs: &[SeqStep]) -> OpResult<()> {
         let ws_seqs: Vec<WsSeqStep> = seqs.iter().map(|s| WsSeqStep {
             input_ids: s.input_ids.clone(),
@@ -343,6 +418,28 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         };
         // Decode-only: logits is [batch, vocab]. Use the graph-friendly
         // argmax (zero alloc, zero D2H, writes into forward_ws.argmax_out_dev).
+        argmax_batched_decode_into(&logits, self.forward_ws.argmax_out_dev_mut())
+    }
+
+    /// Forward + argmax ONLY — no H2D upload.
+    ///
+    /// Used during CUDA Graph capture: device buffers already hold valid
+    /// data from the preceding warmup pass. By skipping `build_plan`'s
+    /// `upload_async` calls, we keep cudaMemcpyAsync operations OUT of
+    /// the captured graph. The graph will contain only kernel launches.
+    fn run_decode_forward_only(&mut self, batch_size: usize) -> OpResult<()> {
+        let (input_ids_dev, mut plan) =
+            self.batch_ws.get_last_plan_views(batch_size, self.block_size)?;
+        plan.block_size = self.block_size;
+
+        let logits = {
+            let mut ctx = ForwardContext {
+                kv_pool: &mut self.kv_pool,
+                plan: &plan,
+                workspace: &mut self.forward_ws,
+            };
+            self.model.forward(&input_ids_dev, &mut ctx)?
+        };
         argmax_batched_decode_into(&logits, self.forward_ws.argmax_out_dev_mut())
     }
 
@@ -406,11 +503,45 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         if std::env::var("RUSTINFER_TRACE_GRAPH").is_ok() {
             eprintln!("[graph] replay slot={:?} batch={}->{}", slot, batch, padded_size);
         }
+
+        // Profiling: enable with RUSTINFER_PROFILE_GPU=1. We wrap the
+        // graph launch with a cudaEvent pair to measure pure GPU time.
+        // The wall-clock around the whole step_batch_with_graph call is
+        // measured outside the launch (build_plan + D2H included).
+        let prof = std::env::var("RUSTINFER_PROFILE_GPU").is_ok();
+        let wall_t0 = std::time::Instant::now();
+        let mut ev_t0: crate::infra::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
+        let mut ev_t1: crate::infra::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
+        if prof {
+            unsafe {
+                crate::infra::cuda::ffi::cudaEventCreate(&mut ev_t0);
+                crate::infra::cuda::ffi::cudaEventCreate(&mut ev_t1);
+                crate::infra::cuda::ffi::cudaEventRecord(ev_t0, self.device.config.stream);
+            }
+        }
         self.device.config.launch(slot)?;
+        if prof {
+            unsafe {
+                crate::infra::cuda::ffi::cudaEventRecord(ev_t1, self.device.config.stream);
+            }
+        }
 
         // 3. Synchronous D2H of the argmax_out_dev (just `padded_size` ints).
         // We only return the first `batch` of them.
         let host = self.forward_ws.argmax_out_dev().to_host_vec()?;
+
+        if prof {
+            unsafe {
+                crate::infra::cuda::ffi::cudaEventSynchronize(ev_t1);
+                let mut ms: f32 = 0.0;
+                crate::infra::cuda::ffi::cudaEventElapsedTime(&mut ms, ev_t0, ev_t1);
+                self.prof_graph_gpu_ns += (ms as f64 * 1.0e6) as u64;
+                crate::infra::cuda::ffi::cudaEventDestroy(ev_t0);
+                crate::infra::cuda::ffi::cudaEventDestroy(ev_t1);
+            }
+            self.prof_step_wall_ns += wall_t0.elapsed().as_nanos() as u64;
+            self.prof_step_count += 1;
+        }
         Ok(host.into_iter().take(batch).collect())
     }
 
@@ -510,8 +641,7 @@ mod tests {
             post_attention_layernorm: RMSNorm::new(make_norm(dim), 1e-5),
             qkv_proj: Linear::new(make_weight(qkv_dim, dim), None),
             o_proj: Linear::new(make_weight(dim, q_dim), None),
-            gate_proj: Linear::new(make_weight(intermediate, dim), None),
-            up_proj: Linear::new(make_weight(intermediate, dim), None),
+            gate_up_proj: Linear::new(make_weight(2 * intermediate, dim), None),
             down_proj: Linear::new(make_weight(dim, intermediate), None),
         };
 

@@ -202,27 +202,25 @@ impl CudaGraphRunner {
     /// Reverse-order warmup + capture sweep.
     ///
     /// For each `size` in `capture_sizes`, in reverse (largest first):
-    ///   1. Run `run_one(size)` `warmup_passes` times (eager) — initializes
-    ///      lazy cuBLAS / cuDNN algos.
-    ///   2. `capture_begin_relaxed` → `run_one(size)` → `capture_end`.
+    ///   1. Run `run_fn(size, false)` `warmup_passes` times (eager) —
+    ///      initializes lazy cuBLAS / cuDNN algos AND uploads plan data.
+    ///   2. `capture_begin_relaxed` → `run_fn(size, true)` → `capture_end`.
+    ///      When `is_capture=true`, the closure must ONLY run forward +
+    ///      argmax (no H2D memcpy), so the graph contains only kernels.
     ///   3. `launch` once to validate the graph.
     ///
-    /// `run_one` should fill the runner's `BatchWorkspace` with safe dummy
-    /// data for the given decode-only batch size, then call
-    /// `forward + argmax_batched_decode_into`. After this returns, the
-    /// runner can call `replay()` for any captured size.
-    ///
-    /// **Important**: `run_one` must use the same workspace addresses every
-    /// time — any per-call alloc would be embedded into the captured graph
-    /// and fail on replay.
+    /// Splitting warmup vs capture ensures H2D memcpy operations stay
+    /// OUTSIDE the captured graph. The device buffers already hold valid
+    /// data from warmup, so the capture pass can run forward against
+    /// those stable addresses without re-uploading.
     pub fn warmup_and_capture_all<F>(
         &mut self,
         config: &CudaConfig,
         warmup_passes: usize,
-        mut run_one: F,
+        mut run_fn: F,
     ) -> OpResult<()>
     where
-        F: FnMut(usize) -> OpResult<()>,
+        F: FnMut(usize, bool) -> OpResult<()>,
     {
         // Iterate sizes in REVERSE order (largest first) for memory-friendly
         // capture: cuBLASLt/cuDNN allocate more workspace for bigger sizes,
@@ -234,16 +232,16 @@ impl CudaGraphRunner {
             .collect();
 
         for (i, size) in order {
-            // 1. Warmup passes (eager).
+            // 1. Warmup passes (eager) — includes H2D upload.
             for _ in 0..warmup_passes {
-                run_one(size)?;
+                run_fn(size, false)?;
             }
             // Wait for warmup kernels to finish before capturing — capture
             // shouldn't share a stream with in-flight kernels.
             config.synchronize()?;
             self.states[i] = SlotState::Warm;
 
-            // 2. Capture.
+            // 2. Capture — forward + argmax only, NO H2D memcpy.
             let slot = GraphSlot::LlmDecode {
                 batch: size,
                 buffer_id: 0,
@@ -253,7 +251,7 @@ impl CudaGraphRunner {
             // Run forward + argmax inside the captured region. If it errors,
             // we still need to call capture_end to leave the stream in a
             // sane state.
-            let res = run_one(size);
+            let res = run_fn(size, true);
             if let Err(e) = res {
                 // Best-effort: end capture into a throwaway graph and drop.
                 let mut graph: crate::infra::cuda::ffi::cudaGraph_t = std::ptr::null_mut();

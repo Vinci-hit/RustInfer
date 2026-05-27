@@ -69,7 +69,7 @@ impl CudaConfig {
     }
 
     pub fn capture_begin_relaxed(&self) -> OpResult<()> {
-        unsafe { cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 2)); }
+        unsafe { cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 1)); }
         Ok(())
     }
 

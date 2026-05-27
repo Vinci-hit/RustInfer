@@ -280,6 +280,24 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
+    fn swiglu_packed<T: Dtype>(
+        gate_up: &Tensor<T, Self>, out: &mut Tensor<T, Self>,
+        rows: usize, inter: usize,
+    ) -> OpResult<()> {
+        // Naive CPU reference: out[r,d] = silu(gate_up[r,d]) * gate_up[r, inter+d]
+        for r in 0..rows {
+            for d in 0..inter {
+                unsafe {
+                    let g = read_f64((gate_up.data_ptr() as *const T).add(r * 2 * inter + d));
+                    let u = read_f64((gate_up.data_ptr() as *const T).add(r * 2 * inter + inter + d));
+                    let silu = g / (1.0 + (-g).exp());
+                    write_f64(out.data_ptr_mut().add(r * inter + d), silu * u);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
         let dim = *input.shape().as_slice().last().unwrap();
         let rows = input.numel() / dim;

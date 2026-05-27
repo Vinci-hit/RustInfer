@@ -26,20 +26,6 @@ unsafe extern "C" {
     fn argmax_cu_bf16_ffi(input: *const half::bf16, vocab_size: i32, output: *mut i32, stream: cudaStream_t);
     fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, stream: cudaStream_t);
     fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, stream: cudaStream_t);
-
-    /// Dense [batch, vocab] argmax. row_stride is in elements (typically = vocab).
-    fn argmax_batch_cu_bf16_ffi(
-        logits: *const half::bf16, batch_size: i32, vocab_size: i32, row_stride: i32,
-        out: *mut i32, stream: cudaStream_t,
-    );
-    fn argmax_batch_cu_fp16_ffi(
-        logits: *const half::f16, batch_size: i32, vocab_size: i32, row_stride: i32,
-        out: *mut i32, stream: cudaStream_t,
-    );
-    fn argmax_batch_cu_f32_ffi(
-        logits: *const f32, batch_size: i32, vocab_size: i32, row_stride: i32,
-        out: *mut i32, stream: cudaStream_t,
-    );
 }
 
 /// Decode-only batched argmax: writes one i32 per sequence into a caller-
@@ -48,6 +34,9 @@ unsafe extern "C" {
 /// model's logits already has this shape with `batch` rows).
 ///
 /// **Graph-capturable**: zero allocation, zero stream sync, zero D2H.
+///
+/// For batch=1, uses the fast two-phase parallel argmax (126 blocks,
+/// ~5µs on 128k vocab) instead of the single-block kernel (184µs).
 pub fn argmax_batched_decode_into<T: Dtype>(
     logits: &Tensor<T, Cuda>,
     out_dev: &mut Tensor<i32, Cuda>,
@@ -60,7 +49,6 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     }
     let batch = shape[0];
     let vocab = shape[1];
-    let row_stride = vocab as i32;
     if out_dev.numel() < batch {
         return Err(OpError::Shape(format!(
             "argmax_batched_decode_into: out_dev too small ({} < batch {})",
@@ -71,23 +59,49 @@ pub fn argmax_batched_decode_into<T: Dtype>(
         return Ok(());
     }
     let stream = logits.device().config.stream;
-    unsafe {
-        match T::DATA_TYPE {
-            DataType::BF16 => argmax_batch_cu_bf16_ffi(
-                logits.data_ptr() as _, batch as i32, vocab as i32, row_stride,
-                out_dev.data_ptr_mut(), stream,
-            ),
-            DataType::F16 => argmax_batch_cu_fp16_ffi(
-                logits.data_ptr() as _, batch as i32, vocab as i32, row_stride,
-                out_dev.data_ptr_mut(), stream,
-            ),
-            DataType::F32 => argmax_batch_cu_f32_ffi(
-                logits.data_ptr() as _, batch as i32, vocab as i32, row_stride,
-                out_dev.data_ptr_mut(), stream,
-            ),
-            _ => return Err(OpError::Kernel(format!(
-                "argmax_batched_decode_into: dtype {:?}", T::DATA_TYPE,
-            ))),
+    let elem_bytes = T::SIZE_BYTES;
+
+    if batch == 1 {
+        // Fast path: two-phase parallel argmax (uses __device__ static buffers,
+        // graph-capturable, 126 blocks × 256 threads → ~5µs for vocab=128k).
+        unsafe {
+            match T::DATA_TYPE {
+                DataType::BF16 => argmax_cu_bf16_ffi(
+                    logits.data_ptr() as _, vocab as i32, out_dev.data_ptr_mut(), stream,
+                ),
+                DataType::F16 => argmax_cu_fp16_ffi(
+                    logits.data_ptr() as _, vocab as i32, out_dev.data_ptr_mut(), stream,
+                ),
+                DataType::F32 => argmax_cu_f32_ffi(
+                    logits.data_ptr() as _, vocab as i32, out_dev.data_ptr_mut(), stream,
+                ),
+                _ => return Err(OpError::Kernel(format!(
+                    "argmax_batched_decode_into: dtype {:?}", T::DATA_TYPE,
+                ))),
+            }
+        }
+    } else {
+        // Multi-row: launch two-phase per row sequentially (static buffers
+        // serialize correctly on a single stream / within a graph).
+        unsafe {
+            for seq in 0..batch {
+                let row_ptr = (logits.data_ptr() as *const u8).add(seq * vocab * elem_bytes);
+                let out_ptr = out_dev.data_ptr_mut().add(seq);
+                match T::DATA_TYPE {
+                    DataType::BF16 => argmax_cu_bf16_ffi(
+                        row_ptr as _, vocab as i32, out_ptr, stream,
+                    ),
+                    DataType::F16 => argmax_cu_fp16_ffi(
+                        row_ptr as _, vocab as i32, out_ptr, stream,
+                    ),
+                    DataType::F32 => argmax_cu_f32_ffi(
+                        row_ptr as _, vocab as i32, out_ptr, stream,
+                    ),
+                    _ => return Err(OpError::Kernel(format!(
+                        "argmax_batched_decode_into: dtype {:?}", T::DATA_TYPE,
+                    ))),
+                }
+            }
         }
     }
     Ok(())

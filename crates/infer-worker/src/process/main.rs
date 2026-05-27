@@ -350,7 +350,7 @@ where
         pool_blocks, bs.block_size, max_blocks_per_seq, bs.max_seq_len,
         cap_num_tokens, cap_batch, flash_decode_capacity_f32,
         // Decode-only graph capture sizes — pad up to nearest power of 2.
-        vec![1, 2, 4, 8, 16],
+        vec![1, 2, 4, 8, 16, 32],
     ).map_err(|e| format!("ModelRunner::new: {:?}", e))?;
 
     // Prime CUDA Graphs for decode-only batches in {1,2,4,8,16}.

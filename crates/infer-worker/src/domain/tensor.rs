@@ -184,6 +184,38 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         Ok(self.view_raw(shape, strides, self.offset_elems, true))
     }
 
+    /// Slice along `dim` from `start` for `length` elements.
+    ///
+    /// Zero-copy: returns a view sharing the same `Arc<Storage>`. The result
+    /// is non-contiguous unless `dim == 0` and `start == 0` (or the slice
+    /// covers the full extent), but downstream kernels that accept row/col
+    /// strides (rope, scatter, matmul) handle this directly.
+    pub fn narrow(&self, dim: usize, start: usize, length: usize) -> OpResult<Self> {
+        let shape = self.shape.as_slice();
+        if dim >= shape.len() {
+            return Err(OpError::Shape(format!(
+                "narrow: dim {} out of range (ndim={})", dim, shape.len(),
+            )));
+        }
+        if start + length > shape[dim] {
+            return Err(OpError::Shape(format!(
+                "narrow: dim {} out of bounds (start={}, length={}, extent={})",
+                dim, start, length, shape[dim],
+            )));
+        }
+        let strides = self.strides.as_slice();
+        let mut new_shape_vec: Vec<usize> = shape.to_vec();
+        new_shape_vec[dim] = length;
+        let new_shape = Shape::from_slice(&new_shape_vec);
+        let extra_offset = start * strides[dim] as usize;
+        let new_offset = self.offset_elems + extra_offset;
+        // After narrow along dim != 0 with non-full extent, the view is
+        // non-contiguous in general. Conservatively mark non-contiguous unless
+        // the narrow is identity.
+        let is_contig = self.is_contiguous && start == 0 && length == shape[dim];
+        Ok(self.view_raw(new_shape, self.strides, new_offset, is_contig))
+    }
+
     // ─── Accessors ─────────────────────────────────────────────────
 
     #[inline] pub fn shape(&self) -> &Shape { &self.shape }

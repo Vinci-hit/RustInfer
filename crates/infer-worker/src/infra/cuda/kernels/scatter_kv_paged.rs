@@ -83,9 +83,10 @@ pub fn scatter_kv_paged<T: Dtype>(
     if batch == 0 { return Ok(()); }
     let stream = k_src.device().config.stream;
 
-    // We assume contiguous source layout: row stride = kv_dim.
-    let k_stride = kv_dim as i32;
-    let v_stride = kv_dim as i32;
+    // Read row stride from the tensors directly so strided views (e.g.
+    // zero-copy slices of a fused QKV buffer) are handled correctly.
+    let k_stride = k_src.strides().as_slice()[0] as i32;
+    let v_stride = v_src.strides().as_slice()[0] as i32;
 
     unsafe {
         match T::DATA_TYPE {

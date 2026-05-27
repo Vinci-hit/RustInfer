@@ -74,6 +74,9 @@ pub struct ForwardWorkspace<T: Dtype, D: MemoryPort> {
     attn_out: Tensor<T, D>,   // [cap_num_tokens, q_dim]
     gate_buf: Tensor<T, D>,   // [cap_num_tokens, intermediate_size]
     up_buf:   Tensor<T, D>,   // [cap_num_tokens, intermediate_size]
+    /// Fused gate_up output: [cap_num_tokens, 2*intermediate_size].
+    /// The fused gate_up GEMV writes here; swiglu_packed reads it.
+    gate_up_buf: Tensor<T, D>,
     ffn_out:  Tensor<T, D>,   // [cap_num_tokens, dim]
     q_buf:    Tensor<T, D>,   // [cap_num_tokens, q_dim]
     k_buf:    Tensor<T, D>,   // [cap_num_tokens, kv_dim]
@@ -117,6 +120,7 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
         let attn_out = alloc(cap_num_tokens, dims.q_dim)?;
         let gate_buf = alloc(cap_num_tokens, dims.intermediate_size)?;
         let up_buf   = alloc(cap_num_tokens, dims.intermediate_size)?;
+        let gate_up_buf = alloc(cap_num_tokens, 2 * dims.intermediate_size)?;
         let ffn_out  = alloc(cap_num_tokens, dims.dim)?;
         let q_buf    = alloc(cap_num_tokens, dims.q_dim)?;
         let k_buf    = alloc(cap_num_tokens, dims.kv_dim)?;
@@ -134,7 +138,7 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
 
         Ok(Self {
             cap_num_tokens, cap_batch, dims,
-            x, h, qkv_buf, attn_out, gate_buf, up_buf, ffn_out,
+            x, h, qkv_buf, attn_out, gate_buf, up_buf, gate_up_buf, ffn_out,
             q_buf, k_buf, v_buf, o_out, logits,
             flash_decode_workspace_f32, argmax_out_dev, argmax_out_host,
         })
@@ -157,6 +161,7 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
     pub fn o_out_view(&self, n: usize)    -> Tensor<T, D> { Self::narrow_rows(&self.o_out, n, self.dims.dim) }
     pub fn gate_view(&self, n: usize)     -> Tensor<T, D> { Self::narrow_rows(&self.gate_buf, n, self.dims.intermediate_size) }
     pub fn up_view(&self, n: usize)       -> Tensor<T, D> { Self::narrow_rows(&self.up_buf, n, self.dims.intermediate_size) }
+    pub fn gate_up_view(&self, n: usize)  -> Tensor<T, D> { Self::narrow_rows(&self.gate_up_buf, n, 2 * self.dims.intermediate_size) }
     pub fn ffn_view(&self, n: usize)      -> Tensor<T, D> { Self::narrow_rows(&self.ffn_out, n, self.dims.dim) }
     pub fn logits_view(&self, n: usize)   -> Tensor<T, D> { Self::narrow_rows(&self.logits, n, self.dims.vocab_size) }
 

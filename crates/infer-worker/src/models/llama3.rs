@@ -16,8 +16,8 @@ pub struct Llama3Layer<T: Dtype, D: OpBackend> {
     pub post_attention_layernorm: RMSNorm<T, D>,
     pub qkv_proj: Linear<T, D>,
     pub o_proj: Linear<T, D>,
-    pub gate_proj: Linear<T, D>,
-    pub up_proj: Linear<T, D>,
+    /// Fused [2*intermediate_size, dim] = vstack(gate_proj, up_proj).
+    pub gate_up_proj: Linear<T, D>,
     pub down_proj: Linear<T, D>,
 }
 
@@ -70,8 +70,8 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Llama3Model<T, D> {
         let mut h        = ctx.workspace.h_view(num_tokens);
         let mut qkv_buf  = ctx.workspace.qkv_view(num_tokens);
         let mut attn_out = ctx.workspace.attn_out_view(num_tokens);
+        let mut gate_up  = ctx.workspace.gate_up_view(num_tokens);
         let mut gate_buf = ctx.workspace.gate_view(num_tokens);
-        let mut up_buf   = ctx.workspace.up_view(num_tokens);
         let mut ffn_out  = ctx.workspace.ffn_view(num_tokens);
         let mut o_out    = ctx.workspace.o_out_view(num_tokens);
         let logits       = ctx.workspace.logits_view(num_tokens);
@@ -92,10 +92,14 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Llama3Model<T, D> {
             layer.qkv_proj.forward(&h, &mut qkv_buf)?;
             if trace { dump("L0 qkv_proj_out", &qkv_buf)?; }
 
-            let mut q = ctx.workspace.q_view(num_tokens);
-            let mut k = ctx.workspace.k_view(num_tokens);
-            let mut v = ctx.workspace.v_view(num_tokens);
-            D::split_qkv(&qkv_buf, &mut q, &mut k, &mut v, num_tokens, q_dim, kv_dim)?;
+            // Zero-copy QKV split: 3 strided views into qkv_buf.
+            // q = qkv_buf[:, 0..q_dim]
+            // k = qkv_buf[:, q_dim..q_dim+kv_dim]
+            // v = qkv_buf[:, q_dim+kv_dim..q_dim+2*kv_dim]
+            // Replaces 3 split_cols kernel launches with O(1) view_raw.
+            let mut q = qkv_buf.narrow(1, 0, q_dim)?;
+            let mut k = qkv_buf.narrow(1, q_dim, kv_dim)?;
+            let v       = qkv_buf.narrow(1, q_dim + kv_dim, kv_dim)?;
 
             // RoPE on Q and K (positions provided by the plan).
             D::rope_inplace(
@@ -150,11 +154,12 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Llama3Model<T, D> {
                 &layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps,
             )?;
 
-            // ── MLP (SwiGLU) ──
-            // The CUDA `swiglu` kernel computes `silu(gate)*up` itself.
-            layer.gate_proj.forward(&h, &mut gate_buf)?;
-            layer.up_proj.forward(&h, &mut up_buf)?;
-            D::swiglu_inplace(&mut gate_buf, &up_buf)?;
+            // ── MLP (fused gate_up + swiglu_packed) ──
+            // gate_up_proj: [num_tokens, dim] → [num_tokens, 2*intermediate]
+            // swiglu_packed: [num_tokens, 2*intermediate] → [num_tokens, intermediate]
+            // (one GEMV + one fused activation, vs gate/up split + swiglu).
+            layer.gate_up_proj.forward(&h, &mut gate_up)?;
+            D::swiglu_packed(&gate_up, &mut gate_buf, num_tokens, self.intermediate_size)?;
             layer.down_proj.forward(&gate_buf, &mut ffn_out)?;
             if trace { dump("L0 ffn_out", &ffn_out)?; }
 

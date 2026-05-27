@@ -152,6 +152,19 @@ pub trait OpBackend: MemoryPort {
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;
     fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()>;
 
+    /// Packed SwiGLU: `gate_up [rows, 2*inter]` → `out [rows, inter]`,
+    /// `out[r,d] = silu(gate_up[r,d]) * gate_up[r, inter+d]`.
+    ///
+    /// Replaces 2 × split + swiglu_inplace with one fused kernel launch.
+    /// Only required to be implemented for backends that need it; CPU
+    /// backend can fall back to the split + swiglu path.
+    fn swiglu_packed<T: Dtype>(
+        gate_up: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+        rows: usize,
+        inter: usize,
+    ) -> OpResult<()>;
+
     // ─── Softmax ─────────────────────────────────────────────────────
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()>;
 

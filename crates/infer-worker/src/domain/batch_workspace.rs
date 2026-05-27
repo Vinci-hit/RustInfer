@@ -248,6 +248,48 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         Ok((input_ids_view, plan))
     }
 
+    /// Return plan views for a decode-only batch WITHOUT uploading.
+    ///
+    /// Used during CUDA Graph capture: the device buffers already contain
+    /// valid data from the preceding warmup pass, so we only need the plan
+    /// metadata (views into stable addresses). This keeps H2D memcpys
+    /// OUT of the captured graph.
+    pub fn get_last_plan_views(
+        &self,
+        batch_size: usize,
+        block_size: usize,
+    ) -> OpResult<(Tensor<i32, D>, BatchPlan<D>)> {
+        if batch_size == 0 || batch_size > self.cap_batch {
+            return Err(OpError::Shape(format!(
+                "get_last_plan_views: batch_size ({}) out of range [1, {}]",
+                batch_size, self.cap_batch,
+            )));
+        }
+        // Decode-only: each seq has q_len=1, so total_tokens = batch_size.
+        let total_tokens = batch_size;
+        let total_q_tiles = batch_size as i32; // 1 tile per seq for q_len=1
+
+        let kind = BatchKind::DecodeOnly;
+        let plan = BatchPlan {
+            kind,
+            num_tokens: total_tokens,
+            batch: batch_size,
+            rope_positions: Self::view_n(&self.rope_positions, total_tokens),
+            cu_q_lens:      Self::view_n(&self.cu_q_lens, batch_size + 1),
+            kv_lens:        Self::view_n(&self.kv_lens, batch_size),
+            seq_positions:  Self::view_n(&self.seq_positions, batch_size),
+            seq_lens_step:  Self::view_n(&self.seq_lens_step, batch_size),
+            block_tables:   Self::view_n(&self.block_tables, batch_size * self.cap_max_blocks_per_seq),
+            max_blocks_per_seq: self.cap_max_blocks_per_seq,
+            block_size,
+            block2req:  Self::view_n(&self.block2req, total_q_tiles.max(1) as usize),
+            block2tile: Self::view_n(&self.block2tile, total_q_tiles.max(1) as usize),
+            total_q_tiles,
+        };
+        let input_ids_view = Self::view_n(&self.input_ids, total_tokens);
+        Ok((input_ids_view, plan))
+    }
+
     /// Set `plan.block_size` after construction (the runner knows it).
     pub fn block_size(&self) -> usize { 0 } // sentinel; runner sets in plan
 

@@ -192,6 +192,12 @@ impl OpBackend for Cuda {
     fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()> {
         kernels::activation::swiglu_inplace(x, gate)
     }
+    fn swiglu_packed<T: Dtype>(
+        gate_up: &Tensor<T, Self>, out: &mut Tensor<T, Self>,
+        rows: usize, inter: usize,
+    ) -> OpResult<()> {
+        kernels::activation::swiglu_packed(gate_up, out, rows, inter)
+    }
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::softmax::softmax(input, output)
     }
