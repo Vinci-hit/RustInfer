@@ -678,7 +678,8 @@ nsys stats \
 ### 待实现 🔄
 
 **高优先级**:
-- 
+- ⚠️ **Batch decode 正确性 bug**: batch>1 时序列间交叉污染 (cross-contamination)，paged attention 读到其他序列的 KV data，导致输出混乱并提前触发 EOS。batch=1 正常，batch≥4 明显退化。
+- ⚠️ **Batch 吞吐量低于 vLLM**: batch=16/32 聚合吞吐比 vLLM 低 33%，原因是上述正确性 bug 导致请求提前结束 + scheduler 在高并发下填充率不足。
 - 采样器：仅argmax，缺少temperature/top-p/top-k
 - 连续批处理：目前串行处理请求
 - PagedAttention：固定KV缓存大小
