@@ -2,11 +2,11 @@
 
 use super::types::Dtype;
 use super::tensor::Tensor;
-use super::ports::Device;
+use super::ports::MemoryPort;
 
 /// KV Cache — domain entity with business rules (grow strategy, layer structure).
 /// Storage is delegated to Infrastructure (via Tensor which uses infra Buffer).
-pub struct KvCache<T: Dtype, D: Device> {
+pub struct KvCache<T: Dtype, D: MemoryPort> {
     pub k_layers: Vec<Tensor<T, D>>,
     pub v_layers: Vec<Tensor<T, D>>,
     pub capacity: usize,
@@ -14,7 +14,7 @@ pub struct KvCache<T: Dtype, D: Device> {
     pub kv_dim: usize,
 }
 
-impl<T: Dtype, D: Device> KvCache<T, D> {
+impl<T: Dtype, D: MemoryPort> KvCache<T, D> {
     #[inline] pub fn capacity(&self) -> usize { self.capacity }
     #[inline] pub fn num_layers(&self) -> usize { self.k_layers.len() }
     #[inline] pub fn kv_dim(&self) -> usize { self.kv_dim }

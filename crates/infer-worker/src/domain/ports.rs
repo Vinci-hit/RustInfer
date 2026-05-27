@@ -23,7 +23,64 @@ pub trait Device: Clone + Send + Sync + Debug + 'static {
 /// Marker: "this device has host-accessible memory" (enables as_slice).
 pub trait HostDevice: Device {}
 
-/// Memory allocator port.
+/// Memory port — devices must implement raw allocation, free, and
+/// host↔device copy primitives. The domain `Storage` type uses this to
+/// provide RAII; `Tensor::from_host_slice` / `to_host_vec` use it for I/O.
+///
+/// Implementations live in `infra/cpu` and `infra/cuda`. Domain code never
+/// uses raw `cudaMalloc` or `std::alloc` directly — it always goes through
+/// this port so device semantics stay correct.
+pub trait MemoryPort: Device {
+    /// Allocate `size` bytes of zero-initialized memory on this device.
+    fn alloc_bytes(&self, size: usize) -> OpResult<NonNull<u8>>;
+
+    /// Free memory previously returned by `alloc_bytes` on this device.
+    ///
+    /// # Safety
+    /// `ptr` must have been returned by this device's `alloc_bytes` with
+    /// the same `size`, and must not have been freed yet.
+    unsafe fn free_bytes(&self, ptr: NonNull<u8>, size: usize);
+
+    /// Copy `size` bytes from a host buffer to a device buffer. May be async
+    /// on the device's stream — pair with `synchronize` if the host buffer
+    /// will be reused or freed before completion.
+    ///
+    /// # Safety
+    /// `dst` must be a valid device pointer with at least `size` bytes;
+    /// `src` must be a valid host pointer with at least `size` bytes.
+    unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()>;
+
+    /// Async H2D copy that does NOT synchronize the device stream. Used by
+    /// long-lived workspaces (e.g. `BatchWorkspace`) that own the host
+    /// staging buffer for the entire runner lifetime — so the queued copy
+    /// is safe even after this call returns.
+    ///
+    /// CPU impl: identical to `upload` (memcpy is already synchronous).
+    /// CUDA impl: `cudaMemcpyAsync(H2D)` on the device's stream, no
+    /// `cudaStreamSynchronize` afterwards. Subsequent kernels on the same
+    /// stream see the data; cross-stream usage is undefined.
+    ///
+    /// # Safety
+    /// Same preconditions as `upload`, plus: `src` must remain valid until
+    /// the device stream consumes the copy (typically guaranteed by storing
+    /// the host buffer in a long-lived workspace).
+    unsafe fn upload_async(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()>;
+
+    /// Copy `size` bytes from a device buffer to a host buffer. **Synchronous**:
+    /// returns only after the copy completes.
+    ///
+    /// # Safety
+    /// `dst` must be a valid host pointer with at least `size` bytes;
+    /// `src` must be a valid device pointer with at least `size` bytes.
+    unsafe fn download(&self, dst: *mut u8, src: NonNull<u8>, size: usize) -> OpResult<()>;
+
+    /// Wait for all pending async operations on this device's stream to
+    /// complete. CPU implementations may make this a no-op.
+    fn synchronize(&self) -> OpResult<()>;
+}
+
+/// Memory allocator port (legacy — kept for diffusion VAE buffer pool).
+/// New code should prefer `MemoryPort`.
 pub trait Allocator: Debug + Send + Sync {
     /// Allocate raw bytes.
     /// # Safety: caller must dealloc with same allocator + layout.
@@ -44,10 +101,17 @@ pub struct AllocError(pub String);
 ///
 /// Generic bounds use `Dtype` (not `Float`) so quantized types (i8, i4)
 /// can participate in mixed-precision operations (e.g. int8 weight × bf16 activation).
-pub trait OpBackend: Device {
+///
+/// `OpBackend: MemoryPort` so any backend can allocate / upload / download
+/// (required for `Tensor::zeros`, `Tensor::from_host_slice`, `Tensor::to_host_vec`).
+pub trait OpBackend: MemoryPort {
     // ─── Allocation ──────────────────────────────────────────────────
-    /// Allocate a contiguous, zeroed tensor on this device.
-    fn alloc_tensor<T: Dtype>(shape: Shape, device: &Self) -> OpResult<Tensor<T, Self>>;
+    /// Allocate a contiguous, zeroed tensor on this device. Default
+    /// implementation routes through `MemoryPort` — overridable for
+    /// backends that have a smarter pool.
+    fn alloc_tensor<T: Dtype>(shape: Shape, device: &Self) -> OpResult<Tensor<T, Self>> {
+        Tensor::<T, Self>::zeros(shape, device)
+    }
 
     // ─── Element-wise ────────────────────────────────────────────────
     fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()>;
@@ -110,21 +174,27 @@ pub trait OpBackend: Device {
         head_dim: usize,
     ) -> OpResult<()>;
 
-    // ─── Attention ───────────────────────────────────────────────────
-    /// Scaled dot-product attention.
-    /// - q: [num_tokens, q_dim]
-    /// - k: [total_kv_len, kv_dim] (from KV cache)
-    /// - v: [total_kv_len, kv_dim]
-    /// - output: [num_tokens, q_dim]
-    /// - seq_starts: [batch+1] prefix-sum of sequence lengths (for ragged batch)
-    /// - head_num / kv_head_num / head_dim: model geometry
-    /// - scale: 1/sqrt(head_dim)
-    fn attention<T: Dtype>(
+    // ─── Attention (paged) ───────────────────────────────────────────
+    /// Batched / ragged attention over a paged KV pool.
+    ///
+    /// - `q`               : `[num_tokens, q_dim]` (q_dim = head_num * head_dim)
+    /// - `k_pool / v_pool` : layer-local paged tensors `[num_blocks, block_size, kv_dim]`
+    /// - `output`          : `[num_tokens, q_dim]`
+    /// - `plan`            : carries `block_tables`, `kv_lens`, `cu_q_lens`,
+    ///                       `block2req`, `block2tile`, `total_q_tiles`, `kind`,
+    ///                       `block_size`, `max_blocks_per_seq`
+    ///
+    /// `BatchKind::DecodeOnly` dispatches to a Flash-Decoding kernel
+    /// (q_len=1 per seq, gather K/V from paged blocks).
+    /// `BatchKind::Ragged` dispatches to a tile-scheduled paged prefill
+    /// kernel (variable q_len + kv_len per seq, GQA-aware).
+    fn attention_paged<T: Dtype>(
         q: &Tensor<T, Self>,
-        k: &Tensor<T, Self>,
-        v: &Tensor<T, Self>,
+        k_pool: &Tensor<T, Self>,
+        v_pool: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
-        seq_starts: &Tensor<i32, Self>,
+        plan: &super::batch::BatchPlan<Self>,
+        workspace: &mut Tensor<f32, Self>,
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
@@ -133,7 +203,6 @@ pub trait OpBackend: Device {
 
     // ─── KV Cache ────────────────────────────────────────────────────
     /// Split a fused [num_tokens, qkv_dim] tensor into Q, K, V.
-    /// Copies columns [0..q_dim), [q_dim..q_dim+kv_dim), [q_dim+kv_dim..qkv_dim).
     fn split_qkv<T: Dtype>(
         qkv: &Tensor<T, Self>,
         q: &mut Tensor<T, Self>,
@@ -144,22 +213,38 @@ pub trait OpBackend: Device {
         kv_dim: usize,
     ) -> OpResult<()>;
 
-    /// Scatter K/V rows into the KV cache at given positions.
-    /// k: [num_tokens, kv_dim], v: [num_tokens, kv_dim]
-    /// positions: position[t] = which cache row to write token t into.
-    fn scatter_kv<T: Dtype>(
-        k: &Tensor<T, Self>,
-        v: &Tensor<T, Self>,
-        k_cache: &mut Tensor<T, Self>,
-        v_cache: &mut Tensor<T, Self>,
-        positions: &Tensor<i32, Self>,
+    /// Scatter K/V rows into a layer's paged KV pool.
+    ///
+    /// - `k_src/v_src`    : `[num_tokens, kv_dim]`
+    /// - `k_pool/v_pool`  : `[num_blocks, block_size, kv_dim]`
+    /// - `block_tables`   : `[batch, max_blocks_per_seq]` device i32, physical block ids
+    /// - `seq_positions`  : `[batch]` — first cache row per seq this step writes
+    /// - `cu_q_lens`      : `[batch + 1]` — prefix sum of per-seq q_len
+    /// - `seq_lens_step`  : `[batch]` — tokens this step writes per seq
+    fn scatter_kv_paged<T: Dtype>(
+        k_src: &Tensor<T, Self>,
+        v_src: &Tensor<T, Self>,
+        k_pool: &mut Tensor<T, Self>,
+        v_pool: &mut Tensor<T, Self>,
+        block_tables: &Tensor<i32, Self>,
+        seq_positions: &Tensor<i32, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        seq_lens_step: &Tensor<i32, Self>,
+        max_blocks_per_seq: usize,
+        block_size: usize,
         kv_dim: usize,
     ) -> OpResult<()>;
 
     // ─── Sampling ────────────────────────────────────────────────────
-    /// Argmax over the last row of logits → output token ID.
-    /// logits: [num_rows, vocab_size], returns argmax of last row.
-    fn argmax<T: Dtype>(logits: &Tensor<T, Self>, num_rows: usize) -> OpResult<i32>;
+    /// Argmax over each sequence's last logits row.
+    /// `logits` : `[num_tokens, vocab_size]`
+    /// `cu_q_lens` : `[batch+1]` — used to find each seq's last row
+    /// Returns `Vec<i32>` of length `batch`.
+    fn argmax_batched<T: Dtype>(
+        logits: &Tensor<T, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        batch: usize,
+    ) -> OpResult<Vec<i32>>;
 
     // ═══════════════════════════════════════════════════════════════════
     // ─── Diffusion ops (Conv / Norm / Spatial) ─────────────────────────

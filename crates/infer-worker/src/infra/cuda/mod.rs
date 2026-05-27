@@ -1,6 +1,6 @@
 //! CUDA infrastructure adapter.
 //!
-//! Implements `Device` and `OpBackend` for `Cuda`.
+//! Implements `Device`, `MemoryPort`, and `OpBackend` for `Cuda`.
 //! Contains: FFI bindings, CudaConfig (handles), thread-local stream,
 //! and kernel dispatch wrappers.
 
@@ -15,11 +15,12 @@ pub use config::{CudaConfig, GraphSlot};
 pub use error::CudaError;
 pub use thread_stream::{get_current_cuda_stream, with_cuda_stream};
 
-use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::Arc;
-use crate::domain::ports::{Device, OpBackend, OpResult, OpError};
-use crate::domain::types::{Dtype, Shape};
+
+use crate::domain::ports::{Device, MemoryPort, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::{Dtype, Shape};
 
 /// CUDA device — carries device_id + shared CudaConfig (handles, stream).
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ impl Device for Cuda {
 
 impl Cuda {
     /// Create a new Cuda device (allocates stream + handles).
-    pub fn new(device_id: i32) -> Result<Self, crate::domain::ports::OpError> {
+    pub fn new(device_id: i32) -> Result<Self, OpError> {
         device_utils::set_current_device(device_id)
             .map_err(|e| OpError::Kernel(format!("set device failed: {}", e)))?;
         let config = Arc::new(CudaConfig::new()
@@ -45,43 +46,118 @@ impl Cuda {
     }
 }
 
-/// Allocate a zeroed CUDA tensor via cudaMalloc + cudaMemset.
-impl<T: Dtype> Tensor<T, Cuda> {
-    pub fn zeros_cuda(shape: impl Into<Shape>, device: &Cuda) -> OpResult<Self> {
-        let shape = shape.into();
-        let numel = shape.numel();
-        let size_bytes = numel * T::SIZE_BYTES;
-        let size = size_bytes.max(1);
+// ─── Cuda MemoryPort ─────────────────────────────────────────────────────────
 
+impl MemoryPort for Cuda {
+    fn alloc_bytes(&self, size: usize) -> OpResult<NonNull<u8>> {
+        let n = size.max(1);
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: cudaMalloc/cudaMemset are safe to call with valid args.
         unsafe {
-            let code = ffi::cudaMalloc(&mut ptr, size);
+            let code = ffi::cudaMalloc(&mut ptr, n);
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaMalloc({} bytes) failed: {:?}", size, code)));
+                return Err(OpError::Kernel(format!("cudaMalloc({}) failed: {:?}", n, code)));
             }
-            let code = ffi::cudaMemset(ptr, 0, size);
+            let code = ffi::cudaMemset(ptr, 0, n);
             if code != ffi::cudaError_cudaSuccess {
                 ffi::cudaFree(ptr);
                 return Err(OpError::Kernel(format!("cudaMemset failed: {:?}", code)));
             }
         }
+        NonNull::new(ptr as *mut u8)
+            .ok_or_else(|| OpError::Kernel("cudaMalloc returned null".into()))
+    }
 
-        let strides = shape.contiguous_strides();
-        Ok(Tensor {
-            shape, strides, offset_elems: 0, numel,
-            is_contiguous: true,
-            storage_ptr: ptr as *mut u8, storage_len: size_bytes,
-            device: device.clone(), _marker: PhantomData,
-        })
+    unsafe fn free_bytes(&self, ptr: NonNull<u8>, _size: usize) {
+        // SAFETY: ptr came from cudaMalloc.
+        unsafe { ffi::cudaFree(ptr.as_ptr() as *mut std::ffi::c_void); }
+    }
+
+    unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
+        if size == 0 { return Ok(()); }
+        let stream = self.config.stream;
+        // SAFETY: caller asserts dst is a device ptr with `size` bytes,
+        // src is a host ptr with `size` bytes.
+        unsafe {
+            let code = ffi::cudaMemcpyAsync(
+                dst.as_ptr() as *mut std::ffi::c_void,
+                src as *const std::ffi::c_void,
+                size,
+                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
+            );
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaMemcpyAsync H2D failed: {:?}", code)));
+            }
+            // Sync so the host buffer can be freed/reused safely after this returns.
+            let code = ffi::cudaStreamSynchronize(stream);
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn upload_async(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
+        if size == 0 { return Ok(()); }
+        let stream = self.config.stream;
+        // SAFETY: caller asserts the host pointer remains valid until the
+        // device stream consumes the copy (workspaces own host staging
+        // buffers for their entire lifetime, so this is upheld).
+        unsafe {
+            let code = ffi::cudaMemcpyAsync(
+                dst.as_ptr() as *mut std::ffi::c_void,
+                src as *const std::ffi::c_void,
+                size,
+                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream,
+            );
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaMemcpyAsync H2D async failed: {:?}", code)));
+            }
+            // NO cudaStreamSynchronize — graph capture friendly.
+        }
+        Ok(())
+    }
+
+    unsafe fn download(&self, dst: *mut u8, src: NonNull<u8>, size: usize) -> OpResult<()> {
+        if size == 0 { return Ok(()); }
+        let stream = self.config.stream;
+        // SAFETY: caller asserts ptrs and size.
+        unsafe {
+            let code = ffi::cudaMemcpyAsync(
+                dst as *mut std::ffi::c_void,
+                src.as_ptr() as *const std::ffi::c_void,
+                size,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                stream,
+            );
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaMemcpyAsync D2H failed: {:?}", code)));
+            }
+            let code = ffi::cudaStreamSynchronize(stream);
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+            }
+        }
+        Ok(())
+    }
+
+    fn synchronize(&self) -> OpResult<()> {
+        let stream = self.config.stream;
+        // SAFETY: stream is owned by self.config.
+        let code = unsafe { ffi::cudaStreamSynchronize(stream) };
+        if code != ffi::cudaError_cudaSuccess {
+            return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+        }
+        Ok(())
     }
 }
 
 /// OpBackend for Cuda — dispatches to CUDA kernels.
 /// Each method fetches the stream from the tensor's device context.
 impl OpBackend for Cuda {
-    fn alloc_tensor<T: Dtype>(shape: Shape, device: &Self) -> OpResult<Tensor<T, Self>> {
-        Tensor::<T, Cuda>::zeros_cuda(shape, device)
-    }
+    // alloc_tensor uses the default impl (Tensor::zeros via MemoryPort).
 
     fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::add::add(a, b, dst)
@@ -138,17 +214,24 @@ impl OpBackend for Cuda {
             num_tokens, head_num as i32, kv_head_num as i32, head_dim as i32,
         )
     }
-    fn attention<T: Dtype>(
-        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
+    fn attention_paged<T: Dtype>(
+        q: &Tensor<T, Self>,
+        k_pool: &Tensor<T, Self>,
+        v_pool: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
-        _seq_starts: &Tensor<i32, Self>,
-        head_num: usize, kv_head_num: usize, head_dim: usize, scale: f32,
+        plan: &crate::domain::batch::BatchPlan<Self>,
+        workspace: &mut Tensor<f32, Self>,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+        scale: f32,
     ) -> OpResult<()> {
-        kernels::attention::attention_prefill(
-            q, k, v, output,
-            head_num as i32, kv_head_num as i32, head_dim as i32, scale,
+        kernels::attention_paged::attention_paged(
+            q, k_pool, v_pool, output, plan, workspace,
+            head_num, kv_head_num, head_dim, scale,
         )
     }
+
     fn split_qkv<T: Dtype>(
         qkv: &Tensor<T, Self>,
         q: &mut Tensor<T, Self>,
@@ -160,71 +243,38 @@ impl OpBackend for Cuda {
     ) -> OpResult<()> {
         let total_cols = (q_dim + 2 * kv_dim) as i32;
         let rows = num_tokens as i32;
-        // Split Q: columns [0, q_dim)
         kernels::split_cols::split_cols(qkv, q, rows, total_cols, 0, q_dim as i32)?;
-        // Split K: columns [q_dim, q_dim + kv_dim)
         kernels::split_cols::split_cols(qkv, k, rows, total_cols, q_dim as i32, kv_dim as i32)?;
-        // Split V: columns [q_dim + kv_dim, q_dim + 2*kv_dim)
         kernels::split_cols::split_cols(qkv, v, rows, total_cols, (q_dim + kv_dim) as i32, kv_dim as i32)?;
         Ok(())
     }
-    fn scatter_kv<T: Dtype>(
-        k: &Tensor<T, Self>,
-        v: &Tensor<T, Self>,
-        k_cache: &mut Tensor<T, Self>,
-        v_cache: &mut Tensor<T, Self>,
-        positions: &Tensor<i32, Self>,
+
+    fn scatter_kv_paged<T: Dtype>(
+        k_src: &Tensor<T, Self>,
+        v_src: &Tensor<T, Self>,
+        k_pool: &mut Tensor<T, Self>,
+        v_pool: &mut Tensor<T, Self>,
+        block_tables: &Tensor<i32, Self>,
+        seq_positions: &Tensor<i32, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        seq_lens_step: &Tensor<i32, Self>,
+        max_blocks_per_seq: usize,
+        block_size: usize,
         kv_dim: usize,
     ) -> OpResult<()> {
-        kernels::scatter_kv::scatter_kv(k, v, k_cache, v_cache, positions, kv_dim)
+        kernels::scatter_kv_paged::scatter_kv_paged(
+            k_src, v_src, k_pool, v_pool,
+            block_tables, seq_positions, cu_q_lens, seq_lens_step,
+            max_blocks_per_seq, block_size, kv_dim,
+        )
     }
-    fn argmax<T: Dtype>(logits: &Tensor<T, Self>, num_rows: usize) -> OpResult<i32> {
-        // Use the sampler kernel on the last row
-        let vocab = logits.numel() / num_rows;
-        let last_row_offset = (num_rows - 1) * vocab;
 
-        // Create a single-element i32 output tensor on device
-        let device = logits.device();
-        let mut output = Tensor::<i32, Cuda>::zeros_cuda([1], device)?;
-
-        // Point to last row of logits
-        let last_row_ptr = unsafe { (logits.data_ptr() as *const u8).add(last_row_offset * T::SIZE_BYTES) };
-        let stream = device.config.stream;
-
-        use crate::domain::types::DataType;
-        unsafe extern "C" {
-            fn argmax_kernel_bf16(output: *mut i32, input: *const half::bf16, vocab_size: i32, stream: ffi::cudaStream_t);
-            fn argmax_kernel_fp16(output: *mut i32, input: *const half::f16, vocab_size: i32, stream: ffi::cudaStream_t);
-            fn argmax_kernel_fp32(output: *mut i32, input: *const f32, vocab_size: i32, stream: ffi::cudaStream_t);
-        }
-        unsafe {
-            match T::DATA_TYPE {
-                DataType::BF16 => argmax_kernel_bf16(output.data_ptr_mut(), last_row_ptr as _, vocab as i32, stream),
-                DataType::F16 => argmax_kernel_fp16(output.data_ptr_mut(), last_row_ptr as _, vocab as i32, stream),
-                DataType::F32 => argmax_kernel_fp32(output.data_ptr_mut(), last_row_ptr as _, vocab as i32, stream),
-                _ => return Err(OpError::Kernel(format!("argmax: {:?}", T::DATA_TYPE))),
-            }
-        }
-
-        // Copy result back to host
-        let mut result: i32 = 0;
-        unsafe {
-            let code = ffi::cudaMemcpyAsync(
-                &mut result as *mut i32 as *mut std::ffi::c_void,
-                output.data_ptr() as *const std::ffi::c_void,
-                4,
-                ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                stream,
-            );
-            if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("argmax D2H copy failed: {:?}", code)));
-            }
-            let code = ffi::cudaStreamSynchronize(stream);
-            if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("argmax sync failed: {:?}", code)));
-            }
-        }
-        Ok(result)
+    fn argmax_batched<T: Dtype>(
+        logits: &Tensor<T, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        batch: usize,
+    ) -> OpResult<Vec<i32>> {
+        kernels::argmax_batched::argmax_batched(logits, cu_q_lens, batch)
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -279,14 +329,12 @@ impl OpBackend for Cuda {
     }
 
     fn sdpa<T: Dtype>(
-        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+        _q: &Tensor<T, Self>, _k: &Tensor<T, Self>, _v: &Tensor<T, Self>,
+        _output: &mut Tensor<T, Self>,
+        _num_heads: usize, _num_kv_heads: usize, _head_dim: usize, _scale: f32,
     ) -> OpResult<()> {
-        kernels::attention::attention_prefill(
-            q, k, v, output,
-            num_heads as i32, num_kv_heads as i32, head_dim as i32, scale,
-        )
+        // SDPA is only used by diffusion; LLM path goes through attention_paged.
+        Err(OpError::Kernel("sdpa: not supported in paged-only build".into()))
     }
 }
 

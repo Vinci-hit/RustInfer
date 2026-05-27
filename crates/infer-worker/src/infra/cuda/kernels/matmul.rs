@@ -9,26 +9,24 @@ use crate::infra::cuda::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn sgemv_cu_fp32x4(
-        output: *mut f32, input: *const f32, weight: *const f32,
-        n: i32, k: i32, stream: cudaStream_t,
+        input: *const f32, weight: *const f32, output: *mut f32,
+        m: i32, k: i32, stream: cudaStream_t,
     );
-    fn sgemm_cublas_forward(
-        output: *mut f32, input: *const f32, weight: *const f32,
+    fn sgemm_naive_f32_cu(
+        a: *const f32, b: *const f32, c: *mut f32,
         m: i32, n: i32, k: i32,
-        cublaslt_handle: crate::infra::cuda::ffi::cublasLtHandle_t,
-        workspace: *mut std::ffi::c_void, workspace_size: usize,
         stream: cudaStream_t,
     );
-    fn hgemv_bf16_forward(
-        output: *mut half::bf16, input: *const half::bf16, weight: *const half::bf16,
+    fn hgemv_bf16_cu(
+        input: *const half::bf16, weight: *const half::bf16, output: *mut half::bf16,
         n: i32, k: i32, stream: cudaStream_t,
     );
-    fn hgemm_cublaslt_bf16_forward(
-        output: *mut half::bf16, input: *const half::bf16, weight: *const half::bf16,
+    fn gemm_cublaslt_bf16(
+        a: *const half::bf16, b: *const half::bf16, c: *mut half::bf16,
         m: i32, n: i32, k: i32,
-        cublaslt_handle: crate::infra::cuda::ffi::cublasLtHandle_t,
-        workspace: *mut std::ffi::c_void, workspace_size: usize,
         stream: cudaStream_t,
+        handle: crate::infra::cuda::ffi::cublasLtHandle_t,
+        workspace: *mut std::ffi::c_void, workspace_size: usize,
     );
     // AWQ int4 quantized kernels
     fn kpack_gemv_cu(
@@ -67,16 +65,29 @@ pub fn matmul<T: Dtype>(
         match T::DATA_TYPE {
             DataType::F32 => {
                 if m == 1 {
-                    sgemv_cu_fp32x4(output.data_ptr_mut() as _, input.data_ptr() as _, weight.data_ptr() as _, n as i32, k as i32, stream);
+                    sgemv_cu_fp32x4(
+                        input.data_ptr() as _, weight.data_ptr() as _, output.data_ptr_mut() as _,
+                        n as i32, k as i32, stream,
+                    );
                 } else {
-                    sgemm_cublas_forward(output.data_ptr_mut() as _, input.data_ptr() as _, weight.data_ptr() as _, m as i32, n as i32, k as i32, cfg.cublaslt_handle, cfg.workspace, cfg.workspace_size, stream);
+                    sgemm_naive_f32_cu(
+                        input.data_ptr() as _, weight.data_ptr() as _, output.data_ptr_mut() as _,
+                        m as i32, n as i32, k as i32, stream,
+                    );
                 }
             }
             DataType::BF16 => {
                 if m == 1 {
-                    hgemv_bf16_forward(output.data_ptr_mut() as _, input.data_ptr() as _, weight.data_ptr() as _, n as i32, k as i32, stream);
+                    hgemv_bf16_cu(
+                        input.data_ptr() as _, weight.data_ptr() as _, output.data_ptr_mut() as _,
+                        n as i32, k as i32, stream,
+                    );
                 } else {
-                    hgemm_cublaslt_bf16_forward(output.data_ptr_mut() as _, input.data_ptr() as _, weight.data_ptr() as _, m as i32, n as i32, k as i32, cfg.cublaslt_handle, cfg.workspace, cfg.workspace_size, stream);
+                    gemm_cublaslt_bf16(
+                        input.data_ptr() as _, weight.data_ptr() as _, output.data_ptr_mut() as _,
+                        m as i32, n as i32, k as i32,
+                        stream, cfg.cublaslt_handle, cfg.workspace, cfg.workspace_size,
+                    );
                 }
             }
             _ => return Err(OpError::Kernel(format!("matmul: unsupported dtype {:?}", T::DATA_TYPE))),

@@ -74,20 +74,9 @@ pub fn patchify_cpu<T: Dtype>(
         }
     }
 
-    // Build output tensor
+    // Build output tensor (CPU host allocation via Tensor::from_host_bytes).
     let out_shape = Shape::from_slice(&[num_tokens, patch_flat]);
-    let layout = std::alloc::Layout::from_size_align(dst_data.len().max(1), 16)
-        .map_err(|e| OpError::Kernel(e.to_string()))?;
-    let ptr = unsafe { std::alloc::alloc(layout) };
-    if ptr.is_null() { return Err(OpError::Kernel("alloc failed".into())); }
-    unsafe { std::ptr::copy_nonoverlapping(dst_data.as_ptr(), ptr, dst_data.len()); }
-
-    Ok(Tensor {
-        shape: out_shape, strides: out_shape.contiguous_strides(),
-        offset_elems: 0, numel: num_tokens * patch_flat, is_contiguous: true,
-        storage_ptr: ptr, storage_len: dst_data.len(),
-        device: Cpu, _marker: std::marker::PhantomData,
-    })
+    Tensor::<T, Cpu>::from_host_bytes(&dst_data, out_shape, &Cpu)
 }
 
 /// Unpatchify: [num_tokens, patch_flat] → [C, F, H, W] (inverse of patchify).
@@ -137,18 +126,7 @@ pub fn unpatchify_cpu<T: Dtype>(
     }
 
     let out_shape = Shape::from_slice(&[c, f, h, w]);
-    let layout = std::alloc::Layout::from_size_align(dst_data.len().max(1), 16)
-        .map_err(|e| OpError::Kernel(e.to_string()))?;
-    let ptr = unsafe { std::alloc::alloc(layout) };
-    if ptr.is_null() { return Err(OpError::Kernel("alloc failed".into())); }
-    unsafe { std::ptr::copy_nonoverlapping(dst_data.as_ptr(), ptr, dst_data.len()); }
-
-    Ok(Tensor {
-        shape: out_shape, strides: out_shape.contiguous_strides(),
-        offset_elems: 0, numel, is_contiguous: true,
-        storage_ptr: ptr, storage_len: dst_data.len(),
-        device: Cpu, _marker: std::marker::PhantomData,
-    })
+    Tensor::<T, Cpu>::from_host_bytes(&dst_data, out_shape, &Cpu)
 }
 
 #[cfg(test)]

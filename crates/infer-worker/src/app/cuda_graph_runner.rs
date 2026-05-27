@@ -98,7 +98,7 @@ impl CudaGraphRunner {
     pub fn capture<T: Dtype, M: LlmModel<T, Cuda>>(
         &mut self,
         model: &M,
-        config: &mut CudaConfig,
+        config: &CudaConfig,
         make_dummy_inputs: &dyn Fn(usize) -> (Tensor<i32, Cuda>, ForwardContext<'static, T, Cuda>),
     ) -> OpResult<()> {
         for (i, &size) in self.capture_sizes.iter().enumerate() {
@@ -164,7 +164,7 @@ impl CudaGraphRunner {
     }
 
     /// Invalidate all captured graphs (e.g. when KV cache grows).
-    pub fn invalidate_all(&mut self, config: &mut CudaConfig) {
+    pub fn invalidate_all(&mut self, config: &CudaConfig) {
         config.invalidate_all_graphs();
         for state in &mut self.states {
             if matches!(state, SlotState::Captured { .. }) {
@@ -186,6 +186,93 @@ impl CudaGraphRunner {
     /// Maximum batch size that has a captured graph.
     pub fn max_capture_size(&self) -> usize {
         self.max_capture_size
+    }
+
+    /// Lookup the captured slot for a specific size, if any. Used by the
+    /// runner to know whether `replay()` can be issued.
+    pub fn captured_slot_for(&self, size: usize) -> Option<GraphSlot> {
+        self.capture_sizes.iter().position(|&s| s == size).and_then(|i| {
+            match self.states[i] {
+                SlotState::Captured { slot } => Some(slot),
+                _ => None,
+            }
+        })
+    }
+
+    /// Reverse-order warmup + capture sweep.
+    ///
+    /// For each `size` in `capture_sizes`, in reverse (largest first):
+    ///   1. Run `run_one(size)` `warmup_passes` times (eager) — initializes
+    ///      lazy cuBLAS / cuDNN algos.
+    ///   2. `capture_begin_relaxed` → `run_one(size)` → `capture_end`.
+    ///   3. `launch` once to validate the graph.
+    ///
+    /// `run_one` should fill the runner's `BatchWorkspace` with safe dummy
+    /// data for the given decode-only batch size, then call
+    /// `forward + argmax_batched_decode_into`. After this returns, the
+    /// runner can call `replay()` for any captured size.
+    ///
+    /// **Important**: `run_one` must use the same workspace addresses every
+    /// time — any per-call alloc would be embedded into the captured graph
+    /// and fail on replay.
+    pub fn warmup_and_capture_all<F>(
+        &mut self,
+        config: &CudaConfig,
+        warmup_passes: usize,
+        mut run_one: F,
+    ) -> OpResult<()>
+    where
+        F: FnMut(usize) -> OpResult<()>,
+    {
+        // Iterate sizes in REVERSE order (largest first) for memory-friendly
+        // capture: cuBLASLt/cuDNN allocate more workspace for bigger sizes,
+        // and we'd rather see those allocations before smaller-size graphs.
+        let order: Vec<(usize, usize)> = self.capture_sizes.iter()
+            .enumerate()
+            .map(|(i, &s)| (i, s))
+            .rev()
+            .collect();
+
+        for (i, size) in order {
+            // 1. Warmup passes (eager).
+            for _ in 0..warmup_passes {
+                run_one(size)?;
+            }
+            // Wait for warmup kernels to finish before capturing — capture
+            // shouldn't share a stream with in-flight kernels.
+            config.synchronize()?;
+            self.states[i] = SlotState::Warm;
+
+            // 2. Capture.
+            let slot = GraphSlot::LlmDecode {
+                batch: size,
+                buffer_id: 0,
+                slot_signature: size as u64,
+            };
+            config.capture_begin_relaxed()?;
+            // Run forward + argmax inside the captured region. If it errors,
+            // we still need to call capture_end to leave the stream in a
+            // sane state.
+            let res = run_one(size);
+            if let Err(e) = res {
+                // Best-effort: end capture into a throwaway graph and drop.
+                let mut graph: crate::infra::cuda::ffi::cudaGraph_t = std::ptr::null_mut();
+                unsafe {
+                    let _ = crate::infra::cuda::ffi::cudaStreamEndCapture(config.stream, &mut graph);
+                    if !graph.is_null() {
+                        crate::infra::cuda::ffi::cudaGraphDestroy(graph);
+                    }
+                }
+                return Err(e);
+            }
+            config.capture_end(slot)?;
+            self.states[i] = SlotState::Captured { slot };
+
+            // 3. Launch once (validates the graph; also "primes" replay).
+            config.launch(slot)?;
+            config.synchronize()?;
+        }
+        Ok(())
     }
 }
 

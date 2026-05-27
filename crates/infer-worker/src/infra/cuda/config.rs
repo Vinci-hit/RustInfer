@@ -34,7 +34,9 @@ pub struct CudaConfig {
     pub cublas_handle_v2: ffi::cublasHandle_t,
     pub workspace: *mut c_void,
     pub workspace_size: usize,
-    pub graphs: HashMap<GraphSlot, CudaGraph>,
+    /// Captured CUDA graphs, keyed by slot. Behind a Mutex so the runner
+    /// can capture from `&CudaConfig` without an outer `&mut`.
+    pub graphs: std::sync::Mutex<HashMap<GraphSlot, CudaGraph>>,
     pub cudnn_handle: ffi::cudnnHandle_t,
 }
 
@@ -59,32 +61,35 @@ impl CudaConfig {
                 return Err(OpError::Kernel(format!("cudnnSetStream failed: {:?}", s)));
             }
         }
-        Ok(Self { stream, cublaslt_handle, cublas_handle_v2, workspace, workspace_size: DEFAULT_GEMM_WORKSPACE_SIZE, graphs: HashMap::new(), cudnn_handle })
+        Ok(Self { stream, cublaslt_handle, cublas_handle_v2, workspace, workspace_size: DEFAULT_GEMM_WORKSPACE_SIZE, graphs: std::sync::Mutex::new(HashMap::new()), cudnn_handle })
     }
 
-    pub fn graph_ready(&self, slot: GraphSlot) -> bool { self.graphs.contains_key(&slot) }
+    pub fn graph_ready(&self, slot: GraphSlot) -> bool {
+        self.graphs.lock().unwrap().contains_key(&slot)
+    }
 
     pub fn capture_begin_relaxed(&self) -> OpResult<()> {
         unsafe { cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 2)); }
         Ok(())
     }
 
-    pub fn capture_end(&mut self, slot: GraphSlot) -> OpResult<()> {
+    pub fn capture_end(&self, slot: GraphSlot) -> OpResult<()> {
         let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
         unsafe { cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph)); }
         let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
         unsafe { cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0)); }
-        self.graphs.insert(slot, CudaGraph { graph, exec });
+        self.graphs.lock().unwrap().insert(slot, CudaGraph { graph, exec });
         Ok(())
     }
 
     pub fn launch(&self, slot: GraphSlot) -> OpResult<()> {
-        let g = self.graphs.get(&slot).ok_or_else(|| OpError::Kernel(format!("graph {:?} not found", slot)))?;
+        let guard = self.graphs.lock().unwrap();
+        let g = guard.get(&slot).ok_or_else(|| OpError::Kernel(format!("graph {:?} not found", slot)))?;
         unsafe { cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream)); }
         Ok(())
     }
 
-    pub fn invalidate_all_graphs(&mut self) { self.graphs.clear(); }
+    pub fn invalidate_all_graphs(&self) { self.graphs.lock().unwrap().clear(); }
 
     pub fn synchronize(&self) -> OpResult<()> {
         unsafe { cuda_check!(ffi::cudaStreamSynchronize(self.stream)); }

@@ -1,12 +1,10 @@
 //! Qwen3 model — same as Llama3 + QK-norm before RoPE.
 
-use std::marker::PhantomData;
 use crate::domain::ports::{OpBackend, OpResult};
 use crate::domain::types::{Dtype, Shape};
 use crate::domain::tensor::Tensor;
 use crate::domain::model::{LlmModel, ForwardContext};
 use super::layers::{Linear, RMSNorm, Embedding};
-use super::llama3::{alloc_i32, alloc_seq_starts};
 
 pub struct Qwen3Layer<T: Dtype, D: OpBackend> {
     pub input_layernorm: RMSNorm<T, D>,
@@ -45,61 +43,47 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
         let num_tokens = input_ids.numel();
         let q_dim = self.head_num * self.head_dim;
         let kv_dim = self.kv_head_num * self.head_dim;
-        let qkv_dim = q_dim + 2 * kv_dim;
-        let dev = input_ids.device();
+        let plan = ctx.plan;
+
+        // Workspace views (Arc-cloned, address-stable).
+        let mut x        = ctx.workspace.x_view(num_tokens);
+        let mut h        = ctx.workspace.h_view(num_tokens);
+        let mut qkv_buf  = ctx.workspace.qkv_view(num_tokens);
+        let mut attn_out = ctx.workspace.attn_out_view(num_tokens);
+        let mut gate_buf = ctx.workspace.gate_view(num_tokens);
+        let mut up_buf   = ctx.workspace.up_view(num_tokens);
+        let mut ffn_out  = ctx.workspace.ffn_view(num_tokens);
+        let mut o_out    = ctx.workspace.o_out_view(num_tokens);
+        let logits       = ctx.workspace.logits_view(num_tokens);
 
         // ── 1. Embedding ──
-        let mut x = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.dim]), dev)?;
         self.embed_tokens.forward(input_ids, &mut x)?;
 
         // ── 2. First input norm ──
-        let mut h = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.dim]), dev)?;
         self.layers[0].input_layernorm.forward(&x, &mut h)?;
 
-        // ── 3. Buffers ──
-        let mut qkv_buf = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, qkv_dim]), dev)?;
-        let mut attn_out = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.dim]), dev)?;
-        let mut gate_buf = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.intermediate_size]), dev)?;
-        let mut up_buf = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.intermediate_size]), dev)?;
-        let mut ffn_out = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.dim]), dev)?;
-        let positions = alloc_i32::<D>(ctx.positions, dev)?;
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
             // ── QKV projection ──
             layer.qkv_proj.forward(&h, &mut qkv_buf)?;
 
-            let mut q = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, q_dim]), dev)?;
-            let mut k = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, kv_dim]), dev)?;
-            let mut v = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, kv_dim]), dev)?;
+            let mut q = ctx.workspace.q_view(num_tokens);
+            let mut k = ctx.workspace.k_view(num_tokens);
+            let mut v = ctx.workspace.v_view(num_tokens);
             D::split_qkv(&qkv_buf, &mut q, &mut k, &mut v, num_tokens, q_dim, kv_dim)?;
 
             // ── QK-norm (Qwen3 specific) ──
             if let Some(ref qn) = layer.q_norm {
-                let mut q_reshaped = Tensor {
-                    shape: Shape::from_slice(&[num_tokens * self.head_num, self.head_dim]),
-                    strides: Shape::from_slice(&[num_tokens * self.head_num, self.head_dim]).contiguous_strides(),
-                    offset_elems: q.offset_elems,
-                    numel: q.numel,
-                    is_contiguous: true,
-                    storage_ptr: q.storage_ptr,
-                    storage_len: q.storage_len,
-                    device: dev.clone(),
-                    _marker: PhantomData,
-                };
+                let mut q_reshaped = q.view_contiguous(
+                    Shape::from_slice(&[num_tokens * self.head_num, self.head_dim]),
+                )?;
                 qn.forward_inplace(&mut q_reshaped)?;
             }
             if let Some(ref kn) = layer.k_norm {
-                let mut k_reshaped = Tensor {
-                    shape: Shape::from_slice(&[num_tokens * self.kv_head_num, self.head_dim]),
-                    strides: Shape::from_slice(&[num_tokens * self.kv_head_num, self.head_dim]).contiguous_strides(),
-                    offset_elems: k.offset_elems,
-                    numel: k.numel,
-                    is_contiguous: true,
-                    storage_ptr: k.storage_ptr,
-                    storage_len: k.storage_len,
-                    device: dev.clone(),
-                    _marker: PhantomData,
-                };
+                let mut k_reshaped = k.view_contiguous(
+                    Shape::from_slice(&[num_tokens * self.kv_head_num, self.head_dim]),
+                )?;
                 kn.forward_inplace(&mut k_reshaped)?;
             }
 
@@ -107,24 +91,38 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
             D::rope_inplace(
                 &mut q, &mut k,
                 &self.sin_cache, &self.cos_cache,
-                &positions,
+                &plan.rope_positions,
                 self.head_num, self.kv_head_num, self.head_dim,
             )?;
 
-            // ── KV scatter ──
-            D::scatter_kv(&k, &v, &mut ctx.k_caches[layer_idx], &mut ctx.v_caches[layer_idx], &positions, kv_dim)?;
+            // ── KV scatter (paged) ──
+            {
+                let layer_kv = &mut ctx.kv_pool.layers[layer_idx];
+                D::scatter_kv_paged(
+                    &k, &v,
+                    &mut layer_kv.k, &mut layer_kv.v,
+                    &plan.block_tables, &plan.seq_positions,
+                    &plan.cu_q_lens, &plan.seq_lens_step,
+                    plan.max_blocks_per_seq, plan.block_size, kv_dim,
+                )?;
+            }
 
-            // ── Attention ──
-            let seq_starts = alloc_seq_starts::<D>(ctx.seq_lens, dev)?;
-            D::attention(
-                &q, &ctx.k_caches[layer_idx], &ctx.v_caches[layer_idx],
-                &mut attn_out, &seq_starts,
-                self.head_num, self.kv_head_num, self.head_dim,
-                1.0 / (self.head_dim as f32).sqrt(),
-            )?;
+            // ── Attention (paged) ──
+            {
+                let layer_kv = &ctx.kv_pool.layers[layer_idx];
+                let k_pool = &layer_kv.k;
+                let v_pool = &layer_kv.v;
+                let scratch = ctx.workspace.flash_decode_workspace();
+                D::attention_paged(
+                    &q, k_pool, v_pool,
+                    &mut attn_out, plan,
+                    scratch,
+                    self.head_num, self.kv_head_num, self.head_dim,
+                    1.0 / (self.head_dim as f32).sqrt(),
+                )?;
+            }
 
             // ── O proj + residual (fused) ──
-            let mut o_out = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.dim]), dev)?;
             layer.o_proj.forward(&attn_out, &mut o_out)?;
             D::fused_add_rmsnorm(
                 &mut h, &mut x, &o_out,
@@ -134,7 +132,6 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
             // ── MLP (SwiGLU) ──
             layer.gate_proj.forward(&h, &mut gate_buf)?;
             layer.up_proj.forward(&h, &mut up_buf)?;
-            D::silu_inplace(&mut gate_buf)?;
             D::swiglu_inplace(&mut gate_buf, &up_buf)?;
             layer.down_proj.forward(&gate_buf, &mut ffn_out)?;
 
@@ -153,13 +150,18 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
         }
 
         // ── 4. LM head ──
-        let mut logits = D::alloc_tensor::<T>(Shape::from_slice(&[num_tokens, self.vocab_size]), dev)?;
-        self.lm_head.forward(&h, &mut logits)?;
-        Ok(logits)
+        let mut logits_mut = logits;
+        self.lm_head.forward(&h, &mut logits_mut)?;
+        Ok(logits_mut)
     }
 
     fn num_layers(&self) -> usize { self.layers.len() }
     fn vocab_size(&self) -> usize { self.vocab_size }
     fn dim(&self) -> usize { self.dim }
     fn kv_dim(&self) -> usize { self.kv_dim }
+    fn q_dim(&self) -> usize { self.head_num * self.head_dim }
+    fn head_num(&self) -> usize { self.head_num }
+    fn head_dim(&self) -> usize { self.head_dim }
+    fn kv_head_num(&self) -> usize { self.kv_head_num }
+    fn intermediate_size(&self) -> usize { self.intermediate_size }
 }

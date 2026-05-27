@@ -2206,12 +2206,14 @@ dependencies = [
 name = "infer-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bindgen",
  "cc",
  "clap",
  "dashmap",
  "half",
  "infer-protocol",
+ "memmap2",
  "num-traits",
  "once_cell",
  "rayon",
@@ -2220,7 +2222,9 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tokenizers",
  "tracing",
+ "tracing-subscriber",
  "walkdir",
  "zmq",
 ]

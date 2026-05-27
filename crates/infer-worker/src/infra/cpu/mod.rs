@@ -1,17 +1,18 @@
 //! CPU infrastructure adapter.
 //!
-//! Implements `Device`, `HostDevice`, `OpBackend` for `Cpu`.
+//! Implements `Device`, `HostDevice`, `MemoryPort`, `OpBackend` for `Cpu`.
 //! All kernels run in pure Rust, using f64 as accumulator for generic T.
 
 use std::alloc::Layout;
-use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use half::{bf16, f16};
 
-use crate::domain::ports::{Device, HostDevice, Allocator, AllocError, OpBackend, OpResult, OpError};
-use crate::domain::types::{Dtype, DataType, Shape};
+use crate::domain::ports::{
+    Allocator, AllocError, Device, HostDevice, MemoryPort, OpBackend, OpError, OpResult,
+};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::{DataType, Dtype, Shape};
 
 // ─── Cpu Device ──────────────────────────────────────────────────────────────
 
@@ -25,7 +26,51 @@ impl Device for Cpu {
 }
 impl HostDevice for Cpu {}
 
-// ─── Cpu Allocator ───────────────────────────────────────────────────────────
+// ─── Cpu MemoryPort ──────────────────────────────────────────────────────────
+
+/// CPU layout: 16-byte aligned, size rounded up to 16 (matches existing kernel
+/// expectations and SIMD alignment).
+#[inline]
+fn cpu_layout(size: usize) -> Layout {
+    Layout::from_size_align(size.max(1), 16).expect("invalid layout")
+}
+
+impl MemoryPort for Cpu {
+    fn alloc_bytes(&self, size: usize) -> OpResult<NonNull<u8>> {
+        let layout = cpu_layout(size);
+        // SAFETY: layout is valid (size>=1, align=16).
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        NonNull::new(ptr).ok_or_else(|| OpError::Kernel("CPU alloc returned null".into()))
+    }
+
+    unsafe fn free_bytes(&self, ptr: NonNull<u8>, size: usize) {
+        let layout = cpu_layout(size);
+        // SAFETY: layout matches the one used in alloc_bytes.
+        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+    }
+
+    unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
+        // SAFETY: caller provides valid src/dst with `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_ptr(), size) };
+        Ok(())
+    }
+
+    unsafe fn upload_async(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
+        // CPU: memcpy is already synchronous; "async" semantics are a no-op.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_ptr(), size) };
+        Ok(())
+    }
+
+    unsafe fn download(&self, dst: *mut u8, src: NonNull<u8>, size: usize) -> OpResult<()> {
+        // SAFETY: caller provides valid src/dst with `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, size) };
+        Ok(())
+    }
+
+    fn synchronize(&self) -> OpResult<()> { Ok(()) }
+}
+
+// ─── Cpu Allocator (legacy, used by VAE pool) ────────────────────────────────
 
 #[derive(Debug)]
 pub struct CpuAllocator;
@@ -40,60 +85,44 @@ impl Allocator for CpuAllocator {
     }
 }
 
-// ─── Tensor construction helper (CPU) ────────────────────────────────────────
+// ─── Tensor construction helpers (CPU) ───────────────────────────────────────
+//
+// `Tensor::zeros(shape, &Cpu)` is the canonical entry point; the convenience
+// wrappers below preserve the historical CPU-only API surface.
 
 impl<T: Dtype> Tensor<T, Cpu> {
-    /// Allocate a contiguous, zero-initialized CPU tensor.
-    pub fn zeros(shape: impl Into<Shape>) -> Tensor<T, Cpu> {
-        let shape = shape.into();
-        let numel = shape.numel();
-        let size_bytes = numel * T::SIZE_BYTES;
-        let layout = Layout::from_size_align(size_bytes.max(1), 16).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        let strides = shape.contiguous_strides();
-        Tensor {
-            shape, strides, offset_elems: 0, numel,
-            is_contiguous: true,
-            storage_ptr: ptr, storage_len: size_bytes,
-            device: Cpu, _marker: PhantomData,
-        }
+    /// CPU-only convenience: allocate a contiguous, zero-initialized tensor.
+    /// Equivalent to `Tensor::zeros(shape, &Cpu).unwrap()`.
+    pub fn zeros_cpu(shape: impl Into<Shape>) -> Tensor<T, Cpu> {
+        Tensor::<T, Cpu>::zeros(shape, &Cpu).expect("CPU alloc cannot fail")
     }
 
-    /// Create from existing data (copies).
+    /// Create from existing host data (copies bytes into a fresh allocation).
     pub fn from_slice(data: &[T], shape: impl Into<Shape>) -> Tensor<T, Cpu> {
-        let shape = shape.into();
-        assert_eq!(data.len(), shape.numel(), "data.len() != shape.numel()");
-        let t = Self::zeros(shape);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr() as *const u8,
-                t.storage_ptr,
-                data.len() * T::SIZE_BYTES,
-            );
-        }
-        t
+        Tensor::<T, Cpu>::from_host_slice(data, shape, &Cpu).expect("CPU from_host_slice cannot fail")
     }
 
-    /// Borrow as typed slice (CPU + contiguous only).
+    /// Borrow the tensor as a typed slice (CPU + contiguous only).
     pub fn as_slice(&self) -> &[T] {
-        assert!(self.is_contiguous, "as_slice requires contiguous");
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.numel) }
+        assert!(self.is_contiguous(), "as_slice requires contiguous");
+        // SAFETY: CPU storage is host-accessible; pointer is valid for `numel` elements.
+        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.numel()) }
     }
 
-    /// Mutable typed slice.
+    /// Mutable typed slice. Note: takes `&mut self` to encode exclusive
+    /// access at the call site, even though the underlying Arc is shared
+    /// — callers that hold multiple Arcs to the same storage must
+    /// coordinate access themselves.
     pub fn as_slice_mut(&mut self) -> &mut [T] {
-        assert!(self.is_contiguous, "as_slice_mut requires contiguous");
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), self.numel) }
+        assert!(self.is_contiguous(), "as_slice_mut requires contiguous");
+        // SAFETY: CPU storage is host-accessible; pointer is valid for `numel` elements.
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), self.numel()) }
     }
 }
 
 // ─── OpBackend for Cpu ───────────────────────────────────────────────────────
 
 impl OpBackend for Cpu {
-    fn alloc_tensor<T: Dtype>(shape: Shape, _device: &Self) -> OpResult<Tensor<T, Self>> {
-        Ok(Tensor::<T, Cpu>::zeros(shape))
-    }
-
     fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
         check_contiguous3(a, b, dst)?;
         check_numel3(a, b, dst)?;
@@ -349,48 +378,86 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
-    fn attention<T: Dtype>(
-        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
+    fn attention_paged<T: Dtype>(
+        q: &Tensor<T, Self>,
+        k_pool: &Tensor<T, Self>,
+        v_pool: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
-        _seq_starts: &Tensor<i32, Self>,
-        head_num: usize, kv_head_num: usize, head_dim: usize, scale: f32,
+        plan: &crate::domain::batch::BatchPlan<Self>,
+        _workspace: &mut Tensor<f32, Self>,  // CPU ignores; no flash-decode scratch needed
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+        scale: f32,
     ) -> OpResult<()> {
-        // Simplified single-sequence CPU attention (no batching)
-        let num_tokens = q.numel() / (head_num * head_dim);
-        let kv_len = k.numel() / (kv_head_num * head_dim);
+        // CPU reference: naive ragged-batch causal attention over a paged
+        // KV pool. Layout:
+        //   k_pool / v_pool : [num_blocks, block_size, kv_dim] contiguous
+        //   block_tables    : [batch, max_blocks_per_seq] (in plan)
+        // For each seq i, q has rows [cu_q_lens[i] .. cu_q_lens[i+1]); attend
+        // to the first `kv_lens[i]` tokens routed through `block_tables[i]`.
         let kv_mul = head_num / kv_head_num;
+        let q_dim = head_num * head_dim;
+        let kv_dim = kv_head_num * head_dim;
+        let block_size = plan.block_size;
+        let max_blocks = plan.max_blocks_per_seq;
 
-        for h in 0..head_num {
-            let kv_h = h / kv_mul;
-            for t in 0..num_tokens {
-                // Compute attention scores for this head/token
-                let mut scores = vec![0.0f64; kv_len];
-                for s in 0..kv_len {
-                    let mut dot = 0.0f64;
-                    for d in 0..head_dim {
-                        unsafe {
-                            let qi = read_f64(q.data_ptr().add(t * head_num * head_dim + h * head_dim + d));
-                            let ki = read_f64(k.data_ptr().add(s * kv_head_num * head_dim + kv_h * head_dim + d));
-                            dot += qi * ki;
+        let cu_q = plan.cu_q_lens.as_slice();
+        let kv_lens_h = plan.kv_lens.as_slice();
+        let block_tables_h = plan.block_tables.as_slice();
+        let batch = plan.batch;
+
+        // Helper: fetch K/V pool row for `(seq, token_pos)`. Returns f64.
+        let fetch = |pool: &Tensor<T, Self>, seq: usize, pos: usize, kv_h: usize, d: usize| -> f64 {
+            let logical_block = pos / block_size;
+            let block_off = pos % block_size;
+            let physical = block_tables_h[seq * max_blocks + logical_block] as usize;
+            let row_idx = physical * block_size + block_off;
+            unsafe { read_f64(pool.data_ptr().add(row_idx * kv_dim + kv_h * head_dim + d)) }
+        };
+
+        for seq in 0..batch {
+            let q_start = cu_q[seq] as usize;
+            let q_end = cu_q[seq + 1] as usize;
+            let q_len = q_end - q_start;
+            let kv_len = kv_lens_h[seq] as usize;
+
+            // Causal: q-row r in this seq attends to KV [0..kv_len-q_len+r+1].
+            let causal_shift = (kv_len as i64) - (q_len as i64);
+
+            for h in 0..head_num {
+                let kv_h = h / kv_mul;
+                for r in 0..q_len {
+                    let q_row_global = q_start + r;
+                    let kv_upper = (causal_shift + r as i64 + 1).max(0) as usize;
+                    let mut scores = vec![0.0f64; kv_upper];
+                    for s in 0..kv_upper {
+                        let mut dot = 0.0f64;
+                        for d in 0..head_dim {
+                            unsafe {
+                                let qi = read_f64(q.data_ptr().add(q_row_global * q_dim + h * head_dim + d));
+                                let ki = fetch(k_pool, seq, s, kv_h, d);
+                                dot += qi * ki;
+                            }
                         }
+                        scores[s] = dot * scale as f64;
                     }
-                    scores[s] = dot * scale as f64;
-                }
-                // Softmax
-                let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let mut sum = 0.0f64;
-                for s in scores.iter_mut() { *s = (*s - max_s).exp(); sum += *s; }
-                for s in scores.iter_mut() { *s /= sum; }
-                // Weighted sum of V
-                for d in 0..head_dim {
-                    let mut val = 0.0f64;
-                    for s in 0..kv_len {
-                        unsafe {
-                            let vi = read_f64(v.data_ptr().add(s * kv_head_num * head_dim + kv_h * head_dim + d));
+                    let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let mut sum = 0.0f64;
+                    for s in scores.iter_mut() {
+                        *s = (*s - max_s).exp();
+                        sum += *s;
+                    }
+                    if sum == 0.0 { sum = 1.0; }
+                    for s in scores.iter_mut() { *s /= sum; }
+                    for d in 0..head_dim {
+                        let mut val = 0.0f64;
+                        for s in 0..kv_upper {
+                            let vi = fetch(v_pool, seq, s, kv_h, d);
                             val += scores[s] * vi;
                         }
+                        unsafe { write_f64(output.data_ptr_mut().add(q_row_global * q_dim + h * head_dim + d), val); }
                     }
-                    unsafe { write_f64(output.data_ptr_mut().add(t * head_num * head_dim + h * head_dim + d), val); }
                 }
             }
         }
@@ -423,41 +490,72 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
-    fn scatter_kv<T: Dtype>(
-        k: &Tensor<T, Self>,
-        v: &Tensor<T, Self>,
-        k_cache: &mut Tensor<T, Self>,
-        v_cache: &mut Tensor<T, Self>,
-        positions: &Tensor<i32, Self>,
+    fn scatter_kv_paged<T: Dtype>(
+        k_src: &Tensor<T, Self>,
+        v_src: &Tensor<T, Self>,
+        k_pool: &mut Tensor<T, Self>,
+        v_pool: &mut Tensor<T, Self>,
+        block_tables: &Tensor<i32, Self>,
+        seq_positions: &Tensor<i32, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        seq_lens_step: &Tensor<i32, Self>,
+        max_blocks_per_seq: usize,
+        block_size: usize,
         kv_dim: usize,
     ) -> OpResult<()> {
-        let num_tokens = k.numel() / kv_dim;
         let elem = T::SIZE_BYTES;
-        let pos_slice = unsafe { std::slice::from_raw_parts(positions.data_ptr(), num_tokens) };
-        for t in 0..num_tokens {
-            let pos = pos_slice[t] as usize;
-            unsafe {
-                let k_src = (k.data_ptr() as *const u8).add(t * kv_dim * elem);
-                let k_dst = (k_cache.data_ptr_mut() as *mut u8).add(pos * kv_dim * elem);
-                std::ptr::copy_nonoverlapping(k_src, k_dst, kv_dim * elem);
-                let v_src = (v.data_ptr() as *const u8).add(t * kv_dim * elem);
-                let v_dst = (v_cache.data_ptr_mut() as *mut u8).add(pos * kv_dim * elem);
-                std::ptr::copy_nonoverlapping(v_src, v_dst, kv_dim * elem);
+        let cu_q = cu_q_lens.as_slice();
+        let seq_pos = seq_positions.as_slice();
+        let seq_lens = seq_lens_step.as_slice();
+        let block_tables_h = block_tables.as_slice();
+        let batch = seq_pos.len();
+        for seq in 0..batch {
+            let q_start = cu_q[seq] as usize;
+            let q_len = seq_lens[seq] as usize;
+            let dst_pos_start = seq_pos[seq] as usize;
+            for t in 0..q_len {
+                let dst_pos = dst_pos_start + t;
+                let logical_block = dst_pos / block_size;
+                let block_off = dst_pos % block_size;
+                let physical = block_tables_h[seq * max_blocks_per_seq + logical_block] as usize;
+                let row_idx = physical * block_size + block_off;
+                unsafe {
+                    let k_src_row = (k_src.data_ptr() as *const u8).add((q_start + t) * kv_dim * elem);
+                    let k_dst_row = (k_pool.data_ptr_mut() as *mut u8).add(row_idx * kv_dim * elem);
+                    std::ptr::copy_nonoverlapping(k_src_row, k_dst_row, kv_dim * elem);
+                    let v_src_row = (v_src.data_ptr() as *const u8).add((q_start + t) * kv_dim * elem);
+                    let v_dst_row = (v_pool.data_ptr_mut() as *mut u8).add(row_idx * kv_dim * elem);
+                    std::ptr::copy_nonoverlapping(v_src_row, v_dst_row, kv_dim * elem);
+                }
             }
         }
         Ok(())
     }
 
-    fn argmax<T: Dtype>(logits: &Tensor<T, Self>, num_rows: usize) -> OpResult<i32> {
-        let vocab = logits.numel() / num_rows;
-        let last_row_offset = (num_rows - 1) * vocab;
-        let mut max_val = f64::NEG_INFINITY;
-        let mut max_idx = 0i32;
-        for i in 0..vocab {
-            let val = unsafe { read_f64(logits.data_ptr().add(last_row_offset + i)) };
-            if val > max_val { max_val = val; max_idx = i as i32; }
+    fn argmax_batched<T: Dtype>(
+        logits: &Tensor<T, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        batch: usize,
+    ) -> OpResult<Vec<i32>> {
+        let total_rows = if logits.shape().as_slice().len() >= 1 {
+            logits.shape().as_slice()[0]
+        } else {
+            return Err(crate::domain::ports::OpError::Shape("logits must be 2D".into()));
+        };
+        let vocab = logits.numel() / total_rows;
+        let cu_q = cu_q_lens.as_slice();
+        let mut out = Vec::with_capacity(batch);
+        for seq in 0..batch {
+            let last_row = (cu_q[seq + 1] - 1) as usize;
+            let mut max_val = f64::NEG_INFINITY;
+            let mut max_idx = 0i32;
+            for i in 0..vocab {
+                let val = unsafe { read_f64(logits.data_ptr().add(last_row * vocab + i)) };
+                if val > max_val { max_val = val; max_idx = i as i32; }
+            }
+            out.push(max_idx);
         }
-        Ok(max_idx)
+        Ok(out)
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -740,14 +838,14 @@ unsafe fn write_f64<T: Dtype>(ptr: *mut T, val: f64) {
 
 // ─── Validation helpers ──────────────────────────────────────────────────────
 
-fn check_contiguous3<T: Dtype, D: Device>(a: &Tensor<T, D>, b: &Tensor<T, D>, c: &Tensor<T, D>) -> OpResult<()> {
+fn check_contiguous3<T: Dtype, D: MemoryPort>(a: &Tensor<T, D>, b: &Tensor<T, D>, c: &Tensor<T, D>) -> OpResult<()> {
     if !a.is_contiguous() || !b.is_contiguous() || !c.is_contiguous() {
         return Err(OpError::NotContiguous(*a.shape()));
     }
     Ok(())
 }
 
-fn check_numel3<T: Dtype, D: Device>(a: &Tensor<T, D>, b: &Tensor<T, D>, c: &Tensor<T, D>) -> OpResult<()> {
+fn check_numel3<T: Dtype, D: MemoryPort>(a: &Tensor<T, D>, b: &Tensor<T, D>, c: &Tensor<T, D>) -> OpResult<()> {
     if a.numel() != b.numel() || a.numel() != c.numel() {
         return Err(OpError::Shape(format!("numel mismatch: {} {} {}", a.numel(), b.numel(), c.numel())));
     }
@@ -762,7 +860,7 @@ mod tests {
 
     #[test]
     fn tensor_zeros_and_slice() {
-        let t = Tensor::<f32, Cpu>::zeros([2, 3]);
+        let t = Tensor::<f32, Cpu>::zeros_cpu([2, 3]);
         assert_eq!(t.shape().as_slice(), &[2, 3]);
         assert_eq!(t.numel(), 6);
         assert!(t.as_slice().iter().all(|&x| x == 0.0));
@@ -779,7 +877,7 @@ mod tests {
     fn op_add_f32() {
         let a = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0], [3]);
         let b = Tensor::<f32, Cpu>::from_slice(&[10.0, 20.0, 30.0], [3]);
-        let mut dst = Tensor::<f32, Cpu>::zeros([3]);
+        let mut dst = Tensor::<f32, Cpu>::zeros_cpu([3]);
         Cpu::add(&a, &b, &mut dst).unwrap();
         assert_eq!(dst.as_slice(), &[11.0, 22.0, 33.0]);
     }
@@ -791,7 +889,7 @@ mod tests {
         let weight_data = vec![1.0f32; dim];
         let input = Tensor::<f32, Cpu>::from_slice(&input_data, [1, dim]);
         let weight = Tensor::<f32, Cpu>::from_slice(&weight_data, [dim]);
-        let mut output = Tensor::<f32, Cpu>::zeros([1, dim]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([1, dim]);
         Cpu::rmsnorm(&input, &weight, &mut output, 1e-6).unwrap();
         let mean_sq: f32 = output.as_slice().iter().map(|x| x * x).sum::<f32>() / dim as f32;
         assert!((mean_sq - 1.0).abs() < 0.01);
@@ -801,7 +899,7 @@ mod tests {
     fn op_matmul_identity() {
         let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 0.0, 0.0, 1.0], [2, 2]);
         let weight = Tensor::<f32, Cpu>::from_slice(&[1.0, 0.0, 0.0, 1.0], [2, 2]);
-        let mut output = Tensor::<f32, Cpu>::zeros([2, 2]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([2, 2]);
         Cpu::matmul(&input, &weight, &mut output).unwrap();
         assert_eq!(output.as_slice(), &[1.0, 0.0, 0.0, 1.0]);
     }
@@ -809,7 +907,7 @@ mod tests {
     #[test]
     fn op_softmax_sums_to_one() {
         let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [1, 4]);
-        let mut output = Tensor::<f32, Cpu>::zeros([1, 4]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([1, 4]);
         Cpu::softmax(&input, &mut output).unwrap();
         let sum: f32 = output.as_slice().iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
@@ -832,7 +930,7 @@ mod tests {
             2.1, 2.2, 2.3,
         ], [3, 3]);
         let indices = Tensor::<i32, Cpu>::from_slice(&[2, 0, 1], [3]);
-        let mut output = Tensor::<f32, Cpu>::zeros([3, 3]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([3, 3]);
         Cpu::embedding(&table, &indices, &mut output).unwrap();
         assert_eq!(&output.as_slice()[..3], &[2.1, 2.2, 2.3]);
         assert_eq!(&output.as_slice()[3..6], &[0.1, 0.2, 0.3]);
@@ -847,7 +945,7 @@ mod tests {
         let input_data: Vec<f32> = (1..=9).map(|x| x as f32).collect();
         let input = Tensor::<f32, Cpu>::from_slice(&input_data, Shape::from_slice(&[1, 1, 3, 3]));
         let weight = Tensor::<f32, Cpu>::from_slice(&[2.0f32], Shape::from_slice(&[1, 1, 1, 1]));
-        let mut output = Tensor::<f32, Cpu>::zeros(Shape::from_slice(&[1, 1, 3, 3]));
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu(Shape::from_slice(&[1, 1, 3, 3]));
         Cpu::conv2d(&input, &weight, None, &mut output, 1, 0).unwrap();
         let out = output.as_slice();
         for i in 0..9 {
@@ -861,7 +959,7 @@ mod tests {
         let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 4, 1, 1]));
         let weight = Tensor::<f32, Cpu>::from_slice(&[1.0; 4], Shape::from_slice(&[4]));
         let bias = Tensor::<f32, Cpu>::from_slice(&[0.0; 4], Shape::from_slice(&[4]));
-        let mut output = Tensor::<f32, Cpu>::zeros(Shape::from_slice(&[1, 4, 1, 1]));
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu(Shape::from_slice(&[1, 4, 1, 1]));
         Cpu::groupnorm(&input, &weight, &bias, &mut output, 1, 1e-5).unwrap();
         // Output should be normalized: mean≈0, var≈1
         let out = output.as_slice();
@@ -874,7 +972,7 @@ mod tests {
         let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 4]));
         let weight = Tensor::<f32, Cpu>::from_slice(&[1.0; 4], Shape::from_slice(&[4]));
         let bias = Tensor::<f32, Cpu>::from_slice(&[0.0; 4], Shape::from_slice(&[4]));
-        let mut output = Tensor::<f32, Cpu>::zeros(Shape::from_slice(&[1, 4]));
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu(Shape::from_slice(&[1, 4]));
         Cpu::layernorm(&input, &weight, &bias, &mut output, 1e-5).unwrap();
         let out = output.as_slice();
         let mean: f32 = out.iter().sum::<f32>() / 4.0;
@@ -887,7 +985,7 @@ mod tests {
     fn op_upsample_nearest_2x() {
         // [1, 1, 2, 2] → [1, 1, 4, 4]
         let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], Shape::from_slice(&[1, 1, 2, 2]));
-        let mut output = Tensor::<f32, Cpu>::zeros(Shape::from_slice(&[1, 1, 4, 4]));
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu(Shape::from_slice(&[1, 1, 4, 4]));
         Cpu::upsample_nearest_2x(&input, &mut output).unwrap();
         let out = output.as_slice();
         // Top-left 2×2 should all be 1.0
@@ -904,7 +1002,7 @@ mod tests {
     fn op_ewise_mul() {
         let a = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [4]);
         let b = Tensor::<f32, Cpu>::from_slice(&[2.0, 3.0, 4.0, 5.0], [4]);
-        let mut dst = Tensor::<f32, Cpu>::zeros([4]);
+        let mut dst = Tensor::<f32, Cpu>::zeros_cpu([4]);
         Cpu::ewise_mul(&a, &b, &mut dst).unwrap();
         assert_eq!(dst.as_slice(), &[2.0, 6.0, 12.0, 20.0]);
     }

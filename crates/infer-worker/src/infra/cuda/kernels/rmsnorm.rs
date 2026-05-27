@@ -78,7 +78,7 @@ pub fn rmsnorm_inplace<T: Dtype>(
 #[derive(Clone, Copy)]
 struct Layout { outer0: i32, outer1: i32, dim: i32, stride0: i64, stride1: i64 }
 
-fn derive_layout<T: Dtype, D: crate::domain::ports::Device>(t: &Tensor<T, D>, dim: usize) -> OpResult<Layout> {
+fn derive_layout<T: Dtype, D: crate::domain::ports::MemoryPort>(t: &Tensor<T, D>, dim: usize) -> OpResult<Layout> {
     let shape = t.shape().as_slice();
     let strides = t.strides().as_slice();
     if shape.is_empty() || *shape.last().unwrap() != dim || *strides.last().unwrap() != 1 {
