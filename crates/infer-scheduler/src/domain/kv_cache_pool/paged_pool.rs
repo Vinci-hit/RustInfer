@@ -114,16 +114,19 @@ impl KvCachePool for PagedKvPool {
     fn allocate_with_prefix(&mut self, tokens: &[i32]) -> Result<(KvLease, PrefixMatch)> {
         self.flush_pending_returns();
         let mut prefix = self.raw_match_prefix(tokens);
+        let prompt_blocks = tokens.len().div_ceil(self.block_size).max(1);
         // Allocate prompt blocks + 1 extra block for decode headroom.
         // This ensures the worker has at least 1 block of space (block_size tokens)
         // after prefill before it needs to send NeedBlocks, avoiding a race
         // condition where NeedBlocks arrives at scheduler before the prefill
         // StepOutput transitions the session to Decoding state.
-        let total_blocks = (tokens.len().div_ceil(self.block_size) + 1).max(1);
+        let total_blocks = prompt_blocks + 1;
         // Keep at least one prompt block writable for the incoming
         // request: avoids mutating the final cached block in-place
         // when the prompt is a full block-cache hit.
-        let max_reusable_blocks = total_blocks.saturating_sub(1);
+        // NOTE: use prompt_blocks (not total_blocks) for reusable calculation,
+        // so the decode headroom block is never shared via prefix cache.
+        let max_reusable_blocks = prompt_blocks.saturating_sub(1);
         if prefix.cached_blocks.len() > max_reusable_blocks {
             prefix.cached_blocks.truncate(max_reusable_blocks);
             prefix.num_cached_tokens = prefix.cached_blocks.len() * self.block_size;
