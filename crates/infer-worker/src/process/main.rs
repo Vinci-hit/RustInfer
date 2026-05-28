@@ -20,6 +20,13 @@ use clap::Parser;
 use half::bf16;
 use serde::Deserialize;
 
+// cudaProfiler API for precise nsys capture
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn cudaProfilerStart() -> u32;
+    fn cudaProfilerStop() -> u32;
+}
+
 use infer_protocol::scheduler_to_worker_control::{SchedulerControlMessage, GrantBlocks};
 use infer_protocol::scheduler_to_worker_data::{
     BatchCommand, PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
@@ -88,6 +95,13 @@ struct Args {
 
     #[arg(long, default_value_t = 1000)]
     heartbeat_interval_ms: u64,
+
+    /// Number of decode steps to profile with cudaProfilerApi.
+    /// When set, calls cudaProfilerStart() before the first decode step
+    /// and cudaProfilerStop() after N steps, then exits.
+    /// Use with: nsys profile --capture-range=cudaProfilerApi ...
+    #[arg(long)]
+    profile_cuda_steps: Option<u32>,
 
     /// Log level (forwarded to tracing-subscriber).
     #[arg(long, default_value = "info")]
@@ -307,13 +321,13 @@ fn main() -> Result<(), String> {
             let model = loader.load_qwen3::<bf16, Cuda>(&load_cfg, &cuda)
                 .map_err(|e| format!("load_qwen3: {:?}", e))?;
             eprintln!("[bootstrap] weights loaded in {:.2}s", load_start.elapsed().as_secs_f32());
-            run_with_model(&control, &data, model, bootstrap, &eos_ids)?;
+            run_with_model(&control, &data, model, bootstrap, &eos_ids, args.profile_cuda_steps)?;
         }
         _ => {
             let model = loader.load_llama3::<bf16, Cuda>(&load_cfg, &cuda)
                 .map_err(|e| format!("load_llama3: {:?}", e))?;
             eprintln!("[bootstrap] weights loaded in {:.2}s", load_start.elapsed().as_secs_f32());
-            run_with_model(&control, &data, model, bootstrap, &eos_ids)?;
+            run_with_model(&control, &data, model, bootstrap, &eos_ids, args.profile_cuda_steps)?;
         }
     }
 
@@ -338,6 +352,7 @@ fn run_with_model<M>(
     model: M,
     bs: Bootstrap<'_>,
     eos_ids: &[i32],
+    profile_cuda_steps: Option<u32>,
 ) -> Result<(), String>
 where
     M: infer_worker::domain::model::LlmModel<bf16, Cuda>,
@@ -418,6 +433,8 @@ where
     eprintln!("[serve] heartbeat interval = {:?}", heartbeat_interval);
     let mut last_heartbeat = Instant::now();
     let mut active: HashMap<u64, ActiveSeq> = HashMap::new();
+    let mut profile_step_count: u32 = 0;
+    let mut profile_started = false;
 
     loop {
         // Drain all pending control messages (non-blocking).
@@ -490,8 +507,29 @@ where
             // If any seq can decode, do it. Otherwise wait for grants.
             let any_runnable = active.values().any(|s| s.has_block_space());
             if any_runnable {
+                // Profiler: start on first decode step
+                if let Some(max_steps) = profile_cuda_steps {
+                    if !profile_started {
+                        unsafe { cudaProfilerStart(); }
+                        profile_started = true;
+                        eprintln!("[profile] cudaProfilerStart (will stop after {} steps)", max_steps);
+                    }
+                }
+
                 if let Err(e) = run_decode_step(&mut runner, &mut active, data, eos_ids) {
                     eprintln!("[serve] decode error: {}", e);
+                }
+
+                // Profiler: stop after N steps and exit
+                if let Some(max_steps) = profile_cuda_steps {
+                    if profile_started {
+                        profile_step_count += 1;
+                        if profile_step_count >= max_steps {
+                            unsafe { cudaProfilerStop(); }
+                            eprintln!("[profile] cudaProfilerStop after {} steps. Exiting.", profile_step_count);
+                            return Ok(());
+                        }
+                    }
                 }
             } else {
                 // All seqs waiting for blocks — drain all pending grants from control.
