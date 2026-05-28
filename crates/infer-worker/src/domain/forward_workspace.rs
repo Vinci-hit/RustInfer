@@ -174,7 +174,7 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::cpu::Cpu;
+    use crate::infrastructure::cpu::Cpu;
 
     fn dims() -> ModelDims {
         ModelDims {

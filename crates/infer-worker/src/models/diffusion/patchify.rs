@@ -6,7 +6,7 @@
 use crate::domain::ports::{OpResult, OpError};
 use crate::domain::types::{Dtype, Shape};
 use crate::domain::tensor::Tensor;
-use crate::infra::cpu::Cpu;
+use crate::infrastructure::cpu::Cpu;
 
 /// Patchify: [C, F, H, W] → [num_tokens, patch_flat] via reshape + permute.
 ///

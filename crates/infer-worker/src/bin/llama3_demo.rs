@@ -18,9 +18,9 @@ use clap::Parser;
 use half::bf16;
 use serde::Deserialize;
 
-use infer_worker::app::model_runner::ModelRunner;
-use infer_worker::infra::cuda::Cuda;
-use infer_worker::infra::io::SafetensorsReader;
+use infer_worker::application::model_runner::ModelRunner;
+use infer_worker::infrastructure::cuda::Cuda;
+use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::models::loader::{LoadConfig, RopeScaling, WeightLoader};
 
 #[derive(Parser, Debug)]
@@ -253,7 +253,7 @@ fn main() -> Result<()> {
     let cap_num_tokens = args.max_seq_len;
     let cap_batch = max_batch_seqs;
     let flash_decode_capacity_f32 =
-        infer_worker::infra::cuda::kernels::attention_paged::flash_decode_workspace_capacity_f32(
+        infer_worker::infrastructure::cuda::kernels::attention_paged::flash_decode_workspace_capacity_f32(
             cap_batch.max(1), 128, 256,
         );
     let mut runner = ModelRunner::new(
@@ -284,7 +284,7 @@ fn main() -> Result<()> {
             eprintln!("[staggered] p0 len={}, p1 len={}", p0.len(), p1.len());
 
             // 1. Prefill req0 alone
-            let prefill0 = infer_worker::app::model_runner::SeqStep {
+            let prefill0 = infer_worker::application::model_runner::SeqStep {
                 input_ids: p0.clone(),
                 positions: (0..p0.len() as i32).collect(),
                 kv_write_start: 0,
@@ -300,7 +300,7 @@ fn main() -> Result<()> {
             let mut t0_last = t0_first;
             for i in 0..5 {
                 let pos = (p0.len() + i) as i32;
-                let step = infer_worker::app::model_runner::SeqStep {
+                let step = infer_worker::application::model_runner::SeqStep {
                     input_ids: vec![t0_last],
                     positions: vec![pos],
                     kv_write_start: pos,
@@ -314,7 +314,7 @@ fn main() -> Result<()> {
             eprintln!("[staggered] decode0 x5: {:?}", t0_tokens);
 
             // 3. Prefill req1 alone
-            let prefill1 = infer_worker::app::model_runner::SeqStep {
+            let prefill1 = infer_worker::application::model_runner::SeqStep {
                 input_ids: p1.clone(),
                 positions: (0..p1.len() as i32).collect(),
                 kv_write_start: 0,
@@ -332,14 +332,14 @@ fn main() -> Result<()> {
                 let pos0 = (p0.len() + 5 + i) as i32;
                 let pos1 = (p1.len() + i) as i32;
                 let steps = vec![
-                    infer_worker::app::model_runner::SeqStep {
+                    infer_worker::application::model_runner::SeqStep {
                         input_ids: vec![t0_last],
                         positions: vec![pos0],
                         kv_write_start: pos0,
                         kv_len_after: pos0 + 1,
                         block_table: bt0.clone(),
                     },
-                    infer_worker::app::model_runner::SeqStep {
+                    infer_worker::application::model_runner::SeqStep {
                         input_ids: vec![t1_last],
                         positions: vec![pos1],
                         kv_write_start: pos1,
@@ -377,7 +377,7 @@ fn main() -> Result<()> {
             let block_table: Vec<u32> = (0..max_blocks_per_seq as u32)
                 .map(|b| bt_start + b)
                 .collect();
-            steps.push(infer_worker::app::model_runner::SeqStep {
+            steps.push(infer_worker::application::model_runner::SeqStep {
                 input_ids: p.clone(),
                 positions: (0..p.len() as i32).collect(),
                 kv_write_start: 0,
@@ -414,7 +414,7 @@ fn main() -> Result<()> {
                 let block_table: Vec<u32> = (0..max_blocks_per_seq as u32)
                     .map(|b| bt_start + b)
                     .collect();
-                decode_steps.push(infer_worker::app::model_runner::SeqStep {
+                decode_steps.push(infer_worker::application::model_runner::SeqStep {
                     input_ids: vec![last_tokens[i]],
                     positions: vec![kv_write_start],
                     kv_write_start,

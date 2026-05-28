@@ -6,7 +6,7 @@ description = "RustInfer Worker: GPU inference runtime with DDD architecture (do
 
 [[bin]]
 name = "rustinfer-worker"
-path = "src/process/main.rs"
+path = "src/bin/worker_main.rs"
 
 [[bin]]
 name = "llama3_demo"

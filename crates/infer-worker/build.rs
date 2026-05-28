@@ -6,11 +6,10 @@ fn main() {
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
              return;
         }
-        let kernel_paths = find_files("src/infra/cuda/kernels", "cu");
-        
+        let kernel_paths = find_files("src/infrastructure/cuda/kernels", "cu");
+
         if kernel_paths.is_empty() {
-            // 如果没有找到任何 .cu 文件，可能是一个配置错误，可以选择性地警告或 panic
-            println!("cargo:warning=No CUDA kernel files (.cu) found in src/infra/cuda/kernels/");
+            println!("cargo:warning=No CUDA kernel files (.cu) found in src/infrastructure/cuda/kernels/");
             // return; // 如果你希望在这种情况下停止构建
         }
         println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
@@ -22,7 +21,7 @@ fn main() {
         println!("cargo:rustc-link-lib=cudnn");
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         let root = PathBuf::from(manifest_dir);
-        let cutlass_include = root.join("src/infra/cuda/kernels/third_party");
+        let cutlass_include = root.join("src/infrastructure/cuda/kernels/third_party");
         if !cutlass_include.exists() {
             panic!(
                 "Cutlass include directory not found at: {:?}", 
@@ -48,7 +47,7 @@ fn main() {
             build.file(path);
             println!("cargo:rerun-if-changed={}", path.display());
         }
-        for path in find_files("src/infra/cuda/kernels", "cuh") {
+        for path in find_files("src/infrastructure/cuda/kernels", "cuh") {
             println!("cargo:rerun-if-changed={}", path.display());
         }
         build.compile("infer_kernels");
@@ -59,12 +58,12 @@ fn main() {
 
         // 4. 使用 bindgen 生成 Rust FFI 绑定
         let bindings = bindgen::Builder::default()
-            .header("src/infra/cuda/wrapper.h")
+            .header("src/infrastructure/cuda/wrapper.h")
             // 告诉 bindgen/libclang CUDA 头文件的位置
             .clang_arg(format!("-I{}/include", env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into())))
             .clang_arg("-I/usr/include/x86_64-linux-gnu")
             // wrapper.h 所在目录（让 #include "kernels/total_head.h" 能找到）
-            .clang_arg("-Isrc/infra/cuda")
+            .clang_arg("-Isrc/infrastructure/cuda")
             // 明确告诉 bindgen 本次编译的目标架构
             .clang_arg(format!("--target={}", target))
             .clang_arg(format!("-I{}", cutlass_include.to_string_lossy()))

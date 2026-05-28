@@ -10,7 +10,7 @@ use safetensors::tensor::TensorView;
 use crate::domain::ports::{MemoryPort, OpBackend, OpResult, OpError};
 use crate::domain::types::{Dtype, DataType, Shape};
 use crate::domain::tensor::Tensor;
-use crate::infra::io::SafetensorsReader;
+use crate::infrastructure::io::SafetensorsReader;
 use super::layers::{Linear, RMSNorm, Embedding};
 use super::llama3::{Llama3Model, Llama3Layer};
 use super::qwen3::{Qwen3Model, Qwen3Layer};

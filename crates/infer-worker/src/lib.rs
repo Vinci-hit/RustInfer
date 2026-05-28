@@ -4,25 +4,23 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
-//! │ process/          进程入口 (main, ZMQ)                   │
+//! │ application/      应用层 (ModelRunner, GraphRunner,       │
+//! │                   ServeLoop, SubScheduler)               │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ app/              应用层 (Runner, Scheduler, Graph)       │
-//! ├─────────────────────────────────────────────────────────┤
-//! │ models/           具体模型 (Qwen3, Llama3)               │
+//! │ models/           具体模型 (Qwen3, Llama3, Diffusion)    │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ domain/           域层 — 纯的，零 FFI，零 I/O             │
 //! │   types, tensor, ports, ops, model trait, runtime        │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ infra/            基础设施 — 实现 domain 的 trait          │
-//! │   cuda/, cpu/, buffer, io                                │
+//! │ infrastructure/   基础设施 — 实现 domain 的 trait          │
+//! │   cuda/, cpu/, io/, transport/                           │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! **依赖方向**: domain ← infra ← app ← models ← process
-//! domain 不 `use` infra 的任何东西（通过 trait 反转依赖）。
+//! **依赖方向**: domain ← infrastructure ← models ← application
+//! domain 不 `use` infrastructure 的任何东西（通过 trait 反转依赖）。
 
 pub mod domain;
-pub mod infra;
-pub mod app;
+pub mod infrastructure;
+pub mod application;
 pub mod models;
-pub mod process;

@@ -7,7 +7,7 @@
 use crate::domain::ports::OpResult;
 use crate::domain::types::Shape;
 use crate::domain::tensor::Tensor;
-use crate::infra::cpu::Cpu;
+use crate::infrastructure::cpu::Cpu;
 
 /// 3D RoPE embedder — precomputes sin/cos for 3 spatial axes.
 pub struct RopeEmbedder3D {

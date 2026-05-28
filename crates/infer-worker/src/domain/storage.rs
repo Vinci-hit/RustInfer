@@ -87,7 +87,7 @@ impl<D: MemoryPort> std::fmt::Debug for Storage<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::cpu::Cpu;
+    use crate::infrastructure::cpu::Cpu;
 
     #[test]
     fn alloc_and_drop_is_safe() {
