@@ -20,11 +20,11 @@ use clap::Parser;
 use half::bf16;
 use serde::Deserialize;
 
-use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+use infer_protocol::scheduler_to_worker_control::{SchedulerControlMessage, GrantBlocks};
 use infer_protocol::scheduler_to_worker_data::{
     BatchCommand, PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
 };
-use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerControlMessage};
+use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerControlMessage, NeedBlocks, NeedBlocksReason};
 use infer_protocol::worker_to_scheduler_data::{DiffusionBatchOutput, GeneratedToken, StepOutput};
 
 use infer_worker::app::model_runner::{ModelRunner, SeqStep};
@@ -176,6 +176,8 @@ struct ActiveSeq {
     max_tokens: usize,
     generated_count: usize,
     sampling: SamplingParams,
+    /// True if we've already sent NeedBlocks for this seq and are awaiting grant.
+    block_requested: bool,
 }
 
 impl ActiveSeq {
@@ -189,7 +191,27 @@ impl ActiveSeq {
             max_tokens: seg.max_tokens,
             generated_count: 1, // first token already produced by prefill argmax
             sampling: seg.sampling_params.clone(),
+            block_requested: false,
         }
+    }
+
+    /// Block capacity in tokens = block_table.len() * block_size.
+    fn block_capacity(&self) -> usize {
+        self.block_table.len() * self.block_size
+    }
+
+    /// True if the next decode step can proceed without new blocks.
+    fn has_block_space(&self) -> bool {
+        self.kv_len + 1 <= self.block_capacity()
+    }
+
+    /// True if we should request new blocks (approaching boundary, within 1 block).
+    /// Skip if we haven't decoded at least 2 steps yet (avoid racing with
+    /// the StepOutput that transitions session to Decoding in scheduler).
+    fn needs_block_soon(&self) -> bool {
+        !self.block_requested
+            && self.generated_count >= 2
+            && self.kv_len + self.block_size >= self.block_capacity()
     }
 }
 
@@ -398,21 +420,34 @@ where
     let mut active: HashMap<u64, ActiveSeq> = HashMap::new();
 
     loop {
-        if let Ok(Some((msg, _req_id))) = control.try_recv(0) {
-            match msg {
-                SchedulerControlMessage::Shutdown => {
-                    eprintln!("[serve] Shutdown received, exiting.");
-                    break;
-                }
-                SchedulerControlMessage::Cancel(c) => {
-                    if active.remove(&c.sequence_id).is_some() {
-                        eprintln!("[serve] cancelled seq {}", c.sequence_id);
+        // Drain all pending control messages (non-blocking).
+        loop {
+            match control.try_recv(0) {
+                Ok(Some((msg, _req_id))) => match msg {
+                    SchedulerControlMessage::Shutdown => {
+                        eprintln!("[serve] Shutdown received, exiting.");
+                        return Ok(());
                     }
-                }
-                SchedulerControlMessage::Ping => {
-                    let _ = control.send(WorkerControlMessage::Pong, _req_id);
-                }
-                _ => {}
+                    SchedulerControlMessage::Cancel(c) => {
+                        if active.remove(&c.sequence_id).is_some() {
+                            eprintln!("[serve] cancelled seq {}", c.sequence_id);
+                        }
+                    }
+                    SchedulerControlMessage::GrantBlocks(grant) => {
+                        if let Some(seq) = active.get_mut(&grant.sequence_id) {
+                            seq.block_table.extend(grant.block_ids.iter().copied());
+                            seq.block_requested = false;
+                        }
+                    }
+                    SchedulerControlMessage::GrantBlocksDenied(denied) => {
+                        active.remove(&denied.sequence_id);
+                    }
+                    SchedulerControlMessage::Ping => {
+                        let _ = control.send(WorkerControlMessage::Pong, _req_id);
+                    }
+                    _ => {}
+                },
+                _ => break,
             }
         }
 
@@ -449,8 +484,35 @@ where
         }
 
         if !active.is_empty() {
-            if let Err(e) = run_decode_step(&mut runner, &mut active, data, eos_ids) {
-                eprintln!("[serve] decode error: {}", e);
+            // Async: request blocks for seqs approaching capacity (non-blocking).
+            request_blocks_if_needed(&mut active, control);
+
+            // If any seq can decode, do it. Otherwise wait for grants.
+            let any_runnable = active.values().any(|s| s.has_block_space());
+            if any_runnable {
+                if let Err(e) = run_decode_step(&mut runner, &mut active, data, eos_ids) {
+                    eprintln!("[serve] decode error: {}", e);
+                }
+            } else {
+                // All seqs waiting for blocks — drain all pending grants from control.
+                loop {
+                    match control.try_recv(20) {
+                        Ok(Some((SchedulerControlMessage::GrantBlocks(grant), _))) => {
+                            if let Some(seq) = active.get_mut(&grant.sequence_id) {
+                                seq.block_table.extend(grant.block_ids.iter().copied());
+                                seq.block_requested = false;
+                            }
+                        }
+                        Ok(Some((SchedulerControlMessage::GrantBlocksDenied(denied), _))) => {
+                            active.remove(&denied.sequence_id);
+                        }
+                        Ok(Some((SchedulerControlMessage::Shutdown, _))) => return Ok(()),
+                        Ok(Some((SchedulerControlMessage::Cancel(c), _))) => {
+                            active.remove(&c.sequence_id);
+                        }
+                        _ => break, // no more messages or timeout
+                    }
+                }
             }
         }
 
@@ -524,6 +586,33 @@ where
     Ok(())
 }
 
+/// Non-blocking: request new blocks for sequences approaching capacity.
+/// Requests 4 blocks at a time to amortize round-trip latency.
+fn request_blocks_if_needed(
+    active: &mut HashMap<u64, ActiveSeq>,
+    control: &ControlPump,
+) {
+    for seq in active.values_mut() {
+        if seq.needs_block_soon() {
+            let request_blocks: u32 = 4; // 4 blocks = 64 tokens of headroom
+            let req = NeedBlocks {
+                worker_id: String::new(),
+                model_instance_id: String::new(),
+                sequence_id: seq.sequence_id,
+                current_blocks: seq.block_table.len() as u32,
+                required_blocks: seq.block_table.len() as u32 + request_blocks,
+                request_blocks,
+                reason: NeedBlocksReason::DecodeExtend,
+            };
+            let _ = control.send(
+                WorkerControlMessage::NeedBlocks(req),
+                infer_protocol::control_envelope::RequestId(0),
+            );
+            seq.block_requested = true;
+        }
+    }
+}
+
 /// Run one decode iteration over all active seqs in a single batched step.
 fn run_decode_step<M>(
     runner: &mut ModelRunner<bf16, Cuda, M>,
@@ -537,9 +626,14 @@ where
     if active.is_empty() {
         return Ok(());
     }
-    // Build steps in a stable order so we can map outputs back to sequence_ids.
-    let mut order: Vec<u64> = active.keys().copied().collect();
+    // Build steps in a stable order, skipping sequences that have no block space.
+    let mut order: Vec<u64> = active.keys().copied()
+        .filter(|sid| active[sid].has_block_space())
+        .collect();
     order.sort_unstable();
+    if order.is_empty() {
+        return Ok(()); // all sequences waiting for blocks
+    }
     let mut steps: Vec<SeqStep> = Vec::with_capacity(order.len());
     for &sid in &order {
         let seq = &active[&sid];

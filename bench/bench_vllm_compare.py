@@ -25,12 +25,22 @@ class Result:
 
 def run_batch(llm, prompts, max_tokens):
     params = SamplingParams(max_tokens=max_tokens, temperature=0)
-    conversations = []
+    # Build prompts with SAME template as RustInfer (fixed date: 26 Jul 2024)
+    # NOTE: no <|begin_of_text|> here — vLLM's tokenizer adds BOS automatically
+    formatted = []
     for p in prompts:
-        conversations.append([{"role": "user", "content": p}])
+        text = (
+            "<|start_header_id|>system<|end_header_id|>\n\n"
+            "Cutting Knowledge Date: December 2023\n"
+            "Today Date: 26 Jul 2024\n\n"
+            "<|eot_id|>"
+            f"<|start_header_id|>user<|end_header_id|>\n\n{p}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+        formatted.append(text)
 
     t0 = time.perf_counter()
-    outputs = llm.chat(conversations, params)
+    outputs = llm.generate(formatted, params)
     wall = time.perf_counter() - t0
     results = []
     for i, out in enumerate(outputs):
@@ -75,7 +85,15 @@ def main():
 
     # Warmup
     params = SamplingParams(max_tokens=16, temperature=0)
-    llm.chat([[{"role": "user", "content": "Hello"}]], params)
+    warmup_text = (
+        "<|start_header_id|>system<|end_header_id|>\n\n"
+        "Cutting Knowledge Date: December 2023\n"
+        "Today Date: 26 Jul 2024\n\n"
+        "<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+    llm.generate([warmup_text], params)
     print("warmup done")
 
     batch_sizes = [int(b) for b in args.batches.split(",")]

@@ -88,12 +88,12 @@ async def main():
         pool = json.load(f)
     print(f"loaded {len(pool)} prompts")
 
-    # Warmup
+    # Warmup — need longer outputs to stabilize cuBLASLt algo selection
     if args.warmup > 0:
         async with aiohttp.ClientSession() as session:
-            warm = [send_one(session, args.url, "Hello", 16) for _ in range(args.warmup)]
+            warm = [send_one(session, args.url, "Write a detailed explanation of how computers work.", 100) for _ in range(5)]
             await asyncio.gather(*warm)
-        print(f"warmup: {args.warmup} requests done")
+        print(f"warmup: 5 requests x 100 tokens done")
 
     batch_sizes = [int(b) for b in args.batches.split(",")]
     all_results: List[dict] = []

@@ -270,6 +270,101 @@ fn main() -> Result<()> {
     }
 
     if let Some(prompts) = batch_prompts {
+        // ─── Staggered test takes priority ───
+        if std::env::var("RUSTINFER_TEST_STAGGERED").is_ok() && prompts.len() >= 2 {
+            let tok_path = args.model_path.join("tokenizer.json");
+            let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+                .map_err(|e| anyhow!("load tokenizer: {:?}", e))?;
+            let eos_ids: &[i32] = &[128001, 128008, 128009];
+            let p0 = &prompts[0];
+            let p1 = &prompts[1];
+            let bt0: Vec<u32> = (0..max_blocks_per_seq as u32).collect();
+            let bt1: Vec<u32> = (max_blocks_per_seq as u32..2 * max_blocks_per_seq as u32).collect();
+
+            eprintln!("[staggered] p0 len={}, p1 len={}", p0.len(), p1.len());
+
+            // 1. Prefill req0 alone
+            let prefill0 = infer_worker::app::model_runner::SeqStep {
+                input_ids: p0.clone(),
+                positions: (0..p0.len() as i32).collect(),
+                kv_write_start: 0,
+                kv_len_after: p0.len() as i32,
+                block_table: bt0.clone(),
+            };
+            let t0_first = runner.step_batch(&[prefill0])
+                .map_err(|e| anyhow!("staggered prefill0: {:?}", e))?[0];
+            eprintln!("[staggered] prefill0 done, first_token={}", t0_first);
+
+            // 2. Decode req0 alone 5 steps
+            let mut t0_tokens = vec![t0_first];
+            let mut t0_last = t0_first;
+            for i in 0..5 {
+                let pos = (p0.len() + i) as i32;
+                let step = infer_worker::app::model_runner::SeqStep {
+                    input_ids: vec![t0_last],
+                    positions: vec![pos],
+                    kv_write_start: pos,
+                    kv_len_after: pos + 1,
+                    block_table: bt0.clone(),
+                };
+                t0_last = runner.step_batch(&[step])
+                    .map_err(|e| anyhow!("staggered decode0 step {}: {:?}", i, e))?[0];
+                t0_tokens.push(t0_last);
+            }
+            eprintln!("[staggered] decode0 x5: {:?}", t0_tokens);
+
+            // 3. Prefill req1 alone
+            let prefill1 = infer_worker::app::model_runner::SeqStep {
+                input_ids: p1.clone(),
+                positions: (0..p1.len() as i32).collect(),
+                kv_write_start: 0,
+                kv_len_after: p1.len() as i32,
+                block_table: bt1.clone(),
+            };
+            let t1_first = runner.step_batch(&[prefill1])
+                .map_err(|e| anyhow!("staggered prefill1: {:?}", e))?[0];
+            eprintln!("[staggered] prefill1 done, first_token={}", t1_first);
+            let mut t1_tokens = vec![t1_first];
+            let mut t1_last = t1_first;
+
+            // 4. Decode [req0, req1] together 10 steps
+            for i in 0..10 {
+                let pos0 = (p0.len() + 5 + i) as i32;
+                let pos1 = (p1.len() + i) as i32;
+                let steps = vec![
+                    infer_worker::app::model_runner::SeqStep {
+                        input_ids: vec![t0_last],
+                        positions: vec![pos0],
+                        kv_write_start: pos0,
+                        kv_len_after: pos0 + 1,
+                        block_table: bt0.clone(),
+                    },
+                    infer_worker::app::model_runner::SeqStep {
+                        input_ids: vec![t1_last],
+                        positions: vec![pos1],
+                        kv_write_start: pos1,
+                        kv_len_after: pos1 + 1,
+                        block_table: bt1.clone(),
+                    },
+                ];
+                let new = runner.step_batch(&steps)
+                    .map_err(|e| anyhow!("staggered joint decode step {}: {:?}", i, e))?;
+                t0_last = new[0];
+                t1_last = new[1];
+                t0_tokens.push(t0_last);
+                t1_tokens.push(t1_last);
+            }
+
+            let txt0 = tokenizer.decode(&t0_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap_or_default();
+            let txt1 = tokenizer.decode(&t1_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap_or_default();
+            println!("[staggered-output] seq=0 tokens={:?}", t0_tokens);
+            println!("[staggered-text]   seq=0 text={:?}", &txt0[..txt0.len().min(200)]);
+            println!("[staggered-output] seq=1 tokens={:?}", t1_tokens);
+            println!("[staggered-text]   seq=1 text={:?}", &txt1[..txt1.len().min(200)]);
+            return Ok(());
+        }
+
+        // ─── Normal sync batch mode ───
         eprintln!("[demo] BATCH MODE: {} prompts", prompts.len());
         let tok_path = args.model_path.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
@@ -291,13 +386,70 @@ fn main() -> Result<()> {
             });
         }
         let gen_start = std::time::Instant::now();
-        let first_tokens = runner.step_batch(&steps)
+        let first_tokens = runner.step_batch_with_graph(&steps)
             .map_err(|e| anyhow!("step_batch: {:?}", e))?;
         eprintln!("[demo] batch prefill: {:.2}s, first tokens: {:?}",
             gen_start.elapsed().as_secs_f32(), first_tokens);
-        for (i, &t) in first_tokens.iter().enumerate() {
-            let txt = tokenizer.decode(&[t as u32], false).unwrap_or_default();
-            println!("=== seq {} first token ===\nid={}  text={:?}\n", i, t, txt);
+
+        // Decode loop for batch mode
+        let batch_size = prompts.len();
+        let mut all_generated: Vec<Vec<i32>> = (0..batch_size)
+            .map(|i| vec![first_tokens[i]])
+            .collect();
+        let mut last_tokens = first_tokens.clone();
+        let eos_ids: &[i32] = &[128001, 128008, 128009];
+        let mut active: Vec<bool> = vec![true; batch_size];
+
+        for step in 0..args.max_new_tokens.saturating_sub(1) {
+            // Check if all done
+            if active.iter().all(|&a| !a) { break; }
+
+            // Build decode steps for all active sequences
+            let mut decode_steps = Vec::new();
+            for i in 0..batch_size {
+                if !active[i] { continue; }
+                let kv_write_start = (prompts[i].len() + all_generated[i].len() - 1) as i32;
+                let kv_len_after = kv_write_start + 1;
+                let bt_start = (i * max_blocks_per_seq) as u32;
+                let block_table: Vec<u32> = (0..max_blocks_per_seq as u32)
+                    .map(|b| bt_start + b)
+                    .collect();
+                decode_steps.push(infer_worker::app::model_runner::SeqStep {
+                    input_ids: vec![last_tokens[i]],
+                    positions: vec![kv_write_start],
+                    kv_write_start,
+                    kv_len_after,
+                    block_table,
+                });
+            }
+
+            let new_tokens = runner.step_batch_with_graph(&decode_steps)
+                .map_err(|e| anyhow!("step_batch decode step {}: {:?}", step, e))?;
+
+            // Map back to active sequences
+            let mut tok_idx = 0;
+            for i in 0..batch_size {
+                if !active[i] { continue; }
+                let t = new_tokens[tok_idx];
+                all_generated[i].push(t);
+                last_tokens[i] = t;
+                if eos_ids.contains(&t) {
+                    active[i] = false;
+                }
+                tok_idx += 1;
+            }
+        }
+
+        let elapsed = gen_start.elapsed().as_secs_f32();
+        eprintln!("[demo] batch decode done in {:.2}s", elapsed);
+        for i in 0..batch_size {
+            let txt = tokenizer.decode(
+                &all_generated[i].iter().map(|&x| x as u32).collect::<Vec<_>>(),
+                false,
+            ).unwrap_or_default();
+            println!("[batch-output] seq={} tokens={:?}", i, all_generated[i]);
+            println!("[batch-text]   seq={} text={:?}", i, &txt[..txt.len().min(200)]);
+            println!();
         }
         return Ok(());
     }

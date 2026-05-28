@@ -33,7 +33,9 @@ unsafe extern "C" {
 /// `[batch, vocab]` contiguous (decode means q_len=1 per seq, so the
 /// model's logits already has this shape with `batch` rows).
 ///
-/// **Graph-capturable**: zero allocation, zero stream sync, zero D2H.
+/// **Graph-capturable**: zero allocation, zero D2H.
+/// For batch=1, no stream sync needed. For batch>1, synchronizes per-sequence
+/// to prevent data races on static buffers used by two-phase argmax.
 ///
 /// For batch=1, uses the fast two-phase parallel argmax (126 blocks,
 /// ~5µs on 128k vocab) instead of the single-block kernel (184µs).
@@ -63,7 +65,8 @@ pub fn argmax_batched_decode_into<T: Dtype>(
 
     if batch == 1 {
         // Fast path: two-phase parallel argmax (uses __device__ static buffers,
-        // graph-capturable, 126 blocks × 256 threads → ~5µs for vocab=128k).
+        // 126 blocks × 256 threads → ~5µs for vocab=128k).
+        // Single sequence means no data race on static buffers.
         unsafe {
             match T::DATA_TYPE {
                 DataType::BF16 => argmax_cu_bf16_ffi(
@@ -81,8 +84,11 @@ pub fn argmax_batched_decode_into<T: Dtype>(
             }
         }
     } else {
-        // Multi-row: launch two-phase per row sequentially (static buffers
-        // serialize correctly on a single stream / within a graph).
+        // Multi-row: launch two-phase per row sequentially on the same stream.
+        // The argmax_cu_*_ffi kernels use __device__ static arrays (d_partial_vals,
+        // d_partial_idxs) for inter-block communication. Since all launches are on
+        // the same stream, phase2 of seq N naturally completes before phase1 of
+        // seq N+1 starts — no explicit sync needed (and sync would break graph capture).
         unsafe {
             for seq in 0..batch {
                 let row_ptr = (logits.data_ptr() as *const u8).add(seq * vocab * elem_bytes);
@@ -130,7 +136,7 @@ pub fn argmax_batched<T: Dtype>(
     }
 
     // One [batch] device scratch for the sub-launch outputs.
-    let mut out_dev = Tensor::<i32, Cuda>::zeros([batch], device)?;
+    let out_dev = Tensor::<i32, Cuda>::zeros([batch], device)?;
     let elem_bytes = T::SIZE_BYTES;
 
     for seq in 0..batch {
