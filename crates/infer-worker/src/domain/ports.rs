@@ -341,6 +341,27 @@ pub trait OpBackend: MemoryPort {
         scale: f32,
     ) -> OpResult<()>;
 
+    /// SDPA with an additive attention mask broadcast across all heads.
+    /// `mask` is `[seq, seq]` (T-dtype). Entries should be `0.0` for
+    /// "attend" and `-inf` (or large negative) for "do not attend". The mask
+    /// is added to scaled scores **before** softmax.
+    ///
+    /// Used by Qwen3 text encoder (causal + padding) and any other attention
+    /// that needs masking; DiT self-attention typically passes `None` and
+    /// should call `sdpa` instead.
+    #[allow(clippy::too_many_arguments)]
+    fn sdpa_masked<T: Dtype>(
+        q: &Tensor<T, Self>,
+        k: &Tensor<T, Self>,
+        v: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        mask: &Tensor<T, Self>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> OpResult<()>;
+
     // ─── Diffusion-only ops (no LLM use) ─────────────────────────────
 
     /// Interleaved RoPE for DiT — applies per-head rotation on

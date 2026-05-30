@@ -15,7 +15,7 @@ use super::dit_block::DiTBlockScratch;
 
 pub const LATENT_CHANNELS: usize = 16;
 pub const VAE_SCALE_FACTOR: usize = 8;
-pub const SEQ_MULTI_OF: usize = 128;
+pub const SEQ_MULTI_OF: usize = 32;
 pub const ADALN_EMBED_DIM: usize = 256;
 pub const N_MAX_STEPS: usize = 50;
 pub const T_FREQ_DIM: usize = 256;

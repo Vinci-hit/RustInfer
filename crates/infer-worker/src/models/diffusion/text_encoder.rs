@@ -268,6 +268,44 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         let positions: Tensor<i32, Cuda> =
             Tensor::from_host_slice(&positions_host, [seq_len], dev)?;
 
+        // Build attention mask `[seq, seq]` (T-dtype) with the same semantics
+        // as transformers' `_prepare_4d_causal_attention_mask`:
+        //   mask[i, j] = 0.0           if j <= i AND attention_mask[j] == 1
+        //              = -3.3895e+38   otherwise
+        // -3.3895e+38 is bf16's minimum finite value (avoids -inf in softmax
+        // overflow paths). We cast to T (f32 / bf16 / f16) when uploading.
+        let mask_neg_inf: f32 = -3.3895313892515355e+38_f32;
+        let mut mask_host_bytes = vec![0u8; seq_len * seq_len * T::SIZE_BYTES];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                // Causal: j > i is masked. Padding: attention_mask[j]==0 is
+                // masked. (We mask along the *key* axis only, matching the
+                // diffusers/transformers convention.)
+                let allow = j <= i && attention_mask[j] != 0;
+                let v = if allow { 0.0_f32 } else { mask_neg_inf };
+                let off = (i * seq_len + j) * T::SIZE_BYTES;
+                match T::DATA_TYPE {
+                    crate::domain::types::DataType::F32 => {
+                        mask_host_bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    crate::domain::types::DataType::BF16 => {
+                        mask_host_bytes[off..off + 2].copy_from_slice(
+                            &half::bf16::from_f32(v).to_le_bytes());
+                    }
+                    crate::domain::types::DataType::F16 => {
+                        mask_host_bytes[off..off + 2].copy_from_slice(
+                            &half::f16::from_f32(v).to_le_bytes());
+                    }
+                    other => return Err(OpError::Kernel(format!(
+                        "Qwen3TextEncoder: unsupported dtype {:?}", other,
+                    ))),
+                }
+            }
+        }
+        let mask_dev: Tensor<T, Cuda> = Tensor::from_host_bytes(
+            &mask_host_bytes, Shape::from_slice(&[seq_len, seq_len]), dev,
+        )?;
+
         // Per-layer scratches.
         let mut h: Tensor<T, Cuda> = Tensor::zeros([seq_len, dim], dev)?;
         let mut qkv: Tensor<T, Cuda> = Tensor::zeros([seq_len, qkv_cols], dev)?;
@@ -339,15 +377,20 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                 attn_out.offset_elems(), true,
             );
             let scale = 1.0 / (head_dim as f32).sqrt();
-            // NOTE: the DiT SDPA we wired is non-causal. Qwen3 needs causal
-            // masking. For text-encoder usage in Z-Image the diffusers code
-            // also calls `Qwen3Model.forward` with **bidirectional** attention
-            // (no causal mask) — they're encoding, not generating. Confirmed
-            // by inspecting `diffusers/models/transformers/transformer_z_image.py`
-            // which calls `text_encoder(input_ids, attention_mask).hidden_states[-2]`.
-            // Qwen3Model is the bidirectional `Qwen3Model` (without LM head),
-            // not `Qwen3ForCausalLM`. So no causal mask needed.
-            Cuda::sdpa(&q3, &k3, &v3, &mut attn3, n_heads, n_kv_heads, head_dim, scale)?;
+            // Qwen3 is a *causal* decoder-only LM (Qwen3Model = Qwen3 stack
+            // without the LM head, but still uses causal masking — verified
+            // by inspecting `transformers.models.qwen3.modeling_qwen3` where
+            // every Qwen3DecoderLayer.self_attn has `is_causal = True`).
+            // Z-Image's `ZImagePipeline.encode_prompt` calls this Qwen3Model
+            // and pulls `hidden_states[-2]`, so we MUST apply the same mask
+            // it would internally build: causal upper-triangular + padding
+            // columns set to -inf. Without it, prompt_embeds magnitudes are
+            // wrong by 2-3 orders of magnitude (verified empirically — first
+            // hidden state shifts from O(8) to O(13000) at layer 10).
+            //
+            // The mask is built once per forward (cached in `mask_dev`).
+            Cuda::sdpa_masked(&q3, &k3, &v3, &mut attn3, &mask_dev,
+                              n_heads, n_kv_heads, head_dim, scale)?;
 
             // 2.6 o_proj(attn) → o_out
             layer.o_proj.forward(&attn_out, &mut o_out)?;

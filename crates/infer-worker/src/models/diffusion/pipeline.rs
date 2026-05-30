@@ -16,6 +16,64 @@ use super::text_encoder::{Qwen3TextEncoder, TEXT_ENCODER_MAX_SEQ_LEN, PAD_TOKEN_
 use super::transformer::{ZImageTransformer, ZImageTransformerConfig};
 use super::vae_decoder::{VaeDecoder, VaeConfig};
 
+/// Load a `[16, 1, H, W]` (or `[1, 16, H, W]`) F32 NPY file into a
+/// `Tensor<T, Cuda>` of shape `[1, 16, H, W]` (cast to T).
+fn load_latent_from_npy<T: Dtype>(
+    path: &str, latent_h: usize, latent_w: usize, dev: &Cuda,
+) -> OpResult<Tensor<T, Cuda>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| OpError::Kernel(format!("open {}: {}", path, e)))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .map_err(|e| OpError::Kernel(format!("read {}: {}", path, e)))?;
+    if &buf[..6] != b"\x93NUMPY" {
+        return Err(OpError::Kernel("not an NPY file".into()));
+    }
+    let header_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+    // Data starts at offset 10 + header_len.
+    let data_start = 10 + header_len;
+    let elem_bytes = (buf.len() - data_start);
+    let n_f32 = elem_bytes / 4;
+    let expected = LATENT_CHANNELS * latent_h * latent_w;
+    if n_f32 != expected {
+        return Err(OpError::Shape(format!(
+            "latent npy numel {} != expected {} ({}*{}*{})",
+            n_f32, expected, LATENT_CHANNELS, latent_h, latent_w,
+        )));
+    }
+    // Read raw f32 values.
+    let f32_data: Vec<f32> = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr().add(data_start) as *const f32, n_f32)
+    }.to_vec();
+    // Cast to T host bytes.
+    let mut host: Vec<u8> = vec![0u8; n_f32 * T::SIZE_BYTES];
+    match T::DATA_TYPE {
+        crate::domain::types::DataType::F32 => {
+            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, n_f32) };
+            dst.copy_from_slice(&f32_data);
+        }
+        crate::domain::types::DataType::BF16 => {
+            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::bf16, n_f32) };
+            for (i, &v) in f32_data.iter().enumerate() {
+                dst[i] = half::bf16::from_f32(v);
+            }
+        }
+        crate::domain::types::DataType::F16 => {
+            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::f16, n_f32) };
+            for (i, &v) in f32_data.iter().enumerate() {
+                dst[i] = half::f16::from_f32(v);
+            }
+        }
+        other => return Err(OpError::Kernel(format!("load_latent: unsupported {:?}", other))),
+    }
+    Tensor::<T, Cuda>::from_host_bytes(
+        &host,
+        crate::domain::types::Shape::from_slice(&[1, LATENT_CHANNELS, latent_h, latent_w]),
+        dev,
+    )
+}
+
 /// Generation parameters.
 pub struct GenerateParams {
     pub height: usize,
@@ -23,8 +81,6 @@ pub struct GenerateParams {
     pub num_inference_steps: usize,
     pub guidance_scale: f32,
     pub seed: Option<u64>,
-    /// If `None`, the scheduler builds its default Flow-Match schedule;
-    /// otherwise this list is used verbatim (Turbo: `[1.0, 0.3]`).
     pub sigmas: Option<Vec<f32>>,
 }
 
@@ -53,21 +109,8 @@ pub struct ZImagePipeline<T: Dtype> {
 }
 
 impl<T: Dtype> ZImagePipeline<T> {
-    /// Load a diffusers-format Z-Image model directory.
-    ///
-    /// Expected structure:
-    /// ```text
-    /// model_dir/
-    /// ├── model_index.json
-    /// ├── scheduler/scheduler_config.json
-    /// ├── text_encoder/{config.json, model*.safetensors}
-    /// ├── tokenizer/tokenizer.json
-    /// ├── transformer/{config.json, diffusion_pytorch_model*.safetensors}
-    /// └── vae/{config.json, diffusion_pytorch_model.safetensors}
-    /// ```
     pub fn from_pretrained<P: AsRef<Path>>(
-        model_dir: P,
-        device: &Cuda,
+        model_dir: P, device: &Cuda,
     ) -> OpResult<Self> {
         Self::from_pretrained_with_capacity(model_dir, device, ZImageCapacity::default())
     }
@@ -162,14 +205,26 @@ impl<T: Dtype> ZImagePipeline<T> {
         let (tokens, mask) = self.tokenize(prompt, TEXT_ENCODER_MAX_SEQ_LEN)?;
         let prompt_embeds = self.text_encoder.forward(&tokens, &mask, device)?;
         // prompt_embeds shape: [actual_len, cap_feat_dim], dtype T.
+        if std::env::var("RUSTINFER_DUMP_PROMPT").is_ok() {
+            super::dit_block::dump_tensor("prompt_embeds_rust", &prompt_embeds);
+        }
+        if std::env::var("RUSTINFER_DUMP_PROMPT").is_ok() {
+            super::dit_block::dump_tensor("prompt_embeds_rust", &prompt_embeds);
+        }
 
         // 2. Initialize random latent + scheduler.
         let latent_h = params.height / 8;
         let latent_w = params.width / 8;
-        // Latent dtype = T; use Tensor::randn.
-        let latent_init: Tensor<T, Cuda> = Tensor::randn(
-            [1, LATENT_CHANNELS, latent_h, latent_w], device, params.seed,
-        )?;
+        // If RUSTINFER_LATENT_NPY is set to a path of a [16,1,H,W] f32 NPY,
+        // load that instead of running randn. This lets us share the exact
+        // initial latent with the Python reference for element-wise diff.
+        let latent_init: Tensor<T, Cuda> = if let Ok(path) = std::env::var("RUSTINFER_LATENT_NPY") {
+            load_latent_from_npy::<T>(&path, latent_h, latent_w, device)?
+        } else {
+            Tensor::randn(
+                [1, LATENT_CHANNELS, latent_h, latent_w], device, params.seed,
+            )?
+        };
         // Copy into pipeline_state.latents (which is sized to capacity).
         // For simplicity we use pipeline_state.latents shape directly when
         // capacity matches; otherwise a strided copy would be needed. Here

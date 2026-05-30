@@ -81,9 +81,14 @@ pub fn dump_tensor<T: Dtype, D: OpBackend>(name: &str, t: &Tensor<T, D>) {
             if v.is_finite() { sum += v as f64; if v < mn { mn = v; } if v > mx { mx = v; } }
             else { nan += 1; }
         }
-        eprintln!("[dump] {} shape={:?} numel={} nan={} mean={:.6} min={:.6} max={:.6} first4={:?}",
+        // Print first 4 raw f32 bits to compare with on-disk file.
+        let bits: Vec<String> = f32_data.iter().take(4)
+            .map(|v| format!("{:08x}", v.to_bits())).collect();
+        eprintln!("[dump] {} shape={:?} numel={} nan={} mean={:.6} min={:.6} max={:.6} \
+                   first4_vals={:?} first4_bits=[{}]",
             name, shape, n, nan, sum / (n as f64).max(1.0), mn, mx,
-            &f32_data[..4.min(n)]);
+            &f32_data[..4.min(n)],
+            bits.join(", "));
     }
 }
 
@@ -284,7 +289,9 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             && !DUMP_DONE.swap(true, std::sync::atomic::Ordering::SeqCst);
         if do_dump {
             eprintln!("[dump] DiTBlock first forward: dumping intermediates");
-            dump_tensor("step0_x_padded_in", x);
+            // Use a different name so we don't overwrite the transformer-level
+            // dump of latent_5d_in (which captures the *pre-x_embedder* state).
+            dump_tensor("step0_block_x_in", x);
             if let Some(c) = adaln_input { dump_tensor("step0_adaln_input", c); }
         }
 
@@ -295,11 +302,13 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             let c = adaln_input.ok_or_else(|| OpError::Kernel(
                 "DiTBlock::forward: modulation=true but adaln_input is None".into()
             ))?;
-            // silu(c) into scratch.adaln_silu (256)
+            // The block's adaLN_modulation is `Sequential(Linear)` only —
+            // NO SiLU prefix. (FinalLayer's adaLN does include SiLU.)
+            // We still copy `c` into a scratch buffer because adaLN.forward
+            // expects a contiguous [1, ADALN_EMBED_DIM] tensor.
             let mut adaln_silu = vp2(&scratch.adaln_silu, 1, 256)?;
             adaln_silu.copy_from(c)?;
-            D::silu_inplace_diff(&mut adaln_silu)?;
-            // mod_out = adaln(silu(c))
+            // mod_out = adaln(c)
             let mut mod_out = vp2(&scratch.mod_out, 1, 4 * dim)?;
             adaln.forward(&adaln_silu, &mut mod_out)?;
             if do_dump { dump_tensor("step0_nr0_mod_out", &mod_out); }

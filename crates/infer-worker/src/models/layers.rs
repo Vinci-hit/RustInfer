@@ -18,11 +18,15 @@ impl<T: Dtype, D: OpBackend> Linear<T, D> {
         Self { weight, bias }
     }
 
-    /// Forward: output = input @ weight^T (+ bias if present)
+    /// Forward: `output = input @ weight^T + bias` (bias is row-broadcast).
+    ///
+    /// `bias` is `[N]` (or `[1, N]`); we broadcast-add it across all rows of
+    /// the `[M, N]` output. Plain `add_inplace` would treat the two tensors
+    /// as element-wise of identical numel and run off the end of `bias`.
     pub fn forward(&self, input: &Tensor<T, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
         D::matmul(input, &self.weight, output)?;
         if let Some(bias) = &self.bias {
-            D::add_inplace(output, bias)?;
+            D::broadcast_add_inplace(output, bias)?;
         }
         Ok(())
     }

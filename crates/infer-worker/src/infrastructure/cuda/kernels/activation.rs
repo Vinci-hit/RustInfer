@@ -75,8 +75,26 @@ pub fn swiglu_packed<T: Dtype>(
                 gate_up.data_ptr() as _, out.data_ptr_mut() as _,
                 rows as i32, inter as i32, stream,
             ),
+            DataType::F32 => {
+                // Generic fallback: split gate_up [rows, 2*inter] into
+                // gate / up halves, apply silu to gate, then ewise multiply.
+                let dev = gate_up.device().clone();
+                let mut gate: Tensor<T, Cuda> = Tensor::zeros([rows, inter], &dev)?;
+                let mut up: Tensor<T, Cuda> = Tensor::zeros([rows, inter], &dev)?;
+                super::split_cols::split_cols(
+                    gate_up, &mut gate,
+                    rows as i32, (2 * inter) as i32, 0, inter as i32,
+                )?;
+                super::split_cols::split_cols(
+                    gate_up, &mut up,
+                    rows as i32, (2 * inter) as i32, inter as i32, inter as i32,
+                )?;
+                silu_inplace(&mut gate)?;
+                super::ewise_mul::ewise_mul(&gate, &up, out)?;
+                let _ = stream;
+            }
             _ => return Err(OpError::Kernel(format!(
-                "swiglu_packed: only bf16 supported, got {:?}", T::DATA_TYPE
+                "swiglu_packed: unsupported dtype {:?}", T::DATA_TYPE
             ))),
         }
     }

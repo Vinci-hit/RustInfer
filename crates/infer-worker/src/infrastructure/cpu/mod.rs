@@ -829,6 +829,14 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
+    fn sdpa_masked<T: Dtype>(
+        _q: &Tensor<T, Self>, _k: &Tensor<T, Self>, _v: &Tensor<T, Self>,
+        _output: &mut Tensor<T, Self>, _mask: &Tensor<T, Self>,
+        _num_heads: usize, _num_kv_heads: usize, _head_dim: usize, _scale: f32,
+    ) -> OpResult<()> {
+        unimplemented!("sdpa_masked: CPU backend is not maintained for diffusion ops")
+    }
+
     // ─── Diffusion-only ops — not maintained for CPU ───
     // The diffusion pipeline runs on CUDA only (per project decision).
 

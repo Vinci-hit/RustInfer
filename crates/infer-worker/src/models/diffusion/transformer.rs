@@ -42,6 +42,12 @@ use super::rope_3d::{RopeEmbedder3D, fill_cap_pos_ids, fill_image_pos_ids};
 use super::state::{DitState, ADALN_EMBED_DIM, SEQ_MULTI_OF, T_FREQ_DIM, T_EMBEDDER_MID};
 use super::timestep_embedder::TimestepEmbedder;
 
+/// One-shot dump latch for the transformer-level intermediates (latent_5d,
+/// patches, x_emb). Only the very first denoise step writes; later steps
+/// run as usual.
+static DUMP_TRANSFORMER_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Take a contiguous 2D view of `src` shaped `[rows, cols]`. Caller asserts
 /// `rows * cols ≤ src.numel()`.
 fn vp2<T: Dtype>(src: &Tensor<T, Cuda>, rows: usize, cols: usize) -> OpResult<Tensor<T, Cuda>> {
@@ -377,7 +383,9 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         // ── 2. Patchify latent ──
         let mut patches = vp2(&state.patches, n, patch_in_dim)?;
         super::patchify::patchify_into(latent_5d, p, pf, &mut patches)?;
-        if std::env::var("RUSTINFER_DUMP").is_ok() {
+        let do_dump = std::env::var("RUSTINFER_DUMP").is_ok()
+            && !DUMP_TRANSFORMER_DONE.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if do_dump {
             super::dit_block::dump_tensor("step0_latent_5d_in", latent_5d);
             super::dit_block::dump_tensor("step0_patches", &patches);
         }
@@ -385,7 +393,7 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         // ── 3. x_embedder + pad ──
         let mut x_emb = vp2(&state.x_emb, n, dim)?;
         self.x_embedder.forward(&patches, &mut x_emb)?;
-        if std::env::var("RUSTINFER_DUMP").is_ok() {
+        if do_dump {
             super::dit_block::dump_tensor("step0_x_emb", &x_emb);
         }
         let mut x_padded = vp2(&state.x_padded, s_img, dim)?;
@@ -411,6 +419,20 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let mut cap_sin = vp2(&state.cap_sin, s_cap, half_d)?;
         self.rope.embed_into_cuda(&img_pos_ids, s_img, &mut x_cos, &mut x_sin)?;
         self.rope.embed_into_cuda(&cap_pos_ids, s_cap, &mut cap_cos, &mut cap_sin)?;
+        if do_dump {
+            super::dit_block::dump_tensor("step0_x_cos", &x_cos);
+            super::dit_block::dump_tensor("step0_x_sin", &x_sin);
+            // Also dump first few image pos_ids for sanity.
+            eprintln!("[dump] img_pos_ids first 12 = {:?}", &img_pos_ids[..12]);
+            eprintln!("[dump] s_cap = {}, s_img = {}, n = {}", s_cap, s_img, n);
+        }
+        if do_dump {
+            super::dit_block::dump_tensor("step0_x_cos", &x_cos);
+            super::dit_block::dump_tensor("step0_x_sin", &x_sin);
+            // Also dump first few image pos_ids for sanity.
+            eprintln!("[dump] img_pos_ids first 12 = {:?}", &img_pos_ids[..12]);
+            eprintln!("[dump] s_cap = {}, s_img = {}, n = {}", s_cap, s_img, n);
+        }
 
         // ── 6. noise_refiner on x ──
         run_block_chain::<T>(

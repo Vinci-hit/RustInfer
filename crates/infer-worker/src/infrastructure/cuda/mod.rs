@@ -342,6 +342,14 @@ impl OpBackend for Cuda {
         kernels::sdpa::sdpa(q, k, v, output, num_heads, num_kv_heads, head_dim, scale)
     }
 
+    fn sdpa_masked<T: Dtype>(
+        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>, mask: &Tensor<T, Self>,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+    ) -> OpResult<()> {
+        kernels::sdpa::sdpa_masked(q, k, v, output, mask, num_heads, num_kv_heads, head_dim, scale)
+    }
+
     fn apply_rope_interleaved<T: Dtype>(
         x: &mut Tensor<T, Self>,
         cos: &Tensor<f32, Self>,

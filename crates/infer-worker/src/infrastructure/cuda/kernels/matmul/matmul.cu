@@ -1078,3 +1078,54 @@ extern "C" void gemm_strided_batched_f32_axb(
             s, M, N, K, batch_count);
     }
 }
+
+// ============================================================================
+//  Standard cuBLAS sgemm wrapper for F32 (uses Tensor Cores TF32 on Hopper).
+//
+//  Row-major C[M,N] = A[M,K] @ B[N,K]^T  (matches our Linear: out=in@W^T).
+//  Col-major equivalent: C^col[N,M] = B[N,K] @ A[K,M]^T.
+//    cublas: C^col = op(X) op(Y), m=N, n=M, k=K
+//    X = B (col [K,N]) → op_T → [N,K], lda=K
+//    Y = A (col [K,M]) → op_N → [K,M], ldb=K
+//    ldc = N
+// ============================================================================
+
+extern "C" void gemm_cublas_f32_axbt(
+    const float* A, const float* B, float* C,
+    int M, int N, int K,
+    cudaStream_t stream
+) {
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) return;
+    cublasSetStream(h, stream);
+    // Enable TF32 (default on Hopper but make sure).
+    cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(
+        h,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_32F, K,
+        A, CUDA_R_32F, K,
+        &beta,
+        C, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        printf("gemm_cublas_f32_axbt failed: %d (M=%d N=%d K=%d)\n", s, M, N, K);
+    }
+}
+
+// ============================================================================
+//  Standard cuBLAS sgemm wrapper for F32 (uses Tensor Cores TF32 on Hopper).
+//
+//  Row-major C[M,N] = A[M,K] @ B[N,K]^T  (matches our Linear: out=in@W^T).
+//  Col-major equivalent: C^col[N,M] = B[N,K] @ A[K,M]^T.
+//    cublas: C^col = op(X) op(Y), m=N, n=M, k=K
+//    X = B (col [K,N]) → op_T → [N,K], lda=K
+//    Y = A (col [K,M]) → op_N → [K,M], ldb=K
+//    ldc = N
+// ============================================================================
+

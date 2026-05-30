@@ -3,14 +3,11 @@
 //! Usage: `cargo run --release --features cuda --example zimage_demo`
 
 use std::path::Path;
-use half::bf16;
 
 use infer_worker::domain::tensor::Tensor;
 use infer_worker::domain::types::Dtype;
 use infer_worker::infrastructure::cuda::Cuda;
-use infer_worker::models::diffusion::pipeline::{ZImagePipeline, GenerateParams};
-
-const MODEL_DIR: &str = "/apdcephfs_qy2/share_303432435/vinciiliu/models/z-image-turbo";
+use infer_worker::models::diffusion::pipeline::{ZImagePipeline, GenerateParams};const MODEL_DIR: &str = "/apdcephfs_qy2/share_303432435/vinciiliu/models/z-image-turbo";
 const PROMPT: &str =
     "A majestic snow leopard standing on a cliff edge at sunset, with golden \
      light illuminating its fur, dramatic mountain landscape in the background, \
@@ -24,9 +21,9 @@ fn main() -> Result<(), String> {
 
     eprintln!("[demo] CUDA init...");
     let cuda = Cuda::new(0).map_err(|e| format!("Cuda::new: {:?}", e))?;
-    eprintln!("[demo] loading pipeline (this can take ~30s)...");
+    eprintln!("[demo] loading pipeline as F32 (this can take ~30s)...");
     let t0 = std::time::Instant::now();
-    let mut pipeline: ZImagePipeline<bf16> =
+    let mut pipeline: ZImagePipeline<half::bf16> =
         ZImagePipeline::from_pretrained(MODEL_DIR, &cuda)
             .map_err(|e| format!("from_pretrained: {:?}", e))?;
     eprintln!("[demo] loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -45,22 +42,22 @@ fn main() -> Result<(), String> {
         .map_err(|e| format!("generate: {:?}", e))?;
     eprintln!("[demo] generated in {:.1}s", t0.elapsed().as_secs_f32());
 
-    // img: [1, 3, H, W] bf16. Convert to f32 then to u8 bytes (range [-1, 1] → [0, 255]).
     let s = img.shape().as_slice().to_vec();
     if s.len() != 4 || s[0] != 1 || s[1] != 3 {
         return Err(format!("unexpected image shape: {:?}", s));
     }
     let h = s[2]; let w = s[3];
-    let host: Vec<bf16> = img.to_host_vec().map_err(|e| format!("D2H: {:?}", e))?;
+    let host: Vec<f32> = {
+        let bf16_host: Vec<half::bf16> = img.to_host_vec().map_err(|e| format!("D2H: {:?}", e))?;
+        bf16_host.iter().map(|v| v.to_f32()).collect()
+    };
 
-    // Diagnostic: print min/max/mean of the output to detect NaN / saturation.
     let mut nfinite = 0usize;
     let mut nnan = 0usize;
     let mut sum = 0.0_f64;
     let mut mn = f32::INFINITY;
     let mut mx = f32::NEG_INFINITY;
-    for v in &host {
-        let x = v.to_f32();
+    for &x in &host {
         if x.is_finite() {
             nfinite += 1;
             sum += x as f64;
@@ -73,40 +70,18 @@ fn main() -> Result<(), String> {
     eprintln!("[demo] image stats: finite={} nan={} mean={:.4} min={:.4} max={:.4}",
         nfinite, nnan, sum / nfinite.max(1) as f64, mn, mx);
 
-    // Diagnostic: print min/max/mean of the output to detect NaN / saturation.
-    let mut nfinite = 0usize;
-    let mut nnan = 0usize;
-    let mut sum = 0.0_f64;
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
-    for v in &host {
-        let x = v.to_f32();
-        if x.is_finite() {
-            nfinite += 1;
-            sum += x as f64;
-            if x < mn { mn = x; }
-            if x > mx { mx = x; }
-        } else {
-            nnan += 1;
-        }
-    }
-    eprintln!("[demo] image stats: finite={} nan={} mean={:.4} min={:.4} max={:.4}",
-        nfinite, nnan, sum / nfinite.max(1) as f64, mn, mx);
-
-    // Layout: [b=0, c, y, x] is c*plane + y*w + x. PNG wants RGB interleaved.
     let plane = h * w;
     let mut bytes = Vec::with_capacity(h * w * 3);
     for y in 0..h {
         for x in 0..w {
             for c in 0..3 {
-                let v = host[c * plane + y * w + x].to_f32();
+                let v = host[c * plane + y * w + x];
                 let u = ((v.clamp(-1.0, 1.0) + 1.0) * 0.5 * 255.0).round() as u8;
                 bytes.push(u);
             }
         }
     }
 
-    // Write PNG.
     let file = std::fs::File::create(OUT_PATH)
         .map_err(|e| format!("create png: {}", e))?;
     let writer = std::io::BufWriter::new(file);

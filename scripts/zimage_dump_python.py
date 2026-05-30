@@ -1,8 +1,6 @@
 """
-Dump intermediate activations of `noise_refiner.0` for numerical comparison
-with the Rust implementation.
-
-Saved to /tmp/zimage_dump_python/ as binary .npy files (float32, overwrite).
+Dump intermediate activations of `noise_refiner.0` for numerical comparison.
+Saves f32 .npy to /tmp/zimage_dump_python/ (overwrite).
 """
 import shutil
 from pathlib import Path
@@ -38,6 +36,47 @@ def main():
     saved_step = {"i": 0}
     SAVE_STEP = 0
 
+    # Hook all_x_embedder["2-1"] for patches/x_emb.
+    x_emb_module = pipe.transformer.all_x_embedder["2-1"]
+    saved_x_emb = {"hooked": False}
+    def x_emb_pre_hook(module, inputs):
+        if saved_step["i"] == SAVE_STEP and not saved_x_emb["hooked"]:
+            x = inputs[0] if isinstance(inputs, tuple) else inputs
+            save_t("step0_patches", x)
+    def x_emb_post_hook(module, inputs, output):
+        if saved_step["i"] == SAVE_STEP and not saved_x_emb["hooked"]:
+            save_t("step0_x_emb", output)
+            saved_x_emb["hooked"] = True
+    x_emb_module.register_forward_pre_hook(x_emb_pre_hook)
+    x_emb_module.register_forward_hook(x_emb_post_hook)
+
+    # Capture initial latent from transformer pre-hook.
+    saved_init = {"done": False}
+    def transformer_pre_hook(module, args, kwargs):
+        if not saved_init["done"]:
+            x = args[0] if args else kwargs.get("x")
+            if isinstance(x, list) and len(x) > 0:
+                t0 = x[0]
+                if isinstance(t0, list):
+                    t0 = t0[-1]
+                save_t("step0_initial_latent", t0)
+                saved_init["done"] = True
+    pipe.transformer.register_forward_pre_hook(transformer_pre_hook, with_kwargs=True)
+
+    # Capture x_freqs_cis and x_pos_ids by wrapping _prepare_sequence
+    # using its unbound class method (avoids recursion).
+    saved_seq = {"x_done": False}
+    cls = type(pipe.transformer)
+    orig_prepare_seq = cls._prepare_sequence
+    def wrap_ps(self_t, feats, pos_ids, inner_pad_mask, pad_token, noise_mask=None, device=None):
+        out = orig_prepare_seq(self_t, feats, pos_ids, inner_pad_mask, pad_token,
+                                noise_mask=noise_mask, device=device)
+        if not saved_seq["x_done"]:
+            save_t("step0_x_pos_ids_py", torch.cat(pos_ids, dim=0))
+            saved_seq["x_done"] = True
+        return out
+    cls._prepare_sequence = wrap_ps
+
     def patched_forward(x, attn_mask, freqs_cis, adaln_input=None,
                         noise_mask=None, adaln_noisy=None, adaln_clean=None,
                         **kwargs):
@@ -50,7 +89,6 @@ def main():
                 adaln_clean=adaln_clean,
                 **kwargs,
             )
-
         save_t("step0_x_padded_in", x)
         save_t("step0_adaln_input", adaln_input)
         save_t("step0_freqs_cis", torch.view_as_real(freqs_cis))
