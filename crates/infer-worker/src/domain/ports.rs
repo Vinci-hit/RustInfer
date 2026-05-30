@@ -340,6 +340,83 @@ pub trait OpBackend: MemoryPort {
         head_dim: usize,
         scale: f32,
     ) -> OpResult<()>;
+
+    // ─── Diffusion-only ops (no LLM use) ─────────────────────────────
+
+    /// Interleaved RoPE for DiT — applies per-head rotation on
+    /// `[seq, n_heads, head_dim]` from F32 cos/sin caches `[seq, head_dim/2]`.
+    fn apply_rope_interleaved<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        cos: &Tensor<f32, Self>,
+        sin: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()>;
+
+    /// Generic column slice: `dst[r, j] = src[r, col_offset + j]` for a
+    /// 2D src of shape `[rows, total_cols]` and dst `[rows, dst_cols]`.
+    fn split_cols<T: Dtype>(
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+        rows: usize,
+        total_cols: usize,
+        col_offset: usize,
+        dst_cols: usize,
+    ) -> OpResult<()>;
+
+    /// Concat two `[*, D]` tensors along dim 0 into a pre-allocated dst.
+    fn concat_seq<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()>;
+
+    /// `dst[..n] = src; dst[n..target] = pad_token`.
+    fn pad_with_token<T: Dtype>(
+        src: &Tensor<T, Self>,
+        pad_token: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()>;
+
+    /// `dst[..n] = src; dst[n..target] = src[n-1]`.
+    fn pad_last_row<T: Dtype>(
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()>;
+
+    /// `dst[keep_prefix..] = pad_token`.
+    fn overwrite_pad_tokens_inplace<T: Dtype>(
+        dst: &mut Tensor<T, Self>,
+        pad_token: &Tensor<T, Self>,
+        keep_prefix: usize,
+    ) -> OpResult<()>;
+
+    /// Cast between dtypes within the same device.
+    fn cast_dtype<S: Dtype, D2: Dtype>(
+        src: &Tensor<S, Self>,
+        dst: &mut Tensor<D2, Self>,
+    ) -> OpResult<()>;
+
+    /// `x += scalar` (in place).
+    fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()>;
+
+    /// In-place SiLU activation (`x = x * sigmoid(x)`).
+    fn silu_inplace_diff<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;
+
+    /// In-place tanh activation.
+    fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;
+
+    /// CUDA-Graph-friendly scalar multiply: `x *= *d_scalar` where
+    /// `d_scalar` is a single-element f32 device tensor.
+    fn scalar_mul_inplace_from_dev<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        d_scalar: &Tensor<f32, Self>,
+    ) -> OpResult<()>;
+
+    /// In-place broadcast add: `x[i, j] += bias[j]` over a `[*, D]` tensor.
+    fn broadcast_add_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+    ) -> OpResult<()>;
 }
 
 /// Operator-level error — no `Unsupported` variant.

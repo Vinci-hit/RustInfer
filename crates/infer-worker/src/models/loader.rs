@@ -57,6 +57,16 @@ impl<'a> WeightLoader<'a> {
         Self { reader }
     }
 
+    /// Whether a tensor with this name exists in the underlying file(s).
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.reader.contains(name)
+    }
+
+    /// Borrow a raw safetensors `TensorView` by name.
+    pub fn read_view(&self, name: &str) -> Result<TensorView<'_>, String> {
+        self.reader.read_view(name)
+    }
+
     /// Load a tensor by name, cast to target dtype T, place on device D.
     pub fn load_tensor<T: Dtype, D: MemoryPort>(&self, name: &str, device: &D) -> OpResult<Tensor<T, D>> {
         let view = self.reader.read_view(name)
@@ -318,6 +328,11 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
     }
 
     Tensor::<T, D>::from_host_bytes(&host_buf, shape, device)
+}
+
+/// Public re-export of the internal cast helper for diffusion loaders.
+pub unsafe fn cast_bytes_pub(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, numel: usize) {
+    cast_bytes(src, src_dt, dst, dst_dt, numel);
 }
 
 /// Element-wise dtype cast via f64 intermediate.

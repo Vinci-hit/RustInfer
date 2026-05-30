@@ -828,6 +828,79 @@ impl OpBackend for Cpu {
         }
         Ok(())
     }
+
+    // ─── Diffusion-only ops — not maintained for CPU ───
+    // The diffusion pipeline runs on CUDA only (per project decision).
+
+    fn apply_rope_interleaved<T: Dtype>(
+        _x: &mut Tensor<T, Self>,
+        _cos: &Tensor<f32, Self>,
+        _sin: &Tensor<f32, Self>,
+        _head_dim: usize,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("apply_rope_interleaved: CPU not implemented".into()))
+    }
+
+    fn split_cols<T: Dtype>(
+        _src: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
+        _rows: usize, _total_cols: usize, _col_offset: usize, _dst_cols: usize,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("split_cols: CPU not implemented".into()))
+    }
+
+    fn concat_seq<T: Dtype>(
+        _a: &Tensor<T, Self>, _b: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("concat_seq: CPU not implemented".into()))
+    }
+
+    fn pad_with_token<T: Dtype>(
+        _src: &Tensor<T, Self>, _pad_token: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("pad_with_token: CPU not implemented".into()))
+    }
+
+    fn pad_last_row<T: Dtype>(
+        _src: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("pad_last_row: CPU not implemented".into()))
+    }
+
+    fn overwrite_pad_tokens_inplace<T: Dtype>(
+        _dst: &mut Tensor<T, Self>, _pad_token: &Tensor<T, Self>, _keep_prefix: usize,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("overwrite_pad_tokens_inplace: CPU not implemented".into()))
+    }
+
+    fn cast_dtype<S: Dtype, D2: Dtype>(
+        _src: &Tensor<S, Self>, _dst: &mut Tensor<D2, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("cast_dtype: CPU not implemented".into()))
+    }
+
+    fn scalar_add_inplace<T: Dtype>(_x: &mut Tensor<T, Self>, _scalar: f64) -> OpResult<()> {
+        Err(OpError::Kernel("scalar_add_inplace: CPU not implemented".into()))
+    }
+
+    fn silu_inplace_diff<T: Dtype>(_x: &mut Tensor<T, Self>) -> OpResult<()> {
+        Err(OpError::Kernel("silu_inplace_diff: CPU not implemented".into()))
+    }
+
+    fn tanh_inplace<T: Dtype>(_x: &mut Tensor<T, Self>) -> OpResult<()> {
+        Err(OpError::Kernel("tanh_inplace: CPU not implemented".into()))
+    }
+
+    fn scalar_mul_inplace_from_dev<T: Dtype>(
+        _x: &mut Tensor<T, Self>, _d_scalar: &Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("scalar_mul_inplace_from_dev: CPU not implemented".into()))
+    }
+
+    fn broadcast_add_inplace<T: Dtype>(
+        _x: &mut Tensor<T, Self>, _bias: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("broadcast_add_inplace: CPU not implemented".into()))
+    }
 }
 
 // ─── Generic numeric helpers ─────────────────────────────────────────────────

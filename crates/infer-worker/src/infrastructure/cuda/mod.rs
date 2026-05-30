@@ -335,12 +335,89 @@ impl OpBackend for Cuda {
     }
 
     fn sdpa<T: Dtype>(
-        _q: &Tensor<T, Self>, _k: &Tensor<T, Self>, _v: &Tensor<T, Self>,
-        _output: &mut Tensor<T, Self>,
-        _num_heads: usize, _num_kv_heads: usize, _head_dim: usize, _scale: f32,
+        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
     ) -> OpResult<()> {
-        // SDPA is only used by diffusion; LLM path goes through attention_paged.
-        Err(OpError::Kernel("sdpa: not supported in paged-only build".into()))
+        kernels::sdpa::sdpa(q, k, v, output, num_heads, num_kv_heads, head_dim, scale)
+    }
+
+    fn apply_rope_interleaved<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        cos: &Tensor<f32, Self>,
+        sin: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        kernels::rope_interleaved::apply_rope_interleaved(x, cos, sin, head_dim)
+    }
+
+    fn split_cols<T: Dtype>(
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+        rows: usize,
+        total_cols: usize,
+        col_offset: usize,
+        dst_cols: usize,
+    ) -> OpResult<()> {
+        kernels::split_cols::split_cols(
+            src, dst,
+            rows as i32, total_cols as i32,
+            col_offset as i32, dst_cols as i32,
+        )
+    }
+
+    fn concat_seq<T: Dtype>(
+        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::concat_seq::concat_seq_into(a, b, dst)
+    }
+
+    fn pad_with_token<T: Dtype>(
+        src: &Tensor<T, Self>, pad_token: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::pad::pad_with_token_into(src, pad_token, dst)
+    }
+
+    fn pad_last_row<T: Dtype>(
+        src: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::pad::pad_last_row_into(src, dst)
+    }
+
+    fn overwrite_pad_tokens_inplace<T: Dtype>(
+        dst: &mut Tensor<T, Self>, pad_token: &Tensor<T, Self>, keep_prefix: usize,
+    ) -> OpResult<()> {
+        kernels::pad::overwrite_pad_tokens_inplace(dst, pad_token, keep_prefix)
+    }
+
+    fn cast_dtype<S: Dtype, D2: Dtype>(
+        src: &Tensor<S, Self>, dst: &mut Tensor<D2, Self>,
+    ) -> OpResult<()> {
+        kernels::cast_dtype::cast_dtype(src, dst)
+    }
+
+    fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
+        kernels::scalar::scalar_add_inplace(x, scalar)
+    }
+
+    fn silu_inplace_diff<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
+        kernels::scalar::silu_inplace(x)
+    }
+
+    fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
+        kernels::scalar::tanh_inplace(x)
+    }
+
+    fn scalar_mul_inplace_from_dev<T: Dtype>(
+        x: &mut Tensor<T, Self>, d_scalar: &Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        kernels::scalar::scalar_mul_inplace_from_dev(x, d_scalar)
+    }
+
+    fn broadcast_add_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>, bias: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::broadcast_mul::broadcast_add_inplace(x, bias)
     }
 }
 

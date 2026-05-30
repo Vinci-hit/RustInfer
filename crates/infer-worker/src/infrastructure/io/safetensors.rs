@@ -55,8 +55,9 @@ impl SafetensorsReader {
     ///
     /// - If `path` is a `.safetensors` file: load it as a single shard.
     /// - If `path` is a directory:
-    ///     - first try `model.safetensors.index.json` for a sharded layout
-    ///     - else fall back to `model.safetensors` (single file)
+    ///     - first try `*.safetensors.index.json` (any prefix — `model.`,
+    ///       `diffusion_pytorch_model.`, etc.) for a sharded layout
+    ///     - else fall back to a single `*.safetensors` file
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let meta = std::fs::metadata(path)
@@ -65,16 +66,31 @@ impl SafetensorsReader {
             return Self::open_single(path);
         }
         if meta.is_dir() {
-            let index = path.join("model.safetensors.index.json");
-            if index.is_file() {
-                return Self::open_sharded(path, &index);
+            // Look for any *.safetensors.index.json first.
+            let entries = std::fs::read_dir(path)
+                .map_err(|e| format!("read_dir {}: {}", path.display(), e))?;
+            let mut index_path: Option<PathBuf> = None;
+            let mut single_path: Option<PathBuf> = None;
+            for e in entries {
+                let e = e.map_err(|err| format!("dirent: {}", err))?;
+                let p = e.path();
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    if name.ends_with(".safetensors.index.json") {
+                        index_path = Some(p);
+                    } else if name.ends_with(".safetensors") {
+                        // Track single-file fallback (only used if no index).
+                        single_path = Some(p);
+                    }
+                }
             }
-            let single = path.join("model.safetensors");
-            if single.is_file() {
+            if let Some(idx) = index_path {
+                return Self::open_sharded(path, &idx);
+            }
+            if let Some(single) = single_path {
                 return Self::open_single(&single);
             }
             return Err(format!(
-                "no model.safetensors.index.json or model.safetensors under {}",
+                "no *.safetensors.index.json or *.safetensors under {}",
                 path.display(),
             ));
         }

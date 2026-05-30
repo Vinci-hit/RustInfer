@@ -6,7 +6,7 @@ use super::ffi;
 use super::error::cuda_check;
 use crate::domain::ports::{OpError, OpResult};
 
-const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 128 * 1024 * 1024;
+const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {

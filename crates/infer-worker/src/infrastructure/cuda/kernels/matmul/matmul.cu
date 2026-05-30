@@ -916,3 +916,165 @@ extern "C" void kpack_gemm_cu(
             (__nv_bfloat16*)output, M, N, K, group_size, group_shift);
     }
 }
+
+// ============================================================================
+//  Strided-batched GEMM (BF16 / F32) — for SDPA's per-head Q@K^T and attn@V.
+//
+//  Computes `C[b] = A[b] @ B[b]^T` for `b in [0, batch_count)`, where each
+//  batch slice is row-major `[m,k]`/`[n,k]`/`[m,n]` with batch stride =
+//  `m*k`/`n*k`/`m*n` (contiguous batch dim).
+//
+//  We use cuBLAS classic API (`cublasGemmStridedBatchedEx`) — simpler than
+//  cuBLASLt for batched, and plenty fast for SDPA of seq≤2048, n_heads≤32.
+//
+//  Row-major hack: cuBLAS is column-major. With row-major C = A @ B^T:
+//    column-major view: C^col = (A @ B^T)^T = B @ A^T
+//    so call cublasGemm with transA=N (B is col-major [K, N] viewed as row [N,K]),
+//    transB=T (A^T = A in col-major when A is row-major [M,K]),
+//    m=N, n=M, k=K, A_arg=B, B_arg=A, C_arg=C (row [M,N] = col [N,M]).
+// ============================================================================
+
+#include <cublas_v2.h>
+
+static cublasHandle_t s_cublas_handle = nullptr;
+static cublasHandle_t get_cublas_handle() {
+    if (!s_cublas_handle) {
+        cublasStatus_t s = cublasCreate(&s_cublas_handle);
+        if (s != CUBLAS_STATUS_SUCCESS) {
+            printf("cublasCreate failed: %d\n", s);
+            return nullptr;
+        }
+    }
+    return s_cublas_handle;
+}
+
+extern "C" void gemm_strided_batched_bf16_axbt(
+    const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
+    int M, int N, int K,
+    long long strideA, long long strideB, long long strideC,
+    int batch_count,
+    cudaStream_t stream
+) {
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) return;
+    cublasSetStream(h, stream);
+    float alpha = 1.0f, beta = 0.0f;
+    // Row-major C[M,N] = A[M,K] @ B[N,K]^T.
+    // Col-major: C_col[N,M] = B[N,K] · A^T[K,M].
+    //   X = B (col-major view of [N,K] data is [K,N]), op_T → [N,K], lda=K
+    //   Y = A^T (col-major view of [M,K] data is [K,M] which = A^T), op_N, ldb=K
+    //   m=N, n=M, k=K, ldc=N.
+    cublasStatus_t s = cublasGemmStridedBatchedEx(
+        h,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_16BF, K, strideB,
+        A, CUDA_R_16BF, K, strideA,
+        &beta,
+        C, CUDA_R_16BF, N, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        printf("gemm_strided_batched_bf16_axbt failed: %d (M=%d N=%d K=%d batch=%d)\n",
+            s, M, N, K, batch_count);
+    }
+}
+
+extern "C" void gemm_strided_batched_bf16_axb(
+    const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
+    int M, int N, int K,
+    long long strideA, long long strideB, long long strideC,
+    int batch_count,
+    cudaStream_t stream
+) {
+    // Row-major C[M,N] = A[M,K] @ B[K,N]
+    // Col-major: cublas computes C_col = B_col @ A_col with m=N,n=M,k=K,
+    //   B_arg=B (row [K,N] = col [N,K]) → CUBLAS_OP_N to get [K,N]? No:
+    //   col [N,K] needs transpose to become [K,N] for the gemm = OP_T.
+    //   A_arg=A (row [M,K] = col [K,M]) → no transpose to get [K,M] = OP_N.
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) return;
+    cublasSetStream(h, stream);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmStridedBatchedEx(
+        h,
+        CUBLAS_OP_T,   // transpose B from col [N,K] to [K,N]
+        CUBLAS_OP_N,   // A is col [K,M] already
+        N, M, K,
+        &alpha,
+        B, CUDA_R_16BF, N, strideB,    // ldb = N (col-major rows of [N,K])
+        A, CUDA_R_16BF, K, strideA,    // lda = K (col-major rows of [K,M])
+        &beta,
+        C, CUDA_R_16BF, N, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        printf("gemm_strided_batched_bf16_axb failed: %d (M=%d N=%d K=%d batch=%d)\n",
+            s, M, N, K, batch_count);
+    }
+}
+
+extern "C" void gemm_strided_batched_f32_axbt(
+    const float* A, const float* B, float* C,
+    int M, int N, int K,
+    long long strideA, long long strideB, long long strideC,
+    int batch_count,
+    cudaStream_t stream
+) {
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) return;
+    cublasSetStream(h, stream);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmStridedBatchedEx(
+        h,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_32F, K, strideB,
+        A, CUDA_R_32F, K, strideA,
+        &beta,
+        C, CUDA_R_32F, N, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        printf("gemm_strided_batched_f32_axbt failed: %d (M=%d N=%d K=%d batch=%d)\n",
+            s, M, N, K, batch_count);
+    }
+}
+
+extern "C" void gemm_strided_batched_f32_axb(
+    const float* A, const float* B, float* C,
+    int M, int N, int K,
+    long long strideA, long long strideB, long long strideC,
+    int batch_count,
+    cudaStream_t stream
+) {
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) return;
+    cublasSetStream(h, stream);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmStridedBatchedEx(
+        h,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_32F, N, strideB,
+        A, CUDA_R_32F, K, strideA,
+        &beta,
+        C, CUDA_R_32F, N, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        printf("gemm_strided_batched_f32_axb failed: %d (M=%d N=%d K=%d batch=%d)\n",
+            s, M, N, K, batch_count);
+    }
+}

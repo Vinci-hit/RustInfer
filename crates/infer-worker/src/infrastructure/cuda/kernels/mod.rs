@@ -20,3 +20,8 @@ pub mod broadcast_mul;
 pub mod ewise_mul;
 pub mod layernorm;
 pub mod conv2d;
+pub mod rope_interleaved;
+pub mod cast_dtype;
+pub mod sdpa;
+pub mod concat_seq;
+pub mod pad;

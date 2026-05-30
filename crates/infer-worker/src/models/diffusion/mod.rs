@@ -20,3 +20,4 @@ pub mod state;
 pub mod rope_3d;
 pub mod timestep_embedder;
 pub mod patchify;
+pub mod text_encoder;
