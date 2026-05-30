@@ -27,6 +27,7 @@
 
 mod batch_builder;
 
+pub mod admission;
 pub mod cancel;
 pub mod control_event;
 pub mod dispatch;

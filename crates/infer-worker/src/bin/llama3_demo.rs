@@ -237,10 +237,12 @@ fn main() -> Result<()> {
             None
         };
     let max_batch_seqs = batch_prompts.as_ref().map(|v| v.len().max(1)).unwrap_or(1);
-    // Paged KV pool sizing: pick block_size=16 (matches scheduler default),
-    // allocate enough blocks to cover max_batch_seqs * max_seq_len, plus
-    // one extra physical block reserved for CUDA-Graph scratch.
-    let block_size: usize = 16;
+    // Paged KV pool sizing: block_size=1 — every token gets its own slot in
+    // the global KV pool. With block_size=1 the paged scatter/attention
+    // kernels degenerate to per-token gather (block_table[seq][i] == that
+    // sequence's i-th token's global KV index), which is the foundation of
+    // the worker-owned `GlobalKvAllocator` design.
+    let block_size: usize = 1;
     let max_blocks_per_seq = (args.max_seq_len + block_size - 1) / block_size;
     let num_blocks = max_blocks_per_seq * max_batch_seqs;
     let pool_blocks = num_blocks + 1;

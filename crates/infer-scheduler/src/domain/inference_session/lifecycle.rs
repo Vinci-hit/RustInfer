@@ -208,17 +208,30 @@ pub struct CompletionMetrics {
     pub num_preemptions: u32,
 }
 
+/// Data for a session that was preempted by the admission cascade
+/// (Phase 6 / plan §7). Generated tokens are dropped; prompt is preserved
+/// in `Arc<RequestMeta>` so the session can be re-queued and re-prefilled.
+/// `KvLease` is intentionally absent — it is consumed by `preempt_to_starved`
+/// and dropped (returning blocks to the legacy block sink) at the moment
+/// the new RadixTree path marks the chain finished.
+pub struct ResourceStarved {
+    pub dropped_output_count: u32,
+    pub preemption_count: u32,
+}
+
 impl sealed::Sealed for Queued {}
 impl sealed::Sealed for Prefilling {}
 impl sealed::Sealed for Decoding {}
 impl sealed::Sealed for Finished {}
 impl sealed::Sealed for Failed {}
+impl sealed::Sealed for ResourceStarved {}
 
 impl SessionState for Queued {}
 impl SessionState for Prefilling {}
 impl SessionState for Decoding {}
 impl SessionState for Finished {}
 impl SessionState for Failed {}
+impl SessionState for ResourceStarved {}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  InferenceSession<S> — parameterized by state data
@@ -437,7 +450,65 @@ impl InferenceSession<Decoding> {
         (seq, kv_lease)
     }
 
+    /// Preempt: Decoding → ResourceStarved (Phase 6 / plan §7).
+    ///
+    /// Used by the admission cascade when KV pressure forces the engine
+    /// to evict a live decoder. Generated tokens are dropped; the prompt
+    /// (in `Arc<RequestMeta>`) survives and the session can be lifted
+    /// back into the waiting queue via [`InferenceSession::<ResourceStarved>::requeue`].
+    ///
+    /// Returns the new typed session and the legacy `KvLease`. In the
+    /// new RadixTree-driven path the lease is empty (the worker-side
+    /// indices have already been marked finished and will be reclaimed
+    /// by the next `FreeKvIndices` round). In the legacy path the
+    /// caller drops the lease, returning blocks to the block sink.
+    pub fn preempt_to_starved(self) -> (InferenceSession<ResourceStarved>, KvLease) {
+        let kv_lease = self.state.kv_lease;
+        let dropped_output_count = self.state.output_tokens.len() as u32;
+        let preemption_count = self.state.preemption_count + 1;
+        let seq = InferenceSession {
+            meta: self.meta,
+            handle: self.handle,
+            state: ResourceStarved {
+                dropped_output_count,
+                preemption_count,
+            },
+        };
+        (seq, kv_lease)
+    }
+
     /// Get the request ID.
+    pub fn id(&self) -> &RequestId {
+        &self.meta.id
+    }
+}
+
+impl InferenceSession<ResourceStarved> {
+    /// Lift a preempted session back into the waiting queue. The same
+    /// `RequestMeta` (which holds the prompt) is preserved; preemption
+    /// count is carried forward so policies can apply backoff.
+    pub fn requeue(self) -> InferenceSession<Queued> {
+        InferenceSession {
+            meta: self.meta,
+            handle: self.handle,
+            // No prefix_match snapshot here; the next admission lookup
+            // (driven by RadixTree::lookup_prefix in the new path) will
+            // recompute it. The legacy field is `Option`-y for exactly
+            // this reason.
+            state: Queued { prefix_match: None },
+        }
+    }
+
+    /// Number of output tokens that were dropped on preemption. Useful
+    /// for metrics; the actual content is gone.
+    pub fn dropped_output_count(&self) -> u32 {
+        self.state.dropped_output_count
+    }
+
+    pub fn preemption_count(&self) -> u32 {
+        self.state.preemption_count
+    }
+
     pub fn id(&self) -> &RequestId {
         &self.meta.id
     }
@@ -570,6 +641,63 @@ mod tests {
         let f = d.fail("oom".into());
         assert_eq!(f.state.partial_output_tokens, vec![11, 22]);
         let _ = f.state.kv_lease.blocks();
+    }
+
+    #[test]
+    fn decoding_preempt_to_starved_drops_outputs_and_bumps_count() {
+        let q = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
+        let mut p = q.start_prefill(paged_alloc());
+        p.advance_chunk(4);
+        let mut d = p.start_decode();
+        d.append_token(99);
+        d.append_token(100);
+        d.append_token(101);
+        let prompt_before = d.meta.input_ids.clone();
+        let id_before = *d.id();
+
+        let (starved, lease) = d.preempt_to_starved();
+        assert_eq!(starved.dropped_output_count(), 3);
+        assert_eq!(starved.preemption_count(), 1);
+        // Prompt preserved verbatim through the Arc<RequestMeta>.
+        assert_eq!(starved.meta.input_ids, prompt_before);
+        assert_eq!(*starved.id(), id_before);
+        // Legacy lease passed back to the caller.
+        assert!(!lease.blocks().is_empty());
+    }
+
+    #[test]
+    fn starved_requeue_returns_to_queued() {
+        let q = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
+        let mut p = q.start_prefill(paged_alloc());
+        p.advance_chunk(4);
+        let d = p.start_decode();
+        let id_before = *d.id();
+        let (starved, _lease) = d.preempt_to_starved();
+        let q2 = starved.requeue();
+        // Re-queued session has the same id, same prompt.
+        assert_eq!(*q2.id(), id_before);
+        assert_eq!(q2.meta.input_ids.len(), 4);
+        assert!(q2.state.prefix_match.is_none());
+    }
+
+    #[test]
+    fn preempt_to_starved_carries_forward_existing_preemption_count() {
+        // Construct a Decoding with preemption_count > 0 directly.
+        let meta = make_meta(2);
+        let session: InferenceSession<Decoding> = InferenceSession {
+            meta: meta.clone(),
+            handle: RequestHandle::noop(),
+            state: Decoding {
+                kv_lease: paged_alloc(),
+                output_tokens: vec![1, 2, 3],
+                seq_position: 5,
+                prompt_len: 2,
+                first_token_time: Instant::now(),
+                preemption_count: 2,
+            },
+        };
+        let (starved, _lease) = session.preempt_to_starved();
+        assert_eq!(starved.preemption_count(), 3, "must increment");
     }
 }
 

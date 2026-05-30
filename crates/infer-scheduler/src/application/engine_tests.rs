@@ -190,6 +190,7 @@
                 token_id: 42,
                 finished: false,
             }],
+            assigned_indices: vec![],
         };
         engine
             .handle_step_output_llm(codec.encode(&output)?)
@@ -357,3 +358,297 @@
         }
         Ok(())
     }
+
+    // ─── Phase 7A: admission cascade activation ─────────────────────
+
+    /// Verifies the engine's `KvBudget` was sized from
+    /// `worker_group.effective_capacity.max_total_kv_tokens` (32 in the
+    /// test fixture). This is the gate for the new path.
+    #[tokio::test]
+    async fn engine_kv_budget_capacity_taken_from_worker_group() -> Result<()> {
+        let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
+        let default_worker = WorkerId::from_identity(b"worker-test");
+        let config = SchedulerConfig {
+            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            num_gpu_blocks: 4,
+            ..Default::default()
+        };
+        let engine = SchedulerEngine::new(
+            config,
+            Box::new(ContinuousBatchingPolicy::new(None)),
+            Box::new(PagedKvPool::new(4, 4)),
+            worker_group(),
+            MockFrontend,
+            MockWorker::default(),
+            control_cmd,
+            control_events,
+            default_worker,
+        );
+        // The worker_group fixture reports max_total_kv_tokens = 32; engine
+        // should pick that up as the KvBudget capacity.
+        assert_eq!(engine.kv_budget.capacity(), 32);
+        assert_eq!(engine.kv_budget.outstanding(), 0);
+        // RadixTree starts empty.
+        assert_eq!(engine.radix.token_count(), 0);
+        Ok(())
+    }
+
+    /// Phase 4 StepOutput.assigned_indices flows into RadixTree +
+    /// KvBudget when LLM step output arrives. Legacy fields are unaffected.
+    #[tokio::test]
+    async fn step_output_assigned_indices_drive_radix_and_budget() -> Result<()> {
+        use infer_protocol::worker_to_scheduler_data::AssignedIndices;
+        let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
+        let default_worker = WorkerId::from_identity(b"worker-test");
+        let config = SchedulerConfig {
+            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            num_gpu_blocks: 4,
+            ..Default::default()
+        };
+        let mut engine = SchedulerEngine::new(
+            config,
+            Box::new(ContinuousBatchingPolicy::new(None)),
+            Box::new(PagedKvPool::new(4, 4)),
+            worker_group(),
+            MockFrontend,
+            MockWorker::default(),
+            control_cmd,
+            control_events,
+            default_worker,
+        );
+
+        // Build a Phase 4 StepOutput with assigned_indices populated. We
+        // skip the prefill_done / tokens machinery (those sequences aren't
+        // actually registered) — the engine's `handle_step_output_llm`
+        // first peels the Phase 4 fields, which should still work, and
+        // then the legacy `process_llm_step` warns on unknown sequence_ids
+        // but does not fail.
+        let codec = MsgPackCodec;
+        let output = StepOutput {
+            prefill_done: vec![],
+            tokens: vec![GeneratedToken {
+                sequence_id: 100,
+                token_id: 42,
+                finished: false,
+            }],
+            assigned_indices: vec![
+                AssignedIndices {
+                    sequence_id: 100,
+                    base: 0,
+                    len: 3,
+                },
+                AssignedIndices {
+                    sequence_id: 200,
+                    base: 3,
+                    len: 5,
+                },
+            ],
+        };
+        engine
+            .handle_step_output_llm(codec.encode(&output)?)
+            .await?;
+
+        // Budget reflects the 3 + 5 = 8 reserved slots.
+        assert_eq!(engine.kv_budget.outstanding(), 8);
+        // RadixTree saw 8 token append calls (one per slot).
+        assert_eq!(engine.radix.token_count(), 8);
+        Ok(())
+    }
+
+    /// `mark_finished_chain` is invoked when a token's `finished` flag is
+    /// set in the StepOutput. After that, evicting from the tree returns
+    /// the slots that belonged to the finished sequence.
+    #[tokio::test]
+    async fn finished_token_marks_chain_for_lru_eviction() -> Result<()> {
+        use infer_protocol::worker_to_scheduler_data::AssignedIndices;
+        let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
+        let default_worker = WorkerId::from_identity(b"worker-test");
+        let config = SchedulerConfig {
+            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            num_gpu_blocks: 4,
+            ..Default::default()
+        };
+        let mut engine = SchedulerEngine::new(
+            config,
+            Box::new(ContinuousBatchingPolicy::new(None)),
+            Box::new(PagedKvPool::new(4, 4)),
+            worker_group(),
+            MockFrontend,
+            MockWorker::default(),
+            control_cmd,
+            control_events,
+            default_worker,
+        );
+
+        let codec = MsgPackCodec;
+        // Step 1: write 4 slots for seq 7.
+        let out1 = StepOutput {
+            prefill_done: vec![],
+            tokens: vec![GeneratedToken {
+                sequence_id: 7,
+                token_id: 11,
+                finished: false,
+            }],
+            assigned_indices: vec![AssignedIndices {
+                sequence_id: 7,
+                base: 0,
+                len: 4,
+            }],
+        };
+        engine.handle_step_output_llm(codec.encode(&out1)?).await?;
+        assert_eq!(engine.radix.lru_len_estimate(), 0);
+
+        // Step 2: finish seq 7 (token.finished = true).
+        let out2 = StepOutput {
+            prefill_done: vec![],
+            tokens: vec![GeneratedToken {
+                sequence_id: 7,
+                token_id: 22,
+                finished: true,
+            }],
+            assigned_indices: vec![AssignedIndices {
+                sequence_id: 7,
+                base: 4,
+                len: 1,
+            }],
+        };
+        engine.handle_step_output_llm(codec.encode(&out2)?).await?;
+
+        // After mark_finished_chain, the chain's leaf must be in LRU.
+        assert!(engine.radix.lru_len_estimate() >= 1);
+        // Eviction yields the 5 slots used by seq 7.
+        let evicted = engine.radix.evict(10);
+        assert_eq!(evicted.len(), 5);
+        let mut sorted = evicted.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
+        Ok(())
+    }
+
+    // ─── Phase 8 — V3/V5: full admission cycle integration ──────────────
+
+    /// **Phase 8 V3-mech / V5-mech integration test.**
+    ///
+    /// Drives the complete worker-owned-KV cycle through the scheduler
+    /// using synthetic StepOutputs (no real worker). Verifies that:
+    ///
+    /// 1. Multiple seqs writing assigned_indices correctly account in
+    ///    `KvBudget` (RadixTree append).
+    /// 2. Finishing a seq makes its slots LRU-evictable.
+    /// 3. The next `evict()` call returns those slots ready for
+    ///    `FreeKvIndices` dispatch.
+    /// 4. Capacity is restored — outstanding can drop back to a level
+    ///    where new work fits.
+    ///
+    /// This test does **not** spin up real ZMQ transports. It exercises
+    /// the engine's hot path (handle_step_output_llm) and the admission
+    /// substrate (RadixTree + KvBudget) end-to-end. Real ZMQ bring-up
+    /// follows in Phase 7B once the worker is rewritten.
+    #[tokio::test]
+    async fn phase8_full_admission_cycle_through_engine() -> Result<()> {
+        use infer_protocol::worker_to_scheduler_data::AssignedIndices;
+        let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
+        let default_worker = WorkerId::from_identity(b"worker-test");
+        let config = SchedulerConfig {
+            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            num_gpu_blocks: 4,
+            ..Default::default()
+        };
+        let mut engine = SchedulerEngine::new(
+            config,
+            Box::new(ContinuousBatchingPolicy::new(None)),
+            Box::new(PagedKvPool::new(4, 4)),
+            worker_group(), // capacity=32 from fixture
+            MockFrontend,
+            MockWorker::default(),
+            control_cmd,
+            control_events,
+            default_worker,
+        );
+        let codec = MsgPackCodec;
+
+        // ── 1. Three seqs each consume 8 slots (total 24/32 = 75%). ──
+        // Use distinct first tokens so the seqs hang off different
+        // root-level branches and don't collide in the prefix tree.
+        for sid in [101u64, 102, 103] {
+            let out = StepOutput {
+                prefill_done: vec![],
+                tokens: vec![GeneratedToken {
+                    sequence_id: sid,
+                    // Token id chosen so each seq starts on its own branch.
+                    token_id: sid as i32,
+                    finished: false,
+                }],
+                assigned_indices: vec![AssignedIndices {
+                    sequence_id: sid,
+                    base: ((sid - 101) * 8) as u32,
+                    len: 8,
+                }],
+            };
+            engine.handle_step_output_llm(codec.encode(&out)?).await?;
+        }
+        assert_eq!(engine.kv_budget.outstanding(), 24, "3*8=24 reserved");
+        assert_eq!(engine.radix.token_count(), 24);
+        assert_eq!(engine.radix.lru_len_estimate(), 0, "no chains finished yet");
+
+        // ── 2. Finish seq 102 — its 8 slots must enter LRU. ──
+        let finish_out = StepOutput {
+            prefill_done: vec![],
+            tokens: vec![GeneratedToken {
+                sequence_id: 102,
+                token_id: 999,
+                finished: true,
+            }],
+            assigned_indices: vec![AssignedIndices {
+                sequence_id: 102,
+                base: 16, // append one more slot for the final token
+                len: 1,
+            }],
+        };
+        engine.handle_step_output_llm(codec.encode(&finish_out)?).await?;
+        assert_eq!(
+            engine.kv_budget.outstanding(),
+            25,
+            "24 + 1 final-token slot"
+        );
+        // Seq 102 chain (9 slots) should now be in LRU.
+        assert!(engine.radix.lru_len_estimate() >= 1);
+
+        // ── 3. Eviction recovers exactly the 9 slots seq 102 owned. ──
+        let freed = engine.radix.evict(100);
+        assert_eq!(freed.len(), 9, "seq 102 had 9 slots total");
+        let mut sorted = freed.clone();
+        sorted.sort_unstable();
+        // Seq 102 used [8..16) and [16..17).
+        assert_eq!(sorted, vec![8, 9, 10, 11, 12, 13, 14, 15, 16]);
+
+        // ── 4. After release, capacity returns to its pre-finish level. ──
+        engine.kv_budget.release(freed.len() as u32);
+        assert_eq!(
+            engine.kv_budget.outstanding(),
+            16,
+            "25 reserved − 9 freed = 16"
+        );
+
+        // ── 5. New seq 104 with 16 slots fits exactly into the headroom. ──
+        let out104 = StepOutput {
+            prefill_done: vec![],
+            tokens: vec![GeneratedToken {
+                sequence_id: 104,
+                token_id: 7,
+                finished: false,
+            }],
+            assigned_indices: vec![AssignedIndices {
+                sequence_id: 104,
+                base: 100,
+                len: 16,
+            }],
+        };
+        engine.handle_step_output_llm(codec.encode(&out104)?).await?;
+        assert_eq!(engine.kv_budget.outstanding(), 32, "exactly at capacity");
+        // Engine-level cycle confirmed: account → mark finished → evict →
+        // reuse capacity. This is the substrate Phase 7B's worker rewrite
+        // will hook into.
+        Ok(())
+    }
+

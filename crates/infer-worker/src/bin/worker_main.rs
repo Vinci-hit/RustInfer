@@ -31,10 +31,15 @@ use infer_protocol::scheduler_to_worker_control::{SchedulerControlMessage, Grant
 use infer_protocol::scheduler_to_worker_data::{
     BatchCommand, PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
 };
-use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerControlMessage, NeedBlocks, NeedBlocksReason};
-use infer_protocol::worker_to_scheduler_data::{DiffusionBatchOutput, GeneratedToken, StepOutput};
+use infer_protocol::worker_to_scheduler_control::{
+    NeedBlocks, NeedBlocksReason, WorkerCapacity, WorkerControlMessage, WorkerStepError,
+};
+use infer_protocol::worker_to_scheduler_data::{
+    AssignedIndices, DiffusionBatchOutput, GeneratedToken, StepOutput,
+};
 
 use infer_worker::application::model_runner::{ModelRunner, SeqStep};
+use infer_worker::domain::global_kv_alloc::GlobalKvAllocator;
 use infer_worker::domain::ports::OpResult;
 use infer_worker::infrastructure::cuda::Cuda;
 use infer_worker::infrastructure::io::SafetensorsReader;
@@ -85,8 +90,12 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     max_seq_len: usize,
 
-    /// Paged KV block size (must match scheduler).
-    #[arg(long, default_value_t = 16)]
+    /// Paged KV block size. Locked to 1 by the worker-owned
+    /// `GlobalKvAllocator` design: every token occupies one slot in the
+    /// global KV pool, so `block_table[seq][i]` is exactly the i-th token's
+    /// global index. Kept as a CLI knob for diagnostics only — production
+    /// must use 1.
+    #[arg(long, default_value_t = 1)]
     block_size: usize,
 
     /// Number of physical paged blocks. If 0, derived from max_batch_seqs * max_seq_len.
@@ -433,6 +442,15 @@ where
     eprintln!("[serve] heartbeat interval = {:?}", heartbeat_interval);
     let mut last_heartbeat = Instant::now();
     let mut active: HashMap<u64, ActiveSeq> = HashMap::new();
+    // Phase 7B: worker-owned global KV-slot allocator. With block_size=1,
+    // `num_blocks` == total token-slot capacity. The legacy +1 scratch
+    // block stays reserved on the runner side; the allocator tracks only
+    // the visible `num_blocks` indices the scheduler sees.
+    let mut kv_allocator = GlobalKvAllocator::new(num_blocks as u32);
+    eprintln!(
+        "[serve] worker-owned KV allocator: total={} (block_size={})",
+        num_blocks, bs.block_size,
+    );
     let mut profile_step_count: u32 = 0;
     let mut profile_started = false;
 
@@ -446,19 +464,31 @@ where
                         return Ok(());
                     }
                     SchedulerControlMessage::Cancel(c) => {
-                        if active.remove(&c.sequence_id).is_some() {
+                        if let Some(removed) = active.remove(&c.sequence_id) {
+                            // Phase 7B: cancelled seq's KV slots return to
+                            // the allocator immediately. Scheduler also
+                            // calls `mark_finished_chain` on its end so
+                            // the radix tree won't surface them in
+                            // `FreeKvIndices` later.
+                            if !removed.block_table.is_empty() {
+                                kv_allocator.free(&removed.block_table);
+                            }
                             eprintln!("[serve] cancelled seq {}", c.sequence_id);
                         }
                     }
-                    SchedulerControlMessage::GrantBlocks(grant) => {
-                        if let Some(seq) = active.get_mut(&grant.sequence_id) {
-                            seq.block_table.extend(grant.block_ids.iter().copied());
-                            seq.block_requested = false;
+                    // Phase 7B: scheduler tells us which global KV indices
+                    // to release back to the allocator (driven by RadixTree
+                    // LRU eviction). Worker is purely passive here.
+                    SchedulerControlMessage::FreeKvIndices(free) => {
+                        if !free.indices.is_empty() {
+                            kv_allocator.free(&free.indices);
                         }
                     }
-                    SchedulerControlMessage::GrantBlocksDenied(denied) => {
-                        active.remove(&denied.sequence_id);
-                    }
+                    // Legacy `GrantBlocks{,Denied}` arrives only from a
+                    // pre-Phase-4 scheduler. Worker no longer requests
+                    // blocks, so these are now no-ops on the new path.
+                    SchedulerControlMessage::GrantBlocks(_) => {}
+                    SchedulerControlMessage::GrantBlocksDenied(_) => {}
                     SchedulerControlMessage::Ping => {
                         let _ = control.send(WorkerControlMessage::Pong, _req_id);
                     }
@@ -495,60 +525,55 @@ where
         }
 
         for cmd in pending_prefills {
-            if let Err(e) = handle_prefill(&mut runner, &cmd, &mut active, data, eos_ids) {
+            if let Err(e) = handle_prefill(
+                &mut runner,
+                &cmd,
+                &mut active,
+                &mut kv_allocator,
+                control,
+                data,
+                eos_ids,
+            ) {
                 eprintln!("[serve] prefill error: {}", e);
             }
         }
 
         if !active.is_empty() {
-            // Async: request blocks for seqs approaching capacity (non-blocking).
-            request_blocks_if_needed(&mut active, control);
+            // Phase 7B: no more `NeedBlocks` round-trips. The worker-owned
+            // GlobalKvAllocator hands out slots inline at decode time; the
+            // scheduler's KvBudget is what gates total outstanding capacity.
+            // If the allocator runs out (which shouldn't happen because the
+            // scheduler reserved capacity before sending the batch), the
+            // decode step itself will fail and we surface that as an error.
 
-            // If any seq can decode, do it. Otherwise wait for grants.
-            let any_runnable = active.values().any(|s| s.has_block_space());
-            if any_runnable {
-                // Profiler: start on first decode step
-                if let Some(max_steps) = profile_cuda_steps {
-                    if !profile_started {
-                        unsafe { cudaProfilerStart(); }
-                        profile_started = true;
-                        eprintln!("[profile] cudaProfilerStart (will stop after {} steps)", max_steps);
-                    }
+            // Profiler: start on first decode step
+            if let Some(max_steps) = profile_cuda_steps {
+                if !profile_started {
+                    unsafe { cudaProfilerStart(); }
+                    profile_started = true;
+                    eprintln!("[profile] cudaProfilerStart (will stop after {} steps)", max_steps);
                 }
+            }
 
-                if let Err(e) = run_decode_step(&mut runner, &mut active, data, eos_ids) {
-                    eprintln!("[serve] decode error: {}", e);
-                }
+            if let Err(e) = run_decode_step(
+                &mut runner,
+                &mut active,
+                &mut kv_allocator,
+                control,
+                data,
+                eos_ids,
+            ) {
+                eprintln!("[serve] decode error: {}", e);
+            }
 
-                // Profiler: stop after N steps and exit
-                if let Some(max_steps) = profile_cuda_steps {
-                    if profile_started {
-                        profile_step_count += 1;
-                        if profile_step_count >= max_steps {
-                            unsafe { cudaProfilerStop(); }
-                            eprintln!("[profile] cudaProfilerStop after {} steps. Exiting.", profile_step_count);
-                            return Ok(());
-                        }
-                    }
-                }
-            } else {
-                // All seqs waiting for blocks — drain all pending grants from control.
-                loop {
-                    match control.try_recv(20) {
-                        Ok(Some((SchedulerControlMessage::GrantBlocks(grant), _))) => {
-                            if let Some(seq) = active.get_mut(&grant.sequence_id) {
-                                seq.block_table.extend(grant.block_ids.iter().copied());
-                                seq.block_requested = false;
-                            }
-                        }
-                        Ok(Some((SchedulerControlMessage::GrantBlocksDenied(denied), _))) => {
-                            active.remove(&denied.sequence_id);
-                        }
-                        Ok(Some((SchedulerControlMessage::Shutdown, _))) => return Ok(()),
-                        Ok(Some((SchedulerControlMessage::Cancel(c), _))) => {
-                            active.remove(&c.sequence_id);
-                        }
-                        _ => break, // no more messages or timeout
+            // Profiler: stop after N steps and exit
+            if let Some(max_steps) = profile_cuda_steps {
+                if profile_started {
+                    profile_step_count += 1;
+                    if profile_step_count >= max_steps {
+                        unsafe { cudaProfilerStop(); }
+                        eprintln!("[profile] cudaProfilerStop after {} steps. Exiting.", profile_step_count);
+                        return Ok(());
                     }
                 }
             }
@@ -572,38 +597,163 @@ fn maybe_heartbeat(
 }
 
 /// Run one prefill batch (one PrefillBatchCmd = potentially many segments).
+///
+/// Phase 7B: each segment's KV slots come from the worker-owned
+/// `GlobalKvAllocator`, not from `seg.block_table` (which is now ignored on
+/// the new path). Optional `seg.prefix_hint` is prepended verbatim — those
+/// slots already hold valid KV from a previous request and we trust the
+/// scheduler not to evict them mid-step (RadixTree pinning, plan §3).
+///
+/// On success the resulting `StepOutput` carries `assigned_indices` so the
+/// scheduler can extend its RadixTree chain for each seq.
 fn handle_prefill<M>(
     runner: &mut ModelRunner<bf16, Cuda, M>,
     cmd: &PrefillBatchCmd,
     active: &mut HashMap<u64, ActiveSeq>,
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
     data: &DataPump,
     eos_ids: &[i32],
 ) -> OpResult<()>
 where
     M: infer_worker::domain::model::LlmModel<bf16, Cuda>,
 {
-    let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
+    // 1. Compute total new KV slots and allocate one contiguous range.
+    let mut per_seg_new_tokens: Vec<u32> = Vec::with_capacity(cmd.segments.len());
+    let mut per_seg_prefix_hint: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
+    let mut total_new: u32 = 0;
     for (i, seg) in cmd.segments.iter().enumerate() {
-        let range = cmd.segment_token_range(i);
-        let prompt = cmd.input_ids[range].to_vec();
-        let positions: Vec<i32> =
-            (seg.segment_start as i32..seg.segment_end as i32).collect();
-        steps.push(SeqStep {
-            input_ids: prompt,
-            positions,
-            kv_write_start: seg.segment_start as i32,
-            kv_len_after: seg.segment_end as i32,
-            block_table: seg.block_table.clone(),
-        });
+        let seg_len = (seg.segment_end - seg.segment_start) as u32;
+        let prefix_hit = seg
+            .prefix_hint
+            .as_ref()
+            .map(|h| h.len() as u32)
+            .unwrap_or(0);
+        // We write KV for every token in the segment that is NOT covered by
+        // a prefix hint. For segments past `segment_start > 0`, the prefix
+        // is by construction earlier than `segment_start`, so all tokens in
+        // this segment are fresh.
+        let new_tokens = if seg.segment_start == 0 {
+            seg_len.saturating_sub(prefix_hit)
+        } else {
+            seg_len
+        };
+        per_seg_new_tokens.push(new_tokens);
+        per_seg_prefix_hint.push(seg.prefix_hint.clone().unwrap_or_default());
+        total_new = total_new.saturating_add(new_tokens);
+        let _ = i;
     }
+
+    let base_indices = match kv_allocator.alloc_indices(total_new) {
+        Ok(v) => v,
+        Err(e) => {
+            // Capacity starvation. Surface every seq in this batch to the
+            // scheduler as a non-fatal step error so the scheduler can fail
+            // them fast (HTTP 500) instead of letting clients sit on
+            // 120-second timeouts. Caller is also responsible for NOT
+            // installing any of these into `active` (we never inserted
+            // since we returned before `commit_step`).
+            eprintln!("[serve] prefill alloc failed: {}", e);
+            let failed_ids: Vec<u64> =
+                cmd.segments.iter().map(|s| s.sequence_id).collect();
+            let _ = control.send(
+                WorkerControlMessage::StepError(WorkerStepError {
+                    sequence_ids: failed_ids,
+                    message: format!("worker KV pool exhausted: {}", e),
+                    fatal: false,
+                }),
+                infer_protocol::control_envelope::RequestId(0),
+            );
+            return Ok(());
+        }
+    };
+
+    // 2. Build SeqStep per segment, attaching the freshly-allocated indices.
+    let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
+    let mut per_seg_indices: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
+    let mut idx_cursor = 0usize;
+    for (i, seg) in cmd.segments.iter().enumerate() {
+        let new_tokens = per_seg_new_tokens[i] as usize;
+        let prefix = &per_seg_prefix_hint[i];
+        let range = cmd.segment_token_range(i);
+        // For the first segment of a fresh prompt we skip the prefix-hit
+        // input tokens (their KV is already on the worker). Continuation
+        // chunks (segment_start > 0) feed all their tokens.
+        let (input_ids, positions): (Vec<i32>, Vec<i32>) = if seg.segment_start == 0 && !prefix.is_empty() {
+            let prefix_len = prefix.len();
+            let prompt = &cmd.input_ids[range.clone()];
+            let trimmed: Vec<i32> = prompt.iter().skip(prefix_len).copied().collect();
+            let positions: Vec<i32> =
+                ((prefix_len as i32)..(prefix_len as i32 + trimmed.len() as i32)).collect();
+            (trimmed, positions)
+        } else {
+            let prompt = cmd.input_ids[range.clone()].to_vec();
+            let positions: Vec<i32> =
+                (seg.segment_start as i32..seg.segment_end as i32).collect();
+            (prompt, positions)
+        };
+
+        // block_table = prefix_hint ++ allocated indices
+        let new_indices: Vec<u32> = base_indices[idx_cursor..idx_cursor + new_tokens].to_vec();
+        idx_cursor += new_tokens;
+        let mut block_table: Vec<u32> = Vec::with_capacity(prefix.len() + new_tokens);
+        block_table.extend_from_slice(prefix);
+        block_table.extend_from_slice(&new_indices);
+
+        let kv_write_start = block_table.len() as i32 - new_tokens as i32; // == prefix_len
+        let kv_len_after = block_table.len() as i32;
+        steps.push(SeqStep {
+            input_ids,
+            positions,
+            kv_write_start,
+            kv_len_after,
+            block_table,
+        });
+        per_seg_indices.push(new_indices);
+    }
+    debug_assert_eq!(idx_cursor, total_new as usize);
+
+    // 3. Run forward.
     let first_tokens = runner.step_batch(&steps)?;
 
-    let mut output = StepOutput { prefill_done: Vec::new(), tokens: Vec::new() };
+    // 4. Build StepOutput including assigned_indices.
+    // Build assigned_indices: one entry per contiguous run within each seq's
+    // allocated indices. `alloc_indices` may return non-contiguous indices
+    // when the free pool is fragmented; `AssignedIndices{base,len}` only
+    // describes contiguous runs, so we emit multiple entries per seq when
+    // needed.
+    let mut assigned: Vec<AssignedIndices> = Vec::new();
+    for (i, seg) in cmd.segments.iter().enumerate() {
+        let indices = &per_seg_indices[i];
+        if indices.is_empty() {
+            continue;
+        }
+        let mut run_start = 0usize;
+        while run_start < indices.len() {
+            let mut run_end = run_start + 1;
+            while run_end < indices.len() && indices[run_end] == indices[run_end - 1] + 1 {
+                run_end += 1;
+            }
+            let len = (run_end - run_start) as u32;
+            assigned.push(AssignedIndices {
+                sequence_id: seg.sequence_id,
+                base: indices[run_start],
+                len: len.min(u16::MAX as u32) as u16,
+            });
+            run_start = run_end;
+        }
+    }
+
+    let mut output = StepOutput {
+        prefill_done: Vec::new(),
+        tokens: Vec::new(),
+        assigned_indices: assigned,
+    };
     for (i, seg) in cmd.segments.iter().enumerate() {
         let token = first_tokens[i];
+        let new_indices = &per_seg_indices[i];
         match seg.completion {
             PrefillSegmentCompletion::ContinuePrefill => {
-                // KV-only chunked prefill segment; not finishing the seq.
                 output.prefill_done.push(seg.sequence_id);
             }
             PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
@@ -615,7 +765,22 @@ where
                     finished,
                 });
                 if !finished {
-                    active.insert(seg.sequence_id, ActiveSeq::from_segment(seg, token));
+                    let prefix = &per_seg_prefix_hint[i];
+                    let mut bt: Vec<u32> = Vec::with_capacity(prefix.len() + new_indices.len());
+                    bt.extend_from_slice(prefix);
+                    bt.extend_from_slice(new_indices);
+                    let kv_len = bt.len();
+                    active.insert(seg.sequence_id, ActiveSeq {
+                        sequence_id: seg.sequence_id,
+                        last_token: token,
+                        kv_len,
+                        block_table: bt,
+                        block_size: 1,
+                        max_tokens: seg.max_tokens,
+                        generated_count: 1,
+                        sampling: seg.sampling_params.clone(),
+                        block_requested: false,
+                    });
                 }
             }
         }
@@ -652,9 +817,16 @@ fn request_blocks_if_needed(
 }
 
 /// Run one decode iteration over all active seqs in a single batched step.
+///
+/// Phase 7B: each step allocates one contiguous range from the worker-owned
+/// allocator (`alloc_segment(N)` where N = #active seqs), distributes one
+/// slot to each seq, and emits `assigned_indices` so the scheduler can
+/// extend its RadixTree chains.
 fn run_decode_step<M>(
     runner: &mut ModelRunner<bf16, Cuda, M>,
     active: &mut HashMap<u64, ActiveSeq>,
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
     data: &DataPump,
     eos_ids: &[i32],
 ) -> OpResult<()>
@@ -664,35 +836,81 @@ where
     if active.is_empty() {
         return Ok(());
     }
-    // Build steps in a stable order, skipping sequences that have no block space.
-    let mut order: Vec<u64> = active.keys().copied()
-        .filter(|sid| active[sid].has_block_space())
-        .collect();
+    let mut order: Vec<u64> = active.keys().copied().collect();
     order.sort_unstable();
     if order.is_empty() {
-        return Ok(()); // all sequences waiting for blocks
+        return Ok(());
     }
+
+    // Allocate one slot per active seq. Using alloc_indices (vs alloc_segment)
+    // means we degrade gracefully when the free pool is fragmented — decode
+    // doesn't need contiguous slots either.
+    let n = order.len() as u32;
+    let new_indices = match kv_allocator.alloc_indices(n) {
+        Ok(v) => v,
+        Err(e) => {
+            // Decode KV starvation: every active seq tried to extend by
+            // one slot and at least one couldn't fit. Report all active
+            // seqs as failed; the scheduler fails them, frees their
+            // chains in RadixTree on the next admission round, and the
+            // worker's allocator gets the slots back via FreeKvIndices.
+            eprintln!("[serve] decode alloc failed: {}", e);
+            let failed_ids: Vec<u64> = order.clone();
+            let _ = control.send(
+                WorkerControlMessage::StepError(WorkerStepError {
+                    sequence_ids: failed_ids,
+                    message: format!("worker KV pool exhausted at decode: {}", e),
+                    fatal: false,
+                }),
+                infer_protocol::control_envelope::RequestId(0),
+            );
+            // Drop these seqs from `active` so we don't keep retrying.
+            // Their block_table slots are eventually reclaimed via
+            // scheduler-side mark_finished_chain → FreeKvIndices.
+            for sid in &order {
+                let _ = active.remove(sid);
+            }
+            return Ok(());
+        }
+    };
+
     let mut steps: Vec<SeqStep> = Vec::with_capacity(order.len());
-    for &sid in &order {
-        let seq = &active[&sid];
+    let mut assigned: Vec<AssignedIndices> = Vec::with_capacity(order.len());
+    for (i, &sid) in order.iter().enumerate() {
+        let new_idx = new_indices[i];
+        let seq = active.get_mut(&sid).unwrap();
+        // Build block_table = current history ++ new slot.
+        let mut bt = seq.block_table.clone();
+        bt.push(new_idx);
         steps.push(SeqStep {
             input_ids: vec![seq.last_token],
             positions: vec![seq.kv_len as i32],
             kv_write_start: seq.kv_len as i32,
             kv_len_after: (seq.kv_len + 1) as i32,
-            block_table: seq.block_table.clone(),
+            block_table: bt,
+        });
+        assigned.push(AssignedIndices {
+            sequence_id: sid,
+            base: new_idx,
+            len: 1,
         });
     }
     let new_tokens = runner.step_batch_with_graph(&steps)?;
 
-    let mut output = StepOutput { prefill_done: Vec::new(), tokens: Vec::new() };
+    let mut output = StepOutput {
+        prefill_done: Vec::new(),
+        tokens: Vec::new(),
+        assigned_indices: assigned,
+    };
     let mut to_remove: Vec<u64> = Vec::new();
     for (i, &sid) in order.iter().enumerate() {
         let token = new_tokens[i];
+        let new_idx = new_indices[i];
         let seq = active.get_mut(&sid).unwrap();
         seq.last_token = token;
         seq.kv_len += 1;
         seq.generated_count += 1;
+        seq.block_table.push(new_idx);
         let finished = eos_ids.contains(&token) || seq.generated_count >= seq.max_tokens;
         output.tokens.push(GeneratedToken {
             sequence_id: sid,
@@ -703,8 +921,11 @@ where
             to_remove.push(sid);
         }
     }
-    for sid in to_remove {
-        active.remove(&sid);
+    for sid in &to_remove {
+        // On finish the scheduler will issue a `FreeKvIndices` after its
+        // RadixTree LRU evicts the chain. Worker keeps the `block_table`
+        // pinned in `active.remove`'s drop until then.
+        let _ = active.remove(sid);
     }
     let _ = data.send_step_output(&output);
     Ok(())

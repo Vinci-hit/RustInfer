@@ -576,6 +576,45 @@ impl RequestTable {
         Ok(seq)
     }
 
+    /// Phase 7A: preempt a Decoding session and re-queue it at the front
+    /// of the waiting queue. Generated tokens are dropped; prompt is
+    /// preserved via `Arc<RequestMeta>` so the next iteration can re-prefill
+    /// (cheaply, ideally via a RadixTree prefix hit).
+    ///
+    /// The legacy `KvLease` carried by `Decoding` is consumed and dropped
+    /// here; in the new path the worker's slots are released by the
+    /// scheduler's `FreeKvIndices` after admission has already called
+    /// `RadixTree::mark_finished_chain`.
+    pub fn preempt_decoding_to_starved(
+        &mut self,
+        sequence_id: SequenceId,
+    ) -> Result<()> {
+        let key = self.decoding_key(sequence_id)?;
+        let seq = self.decoding.remove(key).ok_or_else(|| {
+            SchedulerError::Internal(format!(
+                "decoding slot vanished on preempt: {}",
+                sequence_id
+            ))
+        })?;
+        let request_id = seq.meta.id.clone();
+        // Drop the lease (legacy block-pool returns blocks via Drop sink).
+        let (starved, _lease) = seq.preempt_to_starved();
+        // Lift back to Queued and push to waiting queue front. The address
+        // bookkeeping is mirrored on the `restore_waiting_front` API which
+        // expects the by_request → sequence_id index to still be present;
+        // we never removed it from `by_request` (only `decoding`), so the
+        // re-queue path is straight.
+        let queued = starved.requeue();
+        // The session was registered as Bucket::Decoding; flip it to
+        // Bucket::Waiting before pushing.
+        self.locations
+            .insert(sequence_id, Address::waiting());
+        self.waiting.push_front(queued);
+        debug_assert!(self.validate_consistency().is_ok());
+        let _ = request_id;
+        Ok(())
+    }
+
     pub fn running_sequence_ids(&self) -> Vec<SequenceId> {
         self.prefilling
             .values()

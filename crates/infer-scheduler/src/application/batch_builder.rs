@@ -177,6 +177,10 @@ impl BatchBuilder {
                 } else {
                     PrefillSegmentCompletion::ContinuePrefill
                 },
+                // Phase 4 — RadixTree-driven prefix hint. Phase 6 will populate
+                // this from `RadixTree::lookup_prefix`. Until then the legacy
+                // `block_table` path carries all KV addressing information.
+                prefix_hint: None,
             });
         }
 

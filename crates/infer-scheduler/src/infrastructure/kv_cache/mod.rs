@@ -12,9 +12,11 @@
 pub mod block_allocator;
 pub mod block_table;
 pub mod radix_tree;
+pub mod radix_tree_v2;
 pub mod traits;
 
 pub use block_allocator::PagedBlockAllocator;
 pub use block_table::BlockTable;
 pub use radix_tree::RadixTreeCache;
+pub use radix_tree_v2::{GlobalIndex as TokenSlotIndex, NodeState, PrefixHit, RadixTree, SeqId as RadixSeqId};
 pub use traits::{BlockAllocator, CacheStrategy, PhysicalBlockId, PrefixMatch};

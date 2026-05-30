@@ -27,16 +27,30 @@ pub struct PrefillBatchCmd {
     pub segments: Vec<PrefillSegmentMeta>,
 }
 
-/// Per-segment KV placement (paged-only).
+/// Per-segment KV placement.
 ///
-/// `block_table` is the list of physical block ids assigned by the scheduler;
-/// `block_size` is the token count per block.
+/// **Legacy (Phase ≤ 6)**: `block_table` carries scheduler-assigned physical
+/// block ids. Worker reads the prompt at `block_table[i / block_size][i %
+/// block_size]`. Will be removed in Phase 7 once the worker-owned
+/// `GlobalKvAllocator` is the sole authority on KV slot ids.
+///
+/// **New path (Phase ≥ 4)**: `prefix_hint` carries the prefix-cache hit. If
+/// `Some(indices)`, the first `indices.len()` tokens of the segment have
+/// already been written to the worker's global KV pool at those indices, so
+/// the worker should skip them on the data-plane side and prepend them to the
+/// final `block_table` instead. The remaining tokens get their slots from
+/// `GlobalKvAllocator::alloc_segment` at step time. `None` ⇒ no hit, write
+/// the full segment fresh.
+///
+/// During the transition, both fields coexist; the worker prefers
+/// `prefix_hint` when its allocator has been attached, and falls back to the
+/// legacy `block_table` path otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefillSegmentMeta {
     pub sequence_id: u64,
-    /// Paged KV block table for this sequence.
+    /// Paged KV block table for this sequence (legacy path).
     pub block_table: Vec<u32>,
-    /// Tokens per paged block.
+    /// Tokens per paged block (legacy path; Phase 7 removes this).
     pub block_size: u32,
     pub prompt_len: u32,
     pub segment_start: u32,
@@ -44,6 +58,12 @@ pub struct PrefillSegmentMeta {
     pub max_tokens: usize,
     pub sampling_params: SamplingParams,
     pub completion: PrefillSegmentCompletion,
+    /// Prefix-cache hit (new path). Length is the number of leading prompt
+    /// tokens already cached on the worker; values are global KV indices
+    /// into the worker's `GlobalKvAllocator` pool. `None` ⇒ no hit. Default
+    /// is `None` so legacy scheduler builds compile against new worker.
+    #[serde(default)]
+    pub prefix_hint: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

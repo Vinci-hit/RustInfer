@@ -68,6 +68,19 @@ pub enum BlockGrantDeniedReason {
     WorkerNotReady,
 }
 
+/// Scheduler asking the worker to release a batch of global KV indices back
+/// to its `GlobalKvAllocator` free pool. Sent in response to RadixTree LRU
+/// eviction; worker is purely passive — it never decides which indices to
+/// free.
+///
+/// Indices need not be contiguous; the worker's `GlobalKvAllocator::free`
+/// sorts and coalesces adjacent runs into the free-range list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreeKvIndices {
+    pub model_instance_id: String,
+    pub indices: Vec<u32>,
+}
+
 /// Cancel an in-flight sequence. Migrated from the data plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelSequence {
@@ -106,6 +119,9 @@ pub enum SchedulerControlMessage {
     // ── runtime: KV grants ──
     GrantBlocks(GrantBlocks),
     GrantBlocksDenied(GrantBlocksDenied),
+    /// Phase 4: scheduler asks worker to free a batch of global KV indices
+    /// back to its allocator (driven by RadixTree LRU eviction).
+    FreeKvIndices(FreeKvIndices),
 
     // ── runtime: lifecycle ──
     Cancel(CancelSequence),

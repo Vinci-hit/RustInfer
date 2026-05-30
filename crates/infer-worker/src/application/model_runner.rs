@@ -93,6 +93,30 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
                 block_size * max_blocks_per_seq, max_seq_len,
             )));
         }
+        if block_size != 1 {
+            // The worker-owned `GlobalKvAllocator` (Phase 1) and the new
+            // RadixTree handle (Phase 5) both rely on
+            // `block_table[seq][i]` being the i-th token's global KV index,
+            // which only holds when block_size == 1. Other values still
+            // *function* (the kernels do `pos / block_size` either way), but
+            // the upper-layer invariants break.
+            tracing::warn!(
+                "ModelRunner: block_size={} != 1 — outside the documented worker-owned KV path",
+                block_size,
+            );
+        }
+        if block_size != 1 {
+            // The worker-owned `GlobalKvAllocator` (Phase 1) and the new
+            // RadixTree handle (Phase 5) both rely on
+            // `block_table[seq][i]` being the i-th token's global KV index,
+            // which only holds when block_size == 1. Other values still
+            // *function* (the kernels do `pos / block_size` either way), but
+            // the upper-layer invariants break.
+            tracing::warn!(
+                "ModelRunner: block_size={} != 1 — outside the documented worker-owned KV path",
+                block_size,
+            );
+        }
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             let k = D::alloc_tensor::<T>(

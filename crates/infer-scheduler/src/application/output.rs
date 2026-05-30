@@ -30,7 +30,9 @@ use infer_protocol::scheduler_to_server::{
 };
 
 use crate::domain::kv_cache_pool::{KvCachePool, KvLease};
+use crate::domain::kv_budget::KvBudget;
 use crate::error::Result;
+use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
 use crate::infrastructure::metrics::MetricsRecorder;
 use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::{Decoding, FinishReason, InferenceSession, Prefilling};
@@ -252,6 +254,83 @@ impl OutputProcessingSystem {
         kv_lease: KvLease,
     ) {
         kv.free_finished(prompt_tokens, kv_lease);
+    }
+
+    /// Feed Phase 4 `StepOutput.assigned_indices` into the scheduler-side
+    /// `RadixTree` + `KvBudget`. Idempotent on `assigned_indices.is_empty()`,
+    /// so legacy (Phase ≤ 3) StepOutput payloads are a no-op.
+    ///
+    /// **Per-seq multi-segment correctness (Phase 7B-1)**: when the worker's
+    /// `GlobalKvAllocator` is fragmented it returns non-contiguous indices,
+    /// which the worker emits as multiple `AssignedIndices` entries with the
+    /// same `sequence_id`. We must feed every entry's slots into the radix
+    /// tree, not just the last one — earlier code keyed a HashMap by
+    /// `sequence_id` and silently dropped duplicates, causing 60% of slots
+    /// to be lost from scheduler-side accounting and starving subsequent
+    /// `evict()` calls.
+    pub fn feed_radix_assigned_indices(
+        &self,
+        radix: &mut RadixTree,
+        budget: &mut KvBudget,
+        output: &infer_protocol::worker_to_scheduler_data::StepOutput,
+    ) {
+        let _ = budget; // engine reserves; we just append
+        if output.assigned_indices.is_empty() {
+            return;
+        }
+
+        // Build per-seq concatenated slot list: every AssignedIndices entry
+        // for a given seq contributes its `[base..base+len)` slots, in
+        // protocol order. Worker contract: order matches the seq's own
+        // chain extension order (i.e. the i-th slot in this list is the
+        // KV position for the i-th new token of that seq this step).
+        let mut by_seq: std::collections::HashMap<u64, Vec<u32>> =
+            std::collections::HashMap::new();
+        for a in &output.assigned_indices {
+            let entry = by_seq.entry(a.sequence_id).or_default();
+            for k in 0..a.len as u32 {
+                entry.push(a.base + k);
+            }
+        }
+
+        // Walk tokens in order and pair each with the next slot for its
+        // seq. We use a per-seq cursor to advance through the concatenated
+        // slot list as tokens come in.
+        let mut seq_cursor: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(by_seq.len());
+        for tk in &output.tokens {
+            let Some(slots) = by_seq.get(&tk.sequence_id) else {
+                continue;
+            };
+            let cursor = seq_cursor.entry(tk.sequence_id).or_insert(0);
+            if *cursor < slots.len() {
+                radix.append_token(tk.sequence_id, tk.token_id, slots[*cursor]);
+                *cursor += 1;
+            }
+        }
+        // Any remaining slots (e.g. prefill that wrote 100 KV slots but only
+        // produced one sample token) are appended with placeholder token id
+        // 0 — they represent prompt KV positions whose token ids we don't
+        // re-derive on the scheduler side. Prefix re-use will still work
+        // for the actual prefill path because `lookup_prefix` is driven by
+        // the new seq's prompt, not by the placeholder tokens.
+        for (sid, slots) in &by_seq {
+            let cursor = seq_cursor.entry(*sid).or_insert(0);
+            while *cursor < slots.len() {
+                radix.append_token(*sid, 0, slots[*cursor]);
+                *cursor += 1;
+            }
+        }
+    }
+
+    /// When a session terminates (success / fail / cancel / preempt), tell
+    /// the new RadixTree so its chain transitions to Finished and slots
+    /// become eligible for LRU eviction. Phase 6 path; legacy block-pool
+    /// path is unchanged.
+    ///
+    /// Idempotent on unknown seq ids.
+    pub fn radix_mark_finished(&self, radix: &mut RadixTree, sequence_id: u64) {
+        radix.mark_finished_chain(sequence_id);
     }
 
     /// Process one batch of worker step output (LLM mode).
