@@ -266,12 +266,12 @@ impl SubScheduler {
             return Err(BuildStepError::Empty);
         }
 
-        // ── 2. 一次性切一段连续全局索引 ──
-        let base = alloc
-            .alloc_segment(total_new)
+        // ── 2. Allocate `total_new` indices in one call (may span ranges). ──
+        let new_indices = alloc
+            .alloc_indices(total_new)
             .map_err(BuildStepError::AllocFull)?;
 
-        // ── 3+4+5. 切片 + 拼 block_table + 收集 new_segments ──
+        // ── 3+4+5. Slice + assemble block_table + collect new_segments ──
         let mut batch = StepBatch {
             input_tokens: Vec::with_capacity(total_q_tokens),
             q_start_loc: Vec::with_capacity(total_seqs + 1),
@@ -286,9 +286,35 @@ impl SubScheduler {
         batch.q_start_loc.push(0);
 
         let mut acc_tokens: usize = 0;
-        let mut next_idx: u32 = base;
+        let mut idx_cursor: usize = 0;
 
-        // -- decode 部分 --
+        // Helper: emit one or more NewSegments for a seq's slice of
+        // `new_indices`. Splits at every discontinuity so each NewSegment
+        // is a contiguous run.
+        fn push_runs(
+            out: &mut Vec<NewSegment>,
+            seq_id: u64,
+            slots: &[u32],
+        ) {
+            if slots.is_empty() {
+                return;
+            }
+            let mut run_start = 0usize;
+            while run_start < slots.len() {
+                let mut run_end = run_start + 1;
+                while run_end < slots.len() && slots[run_end] == slots[run_end - 1] + 1 {
+                    run_end += 1;
+                }
+                out.push(NewSegment {
+                    sequence_id: seq_id,
+                    base: slots[run_start],
+                    len: (run_end - run_start) as u32,
+                });
+                run_start = run_end;
+            }
+        }
+
+        // -- decode part --
         for &di in &order_decode {
             let seq = &self.active_decodes[di];
             batch.input_tokens.push(seq.last_token);
@@ -298,24 +324,21 @@ impl SubScheduler {
             batch.sequence_ids.push(seq.sequence_id);
             batch.kv_lens.push(seq.kv_len);
 
-            // block_table = 已存的历史 ++ 本步新分配的 1 个索引
+            let new_idx = new_indices[idx_cursor];
+            idx_cursor += 1;
+
+            // block_table = stored history ++ this step's 1 slot.
             let mut bt = Vec::with_capacity(seq.block_table.len() + 1);
             bt.extend_from_slice(&seq.block_table);
-            bt.push(next_idx);
+            bt.push(new_idx);
             batch.block_tables.push(bt);
 
-            batch.new_segments.push(NewSegment {
-                sequence_id: seq.sequence_id,
-                base: next_idx,
-                len: 1,
-            });
-            next_idx += 1;
+            push_runs(&mut batch.new_segments, seq.sequence_id, &[new_idx]);
         }
 
-        // -- prefill 部分 --
+        // -- prefill part --
         for pf in &order_prefill {
             let v = pf.v;
-            // 输入 token 跳过 prefix_hit 段（那部分 KV 已在 worker pool 中）。
             let pos_start = v.segment_start as usize + pf.prefix_hit;
             for tok in v.input_ids.iter().skip(pf.prefix_hit) {
                 batch.input_tokens.push(*tok);
@@ -326,29 +349,24 @@ impl SubScheduler {
             acc_tokens += pf.new_tokens;
             batch.q_start_loc.push(acc_tokens as i32);
             batch.sequence_ids.push(v.sequence_id);
-            // KV 已写入到 prefix_hit 处。
             batch.kv_lens.push(pos_start);
 
-            // block_table = prefix_hint(若有) ++ 本步新分配的 new_tokens 个
-            let new_seg_len = pf.new_tokens as u32;
+            // Take this seq's slice from the bulk-allocated index list.
+            let seq_slots = &new_indices[idx_cursor..idx_cursor + pf.new_tokens];
+            idx_cursor += pf.new_tokens;
+
+            // block_table = prefix_hint (if any) ++ this seq's new slots.
             let mut bt = Vec::with_capacity(pf.prefix_hit + pf.new_tokens);
             if let Some(hint) = v.prefix_hint.as_ref() {
                 bt.extend_from_slice(hint);
             }
-            for k in 0..new_seg_len {
-                bt.push(next_idx + k);
-            }
+            bt.extend_from_slice(seq_slots);
             batch.block_tables.push(bt);
 
-            batch.new_segments.push(NewSegment {
-                sequence_id: v.sequence_id,
-                base: next_idx,
-                len: new_seg_len,
-            });
-            next_idx += new_seg_len;
+            push_runs(&mut batch.new_segments, v.sequence_id, seq_slots);
         }
 
-        debug_assert_eq!(next_idx, base + total_new);
+        debug_assert_eq!(idx_cursor, total_new as usize);
         Ok(batch)
     }
 
