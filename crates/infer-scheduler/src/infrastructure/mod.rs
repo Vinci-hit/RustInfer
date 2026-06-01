@@ -6,10 +6,11 @@
 //! state lives here.
 //!
 //! Sub-modules:
-//! - `transport` (Step 19): frontend / worker / control plane I/O
-//! - `metrics`   (Step 19): Prometheus recorder + `MetricsHandle`
+//! - `kv_cache`  — scheduler-side prefix index over worker KV slots
+//! - `transport` — frontend / worker / control-plane I/O
+//! - `metrics`   — Prometheus recorder + `MetricsHandle`
 //!
-//! ## `MetricsHandle` (P3-H)
+//! ## `MetricsHandle`
 //!
 //! `MetricsHandle = Arc<MetricsRecorder>` is re-exported from this
 //! module so any application-layer System can carry its own clone

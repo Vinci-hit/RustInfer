@@ -1,7 +1,7 @@
 //! Worker → Scheduler **control plane** messages.
 //!
 //! Spans bootstrap (Hello/Progress/Ready/MemoryProfile/PagedKvReady) and
-//! runtime (Heartbeat, NeedBlocks, StepError, ACKs). Wrapped in
+//! runtime (Heartbeat, StepError, ACKs). Wrapped in
 //! [`crate::ControlEnvelope`] on the wire.
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,17 @@ pub struct WorkerHeartbeat {
     pub worker_id: String,
     pub state: WorkerState,
     pub active_requests: usize,
+    /// Total slots in the worker's `GlobalKvAllocator` (== `num_blocks`
+    /// when `block_size = 1`). The scheduler uses
+    /// `kv_free_slots / kv_total_slots` as the pressure signal that
+    /// drives RadixTree LRU eviction. Older snapshots that did not
+    /// carry these fields deserialize as 0 — which the scheduler reads
+    /// as "no signal, do nothing".
+    #[serde(default)]
+    pub kv_total_slots: u32,
+    /// Free slots in the same allocator (`total - outstanding`).
+    #[serde(default)]
+    pub kv_free_slots: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,25 +116,6 @@ pub struct PagedKvReady {
     pub bytes_allocated: u64,
 }
 
-/// Worker requesting more KV blocks for a sequence. Migrated from the
-/// data-plane `StepOutput.need_blocks` field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NeedBlocks {
-    pub worker_id: String,
-    pub model_instance_id: String,
-    pub sequence_id: u64,
-    pub current_blocks: u32,
-    pub required_blocks: u32,
-    pub request_blocks: u32,
-    pub reason: NeedBlocksReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NeedBlocksReason {
-    DecodeExtend,
-    PrefillExtend,
-}
-
 /// Per-step execution error. Migrated from `StepOutput.error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStepError {
@@ -155,8 +147,7 @@ pub struct UnloadAck {
 ///
 /// RPC replies (`Pong`, `CancelAck`, `DrainAck`, `UnloadAck`) carry the same
 /// `RequestId` as the originating scheduler message. Spontaneous events
-/// (`Heartbeat`, `NeedBlocks`, `StepError`, bootstrap progress) carry
-/// `RequestId::NONE`.
+/// (`Heartbeat`, `StepError`, bootstrap progress) carry `RequestId::NONE`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerControlMessage {
     // ── bootstrap ──
@@ -168,7 +159,6 @@ pub enum WorkerControlMessage {
 
     // ── runtime: spontaneous ──
     Heartbeat(WorkerHeartbeat),
-    NeedBlocks(NeedBlocks),
     StepError(WorkerStepError),
     Error(WorkerError),
 

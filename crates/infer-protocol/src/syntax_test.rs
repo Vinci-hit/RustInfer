@@ -41,7 +41,7 @@ fn test_protocol_types() {
     };
 }
 
-// ─── Phase 4 协议字段 round-trip ──────────────────────────────────────
+// ─── KV protocol field round-trip ────────────────────────────────────
 
 #[cfg(test)]
 mod phase4_kv_protocol {
@@ -88,10 +88,10 @@ mod phase4_kv_protocol {
 
     #[test]
     fn prefill_segment_meta_default_prefix_hint_is_none() {
-        // Old wire format (without prefix_hint field) must deserialize cleanly
-        // because of #[serde(default)].
-        // We construct the legacy-shaped value via direct serialization of an
-        // alternate type that omits the new field.
+        // Older wire formats (without `prefix_hint`) must deserialize cleanly
+        // because of `#[serde(default)]`. We construct the older-shaped
+        // value via direct serialization of an alternate type that omits
+        // the field.
         #[derive(serde::Serialize)]
         struct LegacySeg<'a> {
             sequence_id: u64,
@@ -119,9 +119,9 @@ mod phase4_kv_protocol {
             },
             completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
         };
-        let bytes = rmp_serde::to_vec(&legacy).expect("serialize legacy");
+        let bytes = rmp_serde::to_vec(&legacy).expect("serialize older shape");
         let parsed: PrefillSegmentMeta =
-            rmp_serde::from_slice(&bytes).expect("deserialize new from legacy bytes");
+            rmp_serde::from_slice(&bytes).expect("deserialize current from older bytes");
         assert!(parsed.prefix_hint.is_none());
         assert_eq!(parsed.block_table, vec![10, 11, 12]);
     }
@@ -149,12 +149,14 @@ mod phase4_kv_protocol {
 
     #[test]
     fn step_output_legacy_without_assigned_indices_deserializes() {
+        // Older wire shape omitted `assigned_indices`; current code deserializes
+        // it cleanly via `#[serde(default)]`.
         #[derive(serde::Serialize)]
         struct LegacyStep<'a> {
             prefill_done: &'a [u64],
             tokens: &'a [GeneratedToken],
         }
-        let legacy = LegacyStep {
+        let older = LegacyStep {
             prefill_done: &[3],
             tokens: &[GeneratedToken {
                 sequence_id: 3,
@@ -162,9 +164,9 @@ mod phase4_kv_protocol {
                 finished: true,
             }],
         };
-        let bytes = rmp_serde::to_vec(&legacy).expect("serialize legacy");
+        let bytes = rmp_serde::to_vec(&older).expect("serialize older shape");
         let parsed: StepOutput =
-            rmp_serde::from_slice(&bytes).expect("deserialize new from legacy");
+            rmp_serde::from_slice(&bytes).expect("deserialize current from older bytes");
         assert!(parsed.assigned_indices.is_empty());
         assert_eq!(parsed.prefill_done, vec![3]);
     }
@@ -189,11 +191,11 @@ mod phase4_kv_protocol {
 
     #[test]
     fn validate_passes_when_block_table_empty_but_prefix_hint_present() {
-        // In the new path the scheduler may emit `block_table: vec![]` and
-        // rely entirely on `prefix_hint` + worker-side allocation. The legacy
-        // validate() still rejects empty block_tables; that is intentional
-        // and will be relaxed in Phase 7. This test just pins down current
-        // behavior so the next phase has a clear target.
+        // The scheduler currently emits `block_table: vec![]` and relies
+        // entirely on `prefix_hint` + worker-side allocation, but
+        // `PrefillBatchCmd::validate()` still rejects empty block_tables.
+        // This test pins down that current behavior; relax `validate` if
+        // the field is ever removed from the wire.
         let cmd = PrefillBatchCmd {
             input_ids: vec![1, 2, 3],
             q_start_loc: vec![0],
@@ -214,8 +216,6 @@ mod phase4_kv_protocol {
                 prefix_hint: Some(vec![]),
             }],
         };
-        // Legacy validate: empty block_table is rejected. Phase 7 will
-        // remove this constraint along with the field itself.
         assert!(cmd.validate(8192, 16).is_err());
     }
 }

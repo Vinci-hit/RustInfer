@@ -1,62 +1,50 @@
 //! `ControlEventSystem` — interprets control-plane events.
 //!
-//! Step 16 ports engine's `on_control_event` + `handle_need_blocks`
-//! + `handle_worker_lost` + `handle_control_step_error` (~150 lines)
-//! into a single System. The crucial invariant (P1-B in the refactor
-//! plan) is **this System never touches `OutputProcessingSystem`** —
-//! it returns a [`ControlOutcome`] describing what session failures
-//! the orchestrator should drive next, and the orchestrator (i.e.
-//! `SchedulerEngine`) does the second-stage `output.fail_*` calls
-//! with a fresh borrow.
+//! Translates a single `ControlEvent` into a [`ControlOutcome`] the
+//! engine then dispatches. The System never touches
+//! [`crate::application::OutputProcessingSystem`] directly: it
+//! returns the list of failed `RequestId`s plus a fail message,
+//! and the engine drives `output.fail_sessions(...)` with a fresh
+//! borrow. Keeping the borrows disjoint means the engine can hold
+//! `&mut requests` here while later holding `&mut output` for the
+//! follow-up.
 //!
-//! ## Why P1-B matters
+//! ## What this System handles inline
 //!
-//! Today's engine drives `output.fail_decoding_session(...)` from
-//! within the control-event branch. That works in the current shape
-//! because all four fields (`output`, `frontend`, `kv_manager`,
-//! `requests`) live on the same struct. But once Steps 18-19 split
-//! the engine into thin orchestrator + Systems, the control branch
-//! cannot hold `&mut self.output` *and* `&mut self.requests` *and*
-//! `&mut self.kv_pool` simultaneously without re-aliasing through
-//! the engine. The `ControlOutcome` indirection breaks that knot
-//! ahead of time.
-//!
-//! ## What this System does itself
-//!
-//! - `NeedBlocks` → allocate decode KV blocks, extend the session's
-//!   block table, unicast `GrantBlocks` (or `GrantBlocksDenied`).
-//! - `Heartbeat` → trace-level log.
-//! - `WorkerError { fatal: false }` → error log, no failure.
+//! - `Heartbeat` → check the worker-reported KV pool free ratio;
+//!   when `kv_free_slots / kv_total_slots` falls below
+//!   `KV_LOW_WATER_RATIO`, evict RadixTree LRU leaves and ship a
+//!   `FreeKvIndices` control message back to the worker.
+//! - `WorkerError { fatal: false }` → error log, then `Continue`.
 //!
 //! ## What it returns to the orchestrator
 //!
-//! - `WorkerError { fatal: true }` →
-//!   `Terminate { lost: None, error }` (`lost` populated once
-//!   Step 18 introduces `WorkerNode<Ready>` on the engine).
+//! - `WorkerError { fatal: true }` → `Terminate { error }`.
 //! - `StepError` → `Continue { failed_request_ids, fail_message }`
-//!   (with `Terminate` follow-up if `err.fatal`).
-//! - `WorkerLost` → `Continue { failed_request_ids = all running,
-//!   fail_message: "..."}` plus `Terminate`.
-//!
-//! Right now the engine still has its own copies of the legacy
-//! handlers; Step 18 will delete those and route everything through
-//! `ControlEventSystem::handle()`.
+//!   if `!fatal`, else `Terminate`.
+//! - `WorkerLost` → `Terminate { error }` after collecting every
+//!   running session as failed.
 
 use std::marker::PhantomData;
 
-use infer_protocol::scheduler_to_worker_control::{
-    BlockGrantDeniedReason, GrantBlocks, GrantBlocksDenied, SchedulerControlMessage,
-};
-use infer_protocol::worker_to_scheduler_control::{NeedBlocks, WorkerStepError};
+use infer_protocol::worker_to_scheduler_control::WorkerStepError;
 
-use crate::domain::kv_cache_pool::KvCachePool;
 use crate::error::SchedulerError;
 use crate::domain::inference_session::lifecycle::SequenceId;
 use crate::domain::inference_session::table::RequestTable;
+use crate::domain::kv_budget::KvBudget;
+use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
 use crate::infrastructure::transport::control_plane::{ControlEvent, ControlPlaneCmdTx, WorkerId};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
 
 use super::outcomes::ControlOutcome;
+
+/// Free-ratio threshold below which the scheduler kicks RadixTree LRU
+/// eviction in response to a worker Heartbeat. 15 % free → react.
+const KV_LOW_WATER_RATIO: f32 = 0.15;
+/// Free-ratio target after eviction completes. We free as many LRU
+/// leaves as needed to bring the worker's free ratio above this number.
+const KV_HIGH_WATER_RATIO: f32 = 0.30;
 
 /// Control-event handling stage.
 #[derive(Debug, Default)]
@@ -78,14 +66,13 @@ impl ControlEventSystem {
         &self,
         event: ControlEvent,
         sessions: &mut RequestTable,
-        kv: &mut dyn KvCachePool,
+        radix: &mut RadixTree,
+        kv_budget: &mut KvBudget,
         control_cmd: &ControlPlaneCmdTx,
         worker_group: &WorkerGroup,
+        default_worker: &WorkerId,
     ) -> ControlOutcome {
         match event {
-            ControlEvent::NeedBlocks { worker, req } => {
-                self.handle_need_blocks(worker, req, sessions, kv, control_cmd, worker_group)
-            }
             ControlEvent::StepError { worker: _, err } => {
                 self.handle_worker_step_error(err, sessions)
             }
@@ -114,81 +101,80 @@ impl ControlEventSystem {
             }
             ControlEvent::Heartbeat { worker, hb } => {
                 tracing::trace!(
-                    "Heartbeat: worker={} state={:?} active={}",
+                    "Heartbeat: worker={} state={:?} active={} kv_free={}/{}",
                     worker,
                     hb.state,
-                    hb.active_requests
+                    hb.active_requests,
+                    hb.kv_free_slots,
+                    hb.kv_total_slots,
                 );
+
+                // Worker-driven KV pressure response.
+                //
+                // Total == 0 means the worker did not report KV info
+                // (legacy heartbeats, diffusion mode, bootstrap-phase
+                // heartbeat). Skip silently in that case.
+                if hb.kv_total_slots > 0 {
+                    let free_ratio =
+                        hb.kv_free_slots as f32 / hb.kv_total_slots as f32;
+                    if free_ratio < KV_LOW_WATER_RATIO {
+                        let target_free = ((hb.kv_total_slots as f32)
+                            * KV_HIGH_WATER_RATIO)
+                            as u32;
+                        let need_to_free =
+                            target_free.saturating_sub(hb.kv_free_slots);
+                        if need_to_free > 0 {
+                            self.run_kv_pressure_relief(
+                                radix,
+                                kv_budget,
+                                control_cmd,
+                                worker_group,
+                                default_worker,
+                                need_to_free,
+                            );
+                        }
+                    }
+                }
                 ControlOutcome::noop()
             }
         }
     }
 
-    /// Allocate KV blocks for an in-flight decode and unicast the
-    /// response. KV failures degrade to `GrantBlocksDenied`; nothing
-    /// in this path is fatal to the engine.
-    fn handle_need_blocks(
+    /// Evict RadixTree LRU leaves to satisfy the worker's pressure
+    /// signal, account the freed slots in `KvBudget`, and ship a
+    /// `FreeKvIndices` control message back to the worker. All errors
+    /// are swallowed — pressure relief is best-effort and the next
+    /// Heartbeat will retry if we couldn't free enough.
+    fn run_kv_pressure_relief(
         &self,
-        worker: WorkerId,
-        req: NeedBlocks,
-        sessions: &mut RequestTable,
-        kv: &mut dyn KvCachePool,
+        radix: &mut RadixTree,
+        kv_budget: &mut KvBudget,
         control_cmd: &ControlPlaneCmdTx,
         worker_group: &WorkerGroup,
-    ) -> ControlOutcome {
-        match kv.allocate_decode_blocks(crate::domain::ids::BlockCount::new(req.request_blocks as usize)) {
-            Ok(blocks) => {
-                if let Err(e) =
-                    sessions.extend_decode_kv(SequenceId(req.sequence_id), blocks.clone())
-                {
-                    tracing::debug!(
-                        "NeedBlocks for non-decoding sequence_id={} ignored: {}",
-                        req.sequence_id,
-                        e
-                    );
-                    return ControlOutcome::noop();
-                }
-                if let Err(e) = control_cmd.send_to(
-                    &worker,
-                    SchedulerControlMessage::GrantBlocks(GrantBlocks {
-                        model_instance_id: worker_group.model_instance_id.clone(),
-                        sequence_id: req.sequence_id,
-                        block_ids: blocks.iter().map(|b| b.0).collect(),
-                    }),
-                ) {
-                    return ControlOutcome::Terminate {
-                        lost: None,
-                        error: SchedulerError::WorkerError(format!("GrantBlocks send: {}", e)),
-                    };
-                }
-                ControlOutcome::noop()
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "NeedBlocks denied: sequence_id={} request_blocks={} error={}",
-                    req.sequence_id,
-                    req.request_blocks,
-                    e,
-                );
-                if let Err(send_err) = control_cmd.send_to(
-                    &worker,
-                    SchedulerControlMessage::GrantBlocksDenied(GrantBlocksDenied {
-                        model_instance_id: worker_group.model_instance_id.clone(),
-                        sequence_id: req.sequence_id,
-                        reason: BlockGrantDeniedReason::CacheExhausted,
-                    }),
-                ) {
-                    return ControlOutcome::Terminate {
-                        lost: None,
-                        error: SchedulerError::WorkerError(format!(
-                            "GrantBlocksDenied send: {}",
-                            send_err
-                        )),
-                    };
-                }
-                ControlOutcome::noop()
-            }
+        default_worker: &WorkerId,
+        need_to_free: u32,
+    ) {
+        let freed = radix.evict(need_to_free as usize);
+        if freed.is_empty() {
+            tracing::debug!(
+                need = need_to_free,
+                "KV pressure: RadixTree LRU empty — nothing to evict"
+            );
+            return;
         }
+        kv_budget.release(freed.len() as u32);
+        tracing::info!(
+            need = need_to_free,
+            freed = freed.len(),
+            "KV pressure: evicted RadixTree LRU leaves"
+        );
+        let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
+            infer_protocol::scheduler_to_worker_control::FreeKvIndices {
+                model_instance_id: worker_group.model_instance_id.clone(),
+                indices: freed,
+            },
+        );
+        let _ = control_cmd.send_to(default_worker, msg);
     }
 
     /// Worker-reported step error. Fatal flag escalates to
@@ -208,13 +194,9 @@ impl ControlEventSystem {
         };
         if fatal {
             // Both the failed-list (for OutputSystem) and the fatal
-            // termination must travel back. Today we only carry one
-            // outcome per event; the orchestrator handles fatal
-            // by inspecting the list first and *then* terminating.
-            // We emit Terminate; the orchestrator pre-flushes the
-            // running set on its side. (Engine still mirrors the
-            // pre-Step-16 behavior exactly until Step 18 wires the
-            // orchestrator path.)
+            // termination need to travel back. We currently carry one
+            // outcome per event, so emit `Terminate` and let the engine
+            // pre-flush the running set on its side before unwinding.
             return ControlOutcome::Terminate {
                 lost: None,
                 error: SchedulerError::WorkerError(message),
@@ -247,9 +229,7 @@ impl ControlEventSystem {
             fatal: true,
         };
         let _failed_ids = self.collect_failed_sequence_ids(&synthetic, sessions);
-        // Mirror legacy behavior: bubble fatal error so the engine
-        // exits its event loop. Once Step 18 lands `WorkerNode<Ready>`,
-        // populate `lost` with `worker_node.snapshot_as_lost(...)`.
+        // Bubble the fatal error so the engine exits its event loop.
         ControlOutcome::Terminate {
             lost: None,
             error: SchedulerError::WorkerError(format!("worker {} lost", worker)),
@@ -283,65 +263,22 @@ impl ControlEventSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::kv_cache_pool::KvLease;
-    use crate::infrastructure::kv_cache::traits::PhysicalBlockId;
     use crate::domain::inference_session::handle::RequestHandle;
     use crate::domain::inference_session::lifecycle::{Priority, RequestId, RequestMeta, SamplingParams};
+    use infer_protocol::worker_to_scheduler_control::{WorkerHeartbeat, WorkerState};
     use std::sync::Arc;
     use std::time::Instant;
 
-    /// Mock KvCachePool that always denies decode-block grants.
-    #[derive(Default)]
-    struct DenyingKv;
-    impl KvCachePool for DenyingKv {
-        fn allocate(
-            &mut self,
-            _: crate::domain::ids::TokenCount,
-        ) -> crate::error::Result<KvLease> {
-            Ok(KvLease::empty())
-        }
-        fn allocate_with_prefix(
-            &mut self,
-            _: &[i32],
-        ) -> crate::error::Result<(KvLease, crate::infrastructure::kv_cache::PrefixMatch)> {
-            Ok((
-                KvLease::empty(),
-                crate::infrastructure::kv_cache::PrefixMatch::none(),
-            ))
-        }
-        fn allocate_decode_blocks(
-            &mut self,
-            _: crate::domain::ids::BlockCount,
-        ) -> crate::error::Result<Vec<PhysicalBlockId>> {
-            Err(SchedulerError::CacheExhausted {
-                needed: 1,
-                available: 0,
-            })
-        }
-        fn free_finished(&mut self, _: &[i32], _: KvLease) {}
-        fn match_prefix(
-            &mut self,
-            _: &[i32],
-        ) -> crate::infrastructure::kv_cache::PrefixMatch {
-            crate::infrastructure::kv_cache::PrefixMatch::none()
-        }
-        fn flush_pending_returns(&mut self) {}
-        fn block_size(&self) -> crate::domain::ids::BlockSize {
-            crate::domain::ids::BlockSize::new(1)
-        }
-        fn total_blocks(&self) -> crate::domain::ids::BlockCount {
-            crate::domain::ids::BlockCount::new(0)
-        }
-        fn available_blocks(&self) -> crate::domain::ids::BlockCount {
-            crate::domain::ids::BlockCount::new(0)
-        }
-        fn mode_name(&self) -> &'static str {
-            "denying"
-        }
-    }
-
     fn empty_table() -> RequestTable {
         RequestTable::new()
+    }
+
+    fn fresh_radix() -> RadixTree {
+        RadixTree::new()
+    }
+
+    fn fresh_budget(cap: u32) -> KvBudget {
+        KvBudget::new(cap)
     }
 
     fn worker_group_for_test() -> WorkerGroup {
@@ -387,7 +324,6 @@ mod tests {
         table
             .commit_prefill_start(
                 queued,
-                KvLease::empty(),
                 crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
                 4,
             )
@@ -419,21 +355,44 @@ mod tests {
         )
     }
 
+    fn invoke(
+        sys: &ControlEventSystem,
+        event: ControlEvent,
+        sessions: &mut RequestTable,
+        radix: &mut RadixTree,
+        budget: &mut KvBudget,
+        cmd: &ControlPlaneCmdTx,
+        wg: &WorkerGroup,
+    ) -> ControlOutcome {
+        sys.handle(
+            event,
+            sessions,
+            radix,
+            budget,
+            cmd,
+            wg,
+            &WorkerId::from_identity(b"worker-test"),
+        )
+    }
+
     #[test]
     fn worker_error_fatal_emits_terminate() {
         let sys = ControlEventSystem::new();
         let mut sessions = empty_table();
-        let mut kv = DenyingKv;
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
         let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
         let wg = worker_group_for_test();
-        let outcome = sys.handle(
+        let outcome = invoke(
+            &sys,
             ControlEvent::WorkerError {
                 worker: WorkerId::from_identity(b"w"),
                 message: "boom".into(),
                 fatal: true,
             },
             &mut sessions,
-            &mut kv,
+            &mut radix,
+            &mut budget,
             &cmd,
             &wg,
         );
@@ -450,17 +409,20 @@ mod tests {
     fn worker_error_nonfatal_is_noop() {
         let sys = ControlEventSystem::new();
         let mut sessions = empty_table();
-        let mut kv = DenyingKv;
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
         let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
         let wg = worker_group_for_test();
-        let outcome = sys.handle(
+        let outcome = invoke(
+            &sys,
             ControlEvent::WorkerError {
                 worker: WorkerId::from_identity(b"w"),
                 message: "transient".into(),
                 fatal: false,
             },
             &mut sessions,
-            &mut kv,
+            &mut radix,
+            &mut budget,
             &cmd,
             &wg,
         );
@@ -479,16 +441,19 @@ mod tests {
         let mut sessions = empty_table();
         // One running session: the synthetic StepError gathers it.
         let _ = dummy_running_session(&mut sessions, "ext-1", 1);
-        let mut kv = DenyingKv;
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
         let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
         let wg = worker_group_for_test();
-        let outcome = sys.handle(
+        let outcome = invoke(
+            &sys,
             ControlEvent::WorkerLost {
                 worker: WorkerId::from_identity(b"w"),
                 last_seen_ms: 5000,
             },
             &mut sessions,
-            &mut kv,
+            &mut radix,
+            &mut budget,
             &cmd,
             &wg,
         );
@@ -506,10 +471,12 @@ mod tests {
         let sys = ControlEventSystem::new();
         let mut sessions = empty_table();
         let rid = dummy_running_session(&mut sessions, "ext-2", 7);
-        let mut kv = DenyingKv;
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
         let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
         let wg = worker_group_for_test();
-        let outcome = sys.handle(
+        let outcome = invoke(
+            &sys,
             ControlEvent::StepError {
                 worker: WorkerId::from_identity(b"w"),
                 err: WorkerStepError {
@@ -519,7 +486,8 @@ mod tests {
                 },
             },
             &mut sessions,
-            &mut kv,
+            &mut radix,
+            &mut budget,
             &cmd,
             &wg,
         );
@@ -535,33 +503,127 @@ mod tests {
         }
     }
 
+    /// Heartbeat with no KV info → noop, no eviction, no FreeKvIndices.
     #[test]
-    fn need_blocks_denied_path_does_not_terminate() {
+    fn heartbeat_without_kv_info_is_noop() {
         let sys = ControlEventSystem::new();
         let mut sessions = empty_table();
-        let mut kv = DenyingKv; // denies => GrantBlocksDenied
-        let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(100);
+        let (cmd, mut cmd_rx) = dummy_cmd_tx_with_rx();
         let wg = worker_group_for_test();
-        let outcome = sys.handle(
-            ControlEvent::NeedBlocks {
+        let outcome = invoke(
+            &sys,
+            ControlEvent::Heartbeat {
                 worker: WorkerId::from_identity(b"w"),
-                req: NeedBlocks {
-                    worker_id: "worker-test".into(),
-                    model_instance_id: "default".into(),
-                    sequence_id: 1,
-                    current_blocks: 0,
-                    required_blocks: 1,
-                    request_blocks: 1,
-                    reason: infer_protocol::worker_to_scheduler_control::NeedBlocksReason::DecodeExtend,
+                hb: WorkerHeartbeat {
+                    worker_id: "w".into(),
+                    state: WorkerState::Running,
+                    active_requests: 0,
+                    kv_total_slots: 0,
+                    kv_free_slots: 0,
                 },
             },
             &mut sessions,
-            &mut kv,
+            &mut radix,
+            &mut budget,
             &cmd,
             &wg,
         );
-        // Non-fatal: KV exhausted gets reported back to the worker
-        // via GrantBlocksDenied; the engine continues.
         assert!(matches!(outcome, ControlOutcome::Continue { .. }));
+        assert!(cmd_rx.try_recv().is_err(), "no FreeKvIndices expected");
+    }
+
+    /// Heartbeat above low-water → noop.
+    #[test]
+    fn heartbeat_above_low_water_is_noop() {
+        let sys = ControlEventSystem::new();
+        let mut sessions = empty_table();
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(100);
+        let (cmd, mut cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let _ = invoke(
+            &sys,
+            ControlEvent::Heartbeat {
+                worker: WorkerId::from_identity(b"w"),
+                hb: WorkerHeartbeat {
+                    worker_id: "w".into(),
+                    state: WorkerState::Running,
+                    active_requests: 0,
+                    kv_total_slots: 100,
+                    kv_free_slots: 50, // 50% free
+                },
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+        assert!(cmd_rx.try_recv().is_err(), "no FreeKvIndices expected");
+    }
+
+    /// Heartbeat below low-water with LRU-eligible nodes → evict + send
+    /// `FreeKvIndices` and adjust `KvBudget`.
+    #[tokio::test]
+    async fn heartbeat_low_water_evicts_and_sends_free_kv_indices() {
+        use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+
+        let sys = ControlEventSystem::new();
+        let mut sessions = empty_table();
+        // Build a RadixTree with 3 chains × 4 slots each, all finished
+        // → 12 slots in LRU.
+        let mut radix = fresh_radix();
+        for s in 1..=3u64 {
+            for k in 0..4 {
+                let token = (10 * s as i32) + k;
+                let idx = ((s as u32 - 1) * 4) + k as u32;
+                radix.append_token(s, token, idx);
+            }
+            radix.mark_finished_chain(s);
+        }
+        let mut budget = fresh_budget(100);
+        // Pretend the worker reported these 12 slots.
+        budget.try_reserve(12).unwrap();
+
+        let (cmd, mut cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let _ = invoke(
+            &sys,
+            ControlEvent::Heartbeat {
+                worker: WorkerId::from_identity(b"w"),
+                hb: WorkerHeartbeat {
+                    worker_id: "w".into(),
+                    state: WorkerState::Running,
+                    active_requests: 0,
+                    kv_total_slots: 100,
+                    kv_free_slots: 10, // 10% free → trigger
+                },
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+
+        // Budget should have shrunk by the number of evicted indices.
+        // Target free = 30, current free = 10, need_to_free = 20.
+        // LRU has 12 slots → evict yields all 12.
+        assert_eq!(budget.outstanding(), 0, "all 12 LRU slots released");
+
+        let cmd_msg = cmd_rx.try_recv().expect("FreeKvIndices expected");
+        match cmd_msg {
+            crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo {
+                env, ..
+            } => match env.payload {
+                SchedulerControlMessage::FreeKvIndices(free) => {
+                    assert_eq!(free.indices.len(), 12, "all LRU slots returned");
+                }
+                other => panic!("expected FreeKvIndices, got {:?}", other),
+            },
+            _ => panic!("expected SendTo router command"),
+        }
     }
 }

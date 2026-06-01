@@ -11,7 +11,7 @@ use infer_protocol::worker_to_scheduler_control::WorkerControlMessage;
 use infer_protocol::{
     ControlEnvelope,
     scheduler_to_worker_control::SchedulerControlMessage,
-    worker_to_scheduler_control::{NeedBlocks, WorkerHeartbeat, WorkerStepError},
+    worker_to_scheduler_control::{WorkerHeartbeat, WorkerStepError},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -76,12 +76,6 @@ pub enum ControlEvent {
     Heartbeat {
         worker: WorkerId,
         hb: WorkerHeartbeat,
-    },
-
-    /// Worker requesting more KV blocks (replaces the old data-plane field).
-    NeedBlocks {
-        worker: WorkerId,
-        req: NeedBlocks,
     },
 
     /// Per-step execution error reported by the worker.

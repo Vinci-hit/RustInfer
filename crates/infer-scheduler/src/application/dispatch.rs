@@ -1,20 +1,11 @@
 //! `DispatchSystem` — owns the two transports.
 //!
-//! Step 18 lands the actual transport ownership: previously the
-//! engine held `frontend: F` / `worker: W` generic fields and the
-//! `DispatchSystem` was a hollow shim. Now `DispatchSystem` holds
-//! `Box<dyn FrontendTransport>` + `Box<dyn WorkerTransport>` and
-//! the engine drops both type parameters (`SchedulerEngine<F, W>` →
-//! `SchedulerEngine`).
-//!
-//! ## Why one System owns both transports
-//!
-//! Output (responses, stream chunks) and command dispatch (batch
-//! send) both target the *outbound* side of the engine. Bundling
-//! them into a single System keeps the borrow shape simple:
-//! `OutputProcessingSystem` takes `&mut dyn FrontendTransport`,
-//! the engine's iteration loop takes `&mut dyn WorkerTransport`.
-//! Either can be served by `dispatch.frontend_mut()` / `worker_mut()`
+//! Holds `Box<dyn FrontendTransport>` + `Box<dyn WorkerTransport>` so
+//! the engine itself stays free of `<F, W>` generics. Bundling both
+//! transports into a single System keeps the borrow shape simple:
+//! `OutputProcessingSystem` takes `&mut dyn FrontendTransport`, the
+//! engine's iteration loop takes `&mut dyn WorkerTransport`. Either
+//! can be served by `dispatch.frontend_mut()` / `worker_mut()`
 //! without aliasing.
 //!
 //! ## Public surface
@@ -27,7 +18,7 @@
 //!   the engine after `PlanningSystem::build_*_batch` produces wire
 //!   bytes, so the iteration code stays a one-liner.
 //! - [`DispatchSystem::recv_frontend`] / `recv_worker_output` —
-//!   inbound polling helpers used by `core::event_loop`.
+//!   inbound polling helpers used by the event loop.
 
 use crate::error::Result;
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};

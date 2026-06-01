@@ -6,9 +6,9 @@
 //! (reason string, last-seen timestamp) into error paths and the
 //! eventual `WorkerError` propagation.
 //!
-//! ## P2-C: `snapshot_as_lost` does **not** consume `self`
+//! ## `snapshot_as_lost` does **not** consume `self`
 //!
-//! Naive consuming-transition `mark_lost(self) -> WorkerNode<Lost>`
+//! A naive consuming-transition `mark_lost(self) -> WorkerNode<Lost>`
 //! cannot live behind `&mut self` borrow on a struct field — the
 //! engine needs to keep the `Ready` worker reachable while it builds
 //! up the error path, drains pending sessions, and returns control to
@@ -144,7 +144,8 @@ mod tests {
         ready.touch(Instant::now());
         let lost = ready.snapshot_as_lost("heartbeat timeout");
         assert_eq!(lost.reason(), "heartbeat timeout");
-        // ready is STILL usable — this is the whole point of P2-C.
+        // ready is STILL usable — that's the whole point of the
+        // non-consuming snapshot.
         assert_eq!(ready.model_instance_id().as_str(), "inst-A");
         assert_eq!(ready.capacity().max_batch_tokens.raw(), 2048);
     }

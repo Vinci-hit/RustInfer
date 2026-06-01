@@ -1,8 +1,7 @@
 //! `KvBudget` — host-side authority on worker KV-pool token-slot capacity.
 //!
-//! Phase 6 lands this type alongside `RadixTree` (Phase 5) and the new
-//! `admission` System (Phase 6). The scheduler's main loop owns one
-//! `KvBudget` instance whose `outstanding` count is updated by:
+//! The scheduler's main loop owns one `KvBudget` instance whose
+//! `outstanding` count is updated by:
 //!
 //! - **`+= len`** when a `StepOutput.assigned_indices` arrives — each entry
 //!   represents `len` new global slots the worker just consumed for that seq.
@@ -11,9 +10,10 @@
 //!   must happen *together with* the message send so the budget never
 //!   double-counts.
 //!
-//! Admission consults `try_reserve(projected)` before sending the next
-//! batch. On `Err(KvBudgetFull)` the engine kicks off the eviction →
-//! preemption → defer cascade described in plan §6/§7.
+//! Admission consults `headroom()` before sending the next batch and
+//! drives the eviction → preemption → defer cascade until
+//! `headroom() >= projected`. Reservation against the budget happens
+//! when the worker reports the slots back, not at admission time.
 //!
 //! ## Why a separate type, not just a `u32` field on the engine
 //!
@@ -22,8 +22,8 @@
 //! - It defends a *single* invariant (`0 ≤ outstanding ≤ capacity`) which we
 //!   want to be unmissable. Hard-typing the operation makes integer
 //!   underflow detectable in `release`.
-//! - Phase 8 (TP/PP) will likely change this from a single counter to a
-//!   per-rank fan-out; pinning the boundary now keeps the change local.
+//! - A future TP/PP variant could swap the single counter for a
+//!   per-rank fan-out without disturbing call sites.
 
 use std::fmt;
 

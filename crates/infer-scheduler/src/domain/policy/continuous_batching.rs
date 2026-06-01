@@ -3,10 +3,16 @@
 //! Selects waiting requests in FIFO order (respecting priority from WaitingQueue)
 //! until the token/sequence budget is exhausted.
 //! Supports chunked prefill: long prompts are split across iterations.
+//!
+//! ## Decoding is not the scheduler's job
+//!
+//! The worker owns the decode self-loop: which decoding sequences run
+//! next is decided inside the worker's sub-scheduler, not here. This
+//! policy only drives prefill scheduling — both fresh prompts and
+//! continuation chunks for already-prefilling sequences.
 
-use crate::infrastructure::kv_cache::traits::CacheState;
 use crate::domain::policy::traits::{
-    BatchPlan, DecodeEntry, PrefillEntry, RunningSet, SchedulingPolicy,
+    BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy,
 };
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::policy::token_budget::TokenBudget;
@@ -14,9 +20,8 @@ use crate::domain::policy::token_budget::TokenBudget;
 /// FCFS continuous batching policy.
 ///
 /// Scheduling order per iteration:
-/// 1. All decode sequences continue (1 token each).
-/// 2. Continuation chunks for already-prefilling sequences (priority: don't waste KV).
-/// 3. New requests from the waiting queue (FCFS within priority tier).
+/// 1. Continuation chunks for already-prefilling sequences (priority: don't waste KV).
+/// 2. New requests from the waiting queue (FCFS within priority tier).
 pub struct ContinuousBatchingPolicy {
     /// Max tokens per prefill chunk (None = no chunking, entire prompt at once).
     pub chunked_prefill_size: Option<usize>,
@@ -42,28 +47,16 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
         waiting: &WaitingQueue,
         running: &RunningSet,
         budget: &TokenBudget,
-        _cache_state: &CacheState,
     ) -> BatchPlan {
-        // Step 1: All running decode sequences continue (each uses 1 token).
-        let decode_batch: Vec<DecodeEntry> = running
-            .running_ids
-            .iter()
-            .take(running.num_decoding)
-            .map(|id| DecodeEntry {
-                request_id: id.clone(),
-            })
-            .collect();
-
-        let decode_tokens = decode_batch.len();
-
-        // Token budget remaining after decode.
-        let mut token_budget_remaining = budget.max_tokens.saturating_sub(decode_tokens);
+        // The scheduler does not schedule decoding — the worker's
+        // sub-scheduler decides that. We only plan prefills here.
+        let mut token_budget_remaining = budget.max_tokens;
         // Seq budget: continuation chunks don't consume new seq slots (already counted).
         let seq_budget = budget.max_seqs.saturating_sub(running.total());
 
         let mut prefill_batch: Vec<PrefillEntry> = Vec::new();
 
-        // Step 2: Schedule continuation chunks for already-prefilling sequences.
+        // 1. Schedule continuation chunks for already-prefilling sequences.
         // These MUST run — they already have KV allocated. Priority over new requests.
         for (req_id, remaining) in &running.prefilling_continuations {
             if token_budget_remaining == 0 {
@@ -83,7 +76,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
             token_budget_remaining = token_budget_remaining.saturating_sub(chunk);
         }
 
-        // Step 3: Select new requests from waiting queue.
+        // 2. Select new requests from waiting queue.
         if token_budget_remaining > 0 && seq_budget > 0 && !waiting.is_empty() {
             for (seqs_used, seq) in waiting.iter().enumerate() {
                 if seqs_used >= seq_budget || token_budget_remaining == 0 {
@@ -115,12 +108,10 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
             }
         }
 
-        let prefill_tokens: usize = prefill_batch.iter().map(|e| e.token_range.len()).sum();
-        let total_tokens = decode_tokens + prefill_tokens;
+        let total_tokens: usize = prefill_batch.iter().map(|e| e.token_range.len()).sum();
 
         BatchPlan {
             prefill_batch,
-            decode_batch,
             preemptions: vec![],
             total_tokens,
         }
@@ -162,19 +153,7 @@ mod tests {
     fn empty_running() -> RunningSet {
         RunningSet {
             num_prefilling: 0,
-            num_decoding: 0,
-            decode_tokens: 0,
-            running_ids: vec![],
             prefilling_continuations: vec![],
-        }
-    }
-
-    fn cache_state() -> CacheState {
-        CacheState {
-            free_blocks: 100,
-            total_blocks: 256,
-            utilization: 0.0,
-            evictable_blocks: 0,
         }
     }
 
@@ -185,7 +164,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 512, max_seqs: 4 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert!(!plan.has_work());
     }
 
@@ -196,7 +175,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 25, max_seqs: 4 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         // Budget = 25 tokens, each request is 10 → can fit 2.
         assert_eq!(plan.prefill_batch.len(), 2);
         assert_eq!(plan.total_tokens, 20);
@@ -209,7 +188,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 512, max_seqs: 2 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 2);
     }
 
@@ -220,7 +199,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 512, max_seqs: 4 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         // chunk_size=10, prompt=25 → first chunk is 10 tokens, is_partial=true
         assert_eq!(plan.prefill_batch.len(), 1);
         assert_eq!(plan.prefill_batch[0].token_range, 0..10);
@@ -237,14 +216,11 @@ mod tests {
         let cont_id = RequestId::new_v4();
         let running = RunningSet {
             num_prefilling: 1,
-            num_decoding: 0,
-            decode_tokens: 0,
-            running_ids: vec![],
             prefilling_continuations: vec![(cont_id, 15)],
         };
         let budget = TokenBudget { max_tokens: 12, max_seqs: 4 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         // Continuation chunk takes 10 tokens (chunk_size), leaving 2 for new.
         // In chunked mode the new request can consume the remaining 2-token budget.
         assert_eq!(plan.prefill_batch.len(), 2);
@@ -256,41 +232,13 @@ mod tests {
     }
 
     #[test]
-    fn chunked_prefill_with_decode_mixed() {
-        let policy = ContinuousBatchingPolicy::new(Some(10));
-        let waiting = make_waiting(&[("new", 8)]);
-        let new_id = waiting.iter().next().unwrap().meta.id.clone();
-        let cont_id = RequestId::new_v4();
-        let running = RunningSet {
-            num_prefilling: 1,
-            num_decoding: 2,
-            decode_tokens: 2,
-            running_ids: vec![RequestId::new_v4(), RequestId::new_v4()],
-            prefilling_continuations: vec![(cont_id, 20)],
-        };
-        // Budget = 20 tokens, 4 seqs.
-        // decode takes 2 tokens → 18 remaining.
-        // continuation chunk takes 10 → 8 remaining.
-        // "new" takes 8 → fits!
-        let budget = TokenBudget { max_tokens: 20, max_seqs: 4 };
-
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
-        assert_eq!(plan.decode_batch.len(), 2);
-        // 2 prefill entries: continuation + new
-        assert_eq!(plan.prefill_batch.len(), 2);
-        assert_eq!(plan.prefill_batch[0].request_id, cont_id);
-        assert_eq!(plan.prefill_batch[1].request_id, new_id);
-        assert_eq!(plan.total_tokens, 2 + 10 + 8);
-    }
-
-    #[test]
     fn no_chunking_sends_full_prompt() {
         let policy = ContinuousBatchingPolicy::new(None);
         let waiting = make_waiting(&[("full", 100)]);
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 512, max_seqs: 4 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 1);
         assert_eq!(plan.prefill_batch[0].token_range, 0..100);
         assert!(!plan.prefill_batch[0].is_partial);

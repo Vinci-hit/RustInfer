@@ -1,12 +1,13 @@
 //! Outcomes returned by application-layer Systems.
 //!
-//! Systems can't directly mutate every other System (P1-B in the
-//! refactor plan: `ControlEventSystem` cannot hold `&mut sessions`
-//! and `&mut output_system` at the same time without aliasing
-//! through `SchedulerEngine`). They return enriched outcome enums
-//! that the engine orchestrator interprets and dispatches.
+//! Systems can't directly mutate every other System without aliasing
+//! through `SchedulerEngine` —
+//! `ControlEventSystem::handle` cannot hold `&mut sessions` and
+//! `&mut output_system` at the same time, for instance. Instead each
+//! System returns an enriched outcome enum that the engine
+//! orchestrator interprets and dispatches.
 //!
-//! ## `ControlOutcome` (P1-B)
+//! ## `ControlOutcome`
 //!
 //! Result of `ControlEventSystem::handle()`. The engine inspects
 //! the variant and either calls `OutputProcessingSystem::fail_sessions`
@@ -24,9 +25,9 @@ pub enum ControlOutcome {
     /// the orchestrator must drive (calling `OutputProcessingSystem::
     /// fail_sessions` with the supplied message).
     ///
-    /// `failed_request_ids` carries internal `RequestId` (uuid-backed,
-    /// Step 8). Callers resolving these into the session repository
-    /// hold the only authoritative mapping.
+    /// `failed_request_ids` carries internal `RequestId` (uuid-backed).
+    /// Callers resolving these into the session repository hold the
+    /// only authoritative mapping.
     Continue {
         failed_request_ids: Vec<RequestId>,
         fail_message: Option<String>,
@@ -35,10 +36,10 @@ pub enum ControlOutcome {
     ///
     /// Carries a `SchedulerError` that the orchestrator surfaces and
     /// then bubbles out of the event loop. The `lost` snapshot is
-    /// optional today: until the engine swaps `WorkerGroup` for
-    /// `WorkerNode<Ready>` (Step 18), the System cannot construct
-    /// the snapshot itself; once that lands every `Terminate` will
-    /// carry `Some(lost)` and downstream consumers can rely on it.
+    /// optional: control-event paths that have a `WorkerNode<Ready>`
+    /// in scope can populate it with `worker_node.snapshot_as_lost(...)`
+    /// for downstream diagnostics; today every `Terminate` carries
+    /// `None` and the engine reconstructs the error string itself.
     Terminate {
         lost: Option<WorkerNode<Lost>>,
         error: SchedulerError,

@@ -1,22 +1,20 @@
-//! Paged KV cache: physical block algorithms.
+//! Scheduler-side KV bookkeeping.
 //!
-//! Infrastructure-layer implementation details consumed by
-//! [`crate::domain::kv_cache_pool::PagedKvPool`]:
+//! Physical block allocation lives entirely in the worker; the scheduler's
+//! only KV-related state is a token-prefix index over the global KV slots
+//! the worker has reported via `StepOutput.assigned_indices`. This module
+//! holds that index and the trait helpers that planning consumes.
 //!
-//! - [`PagedBlockAllocator`] — physical block free/used/cached state.
-//! - [`RadixTreeCache`] — token-prefix → block-list reuse table.
-//! - [`BlockTable`] — block-aligned view of a sequence's blocks.
-//! - [`traits`] — internal allocator/strategy traits used between
-//!   the allocator and the radix-tree implementation.
+//! - [`RadixTree`] — token-granularity prefix tree mapping prompt-token
+//!   sequences to global KV indices. Reference-counted by live sequences
+//!   (`Node.owners`); a node enters the LRU only when
+//!   `owners.is_empty() && children.is_empty()`. Eviction yields the
+//!   indices the scheduler returns to the worker via `FreeKvIndices`.
+//! - [`traits`] — small helper types (e.g. [`PrefixMatch`]) used between
+//!   planning and the radix tree.
 
-pub mod block_allocator;
-pub mod block_table;
-pub mod radix_tree;
 pub mod radix_tree_v2;
 pub mod traits;
 
-pub use block_allocator::PagedBlockAllocator;
-pub use block_table::BlockTable;
-pub use radix_tree::RadixTreeCache;
-pub use radix_tree_v2::{GlobalIndex as TokenSlotIndex, NodeState, PrefixHit, RadixTree, SeqId as RadixSeqId};
-pub use traits::{BlockAllocator, CacheStrategy, PhysicalBlockId, PrefixMatch};
+pub use radix_tree_v2::{GlobalIndex as TokenSlotIndex, PrefixHit, RadixTree, SeqId as RadixSeqId};
+pub use traits::PrefixMatch;

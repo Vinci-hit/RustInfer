@@ -5,12 +5,11 @@
 //! - `capacity.rs` — `Capacity` value object (NewType-typed)
 //! - `node.rs`     — main `WorkerNode<S>` aggregate root
 //!
-//! The legacy [`crate::infrastructure::transport::control_plane::WorkerGroup`] is **not yet
-//! removed**: it is still wired into bootstrap (`main.rs`), the
-//! engine, and the control plane. Step 18 (engine slim-down) will
-//! migrate those callers to `WorkerNode<Ready>`; this module exists
-//! standalone now so subsequent steps can construct it without
-//! disturbing the live code path.
+//! The control-plane bootstrap currently builds a
+//! [`crate::infrastructure::transport::control_plane::WorkerGroup`]
+//! that wraps the same handshake data; `WorkerNode<Ready>` lives
+//! alongside it as the typed surface for code paths that want
+//! state-machine guarantees.
 
 mod capacity;
 mod node;

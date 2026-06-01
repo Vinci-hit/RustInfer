@@ -2,32 +2,33 @@
 
 use std::ops::Range;
 
-use crate::infrastructure::kv_cache::traits::CacheState;
 use crate::domain::inference_session::lifecycle::RequestId;
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::policy::token_budget::TokenBudget;
 
-/// A set of currently running (prefilling + decoding) sequences.
+/// A snapshot of currently-running sessions handed to the scheduling
+/// policy.
 ///
-/// Provides read-only access to the scheduler's running state for policy decisions.
+/// The scheduler **does not schedule decodes** — the worker's
+/// sub-scheduler decides which decoding sequences run next. We still
+/// track `num_prefilling` so the policy knows how many sequence slots
+/// are already burned, and `prefilling_continuations` so chunked
+/// prefill can produce a continuation segment. Decoding sequences are
+/// "owned" by the worker; the scheduler only routes their tokens back
+/// to clients and answers cancel/heartbeat events for them.
 pub struct RunningSet {
     /// Number of sequences currently in prefill phase.
     pub num_prefilling: usize,
-    /// Number of sequences currently in decode phase.
-    pub num_decoding: usize,
-    /// Total decode tokens this iteration (one per decoding sequence).
-    pub decode_tokens: usize,
-    /// Request IDs of running decode sequences.
-    pub running_ids: Vec<RequestId>,
     /// Prefilling sequences that need continuation chunks this iteration.
     /// Each entry is (request_id, remaining_tokens_in_prompt).
     pub prefilling_continuations: Vec<(RequestId, usize)>,
 }
 
 impl RunningSet {
-    /// Total number of running sequences.
+    /// Total number of sessions the policy must reason about. Decoding
+    /// is not part of this count — the worker schedules those itself.
     pub fn total(&self) -> usize {
-        self.num_prefilling + self.num_decoding
+        self.num_prefilling
     }
 }
 
@@ -36,11 +37,12 @@ impl RunningSet {
 pub struct BatchPlan {
     /// Requests selected for prefill this iteration.
     pub prefill_batch: Vec<PrefillEntry>,
-    /// Sequences continuing decode.
-    pub decode_batch: Vec<DecodeEntry>,
-    /// Sequences to preempt.
+    /// Sequences to preempt. Currently unused on the worker-driven KV
+    /// path (worker handles preemption internally); retained for
+    /// backwards compatibility in test fixtures.
     pub preemptions: Vec<PreemptionAction>,
-    /// Total tokens in this iteration (prefill + decode).
+    /// Total tokens in this iteration (prefill only — the scheduler
+    /// does not touch decode tokens).
     pub total_tokens: usize,
 }
 
@@ -49,7 +51,6 @@ impl BatchPlan {
     pub fn empty() -> Self {
         Self {
             prefill_batch: vec![],
-            decode_batch: vec![],
             preemptions: vec![],
             total_tokens: 0,
         }
@@ -57,7 +58,7 @@ impl BatchPlan {
 
     /// Whether this plan has any work.
     pub fn has_work(&self) -> bool {
-        !self.prefill_batch.is_empty() || !self.decode_batch.is_empty()
+        !self.prefill_batch.is_empty()
     }
 }
 
@@ -69,12 +70,6 @@ pub struct PrefillEntry {
     pub token_range: Range<usize>,
     /// Whether this is a partial chunk (more chunks coming).
     pub is_partial: bool,
-}
-
-/// A sequence continuing decode in this iteration.
-#[derive(Debug)]
-pub struct DecodeEntry {
-    pub request_id: RequestId,
 }
 
 /// Preemption action to execute.
@@ -97,7 +92,6 @@ pub trait SchedulingPolicy: Send + Sync {
         waiting: &WaitingQueue,
         running: &RunningSet,
         budget: &TokenBudget,
-        cache_state: &CacheState,
     ) -> BatchPlan;
 
     /// Policy name for logging/metrics.
@@ -111,9 +105,8 @@ impl SchedulingPolicy for Box<dyn SchedulingPolicy> {
         waiting: &WaitingQueue,
         running: &RunningSet,
         budget: &TokenBudget,
-        cache_state: &CacheState,
     ) -> BatchPlan {
-        (**self).schedule(waiting, running, budget, cache_state)
+        (**self).schedule(waiting, running, budget)
     }
 
     fn name(&self) -> &'static str {

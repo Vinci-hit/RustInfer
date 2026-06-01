@@ -2,7 +2,7 @@
 //!
 //! Each module name is the contract:
 //!   * `_data` modules: high-volume payloads (batch in / tokens out).
-//!   * `_control` modules: lifecycle, KV grants, liveness, RPC.
+//!   * `_control` modules: lifecycle, KV release, liveness, RPC.
 //!
 //! Every byte that crosses the control plane is wrapped in
 //! [`ControlEnvelope`] with a [`RequestId`] for RPC correlation.

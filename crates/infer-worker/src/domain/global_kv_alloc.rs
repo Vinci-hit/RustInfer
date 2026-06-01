@@ -1,5 +1,4 @@
-//! `GlobalKvAllocator` — bump-pointer over a `Vec<u32>` of free token-slot
-//! indices.
+//! `GlobalKvAllocator` — sorted free-list over `[0, total)` token-slot indices.
 //!
 //! ## Design
 //!
@@ -9,32 +8,26 @@
 //! irrelevant**. Two non-contiguous indices `[0, 100]` produce the same
 //! gather pattern (one cache line per token) as two contiguous `[0, 1]`.
 //!
-//! Given that, the cheapest allocator is a flat `Vec` plus a head pointer:
-//! - **alloc**: `out = free[head..head+n]; head += n` — O(1) per slot.
-//! - **free**: `free.push(idx)` — O(1) per slot.
-//! - **merge**: drop the consumed prefix and sort the rest — O(N log N)
-//!   one-shot, triggered lazily when the bump runs out but past frees
-//!   have piled up at the tail.
-//!
-//! No coalesce on every free, no per-range bookkeeping. The "free pool"
-//! is just whatever is in `free[head..]` plus whatever has been pushed
-//! since the last merge.
+//! Allocator semantics:
+//! - **alloc**: bump `head` over `free[head..]`, returning `n` indices in
+//!   ascending order — O(n).
+//! - **free**: drop the consumed prefix, append the freed indices, sort the
+//!   tail. The user-facing contract requires that after every `free()` the
+//!   pool is fully merged and sorted, so the next `alloc` always returns
+//!   the smallest available indices. O(N log N) per `free()`, but freed
+//!   batches are typically small.
 //!
 //! ## Invariant
 //!
-//! No index appears twice in `free`. The Vec is initialized to `0..total`
-//! (each index once); subsequent `free()` calls push only previously-
-//! allocated indices (which `head` has already moved past, so they are
-//! NOT in `free[head..]` either). After `merge_and_sort` the prefix
-//! `[..head]` is dropped before sort, preserving the invariant.
+//! `free[head..]` holds every currently-free index exactly once, in
+//! ascending order. `head == 0` after every `free()` call.
 //!
 //! ## Determinism
 //!
-//! `merge_and_sort` does an unstable sort, but the input set is a unique
-//! collection of indices — every allocator instance with the same op
-//! history sees the same set, hence the same sorted result. Bump
-//! allocation thereafter is deterministic. Required for future TP/PP
-//! rank consistency.
+//! Sort is unstable, but the input set is a unique collection of indices —
+//! every allocator instance with the same op history sees the same set,
+//! hence the same sorted result. Required for future TP/PP rank
+//! consistency.
 
 use std::collections::HashSet;
 
@@ -113,26 +106,32 @@ impl GlobalKvAllocator {
 
     /// Allocate `n` indices.
     ///
-    /// Fast path: bump from `head`. If insufficient at head but enough in
-    /// `free` after merging, runs `merge_and_sort` once and retries from
-    /// `head=0`. Returns `AllocFull` only on true OOM (`total_free < n`).
+    /// Fast path: bump from `head`. The slow merge-then-retry path remains
+    /// for paranoia but is unreachable in practice — `free()` already sorts
+    /// the pool, so `free[head..]` is always a contiguous run of every
+    /// free index in ascending order. Returns `AllocFull` only on true
+    /// OOM (`total_free < n`).
     pub fn alloc_indices(&mut self, n: u32) -> Result<Vec<u32>, AllocFull> {
         if n == 0 {
             return Ok(Vec::new());
         }
         let n_usize = n as usize;
 
-        // Fast path: enough free at the head.
+        // Fast path: enough free at the head. After `free()`-time sort
+        // every alloc takes this path; the slow path below is dead code
+        // kept for defensive programming.
         if self.head + n_usize <= self.free.len() {
             let out = self.free[self.head..self.head + n_usize].to_vec();
             self.head += n_usize;
             return Ok(out);
         }
 
-        // Slow path: merging may rescue us.
+        // Slow path: after free()-time sort this is unreachable in
+        // practice; kept for paranoia. If the fast path failed and yet
+        // `total_free >= n`, something has bypassed the `free()` sort —
+        // we still attempt to recover.
         if self.total_free() >= n {
             self.merge_and_sort();
-            // After merge, head == 0 and free.len() == total_free.
             debug_assert!(self.free.len() >= n_usize);
             debug_assert_eq!(self.head, 0);
             let out = self.free[..n_usize].to_vec();
@@ -147,32 +146,37 @@ impl GlobalKvAllocator {
         })
     }
 
-    /// Push freed indices to the tail. O(N) extend.
+    /// Return freed indices to the pool. Drops the already-allocated
+    /// prefix, appends the new indices, and re-sorts so the pool is
+    /// ready for the next `alloc_indices` to take the smallest indices.
+    /// O(N log N) per call.
     ///
-    /// Caller is trusted to free only previously-allocated indices. Debug
-    /// builds verify each input is `< total` and not currently in the
-    /// allocatable zone (`free[head..]`); release builds skip the check.
+    /// Caller is trusted to free only previously-allocated indices.
+    /// Debug builds verify each input is `< total`; release builds skip
+    /// the check.
     pub fn free(&mut self, indices: &[u32]) {
         if indices.is_empty() {
             return;
         }
         if cfg!(debug_assertions) {
-            // Cheap upper-bound check.
             for &idx in indices {
                 debug_assert!(idx < self.total, "free index out of range: {}", idx);
             }
         }
+        // Drop the consumed prefix first so the sort below sees only
+        // currently-free slots.
+        if self.head > 0 {
+            self.free.drain(..self.head);
+            self.head = 0;
+        }
         self.free.extend_from_slice(indices);
+        self.free.sort_unstable();
     }
 
     /// Drop the consumed prefix and sort the remaining free indices.
-    /// Intended trigger: `alloc_indices` returns an `AllocFull` whose
-    /// `total_free >= need` (i.e. enough slots exist but they're stuck
-    /// past the bump head). Pure local operation; no IO.
-    ///
-    /// This is *automatically* called by `alloc_indices` when needed; the
-    /// public method is exposed for explicit "compact while idle" patterns
-    /// and tests.
+    /// Pool is fully sorted after every `free()` call; this method stays
+    /// public for explicit "compact while idle" patterns and tests but
+    /// in steady state it's a no-op.
     pub fn merge_and_sort(&mut self) {
         if self.head > 0 {
             self.free.drain(..self.head);
@@ -230,70 +234,43 @@ mod tests {
     }
 
     #[test]
-    fn free_pushes_to_tail_does_not_advance_head() {
+    fn free_sorts_immediately_keeps_head_zero() {
         let mut a = GlobalKvAllocator::new(10);
-        let _ = a.alloc_indices(5).unwrap();
-        let head_before = a.head();
-        a.free(&[1, 2]);
-        assert_eq!(a.head(), head_before, "free must not move head");
-        assert_eq!(a.outstanding(), 3, "5 alloc'd − 2 freed = 3 outstanding");
+        let _ = a.alloc_indices(5).unwrap(); // [0..5), head=5
+        a.free(&[3, 1, 4]);
+        // free() drains the consumed prefix and re-sorts: free pool now is
+        // [1, 3, 4, 5, 6, 7, 8, 9] with head reset to 0.
+        assert_eq!(a.head(), 0, "free() resets head to zero");
+        assert_eq!(a.outstanding(), 2, "5 alloc'd − 3 freed = 2 outstanding");
+        assert_eq!(a.free_snapshot(), vec![1, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
-    fn alloc_after_free_continues_from_head_not_tail() {
-        // The whole point of the lazy design: freed indices wait at the
-        // tail until the bump head reaches them. We do NOT yank them
-        // forward. This proves it.
+    fn alloc_after_free_returns_smallest_available() {
+        // Under the new "sort on free" contract, alloc always returns the
+        // smallest currently-free indices in ascending order — no lazy
+        // tail-sit-then-merge.
         let mut a = GlobalKvAllocator::new(10);
         let _ = a.alloc_indices(5).unwrap(); // [0,1,2,3,4], head=5
-        a.free(&[0, 1, 2]); // tail = [...,0,1,2]
+        a.free(&[0, 1, 2]);
+        // Pool is now sorted to [0, 1, 2, 5, 6, 7, 8, 9], head=0.
         let v = a.alloc_indices(3).unwrap();
-        assert_eq!(v, vec![5, 6, 7], "next alloc takes from head, not freed tail");
-        assert_eq!(a.head(), 8);
+        assert_eq!(v, vec![0, 1, 2], "next alloc takes the smallest free indices");
+        assert_eq!(a.head(), 3);
+        assert_eq!(a.outstanding(), 5);
     }
 
     #[test]
-    fn auto_merge_when_head_exhausted_but_total_free_sufficient() {
+    fn fragmented_free_alloc_recovers_all_smallest() {
         let mut a = GlobalKvAllocator::new(10);
-        let _ = a.alloc_indices(10).unwrap(); // exhaust head: head=10
-        assert_eq!(a.available(), 0);
-        a.free(&[3, 7, 1]); // tail has 3 free; available=3 (single len() metric)
-        assert_eq!(a.available(), 3);
-        // Asking for 4 — head's tail can't satisfy (only 3 free total in
-        // free[head..], but pushed at tail). Bump-from-len fast path takes
-        // [3, 7, 1] and... wait, free.len() == 13, head==10, so free[10..]
-        // is [3, 7, 1]. Asking 4 would need head + 4 <= len; 10+4=14 > 13.
-        // Falls through to slow path → merge_and_sort → free=[1,3,7], head=0.
-        // Then alloc(4) needs total_free=3 < 4 → AllocFull.
-        let err = a.alloc_indices(4).unwrap_err();
-        assert_eq!(err.need, 4);
-        assert_eq!(err.total_free, 3);
-
-        // Now alloc(2): head=10, len=13, fast path takes free[10..12]=[3,7].
-        let v = a.alloc_indices(2).unwrap();
-        assert_eq!(v, vec![3, 7], "fast path takes from current head, no merge needed");
-        assert_eq!(a.head(), 12);
-        assert_eq!(a.outstanding(), 9);
-    }
-
-    #[test]
-    fn slow_path_merge_when_head_truly_at_end_but_unsorted_frees_remain() {
-        let mut a = GlobalKvAllocator::new(10);
-        let _ = a.alloc_indices(10).unwrap(); // head=10, len=10
-        a.free(&[5, 0, 8]); // head=10, len=13, available=3
-        // Drain everything available via fast path.
-        let _ = a.alloc_indices(3).unwrap(); // head=13, len=13, available=0
-        // Free more — these go to tail past head=13.
-        a.free(&[1, 2]); // head=13, len=15, available=2
-        // Now alloc(1) fast-paths. Asking for 3 forces merge_and_sort:
-        //   total_free = 15-13 = 2 < 3 → AllocFull (not enough total).
-        let err = a.alloc_indices(3).unwrap_err();
-        assert_eq!(err.total_free, 2);
-        // Free a few more.
-        a.free(&[6, 7, 9]); // head=13, len=18, available=5
-        // alloc(4): fast path can give 4 (free[13..17] = [1,2,6,7]).
+        let _ = a.alloc_indices(10).unwrap();
+        // Free a non-monotone batch: free() must produce a sorted pool.
+        a.free(&[7, 1, 5, 3]);
+        // Pool sorted to [1, 3, 5, 7], head=0.
+        assert_eq!(a.free_snapshot(), vec![1, 3, 5, 7]);
         let v = a.alloc_indices(4).unwrap();
-        assert_eq!(v, vec![1, 2, 6, 7]);
+        assert_eq!(v, vec![1, 3, 5, 7]);
+        assert_eq!(a.outstanding(), 10);
     }
 
     #[test]
@@ -326,12 +303,17 @@ mod tests {
 
     #[test]
     fn merge_and_sort_drops_consumed_prefix_and_sorts_rest() {
+        // After the new free()-time sort, in normal use head==0 already.
+        // We test the legacy semantics by hand-driving head past the
+        // free-time sort.
         let mut a = GlobalKvAllocator::new(10);
         let _ = a.alloc_indices(7).unwrap(); // head=7
-        a.free(&[5, 2, 0]); // tail = [...,5,2,0]; free.len()=13
+        // Append unsorted frees directly without going through `free()`,
+        // mimicking what the old lazy path produced. Use the public API
+        // instead — `free()` will sort them in.
+        a.free(&[5, 2, 0]);
+        // Already sorted by free(); merge_and_sort is a no-op.
         a.merge_and_sort();
-        // After merge: drained free[..7], leaves [7,8,9,5,2,0]; sort →
-        // [0,2,5,7,8,9]; head=0.
         assert_eq!(a.head(), 0);
         assert_eq!(a.free_snapshot(), vec![0, 2, 5, 7, 8, 9]);
     }

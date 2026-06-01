@@ -1,21 +1,20 @@
 //! Authoritative scheduler request table (a.k.a. `SessionRepository`).
 //!
-//! Step 9 (cosmic-cascade-tesla v5.1): we keep the public type name
-//! `RequestTable` for now (a thin transitional alias `SessionRepository`
-//! is exported alongside) but the *storage substrate* migrates from
-//! `Vec<InferenceSession<S>>` + `iter().position()` linear scans to
-//! `slotmap::SlotMap<SessionKey, InferenceSession<S>>` keyed by a
-//! generational handle.
+//! The storage substrate is a `slotmap::SlotMap<SessionKey,
+//! InferenceSession<S>>` keyed by a generational handle, one map per
+//! state bucket (waiting / prefilling / decoding). The public type
+//! name `RequestTable` is exported alongside a forward-compat
+//! `SessionRepository` alias.
 //!
 //! ## Why SlotMap
 //!
-//! Two production wins over the previous Vec layout:
+//! Two production wins over a `Vec<InferenceSession<S>>`:
 //!
 //! 1. **O(1) state-bucket look-ups.** Every active sequence is reachable
 //!    via the `locations` index in `O(1)`, including the inner bucket
-//!    move for prefill→decode promotion. The old code did
+//!    move for prefill→decode promotion. A `Vec` substrate would do
 //!    `iter().position(|seq| seq.meta.sequence_id == sid)` on every
-//!    `ack_prefill` / `append_generated_token` / `extend_decode_kv` /
+//!    `ack_prefill` / `append_generated_token` /
 //!    `finish_decoding` / `fail_sequence` / `cancel_request` call.
 //!
 //! 2. **ABA resistance through generational keys.** A `SessionKey` issued
@@ -42,8 +41,7 @@ use std::sync::Arc;
 
 use slotmap::{new_key_type, SlotMap};
 
-use crate::domain::kv_cache_pool::KvLease;
-use crate::infrastructure::kv_cache::traits::{PhysicalBlockId, PrefixMatch};
+use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use crate::error::{Result, SchedulerError};
 use crate::domain::inference_session::handle::{ClientId, RequestHandle};
 use crate::domain::inference_session::lifecycle::{
@@ -156,14 +154,11 @@ pub enum CancelOutcome {
         request_id: RequestId,
         external_id: String,
         sequence_id: SequenceId,
-        kv_lease: KvLease,
     },
     RemovedDecoding {
         request_id: RequestId,
         external_id: String,
         sequence_id: SequenceId,
-        prompt_tokens: Vec<i32>,
-        kv_lease: KvLease,
     },
     NotFound,
 }
@@ -204,7 +199,7 @@ pub struct RequestTable {
     terminal: Vec<TerminalRecord>,
 }
 
-/// Forward-compat name. New code (Step 13+) should refer to this.
+/// Forward-compat alias for callers that prefer the longer name.
 pub type SessionRepository = RequestTable;
 
 impl RequestTable {
@@ -352,7 +347,6 @@ impl RequestTable {
     pub fn commit_prefill_start(
         &mut self,
         seq: InferenceSession<Queued>,
-        kv_lease: KvLease,
         prefix_match: PrefixMatch,
         scheduled_len: usize,
     ) -> Result<PrefillStartOutcome> {
@@ -377,7 +371,7 @@ impl RequestTable {
             )));
         }
 
-        let mut prefilling = seq.start_prefill(kv_lease);
+        let mut prefilling = seq.start_prefill();
         prefilling.state.num_computed_tokens = prefix_match
             .num_cached_tokens
             .min(prefilling.state.prompt_len);
@@ -551,20 +545,6 @@ impl RequestTable {
         })
     }
 
-    pub fn extend_decode_kv(
-        &mut self,
-        sequence_id: SequenceId,
-        blocks: Vec<PhysicalBlockId>,
-    ) -> Result<()> {
-        let key = self.decoding_key(sequence_id)?;
-        let seq = self
-            .decoding
-            .get_mut(key)
-            .ok_or_else(|| SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id)))?;
-        seq.state.kv_lease.extend(blocks);
-        Ok(())
-    }
-
     pub fn finish_decoding(&mut self, sequence_id: SequenceId) -> Result<InferenceSession<Decoding>> {
         let key = self.decoding_key(sequence_id)?;
         let seq = self
@@ -574,45 +554,6 @@ impl RequestTable {
         self.remove_active(seq.meta.id.clone(), sequence_id, TerminalReason::Finished)?;
         debug_assert!(self.validate_consistency().is_ok());
         Ok(seq)
-    }
-
-    /// Phase 7A: preempt a Decoding session and re-queue it at the front
-    /// of the waiting queue. Generated tokens are dropped; prompt is
-    /// preserved via `Arc<RequestMeta>` so the next iteration can re-prefill
-    /// (cheaply, ideally via a RadixTree prefix hit).
-    ///
-    /// The legacy `KvLease` carried by `Decoding` is consumed and dropped
-    /// here; in the new path the worker's slots are released by the
-    /// scheduler's `FreeKvIndices` after admission has already called
-    /// `RadixTree::mark_finished_chain`.
-    pub fn preempt_decoding_to_starved(
-        &mut self,
-        sequence_id: SequenceId,
-    ) -> Result<()> {
-        let key = self.decoding_key(sequence_id)?;
-        let seq = self.decoding.remove(key).ok_or_else(|| {
-            SchedulerError::Internal(format!(
-                "decoding slot vanished on preempt: {}",
-                sequence_id
-            ))
-        })?;
-        let request_id = seq.meta.id.clone();
-        // Drop the lease (legacy block-pool returns blocks via Drop sink).
-        let (starved, _lease) = seq.preempt_to_starved();
-        // Lift back to Queued and push to waiting queue front. The address
-        // bookkeeping is mirrored on the `restore_waiting_front` API which
-        // expects the by_request → sequence_id index to still be present;
-        // we never removed it from `by_request` (only `decoding`), so the
-        // re-queue path is straight.
-        let queued = starved.requeue();
-        // The session was registered as Bucket::Decoding; flip it to
-        // Bucket::Waiting before pushing.
-        self.locations
-            .insert(sequence_id, Address::waiting());
-        self.waiting.push_front(queued);
-        debug_assert!(self.validate_consistency().is_ok());
-        let _ = request_id;
-        Ok(())
     }
 
     pub fn running_sequence_ids(&self) -> Vec<SequenceId> {
@@ -717,13 +658,11 @@ impl RequestTable {
                 })?;
                 let request_id_out = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                let kv_lease = seq.state.kv_lease;
                 self.remove_active(request_id.clone(), sequence_id, TerminalReason::Cancelled)?;
                 Ok(CancelOutcome::RemovedPrefilling {
                     request_id: request_id_out,
                     external_id,
                     sequence_id,
-                    kv_lease,
                 })
             }
             Bucket::Decoding => {
@@ -732,15 +671,11 @@ impl RequestTable {
                 })?;
                 let request_id_out = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                let prompt_tokens = seq.meta.input_ids.clone();
-                let kv_lease = seq.state.kv_lease;
                 self.remove_active(request_id.clone(), sequence_id, TerminalReason::Cancelled)?;
                 Ok(CancelOutcome::RemovedDecoding {
                     request_id: request_id_out,
                     external_id,
                     sequence_id,
-                    prompt_tokens,
-                    kv_lease,
                 })
             }
         }
@@ -972,7 +907,7 @@ mod tests {
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&request_id).unwrap();
         let outcome = table
-            .commit_prefill_start(queued, KvLease::empty(), no_prefix(), 4)
+            .commit_prefill_start(queued, no_prefix(), 4)
             .unwrap();
         assert!(matches!(outcome, PrefillStartOutcome::Scheduled { .. }));
         let ack = table.ack_prefill(SequenceId(7)).unwrap();
@@ -1007,11 +942,8 @@ mod tests {
         let outcome = table
             .commit_prefill_start(
                 queued,
-                KvLease::empty(),
                 PrefixMatch {
                     num_cached_tokens: 4,
-                    cached_blocks: vec![],
-                    last_block_hash: None,
                 },
                 1,
             )
@@ -1035,7 +967,7 @@ mod tests {
         table.insert_new(m_a, RequestHandle::noop()).unwrap();
         let queued_a = table.take_waiting(&req_a).unwrap();
         table
-            .commit_prefill_start(queued_a, KvLease::empty(), no_prefix(), 1)
+            .commit_prefill_start(queued_a, no_prefix(), 1)
             .unwrap();
         let _ = table.ack_prefill(SequenceId(1)).unwrap(); // -> Decoding
         // Capture a copy of A's address (the SessionKey in particular).
@@ -1048,7 +980,7 @@ mod tests {
         table.insert_new(m_b, RequestHandle::noop()).unwrap();
         let queued_b = table.take_waiting(&req_b).unwrap();
         table
-            .commit_prefill_start(queued_b, KvLease::empty(), no_prefix(), 1)
+            .commit_prefill_start(queued_b, no_prefix(), 1)
             .unwrap();
         let _ = table.ack_prefill(SequenceId(2)).unwrap();
         // The stored address for A is stale: looking it up in the decoding
@@ -1078,7 +1010,7 @@ mod tests {
         let queued = table.take_waiting(&req).unwrap();
         // Schedule a chunked prefill (1 token of 2): leaves session in Prefilling.
         table
-            .commit_prefill_start(queued, KvLease::empty(), no_prefix(), 1)
+            .commit_prefill_start(queued, no_prefix(), 1)
             .unwrap();
         assert_eq!(
             table.location_for_request(&req),

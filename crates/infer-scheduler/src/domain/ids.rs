@@ -3,8 +3,7 @@
 //! Centralized newtype dictionary for the scheduler domain:
 //! - **Identity**: `InferenceRequestId`, `SequenceId`, `ClientId`,
 //!   `WorkerNodeId`, `ModelInstanceId`
-//! - **KV resources**: `PhysicalBlockId`, `BlockHash`, `BlockSize`,
-//!   `BlockCount`
+//! - **KV resources**: `BlockSize`, `BlockCount`
 //! - **Counts**: `TokenCount`, `SeqCount`, `PromptLen`, `GeneratedCount`
 //! - **Time**: `ArrivalTime`, `LastSeenAt`
 //!
@@ -17,32 +16,28 @@
 //!   arithmetic explicit; **no implicit conversion to `usize`**.
 //! - Identity types implement `Display` for log-friendly output.
 //!
-//! Some types in this module are **re-exports** of legacy locations
-//! (`request::lifecycle::RequestId`, `cache::traits::PhysicalBlockId`,
-//! `transport::control_plane::WorkerId`, `request::handle::ClientId`).
-//! Subsequent refactor steps move the canonical definitions here.
+//! `RequestId`, `SequenceId`, `ClientId`, and `WorkerNodeId` are re-exported
+//! here from their canonical modules so callers can spell their imports
+//! through `domain::ids` without navigating into sub-modules.
 
 use std::ops::{Add, Sub};
 use std::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Re-exports of legacy NewTypes (canonical definitions still in old modules)
+//  Re-exports — canonical definitions live in their owning modules.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub use crate::infrastructure::kv_cache::traits::{BlockHash, PhysicalBlockId};
 pub use crate::domain::inference_session::handle::ClientId;
 pub use crate::domain::inference_session::lifecycle::{RequestId, SequenceId};
 pub use crate::infrastructure::transport::control_plane::WorkerId as WorkerNodeId;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Identity (new types introduced by the refactor)
+//  Identity (defined in this module)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Internal inference request id (newly generated per request, distinct from
-/// the client-supplied `external_id` string).
-///
-/// Replaces the legacy `RequestId(String)` for new domain code. The legacy
-/// string-based `RequestId` is still re-exported above for transitional use.
+/// the client-supplied `external_id` string). The `external_id` is preserved
+/// as a separate field on `RequestMeta` for response routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InferenceRequestId(uuid::Uuid);
 

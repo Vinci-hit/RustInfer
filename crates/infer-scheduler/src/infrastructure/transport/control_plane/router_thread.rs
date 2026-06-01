@@ -270,7 +270,6 @@ fn handle_inbound(
     // Spontaneous events. Surface to the engine.
     let event = match env.payload {
         WorkerControlMessage::Heartbeat(hb) => ControlEvent::Heartbeat { worker, hb },
-        WorkerControlMessage::NeedBlocks(req) => ControlEvent::NeedBlocks { worker, req },
         WorkerControlMessage::StepError(err) => ControlEvent::StepError { worker, err },
         WorkerControlMessage::Error(e) => ControlEvent::WorkerError {
             worker,

@@ -1,35 +1,37 @@
 //! `OutputProcessingSystem` — terminal-state owner.
 //!
-//! Step 15 ports the engine's response-emission + KV-cleanup paths
-//! into a single System. Per the refactor plan (P2-F), this System
-//! is the **sole owner** of returning KV resources to the pool —
-//! no other System or engine method may call `kv.free*` directly.
+//! Single home for response emission and the scheduler-side cleanup
+//! that follows session termination: error fan-out, success
+//! completion, and the `RadixTree` extension that turns each
+//! `StepOutput.assigned_indices` into prefix-cache entries the
+//! next iteration can reuse.
 //!
 //! ## Surface
 //!
 //! - [`OutputProcessingSystem::send_request_error`] — construct and
 //!   emit an error response (stream chunk vs. unary), no state change.
-//! - [`OutputProcessingSystem::fail_prefilling_session`] — KV release
-//!   for a Prefilling session + send error.
+//! - [`OutputProcessingSystem::fail_prefilling_session`] — emit error
+//!   for a session caught in `Prefilling`. RadixTree release is
+//!   driven separately by the engine via `radix_mark_finished`.
 //! - [`OutputProcessingSystem::fail_decoding_session`] — same for
-//!   Decoding (carries partial token count for metrics).
+//!   `Decoding` (carries partial token count for metrics).
 //! - [`OutputProcessingSystem::complete_session`] — emit success
-//!   response, route prompt tokens through prefix cache, release KV,
-//!   record completion metrics.
+//!   response and record completion metrics.
+//! - [`OutputProcessingSystem::feed_radix_assigned_indices`] /
+//!   [`OutputProcessingSystem::radix_mark_finished`] — RadixTree
+//!   maintenance helpers.
 //!
 //! ## Borrow shape
 //!
 //! Each method takes the resources it needs as `&mut`/`&` arguments
-//! rather than holding them in `self`. This lets the engine keep its
-//! current ownership of `RequestTable` / `KvManager` / transports
-//! without forcing field aliasing through the System. Step 18 will
-//! tighten this when the engine slim-down lands.
+//! rather than holding them in `self`. The engine keeps ownership of
+//! `RequestTable` / transports / metrics and hands non-aliasing
+//! borrows in per call.
 
 use infer_protocol::scheduler_to_server::{
     ChunkType, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
 };
 
-use crate::domain::kv_cache_pool::{KvCachePool, KvLease};
 use crate::domain::kv_budget::KvBudget;
 use crate::error::Result;
 use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
@@ -38,10 +40,8 @@ use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::{Decoding, FinishReason, InferenceSession, Prefilling};
 use crate::infrastructure::transport::traits::FrontendTransport;
 
-/// Output / cleanup stage. Stateless today (the `MetricsRecorder` is
-/// passed in per-call rather than owned, since the engine still has
-/// the only reference); a future Step 19 will inject a
-/// `MetricsHandle: Arc<MetricsRecorder>` here.
+/// Output / cleanup stage. Stateless; the engine owns the
+/// `MetricsRecorder` and passes it in per call.
 #[derive(Debug, Default)]
 pub struct OutputProcessingSystem;
 
@@ -96,22 +96,19 @@ impl OutputProcessingSystem {
         }
     }
 
-    /// Fail a session caught in `Prefilling`. Owner of KV release.
+    /// Fail a session caught in `Prefilling`. Emits the error
+    /// response; RadixTree release for the partially-filled chain
+    /// is driven separately by the engine through
+    /// `radix_mark_finished`.
     pub async fn fail_prefilling_session(
         &self,
         frontend: &mut dyn FrontendTransport,
-        kv: &mut dyn KvCachePool,
         seq: InferenceSession<Prefilling>,
         message: &str,
     ) -> Result<()> {
         let external_id = seq.meta.external_id.clone();
         let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
         let stream = seq.meta.stream;
-        // Drop the lease without prefix-cache routing — failed
-        // prompts shouldn't pollute the cache. The KvLease Drop
-        // guard parks blocks in the return sink for the next
-        // `flush_pending_returns` to drain.
-        let _ = (kv, seq.state.kv_lease);
         self.send_request_error(frontend, client_id, external_id, stream, message.to_string(), 0)
             .await
     }
@@ -121,7 +118,6 @@ impl OutputProcessingSystem {
     pub async fn fail_decoding_session(
         &self,
         frontend: &mut dyn FrontendTransport,
-        kv: &mut dyn KvCachePool,
         seq: InferenceSession<Decoding>,
         message: &str,
     ) -> Result<()> {
@@ -129,7 +125,6 @@ impl OutputProcessingSystem {
         let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
         let stream = seq.meta.stream;
         let num_tokens = seq.state.output_tokens.len() as u32;
-        let _ = (kv, seq.state.kv_lease);
         self.send_request_error(
             frontend,
             client_id,
@@ -141,13 +136,13 @@ impl OutputProcessingSystem {
         .await
     }
 
-    /// Successfully complete a Decoding session. Routes the full
-    /// prompt through the prefix cache (so a future request with the
-    /// same prompt can short-circuit), then frees the lease blocks.
+    /// Successfully complete a Decoding session. The `RadixTree`
+    /// already owns prefix indexing for this session's tokens; slot
+    /// release is driven separately by the engine through
+    /// `radix_mark_finished`.
     pub async fn complete_session(
         &self,
         frontend: &mut dyn FrontendTransport,
-        kv: &mut dyn KvCachePool,
         metrics: &MetricsRecorder,
         seq: InferenceSession<Decoding>,
     ) -> Result<CompleteOutcome> {
@@ -162,12 +157,8 @@ impl OutputProcessingSystem {
             FinishReason::Eos
         };
 
-        let prompt_tokens = seq.meta.input_ids.clone();
-        // `finish` consumes the session and yields the lease + output
-        // bookkeeping. We then route the lease through `free_finished`
-        // (P2-F: single owner of KV release).
+        // `finish` consumes the session and yields output bookkeeping.
         let finished = seq.finish(reason);
-        kv.free_finished(&prompt_tokens, finished.state.kv_lease);
 
         let elapsed_ms = finished.state.metrics.e2e_latency.as_millis() as u64;
         let num_tokens = finished.state.metrics.num_output_tokens;
@@ -234,40 +225,17 @@ pub struct CompleteOutcome {
 }
 
 impl OutputProcessingSystem {
-    /// Release KV for a session canceled while still in `Prefilling`.
-    /// No client response (the client already initiated the cancel
-    /// and isn't waiting for an ack from us). Lease drop returns
-    /// the blocks to the sink for the next `flush_pending_returns`.
-    pub fn release_canceled_prefill(&self, kv: &mut dyn KvCachePool, kv_lease: KvLease) {
-        // Cancel doesn't go through prefix cache: a partial prompt is
-        // not worth caching. Just drop the lease and flush.
-        let _ = (kv, kv_lease);
-    }
-
-    /// Release KV for a session canceled in `Decoding`. Routes the
-    /// prompt through the prefix cache (so the work isn't wasted —
-    /// a future request with the same prefix can reuse the blocks).
-    pub fn release_canceled_decode(
-        &self,
-        kv: &mut dyn KvCachePool,
-        prompt_tokens: &[i32],
-        kv_lease: KvLease,
-    ) {
-        kv.free_finished(prompt_tokens, kv_lease);
-    }
-
-    /// Feed Phase 4 `StepOutput.assigned_indices` into the scheduler-side
-    /// `RadixTree` + `KvBudget`. Idempotent on `assigned_indices.is_empty()`,
-    /// so legacy (Phase ≤ 3) StepOutput payloads are a no-op.
+    /// Feed `StepOutput.assigned_indices` into the scheduler-side
+    /// `RadixTree` + `KvBudget`. Idempotent on
+    /// `assigned_indices.is_empty()`.
     ///
-    /// **Per-seq multi-segment correctness (Phase 7B-1)**: when the worker's
+    /// **Per-seq multi-segment correctness**: when the worker's
     /// `GlobalKvAllocator` is fragmented it returns non-contiguous indices,
     /// which the worker emits as multiple `AssignedIndices` entries with the
     /// same `sequence_id`. We must feed every entry's slots into the radix
-    /// tree, not just the last one — earlier code keyed a HashMap by
-    /// `sequence_id` and silently dropped duplicates, causing 60% of slots
-    /// to be lost from scheduler-side accounting and starving subsequent
-    /// `evict()` calls.
+    /// tree, not just the last one — keying a HashMap by `sequence_id`
+    /// would silently drop duplicates and starve subsequent `evict()` calls
+    /// of slots they should have surfaced.
     pub fn feed_radix_assigned_indices(
         &self,
         radix: &mut RadixTree,
@@ -323,10 +291,9 @@ impl OutputProcessingSystem {
         }
     }
 
-    /// When a session terminates (success / fail / cancel / preempt), tell
-    /// the new RadixTree so its chain transitions to Finished and slots
-    /// become eligible for LRU eviction. Phase 6 path; legacy block-pool
-    /// path is unchanged.
+    /// When a session terminates (success / fail / cancel / preempt),
+    /// tell the `RadixTree` so its chain transitions to unowned and
+    /// the chain's tail nodes become eligible for LRU eviction.
     ///
     /// Idempotent on unknown seq ids.
     pub fn radix_mark_finished(&self, radix: &mut RadixTree, sequence_id: u64) {
@@ -351,7 +318,6 @@ impl OutputProcessingSystem {
     pub async fn process_llm_step(
         &self,
         sessions: &mut crate::domain::inference_session::table::RequestTable,
-        kv: &mut dyn KvCachePool,
         frontend: &mut dyn FrontendTransport,
         metrics: &MetricsRecorder,
         codec: &crate::infrastructure::transport::codec::MsgPackCodec,
@@ -423,7 +389,7 @@ impl OutputProcessingSystem {
         finished_sequence_ids.dedup();
         for sequence_id in finished_sequence_ids {
             let seq = sessions.finish_decoding(sequence_id)?;
-            let outcome = self.complete_session(frontend, kv, metrics, seq).await?;
+            let outcome = self.complete_session(frontend, metrics, seq).await?;
             tracing::info!(
                 "Completed {}: {} tokens in {}ms ({:.1} tok/s)",
                 outcome.request_id_display,
@@ -445,7 +411,6 @@ impl OutputProcessingSystem {
     pub async fn fail_sessions(
         &self,
         sessions: &mut crate::domain::inference_session::table::RequestTable,
-        kv: &mut dyn KvCachePool,
         frontend: &mut dyn FrontendTransport,
         failed_request_ids: &[crate::domain::inference_session::lifecycle::RequestId],
         message: &str,
@@ -458,11 +423,11 @@ impl OutputProcessingSystem {
             };
             match sessions.fail_sequence(sid, message)? {
                 FailedOutcome::RemovedPrefilling { sequence, .. } => {
-                    self.fail_prefilling_session(frontend, kv, sequence, message)
+                    self.fail_prefilling_session(frontend, sequence, message)
                         .await?;
                 }
                 FailedOutcome::RemovedDecoding { sequence, .. } => {
-                    self.fail_decoding_session(frontend, kv, sequence, message)
+                    self.fail_decoding_session(frontend, sequence, message)
                         .await?;
                 }
                 FailedOutcome::NotFound { .. } => {}
@@ -477,13 +442,12 @@ impl OutputProcessingSystem {
     /// completes (or errors) at once. We walk the result vector,
     /// route each item through `take_prefilling_by_request` to drop
     /// the session out of the repository with the right terminal
-    /// reason, release its KV (via `release_canceled_prefill` —
-    /// diffusion uses no real KV), and emit the final
-    /// `InferenceResponse` with image bytes.
+    /// reason, and emit the final `InferenceResponse` with image
+    /// bytes. Diffusion uses no real KV, so there is no
+    /// scheduler-side slot release to do here.
     pub async fn process_diffusion_step(
         &self,
         sessions: &mut crate::domain::inference_session::table::RequestTable,
-        kv: &mut dyn KvCachePool,
         frontend: &mut dyn FrontendTransport,
         metrics: &MetricsRecorder,
         codec: &crate::infrastructure::transport::codec::MsgPackCodec,
@@ -529,9 +493,8 @@ impl OutputProcessingSystem {
             let request_id_display = seq.meta.id.to_string();
             let external_id = seq.meta.external_id.clone();
             let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
-            // P2-F: KV release goes through OutputSystem; engine never
-            // touches `kv.free*` directly.
-            self.release_canceled_prefill(kv, seq.state.kv_lease);
+            // No scheduler-side KV cleanup for diffusion; the worker
+            // reclaims any model-internal resources itself.
 
             let elapsed_ms = seq.meta.arrival_time.elapsed().as_millis() as u64;
             let (status, images, error) = match item.status {
@@ -582,8 +545,6 @@ impl OutputProcessingSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::kv_cache_pool::KvLease;
-    use crate::infrastructure::kv_cache::traits::PhysicalBlockId;
     use crate::domain::inference_session::handle::RequestHandle;
     use crate::domain::inference_session::lifecycle::{
         Decoding, InferenceSession, Prefilling, Priority, RequestId, RequestMeta,
@@ -625,58 +586,6 @@ mod tests {
         }
     }
 
-    /// Capturing KvCachePool: records `free_finished` calls so tests
-    /// can verify the success path routes prompts through the
-    /// prefix cache. `allocate` issues empty leases so tests don't
-    /// need a real block allocator.
-    #[derive(Default)]
-    struct CapturingKv {
-        free_finished_calls: Vec<Vec<i32>>,
-    }
-
-    impl crate::domain::kv_cache_pool::KvCachePool for CapturingKv {
-        fn allocate(&mut self, _: crate::domain::ids::TokenCount) -> Result<KvLease> {
-            Ok(KvLease::empty())
-        }
-        fn allocate_with_prefix(
-            &mut self,
-            _: &[i32],
-        ) -> Result<(KvLease, crate::infrastructure::kv_cache::PrefixMatch)> {
-            Ok((
-                KvLease::empty(),
-                crate::infrastructure::kv_cache::PrefixMatch::none(),
-            ))
-        }
-        fn allocate_decode_blocks(
-            &mut self,
-            _: crate::domain::ids::BlockCount,
-        ) -> Result<Vec<crate::infrastructure::kv_cache::PhysicalBlockId>> {
-            Ok(Vec::new())
-        }
-        fn free_finished(&mut self, prompt_tokens: &[i32], _lease: KvLease) {
-            self.free_finished_calls.push(prompt_tokens.to_vec());
-        }
-        fn match_prefix(
-            &mut self,
-            _: &[i32],
-        ) -> crate::infrastructure::kv_cache::PrefixMatch {
-            crate::infrastructure::kv_cache::PrefixMatch::none()
-        }
-        fn flush_pending_returns(&mut self) {}
-        fn block_size(&self) -> crate::domain::ids::BlockSize {
-            crate::domain::ids::BlockSize::new(1)
-        }
-        fn total_blocks(&self) -> crate::domain::ids::BlockCount {
-            crate::domain::ids::BlockCount::new(0)
-        }
-        fn available_blocks(&self) -> crate::domain::ids::BlockCount {
-            crate::domain::ids::BlockCount::new(0)
-        }
-        fn mode_name(&self) -> &'static str {
-            "capturing"
-        }
-    }
-
     fn meta_for_test(stream: bool, prompt: Vec<i32>) -> Arc<RequestMeta> {
         Arc::new(RequestMeta {
             id: RequestId::new_v4(),
@@ -698,7 +607,6 @@ mod tests {
             meta: meta_for_test(stream, vec![1, 2, 3, 4]),
             handle: RequestHandle::noop(),
             state: Prefilling {
-                kv_lease: KvLease::test_with_blocks(vec![PhysicalBlockId(7)]),
                 num_computed_tokens: 0,
                 inflight: None,
                 prompt_len: 4,
@@ -712,7 +620,6 @@ mod tests {
             meta: meta_for_test(stream, vec![1, 2, 3, 4]),
             handle: RequestHandle::noop(),
             state: Decoding {
-                kv_lease: KvLease::test_with_blocks(vec![PhysicalBlockId(11)]),
                 output_tokens: output,
                 seq_position: 4,
                 prompt_len: 4,
@@ -723,16 +630,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_prefilling_releases_kv_and_emits_error() {
+    async fn fail_prefilling_emits_error_response() {
         let sys = OutputProcessingSystem::new();
         let mut frontend = CapturingFrontend::default();
-        let mut kv = CapturingKv::default();
-        sys.fail_prefilling_session(&mut frontend, &mut kv, prefilling_session(false), "bad")
+        sys.fail_prefilling_session(&mut frontend, prefilling_session(false), "bad")
             .await
             .unwrap();
-        // Failure path drops the lease; prefix cache is NOT touched
-        // (we don't want a partial / failed prompt polluting the cache).
-        assert_eq!(kv.free_finished_calls.len(), 0, "no prefix-cache routing on failure");
         let resps = frontend.responses.lock().unwrap();
         assert_eq!(resps.len(), 1);
         assert!(matches!(resps[0].status, ResponseStatus::Error));
@@ -743,10 +646,8 @@ mod tests {
     async fn fail_decoding_carries_partial_token_count_to_metrics() {
         let sys = OutputProcessingSystem::new();
         let mut frontend = CapturingFrontend::default();
-        let mut kv = CapturingKv::default();
         sys.fail_decoding_session(
             &mut frontend,
-            &mut kv,
             decoding_session(false, vec![1, 2, 3]),
             "bang",
         )
@@ -761,10 +662,8 @@ mod tests {
     async fn fail_decoding_streams_error_chunk_when_stream_true() {
         let sys = OutputProcessingSystem::new();
         let mut frontend = CapturingFrontend::default();
-        let mut kv = CapturingKv::default();
         sys.fail_decoding_session(
             &mut frontend,
-            &mut kv,
             decoding_session(true, vec![42, 43]),
             "boom",
         )
@@ -779,25 +678,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_session_routes_through_free_finished() {
+    async fn complete_session_emits_success_response() {
         let sys = OutputProcessingSystem::new();
         let mut frontend = CapturingFrontend::default();
-        let mut kv = CapturingKv::default();
         let metrics = MetricsRecorder::new(false);
         let outcome = sys
             .complete_session(
                 &mut frontend,
-                &mut kv,
                 &metrics,
                 decoding_session(false, vec![10, 11, 12]),
             )
             .await
             .unwrap();
-        // Single owner of KV release: free_finished routes through
-        // the prefix cache. Exactly one call recorded.
-        assert_eq!(kv.free_finished_calls.len(), 1);
-        // Prompt forwarded to prefix cache routing.
-        assert_eq!(kv.free_finished_calls[0], vec![1, 2, 3, 4]);
         // Response is success with the output token list.
         let resps = frontend.responses.lock().unwrap();
         assert_eq!(resps.len(), 1);

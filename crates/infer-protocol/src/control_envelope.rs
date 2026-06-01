@@ -4,15 +4,15 @@
 //! [`ControlEnvelope`]. The envelope carries a [`RequestId`] used to correlate
 //! RPC requests with their replies. `RequestId(0)` (== [`RequestId::NONE`]) is
 //! reserved for spontaneous, uncorrelated events such as `Heartbeat`,
-//! `NeedBlocks`, `StepError`, and bootstrap progress messages.
+//! `StepError`, and bootstrap progress messages.
 //!
 //! ## RequestId allocation
 //!
-//! In phase 1 only the scheduler initiates RPCs (e.g. `Ping`, `Drain`,
+//! Today only the scheduler initiates RPCs (e.g. `Ping`, `Drain`,
 //! `UnloadModel`). The scheduler holds an `AtomicU64` starting at 1 and hands
 //! out monotonic ids. The worker echoes the originating id back on its reply.
-//! A future phase that lets workers initiate RPCs must partition the id space
-//! so the two sides do not collide; for now the worker never allocates.
+//! A future variant that lets workers initiate RPCs must partition the id
+//! space so the two sides do not collide; for now the worker never allocates.
 
 use serde::{Deserialize, Serialize};
 

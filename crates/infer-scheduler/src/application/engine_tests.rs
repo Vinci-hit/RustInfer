@@ -5,12 +5,11 @@
 
     use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
     use infer_protocol::scheduler_to_worker_data::BatchCommand;
-    use infer_protocol::worker_to_scheduler_control::{NeedBlocks, NeedBlocksReason, WorkerStepError};
+    use infer_protocol::worker_to_scheduler_control::WorkerStepError;
     use infer_protocol::worker_to_scheduler_data::{GeneratedToken, StepOutput};
 
-    use crate::domain::kv_cache_pool::{KvLease, PagedKvPool};
-    use crate::infrastructure::kv_cache::traits::PhysicalBlockId;
-    use crate::config::{KvCacheMode, SchedulerConfig};
+    use crate::config::SchedulerConfig;
+    use crate::domain::ids::BlockSize;
     use crate::domain::policy::ContinuousBatchingPolicy;
     use crate::domain::inference_session::handle::{ClientId, RequestHandle};
     use crate::error::SchedulerError;
@@ -133,7 +132,6 @@
             meta,
             handle: RequestHandle::noop(),
             state: Prefilling {
-                kv_lease: KvLease::test_with_blocks(vec![PhysicalBlockId(0)]),
                 num_computed_tokens: 0,
                 inflight: Some(InFlightPrefillSegment {
                     segment_start: 0,
@@ -147,9 +145,9 @@
     }
 
     #[tokio::test]
-    async fn step_output_final_prefill_need_blocks_grants_after_decode_transition() -> Result<()> {
+    async fn step_output_final_prefill_decodes_with_existing_blocks() -> Result<()> {
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            paged_block_size: BlockSize::new(4),
             num_gpu_blocks: 4,
             ..Default::default()
         };
@@ -160,7 +158,6 @@
         let mut engine = SchedulerEngine::new(
             config,
             Box::new(ContinuousBatchingPolicy::new(None)),
-            Box::new(PagedKvPool::new(4, 4)),
             worker_group(),
             MockFrontend,
             worker,
@@ -176,7 +173,6 @@
         let queued = engine.requests.take_waiting(&request_id)?;
         engine.requests.commit_prefill_start(
             queued,
-            KvLease::test_with_blocks(vec![PhysicalBlockId(0)]),
             crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
             4,
         )?;
@@ -201,50 +197,9 @@
         assert_eq!(engine.requests.decoding_len(), 1);
         assert_eq!(engine.requests.decoding()[0].state.output_tokens, vec![42]);
 
-        // Now inject a NeedBlocks event through the control plane and verify
-        // the engine emits a GrantBlocks unicast.
-        let need = NeedBlocks {
-            worker_id: "worker-test".to_string(),
-            model_instance_id: engine.worker_group.model_instance_id.clone(),
-            sequence_id: 7,
-            current_blocks: 1,
-            required_blocks: 2,
-            request_blocks: 1,
-            reason: NeedBlocksReason::DecodeExtend,
-        };
-        engine
-            .on_control_event(ControlEvent::NeedBlocks {
-                worker: default_worker.clone(),
-                req: need,
-            })
-            .await?;
-
-        // After grant: block table extended.
-        let blocks = engine.requests.decoding()[0].state.kv_lease.blocks();
-        assert_eq!(blocks.len(), 2);
-
-        // Drain the cmd_rx and verify GrantBlocks was unicast to the right worker.
-        let cmd = cmd_rx.try_recv().expect("expected RouterCommand on cmd_rx");
-        match cmd {
-            crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo { worker, env } => {
-                assert_eq!(worker, default_worker);
-                match env.payload {
-                    SchedulerControlMessage::GrantBlocks(g) => {
-                        assert_eq!(g.sequence_id, 7);
-                        assert_eq!(g.block_ids.len(), 1);
-                    }
-                    other => panic!("expected GrantBlocks, got {:?}", other),
-                }
-            }
-            other => panic!("expected SendTo, got something else: {}",
-                match other {
-                    crate::infrastructure::transport::control_plane::handle::RouterCommand::Broadcast { .. } => "Broadcast",
-                    crate::infrastructure::transport::control_plane::handle::RouterCommand::CallOne { .. } => "CallOne",
-                    crate::infrastructure::transport::control_plane::handle::RouterCommand::CallAll { .. } => "CallAll",
-                    crate::infrastructure::transport::control_plane::handle::RouterCommand::Shutdown => "Shutdown",
-                    _ => "?",
-                }),
-        }
+        // Drain the cmd_rx — no scheduler control msg should be emitted on the
+        // worker-owned-KV path during a normal decode transition.
+        assert!(cmd_rx.try_recv().is_err(), "no scheduler control msg expected");
 
         // Suppress unused suppression: confirm the data-plane sent vec has the
         // expected single prefill batch (none in this test path).
@@ -252,6 +207,8 @@
         // Use `BatchCommand` to confirm the import remains valid even though no
         // batch was sent on this path.
         let _: Option<BatchCommand> = None;
+        let _ = default_worker;
+        let _ = SchedulerControlMessage::Ping;
         Ok(())
     }
 
@@ -267,7 +224,7 @@
         >,
     ) {
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            paged_block_size: BlockSize::new(4),
             num_gpu_blocks: 4,
             ..Default::default()
         };
@@ -276,7 +233,6 @@
         let engine = SchedulerEngine::new(
             config,
             Box::new(ContinuousBatchingPolicy::new(None)),
-            Box::new(PagedKvPool::new(4, 4)),
             worker_group(),
             MockFrontend,
             MockWorker::default(),
@@ -336,7 +292,6 @@
         let queued = engine.requests.take_waiting(&request_id)?;
         engine.requests.commit_prefill_start(
             queued,
-            KvLease::test_with_blocks(vec![PhysicalBlockId(0)]),
             crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
             4,
         )?;
@@ -359,24 +314,23 @@
         Ok(())
     }
 
-    // ─── Phase 7A: admission cascade activation ─────────────────────
+    // ─── Admission cascade activation ────────────────────────────────
 
     /// Verifies the engine's `KvBudget` was sized from
     /// `worker_group.effective_capacity.max_total_kv_tokens` (32 in the
-    /// test fixture). This is the gate for the new path.
+    /// test fixture).
     #[tokio::test]
     async fn engine_kv_budget_capacity_taken_from_worker_group() -> Result<()> {
         let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
         let default_worker = WorkerId::from_identity(b"worker-test");
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            paged_block_size: BlockSize::new(4),
             num_gpu_blocks: 4,
             ..Default::default()
         };
         let engine = SchedulerEngine::new(
             config,
             Box::new(ContinuousBatchingPolicy::new(None)),
-            Box::new(PagedKvPool::new(4, 4)),
             worker_group(),
             MockFrontend,
             MockWorker::default(),
@@ -393,22 +347,21 @@
         Ok(())
     }
 
-    /// Phase 4 StepOutput.assigned_indices flows into RadixTree +
-    /// KvBudget when LLM step output arrives. Legacy fields are unaffected.
+    /// `StepOutput.assigned_indices` flows into RadixTree + KvBudget when
+    /// LLM step output arrives.
     #[tokio::test]
     async fn step_output_assigned_indices_drive_radix_and_budget() -> Result<()> {
         use infer_protocol::worker_to_scheduler_data::AssignedIndices;
         let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
         let default_worker = WorkerId::from_identity(b"worker-test");
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            paged_block_size: BlockSize::new(4),
             num_gpu_blocks: 4,
             ..Default::default()
         };
         let mut engine = SchedulerEngine::new(
             config,
             Box::new(ContinuousBatchingPolicy::new(None)),
-            Box::new(PagedKvPool::new(4, 4)),
             worker_group(),
             MockFrontend,
             MockWorker::default(),
@@ -417,12 +370,12 @@
             default_worker,
         );
 
-        // Build a Phase 4 StepOutput with assigned_indices populated. We
-        // skip the prefill_done / tokens machinery (those sequences aren't
-        // actually registered) — the engine's `handle_step_output_llm`
-        // first peels the Phase 4 fields, which should still work, and
-        // then the legacy `process_llm_step` warns on unknown sequence_ids
-        // but does not fail.
+        // Build a StepOutput with assigned_indices populated. We skip the
+        // prefill_done / tokens machinery (those sequences aren't actually
+        // registered) — `handle_step_output_llm` first peels the
+        // assigned_indices fields, which exercise the radix/budget path,
+        // and then `process_llm_step` warns on unknown sequence_ids but
+        // does not fail.
         let codec = MsgPackCodec;
         let output = StepOutput {
             prefill_done: vec![],
@@ -464,14 +417,13 @@
         let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
         let default_worker = WorkerId::from_identity(b"worker-test");
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            paged_block_size: BlockSize::new(4),
             num_gpu_blocks: 4,
             ..Default::default()
         };
         let mut engine = SchedulerEngine::new(
             config,
             Box::new(ContinuousBatchingPolicy::new(None)),
-            Box::new(PagedKvPool::new(4, 4)),
             worker_group(),
             MockFrontend,
             MockWorker::default(),
@@ -481,7 +433,7 @@
         );
 
         let codec = MsgPackCodec;
-        // Step 1: write 4 slots for seq 7.
+        // Write 4 slots for seq 7.
         let out1 = StepOutput {
             prefill_done: vec![],
             tokens: vec![GeneratedToken {
@@ -498,7 +450,7 @@
         engine.handle_step_output_llm(codec.encode(&out1)?).await?;
         assert_eq!(engine.radix.lru_len_estimate(), 0);
 
-        // Step 2: finish seq 7 (token.finished = true).
+        // Finish seq 7 (token.finished = true).
         let out2 = StepOutput {
             prefill_done: vec![],
             tokens: vec![GeneratedToken {
@@ -525,10 +477,8 @@
         Ok(())
     }
 
-    // ─── Phase 8 — V3/V5: full admission cycle integration ──────────────
+    // ─── Full admission cycle integration ───────────────────────────────
 
-    /// **Phase 8 V3-mech / V5-mech integration test.**
-    ///
     /// Drives the complete worker-owned-KV cycle through the scheduler
     /// using synthetic StepOutputs (no real worker). Verifies that:
     ///
@@ -542,22 +492,20 @@
     ///
     /// This test does **not** spin up real ZMQ transports. It exercises
     /// the engine's hot path (handle_step_output_llm) and the admission
-    /// substrate (RadixTree + KvBudget) end-to-end. Real ZMQ bring-up
-    /// follows in Phase 7B once the worker is rewritten.
+    /// substrate (RadixTree + KvBudget) end-to-end.
     #[tokio::test]
     async fn phase8_full_admission_cycle_through_engine() -> Result<()> {
         use infer_protocol::worker_to_scheduler_data::AssignedIndices;
         let (control_cmd, control_events, _evt_tx, _cmd_rx) = mock_control_plane();
         let default_worker = WorkerId::from_identity(b"worker-test");
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 4 },
+            paged_block_size: BlockSize::new(4),
             num_gpu_blocks: 4,
             ..Default::default()
         };
         let mut engine = SchedulerEngine::new(
             config,
             Box::new(ContinuousBatchingPolicy::new(None)),
-            Box::new(PagedKvPool::new(4, 4)),
             worker_group(), // capacity=32 from fixture
             MockFrontend,
             MockWorker::default(),
@@ -647,8 +595,7 @@
         engine.handle_step_output_llm(codec.encode(&out104)?).await?;
         assert_eq!(engine.kv_budget.outstanding(), 32, "exactly at capacity");
         // Engine-level cycle confirmed: account → mark finished → evict →
-        // reuse capacity. This is the substrate Phase 7B's worker rewrite
-        // will hook into.
+        // reuse capacity.
         Ok(())
     }
 

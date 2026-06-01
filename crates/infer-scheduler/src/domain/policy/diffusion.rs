@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-use crate::infrastructure::kv_cache::traits::CacheState;
 use crate::domain::policy::traits::{BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy};
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::policy::token_budget::TokenBudget;
@@ -44,7 +43,6 @@ impl SchedulingPolicy for DiffusionPolicy {
         waiting: &WaitingQueue,
         running: &RunningSet,
         _budget: &TokenBudget,
-        _cache_state: &CacheState,
     ) -> BatchPlan {
         if running.num_prefilling > 0 {
             return BatchPlan::empty();
@@ -98,7 +96,6 @@ impl SchedulingPolicy for DiffusionPolicy {
         let total_tokens = prefill_batch.len();
         BatchPlan {
             prefill_batch,
-            decode_batch: vec![],
             preemptions: vec![],
             total_tokens,
         }
@@ -147,19 +144,7 @@ mod tests {
     fn empty_running() -> RunningSet {
         RunningSet {
             num_prefilling: 0,
-            num_decoding: 0,
-            decode_tokens: 0,
-            running_ids: vec![],
             prefilling_continuations: vec![],
-        }
-    }
-
-    fn cache_state() -> CacheState {
-        CacheState {
-            free_blocks: 100,
-            total_blocks: 256,
-            utilization: 0.0,
-            evictable_blocks: 0,
         }
     }
 
@@ -170,7 +155,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert!(!plan.has_work());
     }
 
@@ -181,9 +166,8 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 3);
-        assert!(plan.decode_batch.is_empty());
         assert!(!plan.prefill_batch[0].is_partial);
     }
 
@@ -193,14 +177,11 @@ mod tests {
         let waiting = make_waiting(&["a", "b"]);
         let running = RunningSet {
             num_prefilling: 2,
-            num_decoding: 0,
-            decode_tokens: 0,
-            running_ids: vec![],
             prefilling_continuations: vec![],
         };
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert!(!plan.has_work());
     }
 
@@ -211,7 +192,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
 
-        let plan = policy.schedule(&waiting, &running, &budget, &cache_state());
+        let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 2);
     }
 }

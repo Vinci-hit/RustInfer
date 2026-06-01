@@ -1,14 +1,14 @@
 //! `IngestionSystem` — entrypoint for new client requests.
 //!
-//! Responsibilities (replaces `SchedulerEngine::handle_new_request`):
+//! Responsibilities:
 //!
 //! 1. Validate the protocol payload:
 //!    - LLM mode: non-empty `input_ids`, length within
 //!      `config.max_model_len`.
 //!    - Diffusion mode: non-empty prompt + non-empty
 //!      `prompt_input_ids` (server pre-tokenized).
-//! 2. Mint a fresh `InferenceRequestId(Uuid)` (Step 8) and the next
-//!    monotonic `SequenceId`.
+//! 2. Mint a fresh `RequestId` (uuid-backed) and the next monotonic
+//!    `SequenceId`.
 //! 3. Build the `RequestMeta` aggregate root and hand it to
 //!    `SessionRepository::insert_new`.
 //! 4. Report success/rejection through an `IngestOutcome` enum so

@@ -16,7 +16,7 @@
 //! ```
 //!
 //! Bootstrap (Hello / LoadModel / InitPagedKv / WorkerReady) and runtime
-//! (GrantBlocks / Cancel / Heartbeat / NeedBlocks / …) all flow through the
+//! (FreeKvIndices / Cancel / Heartbeat / …) all flow through the
 //! same socket, so worker ZMQ identity is preserved across the transition.
 
 use std::sync::Arc;
@@ -110,9 +110,10 @@ impl ControlPlane {
     /// running plane plus the [`WorkerGroup`] derived from the worker(s) that
     /// reported Ready.
     ///
-    /// In phase 1 the bootstrap waits for exactly one worker to emit
-    /// `WorkerReady`. The same socket continues to serve the running phase,
-    /// so worker identity survives the transition.
+    /// In single-rank deployments the bootstrap waits for exactly one
+    /// worker to emit `WorkerReady`. The same socket continues to
+    /// serve the running phase, so worker identity survives the
+    /// transition.
     pub async fn bootstrap(
         endpoint: &str,
         load_model: Option<LoadModel>,

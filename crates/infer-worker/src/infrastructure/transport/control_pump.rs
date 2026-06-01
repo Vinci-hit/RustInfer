@@ -43,12 +43,22 @@ impl ControlPump {
         }), RequestId::NONE)
     }
 
-    /// Send heartbeat.
-    pub fn send_heartbeat(&self, active_requests: usize) -> Result<(), String> {
+    /// Send heartbeat. `active_requests` is the worker's current load
+    /// (decode + waiting prefills); `kv_total_slots` / `kv_free_slots`
+    /// expose the worker's `GlobalKvAllocator` occupancy so the scheduler
+    /// can run RadixTree LRU eviction in response to pressure signals.
+    pub fn send_heartbeat(
+        &self,
+        active_requests: usize,
+        kv_total_slots: u32,
+        kv_free_slots: u32,
+    ) -> Result<(), String> {
         self.send(WorkerControlMessage::Heartbeat(WorkerHeartbeat {
             worker_id: self.worker_id.clone(),
             state: WorkerState::Running,
             active_requests,
+            kv_total_slots,
+            kv_free_slots,
         }), RequestId::NONE)
     }
 

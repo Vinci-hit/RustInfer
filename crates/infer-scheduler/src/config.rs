@@ -1,5 +1,7 @@
 //! Scheduler configuration.
 
+use crate::domain::ids::BlockSize;
+
 /// Scheduler operating mode — determines scheduling behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
@@ -10,28 +12,6 @@ pub enum SchedulerMode {
     /// Diffusion: batch-in batch-out, no KV cache management,
     /// all requests in a batch finish together.
     Diffusion,
-}
-
-
-/// KV Cache management mode — determined at startup, immutable at runtime.
-///
-/// Slot mode has been removed in the paged-only refactor; this enum
-/// is retained as a single-variant placeholder so existing call
-/// sites that destructure `kv_cache_mode` keep compiling. A future
-/// step will replace the field with a plain `paged_block_size:
-/// BlockSize` on [`SchedulerConfig`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KvCacheMode {
-    /// Paged mode: scheduler maintains block tables, worker uses PagedAttention kernels.
-    Paged { block_size: usize },
-}
-
-impl Default for KvCacheMode {
-    fn default() -> Self {
-        // Sensible default for benchmark / smoke runs. Production
-        // bootstrap overrides this from the worker handshake.
-        Self::Paged { block_size: 16 }
-    }
 }
 
 
@@ -50,8 +30,8 @@ pub struct SchedulerConfig {
     pub max_model_len: usize,
 
     // ─── KV Cache ───
-    /// KV cache management mode (slot or paged).
-    pub kv_cache_mode: KvCacheMode,
+    /// Paged KV block size (tokens per block).
+    pub paged_block_size: BlockSize,
     /// Total number of GPU blocks (only relevant for Paged mode).
     pub num_gpu_blocks: usize,
 
@@ -81,7 +61,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: 32,
             max_batch_tokens: 1024,
             max_model_len: 4096,
-            kv_cache_mode: KvCacheMode::default(),
+            paged_block_size: BlockSize::new(16),
             num_gpu_blocks: 256,
             chunked_prefill_size: None,
             enable_prefix_caching: false,

@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::domain::kv_cache_pool::KvLease;
 use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use crate::domain::inference_session::handle::RequestHandle;
 use infer_protocol::server_to_scheduler::DiffusionRequest;
@@ -140,7 +139,6 @@ pub struct Queued {
 
 /// Data for a session actively being prefilled.
 pub struct Prefilling {
-    pub kv_lease: KvLease,
     /// How many prompt tokens the Worker has acknowledged as written to KV.
     pub num_computed_tokens: usize,
     /// Segment already sent to Worker but not yet acknowledged.
@@ -158,11 +156,15 @@ pub struct InFlightPrefillSegment {
 
 /// Data for a session in the decode phase.
 pub struct Decoding {
-    pub kv_lease: KvLease,
     pub output_tokens: Vec<i32>,
     pub seq_position: usize,
     pub prompt_len: usize,
     pub first_token_time: Instant,
+    /// Number of times this session has been preempted by the worker
+    /// under KV pressure. The current implementation does not yet
+    /// receive worker-side preempt notifications; this counter is kept
+    /// as a forward-compatible field so the eventual worker → scheduler
+    /// preempt signal can bump it via [`InferenceSession::<Decoding>::bump_preempted`].
     pub preemption_count: u32,
 }
 
@@ -181,21 +183,19 @@ pub struct Finished {
     pub finish_reason: FinishReason,
     pub output_tokens: Vec<i32>,
     pub metrics: CompletionMetrics,
-    /// KV allocation kept for the OutputProcessing system to free during
-    /// `flush_terminals` (RAII Drop guard arrival in Step 11 will fold this
-    /// into automatic cleanup).
-    pub kv_lease: KvLease,
 }
 
 /// Data for a session that errored / was killed.
 ///
-/// **Invariant**: `Failed` always carries the KV allocation so the cleanup
-/// path is uniform with `Finished`. Sessions that fail before any KV is
-/// allocated (e.g. validation reject in Ingestion) should be dropped from
-/// the repository directly without transitioning through `Failed`.
+/// The worker owns physical block ownership; the scheduler-side
+/// `RadixTree::mark_finished_chain` is the only release path. Sessions
+/// that fail before any KV is written (e.g. validation reject in
+/// Ingestion) should still be dropped from the repository directly
+/// without transitioning through `Failed`; we keep the bucket
+/// separate from `Finished` purely to retain partial output token
+/// bookkeeping.
 pub struct Failed {
     pub message: String,
-    pub kv_lease: KvLease,
     pub partial_output_tokens: Vec<i32>,
 }
 
@@ -208,30 +208,17 @@ pub struct CompletionMetrics {
     pub num_preemptions: u32,
 }
 
-/// Data for a session that was preempted by the admission cascade
-/// (Phase 6 / plan §7). Generated tokens are dropped; prompt is preserved
-/// in `Arc<RequestMeta>` so the session can be re-queued and re-prefilled.
-/// `KvLease` is intentionally absent — it is consumed by `preempt_to_starved`
-/// and dropped (returning blocks to the legacy block sink) at the moment
-/// the new RadixTree path marks the chain finished.
-pub struct ResourceStarved {
-    pub dropped_output_count: u32,
-    pub preemption_count: u32,
-}
-
 impl sealed::Sealed for Queued {}
 impl sealed::Sealed for Prefilling {}
 impl sealed::Sealed for Decoding {}
 impl sealed::Sealed for Finished {}
 impl sealed::Sealed for Failed {}
-impl sealed::Sealed for ResourceStarved {}
 
 impl SessionState for Queued {}
 impl SessionState for Prefilling {}
 impl SessionState for Decoding {}
 impl SessionState for Finished {}
 impl SessionState for Failed {}
-impl SessionState for ResourceStarved {}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  InferenceSession<S> — parameterized by state data
@@ -244,7 +231,7 @@ impl SessionState for ResourceStarved {}
 ///
 /// State diagram:
 /// ```text
-///   Queued ──start_prefill(kv)──▶ Prefilling ──promote_to_decoding──▶ Decoding
+///   Queued ──start_prefill()──▶ Prefilling ──promote_to_decoding──▶ Decoding
 ///                                       │                                │
 ///                                       └──────fail(msg)──────▶ Failed ◀┘
 ///                                                                ▲
@@ -252,9 +239,10 @@ impl SessionState for ResourceStarved {}
 /// ```
 ///
 /// **No `Queued::fail()`**: a queued session that fails (e.g. validation
-/// reject) never had KV allocated, so it should be dropped from the
-/// repository, not transitioned to `Failed`. This keeps `Failed::kv_alloc`
-/// non-optional.
+/// reject) is dropped from the repository directly rather than transitioning
+/// to `Failed`. KV ownership lives on the worker; the scheduler signals
+/// release via `RadixTree::mark_finished_chain` rather than through the
+/// typed states.
 pub struct InferenceSession<S: SessionState> {
     /// Shared immutable metadata.
     pub meta: Arc<RequestMeta>,
@@ -285,13 +273,12 @@ impl InferenceSession<Queued> {
     }
 
     /// Transition: Queued → Prefilling.
-    pub fn start_prefill(self, kv_lease: KvLease) -> InferenceSession<Prefilling> {
+    pub fn start_prefill(self) -> InferenceSession<Prefilling> {
         let prompt_len = self.meta.input_ids.len();
         InferenceSession {
             meta: self.meta,
             handle: self.handle,
             state: Prefilling {
-                kv_lease,
                 num_computed_tokens: 0,
                 inflight: None,
                 prompt_len,
@@ -319,7 +306,6 @@ impl InferenceSession<Prefilling> {
             meta: self.meta,
             handle: self.handle,
             state: Decoding {
-                kv_lease: self.state.kv_lease,
                 output_tokens: Vec::new(),
                 seq_position: self.state.prompt_len,
                 prompt_len: self.state.prompt_len,
@@ -329,14 +315,13 @@ impl InferenceSession<Prefilling> {
         }
     }
 
-    /// Transition: Prefilling → Failed (carries KV for cleanup).
+    /// Transition: Prefilling → Failed.
     pub fn fail(self, message: String) -> InferenceSession<Failed> {
         InferenceSession {
             meta: self.meta,
             handle: self.handle,
             state: Failed {
                 message,
-                kv_lease: self.state.kv_lease,
                 partial_output_tokens: Vec::new(),
             },
         }
@@ -385,7 +370,7 @@ impl InferenceSession<Prefilling> {
 }
 
 impl InferenceSession<Decoding> {
-    /// Transition: Decoding → Finished (carries KV for cleanup).
+    /// Transition: Decoding → Finished.
     pub fn finish(self, reason: FinishReason) -> InferenceSession<Finished> {
         let ttft = self.state.first_token_time.duration_since(self.meta.arrival_time);
         let e2e = self.meta.arrival_time.elapsed();
@@ -403,19 +388,17 @@ impl InferenceSession<Decoding> {
                     num_output_tokens: num_tokens,
                     num_preemptions: self.state.preemption_count,
                 },
-                kv_lease: self.state.kv_lease,
             },
         }
     }
 
-    /// Transition: Decoding → Failed (carries KV + partial output).
+    /// Transition: Decoding → Failed (carries partial output).
     pub fn fail(self, message: String) -> InferenceSession<Failed> {
         InferenceSession {
             meta: self.meta,
             handle: self.handle,
             state: Failed {
                 message,
-                kv_lease: self.state.kv_lease,
                 partial_output_tokens: self.state.output_tokens,
             },
         }
@@ -437,78 +420,15 @@ impl InferenceSession<Decoding> {
         self.state.output_tokens.len() >= self.meta.max_tokens
     }
 
-    /// Preempt: Decoding → Queued (for recompute strategy).
-    /// Returns the queued session and the lease (caller is responsible
-    /// for releasing it back to the pool).
-    pub fn preempt_recompute(self) -> (InferenceSession<Queued>, KvLease) {
-        let kv_lease = self.state.kv_lease;
-        let seq = InferenceSession {
-            meta: self.meta,
-            handle: self.handle,
-            state: Queued { prefix_match: None },
-        };
-        (seq, kv_lease)
-    }
-
-    /// Preempt: Decoding → ResourceStarved (Phase 6 / plan §7).
-    ///
-    /// Used by the admission cascade when KV pressure forces the engine
-    /// to evict a live decoder. Generated tokens are dropped; the prompt
-    /// (in `Arc<RequestMeta>`) survives and the session can be lifted
-    /// back into the waiting queue via [`InferenceSession::<ResourceStarved>::requeue`].
-    ///
-    /// Returns the new typed session and the legacy `KvLease`. In the
-    /// new RadixTree-driven path the lease is empty (the worker-side
-    /// indices have already been marked finished and will be reclaimed
-    /// by the next `FreeKvIndices` round). In the legacy path the
-    /// caller drops the lease, returning blocks to the block sink.
-    pub fn preempt_to_starved(self) -> (InferenceSession<ResourceStarved>, KvLease) {
-        let kv_lease = self.state.kv_lease;
-        let dropped_output_count = self.state.output_tokens.len() as u32;
-        let preemption_count = self.state.preemption_count + 1;
-        let seq = InferenceSession {
-            meta: self.meta,
-            handle: self.handle,
-            state: ResourceStarved {
-                dropped_output_count,
-                preemption_count,
-            },
-        };
-        (seq, kv_lease)
+    /// Bump the preemption counter. Reserved hook for the future
+    /// worker→scheduler preempt notification: when the worker's
+    /// internal sub-scheduler kicks a sequence under KV starvation,
+    /// it will tell the scheduler so the metric carries through.
+    pub fn bump_preempted(&mut self) {
+        self.state.preemption_count = self.state.preemption_count.saturating_add(1);
     }
 
     /// Get the request ID.
-    pub fn id(&self) -> &RequestId {
-        &self.meta.id
-    }
-}
-
-impl InferenceSession<ResourceStarved> {
-    /// Lift a preempted session back into the waiting queue. The same
-    /// `RequestMeta` (which holds the prompt) is preserved; preemption
-    /// count is carried forward so policies can apply backoff.
-    pub fn requeue(self) -> InferenceSession<Queued> {
-        InferenceSession {
-            meta: self.meta,
-            handle: self.handle,
-            // No prefix_match snapshot here; the next admission lookup
-            // (driven by RadixTree::lookup_prefix in the new path) will
-            // recompute it. The legacy field is `Option`-y for exactly
-            // this reason.
-            state: Queued { prefix_match: None },
-        }
-    }
-
-    /// Number of output tokens that were dropped on preemption. Useful
-    /// for metrics; the actual content is gone.
-    pub fn dropped_output_count(&self) -> u32 {
-        self.state.dropped_output_count
-    }
-
-    pub fn preemption_count(&self) -> u32 {
-        self.state.preemption_count
-    }
-
     pub fn id(&self) -> &RequestId {
         &self.meta.id
     }
@@ -560,7 +480,6 @@ impl AnySession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::kv_cache::traits::PhysicalBlockId;
 
     fn make_meta(prompt_len: usize) -> Arc<RequestMeta> {
         Arc::new(RequestMeta {
@@ -578,27 +497,19 @@ mod tests {
         })
     }
 
-    fn paged_alloc() -> KvLease {
-        // Tests use a detached lease (no return sink): drop is a no-op,
-        // matching what the engine sees in the legacy `KvAllocation`
-        // shape but typed as the new `KvLease`.
-        KvLease::test_with_blocks(vec![PhysicalBlockId(7), PhysicalBlockId(8)])
-    }
-
     #[test]
-    fn queued_to_prefilling_transfers_meta_and_sets_kv() {
+    fn queued_to_prefilling_transfers_meta() {
         let s = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
-        let s = s.start_prefill(paged_alloc());
+        let s = s.start_prefill();
         assert_eq!(s.state.prompt_len, 4);
         assert_eq!(s.state.num_computed_tokens, 0);
         assert!(s.state.inflight.is_none());
-        let _ = s.state.kv_lease.blocks();
     }
 
     #[test]
     fn prefilling_to_decoding_after_complete() {
         let s = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
-        let mut s = s.start_prefill(paged_alloc());
+        let mut s = s.start_prefill();
         s.advance_chunk(4);
         assert!(s.is_complete());
         let s = s.start_decode();
@@ -607,97 +518,47 @@ mod tests {
     }
 
     #[test]
-    fn decoding_to_finished_carries_kv() {
+    fn decoding_to_finished_carries_output() {
         let q = InferenceSession::<Queued>::new(make_meta(2), RequestHandle::noop());
-        let mut p = q.start_prefill(paged_alloc());
+        let mut p = q.start_prefill();
         p.advance_chunk(2);
         let mut d = p.start_decode();
         d.append_token(99);
         let f = d.finish(FinishReason::Eos);
         assert_eq!(f.state.output_tokens, vec![99]);
-        // Finished must carry kv_alloc for cleanup.
-        assert!(!f.state.kv_lease.blocks().is_empty());
     }
 
     #[test]
-    fn prefilling_fail_carries_kv() {
+    fn prefilling_fail_carries_message() {
         let q = InferenceSession::<Queued>::new(make_meta(2), RequestHandle::noop());
-        let p = q.start_prefill(paged_alloc());
+        let p = q.start_prefill();
         let f = p.fail("worker error".into());
         assert_eq!(f.state.message, "worker error");
-        // Failed must carry kv_alloc for cleanup.
-        assert!(!f.state.kv_lease.blocks().is_empty());
         assert!(f.state.partial_output_tokens.is_empty());
     }
 
     #[test]
     fn decoding_fail_preserves_partial_output() {
         let q = InferenceSession::<Queued>::new(make_meta(2), RequestHandle::noop());
-        let mut p = q.start_prefill(paged_alloc());
+        let mut p = q.start_prefill();
         p.advance_chunk(2);
         let mut d = p.start_decode();
         d.append_token(11);
         d.append_token(22);
         let f = d.fail("oom".into());
         assert_eq!(f.state.partial_output_tokens, vec![11, 22]);
-        let _ = f.state.kv_lease.blocks();
     }
 
     #[test]
-    fn decoding_preempt_to_starved_drops_outputs_and_bumps_count() {
+    fn bump_preempted_increments_count() {
         let q = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
-        let mut p = q.start_prefill(paged_alloc());
+        let mut p = q.start_prefill();
         p.advance_chunk(4);
         let mut d = p.start_decode();
-        d.append_token(99);
-        d.append_token(100);
-        d.append_token(101);
-        let prompt_before = d.meta.input_ids.clone();
-        let id_before = *d.id();
-
-        let (starved, lease) = d.preempt_to_starved();
-        assert_eq!(starved.dropped_output_count(), 3);
-        assert_eq!(starved.preemption_count(), 1);
-        // Prompt preserved verbatim through the Arc<RequestMeta>.
-        assert_eq!(starved.meta.input_ids, prompt_before);
-        assert_eq!(*starved.id(), id_before);
-        // Legacy lease passed back to the caller.
-        assert!(!lease.blocks().is_empty());
-    }
-
-    #[test]
-    fn starved_requeue_returns_to_queued() {
-        let q = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
-        let mut p = q.start_prefill(paged_alloc());
-        p.advance_chunk(4);
-        let d = p.start_decode();
-        let id_before = *d.id();
-        let (starved, _lease) = d.preempt_to_starved();
-        let q2 = starved.requeue();
-        // Re-queued session has the same id, same prompt.
-        assert_eq!(*q2.id(), id_before);
-        assert_eq!(q2.meta.input_ids.len(), 4);
-        assert!(q2.state.prefix_match.is_none());
-    }
-
-    #[test]
-    fn preempt_to_starved_carries_forward_existing_preemption_count() {
-        // Construct a Decoding with preemption_count > 0 directly.
-        let meta = make_meta(2);
-        let session: InferenceSession<Decoding> = InferenceSession {
-            meta: meta.clone(),
-            handle: RequestHandle::noop(),
-            state: Decoding {
-                kv_lease: paged_alloc(),
-                output_tokens: vec![1, 2, 3],
-                seq_position: 5,
-                prompt_len: 2,
-                first_token_time: Instant::now(),
-                preemption_count: 2,
-            },
-        };
-        let (starved, _lease) = session.preempt_to_starved();
-        assert_eq!(starved.preemption_count(), 3, "must increment");
+        assert_eq!(d.state.preemption_count, 0);
+        d.bump_preempted();
+        d.bump_preempted();
+        assert_eq!(d.state.preemption_count, 2);
     }
 }
 

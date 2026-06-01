@@ -5,8 +5,8 @@ use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use infer_scheduler::application::SchedulerEngine;
-use infer_scheduler::config::{KvCacheMode, SchedulerConfig, SchedulerMode};
-use infer_scheduler::domain::kv_cache_pool::{KvCachePool, NoopKvPool, PagedKvPool};
+use infer_scheduler::config::{SchedulerConfig, SchedulerMode};
+use infer_scheduler::domain::BlockSize;
 use infer_scheduler::domain::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
 use infer_protocol::scheduler_to_worker_control::LoadModel;
 use infer_scheduler::infrastructure::transport::control_plane::{ControlPlane, ControlPlaneConfig};
@@ -64,9 +64,9 @@ struct Args {
     #[arg(long, default_value = "llm")]
     mode: String,
 
-    /// KV cache mode: "paged:BLOCK_SIZE" (only paged is supported). Default block size is 16.
-    #[arg(long, default_value = "paged:16")]
-    kv_cache_mode: String,
+    /// Paged KV block size (tokens per block). Default 16.
+    #[arg(long, default_value_t = 16)]
+    paged_block_size: usize,
 
     /// Chunked prefill: max tokens per prefill chunk.
     /// None (default) = no chunking (full prompt in one shot).
@@ -83,17 +83,9 @@ struct Args {
     log_level: String,
 }
 
-fn parse_kv_cache_mode(s: &str) -> KvCacheMode {
-    // Slot mode has been removed; only paged is supported.
-    if let Some(rest) = s.strip_prefix("paged:") {
-        let block_size: usize = rest.parse().unwrap_or(16);
-        KvCacheMode::Paged { block_size }
-    } else {
-        if !s.is_empty() && s != "paged" {
-            tracing::warn!("Unknown kv-cache-mode '{}', defaulting to paged:16", s);
-        }
-        KvCacheMode::Paged { block_size: 16 }
-    }
+fn parse_block_size(s: usize) -> BlockSize {
+    let raw = u32::try_from(s).unwrap_or(16);
+    BlockSize::new(if raw == 0 { 16 } else { raw })
 }
 
 #[tokio::main]
@@ -109,7 +101,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let kv_mode = parse_kv_cache_mode(&args.kv_cache_mode);
+    let paged_block_size = parse_block_size(args.paged_block_size);
     let scheduler_mode = match args.mode.as_str() {
         "diffusion" => SchedulerMode::Diffusion,
         _ => SchedulerMode::Llm,
@@ -126,7 +118,7 @@ async fn main() -> Result<()> {
     tracing::info!("  max_batch_seqs: {}", args.max_batch_seqs);
     tracing::info!("  max_batch_tokens: {}", args.max_batch_tokens);
     tracing::info!("  max_model_len: {}", args.max_model_len);
-    tracing::info!("  kv_cache_mode: {:?}", kv_mode);
+    tracing::info!("  paged_block_size: {}", paged_block_size);
     tracing::info!("  chunked_prefill_size: {:?}", args.chunked_prefill_size);
     tracing::info!("  enable_prefix_caching: {}", args.enable_prefix_caching);
 
@@ -136,7 +128,7 @@ async fn main() -> Result<()> {
         max_num_seqs: args.max_batch_seqs,
         max_batch_tokens: args.max_batch_tokens,
         max_model_len: args.max_model_len,
-        kv_cache_mode: kv_mode,
+        paged_block_size,
         chunked_prefill_size: args.chunked_prefill_size,
         enable_prefix_caching: args.enable_prefix_caching,
         frontend_endpoint: args.frontend_endpoint.clone(),
@@ -162,12 +154,13 @@ async fn main() -> Result<()> {
         tp_size: 1,
         pp_rank: 0,
         pp_size: 1,
-        kv_cache_mode: Some(args.kv_cache_mode.clone()),
+        kv_cache_mode: Some(format!("paged:{}", paged_block_size.raw())),
         kv_cache_memory_fraction: Some(args.mem_fraction_static),
     });
 
-    // Phase 2 control-plane gate: bind ROUTER, optionally assign model, then
-    // wait for WorkerReady. Same socket continues to serve runtime control.
+    // Bind the control-plane ROUTER, optionally assign a model, then
+    // wait for `WorkerReady`. The same socket continues to serve
+    // runtime control once the handshake completes.
     let cp_cfg = ControlPlaneConfig::default();
     let (mut control_plane, worker_group) =
         ControlPlane::bootstrap(&args.worker_control_endpoint, load_model, cp_cfg).await?;
@@ -191,31 +184,20 @@ async fn main() -> Result<()> {
     // shutdown. Boxing + leaking keeps it alive for the duration of run().
     let _control_plane_handle: &'static ControlPlane = Box::leak(Box::new(control_plane));
 
-    if let KvCacheMode::Paged { block_size } = kv_mode
-        && let Some(max_total_kv_tokens) = worker_group.effective_capacity.max_total_kv_tokens {
-            config.num_gpu_blocks = max_total_kv_tokens / block_size;
-            tracing::info!(
-                "Paged KV capacity from worker profile: num_gpu_blocks={} block_size={} max_total_kv_tokens={}",
-                config.num_gpu_blocks,
-                block_size,
-                max_total_kv_tokens,
-            );
-        }
+    if let Some(max_total_kv_tokens) = worker_group.effective_capacity.max_total_kv_tokens {
+        let block_size = paged_block_size.as_usize();
+        config.num_gpu_blocks = max_total_kv_tokens / block_size;
+        tracing::info!(
+            "Paged KV capacity from worker profile: num_gpu_blocks={} block_size={} max_total_kv_tokens={}",
+            config.num_gpu_blocks,
+            block_size,
+            max_total_kv_tokens,
+        );
+    }
 
-    // Build the KV cache pool. Diffusion mode uses the no-op pool
-    // (worker manages any model-internal caches itself); LLM mode
-    // uses the paged pool with optional prefix caching.
-    let kv_pool: Box<dyn KvCachePool> = match scheduler_mode {
-        SchedulerMode::Diffusion => Box::new(NoopKvPool::new()),
-        SchedulerMode::Llm => {
-            let KvCacheMode::Paged { block_size } = kv_mode;
-            Box::new(PagedKvPool::with_prefix_cache(
-                config.num_gpu_blocks,
-                block_size,
-                config.enable_prefix_caching,
-            ))
-        }
-    };
+    // The worker is the sole owner of physical block allocation; the
+    // scheduler only tracks slot accounting via `KvBudget` + `RadixTree`,
+    // wired up inside `SchedulerEngine::new`.
 
     let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
         SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(args.max_batch_seqs)),
@@ -226,7 +208,6 @@ async fn main() -> Result<()> {
     let engine = SchedulerEngine::new(
         config,
         policy,
-        kv_pool,
         worker_group,
         frontend,
         worker,

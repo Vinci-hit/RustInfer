@@ -3,8 +3,8 @@
 //!
 //! Owns:
 //! - `policy: Box<dyn SchedulingPolicy>` — pluggable scheduling
-//!   policy. Boxed (P2-D in the refactor plan) rather than generic
-//!   so the engine isn't generic over a scheduling type parameter.
+//!   policy. Boxed so the engine isn't generic over a scheduling
+//!   type parameter.
 //! - `builder: BatchBuilder` — stateful command serializer; reuses
 //!   internal staging buffers across iterations to avoid alloc churn.
 //! - `current_chunk_sizes` — the per-iteration scratch list mapping
@@ -14,18 +14,19 @@
 //! ## Surface
 //!
 //! - [`PlanningSystem::schedule`] — pure scheduling decision.
-//! - [`PlanningSystem::execute_plan`] — drive KV allocation +
-//!   `RequestTable` transitions for the prefill batch entries.
+//! - [`PlanningSystem::execute_plan`] — drive RadixTree prefix
+//!   pinning + `RequestTable` transitions for the prefill batch
+//!   entries.
 //! - [`PlanningSystem::build_llm_batch`] / `build_diffusion_batch`
 //!   — wire-format serialization, with reusable buffers.
 //! - [`PlanningSystem::scheduled_segments`] — read-only access to
 //!   the current chunk-size list.
 
-use crate::domain::kv_cache_pool::KvCachePool;
-use crate::infrastructure::kv_cache::traits::CacheState;
+use crate::infrastructure::kv_cache::radix_tree_v2::{GlobalIndex, RadixTree};
+use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use crate::config::SchedulerConfig;
 use crate::domain::inference_session::lifecycle::{
-    Decoding, InferenceSession, Prefilling, RequestId,
+    InferenceSession, Prefilling, RequestId,
 };
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::inference_session::table::{PrefillStartOutcome, RequestLocation, RequestTable};
@@ -44,6 +45,12 @@ pub struct PlanningSystem {
     /// `(request_id, tokens_in_segment)`. Cleared at the head of
     /// every `execute_plan` call.
     current_chunk_sizes: Vec<(RequestId, usize)>,
+    /// Per-iteration prefix-cache hits keyed by request id. Populated
+    /// by `execute_plan` (fresh-prompt branch) from
+    /// `RadixTree::lookup_prefix`; consumed by `build_llm_batch` to
+    /// fill `PrefillSegmentMeta.prefix_hint`. Cleared alongside
+    /// `current_chunk_sizes`.
+    current_prefix_hints: Vec<(RequestId, Vec<GlobalIndex>)>,
 }
 
 impl PlanningSystem {
@@ -52,6 +59,7 @@ impl PlanningSystem {
             policy,
             builder: BatchBuilder::new(),
             current_chunk_sizes: Vec::new(),
+            current_prefix_hints: Vec::new(),
         }
     }
 
@@ -68,9 +76,8 @@ impl PlanningSystem {
         waiting: &WaitingQueue,
         running_set: &RunningSet,
         budget: &TokenBudget,
-        cache_state: &CacheState,
     ) -> BatchPlan {
-        self.policy.schedule(waiting, running_set, budget, cache_state)
+        self.policy.schedule(waiting, running_set, budget)
     }
 
     /// Materialize the policy's `BatchPlan` into KV allocations and
@@ -80,19 +87,24 @@ impl PlanningSystem {
     /// - **Continuation**: ask the table to set the next chunk's
     ///   `inflight` window.
     /// - **Fresh prompt**: take the session out of the waiting
-    ///   queue, ask the KV manager for blocks (with prefix reuse),
-    ///   then commit the transition into `Prefilling`.
+    ///   queue, ask the `RadixTree` for the longest prefix hit
+    ///   (which also pins the matched chain by registering the new
+    ///   `SeqId` as an owner), then commit the transition into
+    ///   `Prefilling`. The matched indices are stashed for the
+    ///   batch builder so they ride out as `prefix_hint` on the
+    ///   wire — the worker uses them to skip recomputation.
     ///
-    /// Failures degrade gracefully: KV exhaustion restores the
-    /// session to the front of the waiting queue and breaks out
-    /// (we'll try again next iteration).
+    /// Failures degrade gracefully: a missing waiting entry is
+    /// logged and skipped (we can't drop blocks on the floor any
+    /// more — RadixTree pinning is idempotent on retry).
     pub fn execute_plan(
         &mut self,
         plan: &BatchPlan,
         sessions: &mut RequestTable,
-        kv: &mut dyn KvCachePool,
+        radix: &mut RadixTree,
     ) -> Result<()> {
         self.current_chunk_sizes.clear();
+        self.current_prefix_hints.clear();
 
         for entry in &plan.prefill_batch {
             let scheduled_len = entry.token_range.len();
@@ -129,22 +141,33 @@ impl PlanningSystem {
                     }
                 };
 
-                let (kv_lease, prefix_match) =
-                    match kv.allocate_with_prefix(&seq.meta.input_ids) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            tracing::warn!("KV allocation failed for {}: {}", entry.request_id, e);
-                            sessions.restore_waiting_front(seq)?;
-                            break;
-                        }
-                    };
+                // RadixTree-driven prefix reuse. `lookup_prefix` both
+                // returns the matched global indices *and* attaches
+                // the new sequence as an owner on every node along
+                // the matched chain — the chain is pinned for the
+                // lifetime of this seq.
+                let hit = radix.lookup_prefix(&seq.meta.input_ids, seq.meta.sequence_id.0);
+                let prefix_match = PrefixMatch {
+                    num_cached_tokens: hit.matched_indices.len(),
+                };
+                let matched_indices = hit.matched_indices;
 
-                match sessions.commit_prefill_start(seq, kv_lease, prefix_match, scheduled_len)? {
+                match sessions.commit_prefill_start(
+                    seq,
+                    prefix_match,
+                    scheduled_len,
+                )? {
                     PrefillStartOutcome::Scheduled {
                         request_id, segment, ..
                     } => {
-                        self.current_chunk_sizes
-                            .push((request_id, segment.segment_end - segment.segment_start));
+                        self.current_chunk_sizes.push((
+                            request_id.clone(),
+                            segment.segment_end - segment.segment_start,
+                        ));
+                        if !matched_indices.is_empty() {
+                            self.current_prefix_hints
+                                .push((request_id, matched_indices));
+                        }
                     }
                     PrefillStartOutcome::DecodeReady { request_id, .. } => {
                         tracing::debug!(
@@ -165,15 +188,21 @@ impl PlanningSystem {
     }
 
     /// Build the LLM-mode `Prefill` batch, reusing internal buffers.
+    /// Decoding is the worker's responsibility; the scheduler only
+    /// emits prefill commands.
     pub fn build_llm_batch(
         &mut self,
         prefilling: &[&InferenceSession<Prefilling>],
-        decoding: &[&InferenceSession<Decoding>],
         config: &SchedulerConfig,
         codec: &MsgPackCodec,
     ) -> Result<Vec<u8>> {
-        self.builder
-            .build_llm_batch(prefilling, decoding, config, codec, &self.current_chunk_sizes)
+        self.builder.build_llm_batch(
+            prefilling,
+            config,
+            codec,
+            &self.current_chunk_sizes,
+            &self.current_prefix_hints,
+        )
     }
 
     /// Build the Diffusion-mode batch.

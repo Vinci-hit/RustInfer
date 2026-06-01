@@ -18,8 +18,8 @@ use super::handle::WorkerId;
 /// Authoritative entry for one worker.
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredWorker {
-    /// Stable id. Currently only read in tests; will be consumed by
-    /// the multi-worker selection path once Phase 2 lands.
+    /// Stable id. Currently only read in tests; consumed by the
+    /// multi-worker selection path once TP/PP support lands.
     #[allow(dead_code)]
     pub(crate) worker_id: WorkerId,
     pub(crate) last_seen: Instant,
@@ -53,7 +53,7 @@ impl Registry {
 
     /// Look up the `WorkerId` for an inbound ZMQ identity, registering it on
     /// first sight. Returns `Err(())` if the worker is already known but has
-    /// been marked lost — we refuse silent re-registration in phase 1.
+    /// been marked lost — silent re-registration is refused.
     pub(crate) fn intern(
         &mut self,
         identity: &[u8],

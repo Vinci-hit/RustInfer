@@ -1,9 +1,8 @@
 //! `Capacity` value object for `WorkerNode`.
 //!
-//! Type-driven replacement for the legacy `EffectiveCapacity` struct in
-//! `worker_group.rs`. Wraps the protocol's flat `usize` fields into the
-//! NewTypes from `domain::ids` so arithmetic mistakes (mixing token
-//! counts with sequence counts) become compile errors.
+//! Wraps the protocol's flat `usize` capacity fields into the NewTypes
+//! from `domain::ids` so arithmetic mistakes (mixing token counts with
+//! sequence counts) become compile errors.
 //!
 //! ## Aggregation across ranks
 //!
@@ -13,11 +12,10 @@
 //!
 //! ## Why no `mem_profile`
 //!
-//! The original `EffectiveCapacity` had no memory fields. The protocol's
-//! `WorkerCapacity` does carry `*_mem_*_gb` fields, but those are
-//! diagnostic — used for logging at handshake — not consumed by the
-//! scheduler's planning. We keep them out of the domain `Capacity`
-//! (P3-I in the refactor plan: "delete `mem_profile`").
+//! The protocol's `WorkerCapacity` carries `*_mem_*_gb` fields, but those
+//! are diagnostic — used for logging at handshake — not consumed by the
+//! scheduler's planning. We deliberately keep them out of the domain
+//! `Capacity`.
 
 use infer_protocol::worker_to_scheduler_control::WorkerCapacity;
 

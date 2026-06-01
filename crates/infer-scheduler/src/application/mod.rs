@@ -1,10 +1,10 @@
 //! Application layer — engine orchestrator + 5 Systems.
 //!
 //! Middle ring of the hexagonal architecture. Consumes the
-//! `domain::*` aggregate roots (Session / KvCachePool / WorkerNode /
-//! Policy) and the `infrastructure::*` IO adapters, and exposes the
-//! user-facing flows: ingest a request, schedule one iteration,
-//! drain outputs, drive control events.
+//! `domain::*` aggregate roots (Session / KvBudget / RadixTree /
+//! WorkerNode / Policy) and the `infrastructure::*` IO adapters, and
+//! exposes the user-facing flows: ingest a request, schedule one
+//! iteration, drain outputs, drive control events.
 //!
 //! ## Engine
 //!
@@ -17,17 +17,20 @@
 //! - [`IngestionSystem`]  — accepts new `FrontendEvent::Infer`
 //! - [`PlanningSystem`]   — owns `SchedulingPolicy` + `BatchBuilder`
 //! - [`DispatchSystem`]   — owns the worker + frontend transports
-//! - [`OutputProcessingSystem`] — terminal-state owner, single
-//!   point of KV release
-//! - [`ControlEventSystem`] — translates worker control events
-//!   into `ControlOutcome` (P1-B)
+//! - [`OutputProcessingSystem`] — terminal-state owner; drives
+//!   responses, error fan-out, and `RadixTree` extension from
+//!   `StepOutput.assigned_indices`.
+//! - [`ControlEventSystem`] — translates worker control events into
+//!   a `ControlOutcome` the engine then dispatches; never touches
+//!   `OutputProcessingSystem` directly so borrows stay disjoint.
+//!   This is also where KV-pressure heartbeats from the worker
+//!   trigger RadixTree LRU eviction + `FreeKvIndices` replies.
 //!
-//! Plus [`cancel`] free helpers and the [`batch_builder`] wire
-//! serializer used by `PlanningSystem`.
+//! Plus the [`cancel`] free helpers and an internal `batch_builder`
+//! wire serializer used by `PlanningSystem`.
 
 mod batch_builder;
 
-pub mod admission;
 pub mod cancel;
 pub mod control_event;
 pub mod dispatch;

@@ -27,12 +27,12 @@ unsafe extern "C" {
     fn cudaProfilerStop() -> u32;
 }
 
-use infer_protocol::scheduler_to_worker_control::{SchedulerControlMessage, GrantBlocks};
+use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::scheduler_to_worker_data::{
     BatchCommand, PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
 };
 use infer_protocol::worker_to_scheduler_control::{
-    NeedBlocks, NeedBlocksReason, WorkerCapacity, WorkerControlMessage, WorkerStepError,
+    WorkerCapacity, WorkerControlMessage, WorkerStepError,
 };
 use infer_protocol::worker_to_scheduler_data::{
     AssignedIndices, DiffusionBatchOutput, GeneratedToken, StepOutput,
@@ -199,8 +199,6 @@ struct ActiveSeq {
     max_tokens: usize,
     generated_count: usize,
     sampling: SamplingParams,
-    /// True if we've already sent NeedBlocks for this seq and are awaiting grant.
-    block_requested: bool,
 }
 
 impl ActiveSeq {
@@ -214,27 +212,7 @@ impl ActiveSeq {
             max_tokens: seg.max_tokens,
             generated_count: 1, // first token already produced by prefill argmax
             sampling: seg.sampling_params.clone(),
-            block_requested: false,
         }
-    }
-
-    /// Block capacity in tokens = block_table.len() * block_size.
-    fn block_capacity(&self) -> usize {
-        self.block_table.len() * self.block_size
-    }
-
-    /// True if the next decode step can proceed without new blocks.
-    fn has_block_space(&self) -> bool {
-        self.kv_len + 1 <= self.block_capacity()
-    }
-
-    /// True if we should request new blocks (approaching boundary, within 1 block).
-    /// Skip if we haven't decoded at least 2 steps yet (avoid racing with
-    /// the StepOutput that transitions session to Decoding in scheduler).
-    fn needs_block_soon(&self) -> bool {
-        !self.block_requested
-            && self.generated_count >= 2
-            && self.kv_len + self.block_size >= self.block_capacity()
     }
 }
 
@@ -451,6 +429,15 @@ where
         "[serve] worker-owned KV allocator: total={} (block_size={})",
         num_blocks, bs.block_size,
     );
+    // KV-pressure de-bounce. Worker emits an immediate Heartbeat (out of
+    // the periodic interval) when free_ratio first crosses below
+    // `LOW_WATER_RATIO`, and again when it crosses back above. Inside the
+    // sticky low-water region we throttle: only one immediate hb until we
+    // recover. This keeps the scheduler's RadixTree LRU eviction reactive
+    // without flooding the control plane.
+    const LOW_WATER_RATIO: f32 = 0.15;
+    const RECOVERY_RATIO: f32 = 0.30;
+    let mut last_low_water: bool = false;
     let mut profile_step_count: u32 = 0;
     let mut profile_started = false;
 
@@ -484,11 +471,6 @@ where
                             kv_allocator.free(&free.indices);
                         }
                     }
-                    // Legacy `GrantBlocks{,Denied}` arrives only from a
-                    // pre-Phase-4 scheduler. Worker no longer requests
-                    // blocks, so these are now no-ops on the new path.
-                    SchedulerControlMessage::GrantBlocks(_) => {}
-                    SchedulerControlMessage::GrantBlocksDenied(_) => {}
                     SchedulerControlMessage::Ping => {
                         let _ = control.send(WorkerControlMessage::Pong, _req_id);
                     }
@@ -510,7 +492,7 @@ where
         }
 
         if pending_prefills.is_empty() && active.is_empty() {
-            maybe_heartbeat(control, active.len(), &mut last_heartbeat, heartbeat_interval);
+            maybe_heartbeat(control, active.len(), &kv_allocator, &mut last_heartbeat, heartbeat_interval);
             let idle_wait_ms = (heartbeat_interval.as_millis() as i64 / 2).max(50);
             match data.try_recv_batch(idle_wait_ms) {
                 Ok(Some(BatchCommand::Prefill(p))) => pending_prefills.push(p),
@@ -539,13 +521,6 @@ where
         }
 
         if !active.is_empty() {
-            // Phase 7B: no more `NeedBlocks` round-trips. The worker-owned
-            // GlobalKvAllocator hands out slots inline at decode time; the
-            // scheduler's KvBudget is what gates total outstanding capacity.
-            // If the allocator runs out (which shouldn't happen because the
-            // scheduler reserved capacity before sending the batch), the
-            // decode step itself will fail and we surface that as an error.
-
             // Profiler: start on first decode step
             if let Some(max_steps) = profile_cuda_steps {
                 if !profile_started {
@@ -579,7 +554,34 @@ where
             }
         }
 
-        maybe_heartbeat(control, active.len(), &mut last_heartbeat, heartbeat_interval);
+        maybe_heartbeat(control, active.len(), &kv_allocator, &mut last_heartbeat, heartbeat_interval);
+
+        // Edge-triggered low-water signal. The scheduler reacts to this
+        // by evicting RadixTree leaves whose owners are empty (LRU) and
+        // sending FreeKvIndices back. Crossing the recovery threshold
+        // sends one more Heartbeat so the scheduler sees pressure has
+        // cleared (otherwise it would have to wait for the periodic
+        // tick).
+        let total = kv_allocator.total();
+        let free = kv_allocator.total_free();
+        let free_ratio = if total > 0 { free as f32 / total as f32 } else { 1.0 };
+        if !last_low_water && free_ratio < LOW_WATER_RATIO {
+            last_low_water = true;
+            let _ = control.send_heartbeat(active.len(), total, free);
+            last_heartbeat = Instant::now();
+            tracing::warn!(
+                "KV low-water: free={}/{} ({:.1}%) — emitted immediate Heartbeat",
+                free, total, free_ratio * 100.0
+            );
+        } else if last_low_water && free_ratio >= RECOVERY_RATIO {
+            last_low_water = false;
+            let _ = control.send_heartbeat(active.len(), total, free);
+            last_heartbeat = Instant::now();
+            tracing::info!(
+                "KV recovered: free={}/{} ({:.1}%) — emitted immediate Heartbeat",
+                free, total, free_ratio * 100.0
+            );
+        }
     }
     Ok(())
 }
@@ -587,11 +589,14 @@ where
 fn maybe_heartbeat(
     control: &ControlPump,
     active_n: usize,
+    kv_allocator: &GlobalKvAllocator,
     last: &mut Instant,
     interval: Duration,
 ) {
     if last.elapsed() >= interval {
-        let _ = control.send_heartbeat(active_n);
+        let total = kv_allocator.total();
+        let free = kv_allocator.total_free();
+        let _ = control.send_heartbeat(active_n, total, free);
         *last = Instant::now();
     }
 }
@@ -653,7 +658,17 @@ where
             // 120-second timeouts. Caller is also responsible for NOT
             // installing any of these into `active` (we never inserted
             // since we returned before `commit_step`).
+            //
+            // Also fire an immediate Heartbeat: alloc-fail is the most
+            // severe pressure signal and the scheduler should evict
+            // RadixTree LRU leaves ASAP. Future work: implement worker-
+            // local preemption so we don't have to fail the whole batch.
             eprintln!("[serve] prefill alloc failed: {}", e);
+            let _ = control.send_heartbeat(
+                active.len(),
+                kv_allocator.total(),
+                kv_allocator.total_free(),
+            );
             let failed_ids: Vec<u64> =
                 cmd.segments.iter().map(|s| s.sequence_id).collect();
             let _ = control.send(
@@ -779,7 +794,6 @@ where
                         max_tokens: seg.max_tokens,
                         generated_count: 1,
                         sampling: seg.sampling_params.clone(),
-                        block_requested: false,
                     });
                 }
             }
@@ -787,33 +801,6 @@ where
     }
     let _ = data.send_step_output(&output);
     Ok(())
-}
-
-/// Non-blocking: request new blocks for sequences approaching capacity.
-/// Requests 4 blocks at a time to amortize round-trip latency.
-fn request_blocks_if_needed(
-    active: &mut HashMap<u64, ActiveSeq>,
-    control: &ControlPump,
-) {
-    for seq in active.values_mut() {
-        if seq.needs_block_soon() {
-            let request_blocks: u32 = 4; // 4 blocks = 64 tokens of headroom
-            let req = NeedBlocks {
-                worker_id: String::new(),
-                model_instance_id: String::new(),
-                sequence_id: seq.sequence_id,
-                current_blocks: seq.block_table.len() as u32,
-                required_blocks: seq.block_table.len() as u32 + request_blocks,
-                request_blocks,
-                reason: NeedBlocksReason::DecodeExtend,
-            };
-            let _ = control.send(
-                WorkerControlMessage::NeedBlocks(req),
-                infer_protocol::control_envelope::RequestId(0),
-            );
-            seq.block_requested = true;
-        }
-    }
 }
 
 /// Run one decode iteration over all active seqs in a single batched step.
@@ -854,7 +841,15 @@ where
             // seqs as failed; the scheduler fails them, frees their
             // chains in RadixTree on the next admission round, and the
             // worker's allocator gets the slots back via FreeKvIndices.
+            //
+            // Fire an immediate Heartbeat too — alloc-fail is the most
+            // severe pressure signal we can emit.
             eprintln!("[serve] decode alloc failed: {}", e);
+            let _ = control.send_heartbeat(
+                active.len(),
+                kv_allocator.total(),
+                kv_allocator.total_free(),
+            );
             let failed_ids: Vec<u64> = order.clone();
             let _ = control.send(
                 WorkerControlMessage::StepError(WorkerStepError {

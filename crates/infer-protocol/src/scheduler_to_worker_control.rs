@@ -1,8 +1,8 @@
 //! Scheduler → Worker **control plane** messages.
 //!
-//! Spans bootstrap (Hello, LoadModel, InitPagedKv) and runtime (KV grants,
-//! cancel, drain, unload, liveness). Wrapped in [`crate::ControlEnvelope`]
-//! on the wire.
+//! Spans bootstrap (Hello, LoadModel, InitPagedKv) and runtime (KV index
+//! release, cancel, drain, unload, liveness). Wrapped in
+//! [`crate::ControlEnvelope`] on the wire.
 
 use serde::{Deserialize, Serialize};
 
@@ -45,27 +45,6 @@ pub struct InitPagedKv {
     pub decode_block_request_blocks: u32,
     /// 剩余多少 token 容量时提前异步申请 block。
     pub decode_block_prefetch_margin: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantBlocks {
-    pub model_instance_id: String,
-    pub sequence_id: u64,
-    pub block_ids: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantBlocksDenied {
-    pub model_instance_id: String,
-    pub sequence_id: u64,
-    pub reason: BlockGrantDeniedReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlockGrantDeniedReason {
-    CacheExhausted,
-    SequenceNotFound,
-    WorkerNotReady,
 }
 
 /// Scheduler asking the worker to release a batch of global KV indices back
@@ -116,11 +95,9 @@ pub enum SchedulerControlMessage {
     LoadModel(LoadModel),
     InitPagedKv(InitPagedKv),
 
-    // ── runtime: KV grants ──
-    GrantBlocks(GrantBlocks),
-    GrantBlocksDenied(GrantBlocksDenied),
-    /// Phase 4: scheduler asks worker to free a batch of global KV indices
-    /// back to its allocator (driven by RadixTree LRU eviction).
+    // ── runtime: KV release ──
+    /// Scheduler asks the worker to free a batch of global KV indices
+    /// back to its allocator (driven by `RadixTree` LRU eviction).
     FreeKvIndices(FreeKvIndices),
 
     // ── runtime: lifecycle ──

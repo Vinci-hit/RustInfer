@@ -1,40 +1,31 @@
 //! Token-granularity RadixTree for prefix reuse over worker-owned KV slots.
 //!
-//! ## What this replaces
+//! The worker owns the physical KV pool and its `GlobalKvAllocator`. This
+//! `RadixTree` is the scheduler's prefix-cache index: nodes hold **handles**
+//! to per-token slots in the worker's pool — `Vec<u32>` of global token
+//! indices. Nodes are inserted incrementally one token at a time as the
+//! worker reports each `StepOutput.assigned_indices`. Eviction yields a
+//! `Vec<u32>` of indices that the scheduler then asks the worker to free
+//! via `FreeKvIndices`.
 //!
-//! The legacy `RadixTreeCache` (in `radix_tree.rs`) is block-aligned and
-//! double-duties as a physical block allocator: every node carries a
-//! `PhysicalBlockId`, and "evict" returns block ids that the
-//! `PagedBlockAllocator` then recycles into its free list. That coupling is
-//! exactly what Phase 6 removes.
+//! ## Reference counting + LRU invariant
 //!
-//! In the new design, the worker owns the physical KV pool and its
-//! `GlobalKvAllocator`. The scheduler's RadixTree is a *pure prefix cache*
-//! whose nodes hold **handles** to per-token slots in the worker's pool —
-//! `Vec<u32>` of global token indices. Nodes are inserted incrementally one
-//! token at a time as the worker reports each `StepOutput.assigned_indices`.
-//! Eviction yields a `Vec<u32>` of indices that the scheduler then asks the
-//! worker to free via `FreeKvIndices`.
+//! Every node carries `owners: HashSet<SeqId>` — the set of live sequences
+//! whose chain currently walks through this node. `owners.is_empty()` is the
+//! single source of truth for "no live decoder pins this node".
 //!
-//! ## State machine + LRU invariant
-//!
-//! Every node carries `owners: HashSet<SeqId>`. `owners.is_empty()` ⇔ the
-//! chain through this node has no live decoder; we call this state
-//! `Finished`. Otherwise the node is `Decoding`.
-//!
-//! **Core invariant**: a node is in the LRU list **iff** it is `Finished`
+//! **Core invariant**: a node is in the LRU list **iff** `owners.is_empty()`
 //! **and** it is a leaf of its current subtree. This single rule keeps the
 //! eviction set free of any token slot a live request could legitimately
 //! point to:
 //!
-//! - When `lookup_prefix` matches a node along a previously-Finished chain,
+//! - When `lookup_prefix` matches a node along a previously-unowned chain,
 //!   the new sequence is added to every matched node's `owners`. The nodes
-//!   transition to `Decoding` and are removed from the LRU list in the same
-//!   call. Subsequent `evict` calls cannot pick them up.
+//!   are removed from the LRU list in the same call. Subsequent `evict`
+//!   calls cannot pick them up.
 //! - When `mark_finished_chain` runs, it walks from the chain's leaf back to
 //!   the root, removing the seq from each `owners`. Any node whose owners
-//!   set becomes empty *and* has no still-Decoding children flips to
-//!   Finished and joins the LRU tail.
+//!   set becomes empty *and* has no still-owned children joins the LRU tail.
 //!
 //! The scheduler's main loop is single-threaded, so `lookup_prefix → evict →
 //! send step` runs serially within one iteration. There is no race between
@@ -50,9 +41,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Stable sequence identifier. We reuse the scheduler's `u64`; Phase 6 will
-/// swap this for `crate::domain::inference_session::lifecycle::SequenceId`
-/// once the engine wiring lands.
+/// Stable sequence identifier. Aliased to `u64` to match
+/// `crate::domain::inference_session::lifecycle::SequenceId`'s inner type.
 pub type SeqId = u64;
 
 /// Worker-side global token-slot index.
@@ -62,14 +52,6 @@ pub type GlobalIndex = u32;
 /// sibling appears. Token-by-token append lets us keep this large; we only
 /// pay for splits when prefixes actually fork. Chosen liberally; tunable.
 const EDGE_SPLIT_THRESHOLD: usize = 32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeState {
-    /// At least one live owner — node is pinned, off the LRU list.
-    Decoding,
-    /// No live owner — eligible for LRU eviction once it becomes a leaf.
-    Finished,
-}
 
 #[derive(Debug)]
 struct Node {
@@ -84,10 +66,9 @@ struct Node {
     /// each edge can only branch on its first token (standard radix invariant).
     children: HashMap<i32, NodeId>,
     owners: HashSet<SeqId>,
-    state: NodeState,
     /// Whether this node currently sits in `lru.queue`. Mirrors the
-    /// `Finished + leaf` invariant for O(1) check; we still verify on pop
-    /// because removal is lazy (see `LruList::remove`).
+    /// `owners.is_empty() + leaf` invariant for O(1) check; we still verify
+    /// on pop because removal is lazy (see `LruList::remove`).
     in_lru: bool,
 }
 
@@ -165,8 +146,8 @@ pub struct RadixTree {
 
 /// Outcome of `lookup_prefix`. `matched_indices` is the flat list of global
 /// indices the new request can reuse (in order); `pinned_nodes` is the set
-/// of nodes whose owners now include the new seq, used by Phase 6 if/when
-/// it wants to track per-step temporary holds separately.
+/// of nodes whose owners now include the new seq, exposed for callers that
+/// want to track per-step temporary holds separately.
 #[derive(Debug, Clone)]
 pub struct PrefixHit {
     pub matched_indices: Vec<GlobalIndex>,
@@ -182,7 +163,6 @@ impl RadixTree {
             children: HashMap::new(),
             owners: HashSet::new(),
             // Root is always pinned; never in LRU.
-            state: NodeState::Decoding,
             in_lru: false,
         };
         Self {
@@ -295,7 +275,6 @@ impl RadixTree {
                 s.insert(seq_id);
                 s
             },
-            state: NodeState::Decoding,
             in_lru: false,
         });
         self.nodes[parent].children.insert(token_id, new_id);
@@ -377,12 +356,12 @@ impl RadixTree {
     }
 
     /// Mark `seq_id`'s entire chain as no longer owned by this seq. Nodes
-    /// whose owner set becomes empty (and have no live descendants) flip to
-    /// Finished and enter the LRU tail.
+    /// whose owner set becomes empty (and have no live descendants) enter
+    /// the LRU tail.
     ///
     /// Idempotent: calling on an unknown / already-finished seq is a no-op.
-    /// Required by Phase 4 R4 — a `StepOutput` arriving after cancel must
-    /// still be appendable; here we model the post-StepOutput cleanup.
+    /// A `StepOutput` arriving after cancel must still be appendable; this
+    /// models the post-StepOutput cleanup path.
     pub fn mark_finished_chain(&mut self, seq_id: SeqId) {
         let Some(ChainTip { leaf, pos: _ }) = self.seqs.remove(&seq_id) else {
             return;
@@ -391,7 +370,6 @@ impl RadixTree {
         while cur != self.root {
             self.nodes[cur].owners.remove(&seq_id);
             if self.nodes[cur].owners.is_empty() {
-                self.nodes[cur].state = NodeState::Finished;
                 // Only insert into LRU if currently a leaf in the tree.
                 if self.nodes[cur].children.is_empty() && !self.nodes[cur].in_lru {
                     self.nodes[cur].in_lru = true;
@@ -415,7 +393,6 @@ impl RadixTree {
             // The node may have been re-pinned between push and pop (lookup
             // raised owners 0→1) — skip in that case.
             if self.nodes[node_id].owners.is_empty()
-                && self.nodes[node_id].state == NodeState::Finished
                 && self.nodes[node_id].children.is_empty()
             {
                 self.nodes[node_id].in_lru = false;
@@ -434,8 +411,7 @@ impl RadixTree {
                 self.nodes[node_id].global_indices.clear();
                 self.nodes[node_id].parent = None;
                 self.nodes[node_id].owners.clear();
-                self.nodes[node_id].state = NodeState::Finished;
-                // Removing this child may have made the parent a Finished
+                // Removing this child may have made the parent an unowned
                 // leaf — promote it to LRU.
                 self.maybe_promote_to_lru(parent);
             } else {
@@ -448,17 +424,14 @@ impl RadixTree {
 
     // ─── Internal helpers ─────────────────────────────────────────────
 
-    /// Add `seq_id` to `node.owners`. If the node was Finished + in LRU,
-    /// take it out: it now has a live owner.
+    /// Add `seq_id` to `node.owners`. If the node was previously unowned and
+    /// in LRU, take it out: it now has a live owner.
     fn add_owner(&mut self, node: NodeId, seq_id: SeqId) {
         let was_empty = self.nodes[node].owners.is_empty();
         self.nodes[node].owners.insert(seq_id);
-        if was_empty {
-            self.nodes[node].state = NodeState::Decoding;
-            if self.nodes[node].in_lru {
-                self.lru.remove(node);
-                self.nodes[node].in_lru = false;
-            }
+        if was_empty && self.nodes[node].in_lru {
+            self.lru.remove(node);
+            self.nodes[node].in_lru = false;
         }
     }
 
@@ -499,7 +472,6 @@ impl RadixTree {
         let tail_tokens = self.nodes[node].edge_tokens[pos..].to_vec();
         let tail_indices = self.nodes[node].global_indices[pos..].to_vec();
         let original_children = std::mem::take(&mut self.nodes[node].children);
-        let original_state = self.nodes[node].state;
 
         // Compute the partition of owners: those past `pos` migrate to
         // suffix, those at-or-before stay on prefix.
@@ -563,7 +535,6 @@ impl RadixTree {
             parent: Some(node),
             children: original_children,
             owners: suffix_owners,
-            state: original_state,
             in_lru: false,
         });
 
@@ -593,15 +564,12 @@ impl RadixTree {
         // leaf any more — it cannot remain in LRU.
         self.demote_from_lru_if_present(node);
 
-        // The suffix node may need LRU promotion if it's a Finished leaf
+        // The suffix node may need LRU promotion if it's an unowned leaf
         // (it has no children only when original had no children, which is
         // false when we created the split because original had its edge
         // continue past pos — so suffix has no inherited children only
         // when original was already a leaf). Easier: if suffix has no
         // owners and no children → maybe_promote.
-        if self.nodes[suffix_id].owners.is_empty() {
-            self.nodes[suffix_id].state = NodeState::Finished;
-        }
         self.maybe_promote_to_lru(suffix_id);
     }
 
@@ -614,7 +582,7 @@ impl RadixTree {
         }
     }
 
-    /// If a node has just become a Finished leaf (no owners + no children),
+    /// If a node has just become an unowned leaf (no owners + no children),
     /// promote it into the LRU.
     fn maybe_promote_to_lru(&mut self, node: NodeId) {
         if node == self.root {
@@ -624,7 +592,6 @@ impl RadixTree {
         if !n.in_lru
             && n.owners.is_empty()
             && n.children.is_empty()
-            && n.state == NodeState::Finished
             && !n.edge_tokens.is_empty() // not a logically-deleted node
         {
             self.nodes[node].in_lru = true;
@@ -812,5 +779,147 @@ mod tests {
         // Now another seq looks up the original [10, 20] — must still work.
         let hit3 = t.lookup_prefix(&[10, 20], 3);
         assert_eq!(hit3.matched_indices, vec![100, 101]);
+    }
+
+    // ─── Refcount-only LRU semantics ─────────────────────────────────────
+
+    #[test]
+    fn two_seqs_pin_shared_prefix_until_both_finish() {
+        // Two sequences walk through the same prefix [10, 20]. While either
+        // is still alive, no part of that prefix may be evicted.
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(10, 100), (20, 101), (30, 102)]);
+
+        // Seq 2 reuses [10, 20] then diverges with its own tail [40, 200].
+        let hit = t.lookup_prefix(&[10, 20], 2);
+        assert_eq!(hit.matched_indices, vec![100, 101]);
+        t.append_token(2, 40, 200);
+
+        // Seq 1 finishes: only its private suffix index 102 is releasable.
+        t.mark_finished_chain(1);
+        let evicted = t.evict(10);
+        assert_eq!(evicted, vec![102], "shared prefix must remain pinned by seq 2");
+
+        // Indices 100, 101 are still pinned by seq 2 — also still reusable.
+        let hit_again = t.lookup_prefix(&[10, 20], 3);
+        assert_eq!(hit_again.matched_indices, vec![100, 101]);
+
+        // Both seq 2 & 3 finish — now the shared prefix can drain.
+        t.mark_finished_chain(2);
+        t.mark_finished_chain(3);
+        let mut evicted2 = t.evict(10);
+        evicted2.sort_unstable();
+        // seq 2's tail (200) and the shared prefix (100, 101) both surface.
+        assert_eq!(evicted2, vec![100, 101, 200]);
+    }
+
+    #[test]
+    fn mark_finished_one_evicts_only_unique_tail() {
+        // After one seq finishes, only nodes whose `owners` becomes empty
+        // *and* are leaves may admit to the LRU. Internal shared nodes whose
+        // owners simply drop from {1,2}→{2} stay off the LRU entirely.
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(1, 10), (2, 11), (3, 12)]);
+        // Seq 2 shares [1, 2] then forks with token 9 / idx 20.
+        let _ = t.lookup_prefix(&[1, 2], 2);
+        t.append_token(2, 9, 20);
+
+        let lru_before = t.lru_len_estimate();
+        t.mark_finished_chain(1);
+        // Only seq 1's exclusive tail (idx 12) entered the LRU; the shared
+        // prefix kept its non-empty owner set and stayed pinned.
+        assert_eq!(
+            t.lru_len_estimate() - lru_before,
+            1,
+            "exactly one node (seq 1's exclusive tail) should join LRU"
+        );
+
+        let evicted = t.evict(10);
+        assert_eq!(evicted, vec![12]);
+    }
+
+    #[test]
+    fn reused_prefix_after_partial_eviction() {
+        // Drive a full eviction of one sequence's tokens, then demonstrate
+        // that any surviving shared prefix is still reusable by a fresh seq.
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(7, 70), (8, 71), (9, 72)]);
+        // Seq 2 shares [7, 8] then forks.
+        let _ = t.lookup_prefix(&[7, 8], 2);
+        t.append_token(2, 88, 880);
+
+        // Finish seq 1 and evict aggressively. Seq 2 must keep [7, 8, 88].
+        t.mark_finished_chain(1);
+        let evicted = t.evict(100);
+        assert_eq!(evicted, vec![72], "only seq 1's unique suffix may go");
+
+        // Fresh seq 3 can still reuse [7, 8] from seq 2's pinned chain.
+        let hit = t.lookup_prefix(&[7, 8], 3);
+        assert_eq!(hit.matched_indices, vec![70, 71]);
+
+        // After all consumers vanish, the surviving prefix becomes reclaimable.
+        t.mark_finished_chain(2);
+        t.mark_finished_chain(3);
+        let mut evicted2 = t.evict(100);
+        evicted2.sort_unstable();
+        assert_eq!(evicted2, vec![70, 71, 880]);
+    }
+
+    #[test]
+    fn empty_owners_alone_drives_lru_admission() {
+        // The only way a node can be admitted to the LRU is by having
+        // `owners.is_empty()` and being a leaf. Walk the full lifecycle
+        // to confirm.
+        let mut t = RadixTree::new();
+
+        // 1. A single sequence — nothing should be in LRU while it lives.
+        append_seq(&mut t, 42, &[(5, 500), (6, 501)]);
+        assert_eq!(t.lru_len_estimate(), 0, "live owner must keep nodes off LRU");
+        // evict() with anything in flight returns nothing.
+        assert!(t.evict(10).is_empty());
+
+        // 2. Finish the seq. `owners.is_empty()` becomes true on the
+        // leaf, which is the sole driver of LRU admission.
+        t.mark_finished_chain(42);
+        assert!(t.lru_len_estimate() >= 1, "empty owners on a leaf must enter LRU");
+
+        // 3. Re-pin via lookup. `add_owner` flipping owners 0→1 must
+        // remove the node from the LRU — again, purely by reference count.
+        let hit = t.lookup_prefix(&[5, 6], 7);
+        assert_eq!(hit.matched_indices, vec![500, 501]);
+        let evicted = t.evict(10);
+        assert!(
+            evicted.is_empty(),
+            "non-empty owners must keep node out of LRU; got {:?}",
+            evicted
+        );
+
+        // 4. Finish the new seq. Eviction must again succeed solely
+        // because `owners.is_empty()` is true.
+        t.mark_finished_chain(7);
+        let mut evicted2 = t.evict(10);
+        evicted2.sort_unstable();
+        assert_eq!(evicted2, vec![500, 501]);
+    }
+
+    #[test]
+    fn relookup_resurrects_node_out_of_lru() {
+        // Corner case: a node sits in the LRU with stale generation; a new
+        // lookup re-pins it before evict pops it. The pop must observe
+        // owners non-empty and skip it cleanly without leaking indices.
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(11, 111), (12, 112)]);
+        t.mark_finished_chain(1);
+        // Pre-eviction: chain is sitting in LRU.
+        assert!(t.lru_len_estimate() >= 1);
+
+        // Reuse the prefix — should remove the node from LRU lazily.
+        let hit = t.lookup_prefix(&[11, 12], 2);
+        assert_eq!(hit.matched_indices, vec![111, 112]);
+
+        // Now evict: the LRU's remembered entry is stale; pop_front_valid
+        // skips it via the generation stamp, returning nothing.
+        let evicted = t.evict(10);
+        assert!(evicted.is_empty(), "stale LRU entry must not surface; got {:?}", evicted);
     }
 }

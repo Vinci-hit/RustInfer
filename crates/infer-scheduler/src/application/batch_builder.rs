@@ -1,20 +1,18 @@
 //! Wire-format batch serializer used by [`PlanningSystem`].
 //!
-//! Step 17 ports `core::batch_builder` into the application layer.
-//! The previous module exposed free functions that re-allocated
-//! their staging vectors on every iteration; `BatchBuilder` keeps
-//! those vectors as fields and `clear()`s them, so steady-state
-//! batching no longer churns `input_ids` / `q_start_loc` / `segments`
-//! allocations.
+//! `BatchBuilder` keeps its staging vectors as fields and `clear()`s
+//! them between iterations, so steady-state batching does not churn
+//! `input_ids` / `q_start_loc` / `segments` allocations.
 //!
 //! The builder is internal to the application layer (visible only
 //! to `PlanningSystem`); engines never see it directly.
 
 use std::collections::HashSet;
 
-use crate::config::{KvCacheMode, SchedulerConfig};
+use crate::config::SchedulerConfig;
 use crate::error::{Result, SchedulerError};
-use crate::domain::inference_session::lifecycle::{Decoding, InferenceSession, Prefilling, RequestId};
+use crate::domain::inference_session::lifecycle::{InferenceSession, Prefilling, RequestId};
+use crate::infrastructure::kv_cache::radix_tree_v2::GlobalIndex;
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 
 use infer_protocol::scheduler_to_worker_data::{
@@ -43,25 +41,29 @@ impl BatchBuilder {
 
     /// Build the LLM-mode `Prefill` batch.
     ///
-    /// Decode sessions are intentionally not serialized: Worker owns
-    /// the decode self-loop. `scheduled_segments` is the scheduler's
-    /// pick of which prefilling sessions go in this iteration —
-    /// exactly the ones whose `inflight` matches the planned chunk.
+    /// Worker owns the decode self-loop, so decode sessions are not
+    /// serialized here. `scheduled_segments` is the scheduler's pick
+    /// of which prefilling sessions go in this iteration — exactly
+    /// the ones whose `inflight` matches the planned chunk.
+    ///
+    /// `prefix_hints` carries the per-request global KV indices that
+    /// hit the scheduler's `RadixTree` cache. The worker uses them
+    /// to skip recomputing those leading prompt tokens.
     pub(crate) fn build_llm_batch(
         &mut self,
         prefilling: &[&InferenceSession<Prefilling>],
-        decoding: &[&InferenceSession<Decoding>],
         config: &SchedulerConfig,
         codec: &MsgPackCodec,
         scheduled_segments: &[(RequestId, usize)],
+        prefix_hints: &[(RequestId, Vec<GlobalIndex>)],
     ) -> Result<Vec<u8>> {
-        if prefilling.is_empty() && decoding.is_empty() {
+        if prefilling.is_empty() {
             return Ok(Vec::new());
         }
         if scheduled_segments.is_empty() {
             return Ok(Vec::new());
         }
-        self.build_prefill_cmd(prefilling, config, codec, scheduled_segments)
+        self.build_prefill_cmd(prefilling, config, codec, scheduled_segments, prefix_hints)
     }
 
     /// Build the Diffusion-mode batch.
@@ -121,6 +123,7 @@ impl BatchBuilder {
         config: &SchedulerConfig,
         codec: &MsgPackCodec,
         scheduled_segments: &[(RequestId, usize)],
+        prefix_hints: &[(RequestId, Vec<GlobalIndex>)],
     ) -> Result<Vec<u8>> {
         self.input_ids_all.clear();
         self.q_start_loc.clear();
@@ -155,9 +158,21 @@ impl BatchBuilder {
             self.input_ids_all
                 .extend_from_slice(&seq.meta.input_ids[start..end]);
 
-            let KvCacheMode::Paged { block_size } = config.kv_cache_mode;
-            let block_size = block_size as u32;
-            let block_table: Vec<u32> = seq.state.kv_lease.blocks().iter().map(|b| b.0).collect();
+            let block_size = config.paged_block_size.raw();
+            // The scheduler does not allocate physical KV blocks — the
+            // worker owns the pool. `block_table` ships empty; the
+            // worker provisions slots via its `GlobalKvAllocator` at
+            // step time.
+            let block_table: Vec<u32> = Vec::new();
+
+            // Pull the prefix hint (if any) from the parallel table
+            // populated by `PlanningSystem::execute_plan`. Linear
+            // scan is fine: prefix_hints.len() ≤ scheduled_segments.len()
+            // which is bounded by the per-iteration batch size.
+            let prefix_hint = prefix_hints
+                .iter()
+                .find(|(id, _)| id == &seq.meta.id)
+                .map(|(_, indices)| indices.clone());
 
             self.segments.push(PrefillSegmentMeta {
                 sequence_id: seq.meta.sequence_id.0,
@@ -177,10 +192,7 @@ impl BatchBuilder {
                 } else {
                     PrefillSegmentCompletion::ContinuePrefill
                 },
-                // Phase 4 — RadixTree-driven prefix hint. Phase 6 will populate
-                // this from `RadixTree::lookup_prefix`. Until then the legacy
-                // `block_table` path carries all KV addressing information.
-                prefix_hint: None,
+                prefix_hint,
             });
         }
 
@@ -211,8 +223,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use crate::domain::kv_cache_pool::KvLease;
-    use crate::infrastructure::kv_cache::traits::PhysicalBlockId;
     use crate::domain::inference_session::handle::RequestHandle;
     use crate::domain::inference_session::lifecycle::{
         InFlightPrefillSegment, Priority, RequestMeta, SamplingParams, SequenceId,
@@ -237,7 +247,6 @@ mod tests {
             meta,
             handle: RequestHandle::noop(),
             state: Prefilling {
-                kv_lease: KvLease::test_with_blocks(vec![PhysicalBlockId(7), PhysicalBlockId(8)]),
                 num_computed_tokens: 0,
                 inflight: Some(InFlightPrefillSegment {
                     segment_start: 0,
@@ -253,7 +262,7 @@ mod tests {
     #[test]
     fn build_prefill_batch_with_paged_placement() {
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 16 },
+            paged_block_size: crate::domain::ids::BlockSize::new(16),
             max_model_len: 4096,
             ..Default::default()
         };
@@ -263,7 +272,7 @@ mod tests {
 
         let mut builder = BatchBuilder::new();
         let bytes = builder
-            .build_llm_batch(&[&seq], &[], &config, &codec, &[(request_id, 4)])
+            .build_llm_batch(&[&seq], &config, &codec, &[(request_id, 4)], &[])
             .unwrap();
         let cmd: BatchCommand = codec.decode(&bytes).unwrap();
         let BatchCommand::Prefill(prefill) = cmd else {
@@ -272,7 +281,39 @@ mod tests {
         assert_eq!(prefill.segments.len(), 1);
         let segment = &prefill.segments[0];
         assert_eq!(segment.block_size, 16);
-        assert_eq!(segment.block_table, vec![7, 8]);
+        // Scheduler ships an empty block_table; the worker owns
+        // physical block allocation.
+        assert!(segment.block_table.is_empty());
+        assert!(segment.prefix_hint.is_none());
+    }
+
+    #[test]
+    fn build_prefill_batch_threads_prefix_hint_through() {
+        let config = SchedulerConfig {
+            paged_block_size: crate::domain::ids::BlockSize::new(16),
+            max_model_len: 4096,
+            ..Default::default()
+        };
+        let codec = MsgPackCodec;
+        let seq = make_prefilling_with_blocks();
+        let request_id = seq.meta.id.clone();
+
+        let mut builder = BatchBuilder::new();
+        let bytes = builder
+            .build_llm_batch(
+                &[&seq],
+                &config,
+                &codec,
+                &[(request_id.clone(), 4)],
+                &[(request_id, vec![100, 101, 102])],
+            )
+            .unwrap();
+        let cmd: BatchCommand = codec.decode(&bytes).unwrap();
+        let BatchCommand::Prefill(prefill) = cmd else {
+            panic!("expected prefill command");
+        };
+        let segment = &prefill.segments[0];
+        assert_eq!(segment.prefix_hint.as_deref(), Some(&[100u32, 101, 102][..]));
     }
 
     /// After a build, reusing the same builder for a second batch
@@ -280,7 +321,7 @@ mod tests {
     #[test]
     fn builder_reuse_does_not_concatenate_old_state() {
         let config = SchedulerConfig {
-            kv_cache_mode: KvCacheMode::Paged { block_size: 16 },
+            paged_block_size: crate::domain::ids::BlockSize::new(16),
             max_model_len: 4096,
             ..Default::default()
         };
@@ -289,14 +330,14 @@ mod tests {
         let id1 = seq1.meta.id.clone();
         let mut builder = BatchBuilder::new();
         let _bytes1 = builder
-            .build_llm_batch(&[&seq1], &[], &config, &codec, &[(id1, 4)])
+            .build_llm_batch(&[&seq1], &config, &codec, &[(id1, 4)], &[])
             .unwrap();
 
         // Second iteration: same builder, fresh session.
         let seq2 = make_prefilling_with_blocks();
         let id2 = seq2.meta.id.clone();
         let bytes2 = builder
-            .build_llm_batch(&[&seq2], &[], &config, &codec, &[(id2, 4)])
+            .build_llm_batch(&[&seq2], &config, &codec, &[(id2, 4)], &[])
             .unwrap();
         let cmd: BatchCommand = codec.decode(&bytes2).unwrap();
         let BatchCommand::Prefill(prefill) = cmd else {

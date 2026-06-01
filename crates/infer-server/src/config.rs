@@ -55,6 +55,13 @@ pub struct ServerConfig {
     #[arg(long, default_value = "1.0", env = "MEM_FRACTION_STATIC")]
     pub mem_fraction_static: f32,
 
+    /// Override worker's KV pool size (number of blocks). When unset,
+    /// worker auto-sizes from `max_batch_seqs * ceil(max_model_len / block_size)`.
+    /// Use a small value (e.g. 256) to exercise the KV pressure-relief
+    /// path under load.
+    #[arg(long, env = "NUM_BLOCKS")]
+    pub num_blocks: Option<usize>,
+
     /// 模型名称（用于 /v1/models 返回）
     #[arg(long, env = "MODEL_NAME")]
     pub model_name: Option<String>,

@@ -161,10 +161,16 @@ async fn main() -> Result<()> {
         scheduler_cmd.arg("--chunked-prefill-size").arg(chunk_size.to_string());
     }
 
-    // Forward KV-cache and runtime planning flags so paged mode can be exercised
-    // end-to-end via the all-in-one launcher.
+    // Forward paged KV block size + runtime planning fraction to the scheduler.
+    // `kv_cache_mode` is kept on the server CLI as `paged:<N>` for backwards
+    // compatibility; the scheduler now takes the block size directly.
+    let paged_block_size: usize = config
+        .kv_cache_mode
+        .strip_prefix("paged:")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     scheduler_cmd
-        .arg("--kv-cache-mode").arg(&config.kv_cache_mode)
+        .arg("--paged-block-size").arg(paged_block_size.to_string())
         .arg("--mem-fraction-static").arg(config.mem_fraction_static.to_string());
     if config.enable_prefix_caching {
         scheduler_cmd.arg("--enable-prefix-caching");
@@ -183,14 +189,19 @@ async fn main() -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════════
     tracing::info!("[worker:0] Starting on {}...", assigned_device);
 
-    let worker_child = Command::new("rustinfer-worker")
+    let mut worker_cmd = Command::new("rustinfer-worker");
+    worker_cmd
         .arg("--device").arg(&assigned_device)
         .arg("--worker-pull-endpoint").arg(&worker_in_ep)
         .arg("--worker-push-endpoint").arg(&worker_out_ep)
         .arg("--worker-control-endpoint").arg(&worker_control_ep)
         .arg("--max-batch-tokens").arg(config.max_batch_tokens.to_string())
         .arg("--max-batch-seqs").arg(config.max_batch_seqs.to_string())
-        .arg("--log-level").arg(&config.log_level)
+        .arg("--log-level").arg(&config.log_level);
+    if let Some(n) = config.num_blocks {
+        worker_cmd.arg("--num-blocks").arg(n.to_string());
+    }
+    let worker_child = worker_cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
