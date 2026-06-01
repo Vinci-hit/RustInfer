@@ -218,5 +218,47 @@ mod phase4_kv_protocol {
         };
         assert!(cmd.validate(8192, 16).is_err());
     }
+
+    // ─── KV pressure relief: AllocFailed / Preempt round trips ────────
+
+    #[test]
+    fn alloc_failed_round_trip_preserves_round_and_shortfall() {
+        use crate::worker_to_scheduler_control::{AllocFailed, WorkerControlMessage};
+        let msg = WorkerControlMessage::AllocFailed(AllocFailed {
+            worker_id: "worker-test".to_string(),
+            shortfall: 17,
+            round: 1,
+        });
+        let bytes = rmp_serde::to_vec(&msg).expect("serialize");
+        let parsed: WorkerControlMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize");
+        match parsed {
+            WorkerControlMessage::AllocFailed(a) => {
+                assert_eq!(a.worker_id, "worker-test");
+                assert_eq!(a.shortfall, 17);
+                assert_eq!(a.round, 1);
+            }
+            other => panic!("expected AllocFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn preempt_round_trip_preserves_sequence_ids() {
+        use crate::scheduler_to_worker_control::{Preempt, SchedulerControlMessage};
+        let msg = SchedulerControlMessage::Preempt(Preempt {
+            model_instance_id: "m0".to_string(),
+            sequence_ids: vec![7, 19, 256],
+        });
+        let bytes = rmp_serde::to_vec(&msg).expect("serialize");
+        let parsed: SchedulerControlMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize");
+        match parsed {
+            SchedulerControlMessage::Preempt(p) => {
+                assert_eq!(p.model_instance_id, "m0");
+                assert_eq!(p.sequence_ids, vec![7, 19, 256]);
+            }
+            other => panic!("expected Preempt, got {:?}", other),
+        }
+    }
 }
 

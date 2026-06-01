@@ -271,6 +271,7 @@ fn handle_inbound(
     let event = match env.payload {
         WorkerControlMessage::Heartbeat(hb) => ControlEvent::Heartbeat { worker, hb },
         WorkerControlMessage::StepError(err) => ControlEvent::StepError { worker, err },
+        WorkerControlMessage::AllocFailed(req) => ControlEvent::AllocFailed { worker, req },
         WorkerControlMessage::Error(e) => ControlEvent::WorkerError {
             worker,
             message: e.message,

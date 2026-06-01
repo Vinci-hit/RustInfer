@@ -11,7 +11,7 @@ use infer_protocol::worker_to_scheduler_control::WorkerControlMessage;
 use infer_protocol::{
     ControlEnvelope,
     scheduler_to_worker_control::SchedulerControlMessage,
-    worker_to_scheduler_control::{WorkerHeartbeat, WorkerStepError},
+    worker_to_scheduler_control::{AllocFailed, WorkerHeartbeat, WorkerStepError},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -96,6 +96,15 @@ pub enum ControlEvent {
         worker: WorkerId,
         message: String,
         fatal: bool,
+    },
+
+    /// Worker-driven KV pressure-relief request. `req.round` selects
+    /// the relief level (0 = LRU evict, 1 = victim preempt). Sent only
+    /// when `kv_allocator.alloc_indices()` actually fails on the
+    /// worker — never on a periodic schedule.
+    AllocFailed {
+        worker: WorkerId,
+        req: AllocFailed,
     },
 }
 

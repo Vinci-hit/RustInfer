@@ -202,11 +202,9 @@ fn maybe_heartbeat(
 ) {
     if last.elapsed() >= interval {
         let active = sched.active_decodes.iter().filter(|s| !s.finished).count();
-        // This serve_loop variant does not own a `GlobalKvAllocator`
-        // directly — it's wired up in worker_main.rs's monolithic loop
-        // instead. Send `0/0` for KV slots: the scheduler treats that
-        // as "no signal" and never crosses the low-water threshold.
-        let _ = control.send_heartbeat(active, 0, 0);
+        // Heartbeats are liveness-only now. KV pressure travels through
+        // `AllocFailed` events emitted from the worker_main loop.
+        let _ = control.send_heartbeat(active);
         *last = Instant::now();
     }
 }

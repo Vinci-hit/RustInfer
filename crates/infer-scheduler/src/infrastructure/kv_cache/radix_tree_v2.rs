@@ -380,11 +380,42 @@ impl RadixTree {
         }
     }
 
-    /// Evict from the LRU front until at least `target_n` global indices are
-    /// gathered. The returned indices are batched and sent to the worker via
-    /// `FreeKvIndices`. May return fewer than `target_n` if the LRU is
-    /// exhausted (caller must escalate to `preempt` per plan §6/§7).
-    pub fn evict(&mut self, target_n: usize) -> Vec<GlobalIndex> {
+    /// Sum of `global_indices.len()` across every node currently in
+    /// the LRU. This is the cap on what `evict_collect_at_least` can
+    /// possibly return on a single call.
+    ///
+    /// Walks the LRU queue once and skips stale entries by checking
+    /// each node's `in_lru` flag (the generation stamp on the queue
+    /// itself can't be peeked without popping). Cheap because the
+    /// LRU only ever contains unowned leaves — typical loads keep
+    /// this under a few thousand entries.
+    pub fn lru_total_indices(&self) -> usize {
+        let mut total = 0usize;
+        for &(node_id, _g) in &self.lru.queue {
+            // Only count entries that are still actually in LRU
+            // (un-pinned and a leaf at this instant).
+            if !self.nodes[node_id].in_lru {
+                continue;
+            }
+            if !self.nodes[node_id].owners.is_empty() {
+                continue;
+            }
+            if !self.nodes[node_id].children.is_empty() {
+                continue;
+            }
+            total += self.nodes[node_id].global_indices.len();
+        }
+        total
+    }
+
+    /// Evict from the LRU front until at least `target_n` global
+    /// indices are gathered. Atomic at the node level — a popped
+    /// node's full `global_indices` always ships, never a slice. May
+    /// return *more* than `target_n` (the "at_least" in the name) and
+    /// *less* if the LRU drains before reaching the target. Caller
+    /// must escalate to victim preemption when the returned count is
+    /// short of what they need.
+    pub fn evict_collect_at_least(&mut self, target_n: usize) -> Vec<GlobalIndex> {
         let mut out: Vec<GlobalIndex> = Vec::new();
         while out.len() < target_n {
             let Some(node_id) = self.lru.pop_front_valid() else {
@@ -420,6 +451,14 @@ impl RadixTree {
             }
         }
         out
+    }
+
+    /// Backwards-compat shim. `evict_collect_at_least` is the new
+    /// canonical name. Existing tests and callers that already spelled
+    /// the old name keep working until they're migrated.
+    #[inline]
+    pub fn evict(&mut self, target_n: usize) -> Vec<GlobalIndex> {
+        self.evict_collect_at_least(target_n)
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────
@@ -921,5 +960,60 @@ mod tests {
         // skips it via the generation stamp, returning nothing.
         let evicted = t.evict(10);
         assert!(evicted.is_empty(), "stale LRU entry must not surface; got {:?}", evicted);
+    }
+
+    // ─── lru_total_indices / evict_collect_at_least ──────────────────
+
+    #[test]
+    fn lru_total_indices_counts_finished_leaves() {
+        let mut t = RadixTree::new();
+        // Three independent chains, all finished → 3 leaves * 4 slots each.
+        for s in 1..=3u64 {
+            for k in 0..4u32 {
+                let token = (10 * s as i32) + k as i32;
+                let idx = ((s as u32 - 1) * 4) + k;
+                t.append_token(s, token, idx);
+            }
+            t.mark_finished_chain(s);
+        }
+        assert_eq!(t.lru_total_indices(), 12);
+    }
+
+    #[test]
+    fn lru_total_indices_zero_when_all_pinned() {
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(10, 100), (20, 101)]);
+        // Active seq → no LRU entries.
+        assert_eq!(t.lru_total_indices(), 0);
+    }
+
+    #[test]
+    fn evict_collect_at_least_returns_at_least_target() {
+        let mut t = RadixTree::new();
+        for s in 1..=3u64 {
+            for k in 0..4u32 {
+                let token = (10 * s as i32) + k as i32;
+                let idx = ((s as u32 - 1) * 4) + k;
+                t.append_token(s, token, idx);
+            }
+            t.mark_finished_chain(s);
+        }
+        // Target of 5 must yield at least 5; one chain is 4 → eviction
+        // pops the next chain whole, exceeding the target.
+        let got = t.evict_collect_at_least(5);
+        assert!(got.len() >= 5, "expected ≥ 5 indices, got {}", got.len());
+    }
+
+    #[test]
+    fn evict_collect_at_least_stops_at_lru_empty() {
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(10, 100), (20, 101)]);
+        t.mark_finished_chain(1);
+        // Only 2 indices ever existed; asking for 100 must return 2.
+        let got = t.evict_collect_at_least(100);
+        assert_eq!(got.len(), 2);
+        // Subsequent call returns empty.
+        let got = t.evict_collect_at_least(1);
+        assert!(got.is_empty());
     }
 }

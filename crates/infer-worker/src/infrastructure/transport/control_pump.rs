@@ -6,7 +6,7 @@
 use infer_protocol::control_envelope::{ControlEnvelope, RequestId};
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::{
-    WorkerControlMessage, WorkerHello, WorkerHeartbeat, WorkerReady,
+    AllocFailed, WorkerControlMessage, WorkerHello, WorkerHeartbeat, WorkerReady,
     WorkerState, WorkerCapacity, WORKER_CONTROL_PROTOCOL_VERSION,
 };
 
@@ -44,21 +44,25 @@ impl ControlPump {
     }
 
     /// Send heartbeat. `active_requests` is the worker's current load
-    /// (decode + waiting prefills); `kv_total_slots` / `kv_free_slots`
-    /// expose the worker's `GlobalKvAllocator` occupancy so the scheduler
-    /// can run RadixTree LRU eviction in response to pressure signals.
-    pub fn send_heartbeat(
-        &self,
-        active_requests: usize,
-        kv_total_slots: u32,
-        kv_free_slots: u32,
-    ) -> Result<(), String> {
+    /// (decode + waiting prefills). Heartbeats no longer carry KV
+    /// occupancy — KV pressure flows through `send_alloc_failed`
+    /// (worker → scheduler) on actual alloc failures only.
+    pub fn send_heartbeat(&self, active_requests: usize) -> Result<(), String> {
         self.send(WorkerControlMessage::Heartbeat(WorkerHeartbeat {
             worker_id: self.worker_id.clone(),
             state: WorkerState::Running,
             active_requests,
-            kv_total_slots,
-            kv_free_slots,
+        }), RequestId::NONE)
+    }
+
+    /// Emit an `AllocFailed` control message. `round` selects the
+    /// pressure-relief level the scheduler will apply (0 = LRU evict,
+    /// 1 = victim preempt).
+    pub fn send_alloc_failed(&self, shortfall: u32, round: u8) -> Result<(), String> {
+        self.send(WorkerControlMessage::AllocFailed(AllocFailed {
+            worker_id: self.worker_id.clone(),
+            shortfall,
+            round,
         }), RequestId::NONE)
     }
 

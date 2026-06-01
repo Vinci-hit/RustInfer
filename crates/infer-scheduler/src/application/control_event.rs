@@ -11,10 +11,15 @@
 //!
 //! ## What this System handles inline
 //!
-//! - `Heartbeat` → check the worker-reported KV pool free ratio;
-//!   when `kv_free_slots / kv_total_slots` falls below
-//!   `KV_LOW_WATER_RATIO`, evict RadixTree LRU leaves and ship a
-//!   `FreeKvIndices` control message back to the worker.
+//! - `Heartbeat` → liveness-only (the router thread updates the
+//!   liveness clock); the engine sees this for observability and
+//!   does not act on it.
+//! - `AllocFailed` → KV pressure relief. Round 0 evicts RadixTree LRU
+//!   leaves up to ~5% of total slots and replies with `FreeKvIndices`.
+//!   Round 1 picks decoding / chunked-prefilling victims, marks their
+//!   chains finished, transitions them back to `Queued`, and replies
+//!   with `Preempt(sequence_ids)`. The worker is purely passive at
+//!   both rounds.
 //! - `WorkerError { fatal: false }` → error log, then `Continue`.
 //!
 //! ## What it returns to the orchestrator
@@ -27,24 +32,17 @@
 
 use std::marker::PhantomData;
 
-use infer_protocol::worker_to_scheduler_control::WorkerStepError;
+use infer_protocol::worker_to_scheduler_control::{AllocFailed, WorkerStepError};
 
 use crate::error::SchedulerError;
 use crate::domain::inference_session::lifecycle::SequenceId;
-use crate::domain::inference_session::table::RequestTable;
+use crate::domain::inference_session::table::{PreemptCandidate, RequestTable};
 use crate::domain::kv_budget::KvBudget;
 use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
 use crate::infrastructure::transport::control_plane::{ControlEvent, ControlPlaneCmdTx, WorkerId};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
 
 use super::outcomes::ControlOutcome;
-
-/// Free-ratio threshold below which the scheduler kicks RadixTree LRU
-/// eviction in response to a worker Heartbeat. 15 % free → react.
-const KV_LOW_WATER_RATIO: f32 = 0.15;
-/// Free-ratio target after eviction completes. We free as many LRU
-/// leaves as needed to bring the worker's free ratio above this number.
-const KV_HIGH_WATER_RATIO: f32 = 0.30;
 
 /// Control-event handling stage.
 #[derive(Debug, Default)]
@@ -101,80 +99,195 @@ impl ControlEventSystem {
             }
             ControlEvent::Heartbeat { worker, hb } => {
                 tracing::trace!(
-                    "Heartbeat: worker={} state={:?} active={} kv_free={}/{}",
+                    "Heartbeat: worker={} state={:?} active={}",
                     worker,
                     hb.state,
                     hb.active_requests,
-                    hb.kv_free_slots,
-                    hb.kv_total_slots,
                 );
-
-                // Worker-driven KV pressure response.
-                //
-                // Total == 0 means the worker did not report KV info
-                // (legacy heartbeats, diffusion mode, bootstrap-phase
-                // heartbeat). Skip silently in that case.
-                if hb.kv_total_slots > 0 {
-                    let free_ratio =
-                        hb.kv_free_slots as f32 / hb.kv_total_slots as f32;
-                    if free_ratio < KV_LOW_WATER_RATIO {
-                        let target_free = ((hb.kv_total_slots as f32)
-                            * KV_HIGH_WATER_RATIO)
-                            as u32;
-                        let need_to_free =
-                            target_free.saturating_sub(hb.kv_free_slots);
-                        if need_to_free > 0 {
-                            self.run_kv_pressure_relief(
-                                radix,
-                                kv_budget,
-                                control_cmd,
-                                worker_group,
-                                default_worker,
-                                need_to_free,
-                            );
-                        }
-                    }
-                }
                 ControlOutcome::noop()
+            }
+            ControlEvent::AllocFailed { worker, req } => {
+                self.handle_alloc_failed(
+                    req,
+                    sessions,
+                    radix,
+                    kv_budget,
+                    control_cmd,
+                    worker_group,
+                    &worker,
+                    default_worker,
+                )
             }
         }
     }
 
-    /// Evict RadixTree LRU leaves to satisfy the worker's pressure
-    /// signal, account the freed slots in `KvBudget`, and ship a
-    /// `FreeKvIndices` control message back to the worker. All errors
-    /// are swallowed — pressure relief is best-effort and the next
-    /// Heartbeat will retry if we couldn't free enough.
-    fn run_kv_pressure_relief(
+    /// Worker-driven KV pressure relief.
+    ///
+    /// `round = 0` → Level 1: evict up to `min(5%, lru_total)` indices
+    /// from the RadixTree LRU and reply with `FreeKvIndices`.
+    ///
+    /// `round = 1` → Level 2: pick decoding + chunked-prefilling
+    /// victims sorted by `(output_len desc, input_len asc)` until ~5%
+    /// of total capacity is freed. For each victim:
+    ///   1. `radix.mark_finished_chain(sid)` releases its prefix-tree
+    ///      ownership so its slots can later return to LRU.
+    ///   2. `sessions.preempt_to_queued(sid)` flips the type-state
+    ///      back to `Queued`, push_front'ing it into `waiting`. For
+    ///      Decoding victims this also bumps `preemption_count`.
+    /// Then send `Preempt(victim_ids)`; the worker is purely passive
+    /// and frees their `block_table` locally.
+    fn handle_alloc_failed(
         &self,
+        req: AllocFailed,
+        sessions: &mut RequestTable,
         radix: &mut RadixTree,
         kv_budget: &mut KvBudget,
         control_cmd: &ControlPlaneCmdTx,
         worker_group: &WorkerGroup,
+        worker_from_event: &WorkerId,
         default_worker: &WorkerId,
-        need_to_free: u32,
-    ) {
-        let freed = radix.evict(need_to_free as usize);
-        if freed.is_empty() {
+    ) -> ControlOutcome {
+        // Use the worker that emitted the AllocFailed when available;
+        // fall back to default_worker (single-rank deployment safety net).
+        let _ = default_worker;
+        let target_worker = worker_from_event;
+
+        let total = worker_group
+            .effective_capacity
+            .max_total_kv_tokens
+            .map(|t| u32::try_from(t).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        if total == 0 {
             tracing::debug!(
-                need = need_to_free,
-                "KV pressure: RadixTree LRU empty — nothing to evict"
+                worker_id = %req.worker_id,
+                round = req.round,
+                shortfall = req.shortfall,
+                "AllocFailed: total capacity unknown — skipping relief"
             );
-            return;
+            return ControlOutcome::noop();
         }
-        kv_budget.release(freed.len() as u32);
+
+        // 5% of total slots, rounded down. With block_size=1 this is the
+        // common 5%-of-tokens budget.
+        let five_pct = total / 20;
+
+        if req.round == 0 {
+            // Level 1: LRU evict, target = min(5%, lru_total).
+            let lru_total = radix.lru_total_indices() as u32;
+            let target = five_pct.min(lru_total);
+            if target > 0 {
+                let indices = radix.evict_collect_at_least(target as usize);
+                if !indices.is_empty() {
+                    kv_budget.release(indices.len() as u32);
+                    tracing::info!(
+                        worker_id = %req.worker_id,
+                        shortfall = req.shortfall,
+                        target,
+                        freed = indices.len(),
+                        "AllocFailed round=0: evicting RadixTree LRU leaves"
+                    );
+                    let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
+                        infer_protocol::scheduler_to_worker_control::FreeKvIndices {
+                            model_instance_id: worker_group.model_instance_id.clone(),
+                            indices,
+                        },
+                    );
+                    let _ = control_cmd.send_to(target_worker, msg);
+                    return ControlOutcome::noop();
+                }
+            }
+            // LRU is empty (or evict returned nothing). Fall through to
+            // Level 2 immediately rather than forcing the worker to wait
+            // 500ms for nothing and re-issue a round=1 request. This
+            // halves the relief tail latency in the common burst case
+            // where LRU is empty (cold start, all-active workload).
+            tracing::debug!(
+                worker_id = %req.worker_id,
+                shortfall = req.shortfall,
+                five_pct,
+                lru_total,
+                "AllocFailed round=0: nothing in LRU — escalating to preemption"
+            );
+        }
+
+        // Level 2: victim preemption. Target = fixed 5%.
+        let target = five_pct;
+
+        let mut candidates: Vec<PreemptCandidate> = sessions.preemption_candidates();
+        // (output_len desc, input_len asc). Long outputs first
+        // (sunk-cost is largest), short inputs next (cheapest to
+        // re-prefill on resume).
+        candidates.sort_by(|a, b| {
+            b.output_len
+                .cmp(&a.output_len)
+                .then(a.input_len.cmp(&b.input_len))
+        });
+
+        let mut victims: Vec<u64> = Vec::new();
+        let mut freed: u32 = 0;
+        for cand in &candidates {
+            victims.push(cand.sequence_id);
+            freed = freed.saturating_add(cand.kv_used);
+            if freed >= target {
+                break;
+            }
+        }
+
+        // Level 3: even all candidates won't satisfy the target.
+        // Continue with whatever we have — exhausting the active pool
+        // is the best we can offer; any leftover shortfall makes the
+        // worker-side `wait_for_relief` time out and fail the batch.
+        if freed < target && !victims.is_empty() {
+            tracing::warn!(
+                worker_id = %req.worker_id,
+                target,
+                freed,
+                victims = victims.len(),
+                "AllocFailed round=1: preempted everything but target unmet"
+            );
+        }
+
+        if victims.is_empty() {
+            tracing::warn!(
+                worker_id = %req.worker_id,
+                "AllocFailed round=1: no preemption candidates — relief timeout will fail batch"
+            );
+            return ControlOutcome::noop();
+        }
+
+        // Mark chains finished + flip type-state. Order matters: the
+        // RadixTree drop happens *before* the worker physically frees
+        // anything, so reused indices can never alias a still-pinned
+        // owner.
+        for sid in &victims {
+            radix.mark_finished_chain(*sid);
+            if let Err(e) = sessions.preempt_to_queued(SequenceId(*sid)) {
+                tracing::error!(
+                    sequence_id = sid,
+                    "preempt_to_queued failed: {}",
+                    e
+                );
+            }
+        }
+
         tracing::info!(
-            need = need_to_free,
-            freed = freed.len(),
-            "KV pressure: evicted RadixTree LRU leaves"
+            worker_id = %req.worker_id,
+            shortfall = req.shortfall,
+            target,
+            freed,
+            victims = victims.len(),
+            "AllocFailed round=1: victim preemption"
         );
-        let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
-            infer_protocol::scheduler_to_worker_control::FreeKvIndices {
+
+        let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::Preempt(
+            infer_protocol::scheduler_to_worker_control::Preempt {
                 model_instance_id: worker_group.model_instance_id.clone(),
-                indices: freed,
+                sequence_ids: victims,
             },
         );
-        let _ = control_cmd.send_to(default_worker, msg);
+        let _ = control_cmd.send_to(target_worker, msg);
+
+        ControlOutcome::noop()
     }
 
     /// Worker-reported step error. Fatal flag escalates to
@@ -503,9 +616,9 @@ mod tests {
         }
     }
 
-    /// Heartbeat with no KV info → noop, no eviction, no FreeKvIndices.
+    /// Heartbeat is liveness-only now — no KV pressure inspection.
     #[test]
-    fn heartbeat_without_kv_info_is_noop() {
+    fn heartbeat_is_noop() {
         let sys = ControlEventSystem::new();
         let mut sessions = empty_table();
         let mut radix = fresh_radix();
@@ -520,8 +633,6 @@ mod tests {
                     worker_id: "w".into(),
                     state: WorkerState::Running,
                     active_requests: 0,
-                    kv_total_slots: 0,
-                    kv_free_slots: 0,
                 },
             },
             &mut sessions,
@@ -532,98 +643,5 @@ mod tests {
         );
         assert!(matches!(outcome, ControlOutcome::Continue { .. }));
         assert!(cmd_rx.try_recv().is_err(), "no FreeKvIndices expected");
-    }
-
-    /// Heartbeat above low-water → noop.
-    #[test]
-    fn heartbeat_above_low_water_is_noop() {
-        let sys = ControlEventSystem::new();
-        let mut sessions = empty_table();
-        let mut radix = fresh_radix();
-        let mut budget = fresh_budget(100);
-        let (cmd, mut cmd_rx) = dummy_cmd_tx_with_rx();
-        let wg = worker_group_for_test();
-        let _ = invoke(
-            &sys,
-            ControlEvent::Heartbeat {
-                worker: WorkerId::from_identity(b"w"),
-                hb: WorkerHeartbeat {
-                    worker_id: "w".into(),
-                    state: WorkerState::Running,
-                    active_requests: 0,
-                    kv_total_slots: 100,
-                    kv_free_slots: 50, // 50% free
-                },
-            },
-            &mut sessions,
-            &mut radix,
-            &mut budget,
-            &cmd,
-            &wg,
-        );
-        assert!(cmd_rx.try_recv().is_err(), "no FreeKvIndices expected");
-    }
-
-    /// Heartbeat below low-water with LRU-eligible nodes → evict + send
-    /// `FreeKvIndices` and adjust `KvBudget`.
-    #[tokio::test]
-    async fn heartbeat_low_water_evicts_and_sends_free_kv_indices() {
-        use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
-
-        let sys = ControlEventSystem::new();
-        let mut sessions = empty_table();
-        // Build a RadixTree with 3 chains × 4 slots each, all finished
-        // → 12 slots in LRU.
-        let mut radix = fresh_radix();
-        for s in 1..=3u64 {
-            for k in 0..4 {
-                let token = (10 * s as i32) + k;
-                let idx = ((s as u32 - 1) * 4) + k as u32;
-                radix.append_token(s, token, idx);
-            }
-            radix.mark_finished_chain(s);
-        }
-        let mut budget = fresh_budget(100);
-        // Pretend the worker reported these 12 slots.
-        budget.try_reserve(12).unwrap();
-
-        let (cmd, mut cmd_rx) = dummy_cmd_tx_with_rx();
-        let wg = worker_group_for_test();
-        let _ = invoke(
-            &sys,
-            ControlEvent::Heartbeat {
-                worker: WorkerId::from_identity(b"w"),
-                hb: WorkerHeartbeat {
-                    worker_id: "w".into(),
-                    state: WorkerState::Running,
-                    active_requests: 0,
-                    kv_total_slots: 100,
-                    kv_free_slots: 10, // 10% free → trigger
-                },
-            },
-            &mut sessions,
-            &mut radix,
-            &mut budget,
-            &cmd,
-            &wg,
-        );
-
-        // Budget should have shrunk by the number of evicted indices.
-        // Target free = 30, current free = 10, need_to_free = 20.
-        // LRU has 12 slots → evict yields all 12.
-        assert_eq!(budget.outstanding(), 0, "all 12 LRU slots released");
-
-        let cmd_msg = cmd_rx.try_recv().expect("FreeKvIndices expected");
-        match cmd_msg {
-            crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo {
-                env, ..
-            } => match env.payload {
-                SchedulerControlMessage::FreeKvIndices(free) => {
-                    assert_eq!(free.indices.len(), 12, "all LRU slots returned");
-                }
-                other => panic!("expected FreeKvIndices, got {:?}", other),
-            },
-            _ => panic!("expected SendTo router command"),
-        }
     }
 }

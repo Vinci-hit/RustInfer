@@ -66,17 +66,28 @@ pub struct WorkerHeartbeat {
     pub worker_id: String,
     pub state: WorkerState,
     pub active_requests: usize,
-    /// Total slots in the worker's `GlobalKvAllocator` (== `num_blocks`
-    /// when `block_size = 1`). The scheduler uses
-    /// `kv_free_slots / kv_total_slots` as the pressure signal that
-    /// drives RadixTree LRU eviction. Older snapshots that did not
-    /// carry these fields deserialize as 0 — which the scheduler reads
-    /// as "no signal, do nothing".
-    #[serde(default)]
-    pub kv_total_slots: u32,
-    /// Free slots in the same allocator (`total - outstanding`).
-    #[serde(default)]
-    pub kv_free_slots: u32,
+}
+
+/// Worker-originated KV-pressure signal: `alloc_indices(n)` failed
+/// against the worker-local `GlobalKvAllocator`.
+///
+/// Sent only on actual allocation failure (no periodic / heartbeat-driven
+/// emission). The scheduler interprets `round` as the level in the
+/// pressure-relief escalation:
+/// - `round = 0` → Level 1 (RadixTree LRU eviction). Scheduler may reply
+///   with `FreeKvIndices` after evicting up to ~5% of total slots.
+/// - `round = 1` → Level 2 (victim preemption). Scheduler picks decoding
+///   / chunked-prefilling victims, marks their chains finished, sends a
+///   `Preempt(sequence_ids)` reply. Worker drops them from `active` and
+///   frees their `block_table` locally.
+///
+/// `shortfall` is the original `n` that failed. It is informational —
+/// the scheduler does not use it as a target. Useful for tracing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocFailed {
+    pub worker_id: String,
+    pub shortfall: u32,
+    pub round: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +172,9 @@ pub enum WorkerControlMessage {
     Heartbeat(WorkerHeartbeat),
     StepError(WorkerStepError),
     Error(WorkerError),
+    /// Worker hit `alloc_indices` failure and is asking the scheduler
+    /// for KV pressure relief (LRU evict at round 0, preempt at round 1).
+    AllocFailed(AllocFailed),
 
     // ── runtime: RPC replies ──
     Pong,
@@ -169,4 +183,4 @@ pub enum WorkerControlMessage {
     UnloadAck(UnloadAck),
 }
 
-pub const WORKER_CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const WORKER_CONTROL_PROTOCOL_VERSION: u32 = 4;

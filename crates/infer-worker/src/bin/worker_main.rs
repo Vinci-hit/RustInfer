@@ -429,15 +429,6 @@ where
         "[serve] worker-owned KV allocator: total={} (block_size={})",
         num_blocks, bs.block_size,
     );
-    // KV-pressure de-bounce. Worker emits an immediate Heartbeat (out of
-    // the periodic interval) when free_ratio first crosses below
-    // `LOW_WATER_RATIO`, and again when it crosses back above. Inside the
-    // sticky low-water region we throttle: only one immediate hb until we
-    // recover. This keeps the scheduler's RadixTree LRU eviction reactive
-    // without flooding the control plane.
-    const LOW_WATER_RATIO: f32 = 0.15;
-    const RECOVERY_RATIO: f32 = 0.30;
-    let mut last_low_water: bool = false;
     let mut profile_step_count: u32 = 0;
     let mut profile_started = false;
 
@@ -471,6 +462,21 @@ where
                             kv_allocator.free(&free.indices);
                         }
                     }
+                    // Scheduler-driven Level-2 victim preemption. Drop
+                    // each listed seq from `active` and free its KV
+                    // slots locally. The scheduler has already called
+                    // `radix.mark_finished_chain` and flipped its
+                    // `RequestTable` entry back to Queued.
+                    SchedulerControlMessage::Preempt(p) => {
+                        for sid in &p.sequence_ids {
+                            if let Some(removed) = active.remove(sid) {
+                                if !removed.block_table.is_empty() {
+                                    kv_allocator.free(&removed.block_table);
+                                }
+                                eprintln!("[serve] preempted seq {}", sid);
+                            }
+                        }
+                    }
                     SchedulerControlMessage::Ping => {
                         let _ = control.send(WorkerControlMessage::Pong, _req_id);
                     }
@@ -492,7 +498,7 @@ where
         }
 
         if pending_prefills.is_empty() && active.is_empty() {
-            maybe_heartbeat(control, active.len(), &kv_allocator, &mut last_heartbeat, heartbeat_interval);
+            maybe_heartbeat(control, active.len(), &mut last_heartbeat, heartbeat_interval);
             let idle_wait_ms = (heartbeat_interval.as_millis() as i64 / 2).max(50);
             match data.try_recv_batch(idle_wait_ms) {
                 Ok(Some(BatchCommand::Prefill(p))) => pending_prefills.push(p),
@@ -554,34 +560,11 @@ where
             }
         }
 
-        maybe_heartbeat(control, active.len(), &kv_allocator, &mut last_heartbeat, heartbeat_interval);
+        maybe_heartbeat(control, active.len(), &mut last_heartbeat, heartbeat_interval);
 
-        // Edge-triggered low-water signal. The scheduler reacts to this
-        // by evicting RadixTree leaves whose owners are empty (LRU) and
-        // sending FreeKvIndices back. Crossing the recovery threshold
-        // sends one more Heartbeat so the scheduler sees pressure has
-        // cleared (otherwise it would have to wait for the periodic
-        // tick).
-        let total = kv_allocator.total();
-        let free = kv_allocator.total_free();
-        let free_ratio = if total > 0 { free as f32 / total as f32 } else { 1.0 };
-        if !last_low_water && free_ratio < LOW_WATER_RATIO {
-            last_low_water = true;
-            let _ = control.send_heartbeat(active.len(), total, free);
-            last_heartbeat = Instant::now();
-            tracing::warn!(
-                "KV low-water: free={}/{} ({:.1}%) — emitted immediate Heartbeat",
-                free, total, free_ratio * 100.0
-            );
-        } else if last_low_water && free_ratio >= RECOVERY_RATIO {
-            last_low_water = false;
-            let _ = control.send_heartbeat(active.len(), total, free);
-            last_heartbeat = Instant::now();
-            tracing::info!(
-                "KV recovered: free={}/{} ({:.1}%) — emitted immediate Heartbeat",
-                free, total, free_ratio * 100.0
-            );
-        }
+        // Edge-triggered low-water signaling is gone: KV pressure now
+        // travels through `AllocFailed` events emitted only when an
+        // `alloc_indices` call actually fails. See `wait_for_relief`.
     }
     Ok(())
 }
@@ -589,15 +572,146 @@ where
 fn maybe_heartbeat(
     control: &ControlPump,
     active_n: usize,
-    kv_allocator: &GlobalKvAllocator,
     last: &mut Instant,
     interval: Duration,
 ) {
     if last.elapsed() >= interval {
-        let total = kv_allocator.total();
-        let free = kv_allocator.total_free();
-        let _ = control.send_heartbeat(active_n, total, free);
+        let _ = control.send_heartbeat(active_n);
         *last = Instant::now();
+    }
+}
+
+/// Block-poll the control plane until the scheduler ships KV relief
+/// (either a `FreeKvIndices` or a `Preempt`) or `wait_ms` elapses.
+///
+/// Other control messages that arrive during the wait (Cancel,
+/// Shutdown, Ping) are NOT drained here — they are left in the socket
+/// for the next iteration's regular drain. The only exception is the
+/// two relief variants this function explicitly applies and consumes.
+/// Returns `true` if relief landed, `false` on timeout.
+fn wait_for_relief(
+    control: &ControlPump,
+    kv_allocator: &mut GlobalKvAllocator,
+    active: &mut HashMap<u64, ActiveSeq>,
+    wait_ms: i64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    while Instant::now() < deadline {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as i64;
+        let poll_ms = remaining.min(50).max(1);
+        match control.try_recv(poll_ms) {
+            Ok(Some((SchedulerControlMessage::FreeKvIndices(f), _))) => {
+                if !f.indices.is_empty() {
+                    kv_allocator.free(&f.indices);
+                }
+                return true;
+            }
+            Ok(Some((SchedulerControlMessage::Preempt(p), _))) => {
+                for sid in &p.sequence_ids {
+                    if let Some(entry) = active.remove(sid) {
+                        if !entry.block_table.is_empty() {
+                            kv_allocator.free(&entry.block_table);
+                        }
+                    }
+                }
+                return true;
+            }
+            // For Shutdown / Cancel / Ping we'd ideally hand them back
+            // for the next drain; ZMQ has no peek API. Apply Shutdown
+            // and Cancel inline so the worker doesn't deadlock here;
+            // Ping/Pong is cheap enough to answer immediately.
+            Ok(Some((SchedulerControlMessage::Shutdown, _))) => {
+                eprintln!("[serve] Shutdown received during wait_for_relief");
+                std::process::exit(0);
+            }
+            Ok(Some((SchedulerControlMessage::Cancel(c), _))) => {
+                if let Some(removed) = active.remove(&c.sequence_id) {
+                    if !removed.block_table.is_empty() {
+                        kv_allocator.free(&removed.block_table);
+                    }
+                    eprintln!("[serve] cancelled seq {} (during relief wait)", c.sequence_id);
+                }
+            }
+            Ok(Some((SchedulerControlMessage::Ping, req_id))) => {
+                let _ = control.send(WorkerControlMessage::Pong, req_id);
+            }
+            // Any other message: drop and keep waiting.
+            Ok(Some(_)) => continue,
+            _ => continue,
+        }
+    }
+    false
+}
+
+/// Try to allocate `n_initial` slots. On `AllocFull`, signal the
+/// scheduler with `AllocFailed{round=0}`, block-poll for relief
+/// (FreeKvIndices or Preempt) for up to 500ms, retry. If still
+/// failing, escalate to `round=1` (victim preemption) and retry one
+/// more time. After two rounds the worker gives up and returns
+/// `None` — caller should fail the batch as a last-resort tier-3
+/// fallback.
+///
+/// Importantly: if a Preempt arrives during relief we may have fewer
+/// active seqs than we started with; the retry recomputes the
+/// allocation size against the post-preempt `active` map (decoder
+/// path) by passing `n_initial.min(active.len())`. The prefill path
+/// passes a pre-computed `n_initial` derived from `cmd.segments` and
+/// must use exactly that count regardless of preempt activity.
+fn alloc_with_relief(
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
+    active: &mut HashMap<u64, ActiveSeq>,
+    n_initial: u32,
+) -> Option<Vec<u32>> {
+    const RELIEF_TIMEOUT_MS: i64 = 500;
+    let mut round: u8 = 0;
+    let mut n = n_initial;
+    loop {
+        if n == 0 {
+            // Edge case: caller asked for zero slots, or all active
+            // seqs got preempted out from under us. Return an empty vec
+            // so the caller can short-circuit cleanly.
+            return Some(Vec::new());
+        }
+        match kv_allocator.alloc_indices(n) {
+            Ok(v) => return Some(v),
+            Err(e) => {
+                eprintln!(
+                    "[serve] alloc({}) failed at round={}: {} — requesting relief",
+                    n, round, e
+                );
+                let _ = control.send_alloc_failed(n, round);
+                if !wait_for_relief(control, kv_allocator, active, RELIEF_TIMEOUT_MS) {
+                    eprintln!(
+                        "[serve] relief timed out at round={} (still need {} slots)",
+                        round, n
+                    );
+                    return None;
+                }
+                if round >= 1 {
+                    eprintln!(
+                        "[serve] relief returned but alloc still short after round 1 — giving up"
+                    );
+                    return None;
+                }
+                round += 1;
+                // Decoder path: active may have shrunk. Recompute `n`
+                // capped to active.len() so we never over-allocate.
+                // Prefill path callers pass an explicit `n_initial`
+                // that does NOT track `active` — but Preempt can only
+                // touch already-active seqs and a prefill that hasn't
+                // been installed in `active` yet is invisible to the
+                // scheduler's victim policy. So recomputing against
+                // active.len() is safe: it's a no-op for prefill (n
+                // stays > active.len()) and a useful trim for decode.
+                let active_cap = active.len() as u32;
+                if n > active_cap && n_initial == active_cap {
+                    n = active_cap;
+                }
+            }
+        }
     }
 }
 
@@ -649,32 +763,26 @@ where
         let _ = i;
     }
 
-    let base_indices = match kv_allocator.alloc_indices(total_new) {
-        Ok(v) => v,
-        Err(e) => {
-            // Capacity starvation. Surface every seq in this batch to the
-            // scheduler as a non-fatal step error so the scheduler can fail
-            // them fast (HTTP 500) instead of letting clients sit on
-            // 120-second timeouts. Caller is also responsible for NOT
-            // installing any of these into `active` (we never inserted
-            // since we returned before `commit_step`).
-            //
-            // Also fire an immediate Heartbeat: alloc-fail is the most
-            // severe pressure signal and the scheduler should evict
-            // RadixTree LRU leaves ASAP. Future work: implement worker-
-            // local preemption so we don't have to fail the whole batch.
-            eprintln!("[serve] prefill alloc failed: {}", e);
-            let _ = control.send_heartbeat(
-                active.len(),
-                kv_allocator.total(),
-                kv_allocator.total_free(),
+    let base_indices = match alloc_with_relief(
+        kv_allocator,
+        control,
+        active,
+        total_new,
+    ) {
+        Some(v) => v,
+        None => {
+            // Two rounds of relief failed. Fail the entire batch
+            // (legacy behavior preserved as the final tier-3 escape).
+            eprintln!(
+                "[serve] prefill alloc still failing after relief — failing batch (n={})",
+                total_new
             );
             let failed_ids: Vec<u64> =
                 cmd.segments.iter().map(|s| s.sequence_id).collect();
             let _ = control.send(
                 WorkerControlMessage::StepError(WorkerStepError {
                     sequence_ids: failed_ids,
-                    message: format!("worker KV pool exhausted: {}", e),
+                    message: format!("worker KV pool exhausted (n={})", total_new),
                     fatal: false,
                 }),
                 infer_protocol::control_envelope::RequestId(0),
@@ -823,51 +931,63 @@ where
     if active.is_empty() {
         return Ok(());
     }
-    let mut order: Vec<u64> = active.keys().copied().collect();
-    order.sort_unstable();
-    if order.is_empty() {
-        return Ok(());
-    }
-
     // Allocate one slot per active seq. Using alloc_indices (vs alloc_segment)
     // means we degrade gracefully when the free pool is fragmented — decode
     // doesn't need contiguous slots either.
-    let n = order.len() as u32;
-    let new_indices = match kv_allocator.alloc_indices(n) {
-        Ok(v) => v,
-        Err(e) => {
-            // Decode KV starvation: every active seq tried to extend by
-            // one slot and at least one couldn't fit. Report all active
-            // seqs as failed; the scheduler fails them, frees their
-            // chains in RadixTree on the next admission round, and the
-            // worker's allocator gets the slots back via FreeKvIndices.
-            //
-            // Fire an immediate Heartbeat too — alloc-fail is the most
-            // severe pressure signal we can emit.
-            eprintln!("[serve] decode alloc failed: {}", e);
-            let _ = control.send_heartbeat(
-                active.len(),
-                kv_allocator.total(),
-                kv_allocator.total_free(),
-            );
-            let failed_ids: Vec<u64> = order.clone();
+    //
+    // The active set may change inside `alloc_with_relief` if the
+    // scheduler picks Decoding victims at round 1 — we re-snapshot
+    // `order` after relief completes.
+    let initial_n = active.len() as u32;
+    let new_indices = match alloc_with_relief(
+        kv_allocator,
+        control,
+        active,
+        initial_n,
+    ) {
+        Some(v) => v,
+        None => {
+            // Relief ran out. Fall back to legacy "fail every active
+            // seq" so clients don't sit on a 120s timeout.
+            let order: Vec<u64> = active.keys().copied().collect();
+            eprintln!("[serve] decode alloc still failing after relief — failing {} seqs", order.len());
             let _ = control.send(
                 WorkerControlMessage::StepError(WorkerStepError {
-                    sequence_ids: failed_ids,
-                    message: format!("worker KV pool exhausted at decode: {}", e),
+                    sequence_ids: order.clone(),
+                    message: "worker KV pool exhausted at decode".to_string(),
                     fatal: false,
                 }),
                 infer_protocol::control_envelope::RequestId(0),
             );
-            // Drop these seqs from `active` so we don't keep retrying.
-            // Their block_table slots are eventually reclaimed via
-            // scheduler-side mark_finished_chain → FreeKvIndices.
             for sid in &order {
                 let _ = active.remove(sid);
             }
             return Ok(());
         }
     };
+    // Now build a stable iteration order for the surviving active set.
+    // alloc_with_relief may have shrunk `active` or returned more slots
+    // than we now need; trim if so.
+    let mut order: Vec<u64> = active.keys().copied().collect();
+    order.sort_unstable();
+    if order.is_empty() {
+        // All active seqs were preempted. Free the slots we just got.
+        if !new_indices.is_empty() {
+            kv_allocator.free(&new_indices);
+        }
+        return Ok(());
+    }
+    // alloc_with_relief returned exactly `active.len()` slots when it
+    // re-tried with the post-preempt count. Defensive: if we
+    // over-allocated (shouldn't happen), give back the tail.
+    let new_indices: Vec<u32> = if new_indices.len() > order.len() {
+        let (take, give_back) = new_indices.split_at(order.len());
+        kv_allocator.free(give_back);
+        take.to_vec()
+    } else {
+        new_indices
+    };
+    debug_assert_eq!(new_indices.len(), order.len());
 
     let mut steps: Vec<SeqStep> = Vec::with_capacity(order.len());
     let mut assigned: Vec<AssignedIndices> = Vec::with_capacity(order.len());

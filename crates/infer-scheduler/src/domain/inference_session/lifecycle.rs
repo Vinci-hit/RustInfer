@@ -42,17 +42,6 @@ impl RequestId {
     pub fn new_v4() -> Self {
         Self(uuid::Uuid::new_v4())
     }
-
-    /// Build from an existing UUID (for tests or deserialization).
-    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
-        Self(uuid)
-    }
-
-    /// Borrow the underlying UUID (for hashing/serialization paths
-    /// that need the raw value).
-    pub fn as_uuid(&self) -> &uuid::Uuid {
-        &self.0
-    }
 }
 
 impl std::fmt::Display for RequestId {
@@ -185,20 +174,6 @@ pub struct Finished {
     pub metrics: CompletionMetrics,
 }
 
-/// Data for a session that errored / was killed.
-///
-/// The worker owns physical block ownership; the scheduler-side
-/// `RadixTree::mark_finished_chain` is the only release path. Sessions
-/// that fail before any KV is written (e.g. validation reject in
-/// Ingestion) should still be dropped from the repository directly
-/// without transitioning through `Failed`; we keep the bucket
-/// separate from `Finished` purely to retain partial output token
-/// bookkeeping.
-pub struct Failed {
-    pub message: String,
-    pub partial_output_tokens: Vec<i32>,
-}
-
 /// Per-request completion metrics.
 #[derive(Debug, Clone)]
 pub struct CompletionMetrics {
@@ -212,13 +187,11 @@ impl sealed::Sealed for Queued {}
 impl sealed::Sealed for Prefilling {}
 impl sealed::Sealed for Decoding {}
 impl sealed::Sealed for Finished {}
-impl sealed::Sealed for Failed {}
 
 impl SessionState for Queued {}
 impl SessionState for Prefilling {}
 impl SessionState for Decoding {}
 impl SessionState for Finished {}
-impl SessionState for Failed {}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  InferenceSession<S> — parameterized by state data
@@ -266,12 +239,6 @@ impl InferenceSession<Queued> {
         }
     }
 
-    /// Set prefix match result.
-    pub fn with_prefix_match(mut self, prefix_match: PrefixMatch) -> Self {
-        self.state.prefix_match = Some(prefix_match);
-        self
-    }
-
     /// Transition: Queued → Prefilling.
     pub fn start_prefill(self) -> InferenceSession<Prefilling> {
         let prompt_len = self.meta.input_ids.len();
@@ -286,11 +253,6 @@ impl InferenceSession<Queued> {
             },
         }
     }
-
-    /// Get the request ID.
-    pub fn id(&self) -> &RequestId {
-        &self.meta.id
-    }
 }
 
 impl InferenceSession<Prefilling> {
@@ -302,27 +264,22 @@ impl InferenceSession<Prefilling> {
             self.state.num_computed_tokens,
             self.state.prompt_len,
         );
+        // Pre-size `output_tokens` to dodge the 0→4→8→16→32→64 realloc
+        // sequence on the hot path. 64 covers most short-completion
+        // workloads (chat replies); longer outputs still amortize-grow
+        // with one realloc per doubling. We cap the pre-allocation at
+        // `max_tokens` so very small `max_tokens=8` requests don't
+        // over-allocate either.
+        let initial_cap = self.meta.max_tokens.min(64);
         InferenceSession {
             meta: self.meta,
             handle: self.handle,
             state: Decoding {
-                output_tokens: Vec::new(),
+                output_tokens: Vec::with_capacity(initial_cap),
                 seq_position: self.state.prompt_len,
                 prompt_len: self.state.prompt_len,
                 first_token_time: Instant::now(),
                 preemption_count: 0,
-            },
-        }
-    }
-
-    /// Transition: Prefilling → Failed.
-    pub fn fail(self, message: String) -> InferenceSession<Failed> {
-        InferenceSession {
-            meta: self.meta,
-            handle: self.handle,
-            state: Failed {
-                message,
-                partial_output_tokens: Vec::new(),
             },
         }
     }
@@ -348,11 +305,6 @@ impl InferenceSession<Prefilling> {
         self.state.inflight.is_some()
     }
 
-    /// Advance: chunk completed, more to go.
-    pub fn advance_chunk(&mut self, tokens_processed: usize) {
-        self.state.num_computed_tokens += tokens_processed;
-    }
-
     /// Check if prefill is complete.
     pub fn is_complete(&self) -> bool {
         self.state.num_computed_tokens >= self.state.prompt_len
@@ -361,11 +313,6 @@ impl InferenceSession<Prefilling> {
     /// Remaining tokens to prefill.
     pub fn remaining_tokens(&self) -> usize {
         self.state.prompt_len.saturating_sub(self.state.num_computed_tokens)
-    }
-
-    /// Get the request ID.
-    pub fn id(&self) -> &RequestId {
-        &self.meta.id
     }
 }
 
@@ -392,27 +339,10 @@ impl InferenceSession<Decoding> {
         }
     }
 
-    /// Transition: Decoding → Failed (carries partial output).
-    pub fn fail(self, message: String) -> InferenceSession<Failed> {
-        InferenceSession {
-            meta: self.meta,
-            handle: self.handle,
-            state: Failed {
-                message,
-                partial_output_tokens: self.state.output_tokens,
-            },
-        }
-    }
-
     /// Append a generated token.
     pub fn append_token(&mut self, token_id: i32) {
         self.state.output_tokens.push(token_id);
         self.state.seq_position += 1;
-    }
-
-    /// Number of tokens generated so far.
-    pub fn num_generated(&self) -> usize {
-        self.state.output_tokens.len()
     }
 
     /// Whether max_tokens has been reached.
@@ -426,50 +356,6 @@ impl InferenceSession<Decoding> {
     /// it will tell the scheduler so the metric carries through.
     pub fn bump_preempted(&mut self) {
         self.state.preemption_count = self.state.preemption_count.saturating_add(1);
-    }
-
-    /// Get the request ID.
-    pub fn id(&self) -> &RequestId {
-        &self.meta.id
-    }
-}
-
-impl InferenceSession<Finished> {
-    /// Get the request ID.
-    pub fn id(&self) -> &RequestId {
-        &self.meta.id
-    }
-}
-
-impl InferenceSession<Failed> {
-    /// Get the request ID.
-    pub fn id(&self) -> &RequestId {
-        &self.meta.id
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  AnySession — runtime enum for heterogeneous storage
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Runtime wrapper for sessions in any active lifecycle state.
-///
-/// Repository code uses `AnySession` only for cancel/diagnostic paths; hot
-/// transitions go through typed variants directly.
-pub enum AnySession {
-    Queued(InferenceSession<Queued>),
-    Prefilling(InferenceSession<Prefilling>),
-    Decoding(InferenceSession<Decoding>),
-}
-
-impl AnySession {
-    /// Get the request ID regardless of state.
-    pub fn id(&self) -> &RequestId {
-        match self {
-            Self::Queued(s) => &s.meta.id,
-            Self::Prefilling(s) => &s.meta.id,
-            Self::Decoding(s) => &s.meta.id,
-        }
     }
 }
 
@@ -510,7 +396,7 @@ mod tests {
     fn prefilling_to_decoding_after_complete() {
         let s = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
         let mut s = s.start_prefill();
-        s.advance_chunk(4);
+        s.state.num_computed_tokens = 4;
         assert!(s.is_complete());
         let s = s.start_decode();
         assert_eq!(s.state.seq_position, 4);
@@ -521,7 +407,7 @@ mod tests {
     fn decoding_to_finished_carries_output() {
         let q = InferenceSession::<Queued>::new(make_meta(2), RequestHandle::noop());
         let mut p = q.start_prefill();
-        p.advance_chunk(2);
+        p.state.num_computed_tokens = 2;
         let mut d = p.start_decode();
         d.append_token(99);
         let f = d.finish(FinishReason::Eos);
@@ -529,31 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn prefilling_fail_carries_message() {
-        let q = InferenceSession::<Queued>::new(make_meta(2), RequestHandle::noop());
-        let p = q.start_prefill();
-        let f = p.fail("worker error".into());
-        assert_eq!(f.state.message, "worker error");
-        assert!(f.state.partial_output_tokens.is_empty());
-    }
-
-    #[test]
-    fn decoding_fail_preserves_partial_output() {
-        let q = InferenceSession::<Queued>::new(make_meta(2), RequestHandle::noop());
-        let mut p = q.start_prefill();
-        p.advance_chunk(2);
-        let mut d = p.start_decode();
-        d.append_token(11);
-        d.append_token(22);
-        let f = d.fail("oom".into());
-        assert_eq!(f.state.partial_output_tokens, vec![11, 22]);
-    }
-
-    #[test]
     fn bump_preempted_increments_count() {
         let q = InferenceSession::<Queued>::new(make_meta(4), RequestHandle::noop());
         let mut p = q.start_prefill();
-        p.advance_chunk(4);
+        p.state.num_computed_tokens = 4;
         let mut d = p.start_decode();
         assert_eq!(d.state.preemption_count, 0);
         d.bump_preempted();

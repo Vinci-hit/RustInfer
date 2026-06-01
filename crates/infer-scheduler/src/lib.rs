@@ -45,14 +45,19 @@
 //!   worker-reported `assigned_indices`. The scheduler does not run a
 //!   pre-batch admission cascade — instead, the worker reports KV pool
 //!   occupancy in every Heartbeat.
-//! - **KV pressure is worker-driven, not scheduler-driven**. When
-//!   `kv_free_slots / kv_total_slots` crosses a low-water threshold
-//!   the scheduler evicts owners-empty leaves from `RadixTree` and
-//!   replies with `FreeKvIndices`. This keeps the scheduler reactive
-//!   instead of speculatively guessing pressure.
-//! - **Preemption (under KV starvation) is handled inside the worker**;
-//!   the scheduler is notified out-of-band (future work) and adjusts
-//!   session state. The scheduler does not preempt live decoders.
+//! - **KV pressure is event-driven, not heartbeat-driven**. When the
+//!   worker's `GlobalKvAllocator::alloc_indices` actually fails it
+//!   emits an `AllocFailed{round}` control message. The scheduler
+//!   responds at round 0 with RadixTree LRU eviction (≤5% of total
+//!   capacity) sent back as `FreeKvIndices`, and at round 1 with
+//!   victim preemption — picking decoding / chunked-prefilling
+//!   sessions sorted by `(output_len desc, input_len asc)`, marking
+//!   their chains finished, flipping them back to `Queued`, and
+//!   replying with `Preempt(sequence_ids)`. Heartbeats are
+//!   liveness-only and carry no KV occupancy info.
+//! - **Preemption decisions live in the scheduler**, not the worker.
+//!   The worker is purely passive — it asks for relief on alloc-fail
+//!   and free()s the slots that come back.
 //! - **Decoding is the worker's domain**. The scheduler tracks
 //!   `Decoding` sessions only to route output tokens back to clients
 //!   and respond to cancel — it does not pick which decodes run next.

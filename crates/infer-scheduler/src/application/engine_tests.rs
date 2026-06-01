@@ -599,3 +599,160 @@
         Ok(())
     }
 
+    // ─── AllocFailed pressure-relief paths ───────────────────────────
+
+    /// Round 0 with finished leaves in LRU should evict (up to ~5% of
+    /// total capacity) and reply with `FreeKvIndices` on the cmd_rx.
+    #[tokio::test]
+    async fn alloc_failed_round_0_evicts_lru() -> Result<()> {
+        use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+        use infer_protocol::worker_to_scheduler_control::AllocFailed;
+        let (mut engine, default_worker, _event_tx, mut cmd_rx) = make_engine();
+        // worker_group fixture has max_total_kv_tokens=32 → 5% = 1 slot.
+        // Plant a single finished chain of 1 token in the radix tree.
+        engine.radix.append_token(42, 7, 1000);
+        engine.radix.mark_finished_chain(42);
+        assert_eq!(engine.radix.lru_total_indices(), 1);
+        // Budget must reflect the 1 outstanding slot the radix-planted
+        // node represents — relief releases that slot.
+        engine.kv_budget.try_reserve(1).unwrap();
+
+        engine
+            .on_control_event(crate::infrastructure::transport::control_plane::ControlEvent::AllocFailed {
+                worker: default_worker.clone(),
+                req: AllocFailed {
+                    worker_id: "worker-test".to_string(),
+                    shortfall: 4,
+                    round: 0,
+                },
+            })
+            .await?;
+
+        let cmd = cmd_rx.try_recv().expect("expected FreeKvIndices");
+        match cmd {
+            crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo {
+                env,
+                ..
+            } => match env.payload {
+                SchedulerControlMessage::FreeKvIndices(f) => {
+                    assert_eq!(f.indices, vec![1000]);
+                }
+                other => panic!("expected FreeKvIndices, got {:?}", other),
+            },
+            _ => panic!("expected SendTo router command"),
+        }
+        Ok(())
+    }
+
+    /// Round 0 with empty LRU is a no-op — no scheduler control message
+    /// should be emitted (worker's wait_for_relief will time out and
+    /// retry at round 1).
+    #[tokio::test]
+    async fn alloc_failed_lru_total_zero_round_0_noop() -> Result<()> {
+        use infer_protocol::worker_to_scheduler_control::AllocFailed;
+        let (mut engine, default_worker, _event_tx, mut cmd_rx) = make_engine();
+        // RadixTree is empty by default → lru_total_indices == 0.
+        assert_eq!(engine.radix.lru_total_indices(), 0);
+
+        engine
+            .on_control_event(crate::infrastructure::transport::control_plane::ControlEvent::AllocFailed {
+                worker: default_worker.clone(),
+                req: AllocFailed {
+                    worker_id: "worker-test".to_string(),
+                    shortfall: 4,
+                    round: 0,
+                },
+            })
+            .await?;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no scheduler control msg expected when LRU is empty"
+        );
+        Ok(())
+    }
+
+    /// Round 1 with two Decoding seqs → victim picks the longer-output
+    /// sequence first, sends a `Preempt(sid)`, and the picked seq
+    /// transitions back to Queued with `preemption_count` bumped.
+    #[tokio::test]
+    async fn alloc_failed_round_1_preempts_decoding() -> Result<()> {
+        use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+        use infer_protocol::worker_to_scheduler_control::AllocFailed;
+        let (mut engine, default_worker, _event_tx, mut cmd_rx) = make_engine();
+
+        // ── Build two Decoding sessions:
+        //   seq 11: input=10, output=20  → preferred victim
+        //   seq 12: input=20, output=5   → second
+        let mut build_decoding = |sid: u64, input_len: usize, output_n: usize| {
+            let meta = Arc::new(RequestMeta {
+                id: RequestId::new_v4(),
+                external_id: format!("ext-{}", sid),
+                sequence_id: SequenceId(sid),
+                input_ids: (0..input_len as i32).collect(),
+                max_tokens: 32,
+                sampling: SamplingParams::default(),
+                priority: Priority::default(),
+                stream: false,
+                stop_sequences: vec![],
+                diffusion: None,
+                arrival_time: Instant::now(),
+            });
+            engine
+                .requests
+                .insert_new(Arc::clone(&meta), RequestHandle::noop())
+                .unwrap();
+            let queued = engine.requests.take_waiting(&meta.id).unwrap();
+            engine
+                .requests
+                .commit_prefill_start(
+                    queued,
+                    crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
+                    input_len,
+                )
+                .unwrap();
+            let _ = engine.requests.ack_prefill(SequenceId(sid)).unwrap();
+            for k in 0..output_n {
+                let _ = engine
+                    .requests
+                    .append_generated_token(SequenceId(sid), 100 + k as i32, false)
+                    .unwrap();
+            }
+        };
+        build_decoding(11, 10, 20);
+        build_decoding(12, 20, 5);
+
+        engine
+            .on_control_event(crate::infrastructure::transport::control_plane::ControlEvent::AllocFailed {
+                worker: default_worker.clone(),
+                req: AllocFailed {
+                    worker_id: "worker-test".to_string(),
+                    shortfall: 4,
+                    round: 1,
+                },
+            })
+            .await?;
+
+        // 5% of 32 == 1, so victim selection stops as soon as we pick
+        // the first Decoding seq. (output_len=20 wins.)
+        let cmd = cmd_rx.try_recv().expect("expected Preempt");
+        match cmd {
+            crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo {
+                env,
+                ..
+            } => match env.payload {
+                SchedulerControlMessage::Preempt(p) => {
+                    assert_eq!(p.sequence_ids, vec![11], "longest-output seq picked");
+                }
+                other => panic!("expected Preempt, got {:?}", other),
+            },
+            _ => panic!("expected SendTo router command"),
+        }
+
+        // The picked seq is now Queued (front of waiting). Decoding now
+        // has only seq 12.
+        assert_eq!(engine.requests.decoding_len(), 1);
+        let waiting_front = engine.requests.waiting().front().unwrap();
+        assert_eq!(waiting_front.meta.sequence_id, SequenceId(11));
+        Ok(())
+    }
+

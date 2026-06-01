@@ -66,6 +66,22 @@ pub struct CancelSequence {
     pub sequence_id: u64,
 }
 
+/// Scheduler asking the worker to drop a list of in-flight sequences,
+/// freeing their `block_table` slots back to the worker's allocator.
+///
+/// Sent in response to a Level-2 `AllocFailed` round (`round=1`) when
+/// LRU eviction was insufficient and the scheduler picked victims from
+/// the active decoding / chunked-prefilling pool. The scheduler has
+/// already called `radix.mark_finished_chain(sid)` for each victim and
+/// marked them as preempted in its `RequestTable` before sending this
+/// message — the worker is purely passive: drop them from `active`
+/// and `kv_allocator.free(&block_table)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Preempt {
+    pub model_instance_id: String,
+    pub sequence_ids: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrainMode {
     Graceful,
@@ -99,6 +115,9 @@ pub enum SchedulerControlMessage {
     /// Scheduler asks the worker to free a batch of global KV indices
     /// back to its allocator (driven by `RadixTree` LRU eviction).
     FreeKvIndices(FreeKvIndices),
+    /// Scheduler asks the worker to drop a list of in-flight sequences
+    /// after Level-2 victim preemption.
+    Preempt(Preempt),
 
     // ── runtime: lifecycle ──
     Cancel(CancelSequence),
