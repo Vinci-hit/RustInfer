@@ -1,10 +1,9 @@
-//! Authoritative scheduler request table (a.k.a. `SessionRepository`).
+//! Authoritative scheduler request table.
 //!
 //! The storage substrate is a `slotmap::SlotMap<SessionKey,
 //! InferenceSession<S>>` keyed by a generational handle, one map per
 //! state bucket (waiting / prefilling / decoding). The public type
-//! name `RequestTable` is exported alongside a forward-compat
-//! `SessionRepository` alias.
+//! name `RequestTable` is the main entry point.
 //!
 //! ## Why SlotMap
 //!
@@ -60,19 +59,12 @@ new_key_type! {
 }
 
 /// Which internal SlotMap currently holds an active session.
-///
-/// Replaces the previous `RequestLocation` enum's role; we keep the
-/// old name as a re-export for backward compatibility but new code
-/// should prefer `Bucket`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
     Waiting,
     Prefilling,
     Decoding,
 }
-
-/// Backwards-compatible alias.
-pub type RequestLocation = Bucket;
 
 /// Minimal projection of an active session into the data the
 /// preemption policy needs to score it.
@@ -89,20 +81,6 @@ pub struct PreemptCandidate {
     pub input_len: u32,
     /// `Decoding`: `seq_position`. `Prefilling`: `num_computed_tokens`.
     pub kv_used: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalReason {
-    Finished,
-    Cancelled,
-    Failed(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct TerminalRecord {
-    pub request_id: RequestId,
-    pub sequence_id: SequenceId,
-    pub reason: TerminalReason,
 }
 
 #[derive(Debug, Clone)]
@@ -213,11 +191,7 @@ pub struct RequestTable {
     waiting: WaitingQueue,
     prefilling: SlotMap<SessionKey, InferenceSession<Prefilling>>,
     decoding: SlotMap<SessionKey, InferenceSession<Decoding>>,
-    terminal: Vec<TerminalRecord>,
 }
-
-/// Forward-compat alias for callers that prefer the longer name.
-pub type SessionRepository = RequestTable;
 
 impl RequestTable {
     pub fn new() -> Self {
@@ -228,7 +202,7 @@ impl RequestTable {
         &self.waiting
     }
 
-    pub fn location_for_request(&self, request_id: &RequestId) -> Option<RequestLocation> {
+    pub fn location_for_request(&self, request_id: &RequestId) -> Option<Bucket> {
         let sequence_id = self.sequence_id_for(request_id)?;
         self.locations.get(&sequence_id).map(|a| a.bucket)
     }
@@ -251,10 +225,6 @@ impl RequestTable {
 
     pub fn decoding_len(&self) -> usize {
         self.decoding.len()
-    }
-
-    pub fn terminal(&self) -> &[TerminalRecord] {
-        &self.terminal
     }
 
     pub fn contains_request(&self, request_id: &RequestId) -> bool {
@@ -568,7 +538,7 @@ impl RequestTable {
             .decoding
             .remove(key)
             .ok_or_else(|| SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id)))?;
-        self.remove_active(seq.meta.id.clone(), sequence_id, TerminalReason::Finished)?;
+        self.remove_active(seq.meta.id.clone(), sequence_id)?;
         debug_assert!(self.validate_consistency().is_ok());
         Ok(seq)
     }
@@ -581,7 +551,7 @@ impl RequestTable {
             .collect()
     }
 
-    pub fn fail_sequence(&mut self, sequence_id: SequenceId, message: &str) -> Result<FailedOutcome> {
+    pub fn fail_sequence(&mut self, sequence_id: SequenceId, _message: &str) -> Result<FailedOutcome> {
         let Some(addr) = self.locations.get(&sequence_id).copied() else {
             return Ok(FailedOutcome::NotFound { sequence_id });
         };
@@ -596,7 +566,6 @@ impl RequestTable {
                 self.remove_active(
                     request_id.clone(),
                     sequence_id,
-                    TerminalReason::Failed(message.to_string()),
                 )?;
                 Ok(FailedOutcome::RemovedPrefilling {
                     request_id,
@@ -614,7 +583,6 @@ impl RequestTable {
                 self.remove_active(
                     request_id.clone(),
                     sequence_id,
-                    TerminalReason::Failed(message.to_string()),
                 )?;
                 Ok(FailedOutcome::RemovedDecoding {
                     request_id,
@@ -629,7 +597,6 @@ impl RequestTable {
     pub fn take_prefilling_by_request(
         &mut self,
         request_id: &RequestId,
-        reason: TerminalReason,
     ) -> Result<Option<InferenceSession<Prefilling>>> {
         let Some(sequence_id) = self.sequence_id_for(request_id) else {
             return Ok(None);
@@ -643,7 +610,7 @@ impl RequestTable {
         let seq = self.prefilling.remove(addr.key).ok_or_else(|| {
             SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
         })?;
-        self.remove_active(request_id.clone(), sequence_id, reason)?;
+        self.remove_active(request_id.clone(), sequence_id)?;
         Ok(Some(seq))
     }
 
@@ -662,7 +629,7 @@ impl RequestTable {
                     .waiting
                     .remove(request_id)
                     .ok_or_else(|| SchedulerError::Internal(format!("waiting request not found: {}", request_id)))?;
-                self.remove_active(request_id.clone(), sequence_id, TerminalReason::Cancelled)?;
+                self.remove_active(request_id.clone(), sequence_id)?;
                 Ok(CancelOutcome::RemovedWaiting {
                     request_id: seq.meta.id.clone(),
                     external_id: seq.meta.external_id.clone(),
@@ -675,7 +642,7 @@ impl RequestTable {
                 })?;
                 let request_id_out = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id, TerminalReason::Cancelled)?;
+                self.remove_active(request_id.clone(), sequence_id)?;
                 Ok(CancelOutcome::RemovedPrefilling {
                     request_id: request_id_out,
                     external_id,
@@ -688,7 +655,7 @@ impl RequestTable {
                 })?;
                 let request_id_out = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id, TerminalReason::Cancelled)?;
+                self.remove_active(request_id.clone(), sequence_id)?;
                 Ok(CancelOutcome::RemovedDecoding {
                     request_id: request_id_out,
                     external_id,
@@ -943,7 +910,6 @@ impl RequestTable {
         &mut self,
         request_id: RequestId,
         sequence_id: SequenceId,
-        reason: TerminalReason,
     ) -> Result<()> {
         match self.by_request.remove(&request_id) {
             Some(id) if id == sequence_id => {}
@@ -966,11 +932,6 @@ impl RequestTable {
         // Drop the external_id → sequence_id mapping if it still points at us.
         // (A later request may have shadowed it; we don't disturb that.)
         self.by_external_id.retain(|_, sid| *sid != sequence_id);
-        self.terminal.push(TerminalRecord {
-            request_id,
-            sequence_id,
-            reason,
-        });
         Ok(())
     }
 }

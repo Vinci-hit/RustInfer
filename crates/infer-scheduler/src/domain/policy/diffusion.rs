@@ -96,7 +96,6 @@ impl SchedulingPolicy for DiffusionPolicy {
         let total_tokens = prefill_batch.len();
         BatchPlan {
             prefill_batch,
-            preemptions: vec![],
             total_tokens,
         }
     }

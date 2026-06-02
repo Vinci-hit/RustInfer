@@ -8,7 +8,7 @@ pub mod handle;
 pub use lifecycle::*;
 pub use queue::WaitingQueue;
 pub use table::{
-    CancelOutcome, FailedOutcome, PrefillAckOutcome, PrefillStartOutcome, RequestLocation,
-    RequestTable, TerminalReason, TerminalRecord, TokenAppendOutcome,
+    CancelOutcome, FailedOutcome, PrefillAckOutcome, PrefillStartOutcome, Bucket,
+    RequestTable, TokenAppendOutcome,
 };
 pub use handle::RequestHandle;

@@ -1,4 +1,4 @@
-//! `PlanningSystem` — turn `SessionRepository` state into a serialized
+//! `PlanningSystem` — turn `RequestTable` state into a serialized
 //! `BatchCommand` ready to ship to the worker.
 //!
 //! Owns:
@@ -29,7 +29,7 @@ use crate::domain::inference_session::lifecycle::{
     InferenceSession, Prefilling, RequestId,
 };
 use crate::domain::inference_session::queue::WaitingQueue;
-use crate::domain::inference_session::table::{PrefillStartOutcome, RequestLocation, RequestTable};
+use crate::domain::inference_session::table::{Bucket, PrefillStartOutcome, RequestTable};
 use crate::domain::policy::traits::{BatchPlan, RunningSet, SchedulingPolicy};
 use crate::error::Result;
 use crate::infrastructure::transport::codec::MsgPackCodec;
@@ -114,7 +114,7 @@ impl PlanningSystem {
             }
 
             let is_continuation = sessions.location_for_request(&entry.request_id)
-                == Some(RequestLocation::Prefilling);
+                == Some(Bucket::Prefilling);
 
             if is_continuation {
                 match sessions.set_prefill_inflight(&entry.request_id, scheduled_len) {

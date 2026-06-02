@@ -10,7 +10,7 @@
 //! 2. Mint a fresh `RequestId` (uuid-backed) and the next monotonic
 //!    `SequenceId`.
 //! 3. Build the `RequestMeta` aggregate root and hand it to
-//!    `SessionRepository::insert_new`.
+//!    `RequestTable::insert_new`.
 //! 4. Report success/rejection through an `IngestOutcome` enum so
 //!    the engine can drive metrics + tracing without us depending
 //!    on either.
@@ -107,7 +107,7 @@ impl IngestionSystem {
     /// Validate + admit a single inbound request.
     ///
     /// On `Admitted`, the session is already in
-    /// `SessionRepository`'s waiting queue; on `Rejected`, the
+    /// `RequestTable`'s waiting queue; on `Rejected`, the
     /// repository is untouched.
     pub fn ingest(
         &mut self,

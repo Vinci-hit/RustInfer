@@ -19,4 +19,4 @@ pub mod traits;
 pub use continuous_batching::ContinuousBatchingPolicy;
 pub use diffusion::DiffusionPolicy;
 pub use token_budget::TokenBudget;
-pub use traits::{BatchPlan, PrefillEntry, PreemptionAction, SchedulingPolicy};
+pub use traits::{BatchPlan, PrefillEntry, SchedulingPolicy};

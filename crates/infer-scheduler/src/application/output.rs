@@ -453,7 +453,6 @@ impl OutputProcessingSystem {
         codec: &crate::infrastructure::transport::codec::MsgPackCodec,
         data: Vec<u8>,
     ) -> Result<()> {
-        use crate::domain::inference_session::table::TerminalReason;
         use crate::infrastructure::transport::codec::Codec;
         use infer_protocol::scheduler_to_server::ImageOutput;
         use infer_protocol::worker_to_scheduler_data::{DiffusionBatchOutput, DiffusionOutputStatus};
@@ -476,14 +475,7 @@ impl OutputProcessingSystem {
                 );
                 continue;
             };
-            let reason = if matches!(item.status, DiffusionOutputStatus::Success) {
-                TerminalReason::Finished
-            } else {
-                TerminalReason::Failed(
-                    item.error.clone().unwrap_or_else(|| "diffusion error".to_string()),
-                )
-            };
-            let Some(seq) = sessions.take_prefilling_by_request(&item_request_id, reason)? else {
+            let Some(seq) = sessions.take_prefilling_by_request(&item_request_id)? else {
                 tracing::warn!(
                     "Diffusion output for unknown request_id={}",
                     item.request_id

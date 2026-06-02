@@ -112,7 +112,6 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 
         BatchPlan {
             prefill_batch,
-            preemptions: vec![],
             total_tokens,
         }
     }

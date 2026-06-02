@@ -37,10 +37,6 @@ impl RunningSet {
 pub struct BatchPlan {
     /// Requests selected for prefill this iteration.
     pub prefill_batch: Vec<PrefillEntry>,
-    /// Sequences to preempt. Currently unused on the worker-driven KV
-    /// path (worker handles preemption internally); retained for
-    /// backwards compatibility in test fixtures.
-    pub preemptions: Vec<PreemptionAction>,
     /// Total tokens in this iteration (prefill only — the scheduler
     /// does not touch decode tokens).
     pub total_tokens: usize,
@@ -51,7 +47,6 @@ impl BatchPlan {
     pub fn empty() -> Self {
         Self {
             prefill_batch: vec![],
-            preemptions: vec![],
             total_tokens: 0,
         }
     }
@@ -70,15 +65,6 @@ pub struct PrefillEntry {
     pub token_range: Range<usize>,
     /// Whether this is a partial chunk (more chunks coming).
     pub is_partial: bool,
-}
-
-/// Preemption action to execute.
-#[derive(Debug)]
-pub enum PreemptionAction {
-    /// Recompute: free all KV, move back to waiting queue.
-    Recompute { request_id: RequestId },
-    /// Swap to CPU (stub).
-    Swap { request_id: RequestId },
 }
 
 /// The core trait for pluggable scheduling strategies.
