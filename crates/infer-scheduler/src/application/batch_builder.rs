@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use crate::config::SchedulerConfig;
 use crate::error::{Result, SchedulerError};
 use crate::domain::inference_session::lifecycle::{InferenceSession, Prefilling, RequestId};
-use crate::infrastructure::kv_cache::radix_tree_v2::GlobalIndex;
+use crate::infrastructure::kv_cache::radix_tree::GlobalIndex;
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 
 use infer_protocol::scheduler_to_worker_data::{

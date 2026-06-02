@@ -32,15 +32,21 @@
 mod batch_builder;
 
 pub mod cancel;
+pub mod capacity;
 pub mod control_event;
+pub mod control_fns;
 pub mod dispatch;
 pub mod engine;
 pub mod event_loop;
 pub mod ingestion;
 pub mod outcomes;
 pub mod output;
+pub mod output_fns;
 pub mod planning;
+pub mod scheduler_event;
+pub mod workflow;
 
+pub use capacity::{CapacityGate, DiffusionCapacityGate, LlmCapacityGate};
 pub use control_event::ControlEventSystem;
 pub use dispatch::DispatchSystem;
 pub use engine::SchedulerEngine;
@@ -48,3 +54,4 @@ pub use ingestion::IngestionSystem;
 pub use outcomes::{ControlFlow, ControlOutcome};
 pub use output::OutputProcessingSystem;
 pub use planning::PlanningSystem;
+pub use workflow::{DiffusionWorkflow, EngineWorkflow, LlmWorkflow, ResourceContext};

@@ -13,8 +13,8 @@
 //! - [`traits`] — small helper types (e.g. [`PrefixMatch`]) used between
 //!   planning and the radix tree.
 
-pub mod radix_tree_v2;
+pub mod radix_tree;
 pub mod traits;
 
-pub use radix_tree_v2::{GlobalIndex as TokenSlotIndex, PrefixHit, RadixTree, SeqId as RadixSeqId};
+pub use radix_tree::{GlobalIndex as TokenSlotIndex, PrefixHit, RadixTree, SeqId as RadixSeqId};
 pub use traits::PrefixMatch;

@@ -32,9 +32,10 @@ use infer_protocol::scheduler_to_server::{
     ChunkType, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
 };
 
+use crate::config::SchedulerMode;
 use crate::domain::kv_budget::KvBudget;
 use crate::error::Result;
-use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
+use crate::infrastructure::kv_cache::radix_tree::RadixTree;
 use crate::infrastructure::metrics::MetricsRecorder;
 use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::{Decoding, FinishReason, InferenceSession, Prefilling};
@@ -402,6 +403,90 @@ impl OutputProcessingSystem {
         Ok(())
     }
 
+    /// Process one batch of worker step output (LLM mode) with a
+    /// pre-decoded `StepOutput`. This is the preferred entry point
+    /// when deserialization has already happened (e.g. in a background
+    /// decode task). The `process_llm_step` method is retained for
+    /// backward compat where raw bytes are still in use.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_llm_step_decoded(
+        &self,
+        sessions: &mut crate::domain::inference_session::table::RequestTable,
+        frontend: &mut dyn FrontendTransport,
+        metrics: &MetricsRecorder,
+        output: &infer_protocol::worker_to_scheduler_data::StepOutput,
+    ) -> Result<()> {
+        use crate::domain::inference_session::lifecycle::SequenceId;
+        use crate::domain::inference_session::table::PrefillAckOutcome;
+
+        // 1. ACK prefill segments.
+        for sequence_id in &output.prefill_done {
+            match sessions.ack_prefill(SequenceId(*sequence_id)) {
+                Ok(PrefillAckOutcome::MovedToDecoding { .. })
+                | Ok(PrefillAckOutcome::Continue { .. }) => {}
+                Err(e) => tracing::warn!(
+                    "PrefillDone for sequence_id={} failed: {}",
+                    sequence_id,
+                    e
+                ),
+            }
+        }
+
+        // 2. Process generated tokens.
+        let mut finished_sequence_ids: Vec<SequenceId> = Vec::new();
+        let mut token_chunks: Vec<(ClientId, StreamChunk)> = Vec::new();
+        for token in &output.tokens {
+            match sessions.append_generated_token(
+                SequenceId(token.sequence_id),
+                token.token_id,
+                token.finished,
+            ) {
+                Ok(outcome) => {
+                    if outcome.stream {
+                        token_chunks.push((
+                            outcome.client_id,
+                            StreamChunk {
+                                request_id: outcome.external_id,
+                                chunk_type: ChunkType::Token,
+                                token_id: Some(outcome.token_id),
+                                finish_reason: None,
+                                metrics: None,
+                            },
+                        ));
+                    }
+                    if outcome.worker_finished {
+                        finished_sequence_ids.push(outcome.sequence_id);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "Generated token for sequence_id={} failed: {}",
+                    token.sequence_id,
+                    e
+                ),
+            }
+        }
+
+        for (client_id, chunk) in token_chunks {
+            frontend.send_stream_chunk(&client_id, chunk).await?;
+        }
+
+        finished_sequence_ids.sort_unstable_by_key(|id| id.0);
+        finished_sequence_ids.dedup();
+        for sequence_id in finished_sequence_ids {
+            let seq = sessions.finish_decoding(sequence_id)?;
+            let outcome = self.complete_session(frontend, metrics, seq).await?;
+            tracing::info!(
+                "Completed {}: {} tokens in {}ms ({:.1} tok/s)",
+                outcome.request_id_display,
+                outcome.num_tokens,
+                outcome.elapsed_ms,
+                outcome.tokens_per_second,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Drive the failure path for a list of internal `RequestId`s.
     ///
     /// Used by [`crate::application::ControlEventSystem`] consumers
@@ -531,6 +616,146 @@ impl OutputProcessingSystem {
         }
 
         Ok(())
+    }
+
+    /// Process one batch of worker step output (Diffusion mode) with a
+    /// pre-decoded `DiffusionBatchOutput`. Preferred entry point when
+    /// deserialization has already happened.
+    pub async fn process_diffusion_step_decoded(
+        &self,
+        sessions: &mut crate::domain::inference_session::table::RequestTable,
+        frontend: &mut dyn FrontendTransport,
+        metrics: &MetricsRecorder,
+        output: &infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput,
+    ) -> Result<()> {
+        use infer_protocol::scheduler_to_server::ImageOutput;
+        use infer_protocol::worker_to_scheduler_data::DiffusionOutputStatus;
+
+        for item in &output.results {
+            let Some(seq_id) = sessions.sequence_id_for_external(&item.request_id) else {
+                tracing::warn!(
+                    "Diffusion output for unknown external_id={}",
+                    item.request_id
+                );
+                continue;
+            };
+            let Some(item_request_id) = sessions.request_id_for_sequence(seq_id) else {
+                tracing::warn!(
+                    "Diffusion output: sequence_id={} no longer active",
+                    seq_id
+                );
+                continue;
+            };
+            let Some(seq) = sessions.take_prefilling_by_request(&item_request_id)? else {
+                tracing::warn!(
+                    "Diffusion output for unknown request_id={}",
+                    item.request_id
+                );
+                continue;
+            };
+            let request_id_display = seq.meta.id.to_string();
+            let external_id = seq.meta.external_id.clone();
+            let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
+
+            let elapsed_ms = seq.meta.arrival_time.elapsed().as_millis() as u64;
+            let (status, images, error) = match item.status {
+                DiffusionOutputStatus::Success => {
+                    let images = item
+                        .image
+                        .iter()
+                        .map(|image| ImageOutput {
+                            width: image.width,
+                            height: image.height,
+                            channels: image.channels,
+                            format: image.format.clone(),
+                            data: image.data.clone(),
+                        })
+                        .collect();
+                    (ResponseStatus::Success, images, None)
+                }
+                DiffusionOutputStatus::Error => (ResponseStatus::Error, vec![], item.error.clone()),
+            };
+
+            let response = InferenceResponse {
+                request_id: external_id,
+                status,
+                output_token_ids: vec![],
+                images,
+                finish_reason: Some("stop".to_string()),
+                error,
+                metrics: InferenceMetrics {
+                    total_ms: elapsed_ms.max(item.metrics.total_ms),
+                    num_tokens: 0,
+                    tokens_per_second: 0.0,
+                },
+            };
+
+            frontend.send_response(&client_id, response).await?;
+            metrics.record_completion(elapsed_ms, 0);
+            tracing::info!(
+                "Completed diffusion request {} in {}ms",
+                request_id_display,
+                elapsed_ms
+            );
+        }
+
+        Ok(())
+    }
+}
+
+// ─── OutputRouter ──────────────────────────────────────────────────────
+
+/// Mode-agnostic step-output dispatcher. Absorbs the `match config.mode`
+/// branch so the engine's `handle_step_output` stays clean.
+pub struct OutputRouter;
+
+impl OutputRouter {
+    /// Process worker step output, dispatching to the LLM or Diffusion
+    /// path based on `mode`.
+    ///
+    /// Uses `output_fns` free functions internally.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_step(
+        mode: SchedulerMode,
+        _output_sys: &OutputProcessingSystem,
+        sessions: &mut crate::domain::inference_session::table::RequestTable,
+        frontend: &mut dyn FrontendTransport,
+        metrics: &MetricsRecorder,
+        codec: &crate::infrastructure::transport::codec::MsgPackCodec,
+        radix: &mut RadixTree,
+        kv_budget: &mut KvBudget,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        match mode {
+            SchedulerMode::Llm => {
+                use crate::infrastructure::transport::codec::Codec;
+                use infer_protocol::worker_to_scheduler_data::StepOutput;
+
+                let output: StepOutput = codec.decode(&data)?;
+                if !output.assigned_indices.is_empty() {
+                    let total: u32 = output.assigned_indices.iter().map(|a| a.len as u32).sum();
+                    let _ = kv_budget.try_reserve(total);
+                    super::output_fns::feed_radix_assigned_indices(radix, kv_budget, &output);
+                    for tk in &output.tokens {
+                        if tk.finished {
+                            super::output_fns::radix_mark_finished(radix, tk.sequence_id);
+                        }
+                    }
+                }
+                super::output_fns::process_llm_step_decoded(sessions, frontend, metrics, &output)
+                    .await
+            }
+            SchedulerMode::Diffusion => {
+                use crate::infrastructure::transport::codec::Codec;
+                use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
+
+                let output: DiffusionBatchOutput = codec.decode(&data)?;
+                super::output_fns::process_diffusion_step_decoded(
+                    sessions, frontend, metrics, &output,
+                )
+                .await
+            }
+        }
     }
 }
 

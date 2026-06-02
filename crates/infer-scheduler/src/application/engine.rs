@@ -1,15 +1,17 @@
 //! SchedulerEngine — the top-level async orchestrator.
 //!
-//! Owns all mutable state and drives the event loop.
+//! Owns all mutable state and drives the event loop. Mode-specific
+//! logic lives behind the `EngineWorkflow` trait (`LlmWorkflow` /
+//! `DiffusionWorkflow`), so the engine itself is mode-agnostic.
 
 use infer_protocol::server_to_scheduler::InferenceRequest;
 
 use crate::domain::kv_budget::KvBudget;
-use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
-use crate::config::{SchedulerConfig, SchedulerMode};
+use crate::infrastructure::kv_cache::radix_tree::RadixTree;
+use crate::config::SchedulerConfig;
 use crate::error::Result;
 use crate::infrastructure::metrics::MetricsRecorder;
-use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
+use crate::domain::policy::traits::SchedulingPolicy;
 use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::RequestId;
 use crate::domain::inference_session::table::RequestTable;
@@ -18,31 +20,29 @@ use crate::infrastructure::transport::control_plane::{
     ControlEvent, ControlPlaneCmdTx, ControlPlaneEventRx, WorkerId,
 };
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
-use crate::domain::policy::token_budget::TokenBudget;
 use crate::infrastructure::transport::control_plane::WorkerGroup;
+use crate::application::workflow::EngineWorkflow;
 
 /// The main scheduler engine.
 pub struct SchedulerEngine {
-    // ─── Subsystems ───
-    /// Scheduling policy + batch builder. Owns the `Box<dyn
-    /// SchedulingPolicy>` so the engine itself stays free of a
-    /// scheduling type parameter.
-    planning: crate::application::PlanningSystem,
+    // ─── Workflow ───
+    /// Mode-specific scheduling and output processing. Owns the
+    /// `PlanningSystem` and any mode-specific state (e.g. Diffusion's
+    /// in-flight flag).
+    workflow: Box<dyn EngineWorkflow>,
+
+    // ─── IO ───
     /// Outbound IO. Holds both transports as boxed trait objects so
     /// the engine can drop its `<F, W>` generics.
     dispatch: crate::application::DispatchSystem,
+
+    // ─── Shared resources ───
     /// Scheduler-side prefix-cache index over worker-owned KV slots.
-    /// Populated from `StepOutput.assigned_indices`; consulted by
-    /// `lookup_prefix` during planning and drained by the admission
-    /// cascade's LRU eviction path.
     radix: RadixTree,
-    /// Single capacity gate over the worker's KV pool. `try_reserve` /
-    /// `release` / `headroom` are the admission cascade's only
-    /// counters.
+    /// Single capacity gate over the worker's KV pool.
     kv_budget: KvBudget,
     worker_group: WorkerGroup,
-
-    // ─── Request state ───
+    /// Request state.
     requests: RequestTable,
 
     // ─── Transport ───
@@ -63,17 +63,8 @@ pub struct SchedulerEngine {
 
     // ─── State ───
     iteration_id: u64,
-    /// Diffusion batch-in batch-out gate. LLM mode does not use this as backpressure.
-    worker_busy: bool,
     /// New-request ingestion stage. Owns the monotonic SequenceId counter.
     ingestion: crate::application::IngestionSystem,
-    /// Terminal-state output owner (success / failure / cleanup).
-    /// Stateless today; engine still owns the borrowed resources.
-    output: crate::application::OutputProcessingSystem,
-    /// Control-plane event handler. Returns a `ControlOutcome` that
-    /// the engine then dispatches; this split keeps `ControlEventSystem`
-    /// from needing a simultaneous `&mut` to `OutputProcessingSystem`.
-    control: crate::application::ControlEventSystem,
 }
 
 impl SchedulerEngine {
@@ -92,6 +83,8 @@ impl SchedulerEngine {
         F: FrontendTransport,
         W: WorkerTransport,
     {
+        use crate::config::SchedulerMode;
+
         tracing::info!(
             "SchedulerEngine created: policy={}, worker_group={}, ranks={}, max_seqs={}, max_tokens={}",
             policy.name(),
@@ -101,17 +94,21 @@ impl SchedulerEngine {
             config.max_batch_tokens,
         );
 
+        let workflow: Box<dyn EngineWorkflow> = match config.mode {
+            SchedulerMode::Llm => Box::new(
+                crate::application::workflow::LlmWorkflow::new(policy),
+            ),
+            SchedulerMode::Diffusion => Box::new(
+                crate::application::workflow::DiffusionWorkflow::new(policy),
+            ),
+        };
+
         Self {
-            planning: crate::application::PlanningSystem::new(policy),
+            workflow,
             dispatch: crate::application::DispatchSystem::new(
                 Box::new(frontend),
                 Box::new(worker),
             ),
-            // RadixTree starts empty; admission populates it from
-            // `StepOutput.assigned_indices`. KvBudget capacity is taken
-            // from the worker's reported `max_total_kv_tokens` if known,
-            // else 0 (a 0-capacity budget skips the admission cascade,
-            // useful for diffusion mode and tests).
             radix: RadixTree::new(),
             kv_budget: KvBudget::new(
                 u32::try_from(
@@ -131,10 +128,7 @@ impl SchedulerEngine {
             metrics: MetricsRecorder::new(config.metrics_enabled),
             config,
             iteration_id: 0,
-            worker_busy: false,
             ingestion: crate::application::IngestionSystem::new(),
-            output: crate::application::OutputProcessingSystem::new(),
-            control: crate::application::ControlEventSystem::new(),
         }
     }
 
@@ -149,11 +143,6 @@ impl SchedulerEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle an incoming request from the frontend.
-    ///
-    /// Delegates validation + admission to
-    /// [`crate::application::IngestionSystem`]. The engine itself only
-    /// stays responsible for metrics + tracing, which it drives off
-    /// the returned [`crate::application::IngestOutcome`].
     pub(crate) fn handle_new_request(&mut self, client_id: ClientId, request: InferenceRequest) {
         use crate::application::ingestion::{IngestOutcome, RejectReason};
 
@@ -182,147 +171,77 @@ impl SchedulerEngine {
         }
     }
 
-    /// Run one scheduling iteration.
-    ///
-    /// 1. Skip if diffusion-busy or no pending work.
-    /// 2. Ask `PlanningSystem` for a [`BatchPlan`] (prefill only —
-    ///    decoding is the worker's domain).
-    /// 3. Execute the plan (RadixTree prefix-pinning + session
-    ///    transitions).
-    /// 4. Serialize batch and ship via `DispatchSystem`.
-    ///
-    /// KV pressure handling no longer happens here: the worker reports
-    /// pool occupancy in every Heartbeat and the scheduler reacts to
-    /// low-water signals out-of-band in
-    /// [`Self::on_control_event`].
+    /// Run one scheduling iteration — delegates to the workflow.
     pub(crate) async fn run_iteration(&mut self) -> Result<()> {
-        if self.config.mode == SchedulerMode::Diffusion && self.worker_busy {
-            return Ok(());
-        }
-        if !self.requests.has_pending_work() {
+        if !self.workflow.can_schedule(&self.requests) {
             return Ok(());
         }
         self.iteration_id += 1;
 
-        let plan = self.planning.schedule(
-            self.requests.waiting(),
-            &self.running_set(),
-            &self.token_budget(),
-        );
-        if !plan.has_work()
-            && self.requests.decoding_len() == 0
-            && self.requests.prefilling_len() == 0
-        {
-            return Ok(());
-        }
-        self.planning
-            .execute_plan(&plan, &mut self.requests, &mut self.radix)?;
+        let SchedulerEngine {
+            workflow,
+            dispatch,
+            requests,
+            radix,
+            kv_budget,
+            metrics,
+            codec,
+            config,
+            ..
+        } = self;
 
-        let prefilling_view = self.requests.prefilling();
-        let batch_data = match self.config.mode {
-            SchedulerMode::Llm => self.planning.build_llm_batch(
-                &prefilling_view,
-                &self.config,
-                &self.codec,
-            )?,
-            SchedulerMode::Diffusion => self
-                .planning
-                .build_diffusion_batch(&prefilling_view, &self.codec)?,
+        let mut ctx = crate::application::workflow::ResourceContext {
+            requests,
+            radix,
+            kv_budget,
+            metrics,
+            codec,
+            config,
+        };
+        workflow.try_schedule(&mut ctx, dispatch).await
+    }
+
+    /// Handle step output from the worker — delegates to the workflow.
+    pub(crate) async fn handle_step_output(&mut self, data: Vec<u8>) -> Result<()> {
+        use crate::config::SchedulerMode;
+        use crate::infrastructure::transport::codec::Codec;
+        use crate::application::scheduler_event::SchedulerEvent;
+
+        let event = match self.config.mode {
+            SchedulerMode::Llm => {
+                let output: infer_protocol::worker_to_scheduler_data::StepOutput =
+                    self.codec.decode(&data)?;
+                SchedulerEvent::WorkerLlmStep(output)
+            }
+            SchedulerMode::Diffusion => {
+                let output: infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput =
+                    self.codec.decode(&data)?;
+                SchedulerEvent::WorkerDiffusionStep(output)
+            }
         };
 
-        if !batch_data.is_empty() {
-            if let Some(first) = prefilling_view.first() {
-                tracing::info!(
-                    request_id = %first.meta.id,
-                    sched_latency_ms = first.meta.arrival_time.elapsed().as_secs_f64() * 1000.0,
-                    "TTFT_TRACE: batch sent to worker"
-                );
-            }
-            self.dispatch.send_batch(batch_data).await?;
-            if self.config.mode == SchedulerMode::Diffusion {
-                self.worker_busy = true;
-            }
-        }
-        Ok(())
-    }
+        let SchedulerEngine {
+            workflow,
+            dispatch,
+            requests,
+            radix,
+            kv_budget,
+            metrics,
+            codec,
+            config,
+            ..
+        } = self;
 
-    /// Snapshot of currently-prefilling sessions for the policy. The
-    /// scheduler does not schedule decoding — that lives inside the
-    /// worker — so the snapshot only carries prefill-relevant counters.
-    fn running_set(&self) -> RunningSet {
-        RunningSet {
-            num_prefilling: self.requests.prefilling_len(),
-            prefilling_continuations: self.requests.prefilling_continuations(),
-        }
-    }
-
-    fn token_budget(&self) -> TokenBudget {
-        TokenBudget {
-            max_tokens: self.config.max_batch_tokens,
-            max_seqs: self.config.max_num_seqs,
-        }
-    }
-
-    /// Handle step output from the worker.
-    pub(crate) async fn handle_step_output(&mut self, data: Vec<u8>) -> Result<()> {
-        self.worker_busy = false;
-
-        match self.config.mode {
-            SchedulerMode::Llm => self.handle_step_output_llm(data).await,
-            SchedulerMode::Diffusion => self.handle_step_output_diffusion(data).await,
-        }
-    }
-
-    /// LLM mode: process prefill segment ACKs and generated tokens from Worker.
-    ///
-    /// Thin orchestrator: every state transition + IO happens inside
-    /// [`crate::application::OutputProcessingSystem::process_llm_step`].
-    async fn handle_step_output_llm(&mut self, data: Vec<u8>) -> Result<()> {
-        // Peel `assigned_indices` off the StepOutput before
-        // `process_llm_step` consumes the bytes. Each entry's slots feed
-        // into the RadixTree (so prefix lookup can reuse them) and into
-        // KvBudget (admission's accounting source of truth).
-        if let Ok(parsed) = rmp_serde::from_slice::<
-            infer_protocol::worker_to_scheduler_data::StepOutput,
-        >(&data)
-        {
-            if !parsed.assigned_indices.is_empty() {
-                // Account the slots that the worker just consumed.
-                // Admission ran ahead of the batch send and ensured
-                // headroom for at least `projected`; that headroom is
-                // consumed *here* when the StepOutput proves the worker
-                // actually wrote those slots. Admission itself never
-                // calls `try_reserve` — that would double-count the same
-                // slots once they show up here.
-                let total: u32 = parsed
-                    .assigned_indices
-                    .iter()
-                    .map(|a| a.len as u32)
-                    .sum();
-                let _ = self.kv_budget.try_reserve(total);
-                self.output.feed_radix_assigned_indices(
-                    &mut self.radix,
-                    &mut self.kv_budget,
-                    &parsed,
-                );
-                // Mark finished sequences' chains in the radix tree so
-                // their slots become eligible for LRU eviction.
-                for tk in &parsed.tokens {
-                    if tk.finished {
-                        self.output
-                            .radix_mark_finished(&mut self.radix, tk.sequence_id);
-                    }
-                }
-            }
-        }
-        self.output
-            .process_llm_step(
-                &mut self.requests,
-                self.dispatch.frontend_mut(),
-                &self.metrics,
-                &self.codec,
-                data,
-            )
+        let mut ctx = crate::application::workflow::ResourceContext {
+            requests,
+            radix,
+            kv_budget,
+            metrics,
+            codec,
+            config,
+        };
+        workflow
+            .handle_step_output(&mut ctx, dispatch, event)
             .await
     }
 
@@ -330,28 +249,42 @@ impl SchedulerEngine {
     //  Control-plane event dispatch
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Dispatch a single control event into the appropriate handler. Called by
-    /// the event loop when `control_events.recv()` produces a message.
-    ///
-    /// Delegates the **decision** to
-    /// [`crate::application::ControlEventSystem::handle`], then carries
-    /// out the resulting [`ControlOutcome`] — driving
-    /// `OutputProcessingSystem` for the failed-session list and
-    /// unwinding on `Terminate`. The split keeps `ControlEventSystem`
-    /// from needing simultaneous mutable access to both `requests`
-    /// and `output`.
+    /// Dispatch a single control event into the workflow.
     pub(crate) async fn on_control_event(&mut self, event: ControlEvent) -> Result<()> {
         use crate::application::ControlOutcome;
 
-        let outcome = self.control.handle(
-            event,
-            &mut self.requests,
-            &mut self.radix,
-            &mut self.kv_budget,
-            &self.control_cmd,
-            &self.worker_group,
-            &self.default_worker,
-        );
+        let default_worker = self.default_worker.clone();
+        let control_cmd = self.control_cmd.clone();
+
+        let outcome = {
+            let SchedulerEngine {
+                workflow,
+                requests,
+                radix,
+                kv_budget,
+                metrics,
+                codec,
+                config,
+                worker_group,
+                ..
+            } = self;
+
+            let mut ctx = crate::application::workflow::ResourceContext {
+                requests,
+                radix,
+                kv_budget,
+                metrics,
+                codec,
+                config,
+            };
+            workflow.handle_control_event(
+                event,
+                &mut ctx,
+                &control_cmd,
+                worker_group,
+                &default_worker,
+            )
+        };
         match outcome {
             ControlOutcome::Continue {
                 failed_request_ids,
@@ -364,8 +297,6 @@ impl SchedulerEngine {
                 Ok(())
             }
             ControlOutcome::Terminate { lost: _, error } => {
-                // Drain every running session as failed before bubbling
-                // the fatal error.
                 let running: Vec<RequestId> = self
                     .requests
                     .running_sequence_ids()
@@ -381,38 +312,56 @@ impl SchedulerEngine {
         }
     }
 
-    /// Drive the OutputProcessingSystem for a list of internal
-    /// request ids that the ControlEventSystem flagged as failed.
-    /// Used by [`Self::on_control_event`].
+    /// Drive the failure path for a list of internal `RequestId`s.
     async fn fail_request_ids(
         &mut self,
         failed_request_ids: &[RequestId],
         message: &str,
     ) -> Result<()> {
-        self.output
-            .fail_sessions(
-                &mut self.requests,
-                self.dispatch.frontend_mut(),
-                failed_request_ids,
-                message,
-            )
-            .await
+        crate::application::output_fns::fail_sessions(
+            &mut self.requests,
+            self.dispatch.frontend_mut(),
+            failed_request_ids,
+            message,
+        )
+        .await
     }
 
-    /// Diffusion mode: entire batch completes at once and returns image results.
-    /// Diffusion mode: entire batch completes at once and returns image results.
+    /// LLM mode: process prefill segment ACKs and generated tokens from Worker.
     ///
-    /// Thin orchestrator: full implementation lives in
-    /// [`crate::application::OutputProcessingSystem::process_diffusion_step`].
-    async fn handle_step_output_diffusion(&mut self, data: Vec<u8>) -> Result<()> {
-        self.output
-            .process_diffusion_step(
-                &mut self.requests,
-                self.dispatch.frontend_mut(),
-                &self.metrics,
-                &self.codec,
-                data,
-            )
+    /// Retained for test compatibility. Production code uses
+    /// [`Self::handle_step_output`] which dispatches via the workflow.
+    #[cfg(test)]
+    pub(crate) async fn handle_step_output_llm(&mut self, data: Vec<u8>) -> Result<()> {
+        use crate::infrastructure::transport::codec::Codec;
+        use crate::application::scheduler_event::SchedulerEvent;
+
+        let output: infer_protocol::worker_to_scheduler_data::StepOutput =
+            self.codec.decode(&data)?;
+        let event = SchedulerEvent::WorkerLlmStep(output);
+
+        let SchedulerEngine {
+            workflow,
+            dispatch,
+            requests,
+            radix,
+            kv_budget,
+            metrics,
+            codec,
+            config,
+            ..
+        } = self;
+
+        let mut ctx = crate::application::workflow::ResourceContext {
+            requests,
+            radix,
+            kv_budget,
+            metrics,
+            codec,
+            config,
+        };
+        workflow
+            .handle_step_output(&mut ctx, dispatch, event)
             .await
     }
 
@@ -424,11 +373,29 @@ impl SchedulerEngine {
 
     #[allow(dead_code)]
     pub(crate) fn is_idle(&self) -> bool {
-        !self.has_pending_work() && !self.worker_busy()
+        !self.has_pending_work() && !self.has_in_flight_batch()
     }
 
-    pub(crate) fn worker_busy(&self) -> bool {
-        self.config.mode == SchedulerMode::Diffusion && self.worker_busy
+    pub(crate) fn has_in_flight_batch(&self) -> bool {
+        self.workflow.has_in_flight_batch()
+    }
+
+    pub(crate) fn can_schedule(&self) -> bool {
+        self.workflow.can_schedule(&self.requests)
+    }
+
+    /// Build a `ResourceContext` borrowing all shared resources.
+    /// Only used internally when destructuring isn't needed.
+    #[allow(dead_code)]
+    fn resource_context(&mut self) -> crate::application::workflow::ResourceContext<'_> {
+        crate::application::workflow::ResourceContext {
+            requests: &mut self.requests,
+            radix: &mut self.radix,
+            kv_budget: &mut self.kv_budget,
+            metrics: &self.metrics,
+            codec: &self.codec,
+            config: &self.config,
+        }
     }
 
     #[allow(dead_code)]
@@ -445,7 +412,6 @@ impl SchedulerEngine {
     pub(crate) async fn cancel_request(&mut self, request_id: RequestId) -> Result<()> {
         crate::application::cancel::cancel_request(
             &mut self.requests,
-            &self.output,
             &self.control_cmd,
             &self.default_worker,
             request_id,
@@ -453,12 +419,10 @@ impl SchedulerEngine {
         .await
     }
 
-    /// Cancel by client-supplied external id (delegates to
-    /// [`crate::application::cancel`]).
+    /// Cancel by client-supplied external id.
     pub(crate) async fn cancel_request_by_external_id(&mut self, external_id: &str) -> Result<()> {
         crate::application::cancel::cancel_request_by_external_id(
             &mut self.requests,
-            &self.output,
             &self.control_cmd,
             &self.default_worker,
             external_id,
@@ -466,35 +430,26 @@ impl SchedulerEngine {
         .await
     }
 
-    /// Pick the worker that should receive control traffic for an unspecified
-    /// sequence. Single-rank deployment today; a future TP/PP variant will
-    /// thread per-sequence affinity through here.
     #[allow(dead_code)]
     pub(crate) fn worker_id_for_default(&self) -> &WorkerId {
         &self.default_worker
     }
 
     #[allow(dead_code)]
-    /// Receive an event from the frontend transport.
     pub(crate) async fn recv_frontend_event(&mut self) -> Result<FrontendEvent> {
         self.dispatch.recv_frontend().await
     }
 
     #[allow(dead_code)]
-    /// Receive step output from the worker transport.
     pub(crate) async fn recv_worker_output(&mut self) -> Result<Vec<u8>> {
         self.dispatch.recv_worker_output().await
     }
 
     /// Poll for the next event from frontend, worker, or the control plane.
-    ///
-    /// `tokio::select!` is `biased` so the control plane wins ties — block
-    /// grants and worker-lost notifications take priority over draining the
-    /// next StepOutput from a possibly-wedged worker.
     pub(crate) async fn poll_next_event(&mut self) -> crate::application::event_loop::EngineEvent {
         use crate::application::event_loop::EngineEvent;
 
-        let has_work = self.has_pending_work() || self.worker_busy();
+        let has_work = self.has_pending_work() || self.has_in_flight_batch();
 
         if has_work {
             let (frontend, worker) = self.dispatch.borrow_both_mut();

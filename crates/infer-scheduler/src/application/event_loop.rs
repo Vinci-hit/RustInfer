@@ -1,4 +1,13 @@
 //! Event loop — async select! based main loop.
+//!
+//! The design uses a two-step approach to avoid borrow checker issues with
+//! `tokio::select!` needing multiple `&mut` borrows:
+//! 1. Poll transports with split borrows via `poll_next_event`
+//! 2. Process the event with full `&mut self` access
+//!
+//! The event loop is mode-agnostic — it delegates to `EngineWorkflow`
+//! for all scheduling and output processing decisions. LLM vs Diffusion
+//! logic lives entirely in `LlmWorkflow` / `DiffusionWorkflow`.
 
 use crate::application::engine::SchedulerEngine;
 use crate::error::Result;
@@ -6,11 +15,6 @@ use crate::infrastructure::transport::control_plane::ControlEvent;
 use crate::infrastructure::transport::traits::FrontendEvent;
 
 /// Run the main event loop.
-///
-/// The design uses a two-step approach to avoid borrow checker issues with
-/// `tokio::select!` needing multiple `&mut` borrows:
-/// 1. Poll transports with split borrows via `poll_next_event`
-/// 2. Process the event with full `&mut self` access
 pub async fn run_event_loop(engine: &mut SchedulerEngine) -> Result<()> {
     tracing::info!("Event loop starting...");
 
@@ -21,7 +25,7 @@ pub async fn run_event_loop(engine: &mut SchedulerEngine) -> Result<()> {
             EngineEvent::Frontend(result) => match *result {
                 Ok(FrontendEvent::Infer { client_id, request }) => {
                     engine.handle_new_request(client_id, request);
-                    if !engine.worker_busy() {
+                    if engine.can_schedule() {
                         engine.run_iteration().await?;
                     }
                 }
@@ -32,7 +36,7 @@ pub async fn run_event_loop(engine: &mut SchedulerEngine) -> Result<()> {
                         reason
                     );
                     engine.cancel_request_by_external_id(&external_id).await?;
-                    if !engine.worker_busy() {
+                    if engine.can_schedule() {
                         engine.run_iteration().await?;
                     }
                 }
@@ -57,7 +61,7 @@ pub async fn run_event_loop(engine: &mut SchedulerEngine) -> Result<()> {
             }
             EngineEvent::Control(ev) => {
                 engine.on_control_event(ev).await?;
-                if !engine.worker_busy() {
+                if engine.can_schedule() {
                     engine.run_iteration().await?;
                 }
             }

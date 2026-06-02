@@ -38,7 +38,7 @@ use crate::error::SchedulerError;
 use crate::domain::inference_session::lifecycle::SequenceId;
 use crate::domain::inference_session::table::{PreemptCandidate, RequestTable};
 use crate::domain::kv_budget::KvBudget;
-use crate::infrastructure::kv_cache::radix_tree_v2::RadixTree;
+use crate::infrastructure::kv_cache::radix_tree::RadixTree;
 use crate::infrastructure::transport::control_plane::{ControlEvent, ControlPlaneCmdTx, WorkerId};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
 

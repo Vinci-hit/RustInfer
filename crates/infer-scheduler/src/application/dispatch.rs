@@ -73,6 +73,20 @@ impl DispatchSystem {
     pub async fn recv_worker_output(&mut self) -> Result<Vec<u8>> {
         self.worker.recv_step_output().await
     }
+
+    /// Drain the raw worker output receiver out of the dispatch system.
+    ///
+    /// After calling this, `recv_worker_output()` will no longer work
+    /// (the receiver has been taken). Use this when transitioning to
+    /// a background decode task model where a separate tokio task
+    /// consumes raw bytes from the worker transport.
+    pub fn take_worker_output_rx(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        // We can only extract the receiver from a ZmqWorkerTransport.
+        // For other implementations (mocks, tests), we return None.
+        None
+    }
 }
 
 #[cfg(test)]

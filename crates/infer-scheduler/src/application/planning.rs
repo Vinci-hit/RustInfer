@@ -22,9 +22,9 @@
 //! - [`PlanningSystem::scheduled_segments`] — read-only access to
 //!   the current chunk-size list.
 
-use crate::infrastructure::kv_cache::radix_tree_v2::{GlobalIndex, RadixTree};
+use crate::infrastructure::kv_cache::radix_tree::{GlobalIndex, RadixTree};
 use crate::infrastructure::kv_cache::traits::PrefixMatch;
-use crate::config::SchedulerConfig;
+use crate::config::{SchedulerConfig, SchedulerMode};
 use crate::domain::inference_session::lifecycle::{
     InferenceSession, Prefilling, RequestId,
 };
@@ -213,5 +213,20 @@ impl PlanningSystem {
     ) -> Result<Vec<u8>> {
         self.builder
             .build_diffusion_batch(prefilling, codec, &self.current_chunk_sizes)
+    }
+
+    /// Unified batch build — dispatches to LLM or Diffusion internally.
+    /// This is the preferred entry point; the mode-specific methods are
+    /// retained for backward compat.
+    pub fn build_batch(
+        &mut self,
+        prefilling: &[&InferenceSession<Prefilling>],
+        config: &SchedulerConfig,
+        codec: &MsgPackCodec,
+    ) -> Result<Vec<u8>> {
+        match config.mode {
+            SchedulerMode::Llm => self.build_llm_batch(prefilling, config, codec),
+            SchedulerMode::Diffusion => self.build_diffusion_batch(prefilling, codec),
+        }
     }
 }
