@@ -296,7 +296,13 @@
             4,
         )?;
 
-        engine.cancel_request(request_id).await?;
+        crate::application::cancel::cancel_request(
+            &mut engine.requests,
+            &engine.control_cmd,
+            &engine.default_worker,
+            request_id,
+        )
+        .await?;
 
         let cmd = cmd_rx.try_recv().expect("expected RouterCommand on cmd_rx");
         match cmd {

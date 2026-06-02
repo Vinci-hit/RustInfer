@@ -19,7 +19,7 @@ use crate::infrastructure::transport::codec::MsgPackCodec;
 use crate::infrastructure::transport::control_plane::{
     ControlEvent, ControlPlaneCmdTx, ControlPlaneEventRx, WorkerId,
 };
-use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
+use crate::infrastructure::transport::traits::{FrontendTransport, WorkerTransport};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
 use crate::application::workflow::EngineWorkflow;
 
@@ -371,52 +371,12 @@ impl SchedulerEngine {
         self.requests.has_pending_work()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_idle(&self) -> bool {
-        !self.has_pending_work() && !self.has_in_flight_batch()
-    }
-
     pub(crate) fn has_in_flight_batch(&self) -> bool {
         self.workflow.has_in_flight_batch()
     }
 
     pub(crate) fn can_schedule(&self) -> bool {
         self.workflow.can_schedule(&self.requests)
-    }
-
-    /// Build a `ResourceContext` borrowing all shared resources.
-    /// Only used internally when destructuring isn't needed.
-    #[allow(dead_code)]
-    fn resource_context(&mut self) -> crate::application::workflow::ResourceContext<'_> {
-        crate::application::workflow::ResourceContext {
-            requests: &mut self.requests,
-            radix: &mut self.radix,
-            kv_budget: &mut self.kv_budget,
-            metrics: &self.metrics,
-            codec: &self.codec,
-            config: &self.config,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn worker_group(&self) -> &WorkerGroup {
-        &self.worker_group
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn active_request_count(&self) -> usize {
-        self.requests.active_count()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn cancel_request(&mut self, request_id: RequestId) -> Result<()> {
-        crate::application::cancel::cancel_request(
-            &mut self.requests,
-            &self.control_cmd,
-            &self.default_worker,
-            request_id,
-        )
-        .await
     }
 
     /// Cancel by client-supplied external id.
@@ -428,21 +388,6 @@ impl SchedulerEngine {
             external_id,
         )
         .await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn worker_id_for_default(&self) -> &WorkerId {
-        &self.default_worker
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn recv_frontend_event(&mut self) -> Result<FrontendEvent> {
-        self.dispatch.recv_frontend().await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn recv_worker_output(&mut self) -> Result<Vec<u8>> {
-        self.dispatch.recv_worker_output().await
     }
 
     /// Poll for the next event from frontend, worker, or the control plane.
