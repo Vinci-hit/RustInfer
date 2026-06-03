@@ -43,4 +43,13 @@ pub trait WorkerTransport: Send + Sync + 'static {
 
     /// Receive step output from the worker.
     async fn recv_step_output(&mut self) -> Result<Vec<u8>>;
+
+    /// Drain the raw output receiver out of this transport.
+    ///
+    /// Returns `None` for transports that don't support background
+    /// decoding (mocks, test doubles). After calling this,
+    /// `recv_step_output()` should return `Err(Shutdown)`.
+    fn take_output_rx(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        None
+    }
 }

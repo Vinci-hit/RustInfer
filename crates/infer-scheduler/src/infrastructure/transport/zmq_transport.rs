@@ -213,7 +213,9 @@ impl FrontendTransport for ZmqFrontendTransport {
 /// Worker transport backed by ZMQ PUSH/PULL sockets.
 pub struct ZmqWorkerTransport {
     /// Receive channel: ZMQ thread sends worker outputs here.
-    output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Wrapped in `Option` so `take_output_rx()` can extract it
+    /// for the background decode task.
+    output_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     /// Send channel: scheduler sends batch commands here.
     command_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
@@ -243,7 +245,7 @@ impl ZmqWorkerTransport {
             })?;
 
         Ok(Self {
-            output_rx,
+            output_rx: Some(output_rx),
             command_tx,
         })
     }
@@ -336,9 +338,16 @@ impl WorkerTransport for ZmqWorkerTransport {
     }
 
     async fn recv_step_output(&mut self) -> Result<Vec<u8>> {
-        match self.output_rx.recv().await {
-            Some(data) => Ok(data),
+        match self.output_rx.as_mut() {
+            Some(rx) => match rx.recv().await {
+                Some(data) => Ok(data),
+                None => Err(SchedulerError::Shutdown),
+            },
             None => Err(SchedulerError::Shutdown),
         }
+    }
+
+    fn take_output_rx(&mut self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.output_rx.take()
     }
 }

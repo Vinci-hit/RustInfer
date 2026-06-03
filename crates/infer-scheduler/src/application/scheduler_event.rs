@@ -40,4 +40,6 @@ pub enum SchedulerEvent {
     WorkerShutdown,
     /// Deserialization error on worker data (non-fatal; log and skip).
     WorkerDecodeError(String),
+    /// Non-fatal frontend recv error (log and continue).
+    FrontendError(String),
 }
