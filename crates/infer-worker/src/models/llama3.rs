@@ -5,13 +5,13 @@
 //! so addresses are stable across `forward` calls — required for CUDA
 //! Graph capture.
 
-use crate::domain::ports::{OpBackend, OpResult};
+use crate::domain::ports::{LlmOps, OpResult};
 use crate::domain::types::{Dtype, Shape};
 use crate::domain::tensor::Tensor;
 use crate::domain::model::{LlmModel, ForwardContext};
 use super::layers::{Linear, RMSNorm, Embedding};
 
-pub struct Llama3Layer<T: Dtype, D: OpBackend> {
+pub struct Llama3Layer<T: Dtype, D: LlmOps> {
     pub input_layernorm: RMSNorm<T, D>,
     pub post_attention_layernorm: RMSNorm<T, D>,
     pub qkv_proj: Linear<T, D>,
@@ -21,7 +21,7 @@ pub struct Llama3Layer<T: Dtype, D: OpBackend> {
     pub down_proj: Linear<T, D>,
 }
 
-pub struct Llama3Model<T: Dtype, D: OpBackend> {
+pub struct Llama3Model<T: Dtype, D: LlmOps> {
     pub embed_tokens: Embedding<T, D>,
     pub layers: Vec<Llama3Layer<T, D>>,
     pub norm: RMSNorm<T, D>,
@@ -37,7 +37,7 @@ pub struct Llama3Model<T: Dtype, D: OpBackend> {
     pub vocab_size: usize,
 }
 
-impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Llama3Model<T, D> {
+impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Llama3Model<T, D> {
     fn forward(
         &self,
         input_ids: &Tensor<i32, D>,
@@ -196,26 +196,21 @@ impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Llama3Model<T, D> {
 
 // ─── Helpers (kept for backward compat with other modules / tests) ─────────
 
-use crate::domain::ports::OpError;
-
 /// Allocate a zeroed tensor via OpBackend.
-pub fn alloc<T: Dtype, D: OpBackend>(rows: usize, cols: usize, dev: &D) -> OpResult<Tensor<T, D>> {
+pub fn alloc<T: Dtype, D: LlmOps>(rows: usize, cols: usize, dev: &D) -> OpResult<Tensor<T, D>> {
     D::alloc_tensor(Shape::from_slice(&[rows, cols]), dev)
 }
 
 /// Create a device tensor from host i32 positions (single H2D upload).
-pub fn alloc_i32<D: OpBackend>(positions: &[i32], dev: &D) -> OpResult<Tensor<i32, D>> {
+pub fn alloc_i32<D: LlmOps>(positions: &[i32], dev: &D) -> OpResult<Tensor<i32, D>> {
     Tensor::<i32, D>::from_host_slice(positions, Shape::from_slice(&[positions.len()]), dev)
 }
 
 /// Build seq_starts [batch+1] prefix sum from seq_lens, then upload.
-pub fn alloc_seq_starts<D: OpBackend>(seq_lens: &[usize], dev: &D) -> OpResult<Tensor<i32, D>> {
+pub fn alloc_seq_starts<D: LlmOps>(seq_lens: &[usize], dev: &D) -> OpResult<Tensor<i32, D>> {
     let mut starts = Vec::with_capacity(seq_lens.len() + 1);
     starts.push(0i32);
     let mut acc = 0i32;
     for &len in seq_lens { acc += len as i32; starts.push(acc); }
     alloc_i32::<D>(&starts, dev)
 }
-
-#[allow(dead_code)]
-fn _silence_op_error() -> OpError { OpError::Kernel(String::new()) }

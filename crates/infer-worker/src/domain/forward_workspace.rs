@@ -89,11 +89,32 @@ pub struct ForwardWorkspace<T: Dtype, D: MemoryPort> {
     flash_decode_workspace_f32: Tensor<f32, D>,
 
     /// Long-lived argmax output (one i32 per sequence). Written inside the
-    /// captured graph; D2H read happens once outside.
+    /// captured graph; D2H read happens once outside. This is buffer **C**
+    /// of the `gather_merge_input` dependency-merge.
     argmax_out_dev: Tensor<i32, D>,
 
     /// Reusable host slot for the single-D2H read after each step.
     argmax_out_host: Vec<i32>,
+
+    // ─── Bubble-free decode pipeline buffers (gather_merge_input) ─────
+    //
+    // The merge `A[i] = src[i]>=0 ? C[src[i]] : B[-src[i]-1]` reads C
+    // (`argmax_out_dev`) and B (`new_token_dev`), selected by `src`
+    // (`src_map_dev`), writing A (`BatchWorkspace::input_ids`). B and src
+    // are uploaded by the CPU on a copy stream while the GPU forwards, so
+    // they live here at address-stable `cap_batch` capacity.
+    /// Buffer **B**: first tokens of newly-admitted sequences. Uploaded
+    /// async on the copy-in stream each step. Len `cap_batch`.
+    new_token_dev: Tensor<i32, D>,
+    /// Selector **src**: per-row source for the merge. `>=0` → row of C,
+    /// `<0` → `-src-1` row of B. Uploaded async each step. Len `cap_batch`.
+    src_map_dev: Tensor<i32, D>,
+
+    /// Host staging for `new_token_dev` (owned for the runner's lifetime so
+    /// `upload_async` is safe without an immediate sync). Len `cap_batch`.
+    new_token_host: Vec<i32>,
+    /// Host staging for `src_map_dev`. Len `cap_batch`.
+    src_map_host: Vec<i32>,
 }
 
 impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
@@ -136,11 +157,24 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
         )?;
         let argmax_out_host = vec![0i32; cap_batch.max(1)];
 
+        // Bubble-free decode pipeline buffers (B + src), address-stable at
+        // cap_batch. Default `src_map_dev` = identity (`src[i] = i`) so a
+        // plain "all-continuing" merge is a no-op copy of C → A.
+        let new_token_dev = Tensor::<i32, D>::zeros(
+            Shape::from_slice(&[cap_batch.max(1)]), device,
+        )?;
+        let src_map_dev = Tensor::<i32, D>::zeros(
+            Shape::from_slice(&[cap_batch.max(1)]), device,
+        )?;
+        let new_token_host = vec![0i32; cap_batch.max(1)];
+        let src_map_host = (0..cap_batch.max(1) as i32).collect();
+
         Ok(Self {
             cap_num_tokens, cap_batch, dims,
             x, h, qkv_buf, attn_out, gate_buf, up_buf, gate_up_buf, ffn_out,
             q_buf, k_buf, v_buf, o_out, logits,
             flash_decode_workspace_f32, argmax_out_dev, argmax_out_host,
+            new_token_dev, src_map_dev, new_token_host, src_map_host,
         })
     }
 
@@ -169,6 +203,28 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
     pub fn argmax_out_dev_mut(&mut self)     -> &mut Tensor<i32, D> { &mut self.argmax_out_dev }
     pub fn argmax_out_dev(&self)             -> &Tensor<i32, D>     { &self.argmax_out_dev }
     pub fn argmax_out_host_mut(&mut self)    -> &mut [i32]          { &mut self.argmax_out_host }
+
+    // ─── Bubble-free decode pipeline accessors ───────────────────────
+
+    /// Buffer **B** (`new_token_dev`): newly-admitted seqs' first tokens.
+    pub fn new_token_dev(&self)      -> &Tensor<i32, D>     { &self.new_token_dev }
+    pub fn new_token_dev_mut(&mut self) -> &mut Tensor<i32, D> { &mut self.new_token_dev }
+    /// Selector **src** (`src_map_dev`): per-row merge source.
+    pub fn src_map_dev(&self)        -> &Tensor<i32, D>     { &self.src_map_dev }
+    pub fn src_map_dev_mut(&mut self)   -> &mut Tensor<i32, D> { &mut self.src_map_dev }
+    /// Host staging mirrors (owned for the runner's lifetime; safe for
+    /// `upload_async`).
+    pub fn new_token_host_mut(&mut self) -> &mut [i32]       { &mut self.new_token_host }
+    pub fn src_map_host_mut(&mut self)   -> &mut [i32]       { &mut self.src_map_host }
+    /// View of B/src sized to the active batch (for the kernel launch).
+    pub fn new_token_view(&self, batch: usize) -> Tensor<i32, D> {
+        let strides = Shape::from_slice(&[batch.max(1)]).contiguous_strides();
+        self.new_token_dev.view_raw(Shape::from_slice(&[batch]), strides, 0, true)
+    }
+    pub fn src_map_view(&self, batch: usize) -> Tensor<i32, D> {
+        let strides = Shape::from_slice(&[batch.max(1)]).contiguous_strides();
+        self.src_map_dev.view_raw(Shape::from_slice(&[batch]), strides, 0, true)
+    }
 }
 
 #[cfg(test)]

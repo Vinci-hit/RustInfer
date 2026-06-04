@@ -2,7 +2,7 @@
 
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::{DataType, Dtype, Shape};
+use crate::domain::types::{DataType, Dtype};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::cudaStream_t;
 use half::{bf16, f16};

@@ -4,7 +4,7 @@
 //! `frequency_embedding_size = 256` (= ADALN_EMBED_DIM), an MLP with
 //! `mid = 1024`, output dim = 256, SiLU between layers.
 
-use crate::domain::ports::{OpResult, OpError, OpBackend, MemoryPort};
+use crate::domain::ports::{OpResult, OpError, OpBackend};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype};
 use crate::models::layers::Linear;

@@ -6,7 +6,6 @@
 
 use crate::domain::ports::{OpResult, OpError, MemoryPort};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
 use crate::infrastructure::cpu::Cpu;
 use crate::infrastructure::cuda::Cuda;
 

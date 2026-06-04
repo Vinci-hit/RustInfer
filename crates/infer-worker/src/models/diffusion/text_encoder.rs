@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{OpResult, OpError, OpBackend};
+use crate::domain::ports::{OpResult, OpError, OpBackend, CoreOps, LlmOps, DiffusionOps};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
@@ -174,7 +174,7 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         // dtype T). We compute on host then upload.
         let half = cfg.head_dim / 2;
         let max_pos = cfg.max_position_embeddings.min(2048); // cap for memory
-        let mut sin_host = vec![T::DATA_TYPE; 0]; // placeholder
+        let sin_host = vec![T::DATA_TYPE; 0]; // placeholder
         let mut cos_host_bytes = vec![0u8; max_pos * half * T::SIZE_BYTES];
         let mut sin_host_bytes = vec![0u8; max_pos * half * T::SIZE_BYTES];
         let theta = cfg.rope_theta as f64;
@@ -312,7 +312,7 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         let mut q: Tensor<T, Cuda> = Tensor::zeros([seq_len, q_dim], dev)?;
         let mut k: Tensor<T, Cuda> = Tensor::zeros([seq_len, kv_dim], dev)?;
         let mut v: Tensor<T, Cuda> = Tensor::zeros([seq_len, kv_dim], dev)?;
-        let mut attn_out: Tensor<T, Cuda> = Tensor::zeros([seq_len, q_dim], dev)?;
+        let attn_out: Tensor<T, Cuda> = Tensor::zeros([seq_len, q_dim], dev)?;
         let mut o_out: Tensor<T, Cuda> = Tensor::zeros([seq_len, dim], dev)?;
         let mut gate_up: Tensor<T, Cuda> = Tensor::zeros([seq_len, 2 * inter], dev)?;
         let mut gate: Tensor<T, Cuda> = Tensor::zeros([seq_len, inter], dev)?;

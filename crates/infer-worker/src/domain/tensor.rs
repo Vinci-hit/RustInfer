@@ -257,11 +257,12 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
 
     /// In-place copy from a same-shape, same-dtype, same-device tensor.
     ///
-    /// Performs a device-internal D2D / memcpy. Returns an error if shape
-    /// or numel disagrees. The destination must be contiguous (sources may
-    /// be strided as long as their numel matches and memcpy semantics are
-    /// well-defined — for now we require both contiguous, mirroring the
-    /// behaviour we need from the diffusion pipeline).
+    /// Performs a device-internal D2D memcpy (zero-copy, no host round-trip)
+    /// when the tensors do not share storage. If they share storage (one is a
+    /// view of the other), falls back to a host round-trip to avoid undefined
+    /// behaviour on overlapping D2D copies.
+    /// Returns an error if shape or numel disagrees. Both tensors must be
+    /// contiguous — the D2D copy requires contiguous layout to be correct.
     pub fn copy_from(&mut self, src: &Tensor<T, D>) -> OpResult<()> {
         if self.shape != src.shape {
             return Err(OpError::Shape(format!(
@@ -279,21 +280,28 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         let n = self.numel;
         if n == 0 { return Ok(()); }
         let bytes = n * T::SIZE_BYTES;
-        // For CPU<->CPU and Cuda<->Cuda the storage device is identical
-        // (D is a single device type via the type parameter), so we can
-        // route through the MemoryPort: download to a stack-allocated
-        // staging buffer and re-upload. For tiny sizes this is fine; for
-        // larger ones backends override with stream-ordered D2D copies.
-        // Until the OpBackend gains a `copy_inplace`, we use the host
-        // round-trip path which is correct on every device but not the
-        // fastest on CUDA.
-        let host = src.to_host_vec()?;
-        let dev = self.storage.device().clone();
-        // Reuse from_host_slice path but write into self.
-        // SAFETY: dst is owned, has `bytes` valid bytes.
+
+        // If src and self share the same storage, a D2D copy may overlap.
+        // Fall back to host round-trip (download src → host, upload host → dst)
+        // which is always safe.
+        if Arc::as_ptr(&self.storage) == Arc::as_ptr(&src.storage) {
+            // SAFETY: host round-trip is safe for overlapping views.
+            let host = src.to_host_vec()?;
+            let dev = self.storage.device();
+            unsafe {
+                let dst_nn = std::ptr::NonNull::new_unchecked(self.data_ptr_mut() as *mut u8);
+                dev.upload(dst_nn, host.as_ptr() as *const u8, bytes)?;
+            }
+            return Ok(());
+        }
+
+        // Non-overlapping: D2D copy (fast, no host round-trip).
+        let dev = self.storage.device();
+        // SAFETY: src/dst are different storages, non-overlapping.
         unsafe {
             let dst_nn = std::ptr::NonNull::new_unchecked(self.data_ptr_mut() as *mut u8);
-            dev.upload(dst_nn, host.as_ptr() as *const u8, bytes)?;
+            let src_nn = std::ptr::NonNull::new_unchecked(src.data_ptr() as *mut u8);
+            dev.copy_device_to_device(dst_nn, src_nn, bytes)?;
         }
         Ok(())
     }
@@ -519,7 +527,7 @@ mod opbackend_dispatch_tests {
     //! Catches issues where the trait wiring forgets a method.
 
     use super::*;
-    use crate::domain::ports::OpBackend;
+    use crate::domain::ports::{CoreOps, LlmOps, DiffusionOps};
     use crate::infrastructure::cuda::Cuda;
     use half::bf16;
 

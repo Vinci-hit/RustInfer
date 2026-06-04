@@ -29,7 +29,7 @@ unsafe extern "C" {
 
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::scheduler_to_worker_data::{
-    BatchCommand, PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
+    BatchCommand, PrefillBatchCmd, PrefillSegmentCompletion,
 };
 use infer_protocol::worker_to_scheduler_control::{
     WorkerCapacity, WorkerControlMessage, WorkerStepError,
@@ -191,29 +191,11 @@ fn parse_device_id(spec: &str) -> Result<i32, String> {
 
 /// Per-sequence decode state held by the worker between iterations.
 struct ActiveSeq {
-    sequence_id: u64,
     last_token: i32,
     kv_len: usize,
     block_table: Vec<u32>,
-    block_size: usize,
     max_tokens: usize,
     generated_count: usize,
-    sampling: SamplingParams,
-}
-
-impl ActiveSeq {
-    fn from_segment(seg: &PrefillSegmentMeta, first_token: i32) -> Self {
-        Self {
-            sequence_id: seg.sequence_id,
-            last_token: first_token,
-            kv_len: seg.prompt_len as usize,
-            block_table: seg.block_table.clone(),
-            block_size: seg.block_size as usize,
-            max_tokens: seg.max_tokens,
-            generated_count: 1, // first token already produced by prefill argmax
-            sampling: seg.sampling_params.clone(),
-        }
-    }
 }
 
 fn main() -> Result<(), String> {
@@ -566,7 +548,6 @@ where
         // travels through `AllocFailed` events emitted only when an
         // `alloc_indices` call actually fails. See `wait_for_relief`.
     }
-    Ok(())
 }
 
 fn maybe_heartbeat(
@@ -894,14 +875,11 @@ where
                     bt.extend_from_slice(new_indices);
                     let kv_len = bt.len();
                     active.insert(seg.sequence_id, ActiveSeq {
-                        sequence_id: seg.sequence_id,
                         last_token: token,
                         kv_len,
                         block_table: bt,
-                        block_size: 1,
                         max_tokens: seg.max_tokens,
                         generated_count: 1,
-                        sampling: seg.sampling_params.clone(),
                     });
                 }
             }

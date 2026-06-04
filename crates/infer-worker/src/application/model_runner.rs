@@ -7,18 +7,20 @@
 //! All KV addressing is paged. Single-sequence generation runs as a
 //! `batch=1` plan with a contiguous `block_table = [0, 1, 2, ...]`.
 
-use crate::domain::batch::{BatchKind, BatchPlan, PagedKvLayer, PagedKvPool};
+use crate::domain::batch::{PagedKvLayer, PagedKvPool};
 use crate::domain::batch_workspace::{BatchWorkspace, WsSeqStep};
 use crate::domain::forward_workspace::{ForwardWorkspace, ModelDims};
 use crate::domain::model::{ForwardContext, LlmModel};
-use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use crate::domain::ports::{OpBackend, OpError, OpResult};
+
 use crate::domain::types::{Dtype, Shape};
 
 #[cfg(feature = "cuda")]
 use crate::application::cuda_graph_runner::{CudaGraphRunner, GraphDecision};
 #[cfg(feature = "cuda")]
 use crate::infrastructure::cuda::{Cuda, kernels::argmax_batched::argmax_batched_decode_into};
+#[cfg(feature = "cuda")]
+use crate::infrastructure::cuda::kernels::gather_merge::gather_merge_input_into;
 
 /// Per-sequence step description fed by callers (host side). The runner
 /// converts a slice of these into a device-resident `BatchPlan`.
@@ -105,18 +107,7 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
                 block_size,
             );
         }
-        if block_size != 1 {
-            // The worker-owned `GlobalKvAllocator` (Phase 1) and the new
-            // RadixTree handle (Phase 5) both rely on
-            // `block_table[seq][i]` being the i-th token's global KV index,
-            // which only holds when block_size == 1. Other values still
-            // *function* (the kernels do `pos / block_size` either way), but
-            // the upper-layer invariants break.
-            tracing::warn!(
-                "ModelRunner: block_size={} != 1 — outside the documented worker-owned KV path",
-                block_size,
-            );
-        }
+
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             let k = D::alloc_tensor::<T>(
@@ -629,11 +620,226 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         }
         Ok(generated)
     }
+
+    /// Bubble-free pipelined greedy decode for a single sequence.
+    ///
+    /// This is the integration of the `gather_merge_input` kernel + the
+    /// copy-in/copy-out streams + ordering events. It removes the per-step
+    /// token round-trip (`C` D2H → host → `A` H2D) that the eager loop
+    /// incurs: instead the previous step's on-device argmax (`C`) is folded
+    /// directly into the next step's `input_ids` (`A`) by the merge kernel,
+    /// entirely on-device, and the host-visible token is downloaded on a
+    /// side stream (`So`) that overlaps the next forward.
+    ///
+    /// Per-step chain (all decode steps after prefill):
+    /// ```text
+    ///   compute:  [wait ev_out] merge(A←C) → forward(A→…→C) → argmax(C) → record ev_a
+    ///   So:       [wait ev_a]   D2H(C→host) → record ev_out
+    /// ```
+    /// `src = [0]` (identity) selects "row 0 of C", so the merge copies the
+    /// previous token into A[0]. `B`/`Si` are unused for single-seq greedy
+    /// (no newly-admitted seqs mid-stream) but the plumbing matches the
+    /// general batched design.
+    ///
+    /// Requires primed graphs (falls back to `generate_with_graph` if not).
+    /// Positions for greedy decode are deterministic, so the dynamic decode
+    /// fields are staged on the copy-in stream ahead of each forward.
+    pub fn generate_pipelined(
+        &mut self,
+        prompt_ids: &[i32],
+        max_new_tokens: usize,
+        eos_ids: &[i32],
+    ) -> OpResult<Vec<i32>> {
+        // Without primed graphs the merge/stream chain has no captured
+        // forward to drive — defer to the graph-aware eager loop.
+        if self.graph_runner.is_none() {
+            return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
+        }
+        let num_prompt = prompt_ids.len();
+        if num_prompt == 0 {
+            return Err(OpError::Shape("empty prompt".into()));
+        }
+        // Decode is single-seq batch=1; bail to eager if no batch=1 graph.
+        let max_cap = self.graph_runner.as_ref().unwrap().max_capture_size();
+        if max_cap < 1 {
+            return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
+        }
+        let debug = std::env::var("RUSTINFER_DEBUG_LAYERS").is_ok();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let block_table: Vec<u32> = (0..self.max_blocks_per_seq as u32).collect();
+
+        // 1. Prefill (eager, multi-token). Returns the first decode token.
+        let prefill_seq = SeqStep {
+            input_ids: prompt_ids.to_vec(),
+            positions: (0..num_prompt as i32).collect(),
+            kv_write_start: 0,
+            kv_len_after: num_prompt as i32,
+            block_table: block_table.clone(),
+        };
+        let mut last = self.step_batch_eager(&[prefill_seq])?[0];
+        if debug { eprintln!("[pipe] prefill argmax → token {}", last); }
+        generated.push(last);
+        if eos_ids.contains(&last) {
+            return Ok(generated);
+        }
+
+        // The prefill's eager `argmax_batched` does NOT write
+        // `forward_ws.argmax_out_dev` (C). Seed C with the first decode
+        // token so the first merge has a valid source. One-shot blocking H2D.
+        {
+            let c = self.forward_ws.argmax_out_dev_mut();
+            // SAFETY: c is a device i32 buffer of len ≥ 1; we write one int.
+            unsafe {
+                let code = crate::infrastructure::cuda::ffi::cudaMemcpy(
+                    c.data_ptr_mut() as *mut std::ffi::c_void,
+                    &last as *const i32 as *const std::ffi::c_void,
+                    std::mem::size_of::<i32>(),
+                    crate::infrastructure::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                );
+                if code != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess {
+                    return Err(OpError::Kernel(format!("seed C failed: {:?}", code)));
+                }
+            }
+        }
+
+        // src = [0] (identity): A[0] ← C[0].
+        self.forward_ws.src_map_host_mut()[0] = 0;
+        let cfg = self.device.config.clone();
+
+        // The forward graph for batch=1.
+        let slot = match self.graph_runner.as_ref().unwrap().captured_slot_for(1) {
+            Some(s) => s,
+            None => {
+                // No exact batch=1 graph (capture_sizes didn't include 1).
+                return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
+            }
+        };
+
+        // Reusable host slot for the C download (one i32).
+        let mut host_tok: i32 = last;
+
+        for i in 0..max_new_tokens.saturating_sub(1) {
+            let kv_write_start = (num_prompt + i) as i32;
+            let kv_len_after = (num_prompt + i + 1) as i32;
+
+            // Stage the per-step dynamic decode fields. Positions are
+            // token-independent, so this can run ahead of the forward.
+            self.batch_ws.stage_decode_dynamic(
+                &[kv_write_start],   // rope position
+                &[kv_len_after],     // kv_len after this step
+                &[kv_write_start],   // kv_write_start (seq_positions)
+            )?;
+
+            if i == 0 {
+                // First step: full build_plan populates block_tables +
+                // cu_q_lens + seq_lens_step at the stable device addresses
+                // the graph captured against (async H2D, no token dep).
+                let ws_seq = vec![WsSeqStep {
+                    input_ids: vec![last],
+                    positions: vec![kv_write_start],
+                    kv_write_start,
+                    kv_len_after,
+                    block_table: block_table.clone(),
+                }];
+                let _ = self.batch_ws.build_plan(&ws_seq, &self.device)?;
+                // Upload the identity src selector once (B unused) on Si.
+                unsafe {
+                    cfg.upload_h2d_copy_in(
+                        self.forward_ws.src_map_dev().data_ptr() as *mut std::ffi::c_void,
+                        self.forward_ws.src_map_host_mut().as_ptr() as *const std::ffi::c_void,
+                        std::mem::size_of::<i32>(),
+                    )?;
+                }
+            } else {
+                // Subsequent steps: only the dynamic [batch] fields change.
+                // Upload them on Si (positions / kv_lens / seq_positions).
+                let one = std::mem::size_of::<i32>();
+                unsafe {
+                    cfg.upload_h2d_copy_in(
+                        self.batch_ws.rope_positions_dev().data_ptr() as *mut std::ffi::c_void,
+                        self.batch_ws.h_rope_positions().as_ptr() as *const std::ffi::c_void,
+                        one,
+                    )?;
+                    cfg.upload_h2d_copy_in(
+                        self.batch_ws.kv_lens_dev().data_ptr() as *mut std::ffi::c_void,
+                        self.batch_ws.h_kv_lens().as_ptr() as *const std::ffi::c_void,
+                        one,
+                    )?;
+                    cfg.upload_h2d_copy_in(
+                        self.batch_ws.seq_positions_dev().data_ptr() as *mut std::ffi::c_void,
+                        self.batch_ws.h_seq_positions().as_ptr() as *const std::ffi::c_void,
+                        one,
+                    )?;
+                }
+            }
+            // Record ev_in once the upload(s) are enqueued on Si.
+            cfg.record_copy_in()?;
+
+            // ── Compute stream chain ────────────────────────────────────
+            // WAR guard: don't overwrite C until the previous step's C
+            // download finished. No-op on first step (ev_out unrecorded).
+            if i > 0 {
+                cfg.compute_wait_copy_out()?;
+            }
+            // Wait for the upload on Si before the merge reads src/B and
+            // the forward reads the dynamic fields.
+            cfg.compute_wait_copy_in()?;
+
+            // merge: A ← C (per src). A = batch_ws.input_ids, C = argmax_out_dev.
+            {
+                let c = self.forward_ws.argmax_out_dev();
+                let b = self.forward_ws.new_token_dev();
+                let src = self.forward_ws.src_map_dev();
+                let mut a = self.batch_ws.input_ids_dev().view_raw(
+                    Shape::from_slice(&[1]),
+                    Shape::from_slice(&[1]).contiguous_strides(),
+                    0, true,
+                );
+                gather_merge_input_into(&mut a, c, b, src, 1, cfg.stream)?;
+            }
+
+            // forward + argmax (captured graph). Reads A + dynamic fields,
+            // writes C (argmax_out_dev).
+            cfg.launch(slot)?;
+
+            // Record ev_a: forward+argmax done, C is valid.
+            cfg.record_compute_a()?;
+
+            // ── Copy-out stream chain (overlaps next iteration) ─────────
+            cfg.copy_out_wait_compute_a()?;
+            unsafe {
+                cfg.download_d2h_copy_out(
+                    &mut host_tok as *mut i32 as *mut std::ffi::c_void,
+                    self.forward_ws.argmax_out_dev().data_ptr() as *const std::ffi::c_void,
+                    std::mem::size_of::<i32>(),
+                )?;
+            }
+            cfg.record_copy_out()?;
+
+            // Read host_tok before using it for eos: sync So only.
+            cfg.synchronize_copy_out()?;
+            last = host_tok;
+            if debug {
+                eprintln!(
+                    "[pipe] decode {:>2}: pos={} kv_len={} → token {}",
+                    i, kv_write_start, kv_len_after, last,
+                );
+            }
+            generated.push(last);
+            if eos_ids.contains(&last) {
+                break;
+            }
+        }
+        // Drain all streams before returning.
+        cfg.synchronize()?;
+        Ok(generated)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Tensor;
     use crate::infrastructure::cpu::Cpu;
     use crate::models::layers::{Linear, RMSNorm, Embedding};
     use crate::models::llama3::{Llama3Model, Llama3Layer};
@@ -650,7 +856,7 @@ mod tests {
         let qkv_dim = q_dim + 2 * kv_dim;
         let max_seq = 32;
 
-        use crate::domain::tensor::Tensor;
+        
 
         let make_weight = |rows: usize, cols: usize| -> Tensor<f32, Cpu> {
             let data: Vec<f32> = (0..rows * cols).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();

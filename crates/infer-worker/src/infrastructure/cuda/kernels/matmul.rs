@@ -12,11 +12,6 @@ unsafe extern "C" {
         input: *const f32, weight: *const f32, output: *mut f32,
         m: i32, k: i32, stream: cudaStream_t,
     );
-    fn sgemm_naive_f32_cu(
-        a: *const f32, b: *const f32, c: *mut f32,
-        m: i32, n: i32, k: i32,
-        stream: cudaStream_t,
-    );
     fn gemm_cublas_f32_axbt(
         a: *const f32, b: *const f32, c: *mut f32,
         m: i32, n: i32, k: i32,

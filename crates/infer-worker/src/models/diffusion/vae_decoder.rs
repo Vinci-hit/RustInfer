@@ -12,7 +12,7 @@
 //! reusable scratches don't help much — eager allocation matches the
 //! reference implementation).
 
-use crate::domain::ports::{OpResult, OpError, OpBackend};
+use crate::domain::ports::{OpResult, OpError, OpBackend, CoreOps, DiffusionOps};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;

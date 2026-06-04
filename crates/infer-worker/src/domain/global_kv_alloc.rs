@@ -29,7 +29,6 @@
 //! hence the same sorted result. Required for future TP/PP rank
 //! consistency.
 
-use std::collections::HashSet;
 
 /// Returned when alloc cannot satisfy the request even after merging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

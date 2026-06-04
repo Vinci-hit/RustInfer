@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use crate::domain::ports::{OpResult, OpError, OpBackend};
+use crate::domain::ports::{OpResult, OpError, OpBackend, CoreOps, DiffusionOps};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
@@ -200,9 +200,7 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let dim = config.dim;
         let n_heads = config.n_heads;
         let head_dim = config.head_dim;
-        let intermediate_size = config.intermediate_size;
         let in_channels = config.in_channels;
-        let cap_feat_dim = config.cap_feat_dim;
         let p = config.patch_size;
         let pf = config.f_patch_size;
         let patch_in_dim = pf * p * p * in_channels;
@@ -255,21 +253,21 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         for i in 0..config.n_refiner_layers {
             noise_refiner.push(load_dit_block::<T>(
                 &loader, &format!("noise_refiner.{}", i),
-                dim, n_heads, head_dim, intermediate_size, config.norm_eps, true, device,
+                dim, n_heads, head_dim, config.norm_eps, true, device,
             )?);
         }
         let mut context_refiner = Vec::with_capacity(config.n_refiner_layers);
         for i in 0..config.n_refiner_layers {
             context_refiner.push(load_dit_block::<T>(
                 &loader, &format!("context_refiner.{}", i),
-                dim, n_heads, head_dim, intermediate_size, config.norm_eps, false, device,
+                dim, n_heads, head_dim, config.norm_eps, false, device,
             )?);
         }
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             layers.push(load_dit_block::<T>(
                 &loader, &format!("layers.{}", i),
-                dim, n_heads, head_dim, intermediate_size, config.norm_eps, true, device,
+                dim, n_heads, head_dim, config.norm_eps, true, device,
             )?);
         }
 
@@ -535,7 +533,6 @@ fn load_dit_block<T: Dtype>(
     dim: usize,
     n_heads: usize,
     head_dim: usize,
-    hidden_dim: usize,
     norm_eps: f32,
     modulation: bool,
     device: &Cuda,

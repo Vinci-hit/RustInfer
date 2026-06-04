@@ -77,6 +77,15 @@ pub trait MemoryPort: Device {
     /// Wait for all pending async operations on this device's stream to
     /// complete. CPU implementations may make this a no-op.
     fn synchronize(&self) -> OpResult<()>;
+
+    /// Copy `size` bytes from one device buffer to another device buffer on the
+    /// same device. The buffers must not overlap — use `synchronize` + host
+    /// staging if overlap is required. CPU: `memcpy`; CUDA: `cudaMemcpy` D2D.
+    ///
+    /// # Safety
+    /// `dst` and `src` must be valid device pointers with at least `size`
+    /// bytes each. The memory regions must not overlap.
+    unsafe fn copy_device_to_device(&self, dst: NonNull<u8>, src: NonNull<u8>, size: usize) -> OpResult<()>;
 }
 
 /// Memory allocator port (legacy — kept for diffusion VAE buffer pool).
@@ -94,17 +103,24 @@ pub trait Allocator: Debug + Send + Sync {
 #[error("allocation failed: {0}")]
 pub struct AllocError(pub String);
 
-/// Operator backend port — defines WHAT each op does, not how.
+/// Core operator port — primitives shared by **all** model families
+/// (LLM decoders and diffusion pipelines alike).
 ///
-/// Infrastructure provides `impl OpBackend for Cpu` and `impl OpBackend for Cuda`.
+/// Infrastructure provides `impl CoreOps for Cpu` / `impl CoreOps for Cuda`.
 /// Every method MUST have a real implementation — no `Unsupported` allowed.
 ///
 /// Generic bounds use `Dtype` (not `Float`) so quantized types (i8, i4)
 /// can participate in mixed-precision operations (e.g. int8 weight × bf16 activation).
 ///
-/// `OpBackend: MemoryPort` so any backend can allocate / upload / download
+/// `CoreOps: MemoryPort` so any backend can allocate / upload / download
 /// (required for `Tensor::zeros`, `Tensor::from_host_slice`, `Tensor::to_host_vec`).
-pub trait OpBackend: MemoryPort {
+///
+/// Family-specific ops live in [`LlmOps`] (decoder / paged-KV) and
+/// [`DiffusionOps`] (conv / VAE / DiT). A backend only implements the
+/// trait(s) for the model families it actually runs; the type system then
+/// forbids constructing a model whose ops the backend lacks — at compile
+/// time, with no runtime `Unsupported` path.
+pub trait CoreOps: MemoryPort {
     // ─── Allocation ──────────────────────────────────────────────────
     /// Allocate a contiguous, zeroed tensor on this device. Default
     /// implementation routes through `MemoryPort` — overridable for
@@ -117,18 +133,11 @@ pub trait OpBackend: MemoryPort {
     fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()>;
     fn add_inplace<T: Dtype>(dst: &mut Tensor<T, Self>, src: &Tensor<T, Self>) -> OpResult<()>;
 
-    // ─── Normalization ───────────────────────────────────────────────
-    fn rmsnorm<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>, eps: f32) -> OpResult<()>;
-    fn rmsnorm_inplace<T: Dtype>(x: &mut Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32) -> OpResult<()>;
-
-    /// Fused: residual += input; output = rmsnorm(residual, weight, eps)
-    /// Saves one global memory pass vs separate add + rmsnorm.
-    fn fused_add_rmsnorm<T: Dtype>(
-        output: &mut Tensor<T, Self>,
-        residual: &mut Tensor<T, Self>,
-        input: &Tensor<T, Self>,
-        weight: &Tensor<T, Self>,
-        eps: f32,
+    // ─── Element-wise multiply ───────────────────────────────────────
+    fn ewise_mul<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
     // ─── Linear algebra ──────────────────────────────────────────────
@@ -150,6 +159,89 @@ pub trait OpBackend: MemoryPort {
 
     // ─── Activations ─────────────────────────────────────────────────
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;
+
+    // ─── Softmax ─────────────────────────────────────────────────────
+    fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()>;
+
+    // ─── Embedding ───────────────────────────────────────────────────
+    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()>;
+
+    // ─── Scalar ──────────────────────────────────────────────────────
+    fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()>;
+
+    /// `x += scalar` (in place).
+    fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()>;
+
+    /// CUDA-Graph-friendly scalar multiply: `x *= *d_scalar` where
+    /// `d_scalar` is a single-element f32 device tensor.
+    fn scalar_mul_inplace_from_dev<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        d_scalar: &Tensor<f32, Self>,
+    ) -> OpResult<()>;
+
+    // ─── Broadcast ───────────────────────────────────────────────────
+    /// In-place broadcast multiply: x[i,j] *= scale[j].
+    /// x: [rows, dim], scale: [dim] or [1, dim].
+    fn broadcast_mul_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        scale: &Tensor<T, Self>,
+    ) -> OpResult<()>;
+
+    /// In-place broadcast add: `x[i, j] += bias[j]` over a `[*, D]` tensor.
+    fn broadcast_add_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+    ) -> OpResult<()>;
+
+    // ─── Shape / layout ──────────────────────────────────────────────
+    /// Generic column slice: `dst[r, j] = src[r, col_offset + j]` for a
+    /// 2D src of shape `[rows, total_cols]` and dst `[rows, dst_cols]`.
+    fn split_cols<T: Dtype>(
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+        rows: usize,
+        total_cols: usize,
+        col_offset: usize,
+        dst_cols: usize,
+    ) -> OpResult<()>;
+
+    /// Concat two `[*, D]` tensors along dim 0 into a pre-allocated dst.
+    fn concat_seq<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()>;
+
+    /// Cast between dtypes within the same device.
+    fn cast_dtype<S: Dtype, D2: Dtype>(
+        src: &Tensor<S, Self>,
+        dst: &mut Tensor<D2, Self>,
+    ) -> OpResult<()>;
+}
+
+/// LLM decoder operator port — ops used by autoregressive decoder models
+/// (Llama3, Qwen3, Qwen3_5, …). These models share **all** of these ops;
+/// per-model differences (layer count, dims, weight layout) live in the
+/// model code, not here.
+///
+/// A backend that only serves LLMs implements `CoreOps + LlmOps` and can
+/// skip [`DiffusionOps`] entirely.
+pub trait LlmOps: CoreOps {
+    // ─── Normalization ───────────────────────────────────────────────
+    fn rmsnorm<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>, eps: f32) -> OpResult<()>;
+    fn rmsnorm_inplace<T: Dtype>(x: &mut Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32) -> OpResult<()>;
+
+    /// Fused: residual += input; output = rmsnorm(residual, weight, eps)
+    /// Saves one global memory pass vs separate add + rmsnorm.
+    fn fused_add_rmsnorm<T: Dtype>(
+        output: &mut Tensor<T, Self>,
+        residual: &mut Tensor<T, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()>;
+
+    // ─── Activations ─────────────────────────────────────────────────
     fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()>;
 
     /// Packed SwiGLU: `gate_up [rows, 2*inter]` → `out [rows, inter]`,
@@ -164,15 +256,6 @@ pub trait OpBackend: MemoryPort {
         rows: usize,
         inter: usize,
     ) -> OpResult<()>;
-
-    // ─── Softmax ─────────────────────────────────────────────────────
-    fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()>;
-
-    // ─── Scalar ──────────────────────────────────────────────────────
-    fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()>;
-
-    // ─── Embedding ───────────────────────────────────────────────────
-    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()>;
 
     // ─── RoPE ────────────────────────────────────────────────────────
     /// Apply Rotary Position Embedding in-place.
@@ -258,11 +341,15 @@ pub trait OpBackend: MemoryPort {
         cu_q_lens: &Tensor<i32, Self>,
         batch: usize,
     ) -> OpResult<Vec<i32>>;
+}
 
-    // ═══════════════════════════════════════════════════════════════════
-    // ─── Diffusion ops (Conv / Norm / Spatial) ─────────────────────────
-    // ═══════════════════════════════════════════════════════════════════
-
+/// Diffusion operator port — Conv / Norm / Spatial / DiT ops used by
+/// image-diffusion pipelines (Z_Image VAE + DiT + text encoder). No LLM
+/// decoder uses these.
+///
+/// A backend that only serves LLMs may skip implementing this trait; the
+/// type system then prevents constructing a diffusion model on that backend.
+pub trait DiffusionOps: CoreOps {
     // ─── Conv2D (VAE) ────────────────────────────────────────────────
     /// 2D convolution: input [N, Cin, H, W] × weight [Cout, Cin, Kh, Kw] → output [N, Cout, Hout, Wout]
     fn conv2d<T: Dtype>(
@@ -312,21 +399,6 @@ pub trait OpBackend: MemoryPort {
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
-    // ─── Broadcast multiply (adaLN) ──────────────────────────────────
-    /// In-place broadcast multiply: x[i,j] *= scale[j].
-    /// x: [rows, dim], scale: [dim] or [1, dim].
-    fn broadcast_mul_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>,
-        scale: &Tensor<T, Self>,
-    ) -> OpResult<()>;
-
-    // ─── Element-wise multiply ───────────────────────────────────────
-    fn ewise_mul<T: Dtype>(
-        a: &Tensor<T, Self>,
-        b: &Tensor<T, Self>,
-        dst: &mut Tensor<T, Self>,
-    ) -> OpResult<()>;
-
     // ─── SDPA for DiT (no KV cache, fixed seq len) ───────────────────
     /// Scaled dot-product attention for DiT blocks (self-attention, no cache).
     /// q/k/v: [seq_len, heads * head_dim], output: [seq_len, heads * head_dim]
@@ -362,8 +434,6 @@ pub trait OpBackend: MemoryPort {
         scale: f32,
     ) -> OpResult<()>;
 
-    // ─── Diffusion-only ops (no LLM use) ─────────────────────────────
-
     /// Interleaved RoPE for DiT — applies per-head rotation on
     /// `[seq, n_heads, head_dim]` from F32 cos/sin caches `[seq, head_dim/2]`.
     fn apply_rope_interleaved<T: Dtype>(
@@ -371,24 +441,6 @@ pub trait OpBackend: MemoryPort {
         cos: &Tensor<f32, Self>,
         sin: &Tensor<f32, Self>,
         head_dim: usize,
-    ) -> OpResult<()>;
-
-    /// Generic column slice: `dst[r, j] = src[r, col_offset + j]` for a
-    /// 2D src of shape `[rows, total_cols]` and dst `[rows, dst_cols]`.
-    fn split_cols<T: Dtype>(
-        src: &Tensor<T, Self>,
-        dst: &mut Tensor<T, Self>,
-        rows: usize,
-        total_cols: usize,
-        col_offset: usize,
-        dst_cols: usize,
-    ) -> OpResult<()>;
-
-    /// Concat two `[*, D]` tensors along dim 0 into a pre-allocated dst.
-    fn concat_seq<T: Dtype>(
-        a: &Tensor<T, Self>,
-        b: &Tensor<T, Self>,
-        dst: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
     /// `dst[..n] = src; dst[n..target] = pad_token`.
@@ -411,34 +463,19 @@ pub trait OpBackend: MemoryPort {
         keep_prefix: usize,
     ) -> OpResult<()>;
 
-    /// Cast between dtypes within the same device.
-    fn cast_dtype<S: Dtype, D2: Dtype>(
-        src: &Tensor<S, Self>,
-        dst: &mut Tensor<D2, Self>,
-    ) -> OpResult<()>;
-
-    /// `x += scalar` (in place).
-    fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()>;
-
     /// In-place SiLU activation (`x = x * sigmoid(x)`).
     fn silu_inplace_diff<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;
 
     /// In-place tanh activation.
     fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;
-
-    /// CUDA-Graph-friendly scalar multiply: `x *= *d_scalar` where
-    /// `d_scalar` is a single-element f32 device tensor.
-    fn scalar_mul_inplace_from_dev<T: Dtype>(
-        x: &mut Tensor<T, Self>,
-        d_scalar: &Tensor<f32, Self>,
-    ) -> OpResult<()>;
-
-    /// In-place broadcast add: `x[i, j] += bias[j]` over a `[*, D]` tensor.
-    fn broadcast_add_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>,
-        bias: &Tensor<T, Self>,
-    ) -> OpResult<()>;
 }
+
+/// Backward-compatible "all ops" alias. Code that is generic over an
+/// arbitrary backend supporting *everything* can keep using `D: OpBackend`.
+/// Implemented automatically for any backend that implements all three
+/// capability traits — no explicit `impl` required.
+pub trait OpBackend: CoreOps + LlmOps + DiffusionOps {}
+impl<D: CoreOps + LlmOps + DiffusionOps> OpBackend for D {}
 
 /// Operator-level error — no `Unsupported` variant.
 /// All ops must be implemented; if it can't run, it's a Shape or Kernel error.

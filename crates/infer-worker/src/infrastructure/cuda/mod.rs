@@ -18,9 +18,9 @@ pub use thread_stream::{get_current_cuda_stream, with_cuda_stream};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::domain::ports::{Device, MemoryPort, OpBackend, OpError, OpResult};
+use crate::domain::ports::{Device, MemoryPort, CoreOps, LlmOps, DiffusionOps, OpError, OpResult};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::{Dtype, Shape};
+use crate::domain::types::{Dtype};
 
 /// CUDA device — carries device_id + shared CudaConfig (handles, stream).
 #[derive(Debug, Clone)]
@@ -152,11 +152,35 @@ impl MemoryPort for Cuda {
         }
         Ok(())
     }
+
+    unsafe fn copy_device_to_device(&self, dst: NonNull<u8>, src: NonNull<u8>, size: usize) -> OpResult<()> {
+        if size == 0 { return Ok(()); }
+        let stream = self.config.stream;
+        // SAFETY: caller asserts dst/src are device ptrs with `size` bytes,
+        // and regions do not overlap.
+        unsafe {
+            let code = ffi::cudaMemcpyAsync(
+                dst.as_ptr() as *mut std::ffi::c_void,
+                src.as_ptr() as *const std::ffi::c_void,
+                size,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream,
+            );
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaMemcpyAsync D2D failed: {:?}", code)));
+            }
+            let code = ffi::cudaStreamSynchronize(stream);
+            if code != ffi::cudaError_cudaSuccess {
+                return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// OpBackend for Cuda — dispatches to CUDA kernels.
+/// CoreOps for Cuda — primitives shared by all model families.
 /// Each method fetches the stream from the tensor's device context.
-impl OpBackend for Cuda {
+impl CoreOps for Cuda {
     // alloc_tensor uses the default impl (Tensor::zeros via MemoryPort).
 
     fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
@@ -165,17 +189,10 @@ impl OpBackend for Cuda {
     fn add_inplace<T: Dtype>(dst: &mut Tensor<T, Self>, src: &Tensor<T, Self>) -> OpResult<()> {
         kernels::add::add_inplace(dst, src)
     }
-    fn rmsnorm<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>, eps: f32) -> OpResult<()> {
-        kernels::rmsnorm::rmsnorm(input, weight, output, eps)
-    }
-    fn rmsnorm_inplace<T: Dtype>(x: &mut Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32) -> OpResult<()> {
-        kernels::rmsnorm::rmsnorm_inplace(x, weight, eps)
-    }
-    fn fused_add_rmsnorm<T: Dtype>(
-        output: &mut Tensor<T, Self>, residual: &mut Tensor<T, Self>,
-        input: &Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32,
+    fn ewise_mul<T: Dtype>(
+        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::fused_add_rmsnorm::fused_add_rmsnorm(output, residual, input, weight, eps)
+        kernels::ewise_mul::ewise_mul(a, b, dst)
     }
     fn matmul<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::matmul::matmul(input, weight, output)
@@ -189,6 +206,73 @@ impl OpBackend for Cuda {
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::activation::silu_inplace(x)
     }
+    fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+        kernels::softmax::softmax(input, output)
+    }
+    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+        kernels::embedding::embedding(table, indices, output)
+    }
+    fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
+        kernels::scalar::scalar_mul_inplace(x, scalar)
+    }
+    fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
+        kernels::scalar::scalar_add_inplace(x, scalar)
+    }
+    fn scalar_mul_inplace_from_dev<T: Dtype>(
+        x: &mut Tensor<T, Self>, d_scalar: &Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        kernels::scalar::scalar_mul_inplace_from_dev(x, d_scalar)
+    }
+    fn broadcast_mul_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>, scale: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::broadcast_mul::broadcast_mul_inplace(x, scale)
+    }
+    fn broadcast_add_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>, bias: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::broadcast_mul::broadcast_add_inplace(x, bias)
+    }
+    fn split_cols<T: Dtype>(
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+        rows: usize,
+        total_cols: usize,
+        col_offset: usize,
+        dst_cols: usize,
+    ) -> OpResult<()> {
+        kernels::split_cols::split_cols(
+            src, dst,
+            rows as i32, total_cols as i32,
+            col_offset as i32, dst_cols as i32,
+        )
+    }
+    fn concat_seq<T: Dtype>(
+        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::concat_seq::concat_seq_into(a, b, dst)
+    }
+    fn cast_dtype<S: Dtype, D2: Dtype>(
+        src: &Tensor<S, Self>, dst: &mut Tensor<D2, Self>,
+    ) -> OpResult<()> {
+        kernels::cast_dtype::cast_dtype(src, dst)
+    }
+}
+
+/// LlmOps for Cuda — decoder + paged-KV kernels (Llama3 / Qwen3 / Qwen3_5).
+impl LlmOps for Cuda {
+    fn rmsnorm<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>, eps: f32) -> OpResult<()> {
+        kernels::rmsnorm::rmsnorm(input, weight, output, eps)
+    }
+    fn rmsnorm_inplace<T: Dtype>(x: &mut Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32) -> OpResult<()> {
+        kernels::rmsnorm::rmsnorm_inplace(x, weight, eps)
+    }
+    fn fused_add_rmsnorm<T: Dtype>(
+        output: &mut Tensor<T, Self>, residual: &mut Tensor<T, Self>,
+        input: &Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32,
+    ) -> OpResult<()> {
+        kernels::fused_add_rmsnorm::fused_add_rmsnorm(output, residual, input, weight, eps)
+    }
     fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()> {
         kernels::activation::swiglu_inplace(x, gate)
     }
@@ -197,15 +281,6 @@ impl OpBackend for Cuda {
         rows: usize, inter: usize,
     ) -> OpResult<()> {
         kernels::activation::swiglu_packed(gate_up, out, rows, inter)
-    }
-    fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::softmax::softmax(input, output)
-    }
-    fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        kernels::scalar::scalar_mul_inplace(x, scalar)
-    }
-    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::embedding::embedding(table, indices, output)
     }
     fn rope_inplace<T: Dtype>(
         q: &mut Tensor<T, Self>, k: &mut Tensor<T, Self>,
@@ -282,11 +357,10 @@ impl OpBackend for Cuda {
     ) -> OpResult<Vec<i32>> {
         kernels::argmax_batched::argmax_batched(logits, cu_q_lens, batch)
     }
+}
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Diffusion ops — CUDA dispatch
-    // ═══════════════════════════════════════════════════════════════════
-
+/// DiffusionOps for Cuda — Conv / Norm / Spatial / DiT kernels (Z_Image).
+impl DiffusionOps for Cuda {
     fn conv2d<T: Dtype>(
         input: &Tensor<T, Self>, weight: &Tensor<T, Self>,
         bias: Option<&Tensor<T, Self>>, output: &mut Tensor<T, Self>,
@@ -322,18 +396,6 @@ impl OpBackend for Cuda {
         kernels::upsample::upsample_nearest_2x(input, output)
     }
 
-    fn broadcast_mul_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>, scale: &Tensor<T, Self>,
-    ) -> OpResult<()> {
-        kernels::broadcast_mul::broadcast_mul_inplace(x, scale)
-    }
-
-    fn ewise_mul<T: Dtype>(
-        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        kernels::ewise_mul::ewise_mul(a, b, dst)
-    }
-
     fn sdpa<T: Dtype>(
         q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
@@ -359,27 +421,6 @@ impl OpBackend for Cuda {
         kernels::rope_interleaved::apply_rope_interleaved(x, cos, sin, head_dim)
     }
 
-    fn split_cols<T: Dtype>(
-        src: &Tensor<T, Self>,
-        dst: &mut Tensor<T, Self>,
-        rows: usize,
-        total_cols: usize,
-        col_offset: usize,
-        dst_cols: usize,
-    ) -> OpResult<()> {
-        kernels::split_cols::split_cols(
-            src, dst,
-            rows as i32, total_cols as i32,
-            col_offset as i32, dst_cols as i32,
-        )
-    }
-
-    fn concat_seq<T: Dtype>(
-        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        kernels::concat_seq::concat_seq_into(a, b, dst)
-    }
-
     fn pad_with_token<T: Dtype>(
         src: &Tensor<T, Self>, pad_token: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
@@ -398,34 +439,12 @@ impl OpBackend for Cuda {
         kernels::pad::overwrite_pad_tokens_inplace(dst, pad_token, keep_prefix)
     }
 
-    fn cast_dtype<S: Dtype, D2: Dtype>(
-        src: &Tensor<S, Self>, dst: &mut Tensor<D2, Self>,
-    ) -> OpResult<()> {
-        kernels::cast_dtype::cast_dtype(src, dst)
-    }
-
-    fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        kernels::scalar::scalar_add_inplace(x, scalar)
-    }
-
     fn silu_inplace_diff<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::scalar::silu_inplace(x)
     }
 
     fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::scalar::tanh_inplace(x)
-    }
-
-    fn scalar_mul_inplace_from_dev<T: Dtype>(
-        x: &mut Tensor<T, Self>, d_scalar: &Tensor<f32, Self>,
-    ) -> OpResult<()> {
-        kernels::scalar::scalar_mul_inplace_from_dev(x, d_scalar)
-    }
-
-    fn broadcast_add_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>, bias: &Tensor<T, Self>,
-    ) -> OpResult<()> {
-        kernels::broadcast_mul::broadcast_add_inplace(x, bias)
     }
 }
 

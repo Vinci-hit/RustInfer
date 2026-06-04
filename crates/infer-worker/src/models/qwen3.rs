@@ -1,12 +1,12 @@
 //! Qwen3 model — same as Llama3 + QK-norm before RoPE.
 
-use crate::domain::ports::{OpBackend, OpResult};
+use crate::domain::ports::{LlmOps, OpResult};
 use crate::domain::types::{Dtype, Shape, Strides};
 use crate::domain::tensor::Tensor;
 use crate::domain::model::{LlmModel, ForwardContext};
 use super::layers::{Linear, RMSNorm, Embedding};
 
-pub struct Qwen3Layer<T: Dtype, D: OpBackend> {
+pub struct Qwen3Layer<T: Dtype, D: LlmOps> {
     pub input_layernorm: RMSNorm<T, D>,
     pub post_attention_layernorm: RMSNorm<T, D>,
     pub qkv_proj: Linear<T, D>,
@@ -18,7 +18,7 @@ pub struct Qwen3Layer<T: Dtype, D: OpBackend> {
     pub k_norm: Option<RMSNorm<T, D>>,
 }
 
-pub struct Qwen3Model<T: Dtype, D: OpBackend> {
+pub struct Qwen3Model<T: Dtype, D: LlmOps> {
     pub embed_tokens: Embedding<T, D>,
     pub layers: Vec<Qwen3Layer<T, D>>,
     pub norm: RMSNorm<T, D>,
@@ -34,7 +34,7 @@ pub struct Qwen3Model<T: Dtype, D: OpBackend> {
     pub vocab_size: usize,
 }
 
-impl<T: Dtype, D: OpBackend> LlmModel<T, D> for Qwen3Model<T, D> {
+impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
     fn forward(
         &self,
         input_ids: &Tensor<i32, D>,

@@ -14,6 +14,7 @@ pub mod sampler;
 pub mod split_cols;
 pub mod scatter_kv_paged;
 pub mod argmax_batched;
+pub mod gather_merge;
 pub mod groupnorm;
 pub mod upsample;
 pub mod broadcast_mul;

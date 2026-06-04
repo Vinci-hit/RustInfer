@@ -25,19 +25,7 @@ unsafe extern "C" {
         stride_a: i64, stride_b: i64, stride_c: i64,
         batch: i32, stream: cudaStream_t,
     );
-    fn gemm_strided_batched_bf16_axb(
-        a: *const half::bf16, b: *const half::bf16, c: *mut half::bf16,
-        m: i32, n: i32, k: i32,
-        stride_a: i64, stride_b: i64, stride_c: i64,
-        batch: i32, stream: cudaStream_t,
-    );
     fn gemm_strided_batched_f32_axbt(
-        a: *const f32, b: *const f32, c: *mut f32,
-        m: i32, n: i32, k: i32,
-        stride_a: i64, stride_b: i64, stride_c: i64,
-        batch: i32, stream: cudaStream_t,
-    );
-    fn gemm_strided_batched_f32_axb(
         a: *const f32, b: *const f32, c: *mut f32,
         m: i32, n: i32, k: i32,
         stride_a: i64, stride_b: i64, stride_c: i64,
@@ -143,7 +131,7 @@ pub fn sdpa<T: Dtype>(
     let dev = q.device().clone();
 
     // ── 1. Permute Q [S, H, D] → [H, S, D] ──
-    let mut q_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+    let q_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
         q.data_ptr(), q_hsd.data_ptr_mut(),
         [seq as i64, num_heads as i64, head_dim as i64],
@@ -151,8 +139,8 @@ pub fn sdpa<T: Dtype>(
     )?;
 
     // ── 2. Permute K, V [S, Hkv, D] → [Hkv, S, D] ──
-    let mut k_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
-    let mut v_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
+    let k_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
+    let v_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
         k.data_ptr(), k_hsd_kv.data_ptr_mut(),
         [seq as i64, num_kv_heads as i64, head_dim as i64],
@@ -169,8 +157,8 @@ pub fn sdpa<T: Dtype>(
     let (k_hsd, v_hsd) = if group == 1 {
         (k_hsd_kv, v_hsd_kv)
     } else {
-        let mut k_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
-        let mut v_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+        let k_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+        let v_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
         let head_bytes = seq * head_dim * T::SIZE_BYTES;
         unsafe {
             for kv_hi in 0..num_kv_heads {
@@ -238,13 +226,13 @@ pub fn sdpa<T: Dtype>(
     //                   = sum_sk attn[h, sq, sk] * V_t[h, d, sk]
     //                   = (attn[h] @ V_t[h]^T)[sq, d]   ✓
     //   Permute v_hsd [H, S, D] → v_hds [H, D, S].
-    let mut v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
+    let v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
     permute_3d::<T>(
         v_hsd.data_ptr(), v_hds.data_ptr_mut(),
         [num_heads as i64, seq as i64, head_dim as i64],
         [0, 2, 1], stream,
     )?;
-    let mut out_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+    let out_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     let stride_attn = (seq * seq) as i64;
     let stride_v_hds = (head_dim * seq) as i64;
     let stride_out = (seq * head_dim) as i64;
@@ -342,14 +330,14 @@ pub fn sdpa_masked<T: Dtype>(
     let dev = q.device().clone();
 
     // ── 1. Permute Q [S, H, D] → [H, S, D] ──
-    let mut q_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+    let q_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
         q.data_ptr(), q_hsd.data_ptr_mut(),
         [seq as i64, num_heads as i64, head_dim as i64],
         [1, 0, 2], stream,
     )?;
-    let mut k_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
-    let mut v_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
+    let k_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
+    let v_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
         k.data_ptr(), k_hsd_kv.data_ptr_mut(),
         [seq as i64, num_kv_heads as i64, head_dim as i64],
@@ -365,8 +353,8 @@ pub fn sdpa_masked<T: Dtype>(
     let (k_hsd, v_hsd) = if group == 1 {
         (k_hsd_kv, v_hsd_kv)
     } else {
-        let mut k_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
-        let mut v_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+        let k_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+        let v_full: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
         let head_bytes = seq * head_dim * T::SIZE_BYTES;
         unsafe {
             for kv_hi in 0..num_kv_heads {
@@ -431,13 +419,13 @@ pub fn sdpa_masked<T: Dtype>(
     super::softmax::softmax(&scores, &mut attn)?;
 
     // out = attn @ V (via V permute to [H, D, S] + axbt)
-    let mut v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
+    let v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
     permute_3d::<T>(
         v_hsd.data_ptr(), v_hds.data_ptr_mut(),
         [num_heads as i64, seq as i64, head_dim as i64],
         [0, 2, 1], stream,
     )?;
-    let mut out_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
+    let out_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     let stride_attn = (seq * seq) as i64;
     let stride_v_hds = (head_dim * seq) as i64;
     let stride_out = (seq * head_dim) as i64;

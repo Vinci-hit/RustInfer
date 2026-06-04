@@ -293,6 +293,63 @@ impl<D: MemoryPort> BatchWorkspace<D> {
     /// Set `plan.block_size` after construction (the runner knows it).
     pub fn block_size(&self) -> usize { 0 } // sentinel; runner sets in plan
 
+    // ─── Bubble-free decode pipeline accessors ───────────────────────
+    //
+    // The pipelined decode loop merges the previous step's on-device token
+    // (C) into `input_ids` (A) with `gather_merge_input`, then launches the
+    // captured forward graph (which reads `input_ids` + the dynamic decode
+    // fields below at their stable addresses). Only the small per-step
+    // dynamic fields — positions / kv_lens / seq_positions — are uploaded
+    // each step; `input_ids` is produced on-device by the merge (no token
+    // round-trip), and `block_tables` is uploaded once for a fixed seq set.
+
+    /// Buffer **A**: the next step's `input_ids`. The merge kernel writes
+    /// here; the captured graph reads here. Address-stable.
+    pub fn input_ids_dev(&self) -> &Tensor<i32, D> { &self.input_ids }
+    pub fn input_ids_dev_mut(&mut self) -> &mut Tensor<i32, D> { &mut self.input_ids }
+
+    /// Device tensors for the per-step dynamic decode fields.
+    pub fn rope_positions_dev(&self) -> &Tensor<i32, D> { &self.rope_positions }
+    pub fn kv_lens_dev(&self) -> &Tensor<i32, D> { &self.kv_lens }
+    pub fn seq_positions_dev(&self) -> &Tensor<i32, D> { &self.seq_positions }
+
+    /// Stage the per-step dynamic decode fields into the long-lived host
+    /// buffers (owned for the runner's lifetime, so a following async
+    /// upload on any stream is safe). All three slices are `[batch]`.
+    ///
+    /// Returns `Err` if `batch` exceeds capacity.
+    pub fn stage_decode_dynamic(
+        &mut self,
+        positions: &[i32],
+        kv_lens: &[i32],
+        seq_positions: &[i32],
+    ) -> OpResult<()> {
+        let batch = positions.len();
+        if batch != kv_lens.len() || batch != seq_positions.len() {
+            return Err(OpError::Shape(format!(
+                "stage_decode_dynamic: mismatched lens pos={} kv={} seqpos={}",
+                positions.len(), kv_lens.len(), seq_positions.len(),
+            )));
+        }
+        if batch > self.cap_batch {
+            return Err(OpError::Shape(format!(
+                "stage_decode_dynamic: batch ({}) > cap ({})", batch, self.cap_batch,
+            )));
+        }
+        // Decode: one token per seq, so rope_positions prefix == [batch].
+        self.h_rope_positions[..batch].copy_from_slice(positions);
+        self.h_kv_lens[..batch].copy_from_slice(kv_lens);
+        self.h_seq_positions[..batch].copy_from_slice(seq_positions);
+        Ok(())
+    }
+
+    /// Host staging slices for the dynamic decode fields (read-only views
+    /// of what `stage_decode_dynamic` last wrote). Used by the runner to
+    /// drive a stream-targeted async H2D upload.
+    pub fn h_rope_positions(&self) -> &[i32] { &self.h_rope_positions }
+    pub fn h_kv_lens(&self) -> &[i32] { &self.h_kv_lens }
+    pub fn h_seq_positions(&self) -> &[i32] { &self.h_seq_positions }
+
     fn view_n(t: &Tensor<i32, D>, n: usize) -> Tensor<i32, D> {
         let strides = Shape::from_slice(&[n.max(1)]).contiguous_strides();
         t.view_raw(Shape::from_slice(&[n]), strides, 0, true)

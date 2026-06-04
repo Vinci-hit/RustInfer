@@ -1,19 +1,20 @@
-//! Reusable layer building blocks for LLM models.
+//! Reusable layer building blocks for LLM and diffusion models.
 //!
-//! These structs hold weights and dispatch through OpBackend.
-//! They are generic over `<T: Dtype, D: OpBackend>`.
+//! These structs hold weights and dispatch through the op-capability traits.
+//! Each struct is generic over the *minimal* trait it needs: `CoreOps` for
+//! primitives, `LlmOps` for decoder ops, `DiffusionOps` for conv/VAE/DiT.
 
-use crate::domain::ports::{OpBackend, OpResult};
+use crate::domain::ports::{CoreOps, LlmOps, DiffusionOps, OpResult};
 use crate::domain::types::Dtype;
 use crate::domain::tensor::Tensor;
 
 /// Linear layer: output = input @ weight^T + optional bias
-pub struct Linear<T: Dtype, D: OpBackend> {
+pub struct Linear<T: Dtype, D: CoreOps> {
     pub weight: Tensor<T, D>,
     pub bias: Option<Tensor<T, D>>,
 }
 
-impl<T: Dtype, D: OpBackend> Linear<T, D> {
+impl<T: Dtype, D: CoreOps> Linear<T, D> {
     pub fn new(weight: Tensor<T, D>, bias: Option<Tensor<T, D>>) -> Self {
         Self { weight, bias }
     }
@@ -33,26 +34,26 @@ impl<T: Dtype, D: OpBackend> Linear<T, D> {
 }
 
 /// Quantized linear layer (AWQ int4): output = dequant(input × weight_packed)
-pub struct QuantLinear<A: Dtype, W: Dtype, D: OpBackend> {
+pub struct QuantLinear<A: Dtype, W: Dtype, D: CoreOps> {
     pub weight_packed: Tensor<W, D>,
     pub scales: Tensor<A, D>,
     pub zeros: Option<Tensor<W, D>>,
     pub group_size: usize,
 }
 
-impl<A: Dtype, W: Dtype, D: OpBackend> QuantLinear<A, W, D> {
+impl<A: Dtype, W: Dtype, D: CoreOps> QuantLinear<A, W, D> {
     pub fn forward(&self, input: &Tensor<A, D>, output: &mut Tensor<A, D>) -> OpResult<()> {
         D::matmul_quant(input, &self.weight_packed, output, &self.scales, self.zeros.as_ref(), self.group_size)
     }
 }
 
 /// RMSNorm layer
-pub struct RMSNorm<T: Dtype, D: OpBackend> {
+pub struct RMSNorm<T: Dtype, D: LlmOps> {
     pub weight: Tensor<T, D>,
     pub eps: f32,
 }
 
-impl<T: Dtype, D: OpBackend> RMSNorm<T, D> {
+impl<T: Dtype, D: LlmOps> RMSNorm<T, D> {
     pub fn new(weight: Tensor<T, D>, eps: f32) -> Self { Self { weight, eps } }
 
     pub fn forward(&self, input: &Tensor<T, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
@@ -65,11 +66,11 @@ impl<T: Dtype, D: OpBackend> RMSNorm<T, D> {
 }
 
 /// Embedding table
-pub struct Embedding<T: Dtype, D: OpBackend> {
+pub struct Embedding<T: Dtype, D: CoreOps> {
     pub table: Tensor<T, D>,
 }
 
-impl<T: Dtype, D: OpBackend> Embedding<T, D> {
+impl<T: Dtype, D: CoreOps> Embedding<T, D> {
     pub fn forward(&self, indices: &Tensor<i32, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
         D::embedding(&self.table, indices, output)
     }
@@ -80,14 +81,14 @@ impl<T: Dtype, D: OpBackend> Embedding<T, D> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Conv2D layer (for VAE decoder/encoder)
-pub struct Conv2D<T: Dtype, D: OpBackend> {
+pub struct Conv2D<T: Dtype, D: DiffusionOps> {
     pub weight: Tensor<T, D>,   // [Cout, Cin, Kh, Kw]
     pub bias: Option<Tensor<T, D>>,
     pub stride: usize,
     pub padding: usize,
 }
 
-impl<T: Dtype, D: OpBackend> Conv2D<T, D> {
+impl<T: Dtype, D: DiffusionOps> Conv2D<T, D> {
     pub fn new(weight: Tensor<T, D>, bias: Option<Tensor<T, D>>, stride: usize, padding: usize) -> Self {
         Self { weight, bias, stride, padding }
     }
@@ -98,14 +99,14 @@ impl<T: Dtype, D: OpBackend> Conv2D<T, D> {
 }
 
 /// GroupNorm layer (for VAE)
-pub struct GroupNorm<T: Dtype, D: OpBackend> {
+pub struct GroupNorm<T: Dtype, D: DiffusionOps> {
     pub weight: Tensor<T, D>,
     pub bias: Tensor<T, D>,
     pub num_groups: usize,
     pub eps: f32,
 }
 
-impl<T: Dtype, D: OpBackend> GroupNorm<T, D> {
+impl<T: Dtype, D: DiffusionOps> GroupNorm<T, D> {
     pub fn new(weight: Tensor<T, D>, bias: Tensor<T, D>, num_groups: usize, eps: f32) -> Self {
         Self { weight, bias, num_groups, eps }
     }
@@ -121,13 +122,13 @@ impl<T: Dtype, D: OpBackend> GroupNorm<T, D> {
 }
 
 /// LayerNorm layer (for DiT — different from RMSNorm: uses mean+variance)
-pub struct LayerNorm<T: Dtype, D: OpBackend> {
+pub struct LayerNorm<T: Dtype, D: DiffusionOps> {
     pub weight: Tensor<T, D>,
     pub bias: Tensor<T, D>,
     pub eps: f32,
 }
 
-impl<T: Dtype, D: OpBackend> LayerNorm<T, D> {
+impl<T: Dtype, D: DiffusionOps> LayerNorm<T, D> {
     pub fn new(weight: Tensor<T, D>, bias: Tensor<T, D>, eps: f32) -> Self {
         Self { weight, bias, eps }
     }

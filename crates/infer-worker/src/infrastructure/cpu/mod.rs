@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use half::{bf16, f16};
 
 use crate::domain::ports::{
-    Allocator, AllocError, Device, HostDevice, MemoryPort, OpBackend, OpError, OpResult,
+    Allocator, AllocError, Device, HostDevice, MemoryPort, CoreOps, LlmOps, DiffusionOps, OpError, OpResult,
 };
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype, Shape};
@@ -68,6 +68,13 @@ impl MemoryPort for Cpu {
     }
 
     fn synchronize(&self) -> OpResult<()> { Ok(()) }
+
+    unsafe fn copy_device_to_device(&self, dst: NonNull<u8>, src: NonNull<u8>, size: usize) -> OpResult<()> {
+        // SAFETY: caller guarantees dst/src are valid device (host) pointers,
+        // size is correct, and regions do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), size) };
+        Ok(())
+    }
 }
 
 // ─── Cpu Allocator (legacy, used by VAE pool) ────────────────────────────────
@@ -120,9 +127,10 @@ impl<T: Dtype> Tensor<T, Cpu> {
     }
 }
 
-// ─── OpBackend for Cpu ───────────────────────────────────────────────────────
+// ─── CoreOps for Cpu ─────────────────────────────────────────────────────────
+// Primitives shared by every model family.
 
-impl OpBackend for Cpu {
+impl CoreOps for Cpu {
     fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
         check_contiguous3(a, b, dst)?;
         check_numel3(a, b, dst)?;
@@ -143,6 +151,180 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
+    fn ewise_mul<T: Dtype>(
+        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        for i in 0..a.numel() {
+            unsafe {
+                let va = read_f64(a.data_ptr().add(i));
+                let vb = read_f64(b.data_ptr().add(i));
+                write_f64(dst.data_ptr_mut().add(i), va * vb);
+            }
+        }
+        Ok(())
+    }
+
+    fn matmul<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+        let m = input.shape().as_slice()[0];
+        let k = input.shape().as_slice()[1];
+        let n = weight.shape().as_slice()[0];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    unsafe {
+                        sum += read_f64(input.data_ptr().add(i * k + p)) * read_f64(weight.data_ptr().add(j * k + p));
+                    }
+                }
+                unsafe { write_f64(output.data_ptr_mut().add(i * n + j), sum) };
+            }
+        }
+        Ok(())
+    }
+
+    fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
+        input: &Tensor<A, Self>, weight: &Tensor<W, Self>, output: &mut Tensor<O, Self>,
+        scales: &Tensor<A, Self>, _zeros: Option<&Tensor<W, Self>>, group_size: usize,
+    ) -> OpResult<()> {
+        // CPU reference: dequantize weight per group, then matmul
+        let m = input.shape().as_slice()[0];
+        let k = input.shape().as_slice()[1];
+        let n = weight.shape().as_slice()[0];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    let group = p / group_size;
+                    let scale = unsafe { read_f64(scales.data_ptr().add(j * (k / group_size) + group)) };
+                    let w = unsafe { read_f64(weight.data_ptr().add(j * k + p)) };
+                    let a = unsafe { read_f64(input.data_ptr().add(i * k + p)) };
+                    sum += a * w * scale;
+                }
+                unsafe { write_f64(output.data_ptr_mut().add(i * n + j), sum) };
+            }
+        }
+        Ok(())
+    }
+
+    fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
+        for i in 0..x.numel() {
+            unsafe {
+                let v = read_f64((x.data_ptr() as *const T).add(i));
+                write_f64(x.data_ptr_mut().add(i), v / (1.0 + (-v).exp()));
+            }
+        }
+        Ok(())
+    }
+
+    fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+        let dim = *input.shape().as_slice().last().unwrap();
+        let rows = input.numel() / dim;
+        for row in 0..rows {
+            let off = row * dim;
+            let mut max_v = f64::NEG_INFINITY;
+            for i in 0..dim { unsafe { let v = read_f64(input.data_ptr().add(off + i)); if v > max_v { max_v = v; } } }
+            let mut sum = 0.0f64;
+            for i in 0..dim {
+                unsafe {
+                    let e = (read_f64(input.data_ptr().add(off + i)) - max_v).exp();
+                    write_f64(output.data_ptr_mut().add(off + i), e);
+                    sum += e;
+                }
+            }
+            for i in 0..dim {
+                unsafe {
+                    let v = read_f64((output.data_ptr() as *const T).add(off + i));
+                    write_f64(output.data_ptr_mut().add(off + i), v / sum);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+        let dim = table.shape().as_slice()[1];
+        let seq_len = indices.numel();
+        let idx_slice = unsafe { std::slice::from_raw_parts(indices.data_ptr(), seq_len) };
+        for i in 0..seq_len {
+            let idx = idx_slice[i] as usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (table.data_ptr() as *const u8).add(idx * dim * T::SIZE_BYTES),
+                    (output.data_ptr_mut() as *mut u8).add(i * dim * T::SIZE_BYTES),
+                    dim * T::SIZE_BYTES,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
+        for i in 0..x.numel() {
+            unsafe {
+                let v = read_f64((x.data_ptr() as *const T).add(i));
+                write_f64(x.data_ptr_mut().add(i), v * scalar);
+            }
+        }
+        Ok(())
+    }
+
+    fn broadcast_mul_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>, scale: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let dim = scale.numel();
+        let rows = x.numel() / dim;
+        for row in 0..rows {
+            for i in 0..dim {
+                unsafe {
+                    let v = read_f64((x.data_ptr() as *const T).add(row * dim + i));
+                    let s = read_f64(scale.data_ptr().add(i));
+                    write_f64(x.data_ptr_mut().add(row * dim + i), v * s);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn scalar_add_inplace<T: Dtype>(_x: &mut Tensor<T, Self>, _scalar: f64) -> OpResult<()> {
+        Err(OpError::Kernel("scalar_add_inplace: CPU not implemented".into()))
+    }
+
+    fn scalar_mul_inplace_from_dev<T: Dtype>(
+        _x: &mut Tensor<T, Self>, _d_scalar: &Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("scalar_mul_inplace_from_dev: CPU not implemented".into()))
+    }
+
+    fn broadcast_add_inplace<T: Dtype>(
+        _x: &mut Tensor<T, Self>, _bias: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("broadcast_add_inplace: CPU not implemented".into()))
+    }
+
+    fn split_cols<T: Dtype>(
+        _src: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
+        _rows: usize, _total_cols: usize, _col_offset: usize, _dst_cols: usize,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("split_cols: CPU not implemented".into()))
+    }
+
+    fn concat_seq<T: Dtype>(
+        _a: &Tensor<T, Self>, _b: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("concat_seq: CPU not implemented".into()))
+    }
+
+    fn cast_dtype<S: Dtype, D2: Dtype>(
+        _src: &Tensor<S, Self>, _dst: &mut Tensor<D2, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::Kernel("cast_dtype: CPU not implemented".into()))
+    }
+}
+
+// ─── LlmOps for Cpu ──────────────────────────────────────────────────────────
+// Decoder + paged-KV ops shared by Llama3 / Qwen3 / Qwen3_5.
+
+impl LlmOps for Cpu {
     fn rmsnorm<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>, eps: f32) -> OpResult<()> {
         let dim = *input.shape().as_slice().last().unwrap();
         let rows = input.numel() / dim;
@@ -216,58 +398,6 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
-    fn matmul<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        let m = input.shape().as_slice()[0];
-        let k = input.shape().as_slice()[1];
-        let n = weight.shape().as_slice()[0];
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0f64;
-                for p in 0..k {
-                    unsafe {
-                        sum += read_f64(input.data_ptr().add(i * k + p)) * read_f64(weight.data_ptr().add(j * k + p));
-                    }
-                }
-                unsafe { write_f64(output.data_ptr_mut().add(i * n + j), sum) };
-            }
-        }
-        Ok(())
-    }
-
-    fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
-        input: &Tensor<A, Self>, weight: &Tensor<W, Self>, output: &mut Tensor<O, Self>,
-        scales: &Tensor<A, Self>, _zeros: Option<&Tensor<W, Self>>, group_size: usize,
-    ) -> OpResult<()> {
-        // CPU reference: dequantize weight per group, then matmul
-        let m = input.shape().as_slice()[0];
-        let k = input.shape().as_slice()[1];
-        let n = weight.shape().as_slice()[0];
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0f64;
-                for p in 0..k {
-                    let group = p / group_size;
-                    let scale = unsafe { read_f64(scales.data_ptr().add(j * (k / group_size) + group)) };
-                    let w = unsafe { read_f64(weight.data_ptr().add(j * k + p)) };
-                    let a = unsafe { read_f64(input.data_ptr().add(i * k + p)) };
-                    sum += a * w * scale;
-                }
-                unsafe { write_f64(output.data_ptr_mut().add(i * n + j), sum) };
-            }
-        }
-        Ok(())
-    }
-
-    fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        for i in 0..x.numel() {
-            unsafe {
-                let v = read_f64((x.data_ptr() as *const T).add(i));
-                write_f64(x.data_ptr_mut().add(i), v / (1.0 + (-v).exp()));
-            }
-        }
-        Ok(())
-    }
-
     fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()> {
         for i in 0..x.numel() {
             unsafe {
@@ -293,58 +423,6 @@ impl OpBackend for Cpu {
                     let silu = g / (1.0 + (-g).exp());
                     write_f64(out.data_ptr_mut().add(r * inter + d), silu * u);
                 }
-            }
-        }
-        Ok(())
-    }
-
-    fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        let dim = *input.shape().as_slice().last().unwrap();
-        let rows = input.numel() / dim;
-        for row in 0..rows {
-            let off = row * dim;
-            let mut max_v = f64::NEG_INFINITY;
-            for i in 0..dim { unsafe { let v = read_f64(input.data_ptr().add(off + i)); if v > max_v { max_v = v; } } }
-            let mut sum = 0.0f64;
-            for i in 0..dim {
-                unsafe {
-                    let e = (read_f64(input.data_ptr().add(off + i)) - max_v).exp();
-                    write_f64(output.data_ptr_mut().add(off + i), e);
-                    sum += e;
-                }
-            }
-            for i in 0..dim {
-                unsafe {
-                    let v = read_f64((output.data_ptr() as *const T).add(off + i));
-                    write_f64(output.data_ptr_mut().add(off + i), v / sum);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        for i in 0..x.numel() {
-            unsafe {
-                let v = read_f64((x.data_ptr() as *const T).add(i));
-                write_f64(x.data_ptr_mut().add(i), v * scalar);
-            }
-        }
-        Ok(())
-    }
-
-    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        let dim = table.shape().as_slice()[1];
-        let seq_len = indices.numel();
-        let idx_slice = unsafe { std::slice::from_raw_parts(indices.data_ptr(), seq_len) };
-        for i in 0..seq_len {
-            let idx = idx_slice[i] as usize;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (table.data_ptr() as *const u8).add(idx * dim * T::SIZE_BYTES),
-                    (output.data_ptr_mut() as *mut u8).add(i * dim * T::SIZE_BYTES),
-                    dim * T::SIZE_BYTES,
-                );
             }
         }
         Ok(())
@@ -575,11 +653,13 @@ impl OpBackend for Cpu {
         }
         Ok(out)
     }
+}
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Diffusion ops — CPU reference implementations
-    // ═══════════════════════════════════════════════════════════════════
+// ─── DiffusionOps for Cpu ────────────────────────────────────────────────────
+// Conv / Norm / Spatial / DiT ops. Most are CPU reference or unimplemented —
+// the diffusion pipeline runs on CUDA only (per project decision).
 
+impl DiffusionOps for Cpu {
     fn conv2d<T: Dtype>(
         input: &Tensor<T, Self>, weight: &Tensor<T, Self>,
         bias: Option<&Tensor<T, Self>>, output: &mut Tensor<T, Self>,
@@ -754,36 +834,6 @@ impl OpBackend for Cpu {
         Ok(())
     }
 
-    fn broadcast_mul_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>, scale: &Tensor<T, Self>,
-    ) -> OpResult<()> {
-        let dim = scale.numel();
-        let rows = x.numel() / dim;
-        for row in 0..rows {
-            for i in 0..dim {
-                unsafe {
-                    let v = read_f64((x.data_ptr() as *const T).add(row * dim + i));
-                    let s = read_f64(scale.data_ptr().add(i));
-                    write_f64(x.data_ptr_mut().add(row * dim + i), v * s);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn ewise_mul<T: Dtype>(
-        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        for i in 0..a.numel() {
-            unsafe {
-                let va = read_f64(a.data_ptr().add(i));
-                let vb = read_f64(b.data_ptr().add(i));
-                write_f64(dst.data_ptr_mut().add(i), va * vb);
-            }
-        }
-        Ok(())
-    }
-
     fn sdpa<T: Dtype>(
         q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
@@ -849,19 +899,6 @@ impl OpBackend for Cpu {
         Err(OpError::Kernel("apply_rope_interleaved: CPU not implemented".into()))
     }
 
-    fn split_cols<T: Dtype>(
-        _src: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
-        _rows: usize, _total_cols: usize, _col_offset: usize, _dst_cols: usize,
-    ) -> OpResult<()> {
-        Err(OpError::Kernel("split_cols: CPU not implemented".into()))
-    }
-
-    fn concat_seq<T: Dtype>(
-        _a: &Tensor<T, Self>, _b: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        Err(OpError::Kernel("concat_seq: CPU not implemented".into()))
-    }
-
     fn pad_with_token<T: Dtype>(
         _src: &Tensor<T, Self>, _pad_token: &Tensor<T, Self>, _dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
@@ -880,34 +917,12 @@ impl OpBackend for Cpu {
         Err(OpError::Kernel("overwrite_pad_tokens_inplace: CPU not implemented".into()))
     }
 
-    fn cast_dtype<S: Dtype, D2: Dtype>(
-        _src: &Tensor<S, Self>, _dst: &mut Tensor<D2, Self>,
-    ) -> OpResult<()> {
-        Err(OpError::Kernel("cast_dtype: CPU not implemented".into()))
-    }
-
-    fn scalar_add_inplace<T: Dtype>(_x: &mut Tensor<T, Self>, _scalar: f64) -> OpResult<()> {
-        Err(OpError::Kernel("scalar_add_inplace: CPU not implemented".into()))
-    }
-
     fn silu_inplace_diff<T: Dtype>(_x: &mut Tensor<T, Self>) -> OpResult<()> {
         Err(OpError::Kernel("silu_inplace_diff: CPU not implemented".into()))
     }
 
     fn tanh_inplace<T: Dtype>(_x: &mut Tensor<T, Self>) -> OpResult<()> {
         Err(OpError::Kernel("tanh_inplace: CPU not implemented".into()))
-    }
-
-    fn scalar_mul_inplace_from_dev<T: Dtype>(
-        _x: &mut Tensor<T, Self>, _d_scalar: &Tensor<f32, Self>,
-    ) -> OpResult<()> {
-        Err(OpError::Kernel("scalar_mul_inplace_from_dev: CPU not implemented".into()))
-    }
-
-    fn broadcast_add_inplace<T: Dtype>(
-        _x: &mut Tensor<T, Self>, _bias: &Tensor<T, Self>,
-    ) -> OpResult<()> {
-        Err(OpError::Kernel("broadcast_add_inplace: CPU not implemented".into()))
     }
 }
 

@@ -5,16 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{OpResult, OpError, OpBackend};
+use crate::domain::ports::{OpResult, OpError, CoreOps};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
 
 use super::scheduler::FlowMatchEulerScheduler;
-use super::state::{DitState, DitShapeSpec, PipelineState, ZImageCapacity, LATENT_CHANNELS, ADALN_EMBED_DIM};
+use super::state::{DitState, DitShapeSpec, PipelineState, ZImageCapacity, LATENT_CHANNELS};
 use super::text_encoder::{Qwen3TextEncoder, TEXT_ENCODER_MAX_SEQ_LEN, PAD_TOKEN_ID, apply_chat_template};
-use super::transformer::{ZImageTransformer, ZImageTransformerConfig};
-use super::vae_decoder::{VaeDecoder, VaeConfig};
+use super::transformer::{ZImageTransformer};
+use super::vae_decoder::{VaeDecoder};
 
 /// Load a `[16, 1, H, W]` (or `[1, 16, H, W]`) F32 NPY file into a
 /// `Tensor<T, Cuda>` of shape `[1, 16, H, W]` (cast to T).
@@ -33,7 +33,7 @@ fn load_latent_from_npy<T: Dtype>(
     let header_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
     // Data starts at offset 10 + header_len.
     let data_start = 10 + header_len;
-    let elem_bytes = (buf.len() - data_start);
+    let elem_bytes = buf.len() - data_start;
     let n_f32 = elem_bytes / 4;
     let expected = LATENT_CHANNELS * latent_h * latent_w;
     if n_f32 != expected {
@@ -241,12 +241,12 @@ impl<T: Dtype> ZImagePipeline<T> {
                 self.scheduler.set_timesteps_default(params.num_inference_steps, Some(img_seq_len));
             }
         }
-        let n_steps = self.scheduler.num_steps();
+        let _n_steps = self.scheduler.num_steps();
 
         // 4. Denoise loop.
         let t_scale = self.transformer.config.t_scale;
         let timesteps: Vec<f32> = self.scheduler.timesteps().to_vec();
-        let in_channels = self.transformer.config.in_channels;
+        let _in_channels = self.transformer.config.in_channels;
         for (i, &t) in timesteps.iter().enumerate() {
             // diffusers Z-Image: norm_t = (1 - t/1000), t_scaled = norm_t * t_scale.
             let norm_t = (1000.0 - t) / 1000.0;

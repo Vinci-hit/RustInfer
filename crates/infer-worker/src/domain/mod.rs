@@ -19,7 +19,7 @@ pub mod runtime;
 pub use types::{Shape, Strides, Dims, Dtype, DataType, MAX_RANK};
 pub use storage::Storage;
 pub use tensor::Tensor;
-pub use ports::{Device, Allocator, HostDevice, MemoryPort, OpBackend, OpError, OpResult};
+pub use ports::{Device, Allocator, HostDevice, MemoryPort, CoreOps, LlmOps, DiffusionOps, OpBackend, OpError, OpResult};
 pub use batch::{BatchKind, BatchPlan, PagedKvLayer, PagedKvPool, RAGGED_Q_TILE};
 pub use global_kv_alloc::{AllocFull, GlobalKvAllocator};
 pub use batch_workspace::{BatchWorkspace, WsSeqStep};
