@@ -4,4 +4,3 @@ pub mod cpu;
 pub mod cuda;
 pub mod io;
 pub mod transport;
-pub mod sync_flags;

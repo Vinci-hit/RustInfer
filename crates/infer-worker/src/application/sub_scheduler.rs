@@ -25,7 +25,6 @@ use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, SamplingParams};
 use infer_protocol::worker_to_scheduler_data::{StepOutput, GeneratedToken};
 
 use crate::domain::global_kv_alloc::{AllocFull, GlobalKvAllocator};
-use crate::infrastructure::sync_flags::SyncFlags;
 
 /// 单步最大 batch 容量。
 pub const MAX_BATCH_SEQS: usize = 256;
@@ -115,8 +114,6 @@ pub struct SubScheduler {
     pub pending_prefills: VecDeque<PrefillBatchCmd>,
     /// 上一步提交的 batch 元信息（用于解释 output）。
     pub last_batch: Option<StepBatch>,
-    /// Step buffer 握手.
-    pub sync: SyncFlags,
     /// Max capacity config.
     pub max_batch_tokens: usize,
     pub max_batch_seqs: usize,
@@ -156,7 +153,6 @@ impl SubScheduler {
             active_decodes: Vec::new(),
             pending_prefills: VecDeque::new(),
             last_batch: None,
-            sync: SyncFlags::new(),
             max_batch_tokens,
             max_batch_seqs,
             kv_alloc: None,
