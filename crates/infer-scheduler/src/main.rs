@@ -64,8 +64,8 @@ struct Args {
     #[arg(long, default_value = "llm")]
     mode: String,
 
-    /// Paged KV block size (tokens per block). Default 16.
-    #[arg(long, default_value_t = 16)]
+    /// Paged KV block size (tokens per block). Default 1.
+    #[arg(long, default_value_t = 1)]
     paged_block_size: usize,
 
     /// Chunked prefill: max tokens per prefill chunk.
@@ -84,8 +84,8 @@ struct Args {
 }
 
 fn parse_block_size(s: usize) -> BlockSize {
-    let raw = u32::try_from(s).unwrap_or(16);
-    BlockSize::new(if raw == 0 { 16 } else { raw })
+    let raw = u32::try_from(s).unwrap_or(1);
+    BlockSize::new(if raw == 0 { 1 } else { raw })
 }
 
 #[tokio::main]
@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
         pp_size: 1,
         kv_cache_mode: Some(format!("paged:{}", paged_block_size.raw())),
         kv_cache_memory_fraction: Some(args.mem_fraction_static),
+        enable_prefix_caching: args.enable_prefix_caching,
     });
 
     // Bind the control-plane ROUTER, optionally assign a model, then

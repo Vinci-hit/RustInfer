@@ -105,6 +105,7 @@ mod tests {
             priority: Priority(priority),
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
             arrival_time: Instant::now(),
         });

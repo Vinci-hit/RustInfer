@@ -11,24 +11,31 @@ use crate::domain::policy::token_budget::TokenBudget;
 ///
 /// The scheduler **does not schedule decodes** — the worker's
 /// sub-scheduler decides which decoding sequences run next. We still
-/// track `num_prefilling` so the policy knows how many sequence slots
-/// are already burned, and `prefilling_continuations` so chunked
-/// prefill can produce a continuation segment. Decoding sequences are
-/// "owned" by the worker; the scheduler only routes their tokens back
-/// to clients and answers cancel/heartbeat events for them.
+/// track `num_prefilling` and `num_decoding` so the policy knows how
+/// many sequence slots are already burned, and `prefilling_continuations`
+/// so chunked prefill can produce a continuation segment. Decoding
+/// sequences are "owned" by the worker for stepping, but they still
+/// occupy a batch slot, so admission must count them.
 pub struct RunningSet {
     /// Number of sequences currently in prefill phase.
     pub num_prefilling: usize,
+    /// Number of sequences currently decoding on the worker. These still
+    /// occupy a sequence slot in the worker's batch even though the worker
+    /// drives their decode steps, so admission must count them.
+    pub num_decoding: usize,
     /// Prefilling sequences that need continuation chunks this iteration.
     /// Each entry is (request_id, remaining_tokens_in_prompt).
     pub prefilling_continuations: Vec<(RequestId, usize)>,
 }
 
 impl RunningSet {
-    /// Total number of sessions the policy must reason about. Decoding
-    /// is not part of this count — the worker schedules those itself.
+    /// Total number of sequence slots already occupied in the worker's
+    /// batch. Both prefilling and decoding sequences hold a slot, so the
+    /// seq-admission budget (`max_seqs - total()`) must include both —
+    /// otherwise the worker's batch can overshoot `max_num_seqs` and the
+    /// decode `build_plan` rejects the oversized batch, failing requests.
     pub fn total(&self) -> usize {
-        self.num_prefilling
+        self.num_prefilling + self.num_decoding
     }
 }
 

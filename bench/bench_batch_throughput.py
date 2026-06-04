@@ -31,15 +31,22 @@ class Result:
     text: str
 
 
-async def send_one(session, url, prompt, max_tokens):
+async def send_one(session, url, prompt, max_tokens, model="llama3.2-1b", ignore_eos=False):
     payload = {
-        "model": "llama3.2-1b",
+        "model": model,
         "messages": [
             {"role": "user", "content": prompt}
         ],
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
+    if ignore_eos:
+        # Force exactly max_tokens of generation on both engines so the
+        # throughput comparison measures equal work (vLLM + RustInfer both
+        # accept this field). Without it, greedy decode stops at EOS and
+        # short-answer prompts produce wildly different token counts.
+        payload["ignore_eos"] = True
+        payload["min_tokens"] = max_tokens
     start = time.perf_counter()
     async with session.post(
         f"{url}/v1/chat/completions", json=payload,
@@ -54,11 +61,11 @@ async def send_one(session, url, prompt, max_tokens):
     return Result(prompt, usage["completion_tokens"], elapsed, text)
 
 
-async def run_batch(url, prompts, max_tokens):
+async def run_batch(url, prompts, max_tokens, model="llama3.2-1b", ignore_eos=False):
     """Send len(prompts) requests concurrently, return list of Result."""
     async with aiohttp.ClientSession() as session:
         t0 = time.perf_counter()
-        tasks = [send_one(session, url, p, max_tokens) for p in prompts]
+        tasks = [send_one(session, url, p, max_tokens, model, ignore_eos) for p in prompts]
         results = await asyncio.gather(*tasks)
         wall = time.perf_counter() - t0
     return wall, results
@@ -80,6 +87,11 @@ async def main():
     ap.add_argument("--batches", default="1,2,4,8,16,32")
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--label", default="llama3.2-1b")
+    ap.add_argument("--model", default="llama3.2-1b",
+                    help="Model name sent in the API request payload")
+    ap.add_argument("--ignore-eos", action="store_true",
+                    help="Force exactly max_tokens of generation on both engines "
+                         "(sends ignore_eos+min_tokens) for an equal-work comparison")
     ap.add_argument("--output", default="/tmp/bench_results.json",
                     help="Save full results (with generated text) for quality check")
     args = ap.parse_args()
@@ -91,7 +103,7 @@ async def main():
     # Warmup — need longer outputs to stabilize cuBLASLt algo selection
     if args.warmup > 0:
         async with aiohttp.ClientSession() as session:
-            warm = [send_one(session, args.url, "Write a detailed explanation of how computers work.", 100) for _ in range(5)]
+            warm = [send_one(session, args.url, "Write a detailed explanation of how computers work.", 100, args.model, args.ignore_eos) for _ in range(5)]
             await asyncio.gather(*warm)
         print(f"warmup: 5 requests x 100 tokens done")
 
@@ -101,7 +113,7 @@ async def main():
 
     for bs in batch_sizes:
         prompts = pick_prompts(pool, bs)
-        wall, results = await run_batch(args.url, prompts, args.max_tokens)
+        wall, results = await run_batch(args.url, prompts, args.max_tokens, args.model, args.ignore_eos)
         total_completion = sum(r.completion_tokens for r in results)
         per_req_lat = [r.latency_s for r in results]
         per_req_tok = [r.completion_tokens / r.latency_s for r in results]

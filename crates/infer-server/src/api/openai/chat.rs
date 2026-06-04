@@ -29,7 +29,9 @@ pub async fn chat_completions(
     validate_request(&req)?;
 
     // 2. 应用 chat template → 生成 prompt 文本
-    let template = get_template(&req.model);
+    //    模板必须基于服务端实际加载的 model_type，而不是客户端请求里的
+    //    req.model（客户端可能填任意名字，填错会套错模板导致输出乱码 + 不停止）。
+    let template = get_template(&state.config.model_type);
     let prompt = template.apply(&req.messages)
         .map_err(|e| AppError::bad_request(format!("Template error: {}", e)))?;
 
@@ -59,6 +61,7 @@ pub async fn chat_completions(
         stream: req.stream,
         priority: 0,
         stop_sequences: req.stop.map(|s| s.into_vec()).unwrap_or_default(),
+        ignore_eos: req.ignore_eos || state.config.ignore_eos,
         diffusion: None,
     };
 

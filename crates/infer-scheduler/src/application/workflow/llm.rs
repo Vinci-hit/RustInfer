@@ -9,6 +9,7 @@ use crate::application::output_fns;
 use crate::application::planning::PlanningSystem;
 use crate::application::scheduler_event::SchedulerEvent;
 use crate::application::workflow::{EngineWorkflow, ResourceContext};
+use crate::domain::inference_session::lifecycle::SequenceId;
 use crate::domain::inference_session::table::RequestTable;
 use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::domain::policy::token_budget::TokenBudget;
@@ -132,6 +133,7 @@ impl EngineWorkflow for LlmWorkflow {
 fn running_set(requests: &RequestTable) -> RunningSet {
     RunningSet {
         num_prefilling: requests.prefilling_len(),
+        num_decoding: requests.decoding_len(),
         prefilling_continuations: requests.prefilling_continuations(),
     }
 }
@@ -145,27 +147,63 @@ fn token_budget(config: &crate::config::SchedulerConfig) -> TokenBudget {
 
 /// Core LLM step-output processing. Separated from the trait impl
 /// so it can be called from both the workflow and legacy code paths.
+///
+/// When `enable_prefix_caching` is true, assigned indices are fed into the
+/// RadixTree for prefix-match reuse. When false, the scheduler skips the
+/// RadixTree entirely and only tracks the KV budget — the worker owns KV
+/// recycling via its `GlobalKvAllocator::release()` / `recycle()` path.
 async fn handle_llm_step(
     ctx: &mut ResourceContext<'_>,
     dispatch: &mut DispatchSystem,
     step: &StepOutput,
 ) -> Result<()> {
-    // Feed assigned_indices into RadixTree + KvBudget.
+    let enable_prefix = ctx.config.enable_prefix_caching;
+
+    // KV budget tracking — always needed for admission control.
     if !step.assigned_indices.is_empty() {
         let total: u32 = step.assigned_indices.iter().map(|a| a.len as u32).sum();
         let _ = ctx.kv_budget.try_reserve(total);
-        output_fns::feed_radix_assigned_indices(ctx.radix, ctx.kv_budget, step);
-        for tk in &step.tokens {
-            if tk.finished {
-                output_fns::radix_mark_finished(ctx.radix, tk.sequence_id);
+
+        if enable_prefix {
+            output_fns::feed_radix_assigned_indices(ctx.radix, ctx.kv_budget, step);
+            for tk in &step.tokens {
+                if tk.finished {
+                    output_fns::radix_mark_finished(ctx.radix, tk.sequence_id);
+                }
             }
         }
     }
+
+    // Collect KV slot counts for finished sequences before they are
+    // removed by `process_llm_step_decoded`. Only needed for the
+    // real-time recycling path (prefix caching disabled), where the
+    // scheduler must release the budget itself instead of waiting for
+    // RadixTree LRU eviction.
+    let finished_kv_slots: u32 = if !enable_prefix {
+        step.tokens
+            .iter()
+            .filter(|tk| tk.finished)
+            .filter_map(|tk| ctx.requests.kv_slots_for_sequence(SequenceId(tk.sequence_id)))
+            .sum()
+    } else {
+        0
+    };
+
     output_fns::process_llm_step_decoded(
         ctx.requests,
         dispatch.frontend_mut(),
         ctx.metrics,
         step,
     )
-    .await
+    .await?;
+
+    // Real-time recycling: release KV budget for finished sequences.
+    // The worker has already moved these blocks to its released list or
+    // recycled them into the free pool — the scheduler just aligns its
+    // budget count.
+    if finished_kv_slots > 0 {
+        ctx.kv_budget.release(finished_kv_slots);
+    }
+
+    Ok(())
 }

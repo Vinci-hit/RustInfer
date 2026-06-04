@@ -125,6 +125,7 @@ mod tests {
                 priority: Priority(0),
                 stream: false,
                 stop_sequences: vec![],
+                ignore_eos: false,
                 diffusion: Some(infer_protocol::server_to_scheduler::DiffusionRequest {
                     prompt: id.to_string(),
                     prompt_input_ids: vec![1, 2, 3],
@@ -143,6 +144,7 @@ mod tests {
     fn empty_running() -> RunningSet {
         RunningSet {
             num_prefilling: 0,
+            num_decoding: 0,
             prefilling_continuations: vec![],
         }
     }
@@ -176,6 +178,7 @@ mod tests {
         let waiting = make_waiting(&["a", "b"]);
         let running = RunningSet {
             num_prefilling: 2,
+            num_decoding: 0,
             prefilling_continuations: vec![],
         };
         let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };

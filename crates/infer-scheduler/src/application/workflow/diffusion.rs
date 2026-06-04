@@ -143,6 +143,7 @@ impl EngineWorkflow for DiffusionWorkflow {
 fn running_set(requests: &RequestTable) -> RunningSet {
     RunningSet {
         num_prefilling: requests.prefilling_len(),
+        num_decoding: requests.decoding_len(),
         prefilling_continuations: requests.prefilling_continuations(),
     }
 }

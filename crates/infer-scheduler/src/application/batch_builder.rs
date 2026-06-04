@@ -192,6 +192,7 @@ impl BatchBuilder {
                 } else {
                     PrefillSegmentCompletion::ContinuePrefill
                 },
+                ignore_eos: seq.meta.ignore_eos,
                 prefix_hint,
             });
         }
@@ -240,6 +241,7 @@ mod tests {
             priority: Priority::default(),
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
             arrival_time: Instant::now(),
         });

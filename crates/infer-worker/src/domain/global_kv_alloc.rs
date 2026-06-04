@@ -64,6 +64,11 @@ pub struct GlobalKvAllocator {
     free: Vec<u32>,
     /// Bump pointer. Invariant: `head <= free.len()`.
     head: usize,
+    /// Indices released by completed requests (not yet recycled into the
+    /// free pool). These sit here until the next allocation attempt fails
+    /// and triggers `recycle()`, which drains them into `free` and sorts.
+    /// Used in real-time recycling mode (prefix caching disabled).
+    released: Vec<u32>,
 }
 
 impl GlobalKvAllocator {
@@ -77,6 +82,7 @@ impl GlobalKvAllocator {
             total,
             free,
             head: 0,
+            released: Vec::new(),
         }
     }
 
@@ -105,8 +111,10 @@ impl GlobalKvAllocator {
 
     /// Allocate `n` indices.
     ///
-    /// Fast path: bump from `head`. The slow merge-then-retry path remains
-    /// for paranoia but is unreachable in practice — `free()` already sorts
+    /// Fast path: bump from `head`. If that fails and there are released
+    /// blocks, `recycle()` is called to drain them into the free pool,
+    /// followed by a retry. The slow merge-then-retry path remains for
+    /// paranoia but is unreachable in practice — `free()` already sorts
     /// the pool, so `free[head..]` is always a contiguous run of every
     /// free index in ascending order. Returns `AllocFull` only on true
     /// OOM (`total_free < n`).
@@ -116,13 +124,21 @@ impl GlobalKvAllocator {
         }
         let n_usize = n as usize;
 
-        // Fast path: enough free at the head. After `free()`-time sort
-        // every alloc takes this path; the slow path below is dead code
-        // kept for defensive programming.
+        // Fast path: enough free at the head.
         if self.head + n_usize <= self.free.len() {
             let out = self.free[self.head..self.head + n_usize].to_vec();
             self.head += n_usize;
             return Ok(out);
+        }
+
+        // Try recycling released blocks before giving up.
+        if !self.released.is_empty() {
+            self.recycle();
+            if self.head + n_usize <= self.free.len() {
+                let out = self.free[self.head..self.head + n_usize].to_vec();
+                self.head += n_usize;
+                return Ok(out);
+            }
         }
 
         // Slow path: after free()-time sort this is unreachable in
@@ -170,6 +186,49 @@ impl GlobalKvAllocator {
         }
         self.free.extend_from_slice(indices);
         self.free.sort_unstable();
+    }
+
+    /// Move indices to the released holding list (real-time recycling mode).
+    ///
+    /// Unlike `free()`, released indices are NOT immediately merged into the
+    /// free pool. They stay in a separate holding list until the next
+    /// allocation attempt fails, at which point `recycle()` drains them
+    /// into the free pool and sorts.
+    ///
+    /// Caller is trusted to release only previously-allocated indices.
+    pub fn release(&mut self, indices: &[u32]) {
+        if indices.is_empty() {
+            return;
+        }
+        if cfg!(debug_assertions) {
+            for &idx in indices {
+                debug_assert!(idx < self.total, "release index out of range: {}", idx);
+            }
+        }
+        self.released.extend_from_slice(indices);
+    }
+
+    /// Drain the released holding list into the free pool, drop any
+    /// consumed prefix, and sort so the pool is ready for the next
+    /// `alloc_indices`. Returns the number of indices recycled.
+    pub fn recycle(&mut self) -> usize {
+        if self.released.is_empty() {
+            return 0;
+        }
+        let n = self.released.len();
+        // Drop the consumed prefix so the sort sees only currently-free slots.
+        if self.head > 0 {
+            self.free.drain(..self.head);
+            self.head = 0;
+        }
+        self.free.extend(self.released.drain(..));
+        self.free.sort_unstable();
+        n
+    }
+
+    /// Number of indices currently held in the released list (not yet recycled).
+    pub fn released_len(&self) -> usize {
+        self.released.len()
     }
 
     /// Drop the consumed prefix and sort the remaining free indices.

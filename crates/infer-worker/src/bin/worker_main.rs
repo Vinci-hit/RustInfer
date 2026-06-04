@@ -196,6 +196,9 @@ struct ActiveSeq {
     block_table: Vec<u32>,
     max_tokens: usize,
     generated_count: usize,
+    /// When true, EOS tokens do not terminate the sequence; it decodes
+    /// all the way to `max_tokens` (fixed-length benchmarking).
+    ignore_eos: bool,
 }
 
 fn main() -> Result<(), String> {
@@ -355,11 +358,13 @@ where
         model, bs.cuda.clone(),
         pool_blocks, bs.block_size, max_blocks_per_seq, bs.max_seq_len,
         cap_num_tokens, cap_batch, flash_decode_capacity_f32,
-        // Decode-only graph capture sizes — pad up to nearest power of 2.
-        vec![1, 2, 4, 8, 16, 32],
+        // Decode-only graph capture sizes — full contiguous coverage 1..=32
+        // so every decode batch size up to max_batch_seqs replays its own
+        // graph with zero padding (no wasted compute on padded sequences).
+        (1..=32).collect(),
     ).map_err(|e| format!("ModelRunner::new: {:?}", e))?;
 
-    // Prime CUDA Graphs for decode-only batches in {1,2,4,8,16}.
+    // Prime CUDA Graphs for decode-only batches in 1..=32.
     // The runner reserves the LAST physical block (`pool_blocks-1`) as a
     // graph scratch block; the scheduler only sees `num_blocks` and never
     // allocates that id, so production sequences cannot collide with the
@@ -411,6 +416,11 @@ where
         "[serve] worker-owned KV allocator: total={} (block_size={})",
         num_blocks, bs.block_size,
     );
+    let enable_prefix_caching = bs.load.enable_prefix_caching;
+    eprintln!(
+        "[serve] prefix caching: {}",
+        if enable_prefix_caching { "enabled (RadixTree)" } else { "disabled (real-time recycling)" },
+    );
     let mut profile_step_count: u32 = 0;
     let mut profile_started = false;
 
@@ -425,13 +435,12 @@ where
                     }
                     SchedulerControlMessage::Cancel(c) => {
                         if let Some(removed) = active.remove(&c.sequence_id) {
-                            // Phase 7B: cancelled seq's KV slots return to
-                            // the allocator immediately. Scheduler also
-                            // calls `mark_finished_chain` on its end so
-                            // the radix tree won't surface them in
-                            // `FreeKvIndices` later.
                             if !removed.block_table.is_empty() {
-                                kv_allocator.free(&removed.block_table);
+                                if enable_prefix_caching {
+                                    kv_allocator.free(&removed.block_table);
+                                } else {
+                                    kv_allocator.release(&removed.block_table);
+                                }
                             }
                             eprintln!("[serve] cancelled seq {}", c.sequence_id);
                         }
@@ -444,16 +453,16 @@ where
                             kv_allocator.free(&free.indices);
                         }
                     }
-                    // Scheduler-driven Level-2 victim preemption. Drop
-                    // each listed seq from `active` and free its KV
-                    // slots locally. The scheduler has already called
-                    // `radix.mark_finished_chain` and flipped its
-                    // `RequestTable` entry back to Queued.
+                    // Scheduler-driven Level-2 victim preemption.
                     SchedulerControlMessage::Preempt(p) => {
                         for sid in &p.sequence_ids {
                             if let Some(removed) = active.remove(sid) {
                                 if !removed.block_table.is_empty() {
-                                    kv_allocator.free(&removed.block_table);
+                                    if enable_prefix_caching {
+                                        kv_allocator.free(&removed.block_table);
+                                    } else {
+                                        kv_allocator.release(&removed.block_table);
+                                    }
                                 }
                                 eprintln!("[serve] preempted seq {}", sid);
                             }
@@ -503,6 +512,8 @@ where
                 control,
                 data,
                 eos_ids,
+                enable_prefix_caching,
+                cap_batch,
             ) {
                 eprintln!("[serve] prefill error: {}", e);
             }
@@ -525,6 +536,7 @@ where
                 control,
                 data,
                 eos_ids,
+                enable_prefix_caching,
             ) {
                 eprintln!("[serve] decode error: {}", e);
             }
@@ -575,6 +587,7 @@ fn wait_for_relief(
     kv_allocator: &mut GlobalKvAllocator,
     active: &mut HashMap<u64, ActiveSeq>,
     wait_ms: i64,
+    enable_prefix_caching: bool,
 ) -> bool {
     let deadline = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
     while Instant::now() < deadline {
@@ -593,7 +606,11 @@ fn wait_for_relief(
                 for sid in &p.sequence_ids {
                     if let Some(entry) = active.remove(sid) {
                         if !entry.block_table.is_empty() {
-                            kv_allocator.free(&entry.block_table);
+                            if enable_prefix_caching {
+                                kv_allocator.free(&entry.block_table);
+                            } else {
+                                kv_allocator.release(&entry.block_table);
+                            }
                         }
                     }
                 }
@@ -610,7 +627,11 @@ fn wait_for_relief(
             Ok(Some((SchedulerControlMessage::Cancel(c), _))) => {
                 if let Some(removed) = active.remove(&c.sequence_id) {
                     if !removed.block_table.is_empty() {
-                        kv_allocator.free(&removed.block_table);
+                        if enable_prefix_caching {
+                            kv_allocator.free(&removed.block_table);
+                        } else {
+                            kv_allocator.release(&removed.block_table);
+                        }
                     }
                     eprintln!("[serve] cancelled seq {} (during relief wait)", c.sequence_id);
                 }
@@ -645,6 +666,7 @@ fn alloc_with_relief(
     control: &ControlPump,
     active: &mut HashMap<u64, ActiveSeq>,
     n_initial: u32,
+    enable_prefix_caching: bool,
 ) -> Option<Vec<u32>> {
     const RELIEF_TIMEOUT_MS: i64 = 500;
     let mut round: u8 = 0;
@@ -664,7 +686,7 @@ fn alloc_with_relief(
                     n, round, e
                 );
                 let _ = control.send_alloc_failed(n, round);
-                if !wait_for_relief(control, kv_allocator, active, RELIEF_TIMEOUT_MS) {
+                if !wait_for_relief(control, kv_allocator, active, RELIEF_TIMEOUT_MS, enable_prefix_caching) {
                     eprintln!(
                         "[serve] relief timed out at round={} (still need {} slots)",
                         round, n
@@ -714,10 +736,50 @@ fn handle_prefill<M>(
     control: &ControlPump,
     data: &DataPump,
     eos_ids: &[i32],
+    enable_prefix_caching: bool,
+    cap_batch: usize,
 ) -> OpResult<()>
 where
     M: infer_worker::domain::model::LlmModel<bf16, Cuda>,
 {
+    // Admission guard (defense in depth): the decode step batches every
+    // active seq in one `build_plan` call sized to `cap_batch`. If a prefill
+    // batch would push the active set past that cap, the subsequent decode
+    // step rejects the whole batch and fails every request in it. The
+    // scheduler's seq budget should already prevent this, but a stale or
+    // off-by-one count must not be able to crash a decode batch — so reject
+    // the overflow segments here, non-fatally, before allocating any KV.
+    let new_decode_segments = cmd
+        .segments
+        .iter()
+        .filter(|s| matches!(
+            s.completion,
+            PrefillSegmentCompletion::FinishPrefillAndStartDecode
+        ))
+        .count();
+    if active.len() + new_decode_segments > cap_batch {
+        let overflow_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
+        eprintln!(
+            "[serve] prefill rejected: active ({}) + new ({}) > cap ({}) — failing {} seqs",
+            active.len(),
+            new_decode_segments,
+            cap_batch,
+            overflow_ids.len(),
+        );
+        let _ = control.send(
+            WorkerControlMessage::StepError(WorkerStepError {
+                sequence_ids: overflow_ids,
+                message: format!(
+                    "worker batch slot exhausted: active={} + new={} > cap={}",
+                    active.len(), new_decode_segments, cap_batch,
+                ),
+                fatal: false,
+            }),
+            infer_protocol::control_envelope::RequestId(0),
+        );
+        return Ok(());
+    }
+
     // 1. Compute total new KV slots and allocate one contiguous range.
     let mut per_seg_new_tokens: Vec<u32> = Vec::with_capacity(cmd.segments.len());
     let mut per_seg_prefix_hint: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
@@ -749,6 +811,7 @@ where
         control,
         active,
         total_new,
+        enable_prefix_caching,
     ) {
         Some(v) => v,
         None => {
@@ -862,7 +925,7 @@ where
             }
             PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
                 output.prefill_done.push(seg.sequence_id);
-                let finished = eos_ids.contains(&token) || seg.max_tokens <= 1;
+                let finished = (!seg.ignore_eos && eos_ids.contains(&token)) || seg.max_tokens <= 1;
                 output.tokens.push(GeneratedToken {
                     sequence_id: seg.sequence_id,
                     token_id: token,
@@ -880,7 +943,16 @@ where
                         block_table: bt,
                         max_tokens: seg.max_tokens,
                         generated_count: 1,
+                        ignore_eos: seg.ignore_eos,
                     });
+                } else if !enable_prefix_caching {
+                    // Real-time recycling: prefill that finished immediately
+                    // without starting decode — release its KV blocks now.
+                    let mut bt: Vec<u32> = Vec::with_capacity(new_indices.len());
+                    bt.extend_from_slice(new_indices);
+                    if !bt.is_empty() {
+                        kv_allocator.release(&bt);
+                    }
                 }
             }
         }
@@ -902,6 +974,7 @@ fn run_decode_step<M>(
     control: &ControlPump,
     data: &DataPump,
     eos_ids: &[i32],
+    enable_prefix_caching: bool,
 ) -> OpResult<()>
 where
     M: infer_worker::domain::model::LlmModel<bf16, Cuda>,
@@ -922,6 +995,7 @@ where
         control,
         active,
         initial_n,
+        enable_prefix_caching,
     ) {
         Some(v) => v,
         None => {
@@ -1004,7 +1078,7 @@ where
         seq.kv_len += 1;
         seq.generated_count += 1;
         seq.block_table.push(new_idx);
-        let finished = eos_ids.contains(&token) || seq.generated_count >= seq.max_tokens;
+        let finished = (!seq.ignore_eos && eos_ids.contains(&token)) || seq.generated_count >= seq.max_tokens;
         output.tokens.push(GeneratedToken {
             sequence_id: sid,
             token_id: token,
@@ -1015,10 +1089,16 @@ where
         }
     }
     for sid in &to_remove {
-        // On finish the scheduler will issue a `FreeKvIndices` after its
-        // RadixTree LRU evicts the chain. Worker keeps the `block_table`
-        // pinned in `active.remove`'s drop until then.
-        let _ = active.remove(sid);
+        // When prefix caching is enabled the scheduler will issue a
+        // `FreeKvIndices` after its RadixTree LRU evicts the chain.
+        // When disabled, the worker immediately releases the blocks
+        // to the released pool for real-time recycling.
+        let removed = active.remove(sid);
+        if let Some(removed) = removed {
+            if !enable_prefix_caching && !removed.block_table.is_empty() {
+                kv_allocator.release(&removed.block_table);
+            }
+        }
     }
     let _ = data.send_step_output(&output);
     Ok(())

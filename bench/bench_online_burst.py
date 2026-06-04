@@ -33,10 +33,14 @@ class RequestResult:
     error: str
 
 
+RUSTINFER_MODEL = "llama3.2-1b"
+VLLM_MODEL = "default"
+
+
 async def send_rustinfer(session, url, prompt):
     """Send chat completion to RustInfer server."""
     payload = {
-        "model": "llama3.2-1b",
+        "model": RUSTINFER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
@@ -64,25 +68,17 @@ async def send_rustinfer(session, url, prompt):
 
 
 async def send_vllm(session, url, prompt):
-    """Send completion to vLLM server with same template as RustInfer."""
-    # Use raw prompt with RustInfer's template (no BOS, vLLM adds it)
-    formatted = (
-        "<|start_header_id|>system<|end_header_id|>\n\n"
-        "Cutting Knowledge Date: December 2023\n"
-        "Today Date: 26 Jul 2024\n\n"
-        "<|eot_id|>"
-        f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        "<|start_header_id|>assistant<|end_header_id|>\n\n"
-    )
+    """Send chat completion to vLLM server (server applies its own chat template)."""
     payload = {
-        "prompt": formatted,
+        "model": VLLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 2048,
         "temperature": 0.0,
     }
     start = time.perf_counter()
     try:
         async with session.post(
-            f"{url}/v1/completions", json=payload,
+            f"{url}/v1/chat/completions", json=payload,
             timeout=aiohttp.ClientTimeout(total=120),
         ) as resp:
             body = await resp.json()
@@ -90,7 +86,7 @@ async def send_vllm(session, url, prompt):
         if resp.status != 200:
             return RequestResult(prompt[:100], 0, 0, elapsed, 0, "", False, str(body))
         usage = body["usage"]
-        text = body["choices"][0]["text"]
+        text = body["choices"][0]["message"]["content"]
         return RequestResult(
             prompt[:100],
             usage["completion_tokens"],
@@ -210,7 +206,13 @@ async def main():
     ap.add_argument("--duration", type=int, default=60, help="Test duration in seconds")
     ap.add_argument("--concurrency", type=int, default=32, help="Max concurrent requests")
     ap.add_argument("--output", default=None, help="Save results JSON")
+    ap.add_argument("--model", default=None, help="Model name sent to RustInfer (selects chat template)")
     args = ap.parse_args()
+
+    if args.model:
+        global RUSTINFER_MODEL, VLLM_MODEL
+        RUSTINFER_MODEL = args.model
+        VLLM_MODEL = args.model
 
     if args.url:
         url = args.url

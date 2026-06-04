@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# nsys worker shim: server's all-in-one launcher spawns `rustinfer-worker` by
+# PATH name. Place this dir FIRST in PATH so the worker (and only the worker)
+# launches under `nsys profile`. Scheduler/server run unprofiled.
+#
+# The launcher does NOT pass --profile-cuda-steps, so we append it here to drive
+# the cudaProfilerApi capture range.
+set -euo pipefail
+
+REAL_WORKER="${RUSTINFER_REAL_WORKER:-/root/RustInfer/target/release/rustinfer-worker}"
+NSYS_OUT="${RUSTINFER_NSYS_OUT:-/root/RustInfer/result/nsys_paged_worker_c32}"
+PROFILE_STEPS="${RUSTINFER_PROFILE_STEPS:-300}"
+
+exec nsys profile \
+  --trace=cuda,nvtx,osrt,cudnn,cublas \
+  --cuda-graph-trace=node \
+  --cuda-trace-all-apis=true \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=stop-shutdown \
+  --sample=none \
+  --cpuctxsw=none \
+  --kill=none \
+  --force-overwrite=true \
+  --output="${NSYS_OUT}" \
+  "${REAL_WORKER}" "$@" --profile-cuda-steps "${PROFILE_STEPS}"

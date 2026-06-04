@@ -102,6 +102,8 @@ pub struct RequestMeta {
     pub priority: Priority,
     pub stream: bool,
     pub stop_sequences: Vec<Vec<i32>>,
+    /// Ignore EOS and decode to `max_tokens` (fixed-length benchmarking).
+    pub ignore_eos: bool,
     pub diffusion: Option<DiffusionRequest>,
     pub arrival_time: Instant,
 }
@@ -378,6 +380,7 @@ mod tests {
             priority: Priority::default(),
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
             arrival_time: Instant::now(),
         })

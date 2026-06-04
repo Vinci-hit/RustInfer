@@ -10,7 +10,7 @@
 //! ## `ControlOutcome`
 //!
 //! Result of `ControlEventSystem::handle()`. The engine inspects
-//! the variant and either calls `OutputProcessingSystem::fail_sessions`
+//! the variant and either calls `output_fns::fail_sessions`
 //! (with a fresh `&mut` borrow) for `Continue`, or unwinds the
 //! event loop with `WorkerError` for `Terminate`.
 
@@ -22,8 +22,8 @@ use crate::domain::inference_session::lifecycle::RequestId;
 #[derive(Debug)]
 pub enum ControlOutcome {
     /// Engine continues. Optional list of sessions whose fail path
-    /// the orchestrator must drive (calling `OutputProcessingSystem::
-    /// fail_sessions` with the supplied message).
+    /// the orchestrator must drive (calling `output_fns::fail_sessions`
+    /// with the supplied message).
     ///
     /// `failed_request_ids` carries internal `RequestId` (uuid-backed).
     /// Callers resolving these into the session repository hold the

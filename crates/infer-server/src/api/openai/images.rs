@@ -58,6 +58,7 @@ pub async fn image_generations(
             stream: false,
             priority: 0,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: Some(infer_protocol::server_to_scheduler::DiffusionRequest {
                 prompt: req.prompt.clone(),
                 prompt_input_ids: prompt_input_ids.clone(),

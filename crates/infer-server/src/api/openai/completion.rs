@@ -52,6 +52,7 @@ pub async fn completions(
         stream: req.stream,
         priority: 0,
         stop_sequences: req.stop.map(|s| s.into_vec()).unwrap_or_default(),
+        ignore_eos: req.ignore_eos || state.config.ignore_eos,
         diffusion: None,
     };
 

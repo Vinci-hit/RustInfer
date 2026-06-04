@@ -19,8 +19,10 @@ pub struct ServerConfig {
     #[arg(short, long, env = "MODEL_PATH")]
     pub model: String,
 
-    /// Model type: llama3, qwen3.
-    #[arg(long, default_value = "llama3", env = "MODEL_TYPE")]
+    /// Model type (llama3, qwen3, ...). NOT a CLI flag: it is read from the
+    /// model's `config.json` (`model_type` field) at startup. See
+    /// `resolve_model_type`.
+    #[arg(skip)]
     pub model_type: String,
 
     /// Device(s): comma-separated. e.g. "cuda:0" or "cuda:0,cuda:1" for multi-GPU.
@@ -44,7 +46,7 @@ pub struct ServerConfig {
     pub chunked_prefill_size: Option<usize>,
 
     /// KV cache mode forwarded to the scheduler. Only "paged:<block_size>" is supported.
-    #[arg(long, default_value = "paged:16", env = "KV_CACHE_MODE")]
+    #[arg(long, default_value = "paged:1", env = "KV_CACHE_MODE")]
     pub kv_cache_mode: String,
 
     /// Enable RadixTree prefix caching (paged mode only). Forwarded to scheduler.
@@ -73,6 +75,13 @@ pub struct ServerConfig {
     /// Log level
     #[arg(long, default_value = "info", env = "RUST_LOG")]
     pub log_level: String,
+
+    /// Ignore EOS tokens during generation: sequences decode all the way to
+    /// `max_tokens` regardless of EOS. Server-wide switch for fixed-length
+    /// benchmarking (mirrors vLLM's `--ignore-eos`). Overrides per-request
+    /// `ignore_eos` when set.
+    #[arg(long, default_value_t = false, env = "IGNORE_EOS")]
+    pub ignore_eos: bool,
 }
 
 impl ServerConfig {
@@ -90,5 +99,40 @@ impl ServerConfig {
                 .unwrap_or("default")
                 .to_string()
         })
+    }
+
+    /// Read the model type from `<model>/config.json`.
+    ///
+    /// Maps HuggingFace's `model_type` field to the internal type string used
+    /// by the worker / chat templates (`"llama3"` / `"qwen3"`). Falls back to
+    /// the `architectures` field, then to `"llama3"`.
+    pub fn resolve_model_type(model_path: &str) -> anyhow::Result<String> {
+        use anyhow::Context;
+        let cfg_path = std::path::Path::new(model_path).join("config.json");
+        let bytes = std::fs::read(&cfg_path)
+            .with_context(|| format!("read {}", cfg_path.display()))?;
+        let cfg: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", cfg_path.display()))?;
+
+        let hint = cfg
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                cfg.get("architectures")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+            .to_lowercase();
+
+        let resolved = if hint.contains("qwen") {
+            "qwen3"
+        } else {
+            "llama3"
+        };
+        Ok(resolved.to_string())
     }
 }

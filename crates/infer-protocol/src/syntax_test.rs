@@ -15,6 +15,7 @@ fn test_protocol_types() {
         stream: false,
         priority: 0,
         stop_sequences: vec!["<|eot_id|>".to_string()],
+        ignore_eos: false,
         diffusion: None,
     };
 
@@ -79,6 +80,7 @@ mod phase4_kv_protocol {
                 top_k: -1,
             },
             completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+            ignore_eos: false,
             prefix_hint: Some(vec![100, 101, 102]),
         };
         let r = rt(&seg);
@@ -213,6 +215,7 @@ mod phase4_kv_protocol {
                     top_k: -1,
                 },
                 completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+                ignore_eos: false,
                 prefix_hint: Some(vec![]),
             }],
         };

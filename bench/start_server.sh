@@ -22,7 +22,6 @@ echo "[OK] Build done"
 export PATH=$PWD/target/release:$PATH
 exec ./target/release/rustinfer-server \
   --model $MODEL \
-  --model-type llama3 \
   --device cuda:0 \
   --port $PORT \
   --max-batch-tokens 8192 \

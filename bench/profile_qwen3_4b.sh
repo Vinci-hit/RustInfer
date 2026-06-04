@@ -35,7 +35,6 @@ profile_ri() {
       --output=$RESULT_DIR/nsys_qwen3_4b_ri \
       ./target/release/rustinfer-server \
         --model $MODEL \
-        --model-type qwen3 \
         --device cuda:0 \
         --port $RI_PORT \
         --max-batch-tokens 8192 \

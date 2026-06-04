@@ -61,7 +61,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: 32,
             max_batch_tokens: 1024,
             max_model_len: 4096,
-            paged_block_size: BlockSize::new(16),
+            paged_block_size: BlockSize::new(1),
             num_gpu_blocks: 256,
             chunked_prefill_size: None,
             enable_prefix_caching: false,

@@ -551,6 +551,23 @@ impl RequestTable {
             .collect()
     }
 
+    /// Return the number of KV slots currently occupied by a sequence.
+    /// Returns `None` if the sequence is not in an active (decoding or prefilling) state.
+    pub fn kv_slots_for_sequence(&self, sequence_id: SequenceId) -> Option<u32> {
+        let addr = self.locations.get(&sequence_id).copied()?;
+        match addr.bucket {
+            Bucket::Decoding => {
+                let seq = self.decoding.get(addr.key)?;
+                Some(seq.state.seq_position as u32)
+            }
+            Bucket::Prefilling => {
+                let seq = self.prefilling.get(addr.key)?;
+                Some(seq.state.num_computed_tokens as u32)
+            }
+            _ => None,
+        }
+    }
+
     pub fn fail_sequence(&mut self, sequence_id: SequenceId, _message: &str) -> Result<FailedOutcome> {
         let Some(addr) = self.locations.get(&sequence_id).copied() else {
             return Ok(FailedOutcome::NotFound { sequence_id });
@@ -954,6 +971,7 @@ mod tests {
             priority: Priority::default(),
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
             arrival_time: Instant::now(),
         })

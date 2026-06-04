@@ -53,6 +53,9 @@ pub struct InferenceRequest {
     /// Stop sequences。
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// 忽略 EOS token，强制生成到 max_tokens（用于定长基准测试）。
+    #[serde(default)]
+    pub ignore_eos: bool,
 
     // ─── Diffusion fields ───
     #[serde(default)]

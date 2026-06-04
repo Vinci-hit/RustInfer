@@ -56,6 +56,10 @@ pub struct PrefillSegmentMeta {
     pub max_tokens: usize,
     pub sampling_params: SamplingParams,
     pub completion: PrefillSegmentCompletion,
+    /// Ignore EOS tokens and decode all the way to `max_tokens`.
+    /// Used for fixed-length benchmarking. Defaults to `false`.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Prefix-cache hit. Length is the number of leading prompt tokens
     /// already cached on the worker; values are global KV indices into
     /// the worker's `GlobalKvAllocator` pool. `None` ⇒ no hit.

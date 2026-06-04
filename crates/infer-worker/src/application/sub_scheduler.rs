@@ -622,6 +622,7 @@ mod tests {
                 max_tokens: 100,
                 sampling_params: SamplingParams { temperature: 1.0, top_p: 1.0, top_k: -1 },
                 completion: PrefillSegmentCompletion::FinishPrefillAndStartDecode,
+                ignore_eos: false,
                 prefix_hint: None,
             }],
         }

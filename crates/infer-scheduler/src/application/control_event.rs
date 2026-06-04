@@ -2,9 +2,9 @@
 //!
 //! Translates a single `ControlEvent` into a [`ControlOutcome`] the
 //! engine then dispatches. The System never touches
-//! [`crate::application::OutputProcessingSystem`] directly: it
+//! [`crate::application::output_fns`] directly: it
 //! returns the list of failed `RequestId`s plus a fail message,
-//! and the engine drives `output.fail_sessions(...)` with a fresh
+//! and the engine drives `output_fns::fail_sessions(...)` with a fresh
 //! borrow. Keeping the borrows disjoint means the engine can hold
 //! `&mut requests` here while later holding `&mut output` for the
 //! follow-up.
@@ -57,9 +57,9 @@ impl ControlEventSystem {
 
     /// Translate a single control-plane event.
     ///
-    /// **Does not** call the OutputProcessingSystem. The orchestrator
+    /// **Does not** call output_fns. The orchestrator
     /// is responsible for driving any returned `failed_request_ids`
-    /// through `output.fail_sessions(...)`.
+    /// through `output_fns::fail_sessions(...)`.
     pub fn handle(
         &self,
         event: ControlEvent,
@@ -306,7 +306,7 @@ impl ControlEventSystem {
             fail_message: Some(message.clone()),
         };
         if fatal {
-            // Both the failed-list (for OutputSystem) and the fatal
+            // Both the failed-list (for output_fns) and the fatal
             // termination need to travel back. We currently carry one
             // outcome per event, so emit `Terminate` and let the engine
             // pre-flush the running set on its side before unwinding.
@@ -428,6 +428,7 @@ mod tests {
             priority: Priority::default(),
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
             arrival_time: Instant::now(),
         });

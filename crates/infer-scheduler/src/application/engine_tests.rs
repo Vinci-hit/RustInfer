@@ -125,6 +125,7 @@
             priority: Priority::default(),
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
             arrival_time: Instant::now(),
         });
@@ -700,6 +701,7 @@
                 priority: Priority::default(),
                 stream: false,
                 stop_sequences: vec![],
+                ignore_eos: false,
                 diffusion: None,
                 arrival_time: Instant::now(),
             });

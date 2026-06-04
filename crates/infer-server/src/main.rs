@@ -98,7 +98,12 @@ fn cleanup_ipc(pid: u32) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = ServerConfig::parse();
+    let mut config = ServerConfig::parse();
+
+    // Model type is derived from the model's config.json, not a CLI flag, so
+    // that the chat template / worker dispatch always match the loaded weights.
+    config.model_type = ServerConfig::resolve_model_type(&config.model)
+        .with_context(|| format!("resolve model type from {}", config.model))?;
 
     tracing_subscriber::registry()
         .with(
@@ -136,6 +141,7 @@ async fn main() -> Result<()> {
     tracing::info!("  max_batch_seqs: {}", config.max_batch_seqs);
     tracing::info!("  max_model_len: {}", config.max_model_len);
     tracing::info!("  chunked_prefill_size: {:?}", config.chunked_prefill_size);
+    tracing::info!("  ignore_eos: {}", config.ignore_eos);
 
     let mut children: Vec<ManagedChild> = Vec::new();
 
@@ -168,7 +174,7 @@ async fn main() -> Result<()> {
         .kv_cache_mode
         .strip_prefix("paged:")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+        .unwrap_or(1);
     scheduler_cmd
         .arg("--paged-block-size").arg(paged_block_size.to_string())
         .arg("--mem-fraction-static").arg(config.mem_fraction_static.to_string());

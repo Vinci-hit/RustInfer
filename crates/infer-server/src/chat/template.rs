@@ -104,10 +104,16 @@ impl ChatTemplate for Qwen3Template {
     }
 }
 
-/// 根据模型名称获取对应的 chat template
-pub fn get_template(model_name: &str) -> Box<dyn ChatTemplate + Send + Sync> {
-    match model_name.to_lowercase().as_str() {
-        name if name.contains("qwen") => Box::new(Qwen3Template),
+/// 根据服务器实际加载的 `model_type` 选择对应的 chat template。
+///
+/// 必须基于服务端真实加载的模型类型（`ServerConfig::model_type`，取值
+/// `"llama3"` / `"qwen3"`），而不是客户端请求里任意填写的 `req.model` 字段。
+/// 否则当客户端用错误的模型名（如对 Qwen3 模型发送 `"llama3.2-1b"`）请求时，
+/// 会套用错误的 prompt 模板，模型输出错误的控制 token 且永远不会发出正确的
+/// 终止 token（如 Qwen3 的 `<|im_end|>`），导致生成停不下来、跑满 max_tokens。
+pub fn get_template(model_type: &str) -> Box<dyn ChatTemplate + Send + Sync> {
+    match model_type.to_lowercase().as_str() {
+        t if t.contains("qwen") => Box::new(Qwen3Template),
         _ => Box::new(Llama3Template),
     }
 }

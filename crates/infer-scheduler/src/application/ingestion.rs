@@ -154,6 +154,7 @@ impl IngestionSystem {
             priority: Priority(request.priority),
             stream: request.stream,
             stop_sequences: vec![],
+            ignore_eos: request.ignore_eos,
             diffusion: request.diffusion,
             arrival_time: Instant::now(),
         });
@@ -241,6 +242,7 @@ mod tests {
             priority: 0,
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: None,
         }
     }
@@ -257,6 +259,7 @@ mod tests {
             priority: 0,
             stream: false,
             stop_sequences: vec![],
+            ignore_eos: false,
             diffusion: with_payload.then(|| DiffusionRequest {
                 prompt: prompt.to_string(),
                 prompt_input_ids: vec![1, 2, 3],

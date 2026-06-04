@@ -3,7 +3,7 @@
 //! Holds `Box<dyn FrontendTransport>` + `Box<dyn WorkerTransport>` so
 //! the engine itself stays free of `<F, W>` generics. Bundling both
 //! transports into a single System keeps the borrow shape simple:
-//! `OutputProcessingSystem` takes `&mut dyn FrontendTransport`, the
+//! `output_fns` takes `&mut dyn FrontendTransport`, the
 //! engine's iteration loop takes `&mut dyn WorkerTransport`. Either
 //! can be served by `dispatch.frontend_mut()` / `worker_mut()`
 //! without aliasing.
@@ -13,7 +13,7 @@
 //! - [`DispatchSystem::new`] — construct from boxed transports
 //! - [`DispatchSystem::frontend_mut`] / [`DispatchSystem::worker_mut`]
 //!   — borrow access for systems that drive IO themselves
-//!   (`OutputProcessingSystem`, the engine's `run_iteration`).
+//!   (`output_fns`, the engine's `run_iteration`).
 //! - [`DispatchSystem::send_batch`] — convenience wrapper used by
 //!   the engine after `PlanningSystem::build_*_batch` produces wire
 //!   bytes, so the iteration code stays a one-liner.
@@ -35,7 +35,7 @@ impl DispatchSystem {
         Self { frontend, worker }
     }
 
-    /// Borrow the frontend transport. `OutputProcessingSystem` uses
+    /// Borrow the frontend transport. `output_fns` uses
     /// this to send responses / stream chunks during error and
     /// completion paths.
     pub fn frontend_mut(&mut self) -> &mut dyn FrontendTransport {

@@ -17,6 +17,11 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: Option<usize>,
 
+    /// Force generation of exactly `max_tokens` by ignoring EOS tokens.
+    /// Used for fixed-length benchmarking (mirrors vLLM's `ignore_eos`).
+    #[serde(default)]
+    pub ignore_eos: bool,
+
     #[serde(default)]
     pub stream: bool,
 
@@ -102,6 +107,10 @@ pub struct CompletionRequest {
 
     #[serde(default = "default_max_tokens")]
     pub max_tokens: Option<usize>,
+
+    /// Force generation of exactly `max_tokens` by ignoring EOS tokens.
+    #[serde(default)]
+    pub ignore_eos: bool,
 
     #[serde(default)]
     pub stream: bool,

@@ -32,6 +32,11 @@ pub struct LoadModel {
     /// Fraction of post-profile free memory used for KV cache, e.g. 0.95.
     #[serde(default)]
     pub kv_cache_memory_fraction: Option<f32>,
+    /// Whether RadixTree prefix caching is enabled. When false, the worker
+    /// uses real-time KV recycling (released → free) instead of scheduler-led
+    /// eviction via `FreeKvIndices` / `Preempt`.
+    #[serde(default)]
+    pub enable_prefix_caching: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

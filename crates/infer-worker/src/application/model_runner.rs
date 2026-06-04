@@ -216,8 +216,14 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             // We only care about the case where D is Cuda — see callers.
             unsafe {
                 use crate::infrastructure::cuda::ffi as cf;
-                cf::cudaEventCreate(&mut ev_t0);
-                cf::cudaEventCreate(&mut ev_t1);
+                let r0 = cf::cudaEventCreate(&mut ev_t0);
+                let r1 = cf::cudaEventCreate(&mut ev_t1);
+                if r0 != cf::cudaError_cudaSuccess || r1 != cf::cudaError_cudaSuccess {
+                    tracing::debug!("cudaEventCreate failed — skipping GPU profiling");
+                    // Ensure null pointers stay null so the destroy block is a no-op.
+                    ev_t0 = std::ptr::null_mut();
+                    ev_t1 = std::ptr::null_mut();
+                }
                 // Stream comes from the output tensor's device handle.
                 // For non-Cuda backends this branch is never taken.
             }
@@ -529,13 +535,25 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         let mut ev_t1: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
         if prof {
             unsafe {
-                crate::infrastructure::cuda::ffi::cudaEventCreate(&mut ev_t0);
-                crate::infrastructure::cuda::ffi::cudaEventCreate(&mut ev_t1);
-                crate::infrastructure::cuda::ffi::cudaEventRecord(ev_t0, self.device.config.stream);
+                let r0 = crate::infrastructure::cuda::ffi::cudaEventCreate(&mut ev_t0);
+                let r1 = crate::infrastructure::cuda::ffi::cudaEventCreate(&mut ev_t1);
+                if r0 != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess
+                    || r1 != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess
+                {
+                    tracing::debug!("cudaEventCreate failed — skipping graph profiling");
+                    ev_t0 = std::ptr::null_mut();
+                    ev_t1 = std::ptr::null_mut();
+                } else {
+                    crate::infrastructure::cuda::ffi::cudaEventRecord(
+                        ev_t0,
+                        self.device.config.stream,
+                    );
+                }
             }
         }
         self.device.config.launch(slot)?;
-        if prof {
+        let prof_ok = prof && !ev_t0.is_null() && !ev_t1.is_null();
+        if prof_ok {
             unsafe {
                 crate::infrastructure::cuda::ffi::cudaEventRecord(ev_t1, self.device.config.stream);
             }
@@ -545,7 +563,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         // We only return the first `batch` of them.
         let host = self.forward_ws.argmax_out_dev().to_host_vec()?;
 
-        if prof {
+        if prof_ok {
             unsafe {
                 crate::infrastructure::cuda::ffi::cudaEventSynchronize(ev_t1);
                 let mut ms: f32 = 0.0;

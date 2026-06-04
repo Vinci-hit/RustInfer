@@ -1,10 +1,9 @@
-//! Free-function counterparts for [`super::OutputProcessingSystem`].
+//! Output processing free functions.
 //!
-//! `OutputProcessingSystem` is a stateless singleton — every method
-//! takes external resources as parameters. Converting to free
-//! functions simplifies borrow shapes and prepares for the
-//! `EngineWorkflow` trait where workflow implementations will call
-//! these directly.
+//! All output/termination logic lives here as free functions.
+//! Workflow implementations (`LlmWorkflow`, `DiffusionWorkflow`)
+//! call these directly; `engine.rs` also calls `fail_sessions` for
+//! the terminate-all path.
 
 use infer_protocol::scheduler_to_server::{
     ChunkType, ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,

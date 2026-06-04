@@ -141,6 +141,7 @@ mod tests {
                 priority: Priority(0),
                 stream: false,
                 stop_sequences: vec![],
+                ignore_eos: false,
                 diffusion: None,
                 arrival_time: Instant::now(),
             });
@@ -152,6 +153,7 @@ mod tests {
     fn empty_running() -> RunningSet {
         RunningSet {
             num_prefilling: 0,
+            num_decoding: 0,
             prefilling_continuations: vec![],
         }
     }
@@ -215,6 +217,7 @@ mod tests {
         let cont_id = RequestId::new_v4();
         let running = RunningSet {
             num_prefilling: 1,
+            num_decoding: 0,
             prefilling_continuations: vec![(cont_id, 15)],
         };
         let budget = TokenBudget { max_tokens: 12, max_seqs: 4 };
