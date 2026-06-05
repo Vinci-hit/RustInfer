@@ -74,8 +74,7 @@ RUSTINFER_PROFILE_STEPS=300 \
 PATH=/root/RustInfer/result/nsys-shim:/root/RustInfer/target/release:$PATH \
 ./target/release/rustinfer-server \
   --port 8014 \
-  --model ${MODEL} \
-  --model-type llama3 \
+  --model /apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct \
   --device cuda:0 \
   --max-batch-tokens 2048 \
   --max-batch-seqs 32 \
@@ -83,7 +82,7 @@ PATH=/root/RustInfer/result/nsys-shim:/root/RustInfer/target/release:$PATH \
   --kv-cache-mode paged:1 \
   --mem-fraction-static 0.20 \
   --enable-prefix-caching \
-  --model-name llama3.2-1b \
+  --model-name qwen3 \
   --log-level warn
 ```
 

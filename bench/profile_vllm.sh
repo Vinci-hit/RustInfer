@@ -10,6 +10,12 @@ DURATION=${3:-5}
 MODEL=/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b
 RESULT_DIR=result
 RESULT_FILE=$RESULT_DIR/nsys_vllm_batch${BATCH}
+VLLM_PY=${VLLM_PY:-/root/vllm-bench/bin/python}
+
+# Readiness checks use curl against localhost; bypass any corporate http_proxy so a
+# not-yet-listening port returns a connection error (curl exit!=0) instead of a 502.
+export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
 
 echo "=== Profile vLLM batch=$BATCH, port=$PORT, duration=${DURATION}s ==="
 
@@ -29,7 +35,7 @@ nsys profile \
   --cpuctxsw=none \
   --force-overwrite=true \
   --output=$RESULT_FILE \
-  python3 -m vllm.entrypoints.openai.api_server \
+  "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
     --model $MODEL \
     --port $PORT \
     --max-model-len 4096 \

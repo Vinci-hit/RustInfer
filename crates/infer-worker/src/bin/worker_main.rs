@@ -331,10 +331,40 @@ where
 {
     let _ = bs.load_cfg;
     let max_blocks_per_seq = (bs.max_seq_len + bs.block_size - 1) / bs.block_size;
-    let num_blocks = if bs.num_blocks_arg == 0 {
-        max_blocks_per_seq * bs.load.max_batch_seqs
-    } else {
+    // KV pool sizing. Weights are already resident at this point (load
+    // happened before `run_with_model`), so `cudaMemGetInfo` reflects the
+    // post-load free pool. Allocate `kv_cache_memory_fraction` of that free
+    // memory to the paged KV pool; the rest is left for the forward /
+    // batch workspaces, the CUDA-Graph scratch block, and graph capture
+    // buffers. `--num-blocks` (CLI) still overrides for diagnostics.
+    let num_blocks = if bs.num_blocks_arg != 0 {
+        eprintln!(
+            "[bootstrap] num_blocks override from CLI: {} (skipping GPU mem probe)",
+            bs.num_blocks_arg,
+        );
         bs.num_blocks_arg
+    } else {
+        // Bytes per scheduler-visible block: K and V tensors, one per
+        // layer, each shaped [1, block_size, kv_dim] of bf16 (2 bytes).
+        let bytes_per_block =
+            model.num_layers() * 2 * bs.block_size * model.kv_dim() * std::mem::size_of::<bf16>();
+        let fraction = bs.load.kv_cache_memory_fraction.unwrap_or(0.9).clamp(0.05, 0.98);
+        let (free, total) = infer_worker::infrastructure::cuda::device_utils::mem_get_info()
+            .map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
+        let budget = (free as f64 * fraction as f64) as usize;
+        // Reserve one block for the CUDA-Graph scratch (`pool_blocks` adds
+        // +1 below), so derive at least 1 visible block.
+        let derived = (budget / bytes_per_block.max(1)).saturating_sub(1).max(1);
+        eprintln!(
+            "[bootstrap] KV mem probe: free={:.2}GiB total={:.2}GiB fraction={} bytes/block={} → num_blocks={} (≈{:.2}GiB KV pool)",
+            free as f64 / (1u64 << 30) as f64,
+            total as f64 / (1u64 << 30) as f64,
+            fraction,
+            bytes_per_block,
+            derived,
+            (derived * bytes_per_block) as f64 / (1u64 << 30) as f64,
+        );
+        derived
     };
     // Worker-side pool size = scheduler-visible blocks + 1 scratch block
     // for CUDA Graph padding. The last physical block (id = pool_blocks-1)

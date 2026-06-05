@@ -22,3 +22,17 @@ pub fn set_current_device(device_id: i32) -> Result<(), OpError> {
     }
     Ok(())
 }
+
+/// Query free and total bytes of global memory on the current device.
+/// Returns `(free_bytes, total_bytes)`.
+pub fn mem_get_info() -> Result<(usize, usize), OpError> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    unsafe {
+        let code = ffi::cudaMemGetInfo(&mut free, &mut total);
+        if code != ffi::cudaError_cudaSuccess {
+            return Err(OpError::Kernel(format!("cudaMemGetInfo failed: {:?}", code)));
+        }
+    }
+    Ok((free, total))
+}

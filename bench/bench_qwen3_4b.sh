@@ -10,6 +10,12 @@ RI_PORT=8014
 VLLM_PORT=8001
 BATCH=32
 DURATION=60
+VLLM_PY=${VLLM_PY:-/root/vllm-bench/bin/python}
+
+# Readiness checks use curl against localhost; bypass any corporate http_proxy so a
+# not-yet-listening port returns a connection error (curl exit!=0) instead of a 502.
+export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
 
 echo "=== Qwen3-4B Benchmark: $MODE ==="
 echo ""
@@ -62,7 +68,7 @@ run_vllm() {
     pkill -9 -f "python.*vllm" 2>/dev/null || true
     sleep 1
 
-    python3 -m vllm.entrypoints.openai.api_server \
+    "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
       --model $MODEL \
       --port $VLLM_PORT \
       --max-model-len 4096 \

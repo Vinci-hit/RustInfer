@@ -11,6 +11,13 @@ RI_PORT=8014
 VLLM_PORT=8001
 BATCH=32
 RESULT_DIR=result
+VLLM_PY=${VLLM_PY:-/root/vllm-bench/bin/python}
+
+# Readiness checks below use curl against localhost. A corporate http_proxy in the
+# environment otherwise routes these through the proxy, which returns HTTP 502 for a
+# not-yet-listening port — making curl exit 0 and falsely report "Ready after 1s".
+export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
 
 mkdir -p $RESULT_DIR
 
@@ -91,7 +98,7 @@ profile_vllm() {
       --cpuctxsw=none \
       --force-overwrite=true \
       --output=$RESULT_DIR/nsys_qwen3_4b_vllm \
-      python3 -m vllm.entrypoints.openai.api_server \
+      "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
         --model $MODEL \
         --port $VLLM_PORT \
         --max-model-len 4096 \

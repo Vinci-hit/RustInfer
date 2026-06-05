@@ -287,12 +287,13 @@ fn run_bootstrap_then_router(
     };
 
     tracing::info!(
-        "WorkerReady: id={} model_type={} device={} max_batch_tokens={} max_batch_seqs={}",
+        "WorkerReady: id={} model_type={} device={} max_batch_tokens={} max_batch_seqs={} max_total_kv_tokens={:?}",
         ready.worker_id,
         ready.model_type,
         ready.device,
         ready.capacity.max_batch_tokens,
         ready.capacity.max_batch_seqs,
+        ready.capacity.max_total_kv_tokens,
     );
 
     let worker_group = WorkerGroup::from_single_ready(ready);
