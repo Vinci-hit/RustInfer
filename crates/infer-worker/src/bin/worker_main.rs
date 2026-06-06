@@ -50,19 +50,6 @@ use infer_worker::infrastructure::transport::data_pump::DataPump;
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker", version = "0.3.0")]
 struct Args {
-    /// Path to model weights (optional — the scheduler's `LoadModel`
-    /// payload provides the canonical path).
-    #[arg(long)]
-    model_path: Option<String>,
-
-    /// CUDA device (e.g. "cuda:0").
-    #[arg(long, default_value = "cuda:0")]
-    device: String,
-
-    /// Model architecture: "llama3" or "qwen3" (only llama3 implemented for now).
-    #[arg(long, default_value = "llama3")]
-    model_type: String,
-
     /// Scheduler control plane endpoint (DEALER → ROUTER).
     #[arg(long, alias = "worker-control-endpoint", default_value = "ipc:///tmp/rustinfer-worker-control.ipc")]
     control_endpoint: String,
@@ -80,30 +67,15 @@ struct Args {
     #[arg(long, default_value = "worker-0")]
     worker_id: String,
 
-    #[arg(long, default_value_t = 8192)]
-    max_batch_tokens: usize,
-
-    #[arg(long, default_value_t = 32)]
-    max_batch_seqs: usize,
-
-    /// Maximum seq length per request (== max_blocks_per_seq * block_size).
-    #[arg(long, default_value_t = 4096)]
-    max_seq_len: usize,
-
-    /// Paged KV block size. Locked to 1 by the worker-owned
-    /// `GlobalKvAllocator` design: every token occupies one slot in the
-    /// global KV pool, so `block_table[seq][i]` is exactly the i-th token's
-    /// global index. Kept as a CLI knob for diagnostics only — production
-    /// must use 1.
+    /// Paged KV block size. MUST be 1 (every token = 1 slot in global KV pool).
+    /// Kept as CLI knob for diagnostics only — do not change in production.
     #[arg(long, default_value_t = 1)]
     block_size: usize,
 
-    /// Number of physical paged blocks. If 0, derived from max_batch_seqs * max_seq_len.
+    /// Override number of physical paged blocks. If 0, derived from LoadModel.
+    /// Use with --profile or diagnostics only.
     #[arg(long, default_value_t = 0)]
-    num_blocks: usize,
-
-    #[arg(long, default_value_t = 1000)]
-    heartbeat_interval_ms: u64,
+    num_blocks_override: usize,
 
     /// Number of decode steps to profile with cudaProfilerApi.
     /// When set, calls cudaProfilerStart() before the first decode step
@@ -211,11 +183,10 @@ fn main() -> Result<(), String> {
         .init();
     eprintln!("rustinfer-worker v0.3.0");
     eprintln!("  worker_id = {}", args.worker_id);
-    eprintln!("  model     = {} ({})", args.model_path.as_deref().unwrap_or("<from LoadModel>"), args.model_type);
-    eprintln!("  device    = {}", args.device);
     eprintln!("  control   = {}", args.control_endpoint);
     eprintln!("  data_recv = {}", args.data_recv_endpoint);
     eprintln!("  data_send = {}", args.data_send_endpoint);
+    eprintln!("  (model/device/limits come from scheduler LoadModel)");
 
     // ── 1. ZMQ ──
     let zmq_ctx = zmq::Context::new();
@@ -250,13 +221,13 @@ fn main() -> Result<(), String> {
     );
 
     // ── 4. Load model ──
-    let device_id = parse_device_id(&args.device)?;
+    let device_id = parse_device_id(&load.device)?;
     let cuda = Cuda::new(device_id).map_err(|e| format!("Cuda::new: {:?}", e))?;
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
     let hf_cfg: HfConfig = serde_json::from_slice(&cfg_bytes)
         .map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
-    let max_seq_len = load.max_model_len.max(args.max_seq_len);
+    let max_seq_len = load.max_model_len;
     let load_cfg = build_load_config(&hf_cfg, max_seq_len);
     eprintln!(
         "[bootstrap] arch={} layers={} dim={} heads={}/{} vocab={}",
@@ -278,11 +249,9 @@ fn main() -> Result<(), String> {
         load_cfg: &load_cfg,
         max_seq_len,
         block_size: args.block_size,
-        num_blocks_arg: args.num_blocks,
+        num_blocks_override: args.num_blocks_override,
         server_heartbeat_ms,
-        heartbeat_interval_ms_arg: args.heartbeat_interval_ms,
     };
-
     let eos_ids: Vec<i32> = match load.model_type.as_str() {
         "qwen3" => vec![151643, 151645], // <|endoftext|>, <|im_end|>
         _ => vec![128001, 128008, 128009], // Llama 3.x default
@@ -313,9 +282,8 @@ struct Bootstrap<'a> {
     load_cfg: &'a LoadConfig,
     max_seq_len: usize,
     block_size: usize,
-    num_blocks_arg: usize,
+    num_blocks_override: usize,
     server_heartbeat_ms: Option<u64>,
-    heartbeat_interval_ms_arg: u64,
 }
 
 fn run_with_model<M>(
@@ -336,13 +304,13 @@ where
     // post-load free pool. Allocate `kv_cache_memory_fraction` of that free
     // memory to the paged KV pool; the rest is left for the forward /
     // batch workspaces, the CUDA-Graph scratch block, and graph capture
-    // buffers. `--num-blocks` (CLI) still overrides for diagnostics.
-    let num_blocks = if bs.num_blocks_arg != 0 {
+    // buffers. `--num-blocks-override` (CLI) still overrides for diagnostics.
+    let num_blocks = if bs.num_blocks_override != 0 {
         eprintln!(
             "[bootstrap] num_blocks override from CLI: {} (skipping GPU mem probe)",
-            bs.num_blocks_arg,
+            bs.num_blocks_override,
         );
-        bs.num_blocks_arg
+        bs.num_blocks_override
     } else {
         // Bytes per scheduler-visible block: K and V tensors, one per
         // layer, each shaped [1, block_size, kv_dim] of bf16 (2 bytes).
@@ -430,10 +398,8 @@ where
         max_total_kv_tokens,
     );
 
-    let hb_ms = bs.server_heartbeat_ms
-        .unwrap_or(bs.heartbeat_interval_ms_arg)
-        .min(bs.heartbeat_interval_ms_arg);
-    let heartbeat_interval = Duration::from_millis(hb_ms.max(200));
+    let hb_ms = bs.server_heartbeat_ms.unwrap_or(1000).max(200);
+    let heartbeat_interval = Duration::from_millis(hb_ms);
     eprintln!("[serve] heartbeat interval = {:?}", heartbeat_interval);
     let mut last_heartbeat = Instant::now();
     let mut active: HashMap<u64, ActiveSeq> = HashMap::new();

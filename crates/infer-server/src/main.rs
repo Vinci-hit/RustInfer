@@ -1,16 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use infer_server::{
-    AppState, ServerConfig, ZmqClient,
-    router::build_router,
-    state::ModelInfo,
-};
+use infer_server::ServerConfig;
 
 /// A managed child process with a label.
 struct ManagedChild {
@@ -122,7 +116,7 @@ async fn main() -> Result<()> {
             &devices[1..],
         );
     }
-    let model_name = config.effective_model_name();
+    let _model_name = config.effective_model_name();
 
     // Auto-generate IPC endpoints
     let frontend_ep = format!("ipc:///tmp/rustinfer-{}-frontend.ipc", pid);
@@ -131,12 +125,11 @@ async fn main() -> Result<()> {
     let worker_control_ep = format!("ipc:///tmp/rustinfer-{}-worker-control.ipc", pid);
 
     tracing::info!("╔══════════════════════════════════════════════════╗");
-    tracing::info!("║          RustInfer Server v0.1.0                 ║");
+    tracing::info!("║     RustInfer Scheduler & Worker v0.1.0           ║");
     tracing::info!("╚══════════════════════════════════════════════════╝");
     tracing::info!("  Model: {}", config.model);
     tracing::info!("  Model type: {}", config.model_type);
     tracing::info!("  Devices: {:?}", devices);
-    tracing::info!("  API Server Port: {}", config.port);
     tracing::info!("  max_batch_tokens: {}", config.max_batch_tokens);
     tracing::info!("  max_batch_seqs: {}", config.max_batch_seqs);
     tracing::info!("  max_model_len: {}", config.max_model_len);
@@ -220,51 +213,19 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  3. Initialize API Server
+    //  3. Print connection info for API server
     // ═══════════════════════════════════════════════════════════════════════════
-    tracing::info!("[server] Initializing Tokenizer and ZMQ Client...");
-    let tokenizer_path = std::path::Path::new(&config.model).join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    tracing::info!("Tokenizer loaded (vocab_size={})", tokenizer.get_vocab_size(true));
-
-    let client = ZmqClient::new(&frontend_ep, config.request_timeout_secs).await?;
-    tracing::info!("Connected to scheduler via {}", frontend_ep);
-
-    let model_info = ModelInfo {
-        model_id: model_name,
-        owned_by: "rustinfer".to_string(),
-    };
-
-    let state = Arc::new(AppState {
-        client,
-        tokenizer,
-        config: config.clone(),
-        model_info,
-    });
-
-    let app = build_router(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    tracing::info!("API Server listening on http://{}:{}", config.host, config.port);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-    // Create a broadcast channel for shutdown
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    
-    // Spawn axum server
-    let mut axum_rx = shutdown_tx.subscribe();
-    let server_task = tokio::spawn(async move {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = axum_rx.recv().await;
-                tracing::info!("Axum server shutting down gracefully.");
-            })
-            .await;
-        if let Err(e) = result {
-            tracing::error!("Axum server error: {}", e);
-        }
-    });
+    tracing::info!("╔══════════════════════════════════════════════════╗");
+    tracing::info!("║         Scheduler & Worker Running                ║");
+    tracing::info!("╚══════════════════════════════════════════════════╝");
+    tracing::info!("  Frontend Endpoint: {}", frontend_ep);
+    tracing::info!("  Worker In Endpoint: {}", worker_in_ep);
+    tracing::info!("  Worker Out Endpoint: {}", worker_out_ep);
+    tracing::info!("  Worker Control Endpoint: {}", worker_control_ep);
+    tracing::info!("");
+    tracing::info!("To start the API server in another terminal, run:");
+    tracing::info!("  rustinfer-api --model {} --frontend-endpoint {} --port 8000",
+        config.model, frontend_ep);
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  4. Monitor: wait for CTRL+C or any child exit
@@ -298,14 +259,9 @@ async fn main() -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════════
     //  5. Graceful shutdown
     // ═══════════════════════════════════════════════════════════════════════════
-    let _ = shutdown_tx.send(()); // Signal Axum to shut down
-    
     tracing::info!("Shutting down child processes...");
     shutdown_all(&mut children).await;
     cleanup_ipc(pid);
-
-    tracing::info!("Waiting for Axum server to exit...");
-    let _ = server_task.await;
 
     tracing::info!("All components stopped. Goodbye!");
     Ok(())

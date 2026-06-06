@@ -7,6 +7,10 @@ edition = "2024"
 name = "rustinfer-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "rustinfer-api"
+path = "src/bin/api.rs"
+
 [dependencies]
 # Core inference
 infer-protocol = { path = "../infer-protocol" }
