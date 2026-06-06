@@ -13,5 +13,4 @@ pub mod state;
 
 // Re-exports
 pub use client::ZmqClient;
-pub use config::ServerConfig;
 pub use state::{AppState, SharedState};

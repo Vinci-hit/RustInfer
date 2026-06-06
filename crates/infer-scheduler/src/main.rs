@@ -9,6 +9,7 @@ use infer_scheduler::config::{SchedulerConfig, SchedulerMode};
 use infer_scheduler::domain::BlockSize;
 use infer_scheduler::domain::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
 use infer_protocol::scheduler_to_worker_control::LoadModel;
+use infer_protocol::{resolve_model_type, RustInferConfig};
 use infer_scheduler::infrastructure::transport::control_plane::{ControlPlane, ControlPlaneConfig};
 use infer_scheduler::infrastructure::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
 
@@ -16,71 +17,9 @@ use infer_scheduler::infrastructure::transport::zmq_transport::{ZmqFrontendTrans
 #[command(name = "rustinfer-scheduler")]
 #[command(about = "RustInfer Scheduler — production-grade continuous batching scheduler")]
 struct Args {
-    /// ZMQ frontend endpoint (ROUTER socket, connects to HTTP server).
-    #[arg(long, default_value = "ipc:///tmp/rustinfer.ipc")]
-    frontend_endpoint: String,
-
-    /// ZMQ Worker PUSH endpoint (sends batch commands).
-    #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-in.ipc")]
-    worker_push_endpoint: String,
-
-    /// ZMQ Worker PULL endpoint (receives step outputs).
-    #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-out.ipc")]
-    worker_pull_endpoint: String,
-
-    /// ZMQ Worker control endpoint (lifecycle handshake and readiness).
-    #[arg(long, default_value = "ipc:///tmp/rustinfer-worker-control.ipc")]
-    worker_control_endpoint: String,
-
-    /// Optional model path to assign to the Worker via LoadModel.
-    #[arg(long)]
-    model: Option<String>,
-
-    /// Model type assigned via LoadModel when --model is present.
-    #[arg(long, default_value = "llama3")]
-    model_type: String,
-
-    /// Device assigned via LoadModel when --model is present.
-    #[arg(long, default_value = "cuda:0")]
-    device: String,
-
-    /// Static memory fraction reserved for model runtime planning.
-    #[arg(long, default_value = "1.0")]
-    mem_fraction_static: f32,
-
-    /// Maximum batch tokens per iteration.
-    #[arg(long, default_value = "1024")]
-    max_batch_tokens: usize,
-
-    /// Maximum concurrent sequences in flight.
-    #[arg(long, default_value = "32")]
-    max_batch_seqs: usize,
-
-    /// Maximum model sequence length (prompt + generation).
-    #[arg(long, default_value = "4096")]
-    max_model_len: usize,
-
-    /// Scheduler mode: "llm" (default) or "diffusion".
-    #[arg(long, default_value = "llm")]
-    mode: String,
-
-    /// Paged KV block size (tokens per block). Default 1.
-    #[arg(long, default_value_t = 1)]
-    paged_block_size: usize,
-
-    /// Chunked prefill: max tokens per prefill chunk.
-    /// None (default) = no chunking (full prompt in one shot).
-    /// Set to e.g. 512 or 2048 to split long prompts across iterations.
-    #[arg(long)]
-    chunked_prefill_size: Option<usize>,
-
-    /// Enable RadixTree prefix caching. Only meaningful in paged KV mode.
-    #[arg(long, default_value_t = false)]
-    enable_prefix_caching: bool,
-
-    /// Log level.
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Path to the shared TOML launch config.
+    #[arg(long, default_value = "rustinfer.toml")]
+    config: String,
 }
 
 fn parse_block_size(s: usize) -> BlockSize {
@@ -91,72 +30,82 @@ fn parse_block_size(s: usize) -> BlockSize {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let cfg = RustInferConfig::load(&args.config).map_err(|e| anyhow::anyhow!(e))?;
 
     // Initialize logging.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.clone().into()),
+                .unwrap_or_else(|_| cfg.log_level.clone().into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let paged_block_size = parse_block_size(args.paged_block_size);
-    let scheduler_mode = match args.mode.as_str() {
+    let frontend_endpoint = cfg.frontend_endpoint();
+    let worker_push_endpoint = cfg.worker_in_endpoint();
+    let worker_pull_endpoint = cfg.worker_out_endpoint();
+    let worker_control_endpoint = cfg.worker_control_endpoint();
+
+    let paged_block_size = parse_block_size(cfg.paged_block_size);
+    let scheduler_mode = match cfg.mode.as_str() {
         "diffusion" => SchedulerMode::Diffusion,
         _ => SchedulerMode::Llm,
     };
 
+    // model_type is derived from the model's config.json (never a CLI flag),
+    // so the worker dispatch always matches the loaded weights.
+    let model_type = resolve_model_type(&cfg.model).map_err(|e| anyhow::anyhow!(e))?;
+
     tracing::info!("RustInfer Scheduler v0.2.0 starting...");
     tracing::info!("  Mode: {:?}", scheduler_mode);
-    tracing::info!("  Frontend: {}", args.frontend_endpoint);
-    tracing::info!("  Worker PUSH: {}", args.worker_push_endpoint);
-    tracing::info!("  Worker PULL: {}", args.worker_pull_endpoint);
-    tracing::info!("  Worker Control: {}", args.worker_control_endpoint);
-    tracing::info!("  Assigned model: {}", args.model.as_deref().unwrap_or("<worker-cli>"));
-    tracing::info!("  Assigned model type: {}", args.model_type);
-    tracing::info!("  max_batch_seqs: {}", args.max_batch_seqs);
-    tracing::info!("  max_batch_tokens: {}", args.max_batch_tokens);
-    tracing::info!("  max_model_len: {}", args.max_model_len);
+    tracing::info!("  Frontend: {}", frontend_endpoint);
+    tracing::info!("  Worker PUSH: {}", worker_push_endpoint);
+    tracing::info!("  Worker PULL: {}", worker_pull_endpoint);
+    tracing::info!("  Worker Control: {}", worker_control_endpoint);
+    tracing::info!("  Assigned model: {}", cfg.model);
+    tracing::info!("  Assigned model type: {}", model_type);
+    tracing::info!("  max_batch_seqs: {}", cfg.max_batch_seqs);
+    tracing::info!("  max_batch_tokens: {}", cfg.max_batch_tokens);
+    tracing::info!("  max_model_len: {}", cfg.max_model_len);
     tracing::info!("  paged_block_size: {}", paged_block_size);
-    tracing::info!("  chunked_prefill_size: {:?}", args.chunked_prefill_size);
-    tracing::info!("  enable_prefix_caching: {}", args.enable_prefix_caching);
+    tracing::info!("  chunked_prefill_size: {:?}", cfg.chunked_prefill());
+    tracing::info!("  enable_prefix_caching: {}", cfg.enable_prefix_caching);
 
     // Build config.
     let mut config = SchedulerConfig {
         mode: scheduler_mode,
-        max_num_seqs: args.max_batch_seqs,
-        max_batch_tokens: args.max_batch_tokens,
-        max_model_len: args.max_model_len,
+        max_num_seqs: cfg.max_batch_seqs,
+        max_batch_tokens: cfg.max_batch_tokens,
+        max_model_len: cfg.max_model_len,
         paged_block_size,
-        chunked_prefill_size: args.chunked_prefill_size,
-        enable_prefix_caching: args.enable_prefix_caching,
-        frontend_endpoint: args.frontend_endpoint.clone(),
-        worker_push_endpoint: args.worker_push_endpoint.clone(),
-        worker_pull_endpoint: args.worker_pull_endpoint.clone(),
+        chunked_prefill_size: cfg.chunked_prefill(),
+        enable_prefix_caching: cfg.enable_prefix_caching,
+        frontend_endpoint: frontend_endpoint.clone(),
+        worker_push_endpoint: worker_push_endpoint.clone(),
+        worker_pull_endpoint: worker_pull_endpoint.clone(),
         ..Default::default()
     };
 
     // Create transports.
-    let frontend = ZmqFrontendTransport::new(&args.frontend_endpoint)?;
-    let worker = ZmqWorkerTransport::new(&args.worker_push_endpoint, &args.worker_pull_endpoint)?;
+    let frontend = ZmqFrontendTransport::new(&frontend_endpoint)?;
+    let worker = ZmqWorkerTransport::new(&worker_push_endpoint, &worker_pull_endpoint)?;
 
-    let load_model = args.model.clone().map(|model_path| LoadModel {
+    let load_model = Some(LoadModel {
         model_instance_id: "default".to_string(),
-        model_path,
-        model_type: args.model_type.clone(),
-        device: args.device.clone(),
-        max_batch_tokens: args.max_batch_tokens,
-        max_batch_seqs: args.max_batch_seqs,
-        max_model_len: args.max_model_len,
-        mem_fraction_static: args.mem_fraction_static,
+        model_path: cfg.model.clone(),
+        model_type: model_type.clone(),
+        device: cfg.device.clone(),
+        max_batch_tokens: cfg.max_batch_tokens,
+        max_batch_seqs: cfg.max_batch_seqs,
+        max_model_len: cfg.max_model_len,
+        mem_fraction_static: cfg.mem_fraction_static,
         tp_rank: 0,
         tp_size: 1,
         pp_rank: 0,
         pp_size: 1,
         kv_cache_mode: Some(format!("paged:{}", paged_block_size.raw())),
-        kv_cache_memory_fraction: Some(args.mem_fraction_static),
-        enable_prefix_caching: args.enable_prefix_caching,
+        kv_cache_memory_fraction: Some(cfg.mem_fraction_static),
+        enable_prefix_caching: cfg.enable_prefix_caching,
     });
 
     // Bind the control-plane ROUTER, optionally assign a model, then
@@ -164,7 +113,7 @@ async fn main() -> Result<()> {
     // runtime control once the handshake completes.
     let cp_cfg = ControlPlaneConfig::default();
     let (mut control_plane, worker_group) =
-        ControlPlane::bootstrap(&args.worker_control_endpoint, load_model, cp_cfg).await?;
+        ControlPlane::bootstrap(&worker_control_endpoint, load_model, cp_cfg).await?;
     tracing::info!(
         "WorkerGroup ready: group_id={} model_instance_id={} ranks={} effective_max_batch_tokens={} effective_max_batch_seqs={}",
         worker_group.group_id,
@@ -201,7 +150,7 @@ async fn main() -> Result<()> {
     // wired up inside `SchedulerEngine::new`.
 
     let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
-        SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(args.max_batch_seqs)),
+        SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(cfg.max_batch_seqs)),
         SchedulerMode::Llm => Box::new(ContinuousBatchingPolicy::new(config.chunked_prefill_size)),
     };
 

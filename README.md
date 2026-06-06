@@ -63,19 +63,14 @@ RustInfer 采用**分层模块化架构**，核心包括：
 # 构建
 cargo build --release --features cuda,models
 
-# Terminal 1: Worker
-./target/release/rustinfer-worker \
-  --model ~/models/Llama-3.2-1B-Instruct \
-  --model-type llama3 --device cuda:0
+# Terminal 1: Scheduler（先启动，绑定 IPC sockets）
+./target/release/rustinfer-scheduler --config rustinfer.toml
 
-# Terminal 2: Scheduler
-./target/release/rustinfer-scheduler \
-  --max-batch-tokens 4096 --max-batch-seqs 32
+# Terminal 2: Worker
+./target/release/rustinfer-worker --config rustinfer.toml
 
 # Terminal 3: HTTP Server
-./target/release/rustinfer-server \
-  --tokenizer ~/models/Llama-3.2-1B-Instruct \
-  --engine-endpoint ipc:///tmp/rustinfer.ipc
+./target/release/rustinfer-server --config rustinfer.toml
 ```
 
 **2. 启动 vLLM**
@@ -392,12 +387,7 @@ nsys profile \
 
 ```bash
 PATH=/root/RustInfer/target/release:$PATH \
-./target/release/rustinfer-server \
-  --port 8014 \
-  --engine-endpoint ipc:///tmp/rustinfer-nsys-frontend.ipc \
-  --tokenizer ${MODEL} \
-  --model-name llama3.2-1b \
-  --log-level warn
+./target/release/rustinfer-server --config rustinfer.toml
 
 python bench/bench_real_arrival.py \
   --url http://127.0.0.1:8014 \

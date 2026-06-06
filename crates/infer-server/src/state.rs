@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
+use infer_protocol::RustInferConfig;
+
 use crate::client::ZmqClient;
-use crate::config::ServerConfig;
 
 /// 模型信息
 #[derive(Debug, Clone)]
@@ -21,8 +22,10 @@ pub struct AppState {
     pub client: ZmqClient,
     /// Tokenizer（Server 端负责 encode/decode）
     pub tokenizer: Tokenizer,
-    /// 服务器配置
-    pub config: ServerConfig,
+    /// 服务器配置（来自共享 TOML）
+    pub config: RustInferConfig,
+    /// 服务端实际加载的模型类型（从 config.json 解析，用于 chat template）
+    pub model_type: String,
     /// 加载的模型信息
     pub model_info: ModelInfo,
 }

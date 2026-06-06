@@ -50,43 +50,17 @@ use infer_worker::infrastructure::transport::data_pump::DataPump;
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker", version = "0.3.0")]
 struct Args {
-    /// Scheduler control plane endpoint (DEALER → ROUTER).
-    #[arg(long, alias = "worker-control-endpoint", default_value = "ipc:///tmp/rustinfer-worker-control.ipc")]
-    control_endpoint: String,
-
-    /// Scheduler → Worker data plane endpoint (PUSH → PULL).
-    /// Worker connects with PULL.
-    #[arg(long, alias = "worker-pull-endpoint", default_value = "ipc:///tmp/rustinfer-worker-in.ipc")]
-    data_recv_endpoint: String,
-
-    /// Worker → Scheduler data plane endpoint (PUSH → PULL).
-    /// Worker connects with PUSH.
-    #[arg(long, alias = "worker-push-endpoint", default_value = "ipc:///tmp/rustinfer-worker-out.ipc")]
-    data_send_endpoint: String,
-
-    #[arg(long, default_value = "worker-0")]
-    worker_id: String,
-
-    /// Paged KV block size. MUST be 1 (every token = 1 slot in global KV pool).
-    /// Kept as CLI knob for diagnostics only — do not change in production.
-    #[arg(long, default_value_t = 1)]
-    block_size: usize,
-
-    /// Override number of physical paged blocks. If 0, derived from LoadModel.
-    /// Use with --profile or diagnostics only.
-    #[arg(long, default_value_t = 0)]
-    num_blocks_override: usize,
+    /// Path to the shared TOML launch config.
+    #[arg(long, default_value = "rustinfer.toml")]
+    config: String,
 
     /// Number of decode steps to profile with cudaProfilerApi.
-    /// When set, calls cudaProfilerStart() before the first decode step
-    /// and cudaProfilerStop() after N steps, then exits.
+    /// Diagnostic-only override (not part of the shared config). When set,
+    /// calls cudaProfilerStart() before the first decode step and
+    /// cudaProfilerStop() after N steps, then exits.
     /// Use with: nsys profile --capture-range=cudaProfilerApi ...
     #[arg(long)]
     profile_cuda_steps: Option<u32>,
-
-    /// Log level (forwarded to tracing-subscriber).
-    #[arg(long, default_value = "info")]
-    log_level: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,23 +149,31 @@ struct ActiveSeq {
 
 fn main() -> Result<(), String> {
     let args = Args::parse();
+    let cfg = infer_protocol::RustInferConfig::load(&args.config)?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.clone().into()),
+                .unwrap_or_else(|_| cfg.log_level.clone().into()),
         )
         .init();
+
+    let control_endpoint = cfg.worker_control_endpoint();
+    let data_recv_endpoint = cfg.worker_in_endpoint();
+    let data_send_endpoint = cfg.worker_out_endpoint();
+    let block_size = cfg.paged_block_size;
+    let num_blocks_override = cfg.num_blocks;
+
     eprintln!("rustinfer-worker v0.3.0");
-    eprintln!("  worker_id = {}", args.worker_id);
-    eprintln!("  control   = {}", args.control_endpoint);
-    eprintln!("  data_recv = {}", args.data_recv_endpoint);
-    eprintln!("  data_send = {}", args.data_send_endpoint);
+    eprintln!("  worker_id = {}", cfg.worker_id);
+    eprintln!("  control   = {}", control_endpoint);
+    eprintln!("  data_recv = {}", data_recv_endpoint);
+    eprintln!("  data_send = {}", data_send_endpoint);
     eprintln!("  (model/device/limits come from scheduler LoadModel)");
 
     // ── 1. ZMQ ──
     let zmq_ctx = zmq::Context::new();
-    let control = ControlPump::new(&zmq_ctx, args.worker_id.clone(), &args.control_endpoint)?;
-    let data = DataPump::new(&zmq_ctx, &args.data_recv_endpoint, &args.data_send_endpoint)?;
+    let control = ControlPump::new(&zmq_ctx, cfg.worker_id.clone(), &control_endpoint)?;
+    let data = DataPump::new(&zmq_ctx, &data_recv_endpoint, &data_send_endpoint)?;
 
     // ── 2. Hello ──
     control.send_hello()?;
@@ -240,7 +222,12 @@ fn main() -> Result<(), String> {
     let reader = SafetensorsReader::open(st_path).map_err(|e| format!("open weights: {}", e))?;
     let loader = WeightLoader::new(&reader);
     let load_start = Instant::now();
-    eprintln!("[bootstrap] loading weights for model_type='{}'", load.model_type);
+
+    // Model type is derived from the model's config.json, NOT from
+    // `load.model_type` (which the scheduler fills for its own logging).
+    // This guarantees the worker dispatch always matches the loaded weights.
+    let model_type = infer_protocol::resolve_model_type(&load.model_path)?;
+    eprintln!("[bootstrap] loading weights for model_type='{}' (derived from config.json)", model_type);
 
     // ── 5/6/7. Build runner + send Ready + run serve loop, dispatched on model_type ──
     let bootstrap = Bootstrap {
@@ -248,16 +235,17 @@ fn main() -> Result<(), String> {
         cuda: &cuda,
         load_cfg: &load_cfg,
         max_seq_len,
-        block_size: args.block_size,
-        num_blocks_override: args.num_blocks_override,
+        block_size,
+        num_blocks_override,
         server_heartbeat_ms,
+        model_type: model_type.clone(),
     };
-    let eos_ids: Vec<i32> = match load.model_type.as_str() {
+    let eos_ids: Vec<i32> = match model_type.as_str() {
         "qwen3" => vec![151643, 151645], // <|endoftext|>, <|im_end|>
         _ => vec![128001, 128008, 128009], // Llama 3.x default
     };
 
-    match load.model_type.as_str() {
+    match model_type.as_str() {
         "qwen3" => {
             let model = loader.load_qwen3::<bf16, Cuda>(&load_cfg, &cuda)
                 .map_err(|e| format!("load_qwen3: {:?}", e))?;
@@ -284,6 +272,8 @@ struct Bootstrap<'a> {
     block_size: usize,
     num_blocks_override: usize,
     server_heartbeat_ms: Option<u64>,
+    /// Resolved from config.json (not `load.model_type`).
+    model_type: String,
 }
 
 fn run_with_model<M>(
@@ -380,7 +370,7 @@ where
     control.send_ready(
         bs.load.model_instance_id.clone(),
         bs.load.model_path.clone(),
-        bs.load.model_type.clone(),
+        bs.model_type.clone(),
         WorkerCapacity {
             max_batch_tokens: bs.load.max_batch_tokens,
             max_batch_seqs: bs.load.max_batch_seqs,

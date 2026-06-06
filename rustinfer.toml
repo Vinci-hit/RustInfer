@@ -1,0 +1,50 @@
+# RustInfer shared launch config.
+#
+# One file drives all processes: rustinfer-scheduler, rustinfer-worker,
+# rustinfer-server. Each binary takes only `--config <path>` (defaults to
+# ./rustinfer.toml).
+#
+# `model_type` is intentionally NOT here — it is resolved from the model's
+# config.json so the worker dispatch / chat template always match the weights.
+
+# Model directory (weights + tokenizer.json + config.json). Required.
+model = "/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b"
+
+# Display name for /v1/models. Empty => derive from `model` basename.
+model_name = ""
+
+# Cluster id. All four IPC endpoints derive from this. Use a distinct id to
+# run multiple independent instances on the same host.
+cluster_id = "rustinfer"
+
+# CUDA device.
+device = "cuda:0"
+
+# HTTP API server.
+host = "0.0.0.0"
+port = 8000
+request_timeout_secs = 120
+
+# Batching / capacity.
+max_batch_tokens = 8192
+max_batch_seqs = 32
+max_model_len = 4096
+
+# Paged KV.
+paged_block_size = 16
+chunked_prefill_size = 0      # 0 => disabled
+enable_prefix_caching = false
+mem_fraction_static = 0.9
+num_blocks = 0                # 0 => auto-size
+
+# Generation.
+ignore_eos = false
+
+# Scheduler mode: "llm" or "diffusion".
+mode = "llm"
+
+# Worker.
+worker_id = "worker-0"
+
+# Logging.
+log_level = "info"

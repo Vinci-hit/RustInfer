@@ -5,11 +5,7 @@ edition = "2024"
 
 [[bin]]
 name = "rustinfer-server"
-path = "src/main.rs"
-
-[[bin]]
-name = "rustinfer-api"
-path = "src/bin/api.rs"
+path = "src/bin/server.rs"
 
 [dependencies]
 # Core inference
@@ -49,7 +45,6 @@ uuid = { version = "1.19", features = ["v4", "serde"] }
 # ZMQ (进程间通信)
 zmq = "0.10"
 rmp-serde = "1.3"
-nix = { version = "0.31.3", features = ["signal"] }
 
 [features]
 default = []
