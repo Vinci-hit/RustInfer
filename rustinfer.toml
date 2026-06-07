@@ -8,7 +8,7 @@
 # config.json so the worker dispatch / chat template always match the weights.
 
 # Model directory (weights + tokenizer.json + config.json). Required.
-model = "/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b"
+model = "/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
@@ -31,7 +31,7 @@ max_batch_seqs = 32
 max_model_len = 4096
 
 # Paged KV.
-paged_block_size = 16
+paged_block_size = 1
 chunked_prefill_size = 0      # 0 => disabled
 enable_prefix_caching = false
 mem_fraction_static = 0.9

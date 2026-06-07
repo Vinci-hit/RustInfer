@@ -484,6 +484,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         let batch = seqs.len();
         let primed = self.graph_runner.is_some();
         let max_cap = self.graph_runner.as_ref().map(|g| g.max_capture_size()).unwrap_or(0);
+        eprintln!("[step_batch] seqs.len={} all_decode={}", seqs.len(), all_decode);
 
         if !primed || !all_decode || batch > max_cap {
             return self.step_batch_eager(seqs);
