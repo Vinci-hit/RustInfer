@@ -237,7 +237,8 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             };
             self.model.forward(&input_ids_dev, &mut ctx)?
         };
-        let result = D::argmax_batched(&logits, &plan.cu_q_lens, batch);
+        let (out_dev, workspace) = self.forward_ws.argmax_args();
+        let result = D::argmax_batched(&logits, &plan.cu_q_lens, batch, out_dev, workspace);
 
         #[cfg(feature = "cuda")]
         if prof {
@@ -439,7 +440,8 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         };
         // Decode-only: logits is [batch, vocab]. Use the graph-friendly
         // argmax (zero alloc, zero D2H, writes into forward_ws.argmax_out_dev).
-        argmax_batched_decode_into(&logits, self.forward_ws.argmax_out_dev_mut())
+        let (out_dev, workspace) = self.forward_ws.argmax_args();
+        argmax_batched_decode_into(&logits, out_dev, workspace)
     }
 
     /// Forward + argmax ONLY — no H2D upload.
@@ -461,7 +463,8 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
             };
             self.model.forward(&input_ids_dev, &mut ctx)?
         };
-        argmax_batched_decode_into(&logits, self.forward_ws.argmax_out_dev_mut())
+        let (out_dev, workspace) = self.forward_ws.argmax_args();
+        argmax_batched_decode_into(&logits, out_dev, workspace)
     }
 
     /// Decode-only graph-aware step.
@@ -484,7 +487,6 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         let batch = seqs.len();
         let primed = self.graph_runner.is_some();
         let max_cap = self.graph_runner.as_ref().map(|g| g.max_capture_size()).unwrap_or(0);
-        eprintln!("[step_batch] seqs.len={} all_decode={}", seqs.len(), all_decode);
 
         if !primed || !all_decode || batch > max_cap {
             return self.step_batch_eager(seqs);

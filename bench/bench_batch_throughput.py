@@ -33,7 +33,7 @@ class Result:
 
 async def send_one(session, url, prompt, max_tokens, model="llama3.2-1b", ignore_eos=False):
     payload = {
-        "model": model,
+        # "model": model,
         "messages": [
             {"role": "user", "content": prompt}
         ],

@@ -8,7 +8,7 @@ Usage:
     python3 bench/bench_online_burst.py --target rustinfer --duration 60
 
     # Against vLLM (default port 8001)
-    python3 bench/bench_online_burst.py --target vllm --port 8001 --duration 60
+    python3 bench/bench_online_burst.py --target vllm --port 8000 --duration 60
 """
 import argparse
 import asyncio
@@ -70,9 +70,9 @@ async def send_rustinfer(session, url, prompt):
 async def send_vllm(session, url, prompt):
     """Send chat completion to vLLM server (server applies its own chat template)."""
     payload = {
-        "model": VLLM_MODEL,
+        # "model": VLLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2048,
+        "max_tokens": 512,
         "temperature": 0.0,
     }
     start = time.perf_counter()

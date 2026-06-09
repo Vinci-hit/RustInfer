@@ -12,14 +12,53 @@ RustInfer是一个用Rust语言实现的高性能大语言模型(LLM)推理引�
 
 </div>
 
-RustInfer 采用**分层模块化架构**，核心包括：
+RustInfer 采用**领域驱动设计(DDD) + 六边形架构**，核心设计原则：
 
-- **Model Runtime**: Llama3/Qwen3 模型加载和执行
-- **Base Foundation**: 内存管理、CUDA显存分配器、设备抽象
-- **Tensor Engine**: 零拷贝张量系统，Shape/Stride/Zero-Copy Slice Views
-- **Operator Fabric**: CPU/CUDA 融合算子库（Matmul、FlashAttnGQA、RoPE、RMSNorm 等）
-- **CUDA Acceleration Plane**: 手写 GEMV/GEMM、INT4 量化、CUDA Graph、BF16/INT4 AWQ 推理
-- **Workspace Reuse**: 推理循环内存预分配，零动态分配
+### 三进程分离架构
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Server    │────▶│  Scheduler  │────▶│   Worker    │
+│  (Axum HTTP)│     │ (Continuous │     │ (GPU Inference)
+│             │◀────│  Batching)  │◀────│             │
+└─────────────┘     └─────────────┘     └─────────────┘
+       │                   │                   │
+       └───────────────────┴───────────────────┘
+                    ZeroMQ IPC
+                 (MessagePack, 10-50µs)
+```
+
+- **Server**: Axum HTTP API 服务器，OpenAI 兼容接口
+- **Scheduler**: 连续批处理调度器，负责请求调度和 KV 缓存管理
+- **Worker**: GPU 推理运行时，执行模型前向传播
+
+### DDD 分层架构
+
+核心 crate (`infer-scheduler` / `infer-worker`) 采用 DDD 三层架构：
+
+1. **Domain 层** (领域层)
+   - 纯业务逻辑，无 IO 依赖，无异步运行时
+   - 类型状态 (Typestate) 保证编译期状态安全
+   - 策略模式 (Policy Pattern) 实现可插拔调度策略
+   - 端口定义 (Ports) 通过 trait 实现依赖倒置
+
+2. **Application 层** (应用层)
+   - 编排器 (Orchestrator) + 系统 (Systems)
+   - 异步事件驱动 (tokio select! 循环)
+   - 工作流管理 (LLM/Diffusion)
+
+3. **Infrastructure 层** (基础设施层)
+   - IO 和运行时 (ZMQ Transport, CUDA Kernels)
+   - 指标和监控 (Prometheus)
+   - 具体实现 (CUDA Kernels, CPU 后备)
+
+### 设计模式
+
+- **Typestate Pattern**: 编译期状态验证，防止无效操作
+- **Policy Pattern**: 可插拔调度策略 (ContinuousBatching, Diffusion, TokenBudget)
+- **Repository Pattern**: 请求/会话管理
+- **Port-Adapter Pattern**: Transport 层抽象，便于测试和扩展
+- **Dependency Inversion**: Domain 定义 trait，Infrastructure 实现
 
 ---
 
@@ -57,33 +96,62 @@ RustInfer 采用**分层模块化架构**，核心包括：
 <details>
 <summary><b>复现步骤</b></summary>
 
-**1. 启动 RustInfer（三进程）**
+**1. 配置 `rustinfer.toml`**
+
+复制并修改 `rustinfer.toml`，设置 `model` 路径及其他参数：
+
+```toml
+model = "/path/to/your/model"
+device = "cuda:0"
+host = "0.0.0.0"
+port = 8000
+max_batch_tokens = 8192
+max_batch_seqs = 32
+max_model_len = 4096
+paged_block_size = 1
+mem_fraction_static = 0.9
+log_level = "info"
+```
+
+**2. 构建**
 
 ```bash
-# 构建
 cargo build --release --features cuda,models
+```
 
+**3. 启动 RustInfer（三进程）**
+
+使用脚本一键启动（推荐）：
+
+```bash
 # Terminal 1: Scheduler（先启动，绑定 IPC sockets）
-./target/release/rustinfer-scheduler --config rustinfer.toml
+./scripts/start_scheduler.sh rustinfer.toml
 
 # Terminal 2: Worker
-./target/release/rustinfer-worker --config rustinfer.toml
+./scripts/start_worker.sh rustinfer.toml
 
 # Terminal 3: HTTP Server
-./target/release/rustinfer-server --config rustinfer.toml
+./scripts/start_server.sh rustinfer.toml
 ```
 
-**2. 启动 vLLM**
+> 脚本会自动设置 `RUST_LOG` 等环境变量，并以前台模式运行。
+> 如需手动启动，直接运行二进制文件并传入 `--config` 参数：
+> ```bash
+> ./target/release/rustinfer-scheduler --config rustinfer.toml
+> ./target/release/rustinfer-worker --config rustinfer.toml
+> ./target/release/rustinfer-server --config rustinfer.toml
+> ```
+
+**4. 启动 vLLM**
 
 ```bash
-pip install vllm==0.11.2
-vllm serve ~/models/Llama-3.2-1B-Instruct \
+pip install vllm==0.22.0
+vllm serve ~/models/Qwen3-4B \
   --port 8000 --max-model-len 4096 \
   --gpu-memory-utilization 0.9 \
-  --served-model-name llama3
 ```
 
-**3. 安装压测依赖并运行**
+**5. 安装压测依赖并运行**
 
 ```bash
 cd bench
@@ -230,17 +298,19 @@ cargo test --lib model::diffusion::z_image::pipeline::tests::test_pipeline_z_ima
 RustInfer/
 ├── crates/
 │   ├── infer-protocol/    # 通信协议定义（MessagePack）
-│   ├── infer-scheduler/      # 独立推理引擎进程
-│   ├── infer-worker/        # 核心推理库
-│   │   ├── base/          # 内存管理、分配器
-│   │   ├── tensor/        # 张量系统（零拷贝）
-│   │   ├── op/            # 算子库（CPU/CUDA）
-│   │   ├── model/         # 模型实现（Llama3 / Qwen3）
-│   │   └── cuda/          # CUDA集成
-│   ├── infer-server/     # HTTP API服务器（Axum）
-│   │   ├── api/           # OpenAI兼容端点
+│   ├── infer-scheduler/   # 连续批处理调度器 (DDD 架构)
+│   │   ├── domain/        # 领域层：请求、会话、调度策略
+│   │   ├── application/   # 应用层：调度引擎 + 5 大系统
+│   │   └── infrastructure/# 基础设施层：ZMQ、Prometheus、RadixTree
+│   ├── infer-worker/      # GPU 推理运行时 (DDD 架构)
+│   │   ├── domain/        # 领域层：Tensor、Ops、Ports (trait)
+│   │   ├── application/   # 应用层：ModelRunner、CudaGraph
+│   │   ├── models/        # 模型实现：Llama3、Qwen3、Diffusion
+│   │   └── infrastructure/# 基础设施层：CUDA Kernels、CPU 后备
+│   ├── infer-server/      # HTTP API 服务器（Axum）
+│   │   ├── api/           # OpenAI 兼容端点
 │   │   ├── chat/          # 聊天模板
-│   │   └── zmq_client.rs  # ZMQ客户端
+│   │   └── client/        # ZMQ 客户端
 │   └── infer-frontend/    # Web UI（Dioxus WASM）
 ├── DEVELOPERS.md          # 开发者文档（架构深度解析）
 ├── README.md              # 本文件
@@ -312,85 +382,34 @@ cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ign
 
 ### 1. Worker-only 服务 profile
 
-先启动 Scheduler（不被 nsys profile）：
+用脚本一键启动（推荐）：
+
+**Terminal 1: Scheduler**
 
 ```bash
-cd /root/RustInfer
-mkdir -p result
-
-MODEL=/apdcephfs_qy2/share_303432435/vinciiliu/models/llama3.2-1b
-
-PATH=/root/RustInfer/target/release:$PATH \
-./target/release/rustinfer-scheduler \
-  --frontend-endpoint ipc:///tmp/rustinfer-nsys-frontend.ipc \
-  --worker-push-endpoint ipc:///tmp/rustinfer-nsys-worker-in.ipc \
-  --worker-pull-endpoint ipc:///tmp/rustinfer-nsys-worker-out.ipc \
-  --worker-control-endpoint ipc:///tmp/rustinfer-nsys-worker-control.ipc \
-  --model ${MODEL} \
-  --model-type llama3 \
-  --device cuda:0 \
-  --max-batch-tokens 512 \
-  --max-batch-seqs 4 \
-  --max-model-len 1024 \
-  --kv-cache-mode paged:16 \
-  --mem-fraction-static 0.05 \
-  --enable-prefix-caching \
-  --log-level warn
+./scripts/start_scheduler.sh rustinfer.toml
 ```
 
-再用 `nsys` 启动 Worker。当前 Worker 支持 `--profile-cuda-steps=N`：第一次提交推理 step 前调用 `cudaProfilerStart()`，完成 N 个 worker step 后调用 `cudaProfilerStop()`。因此可以使用 `--capture-range=cudaProfilerApi` 精确采集请求阶段，而不用猜 `--delay`。
+**Terminal 2: Worker (profile)**
 
 ```bash
-PROFILE_STEPS=200
+# 方法 A: --profile-cuda-steps 精确采集（推荐）
+PROFILE_STEPS=200 ./scripts/start_worker_profile_steps.sh rustinfer.toml
 
-PATH=/root/RustInfer/target/release:$PATH \
-nsys profile \
-  --trace=cuda,nvtx,osrt,cudnn,cublas \
-  --cuda-graph-trace=node \
-  --cuda-trace-all-apis=true \
-  --capture-range=cudaProfilerApi \
-  --capture-range-end=stop-shutdown \
-  --sample=none \
-  --cpuctxsw=none \
-  --kill=none \
-  --force-overwrite=true \
-  --output=/root/RustInfer/result/nsys_paged_worker \
-  ./target/release/rustinfer-worker \
-    --device cuda:0 \
-    --worker-pull-endpoint ipc:///tmp/rustinfer-nsys-worker-in.ipc \
-    --worker-push-endpoint ipc:///tmp/rustinfer-nsys-worker-out.ipc \
-    --worker-control-endpoint ipc:///tmp/rustinfer-nsys-worker-control.ipc \
-    --max-batch-tokens 512 \
-    --max-batch-seqs 4 \
-    --profile-cuda-steps ${PROFILE_STEPS} \
-    --log-level warn
+# 方法 B: --delay/--duration 窗口采集（旧版）
+./scripts/start_worker_profile.sh rustinfer.toml
 ```
 
-如果不想使用 profiler API，也可以退回 `--delay/--duration` 模式，但要确保窗口覆盖实际请求而不是模型加载：
+> **方法 A** 使用 `--capture-range=cudaProfilerApi`，Worker 在第 N 个 step 后自动停止 profile，精确覆盖请求阶段。
+> **方法 B** 使用固定时间窗口，需确保窗口覆盖实际请求而非模型加载。
+
+**Terminal 3: HTTP Server + 压测**
 
 ```bash
-nsys profile \
-  --trace=cuda,nvtx,osrt,cudnn,cublas \
-  --cuda-graph-trace=node \
-  --cuda-trace-all-apis=true \
-  --delay=60 \
-  --duration=120 \
-  --sample=none \
-  --cpuctxsw=none \
-  --kill=none \
-  --force-overwrite=true \
-  --output=/root/RustInfer/result/nsys_paged_worker_delay \
-  ./target/release/rustinfer-worker ...
-```
-
-最后启动 HTTP Server 并发起压测：
-
-```bash
-PATH=/root/RustInfer/target/release:$PATH \
-./target/release/rustinfer-server --config rustinfer.toml
+./scripts/start_server.sh rustinfer.toml
 
 python bench/bench_real_arrival.py \
-  --url http://127.0.0.1:8014 \
+  --url http://127.0.0.1:8000 \
   --model llama3.2-1b \
   --label RustInfer-PagedPrefix-Llama3.2-1B-nsys \
   --warmup-requests 2 \
@@ -405,10 +424,9 @@ python bench/bench_real_arrival.py \
 生成统计：
 
 ```bash
-rm -f /root/RustInfer/result/nsys_paged_worker.sqlite
 nsys stats \
   --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum,osrt_sum \
-  /root/RustInfer/result/nsys_paged_worker.nsys-rep
+  result/nsys_worker_steps.nsys-rep
 ```
 
 ### 2. Operator 级 profile（用于验证 nsys 能采到 kernel）
@@ -743,3 +761,12 @@ Made with ❤️ and 🦀 Rust
 [GitHub](https://github.com/Vinci-hit/RustInfer) • [Issues](https://github.com/Vinci-hit/RustInfer/issues)
 
 </div>
+
+优化/替换 flash_paged_decode::paged_decode_pass1_kernel
+当前是最大 GPU 差距源。
+对比 vLLM FlashAttn decode 路径。
+减少 Qwen3 norm kernel 数 / fuse QK norm
+RI norm 比 vLLM 多 86 ms。
+尤其 Q/K norm 是否能合并或做 inplace/strided fusion。
+优化 batched argmax
+RI sampling 多约 30 ms。

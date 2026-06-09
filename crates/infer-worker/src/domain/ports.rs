@@ -335,11 +335,15 @@ pub trait LlmOps: CoreOps {
     /// Argmax over each sequence's last logits row.
     /// `logits` : `[num_tokens, vocab_size]`
     /// `cu_q_lens` : `[batch+1]` — used to find each seq's last row
+    /// `out_dev` : `[batch]` pre-allocated device buffer for kernel output
+    /// `workspace` : `[batch, 256]` per-seq scratch for the argmax kernel
     /// Returns `Vec<i32>` of length `batch`.
     fn argmax_batched<T: Dtype>(
         logits: &Tensor<T, Self>,
         cu_q_lens: &Tensor<i32, Self>,
         batch: usize,
+        out_dev: &mut Tensor<i32, Self>,
+        workspace: &Tensor<f32, Self>,
     ) -> OpResult<Vec<i32>>;
 }
 

@@ -632,6 +632,8 @@ impl LlmOps for Cpu {
         logits: &Tensor<T, Self>,
         cu_q_lens: &Tensor<i32, Self>,
         batch: usize,
+        out_dev: &mut Tensor<i32, Self>,
+        _workspace: &Tensor<f32, Self>,
     ) -> OpResult<Vec<i32>> {
         let total_rows = if logits.shape().as_slice().len() >= 1 {
             logits.shape().as_slice()[0]
@@ -640,7 +642,7 @@ impl LlmOps for Cpu {
         };
         let vocab = logits.numel() / total_rows;
         let cu_q = cu_q_lens.as_slice();
-        let mut out = Vec::with_capacity(batch);
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_dev.data_ptr_mut(), batch) };
         for seq in 0..batch {
             let last_row = (cu_q[seq + 1] - 1) as usize;
             let mut max_val = f64::NEG_INFINITY;
@@ -649,9 +651,9 @@ impl LlmOps for Cpu {
                 let val = unsafe { read_f64(logits.data_ptr().add(last_row * vocab + i)) };
                 if val > max_val { max_val = val; max_idx = i as i32; }
             }
-            out.push(max_idx);
+            out_slice[seq] = max_idx;
         }
-        Ok(out)
+        Ok(out_slice.to_vec())
     }
 }
 
