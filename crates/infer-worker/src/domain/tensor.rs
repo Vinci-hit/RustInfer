@@ -255,6 +255,32 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
     #[inline]
     pub fn dtype(&self) -> DataType { T::DATA_TYPE }
 
+    /// Overwrite the tensor's contents with `data` (host → device upload).
+    ///
+    /// `data.len()` must equal `self.numel()`. The tensor must be contiguous.
+    /// Does **not** allocate; reuses the existing storage.
+    pub fn upload_from_host(&mut self, data: &[T]) -> OpResult<()> {
+        if data.len() != self.numel {
+            return Err(OpError::Shape(format!(
+                "upload_from_host: data.len()={} != self.numel={}",
+                data.len(), self.numel,
+            )));
+        }
+        // No is_contiguous check: upload is a linear H2D memcpy;
+        // non-contiguous views that are memory-packed (e.g. narrow on dim 0)
+        // are fine.
+        let size_bytes = self.numel * T::SIZE_BYTES;
+        if size_bytes > 0 {
+            // SAFETY: self.data_ptr() points to valid device memory of at
+            // least self.numel * SIZE_BYTES bytes.
+            unsafe {
+                let dst = std::ptr::NonNull::new_unchecked(self.data_ptr() as *mut u8);
+                self.storage.device().upload(dst, data.as_ptr() as *const u8, size_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
     /// In-place copy from a same-shape, same-dtype, same-device tensor.
     ///
     /// Performs a device-internal D2D memcpy (zero-copy, no host round-trip)

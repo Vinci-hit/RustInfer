@@ -23,9 +23,9 @@ use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::{self, cudaStream_t};
 
 unsafe extern "C" {
-    fn argmax_cu_bf16_ffi(input: *const half::bf16, selected_rows_device : *const i32, batch_size: i32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    // fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    // fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    fn argmax_cu_bf16_ffi(input: *const half::bf16,selected_rows_device: *const i32, batch_size: i32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
 }
 
 pub fn argmax_batched_decode_into<T: Dtype>(
@@ -63,7 +63,7 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     // Single path: argmax per row
     unsafe {
         argmax_cu_bf16_ffi(
-            logits.data_ptr() as _, std::ptr::null_mut(),batch as i32, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
+            logits.data_ptr() as _,std::ptr::null(), batch as i32, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
         );
     }
     Ok(())
@@ -75,6 +75,7 @@ pub fn argmax_batched<T: Dtype>(
     batch: usize,
     out_dev: &mut Tensor<i32, Cuda>,
     workspace: &Tensor<f32, Cuda>,
+    rows: &mut Tensor<i32, Cuda>,
 ) -> OpResult<Vec<i32>> {
     if batch == 0 {
         return Ok(Vec::new());
@@ -92,17 +93,27 @@ pub fn argmax_batched<T: Dtype>(
         )));
     }
 
+    let elem_bytes = T::SIZE_BYTES;
     let mut selected_rows = Vec::with_capacity(batch);
     for seq in 0..batch {
         selected_rows.push(cu[seq + 1] - 1); // 提取出那几个关键行号
     }
-    let real_batch_size = selected_rows.len();
-    let selected_rows_device = Tensor::from_host_slice(&selected_rows, [batch], device).unwrap();
-    unsafe {
-        match T::DATA_TYPE {
-            DataType::BF16 => argmax_cu_bf16_ffi(logits.data_ptr() as _,selected_rows_device.data_ptr(),real_batch_size as i32 , vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream),
-            _ => return Err(OpError::Kernel(format!("argmax_batched: dtype {:?} not implemented", T::DATA_TYPE))),
+    // Narrow rows to [batch] so upload_from_host length matches.
+    let mut rows = rows.narrow(0, 0, batch)?;
+    rows.upload_from_host(&selected_rows)?;
+    for seq in 0..batch {
+        let last_row = (cu[seq + 1] - 1) as usize;
+        let row_ptr = unsafe { (logits.data_ptr() as *const u8).add(last_row * vocab * elem_bytes) };
+        let out_ptr = unsafe { out_dev.data_ptr_mut().add(seq) };
+        unsafe {
+            match T::DATA_TYPE {
+                DataType::BF16 => argmax_cu_bf16_ffi(logits.data_ptr() as _, rows.data_ptr(),batch as i32, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
+                DataType::F16 => argmax_cu_fp16_ffi(row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
+                DataType::F32 => argmax_cu_f32_ffi(row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
+                _ => return Err(OpError::Kernel(format!("argmax_batched: dtype {:?}", T::DATA_TYPE))),
+            }
         }
+        break;
     }
     // Sync once before D2H read.
     unsafe {

@@ -10,7 +10,7 @@ pub mod embedding;
 pub mod rope;
 pub mod attention_paged;
 pub mod fused_add_rmsnorm;
-pub mod sampler;
+// pub mod sampler;
 pub mod split_cols;
 pub mod scatter_kv_paged;
 pub mod argmax_batched;

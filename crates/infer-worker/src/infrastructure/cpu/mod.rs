@@ -634,6 +634,7 @@ impl LlmOps for Cpu {
         batch: usize,
         out_dev: &mut Tensor<i32, Self>,
         _workspace: &Tensor<f32, Self>,
+        _rows: &mut Tensor<i32, Self>,
     ) -> OpResult<Vec<i32>> {
         let total_rows = if logits.shape().as_slice().len() >= 1 {
             logits.shape().as_slice()[0]

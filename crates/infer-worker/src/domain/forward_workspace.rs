@@ -101,6 +101,11 @@ pub struct ForwardWorkspace<T: Dtype, D: MemoryPort> {
     /// `256` is the per-seq scratch size expected by the kernel.
     argmax_workspace: Tensor<f32, D>,
 
+    /// Pre-allocated device buffer for `argmax_batched` row indices.
+    /// Shape `[cap_batch]`.  Caller uploads `selected_rows` each step;
+    /// passed to the kernel as `selected_rows_device`.
+    argmax_rows_dev: Tensor<i32, D>,
+
     // ─── Bubble-free decode pipeline buffers (gather_merge_input) ─────
     //
     // The merge `A[i] = src[i]>=0 ? C[src[i]] : B[-src[i]-1]` reads C
@@ -164,6 +169,9 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
         let argmax_workspace = Tensor::<f32, D>::zeros(
             Shape::from_slice(&[cap_batch.max(1), 256]), device,
         )?;
+        let argmax_rows_dev = Tensor::<i32, D>::zeros(
+            Shape::from_slice(&[cap_batch.max(1)]), device,
+        )?;
 
         // Bubble-free decode pipeline buffers (B + src), address-stable at
         // cap_batch. Default `src_map_dev` = identity (`src[i] = i`) so a
@@ -182,6 +190,7 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
             x, h, qkv_buf, attn_out, gate_buf, up_buf, gate_up_buf, ffn_out,
             q_buf, k_buf, v_buf, o_out, logits,
             flash_decode_workspace_f32, argmax_out_dev, argmax_out_host, argmax_workspace,
+            argmax_rows_dev,
             new_token_dev, src_map_dev, new_token_host, src_map_host,
         })
     }
@@ -213,10 +222,13 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
     pub fn argmax_out_host_mut(&mut self)    -> &mut [i32]          { &mut self.argmax_out_host }
     pub fn argmax_workspace_mut(&mut self) -> &mut Tensor<f32, D> { &mut self.argmax_workspace }
     pub fn argmax_workspace(&self)       -> &Tensor<f32, D>     { &self.argmax_workspace }
-    /// 同时借出 `argmax_out_dev` (mut) 和 `argmax_workspace` (imm)，
-    /// 绕过 Rust 借用检查器无法在同一调用中同时取 `&mut self` + `&self` 的限制。
-    pub fn argmax_args(&mut self) -> (&mut Tensor<i32, D>, &Tensor<f32, D>) {
-        (&mut self.argmax_out_dev, &self.argmax_workspace)
+    pub fn argmax_rows_dev_mut(&mut self) -> &mut Tensor<i32, D>  { &mut self.argmax_rows_dev }
+    pub fn argmax_rows_dev(&self)       -> &Tensor<i32, D>     { &self.argmax_rows_dev }
+    /// 同时借出 `argmax_out_dev` (mut)、`argmax_workspace` (imm) 和
+    /// `argmax_rows_dev` (mut)，绕过 Rust 借用检查器无法在同一调用中
+    /// 同时取 `&mut self` + `&self` 的限制。
+    pub fn argmax_args(&mut self) -> (&mut Tensor<i32, D>, &Tensor<f32, D>, &mut Tensor<i32, D>) {
+        (&mut self.argmax_out_dev, &self.argmax_workspace, &mut self.argmax_rows_dev)
     }
 
     // ─── Bubble-free decode pipeline accessors ───────────────────────

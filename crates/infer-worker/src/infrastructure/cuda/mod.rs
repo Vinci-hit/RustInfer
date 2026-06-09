@@ -356,8 +356,9 @@ impl LlmOps for Cuda {
         batch: usize,
         out_dev: &mut Tensor<i32, Self>,
         workspace: &Tensor<f32, Self>,
+        rows: &mut Tensor<i32, Self>,
     ) -> OpResult<Vec<i32>> {
-        kernels::argmax_batched::argmax_batched(logits, cu_q_lens, batch, out_dev, workspace)
+        kernels::argmax_batched::argmax_batched(logits, cu_q_lens, batch, out_dev, workspace, rows)
     }
 }
 

@@ -116,7 +116,7 @@ __global__ void argmax_phase1_bf16(
 
     if (tid == 0) {
 
-        auto* partial_vals = workspace_bf16 + row * 512;
+        auto* partial_vals = workspace_bf16 + blockIdx.y * 512;
         auto* partial_idxs = reinterpret_cast<int*>(partial_vals + 170);
 
         partial_vals[block_in_row] = __float2bfloat16(block_result.value);

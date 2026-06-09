@@ -237,8 +237,8 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             };
             self.model.forward(&input_ids_dev, &mut ctx)?
         };
-        let (out_dev, workspace) = self.forward_ws.argmax_args();
-        let result = D::argmax_batched(&logits, &plan.cu_q_lens, batch, out_dev, workspace);
+        let (out_dev, workspace, rows) = self.forward_ws.argmax_args();
+        let result = D::argmax_batched(&logits, &plan.cu_q_lens, batch, out_dev, workspace, rows);
 
         #[cfg(feature = "cuda")]
         if prof {
@@ -440,7 +440,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
         };
         // Decode-only: logits is [batch, vocab]. Use the graph-friendly
         // argmax (zero alloc, zero D2H, writes into forward_ws.argmax_out_dev).
-        let (out_dev, workspace) = self.forward_ws.argmax_args();
+        let (out_dev, workspace, _rows) = self.forward_ws.argmax_args();
         argmax_batched_decode_into(&logits, out_dev, workspace)
     }
 
@@ -463,7 +463,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
             };
             self.model.forward(&input_ids_dev, &mut ctx)?
         };
-        let (out_dev, workspace) = self.forward_ws.argmax_args();
+        let (out_dev, workspace, _rows) = self.forward_ws.argmax_args();
         argmax_batched_decode_into(&logits, out_dev, workspace)
     }
 
