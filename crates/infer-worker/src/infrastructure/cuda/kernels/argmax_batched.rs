@@ -23,9 +23,9 @@ use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::{self, cudaStream_t};
 
 unsafe extern "C" {
-    fn argmax_cu_bf16_ffi(input: *const half::bf16, batch_size: i32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    fn argmax_cu_bf16_ffi(input: *const half::bf16, selected_rows_device : *const i32, batch_size: i32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    // fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    // fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
 }
 
 pub fn argmax_batched_decode_into<T: Dtype>(
@@ -50,56 +50,21 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     if batch == 0 {
         return Ok(());
     }
-    let stream = logits.device().config.stream;
-    let elem_bytes = T::SIZE_BYTES;
 
-    if batch == 1 {
-        // Fast path: two-phase parallel argmax (uses __device__ static buffers,
-        // 126 blocks × 256 threads → ~5µs for vocab=128k).
-        // Single sequence means no data race on static buffers.
-        unsafe {
-            match T::DATA_TYPE {
-                DataType::BF16 => argmax_cu_bf16_ffi(
-                    logits.data_ptr() as _, 1i32, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
-                ),
-                DataType::F16 => argmax_cu_fp16_ffi(
-                    logits.data_ptr() as _, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
-                ),
-                DataType::F32 => argmax_cu_f32_ffi(
-                    logits.data_ptr() as _, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
-                ),
-                _ => return Err(OpError::Kernel(format!(
-                    "argmax_batched_decode_into: dtype {:?}", T::DATA_TYPE,
-                ))),
-            }
-        }
-    } else {
-        // Multi-row: launch two-phase per row sequentially on the same stream.
-        // The argmax_cu_*_ffi kernels use __device__ static arrays (d_partial_vals,
-        // d_partial_idxs) for inter-block communication. Since all launches are on
-        // the same stream, phase2 of seq N naturally completes before phase1 of
-        // seq N+1 starts — no explicit sync needed (and sync would break graph capture).
-        unsafe {
-            for seq in 0..batch {
-                let row_ptr = (logits.data_ptr() as *const u8).add(seq * vocab * elem_bytes);
-                let out_ptr = out_dev.data_ptr_mut().add(seq);
-                match T::DATA_TYPE {
-                    DataType::BF16 => argmax_cu_bf16_ffi(
-                        row_ptr as _, batch as i32, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream,
-                    ),
-                    DataType::F16 => argmax_cu_fp16_ffi(
-                        row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream,
-                    ),
-                    DataType::F32 => argmax_cu_f32_ffi(
-                        row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream,
-                    ),
-                    _ => return Err(OpError::Kernel(format!(
-                        "argmax_batched_decode_into: dtype {:?}", T::DATA_TYPE,
-                    ))),
-                }
-                break;
-            }
-        }
+    // Only support BF16
+    if T::DATA_TYPE != DataType::BF16 {
+        return Err(OpError::Kernel(format!(
+            "argmax_batched_decode_into: dtype {:?} not implemented", T::DATA_TYPE,
+        )));
+    }
+
+    let stream = logits.device().config.stream;
+
+    // Single path: argmax per row
+    unsafe {
+        argmax_cu_bf16_ffi(
+            logits.data_ptr() as _, std::ptr::null_mut(),batch as i32, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
+        );
     }
     Ok(())
 }
@@ -118,7 +83,6 @@ pub fn argmax_batched<T: Dtype>(
     let vocab = logits.numel() / total_rows;
     let device = logits.device();
     let stream = device.config.stream;
-
     // Pull cu_q_lens to host (small, batch+1 i32s).
     let cu = cu_q_lens.to_host_vec()?;
     if cu.len() != batch + 1 {
@@ -128,19 +92,16 @@ pub fn argmax_batched<T: Dtype>(
         )));
     }
 
-    let elem_bytes = T::SIZE_BYTES;
-
+    let mut selected_rows = Vec::with_capacity(batch);
     for seq in 0..batch {
-        let last_row = (cu[seq + 1] - 1) as usize;
-        let row_ptr = unsafe { (logits.data_ptr() as *const u8).add(last_row * vocab * elem_bytes) };
-        let out_ptr = unsafe { out_dev.data_ptr_mut().add(seq) };
-        unsafe {
-            match T::DATA_TYPE {
-                DataType::BF16 => argmax_cu_bf16_ffi(row_ptr as _, 1, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
-                DataType::F16 => argmax_cu_fp16_ffi(row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
-                DataType::F32 => argmax_cu_f32_ffi(row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
-                _ => return Err(OpError::Kernel(format!("argmax_batched: dtype {:?}", T::DATA_TYPE))),
-            }
+        selected_rows.push(cu[seq + 1] - 1); // 提取出那几个关键行号
+    }
+    let real_batch_size = selected_rows.len();
+    let selected_rows_device = Tensor::from_host_slice(&selected_rows, [batch], device).unwrap();
+    unsafe {
+        match T::DATA_TYPE {
+            DataType::BF16 => argmax_cu_bf16_ffi(logits.data_ptr() as _,selected_rows_device.data_ptr(),real_batch_size as i32 , vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream),
+            _ => return Err(OpError::Kernel(format!("argmax_batched: dtype {:?} not implemented", T::DATA_TYPE))),
         }
     }
     // Sync once before D2H read.

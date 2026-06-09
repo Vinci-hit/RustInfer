@@ -36,6 +36,7 @@ void argmax_cu_f32_ffi(
  */
 void argmax_cu_bf16_ffi(
     const __nv_bfloat16* logits_ptr,
+    const int * selected_rows_device,
     int batch_size,
     int vocab_size,
     int* result_ptr_gpu,

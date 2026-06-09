@@ -39,7 +39,6 @@ void argmax_cu_f32_ffi(
 
 constexpr int ARGMAX_THREADS = 256;
 constexpr int ARGMAX_MAX_BLOCKS_PER_ROW = 170;
-constexpr int ARGMAX_WORKSPACE_BUFS_PER_BATCH = 3;
 
 // ------------------- type convert -------------------
 
@@ -81,14 +80,14 @@ struct ArgMaxPairOp {
 // Phase 1: each block reduces a chunk, writes partial result to workspace
 __global__ void argmax_phase1_bf16(
     const __nv_bfloat16* __restrict__ input,
-    int batch_size,
+    const int * selected_rows_device,
     int vocab_size,
     int num_blocks_per_row,
     __nv_bfloat16* __restrict__ workspace_bf16
 ) {
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y;
+    int row = selected_rows_device == nullptr ? blockIdx.y : selected_rows_device[blockIdx.y];
     int block_in_row = blockIdx.x;
 
     float max_val = -3.40282e38f;
@@ -127,7 +126,6 @@ __global__ void argmax_phase1_bf16(
 
 // Phase 2: single block per row reduces partial results
 __global__ void argmax_phase2_bf16(
-    int batch_size,
     int num_blocks_per_row,
     int* __restrict__ output_idx,
     const __nv_bfloat16* __restrict__ workspace_bf16
@@ -167,6 +165,7 @@ __global__ void argmax_phase2_bf16(
 
 void argmax_cu_bf16_ffi(
     const __nv_bfloat16* logits_ptr,
+    const int * selected_rows_device,
     int batch_size,
     int vocab_size,
     int* result_ptr_gpu,
@@ -191,7 +190,7 @@ void argmax_cu_bf16_ffi(
 
     argmax_phase1_bf16<<<grid1, block, 0, stream>>>(
         logits_ptr,
-        batch_size,
+        selected_rows_device,
         vocab_size,
         num_blocks_per_row,
         workspace_bf16
@@ -200,7 +199,6 @@ void argmax_cu_bf16_ffi(
     dim3 grid2(batch_size);
 
     argmax_phase2_bf16<<<grid2, block, 0, stream>>>(
-        batch_size,
         num_blocks_per_row,
         result_ptr_gpu,
         workspace_bf16
