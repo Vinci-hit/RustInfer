@@ -95,6 +95,90 @@ __global__ void fused_add_rmsnorm_bf16_kernel(
         out_u4[i] = r_raw;
     }
 }
+template <int BLOCK_DIM_X, int DIM>
+__global__ void fused_add_rmsnorm_bf16_kernel_cached(
+    __nv_bfloat16* __restrict__ norm_output,
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    float eps
+) {
+    static_assert(DIM % 8 == 0, "DIM must be divisible by 8");
+    static_assert(DIM / 8 <= BLOCK_DIM_X, "DIM too large for one-vector-per-thread kernel");
+
+    constexpr int NUM_WARPS = BLOCK_DIM_X / 32;
+    constexpr int VEC_COUNT = DIM / 8;
+
+    const int row_offset = blockIdx.x * DIM;
+    const int tid = threadIdx.x;
+    const int lane_id = tid & 31;
+    const int warp_id = tid >> 5;
+
+    const uint4* res_u4 = reinterpret_cast<const uint4*>(residual + row_offset);
+    uint4* res_out_u4 = reinterpret_cast<uint4*>(residual + row_offset);
+    const uint4* in_u4 = reinterpret_cast<const uint4*>(input + row_offset);
+    const uint4* w_u4 = reinterpret_cast<const uint4*>(weight);
+    uint4* out_u4 = reinterpret_cast<uint4*>(norm_output + row_offset);
+
+    uint4 h_raw;
+    uint4 w_raw;
+    bool valid = tid < VEC_COUNT;
+
+    float sum = 0.0f;
+
+    if (valid) {
+        h_raw = res_u4[tid];
+        uint4 inp_raw = in_u4[tid];
+        w_raw = w_u4[tid];
+
+        __nv_bfloat162* h_b2 = reinterpret_cast<__nv_bfloat162*>(&h_raw);
+        const __nv_bfloat162* in_b2 = reinterpret_cast<const __nv_bfloat162*>(&inp_raw);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            h_b2[j] = __hadd2(h_b2[j], in_b2[j]);
+            float2 f2 = __bfloat1622float2(h_b2[j]);
+            sum = __fmaf_rn(f2.x, f2.x, sum);
+            sum = __fmaf_rn(f2.y, f2.y, sum);
+        }
+
+        res_out_u4[tid] = h_raw;
+    }
+
+    sum = warp_reduce_sum(sum);
+
+    __shared__ float smem[NUM_WARPS + 1];
+
+    if (lane_id == 0) {
+        smem[warp_id] = sum;
+    }
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = lane_id < NUM_WARPS ? smem[lane_id] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane_id == 0) {
+            smem[NUM_WARPS] = rsqrtf(val / float(DIM) + eps);
+        }
+    }
+
+    __syncthreads();
+
+    if (valid) {
+        __nv_bfloat162 scale = __floats2bfloat162_rn(smem[NUM_WARPS], smem[NUM_WARPS]);
+
+        __nv_bfloat162* h_b2 = reinterpret_cast<__nv_bfloat162*>(&h_raw);
+        __nv_bfloat162* w_b2 = reinterpret_cast<__nv_bfloat162*>(&w_raw);
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            h_b2[j] = __hmul2(__hmul2(h_b2[j], scale), w_b2[j]);
+        }
+
+        out_u4[tid] = h_raw;
+    }
+}
 
 void fused_add_rmsnorm_kernel_cu_bf16(
     __nv_bfloat16* norm_output,
@@ -104,10 +188,7 @@ void fused_add_rmsnorm_kernel_cu_bf16(
     int rows, int dim, float eps,
     cudaStream_t stream
 ) {
-    constexpr int threads_num = 256;
-    fused_add_rmsnorm_bf16_kernel<threads_num><<<rows, threads_num, 0, stream>>>(
-        norm_output, residual, input, weight, dim, eps
-    );
+    fused_add_rmsnorm_bf16_kernel_cached<512, 2560><<<rows, 512, 0, stream>>>(norm_output, residual, input, weight, eps);
 }
 
 
