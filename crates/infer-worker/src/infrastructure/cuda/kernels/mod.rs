@@ -8,6 +8,7 @@ pub mod activation;
 pub mod scalar;
 pub mod embedding;
 pub mod rope;
+pub mod qkv_norm_rope_scatter;
 pub mod attention_paged;
 pub mod fused_add_rmsnorm;
 // pub mod sampler;

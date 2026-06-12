@@ -1,7 +1,7 @@
 //! Qwen3 model — same as Llama3 + QK-norm before RoPE.
 
 use crate::domain::ports::{LlmOps, OpResult};
-use crate::domain::types::{Dtype, Shape, Strides};
+use crate::domain::types::Dtype;
 use crate::domain::tensor::Tensor;
 use crate::domain::model::{LlmModel, ForwardContext};
 use super::layers::{Linear, RMSNorm, Embedding};
@@ -69,53 +69,36 @@ impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
             layer.qkv_proj.forward(&h, &mut qkv_buf)?;
 
             // Zero-copy QKV split via strided views (saves 3 split_cols launches).
-            let qkv_cols = q_dim + 2 * kv_dim;
             let mut q = qkv_buf.narrow(1, 0, q_dim)?;
             let mut k = qkv_buf.narrow(1, q_dim, kv_dim)?;
             let v       = qkv_buf.narrow(1, q_dim + kv_dim, kv_dim)?;
 
-            // ── QK-norm (Qwen3 specific) ──
-            //
-            // RMSNorm kernel natively accepts a strided 3D
-            // `[T, head_num, head_size]` view; we rewrite the strided
-            // `[T, q_dim]` Q into `[T, head_num, head_size]` via raw_view
-            // (strides `[qkv_cols, head_size, 1]`). No copy.
-            if let Some(ref qn) = layer.q_norm {
-                let mut q3 = q.view_raw(
-                    Shape::from_slice(&[num_tokens, self.head_num, self.head_dim]),
-                    Strides::from_slice(&[qkv_cols, self.head_dim, 1]),
-                    q.offset_elems(),
-                    false,
-                );
-                qn.forward_inplace(&mut q3)?;
-            }
-            if let Some(ref kn) = layer.k_norm {
-                let mut k3 = k.view_raw(
-                    Shape::from_slice(&[num_tokens, self.kv_head_num, self.head_dim]),
-                    Strides::from_slice(&[qkv_cols, self.head_dim, 1]),
-                    k.offset_elems(),
-                    false,
-                );
-                kn.forward_inplace(&mut k3)?;
-            }
-
-            // ── RoPE ──
-            D::rope_inplace(
-                &mut q, &mut k,
-                &self.sin_cache, &self.cos_cache,
-                &plan.rope_positions,
-                self.head_num, self.kv_head_num, self.head_dim,
-            )?;
-
-            // ── KV scatter (paged) ──
+            // ── QK-norm + RoPE + KV scatter (fused Qwen3 path) ──
             {
                 let layer_kv = &mut ctx.kv_pool.layers[layer_idx];
-                D::scatter_kv_paged(
-                    &k, &v,
-                    &mut layer_kv.k, &mut layer_kv.v,
-                    &plan.block_tables, &plan.seq_positions,
-                    &plan.cu_q_lens, &plan.seq_lens_step,
-                    plan.max_blocks_per_seq, plan.block_size, kv_dim,
+                D::qkv_norm_rope_scatter(
+                    &mut q,
+                    &mut k,
+                    &v,
+                    layer.q_norm.as_ref().map(|n| &n.weight),
+                    layer.k_norm.as_ref().map(|n| &n.weight),
+                    layer.q_norm.as_ref().map_or(0.0, |n| n.eps),
+                    layer.k_norm.as_ref().map_or(0.0, |n| n.eps),
+                    &self.sin_cache,
+                    &self.cos_cache,
+                    &plan.rope_positions,
+                    &mut layer_kv.k,
+                    &mut layer_kv.v,
+                    &plan.block_tables,
+                    &plan.seq_positions,
+                    &plan.cu_q_lens,
+                    &plan.seq_lens_step,
+                    plan.max_blocks_per_seq,
+                    plan.block_size,
+                    self.head_num,
+                    self.kv_head_num,
+                    self.head_dim,
+                    kv_dim,
                 )?;
             }
 

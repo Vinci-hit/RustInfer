@@ -295,6 +295,37 @@ impl LlmOps for Cuda {
             num_tokens, head_num as i32, kv_head_num as i32, head_dim as i32,
         )
     }
+
+    fn qkv_norm_rope_scatter<T: Dtype>(
+        q: &mut Tensor<T, Self>,
+        k: &mut Tensor<T, Self>,
+        v: &Tensor<T, Self>,
+        q_weight: Option<&Tensor<T, Self>>,
+        k_weight: Option<&Tensor<T, Self>>,
+        q_eps: f32,
+        k_eps: f32,
+        sin: &Tensor<T, Self>,
+        cos: &Tensor<T, Self>,
+        positions: &Tensor<i32, Self>,
+        k_pool: &mut Tensor<T, Self>,
+        v_pool: &mut Tensor<T, Self>,
+        block_tables: &Tensor<i32, Self>,
+        seq_positions: &Tensor<i32, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        seq_lens_step: &Tensor<i32, Self>,
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+        kv_dim: usize,
+    ) -> OpResult<()> {
+        kernels::qkv_norm_rope_scatter::qkv_norm_rope_scatter(
+            q, k, v, q_weight, k_weight, q_eps, k_eps, sin, cos, positions,
+            k_pool, v_pool, block_tables, seq_positions, cu_q_lens, seq_lens_step,
+            max_blocks_per_seq, block_size, head_num, kv_head_num, head_dim, kv_dim,
+        )
+    }
     fn attention_paged<T: Dtype>(
         q: &Tensor<T, Self>,
         k_pool: &Tensor<T, Self>,

@@ -331,6 +331,61 @@ pub trait LlmOps: CoreOps {
         kv_dim: usize,
     ) -> OpResult<()>;
 
+    /// Fused Qwen3 Q/K RMSNorm + RoPE + paged K/V scatter.
+    fn qkv_norm_rope_scatter<T: Dtype>(
+        q: &mut Tensor<T, Self>,
+        k: &mut Tensor<T, Self>,
+        v: &Tensor<T, Self>,
+        q_weight: Option<&Tensor<T, Self>>,
+        k_weight: Option<&Tensor<T, Self>>,
+        q_eps: f32,
+        k_eps: f32,
+        sin: &Tensor<T, Self>,
+        cos: &Tensor<T, Self>,
+        positions: &Tensor<i32, Self>,
+        k_pool: &mut Tensor<T, Self>,
+        v_pool: &mut Tensor<T, Self>,
+        block_tables: &Tensor<i32, Self>,
+        seq_positions: &Tensor<i32, Self>,
+        cu_q_lens: &Tensor<i32, Self>,
+        seq_lens_step: &Tensor<i32, Self>,
+        max_blocks_per_seq: usize,
+        block_size: usize,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+        kv_dim: usize,
+    ) -> OpResult<()> {
+        if let Some(q_weight) = q_weight {
+            let q_cols = q.strides().as_slice()[0];
+            let q_offset = q.offset_elems();
+            let mut q3 = q.view_raw(
+                Shape::from_slice(&[positions.numel(), head_num, head_dim]),
+                super::types::Strides::from_slice(&[q_cols, head_dim, 1]),
+                q_offset,
+                false,
+            );
+            Self::rmsnorm_inplace(&mut q3, q_weight, q_eps)?;
+        }
+        if let Some(k_weight) = k_weight {
+            let k_cols = k.strides().as_slice()[0];
+            let k_offset = k.offset_elems();
+            let mut k3 = k.view_raw(
+                Shape::from_slice(&[positions.numel(), kv_head_num, head_dim]),
+                super::types::Strides::from_slice(&[k_cols, head_dim, 1]),
+                k_offset,
+                false,
+            );
+            Self::rmsnorm_inplace(&mut k3, k_weight, k_eps)?;
+        }
+        Self::rope_inplace(q, k, sin, cos, positions, head_num, kv_head_num, head_dim)?;
+        Self::scatter_kv_paged(
+            k, v, k_pool, v_pool,
+            block_tables, seq_positions, cu_q_lens, seq_lens_step,
+            max_blocks_per_seq, block_size, kv_dim,
+        )
+    }
+
     // ─── Sampling ────────────────────────────────────────────────────
     /// Argmax over each sequence's last logits row.
     /// `logits` : `[num_tokens, vocab_size]`
