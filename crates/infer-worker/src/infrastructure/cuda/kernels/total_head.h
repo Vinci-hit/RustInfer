@@ -7,3 +7,4 @@
 #include "./rope/rope.h"
 #include "./flash_attn_gqa/flash_attn_gqa.h"
 #include "./scatter/scatter.h"
+#include "./qkv_norm_rope_scatter/qkv_norm_rope_scatter.h"
