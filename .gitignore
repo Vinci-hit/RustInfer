@@ -16,3 +16,4 @@
 crates/infer-worker/.codex
 *.log
 *.json
+/doc
