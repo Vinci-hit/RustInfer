@@ -4,14 +4,18 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use infer_protocol::scheduler_to_worker_control::LoadModel;
+use infer_protocol::{RustInferConfig, resolve_model_type};
 use infer_scheduler::application::SchedulerEngine;
 use infer_scheduler::config::{SchedulerConfig, SchedulerMode};
 use infer_scheduler::domain::BlockSize;
-use infer_scheduler::domain::policy::{ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy};
-use infer_protocol::scheduler_to_worker_control::LoadModel;
-use infer_protocol::{resolve_model_type, RustInferConfig};
+use infer_scheduler::domain::policy::{
+    ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy,
+};
 use infer_scheduler::infrastructure::transport::control_plane::{ControlPlane, ControlPlaneConfig};
-use infer_scheduler::infrastructure::transport::zmq_transport::{ZmqFrontendTransport, ZmqWorkerTransport};
+use infer_scheduler::infrastructure::transport::zmq_transport::{
+    ZmqFrontendTransport, ZmqWorkerTransport,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]

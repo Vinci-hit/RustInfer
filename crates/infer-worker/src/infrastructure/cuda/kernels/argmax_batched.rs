@@ -23,9 +23,29 @@ use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::{self, cudaStream_t};
 
 unsafe extern "C" {
-    fn argmax_cu_bf16_ffi(input: *const half::bf16,selected_rows_device: *const i32, batch_size: i32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    fn argmax_cu_bf16_ffi(
+        input: *const half::bf16,
+        selected_rows_device: *const i32,
+        batch_size: i32,
+        vocab_size: i32,
+        output: *mut i32,
+        workspace: *mut f32,
+        stream: cudaStream_t,
+    );
+    fn argmax_cu_fp16_ffi(
+        input: *const half::f16,
+        vocab_size: i32,
+        output: *mut i32,
+        workspace: *mut f32,
+        stream: cudaStream_t,
+    );
+    fn argmax_cu_f32_ffi(
+        input: *const f32,
+        vocab_size: i32,
+        output: *mut i32,
+        workspace: *mut f32,
+        stream: cudaStream_t,
+    );
 }
 
 pub fn argmax_batched_decode_into<T: Dtype>(
@@ -36,7 +56,8 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     let shape = logits.shape().as_slice();
     if shape.len() < 2 {
         return Err(OpError::Shape(format!(
-            "argmax_batched_decode_into: logits must be 2D, got {:?}", shape,
+            "argmax_batched_decode_into: logits must be 2D, got {:?}",
+            shape,
         )));
     }
     let batch = shape[0];
@@ -44,7 +65,8 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     if out_dev.numel() < batch {
         return Err(OpError::Shape(format!(
             "argmax_batched_decode_into: out_dev too small ({} < batch {})",
-            out_dev.numel(), batch,
+            out_dev.numel(),
+            batch,
         )));
     }
     if batch == 0 {
@@ -54,7 +76,8 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     // Only support BF16
     if T::DATA_TYPE != DataType::BF16 {
         return Err(OpError::Kernel(format!(
-            "argmax_batched_decode_into: dtype {:?} not implemented", T::DATA_TYPE,
+            "argmax_batched_decode_into: dtype {:?} not implemented",
+            T::DATA_TYPE,
         )));
     }
 
@@ -63,7 +86,13 @@ pub fn argmax_batched_decode_into<T: Dtype>(
     // Single path: argmax per row
     unsafe {
         argmax_cu_bf16_ffi(
-            logits.data_ptr() as _,std::ptr::null(), batch as i32, vocab as i32, out_dev.data_ptr_mut(), workspace.data_ptr_mut(), stream,
+            logits.data_ptr() as _,
+            std::ptr::null(),
+            batch as i32,
+            vocab as i32,
+            out_dev.data_ptr_mut(),
+            workspace.data_ptr_mut(),
+            stream,
         );
     }
     Ok(())
@@ -89,7 +118,8 @@ pub fn argmax_batched<T: Dtype>(
     if cu.len() != batch + 1 {
         return Err(OpError::Shape(format!(
             "argmax_batched: cu_q_lens.len()={} expected batch+1={}",
-            cu.len(), batch + 1,
+            cu.len(),
+            batch + 1,
         )));
     }
 
@@ -103,14 +133,40 @@ pub fn argmax_batched<T: Dtype>(
     rows.upload_from_host(&selected_rows)?;
     for seq in 0..batch {
         let last_row = (cu[seq + 1] - 1) as usize;
-        let row_ptr = unsafe { (logits.data_ptr() as *const u8).add(last_row * vocab * elem_bytes) };
+        let row_ptr =
+            unsafe { (logits.data_ptr() as *const u8).add(last_row * vocab * elem_bytes) };
         let out_ptr = unsafe { out_dev.data_ptr_mut().add(seq) };
         unsafe {
             match T::DATA_TYPE {
-                DataType::BF16 => argmax_cu_bf16_ffi(logits.data_ptr() as _, rows.data_ptr(),batch as i32, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
-                DataType::F16 => argmax_cu_fp16_ffi(row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
-                DataType::F32 => argmax_cu_f32_ffi(row_ptr as _, vocab as i32, out_ptr, workspace.data_ptr_mut(), stream),
-                _ => return Err(OpError::Kernel(format!("argmax_batched: dtype {:?}", T::DATA_TYPE))),
+                DataType::BF16 => argmax_cu_bf16_ffi(
+                    logits.data_ptr() as _,
+                    rows.data_ptr(),
+                    batch as i32,
+                    vocab as i32,
+                    out_ptr,
+                    workspace.data_ptr_mut(),
+                    stream,
+                ),
+                DataType::F16 => argmax_cu_fp16_ffi(
+                    row_ptr as _,
+                    vocab as i32,
+                    out_ptr,
+                    workspace.data_ptr_mut(),
+                    stream,
+                ),
+                DataType::F32 => argmax_cu_f32_ffi(
+                    row_ptr as _,
+                    vocab as i32,
+                    out_ptr,
+                    workspace.data_ptr_mut(),
+                    stream,
+                ),
+                _ => {
+                    return Err(OpError::Kernel(format!(
+                        "argmax_batched: dtype {:?}",
+                        T::DATA_TYPE
+                    )));
+                }
             }
         }
         break;

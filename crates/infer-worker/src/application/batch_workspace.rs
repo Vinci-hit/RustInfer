@@ -10,20 +10,18 @@
 //! whose tensors are O(1) `view_raw` shares of the workspace storage.
 //! Subsequent CUDA Graph capture/replay over decoders sees stable addresses.
 //!
-//! # Why domain (not app)
-//!
-//! Same rationale as `ForwardWorkspace`: it composes only domain-layer
-//! types (`Tensor`, `BatchPlan`, `MemoryPort`). DDD-pure.
+//! This is application/runtime state: it encodes runner capacity, stable
+//! device addresses, and async host-staging behavior.
 
-use super::batch::{BatchKind, BatchPlan, RAGGED_Q_TILE};
-use super::ports::{MemoryPort, OpError, OpResult};
-use super::tensor::Tensor;
-use super::types::Shape;
+use crate::domain::batch::{BatchKind, BatchPlan, RAGGED_Q_TILE};
+use crate::domain::ports::{MemoryPort, OpError, OpResult};
+use crate::domain::tensor::Tensor;
+use crate::domain::types::Shape;
 
 /// Caller's per-sequence step description.
 ///
-/// Mirrors `app::model_runner::SeqStep`. Kept independent so domain-level
-/// tests can construct workspaces without depending on app.
+/// Mirrors `app::model_runner::SeqStep` but stays local to the workspace
+/// builder API.
 #[derive(Debug, Clone)]
 pub struct WsSeqStep {
     pub input_ids: Vec<i32>,
@@ -40,15 +38,15 @@ pub struct BatchWorkspace<D: MemoryPort> {
     pub cap_total_q_tiles: usize,
 
     // Device tensors at MAX capacity (alloc once, address-stable).
-    input_ids:      Tensor<i32, D>,
+    input_ids: Tensor<i32, D>,
     rope_positions: Tensor<i32, D>,
-    cu_q_lens:      Tensor<i32, D>,
-    kv_lens:        Tensor<i32, D>,
-    seq_positions:  Tensor<i32, D>,
-    seq_lens_step:  Tensor<i32, D>,
-    block_tables:   Tensor<i32, D>,
-    block2req:      Tensor<i32, D>,
-    block2tile:     Tensor<i32, D>,
+    cu_q_lens: Tensor<i32, D>,
+    kv_lens: Tensor<i32, D>,
+    seq_positions: Tensor<i32, D>,
+    seq_lens_step: Tensor<i32, D>,
+    block_tables: Tensor<i32, D>,
+    block2req: Tensor<i32, D>,
+    block2tile: Tensor<i32, D>,
 
     // Long-lived host staging — owns memory for the runner's lifetime so
     // `upload_async` is safe (the device stream consumes the copy before
@@ -71,33 +69,36 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         cap_batch: usize,
         cap_max_blocks_per_seq: usize,
     ) -> OpResult<Self> {
-        let cap_total_q_tiles =
-            ((cap_num_tokens + RAGGED_Q_TILE as usize - 1) / RAGGED_Q_TILE as usize)
-                .max(1)
-                .max(cap_batch);
+        let cap_total_q_tiles = ((cap_num_tokens + RAGGED_Q_TILE as usize - 1)
+            / RAGGED_Q_TILE as usize)
+            .max(1)
+            .max(cap_batch);
         let alloc1 = |n: usize| -> OpResult<Tensor<i32, D>> {
             Tensor::<i32, D>::zeros(Shape::from_slice(&[n.max(1)]), device)
         };
         Ok(Self {
-            cap_num_tokens, cap_batch, cap_max_blocks_per_seq, cap_total_q_tiles,
-            input_ids:      alloc1(cap_num_tokens)?,
+            cap_num_tokens,
+            cap_batch,
+            cap_max_blocks_per_seq,
+            cap_total_q_tiles,
+            input_ids: alloc1(cap_num_tokens)?,
             rope_positions: alloc1(cap_num_tokens)?,
-            cu_q_lens:      alloc1(cap_batch + 1)?,
-            kv_lens:        alloc1(cap_batch)?,
-            seq_positions:  alloc1(cap_batch)?,
-            seq_lens_step:  alloc1(cap_batch)?,
-            block_tables:   alloc1(cap_batch * cap_max_blocks_per_seq.max(1))?,
-            block2req:      alloc1(cap_total_q_tiles)?,
-            block2tile:     alloc1(cap_total_q_tiles)?,
-            h_input_ids:      vec![0; cap_num_tokens.max(1)],
+            cu_q_lens: alloc1(cap_batch + 1)?,
+            kv_lens: alloc1(cap_batch)?,
+            seq_positions: alloc1(cap_batch)?,
+            seq_lens_step: alloc1(cap_batch)?,
+            block_tables: alloc1(cap_batch * cap_max_blocks_per_seq.max(1))?,
+            block2req: alloc1(cap_total_q_tiles)?,
+            block2tile: alloc1(cap_total_q_tiles)?,
+            h_input_ids: vec![0; cap_num_tokens.max(1)],
             h_rope_positions: vec![0; cap_num_tokens.max(1)],
-            h_cu_q_lens:      vec![0; cap_batch + 1],
-            h_kv_lens:        vec![0; cap_batch.max(1)],
-            h_seq_positions:  vec![0; cap_batch.max(1)],
-            h_seq_lens_step:  vec![0; cap_batch.max(1)],
-            h_block_tables:   vec![0; cap_batch * cap_max_blocks_per_seq.max(1)],
-            h_block2req:      vec![0; cap_total_q_tiles],
-            h_block2tile:     vec![0; cap_total_q_tiles],
+            h_cu_q_lens: vec![0; cap_batch + 1],
+            h_kv_lens: vec![0; cap_batch.max(1)],
+            h_seq_positions: vec![0; cap_batch.max(1)],
+            h_seq_lens_step: vec![0; cap_batch.max(1)],
+            h_block_tables: vec![0; cap_batch * cap_max_blocks_per_seq.max(1)],
+            h_block2req: vec![0; cap_total_q_tiles],
+            h_block2tile: vec![0; cap_total_q_tiles],
         })
     }
 
@@ -113,7 +114,9 @@ impl<D: MemoryPort> BatchWorkspace<D> {
     ) -> OpResult<(Tensor<i32, D>, BatchPlan<D>)> {
         let batch = seqs.len();
         if batch == 0 {
-            return Err(OpError::Shape("BatchWorkspace::build_plan: empty seqs".into()));
+            return Err(OpError::Shape(
+                "BatchWorkspace::build_plan: empty seqs".into(),
+            ));
         }
         if batch > self.cap_batch {
             return Err(OpError::Shape(format!(
@@ -133,13 +136,17 @@ impl<D: MemoryPort> BatchWorkspace<D> {
             if s.input_ids.len() != s.positions.len() {
                 return Err(OpError::Shape(format!(
                     "WsSeqStep[{}]: input_ids ({}) != positions ({})",
-                    i, s.input_ids.len(), s.positions.len(),
+                    i,
+                    s.input_ids.len(),
+                    s.positions.len(),
                 )));
             }
             if s.block_table.len() > self.cap_max_blocks_per_seq {
                 return Err(OpError::Shape(format!(
                     "WsSeqStep[{}]: block_table ({}) > cap ({})",
-                    i, s.block_table.len(), self.cap_max_blocks_per_seq,
+                    i,
+                    s.block_table.len(),
+                    self.cap_max_blocks_per_seq,
                 )));
             }
             total_tokens += s.input_ids.len();
@@ -172,10 +179,8 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         for (i, s) in seqs.iter().enumerate() {
             let q_len = s.input_ids.len();
             // input_ids + rope_positions
-            self.h_input_ids[acc as usize..acc as usize + q_len]
-                .copy_from_slice(&s.input_ids);
-            self.h_rope_positions[acc as usize..acc as usize + q_len]
-                .copy_from_slice(&s.positions);
+            self.h_input_ids[acc as usize..acc as usize + q_len].copy_from_slice(&s.input_ids);
+            self.h_rope_positions[acc as usize..acc as usize + q_len].copy_from_slice(&s.positions);
             acc += q_len as i32;
             self.h_cu_q_lens[i + 1] = acc;
             self.h_kv_lens[i] = s.kv_len_after;
@@ -207,18 +212,31 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         // bandwidth for the unused tail).
         unsafe {
             self.upload_prefix(device, &self.input_ids, &self.h_input_ids[..total_tokens])?;
-            self.upload_prefix(device, &self.rope_positions, &self.h_rope_positions[..total_tokens])?;
+            self.upload_prefix(
+                device,
+                &self.rope_positions,
+                &self.h_rope_positions[..total_tokens],
+            )?;
             self.upload_prefix(device, &self.cu_q_lens, &self.h_cu_q_lens[..batch + 1])?;
             self.upload_prefix(device, &self.kv_lens, &self.h_kv_lens[..batch])?;
             self.upload_prefix(device, &self.seq_positions, &self.h_seq_positions[..batch])?;
             self.upload_prefix(device, &self.seq_lens_step, &self.h_seq_lens_step[..batch])?;
-            self.upload_prefix(device, &self.block_tables,
-                &self.h_block_tables[..batch * self.cap_max_blocks_per_seq])?;
+            self.upload_prefix(
+                device,
+                &self.block_tables,
+                &self.h_block_tables[..batch * self.cap_max_blocks_per_seq],
+            )?;
             if total_q_tiles > 0 {
-                self.upload_prefix(device, &self.block2req,
-                    &self.h_block2req[..total_q_tiles as usize])?;
-                self.upload_prefix(device, &self.block2tile,
-                    &self.h_block2tile[..total_q_tiles as usize])?;
+                self.upload_prefix(
+                    device,
+                    &self.block2req,
+                    &self.h_block2req[..total_q_tiles as usize],
+                )?;
+                self.upload_prefix(
+                    device,
+                    &self.block2tile,
+                    &self.h_block2tile[..total_q_tiles as usize],
+                )?;
             }
         }
 
@@ -233,14 +251,14 @@ impl<D: MemoryPort> BatchWorkspace<D> {
             num_tokens: total_tokens,
             batch,
             rope_positions: Self::view_n(&self.rope_positions, total_tokens),
-            cu_q_lens:      Self::view_n(&self.cu_q_lens, batch + 1),
-            kv_lens:        Self::view_n(&self.kv_lens, batch),
-            seq_positions:  Self::view_n(&self.seq_positions, batch),
-            seq_lens_step:  Self::view_n(&self.seq_lens_step, batch),
-            block_tables:   Self::view_n(&self.block_tables, batch * self.cap_max_blocks_per_seq),
+            cu_q_lens: Self::view_n(&self.cu_q_lens, batch + 1),
+            kv_lens: Self::view_n(&self.kv_lens, batch),
+            seq_positions: Self::view_n(&self.seq_positions, batch),
+            seq_lens_step: Self::view_n(&self.seq_lens_step, batch),
+            block_tables: Self::view_n(&self.block_tables, batch * self.cap_max_blocks_per_seq),
             max_blocks_per_seq: self.cap_max_blocks_per_seq,
-            block_size: 0,  // caller fills (the runner knows the pool block size)
-            block2req:  Self::view_n(&self.block2req, total_q_tiles.max(1) as usize),
+            block_size: 0, // caller fills (the runner knows the pool block size)
+            block2req: Self::view_n(&self.block2req, total_q_tiles.max(1) as usize),
             block2tile: Self::view_n(&self.block2tile, total_q_tiles.max(1) as usize),
             total_q_tiles,
         };
@@ -275,14 +293,17 @@ impl<D: MemoryPort> BatchWorkspace<D> {
             num_tokens: total_tokens,
             batch: batch_size,
             rope_positions: Self::view_n(&self.rope_positions, total_tokens),
-            cu_q_lens:      Self::view_n(&self.cu_q_lens, batch_size + 1),
-            kv_lens:        Self::view_n(&self.kv_lens, batch_size),
-            seq_positions:  Self::view_n(&self.seq_positions, batch_size),
-            seq_lens_step:  Self::view_n(&self.seq_lens_step, batch_size),
-            block_tables:   Self::view_n(&self.block_tables, batch_size * self.cap_max_blocks_per_seq),
+            cu_q_lens: Self::view_n(&self.cu_q_lens, batch_size + 1),
+            kv_lens: Self::view_n(&self.kv_lens, batch_size),
+            seq_positions: Self::view_n(&self.seq_positions, batch_size),
+            seq_lens_step: Self::view_n(&self.seq_lens_step, batch_size),
+            block_tables: Self::view_n(
+                &self.block_tables,
+                batch_size * self.cap_max_blocks_per_seq,
+            ),
             max_blocks_per_seq: self.cap_max_blocks_per_seq,
             block_size,
-            block2req:  Self::view_n(&self.block2req, total_q_tiles.max(1) as usize),
+            block2req: Self::view_n(&self.block2req, total_q_tiles.max(1) as usize),
             block2tile: Self::view_n(&self.block2tile, total_q_tiles.max(1) as usize),
             total_q_tiles,
         };
@@ -290,28 +311,119 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         Ok((input_ids_view, plan))
     }
 
+    /// Build a decode-only plan without uploading `input_ids`.
+    ///
+    /// The caller guarantees buffer A already contains one input token per
+    /// row in the same order as `steps`. This method updates only dynamic
+    /// decode metadata: RoPE positions, KV lengths, write positions,
+    /// block tables, and the fixed q_len=1 schedule.
+    pub fn build_decode_plan_preserve_input(
+        &mut self,
+        steps: &[WsSeqStep],
+        device: &D,
+        block_size: usize,
+    ) -> OpResult<(Tensor<i32, D>, BatchPlan<D>)> {
+        let batch = steps.len();
+        if batch == 0 {
+            return Err(OpError::Shape(
+                "build_decode_plan_preserve_input: empty steps".into(),
+            ));
+        }
+        if batch > self.cap_batch {
+            return Err(OpError::Shape(format!(
+                "build_decode_plan_preserve_input: batch ({}) > cap ({})",
+                batch, self.cap_batch,
+            )));
+        }
+
+        self.h_cu_q_lens[0] = 0;
+        for (i, step) in steps.iter().enumerate() {
+            if step.input_ids.len() != 1 || step.positions.len() != 1 {
+                return Err(OpError::Shape(format!(
+                    "build_decode_plan_preserve_input[{}]: expected q_len=1, got input_ids={} positions={}",
+                    i,
+                    step.input_ids.len(),
+                    step.positions.len(),
+                )));
+            }
+            if step.block_table.len() > self.cap_max_blocks_per_seq {
+                return Err(OpError::Shape(format!(
+                    "build_decode_plan_preserve_input[{}]: block_table ({}) > cap ({})",
+                    i,
+                    step.block_table.len(),
+                    self.cap_max_blocks_per_seq,
+                )));
+            }
+
+            self.h_rope_positions[i] = step.positions[0];
+            self.h_cu_q_lens[i + 1] = (i + 1) as i32;
+            self.h_kv_lens[i] = step.kv_len_after;
+            self.h_seq_positions[i] = step.kv_write_start;
+            self.h_seq_lens_step[i] = 1;
+            let row_off = i * self.cap_max_blocks_per_seq;
+            for slot in &mut self.h_block_tables[row_off..row_off + self.cap_max_blocks_per_seq] {
+                *slot = 0;
+            }
+            for (j, &phys) in step.block_table.iter().enumerate() {
+                self.h_block_tables[row_off + j] = phys as i32;
+            }
+            self.h_block2req[i] = i as i32;
+            self.h_block2tile[i] = 0;
+        }
+
+        unsafe {
+            self.upload_prefix(
+                device,
+                &self.rope_positions,
+                &self.h_rope_positions[..batch],
+            )?;
+            self.upload_prefix(device, &self.cu_q_lens, &self.h_cu_q_lens[..batch + 1])?;
+            self.upload_prefix(device, &self.kv_lens, &self.h_kv_lens[..batch])?;
+            self.upload_prefix(device, &self.seq_positions, &self.h_seq_positions[..batch])?;
+            self.upload_prefix(device, &self.seq_lens_step, &self.h_seq_lens_step[..batch])?;
+            self.upload_prefix(
+                device,
+                &self.block_tables,
+                &self.h_block_tables[..batch * self.cap_max_blocks_per_seq],
+            )?;
+            self.upload_prefix(device, &self.block2req, &self.h_block2req[..batch])?;
+            self.upload_prefix(device, &self.block2tile, &self.h_block2tile[..batch])?;
+        }
+
+        self.get_last_plan_views(batch, block_size)
+    }
+
     /// Set `plan.block_size` after construction (the runner knows it).
-    pub fn block_size(&self) -> usize { 0 } // sentinel; runner sets in plan
+    pub fn block_size(&self) -> usize {
+        0
+    } // sentinel; runner sets in plan
 
     // ─── Bubble-free decode pipeline accessors ───────────────────────
     //
-    // The pipelined decode loop merges the previous step's on-device token
-    // (C) into `input_ids` (A) with `gather_merge_input`, then launches the
-    // captured forward graph (which reads `input_ids` + the dynamic decode
-    // fields below at their stable addresses). Only the small per-step
-    // dynamic fields — positions / kv_lens / seq_positions — are uploaded
-    // each step; `input_ids` is produced on-device by the merge (no token
-    // round-trip), and `block_tables` is uploaded once for a fixed seq set.
+    // The ABC decode loop keeps `input_ids` as buffer A. A is read by the
+    // captured forward graph, then the compact merge writes surviving C
+    // tokens back into A. Only small per-step dynamic fields — positions,
+    // kv_lens, seq_positions, and block_tables — are uploaded here.
 
     /// Buffer **A**: the next step's `input_ids`. The merge kernel writes
     /// here; the captured graph reads here. Address-stable.
-    pub fn input_ids_dev(&self) -> &Tensor<i32, D> { &self.input_ids }
-    pub fn input_ids_dev_mut(&mut self) -> &mut Tensor<i32, D> { &mut self.input_ids }
+    pub fn input_ids_dev(&self) -> &Tensor<i32, D> {
+        &self.input_ids
+    }
+    pub fn input_ids_dev_mut(&mut self) -> &mut Tensor<i32, D> {
+        &mut self.input_ids
+    }
 
     /// Device tensors for the per-step dynamic decode fields.
-    pub fn rope_positions_dev(&self) -> &Tensor<i32, D> { &self.rope_positions }
-    pub fn kv_lens_dev(&self) -> &Tensor<i32, D> { &self.kv_lens }
-    pub fn seq_positions_dev(&self) -> &Tensor<i32, D> { &self.seq_positions }
+    pub fn rope_positions_dev(&self) -> &Tensor<i32, D> {
+        &self.rope_positions
+    }
+    pub fn kv_lens_dev(&self) -> &Tensor<i32, D> {
+        &self.kv_lens
+    }
+    pub fn seq_positions_dev(&self) -> &Tensor<i32, D> {
+        &self.seq_positions
+    }
 
     /// Stage the per-step dynamic decode fields into the long-lived host
     /// buffers (owned for the runner's lifetime, so a following async
@@ -328,12 +440,15 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         if batch != kv_lens.len() || batch != seq_positions.len() {
             return Err(OpError::Shape(format!(
                 "stage_decode_dynamic: mismatched lens pos={} kv={} seqpos={}",
-                positions.len(), kv_lens.len(), seq_positions.len(),
+                positions.len(),
+                kv_lens.len(),
+                seq_positions.len(),
             )));
         }
         if batch > self.cap_batch {
             return Err(OpError::Shape(format!(
-                "stage_decode_dynamic: batch ({}) > cap ({})", batch, self.cap_batch,
+                "stage_decode_dynamic: batch ({}) > cap ({})",
+                batch, self.cap_batch,
             )));
         }
         // Decode: one token per seq, so rope_positions prefix == [batch].
@@ -346,9 +461,15 @@ impl<D: MemoryPort> BatchWorkspace<D> {
     /// Host staging slices for the dynamic decode fields (read-only views
     /// of what `stage_decode_dynamic` last wrote). Used by the runner to
     /// drive a stream-targeted async H2D upload.
-    pub fn h_rope_positions(&self) -> &[i32] { &self.h_rope_positions }
-    pub fn h_kv_lens(&self) -> &[i32] { &self.h_kv_lens }
-    pub fn h_seq_positions(&self) -> &[i32] { &self.h_seq_positions }
+    pub fn h_rope_positions(&self) -> &[i32] {
+        &self.h_rope_positions
+    }
+    pub fn h_kv_lens(&self) -> &[i32] {
+        &self.h_kv_lens
+    }
+    pub fn h_seq_positions(&self) -> &[i32] {
+        &self.h_seq_positions
+    }
 
     fn view_n(t: &Tensor<i32, D>, n: usize) -> Tensor<i32, D> {
         let strides = Shape::from_slice(&[n.max(1)]).contiguous_strides();
@@ -357,23 +478,14 @@ impl<D: MemoryPort> BatchWorkspace<D> {
 
     /// Async-upload `host[..]` into the prefix of `dev`. Caller asserts
     /// `host.len() <= dev.numel()`.
-    unsafe fn upload_prefix(
-        &self,
-        device: &D,
-        dev: &Tensor<i32, D>,
-        host: &[i32],
-    ) -> OpResult<()> {
-        if host.is_empty() { return Ok(()); }
+    unsafe fn upload_prefix(&self, device: &D, dev: &Tensor<i32, D>, host: &[i32]) -> OpResult<()> {
+        if host.is_empty() {
+            return Ok(());
+        }
         let bytes = host.len() * std::mem::size_of::<i32>();
-        let dst = unsafe {
-            std::ptr::NonNull::new_unchecked(dev.data_ptr_mut() as *mut u8)
-        };
+        let dst = unsafe { std::ptr::NonNull::new_unchecked(dev.data_ptr_mut() as *mut u8) };
         unsafe {
-            device.upload_async(
-                dst,
-                host.as_ptr() as *const u8,
-                bytes,
-            )?;
+            device.upload_async(dst, host.as_ptr() as *const u8, bytes)?;
         }
         Ok(())
     }

@@ -30,14 +30,16 @@ pub fn handle_control_event(
     control_cmd: &ControlPlaneCmdTx,
     worker_group: &WorkerGroup,
     default_worker: &WorkerId,
+    enable_prefix_caching: bool,
 ) -> ControlOutcome {
     match event {
         ControlEvent::StepError { worker: _, err } => {
-            handle_worker_step_error(err, sessions)
+            handle_worker_step_error(err, sessions, radix, kv_budget, enable_prefix_caching)
         }
-        ControlEvent::WorkerLost { worker, last_seen_ms } => {
-            handle_worker_lost(worker, last_seen_ms, sessions)
-        }
+        ControlEvent::WorkerLost {
+            worker,
+            last_seen_ms,
+        } => handle_worker_lost(worker, last_seen_ms, sessions),
         ControlEvent::WorkerError {
             worker,
             message,
@@ -67,18 +69,17 @@ pub fn handle_control_event(
             );
             ControlOutcome::noop()
         }
-        ControlEvent::AllocFailed { worker, req } => {
-            handle_alloc_failed(
-                req,
-                sessions,
-                radix,
-                kv_budget,
-                control_cmd,
-                worker_group,
-                &worker,
-                default_worker,
-            )
-        }
+        ControlEvent::AllocFailed { worker, req } => handle_alloc_failed(
+            req,
+            sessions,
+            radix,
+            kv_budget,
+            control_cmd,
+            worker_group,
+            &worker,
+            default_worker,
+            enable_prefix_caching,
+        ),
     }
 }
 
@@ -92,6 +93,7 @@ fn handle_alloc_failed(
     worker_group: &WorkerGroup,
     worker_from_event: &WorkerId,
     default_worker: &WorkerId,
+    enable_prefix_caching: bool,
 ) -> ControlOutcome {
     let _ = default_worker;
     let target_worker = worker_from_event;
@@ -111,15 +113,16 @@ fn handle_alloc_failed(
         return ControlOutcome::noop();
     }
 
-    let five_pct = total / 20;
+    let five_pct = (total / 20).max(1);
+    let target_slots = req.shortfall.max(five_pct).max(1);
 
     if req.round == 0 {
         let lru_total = radix.lru_total_indices() as u32;
-        let target = five_pct.min(lru_total);
+        let target = target_slots.min(lru_total);
         if target > 0 {
             let indices = radix.evict_collect_at_least(target as usize);
             if !indices.is_empty() {
-                kv_budget.release(indices.len() as u32);
+                release_budget_up_to(kv_budget, indices.len() as u32, "alloc_failed_round0");
                 tracing::info!(
                     worker_id = %req.worker_id,
                     shortfall = req.shortfall,
@@ -147,7 +150,7 @@ fn handle_alloc_failed(
     }
 
     // Level 2: victim preemption.
-    let target = five_pct;
+    let target = target_slots;
 
     let mut candidates: Vec<PreemptCandidate> = sessions.preemption_candidates();
     candidates.sort_by(|a, b| {
@@ -184,22 +187,44 @@ fn handle_alloc_failed(
         return ControlOutcome::noop();
     }
 
+    let mut scheduler_released_slots = 0u32;
     for sid in &victims {
-        radix.mark_finished_chain(*sid);
+        if enable_prefix_caching {
+            radix.mark_finished_chain(*sid);
+        } else if let Some(n) = sessions.kv_slots_for_sequence(SequenceId(*sid)) {
+            scheduler_released_slots = scheduler_released_slots.saturating_add(n);
+        }
         if let Err(e) = sessions.preempt_to_queued(SequenceId(*sid)) {
-            tracing::error!(
-                sequence_id = sid,
-                "preempt_to_queued failed: {}",
-                e
-            );
+            tracing::error!(sequence_id = sid, "preempt_to_queued failed: {}", e);
         }
     }
+    let free_indices = if enable_prefix_caching {
+        let indices = radix.evict_collect_at_least(target as usize);
+        if !indices.is_empty() {
+            release_budget_up_to(
+                kv_budget,
+                indices.len() as u32,
+                "alloc_failed_round1_prefix",
+            );
+        }
+        indices
+    } else {
+        if scheduler_released_slots > 0 {
+            release_budget_up_to(
+                kv_budget,
+                scheduler_released_slots,
+                "alloc_failed_round1_preempt",
+            );
+        }
+        Vec::new()
+    };
 
     tracing::info!(
         worker_id = %req.worker_id,
         shortfall = req.shortfall,
         target,
         freed,
+        free_indices = free_indices.len(),
         victims = victims.len(),
         "AllocFailed round=1: victim preemption"
     );
@@ -208,6 +233,7 @@ fn handle_alloc_failed(
         infer_protocol::scheduler_to_worker_control::Preempt {
             model_instance_id: worker_group.model_instance_id.clone(),
             sequence_ids: victims,
+            free_indices,
         },
     );
     let _ = control_cmd.send_to(target_worker, msg);
@@ -219,8 +245,23 @@ fn handle_alloc_failed(
 fn handle_worker_step_error(
     err: WorkerStepError,
     sessions: &mut RequestTable,
+    radix: &mut RadixTree,
+    kv_budget: &mut KvBudget,
+    enable_prefix_caching: bool,
 ) -> ControlOutcome {
-    let failed_ids = collect_failed_sequence_ids(&err, sessions);
+    let failed_sequence_ids = collect_failed_sequence_ids(&err, sessions);
+    for raw in &failed_sequence_ids {
+        let sid = SequenceId(*raw);
+        if enable_prefix_caching {
+            radix.mark_finished_chain(*raw);
+        } else if let Some(n) = sessions.kv_slots_for_sequence(sid) {
+            release_budget_up_to(kv_budget, n, "worker_step_error");
+        }
+    }
+    let failed_ids = failed_sequence_ids
+        .iter()
+        .filter_map(|raw| sessions.request_id_for_sequence(SequenceId(*raw)))
+        .collect();
     let fatal = err.fatal;
     let message = err.message;
     let outcome_continue = ControlOutcome::Continue {
@@ -234,6 +275,23 @@ fn handle_worker_step_error(
         };
     }
     outcome_continue
+}
+
+fn release_budget_up_to(kv_budget: &mut KvBudget, requested: u32, reason: &'static str) -> u32 {
+    let releasable = requested.min(kv_budget.outstanding());
+    if releasable < requested {
+        tracing::warn!(
+            requested,
+            outstanding = kv_budget.outstanding(),
+            released = releasable,
+            reason,
+            "KV budget release exceeds outstanding; clamping"
+        );
+    }
+    if releasable > 0 {
+        kv_budget.release(releasable);
+    }
+    releasable
 }
 
 /// Worker liveness watchdog timed out.
@@ -253,20 +311,13 @@ fn handle_worker_lost(
     }
 }
 
-/// Resolve the list of internal `RequestId` for a `WorkerStepError`.
-fn collect_failed_sequence_ids(
-    err: &WorkerStepError,
-    sessions: &RequestTable,
-) -> Vec<crate::domain::inference_session::lifecycle::RequestId> {
+/// Resolve raw sequence ids affected by a `WorkerStepError`.
+fn collect_failed_sequence_ids(err: &WorkerStepError, sessions: &RequestTable) -> Vec<u64> {
     let mut sequence_ids = err.sequence_ids.clone();
     if err.fatal || sequence_ids.is_empty() {
-        sequence_ids
-            .extend(sessions.running_sequence_ids().into_iter().map(|id| id.0));
+        sequence_ids.extend(sessions.running_sequence_ids().into_iter().map(|id| id.0));
     }
     sequence_ids.sort_unstable();
     sequence_ids.dedup();
     sequence_ids
-        .into_iter()
-        .filter_map(|raw| sessions.request_id_for_sequence(SequenceId(raw)))
-        .collect()
 }

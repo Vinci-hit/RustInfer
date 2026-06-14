@@ -1,6 +1,6 @@
 //! CUDA error type + cuda_check! macro.
-use std::ffi::CStr;
 use super::ffi;
+use std::ffi::CStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaError(pub ffi::cudaError_t);
@@ -24,9 +24,10 @@ macro_rules! cuda_check {
     ($expr:expr) => {{
         let code = $expr;
         if code != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess {
-            return Err(crate::domain::ports::OpError::Kernel(
-                format!("{}", crate::infrastructure::cuda::CudaError(code))
-            ));
+            return Err(crate::domain::ports::OpError::Kernel(format!(
+                "{}",
+                crate::infrastructure::cuda::CudaError(code)
+            )));
         }
     }};
 }

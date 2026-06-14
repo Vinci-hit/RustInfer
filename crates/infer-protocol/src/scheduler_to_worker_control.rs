@@ -85,6 +85,14 @@ pub struct CancelSequence {
 pub struct Preempt {
     pub model_instance_id: String,
     pub sequence_ids: Vec<u64>,
+    /// Scheduler-selected indices that are safe to release immediately.
+    ///
+    /// In prefix-caching mode this is the only safe physical release channel:
+    /// the worker's active block table can contain borrowed prefix slots shared
+    /// with other live sequences. In non-prefix mode this is usually empty
+    /// because the worker can release the victim's whole private block table.
+    #[serde(default)]
+    pub free_indices: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

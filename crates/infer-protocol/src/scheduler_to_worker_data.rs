@@ -91,11 +91,7 @@ impl PrefillBatchCmd {
         start..end
     }
 
-    pub fn validate(
-        &self,
-        max_batch_tokens: usize,
-        max_seqs: usize,
-    ) -> ProtocolResult<()> {
+    pub fn validate(&self, max_batch_tokens: usize, max_seqs: usize) -> ProtocolResult<()> {
         let n = self.num_requests();
         if n == 0 {
             return Err(ProtocolError::invalid_argument(
@@ -145,12 +141,6 @@ impl PrefillBatchCmd {
             if segment.sequence_id == 0 {
                 return Err(ProtocolError::invalid_argument(format!(
                     "PrefillBatchCmd segment {} has sequence_id=0",
-                    i
-                )));
-            }
-            if segment.block_table.is_empty() {
-                return Err(ProtocolError::invalid_argument(format!(
-                    "PrefillBatchCmd segment {} has empty block_table",
                     i
                 )));
             }
@@ -272,11 +262,7 @@ impl DiffusionBatchCmd {
                     i
                 )));
             }
-            if req.height == 0
-                || req.width == 0
-                || req.height % 16 != 0
-                || req.width % 16 != 0
-            {
+            if req.height == 0 || req.width == 0 || req.height % 16 != 0 || req.width % 16 != 0 {
                 return Err(ProtocolError::invalid_argument(format!(
                     "DiffusionBatchCmd request {} invalid shape {}x{}; dimensions must be positive multiples of 16",
                     i, req.height, req.width

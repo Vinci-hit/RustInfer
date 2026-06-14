@@ -361,7 +361,12 @@ fn drive_handshake(
     loop {
         let identity = match socket.recv_bytes(0) {
             Ok(b) => b,
-            Err(e) => return Err(ControlError::Router(format!("bootstrap recv identity: {}", e))),
+            Err(e) => {
+                return Err(ControlError::Router(format!(
+                    "bootstrap recv identity: {}",
+                    e
+                )));
+            }
         };
         let mut last = identity.clone();
         while socket.get_rcvmore().unwrap_or(false) {
@@ -413,7 +418,9 @@ fn drive_handshake(
                 if let Some(cmd) = load_model {
                     tracing::info!(
                         "Sending LoadModel: model_instance_id={} model_type={} path={}",
-                        cmd.model_instance_id, cmd.model_type, cmd.model_path,
+                        cmd.model_instance_id,
+                        cmd.model_type,
+                        cmd.model_path,
                     );
                     send_scheduler_msg(
                         socket,
@@ -425,7 +432,9 @@ fn drive_handshake(
             WorkerControlMessage::Progress(p) => {
                 tracing::info!(
                     "WorkerProgress: id={} state={:?} message={}",
-                    p.worker_id, p.state, p.message
+                    p.worker_id,
+                    p.state,
+                    p.message
                 );
             }
             WorkerControlMessage::MemoryProfile(profile) => {
@@ -444,7 +453,9 @@ fn drive_handshake(
             WorkerControlMessage::Heartbeat(hb) => {
                 tracing::debug!(
                     "WorkerHeartbeat (bootstrap): id={} state={:?} active={}",
-                    hb.worker_id, hb.state, hb.active_requests
+                    hb.worker_id,
+                    hb.state,
+                    hb.active_requests
                 );
             }
             WorkerControlMessage::Ready(ready) => {
@@ -510,9 +521,15 @@ fn handle_memory_profile(
     };
     tracing::info!(
         "Sending InitPagedKv: model_instance_id={} block_size={} blocks={}",
-        init.model_instance_id, init.block_size, init.initial_num_blocks,
+        init.model_instance_id,
+        init.block_size,
+        init.initial_num_blocks,
     );
-    send_scheduler_msg(socket, identity, &SchedulerControlMessage::InitPagedKv(init))
+    send_scheduler_msg(
+        socket,
+        identity,
+        &SchedulerControlMessage::InitPagedKv(init),
+    )
 }
 
 fn paged_block_size(cmd: &LoadModel) -> Option<u32> {
@@ -540,4 +557,11 @@ fn send_scheduler_msg(
 
 // Suppress unused-import warnings during in-progress wiring.
 #[allow(dead_code)]
-fn _force_imports(_: WorkerHello, _: WorkerHeartbeat, _: WorkerError, _: PagedKvReady, _: RequestId) {}
+fn _force_imports(
+    _: WorkerHello,
+    _: WorkerHeartbeat,
+    _: WorkerError,
+    _: PagedKvReady,
+    _: RequestId,
+) {
+}

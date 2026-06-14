@@ -1,33 +1,50 @@
 //! RoPE (Rotary Position Embedding) CUDA kernel wrapper.
 
-use crate::domain::ports::{OpResult, OpError};
-use crate::domain::types::{DataType, Dtype};
+use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::{DataType, Dtype};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::cudaStream_t;
 
 unsafe extern "C" {
     pub fn rope_kernel_cu(
-        dim: i32, kv_dim: i32, head_size: i32,
-        q: *mut f32, k: *mut f32,
-        positions: *const i32, seq_len: i32,
-        sin_cache: *const f32, cos_cache: *const f32,
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        q: *mut f32,
+        k: *mut f32,
+        positions: *const i32,
+        seq_len: i32,
+        sin_cache: *const f32,
+        cos_cache: *const f32,
         stream: cudaStream_t,
     );
     pub fn rope_kernel_cu_bf16(
-        dim: i32, kv_dim: i32, head_size: i32,
-        q: *mut half::bf16, k: *mut half::bf16,
-        positions: *const i32, seq_len: i32,
-        q_row_stride: i32, k_row_stride: i32,
-        sin_cache: *const half::bf16, cos_cache: *const half::bf16,
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        q: *mut half::bf16,
+        k: *mut half::bf16,
+        positions: *const i32,
+        seq_len: i32,
+        q_row_stride: i32,
+        k_row_stride: i32,
+        sin_cache: *const half::bf16,
+        cos_cache: *const half::bf16,
         stream: cudaStream_t,
     );
     pub fn rope_kernel_cu_fp16(
-        dim: i32, kv_dim: i32, head_size: i32,
-        q: *mut half::f16, k: *mut half::f16,
-        positions: *const i32, seq_len: i32,
-        q_row_stride: i32, k_row_stride: i32,
-        sin_cache: *const half::f16, cos_cache: *const half::f16,
+        dim: i32,
+        kv_dim: i32,
+        head_size: i32,
+        q: *mut half::f16,
+        k: *mut half::f16,
+        positions: *const i32,
+        seq_len: i32,
+        q_row_stride: i32,
+        k_row_stride: i32,
+        sin_cache: *const half::f16,
+        cos_cache: *const half::f16,
         stream: cudaStream_t,
     );
 }
@@ -60,26 +77,43 @@ pub fn rope_inplace<T: Dtype>(
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => rope_kernel_cu(
-                q_dim, kv_dim, head_dim,
-                q.data_ptr_mut() as _, k.data_ptr_mut() as _,
-                positions_dev, num_tokens,
-                sin.data_ptr() as _, cos.data_ptr() as _,
+                q_dim,
+                kv_dim,
+                head_dim,
+                q.data_ptr_mut() as _,
+                k.data_ptr_mut() as _,
+                positions_dev,
+                num_tokens,
+                sin.data_ptr() as _,
+                cos.data_ptr() as _,
                 stream,
             ),
             DataType::BF16 => rope_kernel_cu_bf16(
-                q_dim, kv_dim, head_dim,
-                q.data_ptr_mut() as _, k.data_ptr_mut() as _,
-                positions_dev, num_tokens,
-                q_row_stride, k_row_stride,
-                sin.data_ptr() as _, cos.data_ptr() as _,
+                q_dim,
+                kv_dim,
+                head_dim,
+                q.data_ptr_mut() as _,
+                k.data_ptr_mut() as _,
+                positions_dev,
+                num_tokens,
+                q_row_stride,
+                k_row_stride,
+                sin.data_ptr() as _,
+                cos.data_ptr() as _,
                 stream,
             ),
             DataType::F16 => rope_kernel_cu_fp16(
-                q_dim, kv_dim, head_dim,
-                q.data_ptr_mut() as _, k.data_ptr_mut() as _,
-                positions_dev, num_tokens,
-                q_row_stride, k_row_stride,
-                sin.data_ptr() as _, cos.data_ptr() as _,
+                q_dim,
+                kv_dim,
+                head_dim,
+                q.data_ptr_mut() as _,
+                k.data_ptr_mut() as _,
+                positions_dev,
+                num_tokens,
+                q_row_stride,
+                k_row_stride,
+                sin.data_ptr() as _,
+                cos.data_ptr() as _,
                 stream,
             ),
             _ => return Err(OpError::Kernel(format!("rope: {:?}", T::DATA_TYPE))),

@@ -62,10 +62,7 @@ impl Registry {
     ) -> Result<WorkerId, RegistrationRefused> {
         if let Some(wid) = self.by_identity.get(identity) {
             // Update last_seen + state in place.
-            let mut view = self
-                .view
-                .write()
-                .expect("registry view poisoned");
+            let mut view = self.view.write().expect("registry view poisoned");
             if let Some(entry) = view.by_worker_id.get_mut(wid) {
                 entry.last_seen = now;
                 entry.state = state;

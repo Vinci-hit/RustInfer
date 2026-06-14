@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::domain::inference_session::lifecycle::{RequestId, InferenceSession, Queued};
+use crate::domain::inference_session::lifecycle::{InferenceSession, Queued, RequestId};
 
 /// Multi-priority waiting queue.
 ///
@@ -91,13 +91,14 @@ impl Default for WaitingQueue {
 mod tests {
     use super::*;
     use crate::domain::inference_session::handle::RequestHandle;
-    use crate::domain::inference_session::lifecycle::{RequestMeta, SamplingParams, Priority};
+    use crate::domain::inference_session::lifecycle::{Priority, RequestMeta, SamplingParams};
     use std::sync::Arc;
     use std::time::Instant;
 
     fn make_seq(id: &str, priority: i32) -> InferenceSession<Queued> {
         let meta = Arc::new(RequestMeta {
-            id: RequestId::new_v4(), external_id: id.to_string(),
+            id: RequestId::new_v4(),
+            external_id: id.to_string(),
             sequence_id: crate::domain::inference_session::lifecycle::SequenceId(1),
             input_ids: vec![1, 2, 3],
             max_tokens: 10,

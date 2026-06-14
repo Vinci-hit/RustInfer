@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # === Model Config ===
-MODEL_PATH="/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct"
+MODEL_PATH="/root/models/Qwen3-4B-Instruct-2507"
 
 # === Runtime Config (from bootstrap log) ===
 MAX_NUM_SEQS=32

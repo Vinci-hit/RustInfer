@@ -13,7 +13,7 @@
 //! since latent volume is tiny vs. the rest of the pipeline (1024×1024 →
 //! ~1MB BF16). When the device tensor lives on CPU we skip the round-trip.
 
-use crate::domain::ports::{OpResult, OpError};
+use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
@@ -31,7 +31,8 @@ pub fn patchify_into<T: Dtype>(
     let s = image.shape().as_slice();
     if s.len() != 4 {
         return Err(OpError::Shape(format!(
-            "patchify_into: expected [C,F,H,W], got {:?}", s,
+            "patchify_into: expected [C,F,H,W], got {:?}",
+            s,
         )));
     }
     let (c, f, h, w) = (s[0], s[1], s[2], s[3]);
@@ -48,7 +49,8 @@ pub fn patchify_into<T: Dtype>(
     let ds = dst.shape().as_slice();
     if ds != [num_tokens, patch_flat] {
         return Err(OpError::Shape(format!(
-            "patchify_into: dst {:?} != [{}, {}]", ds, num_tokens, patch_flat,
+            "patchify_into: dst {:?} != [{}, {}]",
+            ds, num_tokens, patch_flat,
         )));
     }
 
@@ -93,7 +95,9 @@ pub fn patchify_into<T: Dtype>(
 /// `patchify_into`.
 pub fn unpatchify_into<T: Dtype>(
     tokens: &Tensor<T, Cuda>,
-    f: usize, h: usize, w: usize,
+    f: usize,
+    h: usize,
+    w: usize,
     out_channels: usize,
     patch_size: usize,
     f_patch_size: usize,
@@ -107,13 +111,15 @@ pub fn unpatchify_into<T: Dtype>(
     let ts = tokens.shape().as_slice();
     if ts != [num_tokens, patch_flat] {
         return Err(OpError::Shape(format!(
-            "unpatchify_into: tokens {:?} != [{}, {}]", ts, num_tokens, patch_flat,
+            "unpatchify_into: tokens {:?} != [{}, {}]",
+            ts, num_tokens, patch_flat,
         )));
     }
     let ds = dst.shape().as_slice();
     if ds != [out_channels, f, h, w] {
         return Err(OpError::Shape(format!(
-            "unpatchify_into: dst {:?} != [{}, {}, {}, {}]", ds, out_channels, f, h, w,
+            "unpatchify_into: dst {:?} != [{}, {}, {}, {}]",
+            ds, out_channels, f, h, w,
         )));
     }
 
@@ -136,7 +142,8 @@ pub fn unpatchify_into<T: Dtype>(
                             for ch in 0..out_channels {
                                 let local = pf * (p_h * p_w * out_channels)
                                     + ph * (p_w * out_channels)
-                                    + pw * out_channels + ch;
+                                    + pw * out_channels
+                                    + ch;
                                 let src_idx = token_idx * patch_flat + local;
                                 let dst_idx = ch * stride_c + fi * stride_f + hi * stride_h + wi;
                                 dst_host[dst_idx] = src_host[src_idx];
@@ -171,7 +178,9 @@ fn upload_into<T: Dtype>(dst: &mut Tensor<T, Cuda>, host: &[T]) -> OpResult<()> 
         return Err(OpError::NotContiguous(*dst.shape()));
     }
     let bytes = host.len() * T::SIZE_BYTES;
-    if bytes == 0 { return Ok(()); }
+    if bytes == 0 {
+        return Ok(());
+    }
     use crate::domain::ports::MemoryPort;
     let dev = dst.device().clone();
     unsafe {
@@ -233,7 +242,9 @@ mod tests {
         let n = c * f * h * w;
         let host: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 5.0).collect();
         let img: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [c, f, h, w], &cuda).unwrap();
-        let f_t = 1; let h_t = h / 2; let w_t = w / 2;
+        let f_t = 1;
+        let h_t = h / 2;
+        let w_t = w / 2;
         let num_tokens = f_t * h_t * w_t;
         let patch_flat = 1 * 2 * 2 * c;
         let mut tokens: Tensor<f32, Cuda> = Tensor::zeros([num_tokens, patch_flat], &cuda).unwrap();
@@ -242,7 +253,11 @@ mod tests {
         unpatchify_into(&tokens, f, h, w, c, 2, 1, &mut back).unwrap();
         let restored = back.to_host_vec().unwrap();
         for (i, (a, b)) in host.iter().zip(restored.iter()).enumerate() {
-            assert_eq!(a, b, "roundtrip mismatch at {}: orig={}, restored={}", i, a, b);
+            assert_eq!(
+                a, b,
+                "roundtrip mismatch at {}: orig={}, restored={}",
+                i, a, b
+            );
         }
     }
 
@@ -254,17 +269,26 @@ mod tests {
         let n = c * f * h * w;
         let host: Vec<bf16> = (0..n).map(|i| bf16::from_f32(i as f32 * 0.05)).collect();
         let img: Tensor<bf16, Cuda> = Tensor::from_host_slice(&host, [c, f, h, w], &cuda).unwrap();
-        let f_t = 1; let h_t = h / 2; let w_t = w / 2;
+        let f_t = 1;
+        let h_t = h / 2;
+        let w_t = w / 2;
         let num_tokens = f_t * h_t * w_t; // 16
         let patch_flat = 2 * 2 * c; // 64
-        let mut tokens: Tensor<bf16, Cuda> = Tensor::zeros([num_tokens, patch_flat], &cuda).unwrap();
+        let mut tokens: Tensor<bf16, Cuda> =
+            Tensor::zeros([num_tokens, patch_flat], &cuda).unwrap();
         patchify_into(&img, 2, 1, &mut tokens).unwrap();
         let mut back: Tensor<bf16, Cuda> = Tensor::zeros([c, f, h, w], &cuda).unwrap();
         unpatchify_into(&tokens, f, h, w, c, 2, 1, &mut back).unwrap();
         let restored = back.to_host_vec().unwrap();
         for (i, (a, b)) in host.iter().zip(restored.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(),
-                "bf16 roundtrip mismatch at {}: orig={}, restored={}", i, a.to_f32(), b.to_f32());
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "bf16 roundtrip mismatch at {}: orig={}, restored={}",
+                i,
+                a.to_f32(),
+                b.to_f32()
+            );
         }
     }
 }

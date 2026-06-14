@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
 use infer_protocol::server_to_scheduler::{CancelReason, InferenceRequest};
 
-use crate::error::Result;
 use crate::domain::inference_session::handle::ClientId;
+use crate::error::Result;
 
 pub enum FrontendEvent {
     Infer {

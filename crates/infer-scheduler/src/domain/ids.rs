@@ -198,7 +198,10 @@ macro_rules! count_newtype {
     };
 }
 
-count_newtype!(TokenCount, "Generic token count (max_tokens / num_tokens / etc.)");
+count_newtype!(
+    TokenCount,
+    "Generic token count (max_tokens / num_tokens / etc.)"
+);
 count_newtype!(SeqCount, "Sequence/batch slot count");
 count_newtype!(PromptLen, "Prompt length in tokens");
 count_newtype!(GeneratedCount, "Number of tokens generated so far");

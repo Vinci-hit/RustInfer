@@ -24,10 +24,12 @@ use std::time::Instant;
 use infer_protocol::server_to_scheduler::{InferenceModality, InferenceRequest};
 
 use crate::config::{SchedulerConfig, SchedulerMode};
-use crate::error::SchedulerError;
 use crate::domain::inference_session::handle::{ClientId, RequestHandle};
-use crate::domain::inference_session::lifecycle::{Priority, RequestId, RequestMeta, SamplingParams, SequenceId};
+use crate::domain::inference_session::lifecycle::{
+    Priority, RequestId, RequestMeta, SamplingParams, SequenceId,
+};
 use crate::domain::inference_session::table::RequestTable;
+use crate::error::SchedulerError;
 
 /// Outcome of [`IngestionSystem::ingest`].
 #[derive(Debug)]
@@ -54,6 +56,10 @@ pub enum RejectReason {
     EmptyPrompt,
     /// LLM prompt longer than `config.max_model_len`.
     PromptTooLong { len: usize, limit: usize },
+    /// LLM max_tokens must be positive.
+    MaxTokensZero,
+    /// Prompt + generated tokens would exceed the model context window.
+    TotalTokensTooLong { requested: usize, limit: usize },
     /// Diffusion mode but request carried no `diffusion` payload.
     DiffusionPayloadMissing,
     /// Diffusion mode but `diffusion.prompt` was empty.
@@ -72,11 +78,16 @@ impl RejectReason {
             Self::PromptTooLong { len, limit } => {
                 format!("prompt length {} exceeds max_model_len {}", len, limit)
             }
+            Self::MaxTokensZero => "max_tokens must be > 0".to_string(),
+            Self::TotalTokensTooLong { requested, limit } => {
+                format!(
+                    "prompt length + max_tokens {} exceeds max_model_len {}",
+                    requested, limit
+                )
+            }
             Self::DiffusionPayloadMissing => "missing diffusion payload".to_string(),
             Self::DiffusionPromptEmpty => "empty diffusion prompt".to_string(),
-            Self::DiffusionPromptIdsEmpty => {
-                "empty server-tokenized prompt_input_ids".to_string()
-            }
+            Self::DiffusionPromptIdsEmpty => "empty server-tokenized prompt_input_ids".to_string(),
             Self::Repository(msg) => format!("repository rejected: {}", msg),
         }
     }
@@ -101,7 +112,9 @@ impl IngestionSystem {
         // SequenceId(0) is reserved as a sentinel "unassigned" value
         // in some debug paths; start at 1 to keep parity with the
         // previous engine counter.
-        Self { next_sequence_id: 1 }
+        Self {
+            next_sequence_id: 1,
+        }
     }
 
     /// Validate + admit a single inbound request.
@@ -202,6 +215,16 @@ impl IngestionSystem {
         if request.input_ids.len() > config.max_model_len {
             return Err(RejectReason::PromptTooLong {
                 len: request.input_ids.len(),
+                limit: config.max_model_len,
+            });
+        }
+        if request.max_tokens == 0 {
+            return Err(RejectReason::MaxTokensZero);
+        }
+        let requested = request.input_ids.len().saturating_add(request.max_tokens);
+        if requested > config.max_model_len {
+            return Err(RejectReason::TotalTokensTooLong {
+                requested,
                 limit: config.max_model_len,
             });
         }

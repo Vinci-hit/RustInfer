@@ -12,12 +12,12 @@
 //! ```
 
 pub mod dit_block;
-pub mod transformer;
-pub mod vae_decoder;
+pub mod patchify;
 pub mod pipeline;
+pub mod rope_3d;
 pub mod scheduler;
 pub mod state;
-pub mod rope_3d;
-pub mod timestep_embedder;
-pub mod patchify;
 pub mod text_encoder;
+pub mod timestep_embedder;
+pub mod transformer;
+pub mod vae_decoder;

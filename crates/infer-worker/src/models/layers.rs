@@ -4,9 +4,9 @@
 //! Each struct is generic over the *minimal* trait it needs: `CoreOps` for
 //! primitives, `LlmOps` for decoder ops, `DiffusionOps` for conv/VAE/DiT.
 
-use crate::domain::ports::{CoreOps, LlmOps, DiffusionOps, OpResult};
-use crate::domain::types::Dtype;
+use crate::domain::ports::{CoreOps, DiffusionOps, LlmOps, OpResult};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::Dtype;
 
 /// Linear layer: output = input @ weight^T + optional bias
 pub struct Linear<T: Dtype, D: CoreOps> {
@@ -43,7 +43,14 @@ pub struct QuantLinear<A: Dtype, W: Dtype, D: CoreOps> {
 
 impl<A: Dtype, W: Dtype, D: CoreOps> QuantLinear<A, W, D> {
     pub fn forward(&self, input: &Tensor<A, D>, output: &mut Tensor<A, D>) -> OpResult<()> {
-        D::matmul_quant(input, &self.weight_packed, output, &self.scales, self.zeros.as_ref(), self.group_size)
+        D::matmul_quant(
+            input,
+            &self.weight_packed,
+            output,
+            &self.scales,
+            self.zeros.as_ref(),
+            self.group_size,
+        )
     }
 }
 
@@ -54,7 +61,9 @@ pub struct RMSNorm<T: Dtype, D: LlmOps> {
 }
 
 impl<T: Dtype, D: LlmOps> RMSNorm<T, D> {
-    pub fn new(weight: Tensor<T, D>, eps: f32) -> Self { Self { weight, eps } }
+    pub fn new(weight: Tensor<T, D>, eps: f32) -> Self {
+        Self { weight, eps }
+    }
 
     pub fn forward(&self, input: &Tensor<T, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
         D::rmsnorm(input, &self.weight, output, self.eps)
@@ -82,19 +91,36 @@ impl<T: Dtype, D: CoreOps> Embedding<T, D> {
 
 /// Conv2D layer (for VAE decoder/encoder)
 pub struct Conv2D<T: Dtype, D: DiffusionOps> {
-    pub weight: Tensor<T, D>,   // [Cout, Cin, Kh, Kw]
+    pub weight: Tensor<T, D>, // [Cout, Cin, Kh, Kw]
     pub bias: Option<Tensor<T, D>>,
     pub stride: usize,
     pub padding: usize,
 }
 
 impl<T: Dtype, D: DiffusionOps> Conv2D<T, D> {
-    pub fn new(weight: Tensor<T, D>, bias: Option<Tensor<T, D>>, stride: usize, padding: usize) -> Self {
-        Self { weight, bias, stride, padding }
+    pub fn new(
+        weight: Tensor<T, D>,
+        bias: Option<Tensor<T, D>>,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
+        Self {
+            weight,
+            bias,
+            stride,
+            padding,
+        }
     }
 
     pub fn forward(&self, input: &Tensor<T, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
-        D::conv2d(input, &self.weight, self.bias.as_ref(), output, self.stride, self.padding)
+        D::conv2d(
+            input,
+            &self.weight,
+            self.bias.as_ref(),
+            output,
+            self.stride,
+            self.padding,
+        )
     }
 }
 
@@ -108,16 +134,35 @@ pub struct GroupNorm<T: Dtype, D: DiffusionOps> {
 
 impl<T: Dtype, D: DiffusionOps> GroupNorm<T, D> {
     pub fn new(weight: Tensor<T, D>, bias: Tensor<T, D>, num_groups: usize, eps: f32) -> Self {
-        Self { weight, bias, num_groups, eps }
+        Self {
+            weight,
+            bias,
+            num_groups,
+            eps,
+        }
     }
 
     pub fn forward(&self, input: &Tensor<T, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
-        D::groupnorm(input, &self.weight, &self.bias, output, self.num_groups, self.eps)
+        D::groupnorm(
+            input,
+            &self.weight,
+            &self.bias,
+            output,
+            self.num_groups,
+            self.eps,
+        )
     }
 
     /// Fused GroupNorm + SiLU activation.
     pub fn forward_silu(&self, input: &Tensor<T, D>, output: &mut Tensor<T, D>) -> OpResult<()> {
-        D::groupnorm_silu(input, &self.weight, &self.bias, output, self.num_groups, self.eps)
+        D::groupnorm_silu(
+            input,
+            &self.weight,
+            &self.bias,
+            output,
+            self.num_groups,
+            self.eps,
+        )
     }
 }
 
@@ -137,4 +182,3 @@ impl<T: Dtype, D: DiffusionOps> LayerNorm<T, D> {
         D::layernorm(input, &self.weight, &self.bias, output, self.eps)
     }
 }
-

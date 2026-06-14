@@ -16,23 +16,23 @@
 use infer_protocol::server_to_scheduler::InferenceRequest;
 use tokio::sync::mpsc;
 
-use crate::domain::kv_budget::KvBudget;
-use crate::infrastructure::kv_cache::radix_tree::RadixTree;
+use crate::application::scheduler_event::SchedulerEvent;
+use crate::application::workflow::EngineWorkflow;
 use crate::config::{SchedulerConfig, SchedulerMode};
-use crate::error::Result;
-use crate::infrastructure::metrics::MetricsRecorder;
-use crate::domain::policy::traits::SchedulingPolicy;
 use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::RequestId;
 use crate::domain::inference_session::table::RequestTable;
+use crate::domain::kv_budget::KvBudget;
+use crate::domain::policy::traits::SchedulingPolicy;
+use crate::error::Result;
+use crate::infrastructure::kv_cache::radix_tree::RadixTree;
+use crate::infrastructure::metrics::MetricsRecorder;
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
+use crate::infrastructure::transport::control_plane::WorkerGroup;
 use crate::infrastructure::transport::control_plane::{
     ControlEvent, ControlPlaneCmdTx, ControlPlaneEventRx, WorkerId,
 };
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
-use crate::infrastructure::transport::control_plane::WorkerGroup;
-use crate::application::scheduler_event::SchedulerEvent;
-use crate::application::workflow::EngineWorkflow;
 
 /// The main scheduler engine.
 pub struct SchedulerEngine {
@@ -116,20 +116,15 @@ impl SchedulerEngine {
         let worker_output_rx = worker.take_output_rx();
 
         let workflow: Box<dyn EngineWorkflow> = match config.mode {
-            SchedulerMode::Llm => Box::new(
-                crate::application::workflow::LlmWorkflow::new(policy),
-            ),
-            SchedulerMode::Diffusion => Box::new(
-                crate::application::workflow::DiffusionWorkflow::new(policy),
-            ),
+            SchedulerMode::Llm => Box::new(crate::application::workflow::LlmWorkflow::new(policy)),
+            SchedulerMode::Diffusion => {
+                Box::new(crate::application::workflow::DiffusionWorkflow::new(policy))
+            }
         };
 
         Self {
             workflow,
-            dispatch: crate::application::DispatchSystem::new(
-                Box::new(frontend),
-                Box::new(worker),
-            ),
+            dispatch: crate::application::DispatchSystem::new(Box::new(frontend), Box::new(worker)),
             radix: RadixTree::new(),
             kv_budget: KvBudget::new(
                 u32::try_from(
@@ -188,7 +183,9 @@ impl SchedulerEngine {
         use crate::application::ingestion::{IngestOutcome, RejectReason};
 
         let external_id = request.request_id.clone();
-        let outcome = self.ingestion.ingest(client_id, request, &self.config, &mut self.requests);
+        let outcome = self
+            .ingestion
+            .ingest(client_id, request, &self.config, &mut self.requests);
         match outcome {
             IngestOutcome::Admitted { request_id, .. } => {
                 tracing::info!(
@@ -267,9 +264,7 @@ impl SchedulerEngine {
             codec,
             config,
         };
-        workflow
-            .handle_step_output(&mut ctx, dispatch, event)
-            .await
+        workflow.handle_step_output(&mut ctx, dispatch, event).await
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -381,13 +376,23 @@ impl SchedulerEngine {
         self.workflow.can_schedule(&self.requests)
     }
 
+    pub(crate) fn shutdown_worker_best_effort(&self) {
+        let _ = self.control_cmd.send_to(
+            &self.default_worker,
+            infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::Shutdown,
+        );
+    }
+
     /// Cancel by client-supplied external id.
     pub(crate) async fn cancel_request_by_external_id(&mut self, external_id: &str) -> Result<()> {
-        crate::application::cancel::cancel_request_by_external_id(
+        crate::application::cancel::cancel_request_by_external_id_with_kv(
             &mut self.requests,
+            &mut self.radix,
+            &mut self.kv_budget,
             &self.control_cmd,
             &self.default_worker,
             external_id,
+            self.config.enable_prefix_caching,
         )
         .await
     }
@@ -455,7 +460,9 @@ async fn decode_worker_output(
                 }
             }
             SchedulerMode::Diffusion => {
-                match codec.decode::<infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput>(&data) {
+                match codec
+                    .decode::<infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput>(&data)
+                {
                     Ok(output) => SchedulerEvent::WorkerDiffusionStep(output),
                     Err(e) => SchedulerEvent::WorkerDecodeError(e.to_string()),
                 }
@@ -477,14 +484,17 @@ fn frontend_result_to_event(result: crate::error::Result<FrontendEvent>) -> Sche
         Ok(FrontendEvent::Infer { client_id, request }) => {
             SchedulerEvent::NewRequest { client_id, request }
         }
-        Ok(FrontendEvent::Cancel { external_id, reason }) => {
-            SchedulerEvent::Cancel { external_id, reason }
-        }
+        Ok(FrontendEvent::Cancel {
+            external_id,
+            reason,
+        }) => SchedulerEvent::Cancel {
+            external_id,
+            reason,
+        },
         Err(crate::error::SchedulerError::Shutdown) => SchedulerEvent::FrontendShutdown,
         Err(e) => SchedulerEvent::FrontendError(e.to_string()),
     }
 }
-
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]

@@ -3,26 +3,22 @@
 //! This module defines WHAT the system IS, not HOW it does things.
 //! All trait definitions (ports) live here. Infrastructure implements them.
 
-pub mod types;
+pub mod batch;
+pub mod global_kv_alloc;
+pub mod model;
+pub mod ports;
 pub mod storage;
 pub mod tensor;
-pub mod ports;
-pub mod ops;
-pub mod batch;
-pub mod batch_workspace;
-pub mod global_kv_alloc;
-pub mod forward_workspace;
-pub mod model;
-pub mod runtime;
+pub mod types;
 
 // ─── Re-exports ──────────────────────────────────────────────────────────────
-pub use types::{Shape, Strides, Dims, Dtype, DataType, MAX_RANK};
-pub use storage::Storage;
-pub use tensor::Tensor;
-pub use ports::{Device, Allocator, HostDevice, MemoryPort, CoreOps, LlmOps, DiffusionOps, OpBackend, OpError, OpResult};
 pub use batch::{BatchKind, BatchPlan, PagedKvLayer, PagedKvPool, RAGGED_Q_TILE};
 pub use global_kv_alloc::{AllocFull, GlobalKvAllocator};
-pub use batch_workspace::{BatchWorkspace, WsSeqStep};
-pub use forward_workspace::{ForwardWorkspace, ModelDims};
-pub use model::{LlmModel, ForwardContext};
-pub use runtime::KvCache;
+pub use model::{ForwardContext, LlmForwardWorkspace, LlmModel};
+pub use ports::{
+    Allocator, CoreOps, Device, DiffusionOps, HostDevice, LlmOps, MemoryPort, OpBackend, OpError,
+    OpResult,
+};
+pub use storage::Storage;
+pub use tensor::Tensor;
+pub use types::{DataType, Dims, Dtype, MAX_RANK, Shape, Strides};

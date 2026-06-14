@@ -25,7 +25,7 @@
 //! All buffers used during forward must be passed in by the caller as
 //! pre-allocated workspaces (`DiTBlockScratch`) so the hot path is alloc-free.
 
-use crate::domain::ports::{OpResult, OpError, OpBackend};
+use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype, Shape};
 use crate::models::layers::{Linear, RMSNorm};
@@ -39,7 +39,9 @@ use crate::models::layers::{Linear, RMSNorm};
 static DUMP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn dump_enabled() -> bool {
-    std::env::var("RUSTINFER_DUMP").map(|v| v == "1").unwrap_or(false)
+    std::env::var("RUSTINFER_DUMP")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Dump `t` (any contiguous Tensor<T, D>) to `/tmp/zimage_dump_rust/<name>.npy`
@@ -52,7 +54,10 @@ pub fn dump_tensor<T: Dtype, D: OpBackend>(name: &str, t: &Tensor<T, D>) {
     let path = dir.join(format!("{}.npy", name));
     let host: Vec<T> = match t.to_host_vec() {
         Ok(v) => v,
-        Err(e) => { eprintln!("[dump] {}: D2H failed: {:?}", name, e); return; }
+        Err(e) => {
+            eprintln!("[dump] {}: D2H failed: {:?}", name, e);
+            return;
+        }
     };
     let shape: Vec<usize> = t.shape().as_slice().to_vec();
     let f32_data: Vec<f32> = match T::DATA_TYPE {
@@ -61,13 +66,20 @@ pub fn dump_tensor<T: Dtype, D: OpBackend>(name: &str, t: &Tensor<T, D>) {
         },
         DataType::BF16 => unsafe {
             std::slice::from_raw_parts(host.as_ptr() as *const half::bf16, host.len())
-                .iter().map(|v| v.to_f32()).collect()
+                .iter()
+                .map(|v| v.to_f32())
+                .collect()
         },
         DataType::F16 => unsafe {
             std::slice::from_raw_parts(host.as_ptr() as *const half::f16, host.len())
-                .iter().map(|v| v.to_f32()).collect()
+                .iter()
+                .map(|v| v.to_f32())
+                .collect()
         },
-        other => { eprintln!("[dump] {}: unsupported dtype {:?}", name, other); return; }
+        other => {
+            eprintln!("[dump] {}: unsupported dtype {:?}", name, other);
+            return;
+        }
     };
     if let Err(e) = write_npy_f32(&path, &shape, &f32_data) {
         eprintln!("[dump] {}: write failed: {}", name, e);
@@ -76,19 +88,40 @@ pub fn dump_tensor<T: Dtype, D: OpBackend>(name: &str, t: &Tensor<T, D>) {
         let n = f32_data.len();
         let mut sum = 0.0_f64;
         let mut nan = 0usize;
-        let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
         for &v in &f32_data {
-            if v.is_finite() { sum += v as f64; if v < mn { mn = v; } if v > mx { mx = v; } }
-            else { nan += 1; }
+            if v.is_finite() {
+                sum += v as f64;
+                if v < mn {
+                    mn = v;
+                }
+                if v > mx {
+                    mx = v;
+                }
+            } else {
+                nan += 1;
+            }
         }
         // Print first 4 raw f32 bits to compare with on-disk file.
-        let bits: Vec<String> = f32_data.iter().take(4)
-            .map(|v| format!("{:08x}", v.to_bits())).collect();
-        eprintln!("[dump] {} shape={:?} numel={} nan={} mean={:.6} min={:.6} max={:.6} \
+        let bits: Vec<String> = f32_data
+            .iter()
+            .take(4)
+            .map(|v| format!("{:08x}", v.to_bits()))
+            .collect();
+        eprintln!(
+            "[dump] {} shape={:?} numel={} nan={} mean={:.6} min={:.6} max={:.6} \
                    first4_vals={:?} first4_bits=[{}]",
-            name, shape, n, nan, sum / (n as f64).max(1.0), mn, mx,
+            name,
+            shape,
+            n,
+            nan,
+            sum / (n as f64).max(1.0),
+            mn,
+            mx,
             &f32_data[..4.min(n)],
-            bits.join(", "));
+            bits.join(", ")
+        );
     }
 }
 
@@ -97,15 +130,25 @@ fn write_npy_f32(path: &std::path::Path, shape: &[usize], data: &[f32]) -> std::
     let mut f = std::fs::File::create(path)?;
     f.write_all(b"\x93NUMPY")?;
     f.write_all(&[1u8, 0u8])?;
-    let shape_str = shape.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
-    let shape_str = if shape.len() == 1 { format!("{},", shape_str) } else { shape_str };
+    let shape_str = shape
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shape_str = if shape.len() == 1 {
+        format!("{},", shape_str)
+    } else {
+        shape_str
+    };
     let mut header = format!(
         "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}), }}",
         shape_str,
     );
     let prefix = 10;
     let needed_pad = (64 - (prefix + header.len() + 1) % 64) % 64;
-    for _ in 0..needed_pad { header.push(' '); }
+    for _ in 0..needed_pad {
+        header.push(' ');
+    }
     header.push('\n');
     let header_len = header.len() as u16;
     f.write_all(&header_len.to_le_bytes())?;
@@ -122,11 +165,19 @@ fn write_npy_f32(path: &std::path::Path, shape: &[usize], data: &[f32]) -> std::
 /// Take a contiguous 2D prefix view of `src` shaped `[rows, cols]`.
 /// Caller asserts the storage holds at least `rows * cols` valid elements
 /// at offset 0.
-fn vp2<T: Dtype, D: OpBackend>(src: &Tensor<T, D>, rows: usize, cols: usize) -> OpResult<Tensor<T, D>> {
+fn vp2<T: Dtype, D: OpBackend>(
+    src: &Tensor<T, D>,
+    rows: usize,
+    cols: usize,
+) -> OpResult<Tensor<T, D>> {
     let total = src.numel();
     if rows * cols > total {
         return Err(OpError::Shape(format!(
-            "vp2: requested {}*{}={} > storage numel {}", rows, cols, rows * cols, total,
+            "vp2: requested {}*{}={} > storage numel {}",
+            rows,
+            cols,
+            rows * cols,
+            total,
         )));
     }
     Ok(src.view_raw(
@@ -138,11 +189,21 @@ fn vp2<T: Dtype, D: OpBackend>(src: &Tensor<T, D>, rows: usize, cols: usize) -> 
 }
 
 /// 3D variant of `vp2`.
-fn vp3<T: Dtype, D: OpBackend>(src: &Tensor<T, D>, a: usize, b: usize, c: usize) -> OpResult<Tensor<T, D>> {
+fn vp3<T: Dtype, D: OpBackend>(
+    src: &Tensor<T, D>,
+    a: usize,
+    b: usize,
+    c: usize,
+) -> OpResult<Tensor<T, D>> {
     let total = src.numel();
     if a * b * c > total {
         return Err(OpError::Shape(format!(
-            "vp3: requested {}*{}*{}={} > storage numel {}", a, b, c, a * b * c, total,
+            "vp3: requested {}*{}*{}={} > storage numel {}",
+            a,
+            b,
+            c,
+            a * b * c,
+            total,
         )));
     }
     Ok(src.view_raw(
@@ -271,13 +332,16 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
         if x.shape().as_slice() != [seq, dim] {
             return Err(OpError::Shape(format!(
                 "DiTBlock::forward: x shape {:?} doesn't match [seq, dim={}]",
-                x.shape(), dim,
+                x.shape(),
+                dim,
             )));
         }
         if dst.shape().as_slice() != [seq, dim] {
             return Err(OpError::Shape(format!(
                 "DiTBlock::forward: dst shape {:?} != [{}, {}]",
-                dst.shape(), seq, dim,
+                dst.shape(),
+                seq,
+                dim,
             )));
         }
 
@@ -285,23 +349,26 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
         let have_mod = self.modulation;
         // First-block dump: only do this for the very first DiTBlock forward
         // call in the whole process, gated by RUSTINFER_DUMP=1.
-        let do_dump = dump_enabled()
-            && !DUMP_DONE.swap(true, std::sync::atomic::Ordering::SeqCst);
+        let do_dump = dump_enabled() && !DUMP_DONE.swap(true, std::sync::atomic::Ordering::SeqCst);
         if do_dump {
             eprintln!("[dump] DiTBlock first forward: dumping intermediates");
             // Use a different name so we don't overwrite the transformer-level
             // dump of latent_5d_in (which captures the *pre-x_embedder* state).
             dump_tensor("step0_block_x_in", x);
-            if let Some(c) = adaln_input { dump_tensor("step0_adaln_input", c); }
+            if let Some(c) = adaln_input {
+                dump_tensor("step0_adaln_input", c);
+            }
         }
 
         if have_mod {
-            let adaln = self.adaln_modulation.as_ref().ok_or_else(|| OpError::Kernel(
-                "DiTBlock::forward: modulation=true but adaln_modulation is None".into()
-            ))?;
-            let c = adaln_input.ok_or_else(|| OpError::Kernel(
-                "DiTBlock::forward: modulation=true but adaln_input is None".into()
-            ))?;
+            let adaln = self.adaln_modulation.as_ref().ok_or_else(|| {
+                OpError::Kernel(
+                    "DiTBlock::forward: modulation=true but adaln_modulation is None".into(),
+                )
+            })?;
+            let c = adaln_input.ok_or_else(|| {
+                OpError::Kernel("DiTBlock::forward: modulation=true but adaln_input is None".into())
+            })?;
             // The block's adaLN_modulation is `Sequential(Linear)` only —
             // NO SiLU prefix. (FinalLayer's adaLN does include SiLU.)
             // We still copy `c` into a scratch buffer because adaLN.forward
@@ -311,16 +378,18 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             // mod_out = adaln(c)
             let mut mod_out = vp2(&scratch.mod_out, 1, 4 * dim)?;
             adaln.forward(&adaln_silu, &mut mod_out)?;
-            if do_dump { dump_tensor("step0_nr0_mod_out", &mod_out); }
+            if do_dump {
+                dump_tensor("step0_nr0_mod_out", &mod_out);
+            }
             // Split into 4 chunks of [1, dim].
             let mut scale_msa = vp2(&scratch.scale_msa, 1, dim)?;
             let mut gate_msa = vp2(&scratch.gate_msa, 1, dim)?;
             let mut scale_mlp = vp2(&scratch.scale_mlp, 1, dim)?;
             let mut gate_mlp = vp2(&scratch.gate_mlp, 1, dim)?;
-            D::split_cols(&mod_out, &mut scale_msa, 1, 4 * dim, 0,         dim)?;
-            D::split_cols(&mod_out, &mut gate_msa,  1, 4 * dim, dim,       dim)?;
-            D::split_cols(&mod_out, &mut scale_mlp, 1, 4 * dim, 2 * dim,   dim)?;
-            D::split_cols(&mod_out, &mut gate_mlp,  1, 4 * dim, 3 * dim,   dim)?;
+            D::split_cols(&mod_out, &mut scale_msa, 1, 4 * dim, 0, dim)?;
+            D::split_cols(&mod_out, &mut gate_msa, 1, 4 * dim, dim, dim)?;
+            D::split_cols(&mod_out, &mut scale_mlp, 1, 4 * dim, 2 * dim, dim)?;
+            D::split_cols(&mod_out, &mut gate_mlp, 1, 4 * dim, 3 * dim, dim)?;
             // scale += 1; gate = tanh(gate)
             D::scalar_add_inplace(&mut scale_msa, 1.0)?;
             D::scalar_add_inplace(&mut scale_mlp, 1.0)?;
@@ -341,7 +410,9 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             let scale_msa = vp2(&scratch.scale_msa, 1, dim)?;
             D::broadcast_mul_inplace(&mut norm1_x, &scale_msa)?;
         }
-        if do_dump { dump_tensor("step0_nr0_norm1_x", &norm1_x); }
+        if do_dump {
+            dump_tensor("step0_nr0_norm1_x", &norm1_x);
+        }
 
         // ── 3. QKV projection + split + qk-norm + RoPE ──
         let mut qkv_out = vp2(&scratch.qkv_out, seq, 3 * dim)?;
@@ -349,9 +420,9 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
         let mut q = vp2(&scratch.q, seq, dim)?;
         let mut k = vp2(&scratch.k, seq, dim)?;
         let mut v = vp2(&scratch.v, seq, dim)?;
-        D::split_cols(&qkv_out, &mut q, seq, 3 * dim, 0,     dim)?;
-        D::split_cols(&qkv_out, &mut k, seq, 3 * dim, dim,   dim)?;
-        D::split_cols(&qkv_out, &mut v, seq, 3 * dim, 2*dim, dim)?;
+        D::split_cols(&qkv_out, &mut q, seq, 3 * dim, 0, dim)?;
+        D::split_cols(&qkv_out, &mut k, seq, 3 * dim, dim, dim)?;
+        D::split_cols(&qkv_out, &mut v, seq, 3 * dim, 2 * dim, dim)?;
         if do_dump {
             dump_tensor("step0_nr0_qkv_q", &q);
             dump_tensor("step0_nr0_qkv_k", &k);
@@ -387,14 +458,27 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
         let k3_in = vp3(&scratch.k, seq, self.n_heads, self.head_dim)?;
         let mut attn3 = vp3(&scratch.attn_out, seq, self.n_heads, self.head_dim)?;
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        D::sdpa(&q3_in, &k3_in, &v3, &mut attn3, self.n_heads, self.n_heads, self.head_dim, scale)?;
-        if do_dump { dump_tensor("step0_nr0_attn_out_premerge", &attn3); }
+        D::sdpa(
+            &q3_in,
+            &k3_in,
+            &v3,
+            &mut attn3,
+            self.n_heads,
+            self.n_heads,
+            self.head_dim,
+            scale,
+        )?;
+        if do_dump {
+            dump_tensor("step0_nr0_attn_out_premerge", &attn3);
+        }
 
         // ── 5. to_out projection ──
         let attn_flat = vp2(&scratch.attn_out, seq, dim)?;
         let mut to_out_buf = vp2(&scratch.to_out_buf, seq, dim)?;
         self.to_out.forward(&attn_flat, &mut to_out_buf)?;
-        if do_dump { dump_tensor("step0_nr0_attn_out_post", &to_out_buf); }
+        if do_dump {
+            dump_tensor("step0_nr0_attn_out_post", &to_out_buf);
+        }
 
         // ── 6. attention_norm2(to_out) [* gate_msa] ──
         let mut norm2_attn = vp2(&scratch.norm2_attn, seq, dim)?;
@@ -403,12 +487,16 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             let gate_msa = vp2(&scratch.gate_msa, 1, dim)?;
             D::broadcast_mul_inplace(&mut norm2_attn, &gate_msa)?;
         }
-        if do_dump { dump_tensor("step0_nr0_norm2_attn", &norm2_attn); }
+        if do_dump {
+            dump_tensor("step0_nr0_norm2_attn", &norm2_attn);
+        }
 
         // ── 7. dst = x + norm2_attn  (gate_msa already applied above) ──
         dst.copy_from(x)?;
         D::add_inplace(dst, &norm2_attn)?;
-        if do_dump { dump_tensor("step0_nr0_after_attn", dst); }
+        if do_dump {
+            dump_tensor("step0_nr0_after_attn", dst);
+        }
 
         // ── 8. ffn_norm1(dst) [* scale_mlp] ──
         let mut norm1_ffn = vp2(&scratch.norm1_ffn, seq, dim)?;
@@ -417,7 +505,9 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             let scale_mlp = vp2(&scratch.scale_mlp, 1, dim)?;
             D::broadcast_mul_inplace(&mut norm1_ffn, &scale_mlp)?;
         }
-        if do_dump { dump_tensor("step0_nr0_norm1_ffn", &norm1_ffn); }
+        if do_dump {
+            dump_tensor("step0_nr0_norm1_ffn", &norm1_ffn);
+        }
 
         // ── 9. FFN: w2(silu(w1) * w3) ──
         let hidden = self.w1.weight.shape().as_slice()[0];
@@ -433,10 +523,14 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
         D::silu_inplace_diff(&mut w1_out)?;
         let w1_in = vp2(&scratch.w1_out, seq, hidden)?;
         D::ewise_mul(&w1_in, &w3_out, &mut w1_out)?;
-        if do_dump { dump_tensor("step0_nr0_silu_w1_x_w3", &w1_out); }
+        if do_dump {
+            dump_tensor("step0_nr0_silu_w1_x_w3", &w1_out);
+        }
         let mut ffn_out = vp2(&scratch.ffn_out, seq, dim)?;
         self.w2.forward(&w1_out, &mut ffn_out)?;
-        if do_dump { dump_tensor("step0_nr0_w2_out", &ffn_out); }
+        if do_dump {
+            dump_tensor("step0_nr0_w2_out", &ffn_out);
+        }
 
         // ── 10. ffn_norm2(ffn_out) [* gate_mlp] ──
         let mut norm2_ffn = vp2(&scratch.norm2_ffn, seq, dim)?;
@@ -445,11 +539,15 @@ impl<T: Dtype, D: OpBackend> DiTBlock<T, D> {
             let gate_mlp = vp2(&scratch.gate_mlp, 1, dim)?;
             D::broadcast_mul_inplace(&mut norm2_ffn, &gate_mlp)?;
         }
-        if do_dump { dump_tensor("step0_nr0_norm2_ffn", &norm2_ffn); }
+        if do_dump {
+            dump_tensor("step0_nr0_norm2_ffn", &norm2_ffn);
+        }
 
         // ── 11. dst += norm2_ffn ──
         D::add_inplace(dst, &norm2_ffn)?;
-        if do_dump { dump_tensor("step0_nr0_block_out", dst); }
+        if do_dump {
+            dump_tensor("step0_nr0_block_out", dst);
+        }
 
         Ok(())
     }
@@ -465,7 +563,12 @@ mod tests {
     /// Build a "tiny but valid" DiT block with random weights for a CUDA shape
     /// check + finite-output test.
     fn make_random_block(
-        cuda: &Cuda, dim: usize, n_heads: usize, hidden: usize, modulation: bool, seed: u64,
+        cuda: &Cuda,
+        dim: usize,
+        n_heads: usize,
+        hidden: usize,
+        modulation: bool,
+        seed: u64,
     ) -> DiTBlock<f32, Cuda> {
         let head_dim = dim / n_heads;
         let randn_w = |out: usize, in_: usize, s: u64| -> Linear<f32, Cuda> {
@@ -494,7 +597,10 @@ mod tests {
             } else {
                 None
             },
-            dim, n_heads, head_dim, modulation,
+            dim,
+            n_heads,
+            head_dim,
+            modulation,
         }
     }
 
@@ -514,16 +620,26 @@ mod tests {
         // Random inputs (use small magnitudes so RMSNorm doesn't blow up).
         let x: Tensor<f32, Cuda> = Tensor::randn([seq, dim], &cuda, Some(7)).unwrap();
         let cos: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &(0..seq * half).map(|i| (i as f32 * 0.1).cos()).collect::<Vec<_>>(),
-            [seq, half], &cuda,
-        ).unwrap();
+            &(0..seq * half)
+                .map(|i| (i as f32 * 0.1).cos())
+                .collect::<Vec<_>>(),
+            [seq, half],
+            &cuda,
+        )
+        .unwrap();
         let sin: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &(0..seq * half).map(|i| (i as f32 * 0.1).sin()).collect::<Vec<_>>(),
-            [seq, half], &cuda,
-        ).unwrap();
+            &(0..seq * half)
+                .map(|i| (i as f32 * 0.1).sin())
+                .collect::<Vec<_>>(),
+            [seq, half],
+            &cuda,
+        )
+        .unwrap();
 
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([seq, dim], &cuda).unwrap();
-        block.forward(&x, &cos, &sin, None, &mut scratch, &mut dst).unwrap();
+        block
+            .forward(&x, &cos, &sin, None, &mut scratch, &mut dst)
+            .unwrap();
 
         let got = dst.to_host_vec().unwrap();
         for (i, v) in got.iter().enumerate() {
@@ -531,8 +647,17 @@ mod tests {
         }
         // Output should differ from input (block does *something*).
         let xv = x.to_host_vec().unwrap();
-        let diff: f32 = got.iter().zip(xv.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>() / got.len() as f32;
-        assert!(diff > 1e-4, "block output identical to input (avg diff {})", diff);
+        let diff: f32 = got
+            .iter()
+            .zip(xv.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / got.len() as f32;
+        assert!(
+            diff > 1e-4,
+            "block output identical to input (avg diff {})",
+            diff
+        );
     }
 
     #[test]
@@ -550,15 +675,25 @@ mod tests {
         let x: Tensor<f32, Cuda> = Tensor::randn([seq, dim], &cuda, Some(8)).unwrap();
         let adaln_in: Tensor<f32, Cuda> = Tensor::randn([1, 256], &cuda, Some(81)).unwrap();
         let cos: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &(0..seq * half).map(|i| (i as f32 * 0.07).cos()).collect::<Vec<_>>(),
-            [seq, half], &cuda,
-        ).unwrap();
+            &(0..seq * half)
+                .map(|i| (i as f32 * 0.07).cos())
+                .collect::<Vec<_>>(),
+            [seq, half],
+            &cuda,
+        )
+        .unwrap();
         let sin: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &(0..seq * half).map(|i| (i as f32 * 0.07).sin()).collect::<Vec<_>>(),
-            [seq, half], &cuda,
-        ).unwrap();
+            &(0..seq * half)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect::<Vec<_>>(),
+            [seq, half],
+            &cuda,
+        )
+        .unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([seq, dim], &cuda).unwrap();
-        block.forward(&x, &cos, &sin, Some(&adaln_in), &mut scratch, &mut dst).unwrap();
+        block
+            .forward(&x, &cos, &sin, Some(&adaln_in), &mut scratch, &mut dst)
+            .unwrap();
         let got = dst.to_host_vec().unwrap();
         for (i, v) in got.iter().enumerate() {
             assert!(v.is_finite(), "non-finite output at {}: {}", i, v);
@@ -572,7 +707,10 @@ mod tests {
         // (Modulo numerical noise from the SDPA softmax which returns a
         // valid probability distribution.)
         let cuda = Cuda::new(0).unwrap();
-        let dim = 32; let n_heads = 4; let hidden = 64; let seq = 8;
+        let dim = 32;
+        let n_heads = 4;
+        let hidden = 64;
+        let seq = 8;
         let block = make_random_block(&cuda, dim, n_heads, hidden, false, 1);
         let mut scratch = DiTBlockScratch::<f32, Cuda>::new(dim, hidden, seq, &cuda).unwrap();
         let head_dim = dim / n_heads;
@@ -581,10 +719,14 @@ mod tests {
         let cos: Tensor<f32, Cuda> = Tensor::zeros([seq, half], &cuda).unwrap();
         let sin: Tensor<f32, Cuda> = Tensor::zeros([seq, half], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([seq, dim], &cuda).unwrap();
-        block.forward(&x, &cos, &sin, None, &mut scratch, &mut dst).unwrap();
+        block
+            .forward(&x, &cos, &sin, None, &mut scratch, &mut dst)
+            .unwrap();
         let got = dst.to_host_vec().unwrap();
         // Output must be finite (no NaNs from RMSNorm on zero input — the
         // norm_q/norm_k weight=1 path divides by sqrt(eps)).
-        for v in got { assert!(v.is_finite()); }
+        for v in got {
+            assert!(v.is_finite());
+        }
     }
 }

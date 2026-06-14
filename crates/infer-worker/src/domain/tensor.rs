@@ -50,11 +50,7 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
 
     /// Allocate a contiguous tensor on `device` and upload `data` into it.
     /// `data.len()` must equal `shape.numel()`.
-    pub fn from_host_slice(
-        data: &[T],
-        shape: impl Into<Shape>,
-        device: &D,
-    ) -> OpResult<Self> {
+    pub fn from_host_slice(data: &[T], shape: impl Into<Shape>, device: &D) -> OpResult<Self> {
         let shape = shape.into();
         let numel = shape.numel();
         if data.len() != numel {
@@ -88,11 +84,7 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
     /// Allocate from an already-prepared host byte buffer (used by loaders
     /// that have done dtype casting). `bytes.len()` must equal
     /// `shape.numel() * T::SIZE_BYTES`.
-    pub fn from_host_bytes(
-        bytes: &[u8],
-        shape: impl Into<Shape>,
-        device: &D,
-    ) -> OpResult<Self> {
+    pub fn from_host_bytes(bytes: &[u8], shape: impl Into<Shape>, device: &D) -> OpResult<Self> {
         let shape = shape.into();
         let numel = shape.numel();
         let size_bytes = numel * T::SIZE_BYTES;
@@ -136,12 +128,16 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             // starting at `data_ptr()`; destination is freshly reserved.
             unsafe {
                 let src = std::ptr::NonNull::new_unchecked(self.data_ptr() as *mut u8);
-                self.storage.device().download(out.as_mut_ptr() as *mut u8, src, size_bytes)?;
+                self.storage
+                    .device()
+                    .download(out.as_mut_ptr() as *mut u8, src, size_bytes)?;
                 out.set_len(self.numel);
             }
         } else {
             // SAFETY: empty vec.
-            unsafe { out.set_len(0); }
+            unsafe {
+                out.set_len(0);
+            }
         }
         Ok(out)
     }
@@ -194,7 +190,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         let shape = self.shape.as_slice();
         if dim >= shape.len() {
             return Err(OpError::Shape(format!(
-                "narrow: dim {} out of range (ndim={})", dim, shape.len(),
+                "narrow: dim {} out of range (ndim={})",
+                dim,
+                shape.len(),
             )));
         }
         if start + length > shape[dim] {
@@ -218,14 +216,38 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
 
     // ─── Accessors ─────────────────────────────────────────────────
 
-    #[inline] pub fn shape(&self) -> &Shape { &self.shape }
-    #[inline] pub fn strides(&self) -> &Strides { &self.strides }
-    #[inline] pub fn ndim(&self) -> usize { self.shape.ndim() }
-    #[inline] pub fn numel(&self) -> usize { self.numel }
-    #[inline] pub fn is_contiguous(&self) -> bool { self.is_contiguous }
-    #[inline] pub fn device(&self) -> &D { self.storage.device() }
-    #[inline] pub fn storage(&self) -> &Arc<Storage<D>> { &self.storage }
-    #[inline] pub fn offset_elems(&self) -> usize { self.offset_elems }
+    #[inline]
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+    #[inline]
+    pub fn strides(&self) -> &Strides {
+        &self.strides
+    }
+    #[inline]
+    pub fn ndim(&self) -> usize {
+        self.shape.ndim()
+    }
+    #[inline]
+    pub fn numel(&self) -> usize {
+        self.numel
+    }
+    #[inline]
+    pub fn is_contiguous(&self) -> bool {
+        self.is_contiguous
+    }
+    #[inline]
+    pub fn device(&self) -> &D {
+        self.storage.device()
+    }
+    #[inline]
+    pub fn storage(&self) -> &Arc<Storage<D>> {
+        &self.storage
+    }
+    #[inline]
+    pub fn offset_elems(&self) -> usize {
+        self.offset_elems
+    }
 
     /// Raw pointer to the first element (with offset applied).
     ///
@@ -253,7 +275,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
 
     /// Element dtype tag (mirrors `T::DATA_TYPE`).
     #[inline]
-    pub fn dtype(&self) -> DataType { T::DATA_TYPE }
+    pub fn dtype(&self) -> DataType {
+        T::DATA_TYPE
+    }
 
     /// Overwrite the tensor's contents with `data` (host → device upload).
     ///
@@ -263,7 +287,8 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         if data.len() != self.numel {
             return Err(OpError::Shape(format!(
                 "upload_from_host: data.len()={} != self.numel={}",
-                data.len(), self.numel,
+                data.len(),
+                self.numel,
             )));
         }
         // No is_contiguous check: upload is a linear H2D memcpy;
@@ -275,7 +300,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             // least self.numel * SIZE_BYTES bytes.
             unsafe {
                 let dst = std::ptr::NonNull::new_unchecked(self.data_ptr() as *mut u8);
-                self.storage.device().upload(dst, data.as_ptr() as *const u8, size_bytes)?;
+                self.storage
+                    .device()
+                    .upload(dst, data.as_ptr() as *const u8, size_bytes)?;
             }
         }
         Ok(())
@@ -304,7 +331,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             }));
         }
         let n = self.numel;
-        if n == 0 { return Ok(()); }
+        if n == 0 {
+            return Ok(());
+        }
         let bytes = n * T::SIZE_BYTES;
 
         // If src and self share the same storage, a D2D copy may overlap.
@@ -375,7 +404,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         while i < n {
             // Avoid log(0).
             let mut u1 = unit_f32(&mut state);
-            if u1 < 1e-7 { u1 = 1e-7; }
+            if u1 < 1e-7 {
+                u1 = 1e-7;
+            }
             let u2 = unit_f32(&mut state);
             let r = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
@@ -394,22 +425,31 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             let bytes: Vec<u8> = match T::DATA_TYPE {
                 DataType::F32 => {
                     let mut v = Vec::with_capacity(n * 4);
-                    for &x in &buf_f32 { v.extend_from_slice(&x.to_le_bytes()); }
+                    for &x in &buf_f32 {
+                        v.extend_from_slice(&x.to_le_bytes());
+                    }
                     v
                 }
                 DataType::BF16 => {
                     let mut v = Vec::with_capacity(n * 2);
-                    for &x in &buf_f32 { v.extend_from_slice(&bf16::from_f32(x).to_le_bytes()); }
+                    for &x in &buf_f32 {
+                        v.extend_from_slice(&bf16::from_f32(x).to_le_bytes());
+                    }
                     v
                 }
                 DataType::F16 => {
                     let mut v = Vec::with_capacity(n * 2);
-                    for &x in &buf_f32 { v.extend_from_slice(&f16::from_f32(x).to_le_bytes()); }
+                    for &x in &buf_f32 {
+                        v.extend_from_slice(&f16::from_f32(x).to_le_bytes());
+                    }
                     v
                 }
-                _ => return Err(OpError::Kernel(format!(
-                    "Tensor::randn: unsupported dtype {:?}", T::DATA_TYPE,
-                ))),
+                _ => {
+                    return Err(OpError::Kernel(format!(
+                        "Tensor::randn: unsupported dtype {:?}",
+                        T::DATA_TYPE,
+                    )));
+                }
             };
             // SAFETY: storage holds exactly n * SIZE_BYTES bytes of writable memory.
             unsafe {
@@ -497,7 +537,12 @@ mod helper_tests {
         let dev = Cpu;
         let n = 4096usize;
         let t: Tensor<bf16, Cpu> = Tensor::randn([n], &dev, Some(11)).unwrap();
-        let v: Vec<f32> = t.to_host_vec().unwrap().iter().map(|x| x.to_f32()).collect();
+        let v: Vec<f32> = t
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
         let mean: f32 = v.iter().sum::<f32>() / n as f32;
         let var: f32 = v.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n as f32;
         assert!(mean.abs() < 0.1, "mean was {}", mean);
@@ -539,8 +584,14 @@ mod helper_tests {
         let gpu_host = gpu_t.to_host_vec().unwrap();
         let cpu_host = cpu_t.to_host_vec().unwrap();
         for (i, (a, b)) in cpu_host.iter().zip(gpu_host.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(),
-                "cpu/gpu randn diverged at i={}: cpu={}, gpu={}", i, a.to_f32(), b.to_f32());
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "cpu/gpu randn diverged at i={}: cpu={}, gpu={}",
+                i,
+                a.to_f32(),
+                b.to_f32()
+            );
         }
     }
 }
@@ -553,7 +604,7 @@ mod opbackend_dispatch_tests {
     //! Catches issues where the trait wiring forgets a method.
 
     use super::*;
-    use crate::domain::ports::{CoreOps, LlmOps, DiffusionOps};
+    use crate::domain::ports::{CoreOps, DiffusionOps, LlmOps};
     use crate::infrastructure::cuda::Cuda;
     use half::bf16;
 
@@ -565,9 +616,12 @@ mod opbackend_dispatch_tests {
         let x_host: Vec<f32> = (0..seq * h * d).map(|i| (i as f32) * 0.1).collect();
         let cos_host: Vec<f32> = vec![0.9; seq * half];
         let sin_host: Vec<f32> = vec![0.1; seq * half];
-        let mut x: Tensor<f32, Cuda> = Tensor::from_host_slice(&x_host, [seq, h, d], &cuda).unwrap();
-        let cos_t: Tensor<f32, Cuda> = Tensor::from_host_slice(&cos_host, [seq, half], &cuda).unwrap();
-        let sin_t: Tensor<f32, Cuda> = Tensor::from_host_slice(&sin_host, [seq, half], &cuda).unwrap();
+        let mut x: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&x_host, [seq, h, d], &cuda).unwrap();
+        let cos_t: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&cos_host, [seq, half], &cuda).unwrap();
+        let sin_t: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&sin_host, [seq, half], &cuda).unwrap();
         Cuda::apply_rope_interleaved(&mut x, &cos_t, &sin_t, d).unwrap();
         let got = x.to_host_vec().unwrap();
         // Sanity: values changed.
@@ -582,11 +636,19 @@ mod opbackend_dispatch_tests {
     fn opbackend_concat_seq_dispatches() {
         let cuda = Cuda::new(0).unwrap();
         let a: Tensor<bf16, Cuda> = Tensor::from_host_slice(
-            &(0..8).map(|i| bf16::from_f32(i as f32)).collect::<Vec<_>>(), [2, 4], &cuda,
-        ).unwrap();
+            &(0..8).map(|i| bf16::from_f32(i as f32)).collect::<Vec<_>>(),
+            [2, 4],
+            &cuda,
+        )
+        .unwrap();
         let b: Tensor<bf16, Cuda> = Tensor::from_host_slice(
-            &(0..12).map(|i| bf16::from_f32(-(i as f32))).collect::<Vec<_>>(), [3, 4], &cuda,
-        ).unwrap();
+            &(0..12)
+                .map(|i| bf16::from_f32(-(i as f32)))
+                .collect::<Vec<_>>(),
+            [3, 4],
+            &cuda,
+        )
+        .unwrap();
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([5, 4], &cuda).unwrap();
         Cuda::concat_seq(&a, &b, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
@@ -615,8 +677,10 @@ mod opbackend_dispatch_tests {
     #[test]
     fn opbackend_pad_with_token_dispatches() {
         let cuda = Cuda::new(0).unwrap();
-        let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [1, 4], &cuda).unwrap();
-        let pad: Tensor<f32, Cuda> = Tensor::from_host_slice(&[7.0, 7.0, 7.0, 7.0], [4], &cuda).unwrap();
+        let src: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [1, 4], &cuda).unwrap();
+        let pad: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[7.0, 7.0, 7.0, 7.0], [4], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([3, 4], &cuda).unwrap();
         Cuda::pad_with_token(&src, &pad, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
@@ -627,24 +691,32 @@ mod opbackend_dispatch_tests {
     #[test]
     fn opbackend_cast_dtype_dispatches() {
         let cuda = Cuda::new(0).unwrap();
-        let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [4], &cuda).unwrap();
+        let src: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [4], &cuda).unwrap();
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([4], &cuda).unwrap();
         Cuda::cast_dtype(&src, &mut dst).unwrap();
-        let got: Vec<f32> = dst.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = dst
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
     fn opbackend_silu_and_tanh_dispatch() {
         let cuda = Cuda::new(0).unwrap();
-        let mut s: Tensor<f32, Cuda> = Tensor::from_host_slice(&[1.0, 2.0, -1.0], [3], &cuda).unwrap();
+        let mut s: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[1.0, 2.0, -1.0], [3], &cuda).unwrap();
         Cuda::silu_inplace_diff(&mut s).unwrap();
         let s_got = s.to_host_vec().unwrap();
         for (i, &x) in [1.0_f32, 2.0, -1.0].iter().enumerate() {
             let expected = x / (1.0 + (-x).exp());
             assert!((s_got[i] - expected).abs() < 1e-5);
         }
-        let mut t: Tensor<f32, Cuda> = Tensor::from_host_slice(&[0.5, 1.0, -1.0], [3], &cuda).unwrap();
+        let mut t: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[0.5, 1.0, -1.0], [3], &cuda).unwrap();
         Cuda::tanh_inplace(&mut t).unwrap();
         let t_got = t.to_host_vec().unwrap();
         for (i, &x) in [0.5_f32, 1.0, -1.0].iter().enumerate() {
@@ -655,7 +727,8 @@ mod opbackend_dispatch_tests {
     #[test]
     fn opbackend_scalar_mul_from_dev_dispatches() {
         let cuda = Cuda::new(0).unwrap();
-        let mut x: Tensor<f32, Cuda> = Tensor::from_host_slice(&[1.0, 2.0, 3.0], [3], &cuda).unwrap();
+        let mut x: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[1.0, 2.0, 3.0], [3], &cuda).unwrap();
         let scalar: Tensor<f32, Cuda> = Tensor::from_host_slice(&[2.5_f32], [1], &cuda).unwrap();
         Cuda::scalar_mul_inplace_from_dev(&mut x, &scalar).unwrap();
         let got = x.to_host_vec().unwrap();
@@ -678,9 +751,8 @@ mod opbackend_dispatch_tests {
     #[test]
     fn opbackend_broadcast_add_dispatches() {
         let cuda = Cuda::new(0).unwrap();
-        let mut x: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &[1.0, 2.0, 3.0, 4.0], [2, 2], &cuda,
-        ).unwrap();
+        let mut x: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [2, 2], &cuda).unwrap();
         let bias: Tensor<f32, Cuda> = Tensor::from_host_slice(&[10.0, 20.0], [2], &cuda).unwrap();
         Cuda::broadcast_add_inplace(&mut x, &bias).unwrap();
         let got = x.to_host_vec().unwrap();

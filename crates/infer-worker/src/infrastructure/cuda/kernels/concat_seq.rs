@@ -2,11 +2,11 @@
 //!
 //! Implemented as two stream-ordered D2D memcpy.
 
-use crate::domain::ports::{OpResult, OpError};
+use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
-use crate::infrastructure::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind, cudaError_cudaSuccess};
+use crate::infrastructure::cuda::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind};
 
 /// In-place concat: `dst = [a; b]` along dim 0.
 ///
@@ -22,12 +22,14 @@ pub fn concat_seq_into<T: Dtype>(
     let ds_ = dst.shape().as_slice();
     if as_.len() != 2 || bs_.len() != 2 || ds_.len() != 2 {
         return Err(OpError::Shape(format!(
-            "concat_seq: 2D required, got a={:?} b={:?} dst={:?}", as_, bs_, ds_,
+            "concat_seq: 2D required, got a={:?} b={:?} dst={:?}",
+            as_, bs_, ds_,
         )));
     }
     if as_[1] != bs_[1] || ds_[1] != as_[1] {
         return Err(OpError::Shape(format!(
-            "concat_seq: last-dim mismatch a={} b={} dst={}", as_[1], bs_[1], ds_[1],
+            "concat_seq: last-dim mismatch a={} b={} dst={}",
+            as_[1], bs_[1], ds_[1],
         )));
     }
     if ds_[0] != as_[0] + bs_[0] {
@@ -89,8 +91,12 @@ mod tests {
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([s_a + s_b, d], &cuda).unwrap();
         concat_seq_into(&a, &b, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
-        for i in 0..s_a * d { assert_eq!(got[i], a_host[i]); }
-        for i in 0..s_b * d { assert_eq!(got[s_a * d + i], b_host[i]); }
+        for i in 0..s_a * d {
+            assert_eq!(got[i], a_host[i]);
+        }
+        for i in 0..s_b * d {
+            assert_eq!(got[s_a * d + i], b_host[i]);
+        }
     }
 
     #[test]
@@ -103,9 +109,18 @@ mod tests {
         let b: Tensor<bf16, Cuda> = Tensor::from_host_slice(&b_host, [3, d], &cuda).unwrap();
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([5, d], &cuda).unwrap();
         concat_seq_into(&a, &b, &mut dst).unwrap();
-        let got: Vec<f32> = dst.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
-        for i in 0..2 * d { assert_eq!(got[i], a_host[i].to_f32()); }
-        for i in 0..3 * d { assert_eq!(got[2 * d + i], b_host[i].to_f32()); }
+        let got: Vec<f32> = dst
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
+        for i in 0..2 * d {
+            assert_eq!(got[i], a_host[i].to_f32());
+        }
+        for i in 0..3 * d {
+            assert_eq!(got[2 * d + i], b_host[i].to_f32());
+        }
     }
 
     #[test]
@@ -115,6 +130,9 @@ mod tests {
         let b: Tensor<f32, Cuda> = Tensor::zeros([3, 5], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([5, 4], &cuda).unwrap();
         let err = concat_seq_into(&a, &b, &mut dst).unwrap_err();
-        match err { OpError::Shape(_) => {}, other => panic!("got {:?}", other) }
+        match err {
+            OpError::Shape(_) => {}
+            other => panic!("got {:?}", other),
+        }
     }
 }

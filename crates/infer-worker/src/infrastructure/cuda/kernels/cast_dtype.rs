@@ -25,7 +25,8 @@ pub fn cast_dtype<S: Dtype, D: Dtype>(
     if src.shape() != dst.shape() {
         return Err(OpError::Shape(format!(
             "cast_dtype: shape mismatch src={:?} dst={:?}",
-            src.shape(), dst.shape(),
+            src.shape(),
+            dst.shape(),
         )));
     }
     if !src.is_contiguous() || !dst.is_contiguous() {
@@ -36,16 +37,28 @@ pub fn cast_dtype<S: Dtype, D: Dtype>(
     unsafe {
         match (S::DATA_TYPE, D::DATA_TYPE) {
             (DataType::F32, DataType::BF16) => cast_f32_to_bf16_forward(
-                dst.data_ptr_mut() as *mut bf16, src.data_ptr() as *const f32, n, stream,
+                dst.data_ptr_mut() as *mut bf16,
+                src.data_ptr() as *const f32,
+                n,
+                stream,
             ),
             (DataType::BF16, DataType::F32) => cast_bf16_to_f32_forward(
-                dst.data_ptr_mut() as *mut f32, src.data_ptr() as *const bf16, n, stream,
+                dst.data_ptr_mut() as *mut f32,
+                src.data_ptr() as *const bf16,
+                n,
+                stream,
             ),
             (DataType::F32, DataType::F16) => cast_f32_to_f16_forward(
-                dst.data_ptr_mut() as *mut f16, src.data_ptr() as *const f32, n, stream,
+                dst.data_ptr_mut() as *mut f16,
+                src.data_ptr() as *const f32,
+                n,
+                stream,
             ),
             (DataType::F16, DataType::F32) => cast_f16_to_f32_forward(
-                dst.data_ptr_mut() as *mut f32, src.data_ptr() as *const f16, n, stream,
+                dst.data_ptr_mut() as *mut f32,
+                src.data_ptr() as *const f16,
+                n,
+                stream,
             ),
             (a, b) if a == b => {
                 // Same dtype → memcpy via stream-ordered device copy.
@@ -63,18 +76,19 @@ pub fn cast_dtype<S: Dtype, D: Dtype>(
                     }
                 }
             }
-            (s, d) => return Err(OpError::Kernel(format!(
-                "cast_dtype: unsupported {:?} → {:?}", s, d,
-            ))),
+            (s, d) => {
+                return Err(OpError::Kernel(format!(
+                    "cast_dtype: unsupported {:?} → {:?}",
+                    s, d,
+                )));
+            }
         }
     }
     Ok(())
 }
 
 /// Allocate a new `Tensor<D, Cuda>` and cast `src` into it.
-pub fn cast_dtype_new<S: Dtype, D: Dtype>(
-    src: &Tensor<S, Cuda>,
-) -> OpResult<Tensor<D, Cuda>> {
+pub fn cast_dtype_new<S: Dtype, D: Dtype>(src: &Tensor<S, Cuda>) -> OpResult<Tensor<D, Cuda>> {
     let mut dst: Tensor<D, Cuda> = Tensor::zeros(*src.shape(), src.device())?;
     cast_dtype(src, &mut dst)?;
     Ok(dst)
@@ -95,14 +109,25 @@ mod tests {
 
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([n], &cuda).unwrap();
         cast_dtype(&src, &mut dst).unwrap();
-        let got: Vec<f32> = dst.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = dst
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
 
         for (i, (a, b)) in src_host.iter().zip(got.iter()).enumerate() {
             // BF16 has 7 mantissa bits → ~1% relative error.
             let abs = (a - b).abs();
             let rel = abs / a.abs().max(1e-3);
-            assert!(abs < 0.05 || rel < 0.01,
-                "cast f32→bf16 mismatch at {}: src={} got={} abs={}", i, a, b, abs);
+            assert!(
+                abs < 0.05 || rel < 0.01,
+                "cast f32→bf16 mismatch at {}: src={} got={} abs={}",
+                i,
+                a,
+                b,
+                abs
+            );
         }
     }
 
@@ -138,7 +163,12 @@ mod tests {
         let src_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&src_host, [4], &cuda).unwrap();
         let dst: Tensor<bf16, Cuda> = cast_dtype_new(&src).unwrap();
-        let got: Vec<f32> = dst.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = dst
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         for (a, b) in src_host.iter().zip(got.iter()) {
             assert!((a - b).abs() < 0.05);
         }

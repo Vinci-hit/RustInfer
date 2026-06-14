@@ -20,8 +20,8 @@
 //!   forced on us.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use infer_protocol::RequestId;
@@ -38,8 +38,7 @@ use super::handle::{ControlError, ControlResult, WorkerId};
 pub(crate) type OneRx = oneshot::Receiver<ControlResult<WorkerControlMessage>>;
 
 /// Awaitable reply set for [`super::handle::ControlPlaneCmdTx::call_all`].
-pub(crate) type AllRx =
-    oneshot::Receiver<Vec<(WorkerId, ControlResult<WorkerControlMessage>)>>;
+pub(crate) type AllRx = oneshot::Receiver<Vec<(WorkerId, ControlResult<WorkerControlMessage>)>>;
 
 pub(crate) struct PendingCalls {
     next_id: AtomicU64,
@@ -115,12 +114,7 @@ impl PendingCalls {
     }
 
     /// Called by the router thread when a reply arrives.
-    pub(crate) fn complete(
-        &self,
-        id: RequestId,
-        worker: WorkerId,
-        reply: WorkerControlMessage,
-    ) {
+    pub(crate) fn complete(&self, id: RequestId, worker: WorkerId, reply: WorkerControlMessage) {
         let mut g = lock_inner(&self.inner);
 
         let finished = match g.get_mut(&id) {
@@ -143,10 +137,9 @@ impl PendingCalls {
             None => return,
         };
 
-        if finished
-            && let Some(PendingEntry::All { collected, tx, .. }) = g.remove(&id) {
-                let _ = tx.send(collected);
-            }
+        if finished && let Some(PendingEntry::All { collected, tx, .. }) = g.remove(&id) {
+            let _ = tx.send(collected);
+        }
     }
 
     /// Periodic sweep for deadlines. Returns the count of fired entries.
@@ -200,7 +193,11 @@ impl PendingCalls {
         // Allocator starts at 1 and increments; overflow back to 0 is
         // astronomically unlikely (>500 yrs at 1M RPCs/s) but we still skip 0
         // to preserve the "0 == uncorrelated" invariant.
-        let raw = if raw == 0 { self.next_id.fetch_add(1, Ordering::Relaxed) } else { raw };
+        let raw = if raw == 0 {
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        } else {
+            raw
+        };
         RequestId(raw)
     }
 }

@@ -7,20 +7,19 @@
 //! All KV addressing is paged. Single-sequence generation runs as a
 //! `batch=1` plan with a contiguous `block_table = [0, 1, 2, ...]`.
 
+use crate::application::batch_workspace::{BatchWorkspace, WsSeqStep};
+use crate::application::forward_workspace::{ForwardWorkspace, ModelDims};
 use crate::domain::batch::{PagedKvLayer, PagedKvPool};
-use crate::domain::batch_workspace::{BatchWorkspace, WsSeqStep};
-use crate::domain::forward_workspace::{ForwardWorkspace, ModelDims};
 use crate::domain::model::{ForwardContext, LlmModel};
 use crate::domain::ports::{OpBackend, OpError, OpResult};
 
 use crate::domain::types::{Dtype, Shape};
 
 #[cfg(feature = "cuda")]
-use crate::application::cuda_graph_runner::{CudaGraphRunner, GraphDecision};
+mod cuda_decode;
+
 #[cfg(feature = "cuda")]
-use crate::infrastructure::cuda::{Cuda, kernels::argmax_batched::argmax_batched_decode_into};
-#[cfg(feature = "cuda")]
-use crate::infrastructure::cuda::kernels::gather_merge::gather_merge_input_into;
+use crate::application::cuda_graph_runner::CudaGraphRunner;
 
 /// Per-sequence step description fed by callers (host side). The runner
 /// converts a slice of these into a device-resident `BatchPlan`.
@@ -34,12 +33,12 @@ pub struct SeqStep {
     pub kv_write_start: i32,
     /// KV length AFTER this step writes (= kv_write_start + input_ids.len()).
     pub kv_len_after: i32,
-    /// Physical block ids for this seq, length must equal
-    /// `runner.max_blocks_per_seq`. Unused trailing entries can be 0.
+    /// Physical block ids for this seq. The row must cover every block
+    /// touched by `kv_len_after`; unused trailing entries are optional.
     pub block_table: Vec<u32>,
 }
 
-pub struct ModelRunner<T: Dtype, D: OpBackend, M: LlmModel<T, D>> {
+pub struct ModelRunner<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> {
     pub model: M,
     pub kv_pool: PagedKvPool<T, D>,
     pub forward_ws: ForwardWorkspace<T, D>,
@@ -71,7 +70,7 @@ pub struct ModelRunner<T: Dtype, D: OpBackend, M: LlmModel<T, D>> {
     pub prof_step_count: u64,
 }
 
-impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
+impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRunner<T, D, M> {
     /// Create a runner. CUDA-Graph capture is **not** done here; call
     /// `prime_graphs_cuda(...)` after construction (CUDA only).
     pub fn new(
@@ -88,11 +87,24 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
     ) -> OpResult<Self> {
         let num_layers = model.num_layers();
         let kv_dim = model.kv_dim();
-        if block_size * max_blocks_per_seq < max_seq_len {
+        if block_size == 0 {
+            return Err(OpError::Shape("ModelRunner::new: block_size=0".into()));
+        }
+        if max_blocks_per_seq == 0 {
+            return Err(OpError::Shape(
+                "ModelRunner::new: max_blocks_per_seq=0".into(),
+            ));
+        }
+        if max_seq_len == 0 {
+            return Err(OpError::Shape("ModelRunner::new: max_seq_len=0".into()));
+        }
+        if block_size.saturating_mul(max_blocks_per_seq) < max_seq_len {
             return Err(OpError::Shape(format!(
                 "ModelRunner::new: block_size({})*max_blocks_per_seq({}) = {} < max_seq_len({})",
-                block_size, max_blocks_per_seq,
-                block_size * max_blocks_per_seq, max_seq_len,
+                block_size,
+                max_blocks_per_seq,
+                block_size.saturating_mul(max_blocks_per_seq),
+                max_seq_len,
             )));
         }
         if block_size != 1 {
@@ -120,7 +132,12 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             )?;
             layers.push(PagedKvLayer { k, v });
         }
-        let kv_pool = PagedKvPool { layers, num_blocks, block_size, kv_dim };
+        let kv_pool = PagedKvPool {
+            layers,
+            num_blocks,
+            block_size,
+            kv_dim,
+        };
 
         let dims = ModelDims {
             dim: model.dim(),
@@ -133,11 +150,14 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             head_dim: model.head_dim(),
         };
         let forward_ws = ForwardWorkspace::<T, D>::new(
-            &device, dims, cap_num_tokens, cap_batch, flash_decode_capacity_f32,
+            &device,
+            dims,
+            cap_num_tokens,
+            cap_batch,
+            flash_decode_capacity_f32,
         )?;
-        let batch_ws = BatchWorkspace::<D>::new(
-            &device, cap_num_tokens, cap_batch, max_blocks_per_seq,
-        )?;
+        let batch_ws =
+            BatchWorkspace::<D>::new(&device, cap_num_tokens, cap_batch, max_blocks_per_seq)?;
 
         Ok(Self {
             model,
@@ -183,14 +203,19 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
 
     /// Eager step (no graphs). Always available on every backend.
     fn step_batch_eager(&mut self, seqs: &[SeqStep]) -> OpResult<Vec<i32>> {
+        self.validate_steps(seqs)?;
+
         // Adapt SeqStep → WsSeqStep (workspace's own type).
-        let ws_seqs: Vec<WsSeqStep> = seqs.iter().map(|s| WsSeqStep {
-            input_ids: s.input_ids.clone(),
-            positions: s.positions.clone(),
-            kv_write_start: s.kv_write_start,
-            kv_len_after: s.kv_len_after,
-            block_table: s.block_table.clone(),
-        }).collect();
+        let ws_seqs: Vec<WsSeqStep> = seqs
+            .iter()
+            .map(|s| WsSeqStep {
+                input_ids: s.input_ids.clone(),
+                positions: s.positions.clone(),
+                kv_write_start: s.kv_write_start,
+                kv_len_after: s.kv_len_after,
+                block_table: s.block_table.clone(),
+            })
+            .collect();
 
         let (input_ids_dev, mut plan) = self.batch_ws.build_plan(&ws_seqs, &self.device)?;
         // Workspace doesn't know the runner's block_size; patch it in.
@@ -262,6 +287,84 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
         result
     }
 
+    fn validate_steps(&self, seqs: &[SeqStep]) -> OpResult<()> {
+        for (i, s) in seqs.iter().enumerate() {
+            if s.input_ids.is_empty() {
+                return Err(OpError::Shape(format!("SeqStep[{}]: empty input_ids", i)));
+            }
+            if s.input_ids.len() != s.positions.len() {
+                return Err(OpError::Shape(format!(
+                    "SeqStep[{}]: input_ids ({}) != positions ({})",
+                    i,
+                    s.input_ids.len(),
+                    s.positions.len(),
+                )));
+            }
+            if s.kv_write_start < 0 || s.kv_len_after < 0 {
+                return Err(OpError::Shape(format!(
+                    "SeqStep[{}]: negative kv range start={} len_after={}",
+                    i, s.kv_write_start, s.kv_len_after,
+                )));
+            }
+
+            let q_len = s.input_ids.len();
+            let kv_write_start = s.kv_write_start as usize;
+            let kv_len_after = s.kv_len_after as usize;
+            let expected_kv_len = kv_write_start
+                .checked_add(q_len)
+                .ok_or_else(|| OpError::Shape(format!("SeqStep[{}]: kv length overflow", i)))?;
+            if kv_len_after != expected_kv_len {
+                return Err(OpError::Shape(format!(
+                    "SeqStep[{}]: kv_len_after ({}) != kv_write_start ({}) + q_len ({})",
+                    i, kv_len_after, kv_write_start, q_len,
+                )));
+            }
+            if kv_len_after > self.max_seq_len {
+                return Err(OpError::Shape(format!(
+                    "SeqStep[{}]: kv_len_after ({}) > max_seq_len ({})",
+                    i, kv_len_after, self.max_seq_len,
+                )));
+            }
+
+            for (j, &pos) in s.positions.iter().enumerate() {
+                if pos < 0 || pos as usize >= self.max_seq_len {
+                    return Err(OpError::Shape(format!(
+                        "SeqStep[{}]: position[{}]={} outside [0,{})",
+                        i, j, pos, self.max_seq_len,
+                    )));
+                }
+            }
+
+            let required_blocks = kv_len_after.div_ceil(self.block_size);
+            if s.block_table.len() < required_blocks {
+                return Err(OpError::Shape(format!(
+                    "SeqStep[{}]: block_table ({}) < required blocks ({}) for kv_len_after {}",
+                    i,
+                    s.block_table.len(),
+                    required_blocks,
+                    kv_len_after,
+                )));
+            }
+            if s.block_table.len() > self.max_blocks_per_seq {
+                return Err(OpError::Shape(format!(
+                    "SeqStep[{}]: block_table ({}) > max_blocks_per_seq ({})",
+                    i,
+                    s.block_table.len(),
+                    self.max_blocks_per_seq,
+                )));
+            }
+            for (j, &block) in s.block_table.iter().enumerate() {
+                if block as usize >= self.kv_pool.num_blocks {
+                    return Err(OpError::Shape(format!(
+                        "SeqStep[{}]: block_table[{}]={} outside KV pool blocks {}",
+                        i, j, block, self.kv_pool.num_blocks,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Convenience: prefill a single prompt then greedily decode up to
     /// `max_new_tokens` new tokens. Stops early on any token in `eos_ids`.
     /// Uses physical blocks `[0, 1, ..., max_blocks_per_seq - 1]`.
@@ -287,10 +390,15 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
             block_table: block_table.clone(),
         };
         if debug {
-            eprintln!("[runner] prefill: num_tokens={} kv_len_after={}", num_prompt, num_prompt);
+            eprintln!(
+                "[runner] prefill: num_tokens={} kv_len_after={}",
+                num_prompt, num_prompt
+            );
         }
         let mut last = self.step_batch(&[prefill_seq])?[0];
-        if debug { eprintln!("[runner] prefill argmax → token {}", last); }
+        if debug {
+            eprintln!("[runner] prefill argmax → token {}", last);
+        }
         generated.push(last);
         if eos_ids.contains(&last) {
             return Ok(generated);
@@ -323,547 +431,13 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D>> ModelRunner<T, D, M> {
     }
 }
 
-// ─── CUDA-only: graph priming + graph-aware step ───────────────────────────
-#[cfg(feature = "cuda")]
-impl<T: Dtype, M: LlmModel<T, Cuda>> ModelRunner<T, Cuda, M> {
-    /// Capture all decode-only graphs in `capture_sizes`.
-    ///
-    /// For each `size` (in reverse — largest first for memory-friendly
-    /// allocator behaviour):
-    ///
-    ///   1. Build a dummy decode-only `WsSeqStep` of `size` sequences,
-    ///      each with `input_ids=[0]`, `positions=[0]`, kv_write_start=0,
-    ///      kv_len_after=1, and a block_table that points entirely at the
-    ///      LAST physical block (used as a graph-only scratch block — its
-    ///      contents are deliberately discarded between captures).
-    ///   2. Run 2 eager warmup forwards to settle cuBLAS/cuDNN algos.
-    ///   3. Capture forward + argmax_batched_decode_into into the graph.
-    ///
-    /// After this returns, `step_batch_with_graph` will route any
-    /// decode-only step with `batch ≤ max_capture_size` through the
-    /// captured graph instead of eager kernels.
-    ///
-    /// **NOTE**: this assumes the LAST physical block (id `num_blocks-1`)
-    /// is reserved by the runner as a graph scratch block — production
-    /// allocations must avoid it.
-    pub fn prime_graphs_cuda(&mut self) -> OpResult<()> {
-        if self.capture_sizes.is_empty() {
-            return Ok(());
-        }
-        // Drop sizes exceeding the batch capacity — those would overflow
-        // `BatchWorkspace::build_plan` during capture.
-        let usable_sizes: Vec<usize> = self
-            .capture_sizes
-            .iter()
-            .copied()
-            .filter(|&s| s <= self.cap_batch)
-            .collect();
-        if usable_sizes.is_empty() {
-            eprintln!(
-                "[graph] cap_batch={} too small for any capture size in {:?}; skipping",
-                self.cap_batch, self.capture_sizes,
-            );
-            return Ok(());
-        }
-        if usable_sizes.len() != self.capture_sizes.len() {
-            eprintln!(
-                "[graph] capping capture sizes to {:?} (cap_batch={})",
-                usable_sizes, self.cap_batch,
-            );
-        }
-        let scratch_block = (self.kv_pool.num_blocks - 1) as u32;
-        let block_table: Vec<u32> = vec![scratch_block; self.max_blocks_per_seq];
-
-        let mut graph_runner = CudaGraphRunner::new(usable_sizes.clone());
-
-        // Build the runner exactly once; wrap in Option so we can `take`
-        // around the closure (needed to satisfy borrow checker — the
-        // closure borrows `self` mutably, so the runner can't sit in
-        // `self.graph_runner` while we're inside.
-
-        // Block_table is the same for all dummy seqs; produce SeqSteps
-        // for the maximum capture size, slice for smaller ones.
-        let max_size = *usable_sizes.last().unwrap();
-        let dummy_steps: Vec<SeqStep> = (0..max_size).map(|_| SeqStep {
-            input_ids: vec![0],
-            positions: vec![0],
-            kv_write_start: 0,
-            kv_len_after: 1,
-            block_table: block_table.clone(),
-        }).collect();
-
-        // The capture loop needs `&CudaConfig`. The runner's stream lives
-        // inside `Arc<CudaConfig>`, so a cheap clone gives us a handle
-        // independent of `self` and avoids aliasing during the closure.
-        let cuda_config = self.device.config.clone();
-
-        graph_runner.warmup_and_capture_all(
-            &*cuda_config,
-            2,
-            |size, is_capture| {
-                if is_capture {
-                    // Capture pass: forward + argmax ONLY (no H2D memcpy).
-                    // Device buffers already hold valid data from warmup.
-                    self.run_decode_forward_only(size)
-                } else {
-                    // Warmup pass: full path including H2D upload.
-                    self.run_decode_only_step(&dummy_steps[..size])
-                }
-            },
-        )?;
-
-        self.graph_runner = Some(graph_runner);
-        Ok(())
-    }
-
-    /// Run a single decode-only forward into `forward_ws.argmax_out_dev`.
-    /// Includes build_plan (H2D upload). Used for warmup passes and eager fallback.
-    fn run_decode_only_step(&mut self, seqs: &[SeqStep]) -> OpResult<()> {
-        let ws_seqs: Vec<WsSeqStep> = seqs.iter().map(|s| WsSeqStep {
-            input_ids: s.input_ids.clone(),
-            positions: s.positions.clone(),
-            kv_write_start: s.kv_write_start,
-            kv_len_after: s.kv_len_after,
-            block_table: s.block_table.clone(),
-        }).collect();
-
-        let (input_ids_dev, mut plan) = self.batch_ws.build_plan(&ws_seqs, &self.device)?;
-        plan.block_size = self.block_size;
-
-        let logits = {
-            let mut ctx = ForwardContext {
-                kv_pool: &mut self.kv_pool,
-                plan: &plan,
-                workspace: &mut self.forward_ws,
-            };
-            self.model.forward(&input_ids_dev, &mut ctx)?
-        };
-        // Decode-only: logits is [batch, vocab]. Use the graph-friendly
-        // argmax (zero alloc, zero D2H, writes into forward_ws.argmax_out_dev).
-        let (out_dev, workspace, _rows) = self.forward_ws.argmax_args();
-        argmax_batched_decode_into(&logits, out_dev, workspace)
-    }
-
-    /// Forward + argmax ONLY — no H2D upload.
-    ///
-    /// Used during CUDA Graph capture: device buffers already hold valid
-    /// data from the preceding warmup pass. By skipping `build_plan`'s
-    /// `upload_async` calls, we keep cudaMemcpyAsync operations OUT of
-    /// the captured graph. The graph will contain only kernel launches.
-    fn run_decode_forward_only(&mut self, batch_size: usize) -> OpResult<()> {
-        let (input_ids_dev, mut plan) =
-            self.batch_ws.get_last_plan_views(batch_size, self.block_size)?;
-        plan.block_size = self.block_size;
-
-        let logits = {
-            let mut ctx = ForwardContext {
-                kv_pool: &mut self.kv_pool,
-                plan: &plan,
-                workspace: &mut self.forward_ws,
-            };
-            self.model.forward(&input_ids_dev, &mut ctx)?
-        };
-        let (out_dev, workspace, _rows) = self.forward_ws.argmax_args();
-        argmax_batched_decode_into(&logits, out_dev, workspace)
-    }
-
-    /// Decode-only graph-aware step.
-    ///
-    /// - If every seq has q_len=1 AND batch ≤ max_capture_size AND graphs
-    ///   are primed: pad up to the next captured size (extra rows point at
-    ///   the scratch block + position 0), launch the graph, D2H-read the
-    ///   first `batch` argmax outputs, return.
-    /// - Otherwise: fall back to `step_batch_eager` (which does its own
-    ///   D2H-sync inside `argmax_batched`).
-    pub fn step_batch_with_graph(&mut self, seqs: &[SeqStep]) -> OpResult<Vec<i32>> {
-        if seqs.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Escape hatch for A/B benchmarking against eager.
-        if std::env::var("RUSTINFER_DISABLE_GRAPH").is_ok() {
-            return self.step_batch_eager(seqs);
-        }
-        let all_decode = seqs.iter().all(|s| s.input_ids.len() == 1);
-        let batch = seqs.len();
-        let primed = self.graph_runner.is_some();
-        let max_cap = self.graph_runner.as_ref().map(|g| g.max_capture_size()).unwrap_or(0);
-
-        if !primed || !all_decode || batch > max_cap {
-            return self.step_batch_eager(seqs);
-        }
-
-        // Pick the next captured size ≥ batch.
-        let decision = self.graph_runner.as_ref().unwrap().decide(batch);
-        let (slot, padded_size) = match decision {
-            GraphDecision::Replay { slot, padded_size, .. } => (slot, padded_size),
-            GraphDecision::Eager => return self.step_batch_eager(seqs),
-        };
-
-        // Pad up to padded_size with scratch-block dummy seqs.
-        let scratch_block = (self.kv_pool.num_blocks - 1) as u32;
-        let pad_block_table: Vec<u32> = vec![scratch_block; self.max_blocks_per_seq];
-        let mut padded: Vec<SeqStep> = seqs.to_vec();
-        for _ in batch..padded_size {
-            padded.push(SeqStep {
-                input_ids: vec![0],
-                positions: vec![0],
-                kv_write_start: 0,
-                kv_len_after: 1,
-                block_table: pad_block_table.clone(),
-            });
-        }
-
-        // 1. Async-upload the (padded) plan into batch_ws.
-        let ws_seqs: Vec<WsSeqStep> = padded.iter().map(|s| WsSeqStep {
-            input_ids: s.input_ids.clone(),
-            positions: s.positions.clone(),
-            kv_write_start: s.kv_write_start,
-            kv_len_after: s.kv_len_after,
-            block_table: s.block_table.clone(),
-        }).collect();
-        let _ = self.batch_ws.build_plan(&ws_seqs, &self.device)?;
-
-        // 2. Launch the captured graph.
-        if std::env::var("RUSTINFER_TRACE_GRAPH").is_ok() {
-            eprintln!("[graph] replay slot={:?} batch={}->{}", slot, batch, padded_size);
-        }
-
-        // Profiling: enable with RUSTINFER_PROFILE_GPU=1. We wrap the
-        // graph launch with a cudaEvent pair to measure pure GPU time.
-        // The wall-clock around the whole step_batch_with_graph call is
-        // measured outside the launch (build_plan + D2H included).
-        let prof = std::env::var("RUSTINFER_PROFILE_GPU").is_ok();
-        let wall_t0 = std::time::Instant::now();
-        let mut ev_t0: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
-        let mut ev_t1: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
-        if prof {
-            unsafe {
-                let r0 = crate::infrastructure::cuda::ffi::cudaEventCreate(&mut ev_t0);
-                let r1 = crate::infrastructure::cuda::ffi::cudaEventCreate(&mut ev_t1);
-                if r0 != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess
-                    || r1 != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess
-                {
-                    tracing::debug!("cudaEventCreate failed — skipping graph profiling");
-                    ev_t0 = std::ptr::null_mut();
-                    ev_t1 = std::ptr::null_mut();
-                } else {
-                    crate::infrastructure::cuda::ffi::cudaEventRecord(
-                        ev_t0,
-                        self.device.config.stream,
-                    );
-                }
-            }
-        }
-        self.device.config.launch(slot)?;
-        let prof_ok = prof && !ev_t0.is_null() && !ev_t1.is_null();
-        if prof_ok {
-            unsafe {
-                crate::infrastructure::cuda::ffi::cudaEventRecord(ev_t1, self.device.config.stream);
-            }
-        }
-
-        // 3. Synchronous D2H of the argmax_out_dev (just `padded_size` ints).
-        // We only return the first `batch` of them.
-        let host = self.forward_ws.argmax_out_dev().to_host_vec()?;
-
-        if prof_ok {
-            unsafe {
-                crate::infrastructure::cuda::ffi::cudaEventSynchronize(ev_t1);
-                let mut ms: f32 = 0.0;
-                crate::infrastructure::cuda::ffi::cudaEventElapsedTime(&mut ms, ev_t0, ev_t1);
-                self.prof_graph_gpu_ns += (ms as f64 * 1.0e6) as u64;
-                crate::infrastructure::cuda::ffi::cudaEventDestroy(ev_t0);
-                crate::infrastructure::cuda::ffi::cudaEventDestroy(ev_t1);
-            }
-            self.prof_step_wall_ns += wall_t0.elapsed().as_nanos() as u64;
-            self.prof_step_count += 1;
-        }
-        Ok(host.into_iter().take(batch).collect())
-    }
-
-    /// Same shape as `generate`, but routes decode steps through
-    /// `step_batch_with_graph` so primed CUDA graphs are used.
-    ///
-    /// Prefill (multi-token) always goes through eager — it's never
-    /// decode-only by definition.
-    pub fn generate_with_graph(
-        &mut self,
-        prompt_ids: &[i32],
-        max_new_tokens: usize,
-        eos_ids: &[i32],
-    ) -> OpResult<Vec<i32>> {
-        let debug = std::env::var("RUSTINFER_DEBUG_LAYERS").is_ok();
-        let mut generated = Vec::with_capacity(max_new_tokens);
-        let num_prompt = prompt_ids.len();
-        if num_prompt == 0 {
-            return Err(OpError::Shape("empty prompt".into()));
-        }
-        let block_table: Vec<u32> = (0..self.max_blocks_per_seq as u32).collect();
-
-        let prefill_seq = SeqStep {
-            input_ids: prompt_ids.to_vec(),
-            positions: (0..num_prompt as i32).collect(),
-            kv_write_start: 0,
-            kv_len_after: num_prompt as i32,
-            block_table: block_table.clone(),
-        };
-        // Prefill is multi-token → eager.
-        let mut last = self.step_batch_eager(&[prefill_seq])?[0];
-        if debug { eprintln!("[runner] prefill argmax → token {}", last); }
-        generated.push(last);
-        if eos_ids.contains(&last) {
-            return Ok(generated);
-        }
-
-        for i in 0..max_new_tokens.saturating_sub(1) {
-            let kv_write_start = (num_prompt + i) as i32;
-            let kv_len_after = (num_prompt + i + 1) as i32;
-            let step = SeqStep {
-                input_ids: vec![last],
-                positions: vec![kv_write_start],
-                kv_write_start,
-                kv_len_after,
-                block_table: block_table.clone(),
-            };
-            // Decode → graph (auto-falls-back to eager if not primed).
-            let new = self.step_batch_with_graph(&[step])?[0];
-            if debug {
-                eprintln!(
-                    "[runner] graph-decode {:>2}: in={:>6} pos={} kv_len={} → token {}",
-                    i, last, kv_write_start, kv_len_after, new,
-                );
-            }
-            last = new;
-            generated.push(last);
-            if eos_ids.contains(&last) {
-                break;
-            }
-        }
-        Ok(generated)
-    }
-
-    /// Bubble-free pipelined greedy decode for a single sequence.
-    ///
-    /// This is the integration of the `gather_merge_input` kernel + the
-    /// copy-in/copy-out streams + ordering events. It removes the per-step
-    /// token round-trip (`C` D2H → host → `A` H2D) that the eager loop
-    /// incurs: instead the previous step's on-device argmax (`C`) is folded
-    /// directly into the next step's `input_ids` (`A`) by the merge kernel,
-    /// entirely on-device, and the host-visible token is downloaded on a
-    /// side stream (`So`) that overlaps the next forward.
-    ///
-    /// Per-step chain (all decode steps after prefill):
-    /// ```text
-    ///   compute:  [wait ev_out] merge(A←C) → forward(A→…→C) → argmax(C) → record ev_a
-    ///   So:       [wait ev_a]   D2H(C→host) → record ev_out
-    /// ```
-    /// `src = [0]` (identity) selects "row 0 of C", so the merge copies the
-    /// previous token into A[0]. `B`/`Si` are unused for single-seq greedy
-    /// (no newly-admitted seqs mid-stream) but the plumbing matches the
-    /// general batched design.
-    ///
-    /// Requires primed graphs (falls back to `generate_with_graph` if not).
-    /// Positions for greedy decode are deterministic, so the dynamic decode
-    /// fields are staged on the copy-in stream ahead of each forward.
-    pub fn generate_pipelined(
-        &mut self,
-        prompt_ids: &[i32],
-        max_new_tokens: usize,
-        eos_ids: &[i32],
-    ) -> OpResult<Vec<i32>> {
-        // Without primed graphs the merge/stream chain has no captured
-        // forward to drive — defer to the graph-aware eager loop.
-        if self.graph_runner.is_none() {
-            return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
-        }
-        let num_prompt = prompt_ids.len();
-        if num_prompt == 0 {
-            return Err(OpError::Shape("empty prompt".into()));
-        }
-        // Decode is single-seq batch=1; bail to eager if no batch=1 graph.
-        let max_cap = self.graph_runner.as_ref().unwrap().max_capture_size();
-        if max_cap < 1 {
-            return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
-        }
-        let debug = std::env::var("RUSTINFER_DEBUG_LAYERS").is_ok();
-        let mut generated = Vec::with_capacity(max_new_tokens);
-        let block_table: Vec<u32> = (0..self.max_blocks_per_seq as u32).collect();
-
-        // 1. Prefill (eager, multi-token). Returns the first decode token.
-        let prefill_seq = SeqStep {
-            input_ids: prompt_ids.to_vec(),
-            positions: (0..num_prompt as i32).collect(),
-            kv_write_start: 0,
-            kv_len_after: num_prompt as i32,
-            block_table: block_table.clone(),
-        };
-        let mut last = self.step_batch_eager(&[prefill_seq])?[0];
-        if debug { eprintln!("[pipe] prefill argmax → token {}", last); }
-        generated.push(last);
-        if eos_ids.contains(&last) {
-            return Ok(generated);
-        }
-
-        // The prefill's eager `argmax_batched` does NOT write
-        // `forward_ws.argmax_out_dev` (C). Seed C with the first decode
-        // token so the first merge has a valid source. One-shot blocking H2D.
-        {
-            let c = self.forward_ws.argmax_out_dev_mut();
-            // SAFETY: c is a device i32 buffer of len ≥ 1; we write one int.
-            unsafe {
-                let code = crate::infrastructure::cuda::ffi::cudaMemcpy(
-                    c.data_ptr_mut() as *mut std::ffi::c_void,
-                    &last as *const i32 as *const std::ffi::c_void,
-                    std::mem::size_of::<i32>(),
-                    crate::infrastructure::cuda::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                );
-                if code != crate::infrastructure::cuda::ffi::cudaError_cudaSuccess {
-                    return Err(OpError::Kernel(format!("seed C failed: {:?}", code)));
-                }
-            }
-        }
-
-        // src = [0] (identity): A[0] ← C[0].
-        self.forward_ws.src_map_host_mut()[0] = 0;
-        let cfg = self.device.config.clone();
-
-        // The forward graph for batch=1.
-        let slot = match self.graph_runner.as_ref().unwrap().captured_slot_for(1) {
-            Some(s) => s,
-            None => {
-                // No exact batch=1 graph (capture_sizes didn't include 1).
-                return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
-            }
-        };
-
-        // Reusable host slot for the C download (one i32).
-        let mut host_tok: i32 = last;
-
-        for i in 0..max_new_tokens.saturating_sub(1) {
-            let kv_write_start = (num_prompt + i) as i32;
-            let kv_len_after = (num_prompt + i + 1) as i32;
-
-            // Stage the per-step dynamic decode fields. Positions are
-            // token-independent, so this can run ahead of the forward.
-            self.batch_ws.stage_decode_dynamic(
-                &[kv_write_start],   // rope position
-                &[kv_len_after],     // kv_len after this step
-                &[kv_write_start],   // kv_write_start (seq_positions)
-            )?;
-
-            if i == 0 {
-                // First step: full build_plan populates block_tables +
-                // cu_q_lens + seq_lens_step at the stable device addresses
-                // the graph captured against (async H2D, no token dep).
-                let ws_seq = vec![WsSeqStep {
-                    input_ids: vec![last],
-                    positions: vec![kv_write_start],
-                    kv_write_start,
-                    kv_len_after,
-                    block_table: block_table.clone(),
-                }];
-                let _ = self.batch_ws.build_plan(&ws_seq, &self.device)?;
-                // Upload the identity src selector once (B unused) on Si.
-                unsafe {
-                    cfg.upload_h2d_copy_in(
-                        self.forward_ws.src_map_dev().data_ptr() as *mut std::ffi::c_void,
-                        self.forward_ws.src_map_host_mut().as_ptr() as *const std::ffi::c_void,
-                        std::mem::size_of::<i32>(),
-                    )?;
-                }
-            } else {
-                // Subsequent steps: only the dynamic [batch] fields change.
-                // Upload them on Si (positions / kv_lens / seq_positions).
-                let one = std::mem::size_of::<i32>();
-                unsafe {
-                    cfg.upload_h2d_copy_in(
-                        self.batch_ws.rope_positions_dev().data_ptr() as *mut std::ffi::c_void,
-                        self.batch_ws.h_rope_positions().as_ptr() as *const std::ffi::c_void,
-                        one,
-                    )?;
-                    cfg.upload_h2d_copy_in(
-                        self.batch_ws.kv_lens_dev().data_ptr() as *mut std::ffi::c_void,
-                        self.batch_ws.h_kv_lens().as_ptr() as *const std::ffi::c_void,
-                        one,
-                    )?;
-                    cfg.upload_h2d_copy_in(
-                        self.batch_ws.seq_positions_dev().data_ptr() as *mut std::ffi::c_void,
-                        self.batch_ws.h_seq_positions().as_ptr() as *const std::ffi::c_void,
-                        one,
-                    )?;
-                }
-            }
-            // Record ev_in once the upload(s) are enqueued on Si.
-            cfg.record_copy_in()?;
-
-            // ── Compute stream chain ────────────────────────────────────
-            // WAR guard: don't overwrite C until the previous step's C
-            // download finished. No-op on first step (ev_out unrecorded).
-            if i > 0 {
-                cfg.compute_wait_copy_out()?;
-            }
-            // Wait for the upload on Si before the merge reads src/B and
-            // the forward reads the dynamic fields.
-            cfg.compute_wait_copy_in()?;
-
-            // merge: A ← C (per src). A = batch_ws.input_ids, C = argmax_out_dev.
-            {
-                let c = self.forward_ws.argmax_out_dev();
-                let b = self.forward_ws.new_token_dev();
-                let src = self.forward_ws.src_map_dev();
-                let mut a = self.batch_ws.input_ids_dev().view_raw(
-                    Shape::from_slice(&[1]),
-                    Shape::from_slice(&[1]).contiguous_strides(),
-                    0, true,
-                );
-                gather_merge_input_into(&mut a, c, b, src, 1, cfg.stream)?;
-            }
-
-            // forward + argmax (captured graph). Reads A + dynamic fields,
-            // writes C (argmax_out_dev).
-            cfg.launch(slot)?;
-
-            // Record ev_a: forward+argmax done, C is valid.
-            cfg.record_compute_a()?;
-
-            // ── Copy-out stream chain (overlaps next iteration) ─────────
-            cfg.copy_out_wait_compute_a()?;
-            unsafe {
-                cfg.download_d2h_copy_out(
-                    &mut host_tok as *mut i32 as *mut std::ffi::c_void,
-                    self.forward_ws.argmax_out_dev().data_ptr() as *const std::ffi::c_void,
-                    std::mem::size_of::<i32>(),
-                )?;
-            }
-            cfg.record_copy_out()?;
-
-            // Read host_tok before using it for eos: sync So only.
-            cfg.synchronize_copy_out()?;
-            last = host_tok;
-            if debug {
-                eprintln!(
-                    "[pipe] decode {:>2}: pos={} kv_len={} → token {}",
-                    i, kv_write_start, kv_len_after, last,
-                );
-            }
-            generated.push(last);
-            if eos_ids.contains(&last) {
-                break;
-            }
-        }
-        // Drain all streams before returning.
-        cfg.synchronize()?;
-        Ok(generated)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::Tensor;
     use crate::infrastructure::cpu::Cpu;
-    use crate::models::layers::{Linear, RMSNorm, Embedding};
-    use crate::models::llama3::{Llama3Model, Llama3Layer};
+    use crate::models::layers::{Embedding, Linear, RMSNorm};
+    use crate::models::llama3::{Llama3Layer, Llama3Model};
 
     fn tiny_llama3() -> Llama3Model<f32, Cpu> {
         let dim = 16;
@@ -877,10 +451,10 @@ mod tests {
         let qkv_dim = q_dim + 2 * kv_dim;
         let max_seq = 32;
 
-        
-
         let make_weight = |rows: usize, cols: usize| -> Tensor<f32, Cpu> {
-            let data: Vec<f32> = (0..rows * cols).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
+            let data: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.01)
+                .collect();
             Tensor::<f32, Cpu>::from_slice(&data, [rows, cols])
         };
         let make_norm = |dim: usize| -> Tensor<f32, Cpu> {
@@ -903,7 +477,9 @@ mod tests {
         };
 
         Llama3Model {
-            embed_tokens: Embedding { table: make_weight(vocab, dim) },
+            embed_tokens: Embedding {
+                table: make_weight(vocab, dim),
+            },
             layers: vec![layer],
             norm: RMSNorm::new(make_norm(dim), 1e-5),
             lm_head: Linear::new(make_weight(vocab, dim), None),
@@ -930,6 +506,26 @@ mod tests {
         for &t in &tokens {
             assert!(t >= 0 && t < 64, "token {} out of vocab range", t);
         }
+    }
+
+    #[test]
+    fn rejects_invalid_step_before_forward() {
+        let model = tiny_llama3();
+        let mut runner = ModelRunner::new(model, Cpu, 4, 4, 4, 16, 4, 1, 1, vec![]).unwrap();
+        let err = runner
+            .step_batch(&[SeqStep {
+                input_ids: vec![1, 2],
+                positions: vec![0, 1],
+                kv_write_start: 0,
+                kv_len_after: 3,
+                block_table: vec![0],
+            }])
+            .unwrap_err();
+        assert!(
+            matches!(err, OpError::Shape(ref msg) if msg.contains("kv_len_after")),
+            "unexpected error: {:?}",
+            err
+        );
     }
 
     /// Ragged batch (CPU naive): 2 sequences, different prompt lengths,
@@ -969,16 +565,24 @@ mod tests {
 
         // Reference: serial per-prompt runners, each with its own pool.
         let model_ref0 = tiny_llama3();
-        let mut runner_ref0 = ModelRunner::new(model_ref0, Cpu, 4, 4, 4, 16, 8, 1, 1, vec![]).unwrap();
+        let mut runner_ref0 =
+            ModelRunner::new(model_ref0, Cpu, 4, 4, 4, 16, 8, 1, 1, vec![]).unwrap();
         let r0 = runner_ref0.generate(&p0, 1, &[]).unwrap();
 
         let model_ref1 = tiny_llama3();
-        let mut runner_ref1 = ModelRunner::new(model_ref1, Cpu, 4, 4, 4, 16, 8, 1, 1, vec![]).unwrap();
+        let mut runner_ref1 =
+            ModelRunner::new(model_ref1, Cpu, 4, 4, 4, 16, 8, 1, 1, vec![]).unwrap();
         let r1 = runner_ref1.generate(&p1, 1, &[]).unwrap();
 
-        assert_eq!(batched_first[0], r0[0],
-            "ragged batch seq 0 first-token mismatch: batch={} serial={}", batched_first[0], r0[0]);
-        assert_eq!(batched_first[1], r1[0],
-            "ragged batch seq 1 first-token mismatch: batch={} serial={}", batched_first[1], r1[0]);
+        assert_eq!(
+            batched_first[0], r0[0],
+            "ragged batch seq 0 first-token mismatch: batch={} serial={}",
+            batched_first[0], r0[0]
+        );
+        assert_eq!(
+            batched_first[1], r1[0],
+            "ragged batch seq 1 first-token mismatch: batch={} serial={}",
+            batched_first[1], r1[0]
+        );
     }
 }

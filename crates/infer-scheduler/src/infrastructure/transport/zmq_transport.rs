@@ -6,8 +6,8 @@ use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
 use infer_protocol::server_to_scheduler::ServerCommand;
 use tokio::sync::mpsc;
 
-use crate::error::{Result, SchedulerError, TransportError};
 use crate::domain::inference_session::handle::ClientId;
+use crate::error::{Result, SchedulerError, TransportError};
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
@@ -146,7 +146,10 @@ impl ZmqFrontendTransport {
                         }
                     }
                     Err(zmq::Error::EAGAIN) => break,
-                    Err(e) => { tracing::error!("ZMQ recv: {:?}", e); break; }
+                    Err(e) => {
+                        tracing::error!("ZMQ recv: {:?}", e);
+                        break;
+                    }
                 }
             }
 
@@ -154,7 +157,10 @@ impl ZmqFrontendTransport {
             while wakeup_rx.recv_bytes(zmq::DONTWAIT).is_ok() {}
             while let Ok(msg) = msg_rx.try_recv() {
                 match msg {
-                    OutgoingResponse::Full { client_id, response } => {
+                    OutgoingResponse::Full {
+                        client_id,
+                        response,
+                    } => {
                         if let Ok(data) = codec.encode(&response) {
                             let _ = socket.send(client_id.as_bytes(), zmq::SNDMORE);
                             let _ = socket.send(&b""[..], zmq::SNDMORE);
@@ -322,7 +328,10 @@ impl ZmqWorkerTransport {
                         }
                     }
                     Err(zmq::Error::EAGAIN) => break,
-                    Err(e) => { tracing::error!("ZMQ PULL: {:?}", e); break; }
+                    Err(e) => {
+                        tracing::error!("ZMQ PULL: {:?}", e);
+                        break;
+                    }
                 }
             }
         }

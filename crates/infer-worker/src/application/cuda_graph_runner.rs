@@ -31,10 +31,10 @@
 //! CudaGraphRunner lives in the **app** layer (execution orchestration).
 //! It borrows infra (CudaConfig for capture/replay) and domain (model forward).
 
+use crate::domain::model::{ForwardContext, LlmForwardWorkspace, LlmModel};
 use crate::domain::ports::{OpBackend, OpResult};
-use crate::domain::types::Dtype;
 use crate::domain::tensor::Tensor;
-use crate::domain::model::{LlmModel, ForwardContext};
+use crate::domain::types::Dtype;
 
 #[cfg(feature = "cuda")]
 use crate::infrastructure::cuda::{Cuda, CudaConfig, config::GraphSlot};
@@ -75,16 +75,26 @@ impl CudaGraphRunner {
         );
         let max_capture_size = *capture_sizes.last().unwrap();
         let states = capture_sizes.iter().map(|_| SlotState::Cold).collect();
-        Self { capture_sizes, states, max_capture_size }
+        Self {
+            capture_sizes,
+            states,
+            max_capture_size,
+        }
     }
 
     /// Phase 1: Warmup — run each capture size in eager mode to initialize
     /// lazy parameters (cuBLAS algorithm selection, workspace, etc.).
-    pub fn warmup<T: Dtype, D: OpBackend, M: LlmModel<T, D>>(
+    pub fn warmup<T, D, M, W>(
         &mut self,
         model: &M,
-        make_dummy_inputs: &dyn Fn(usize) -> (Tensor<i32, D>, ForwardContext<'static, T, D>),
-    ) -> OpResult<()> {
+        make_dummy_inputs: &dyn Fn(usize) -> (Tensor<i32, D>, ForwardContext<'static, T, D, W>),
+    ) -> OpResult<()>
+    where
+        T: Dtype,
+        D: OpBackend,
+        W: LlmForwardWorkspace<T, D> + 'static,
+        M: LlmModel<T, D, W>,
+    {
         for (i, &size) in self.capture_sizes.iter().enumerate() {
             // Run forward with dummy data (eager, no graph capture)
             let (input_ids, mut ctx) = make_dummy_inputs(size);
@@ -95,12 +105,20 @@ impl CudaGraphRunner {
     }
 
     /// Phase 2: Capture — for each warmed-up size, capture into a CUDA graph.
-    pub fn capture<T: Dtype, M: LlmModel<T, Cuda>>(
+    pub fn capture<T, M, W>(
         &mut self,
         model: &M,
         config: &CudaConfig,
-        make_dummy_inputs: &dyn Fn(usize) -> (Tensor<i32, Cuda>, ForwardContext<'static, T, Cuda>),
-    ) -> OpResult<()> {
+        make_dummy_inputs: &dyn Fn(
+            usize,
+        )
+            -> (Tensor<i32, Cuda>, ForwardContext<'static, T, Cuda, W>),
+    ) -> OpResult<()>
+    where
+        T: Dtype,
+        W: LlmForwardWorkspace<T, Cuda> + 'static,
+        M: LlmModel<T, Cuda, W>,
+    {
         for (i, &size) in self.capture_sizes.iter().enumerate() {
             match self.states[i] {
                 SlotState::Warm => {}
@@ -175,7 +193,9 @@ impl CudaGraphRunner {
 
     /// Check if all sizes are captured and ready.
     pub fn is_fully_ready(&self) -> bool {
-        self.states.iter().all(|s| matches!(s, SlotState::Captured { .. }))
+        self.states
+            .iter()
+            .all(|s| matches!(s, SlotState::Captured { .. }))
     }
 
     /// Get the list of capture sizes.
@@ -191,12 +211,13 @@ impl CudaGraphRunner {
     /// Lookup the captured slot for a specific size, if any. Used by the
     /// runner to know whether `replay()` can be issued.
     pub fn captured_slot_for(&self, size: usize) -> Option<GraphSlot> {
-        self.capture_sizes.iter().position(|&s| s == size).and_then(|i| {
-            match self.states[i] {
+        self.capture_sizes
+            .iter()
+            .position(|&s| s == size)
+            .and_then(|i| match self.states[i] {
                 SlotState::Captured { slot } => Some(slot),
                 _ => None,
-            }
-        })
+            })
     }
 
     /// Reverse-order warmup + capture sweep.
@@ -225,7 +246,9 @@ impl CudaGraphRunner {
         // Iterate sizes in REVERSE order (largest first) for memory-friendly
         // capture: cuBLASLt/cuDNN allocate more workspace for bigger sizes,
         // and we'd rather see those allocations before smaller-size graphs.
-        let order: Vec<(usize, usize)> = self.capture_sizes.iter()
+        let order: Vec<(usize, usize)> = self
+            .capture_sizes
+            .iter()
             .enumerate()
             .map(|(i, &s)| (i, s))
             .rev()
@@ -256,7 +279,10 @@ impl CudaGraphRunner {
                 // Best-effort: end capture into a throwaway graph and drop.
                 let mut graph: crate::infrastructure::cuda::ffi::cudaGraph_t = std::ptr::null_mut();
                 unsafe {
-                    let _ = crate::infrastructure::cuda::ffi::cudaStreamEndCapture(config.stream, &mut graph);
+                    let _ = crate::infrastructure::cuda::ffi::cudaStreamEndCapture(
+                        config.stream,
+                        &mut graph,
+                    );
                     if !graph.is_null() {
                         crate::infrastructure::cuda::ffi::cudaGraphDestroy(graph);
                     }
@@ -315,13 +341,21 @@ mod tests {
         // Simulate all captured
         for (i, &size) in runner.capture_sizes.clone().iter().enumerate() {
             runner.states[i] = SlotState::Captured {
-                slot: GraphSlot::LlmDecode { batch: size, buffer_id: 0, slot_signature: size as u64 },
+                slot: GraphSlot::LlmDecode {
+                    batch: size,
+                    buffer_id: 0,
+                    slot_signature: size as u64,
+                },
             };
         }
 
         // Exact match
         match runner.decide(4) {
-            GraphDecision::Replay { padded_size, original_size, .. } => {
+            GraphDecision::Replay {
+                padded_size,
+                original_size,
+                ..
+            } => {
                 assert_eq!(padded_size, 4);
                 assert_eq!(original_size, 4);
             }
@@ -330,7 +364,11 @@ mod tests {
 
         // Needs padding: 5 → next is 8
         match runner.decide(5) {
-            GraphDecision::Replay { padded_size, original_size, .. } => {
+            GraphDecision::Replay {
+                padded_size,
+                original_size,
+                ..
+            } => {
                 assert_eq!(padded_size, 8);
                 assert_eq!(original_size, 5);
             }
@@ -350,14 +388,22 @@ mod tests {
     #[test]
     fn needs_padding() {
         let d = GraphDecision::Replay {
-            slot: GraphSlot::LlmDecode { batch: 8, buffer_id: 0, slot_signature: 8 },
+            slot: GraphSlot::LlmDecode {
+                batch: 8,
+                buffer_id: 0,
+                slot_signature: 8,
+            },
             padded_size: 8,
             original_size: 5,
         };
         assert!(d.needs_padding());
 
         let d2 = GraphDecision::Replay {
-            slot: GraphSlot::LlmDecode { batch: 4, buffer_id: 0, slot_signature: 4 },
+            slot: GraphSlot::LlmDecode {
+                batch: 4,
+                buffer_id: 0,
+                slot_signature: 4,
+            },
             padded_size: 4,
             original_size: 4,
         };

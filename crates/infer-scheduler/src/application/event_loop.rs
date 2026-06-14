@@ -37,7 +37,10 @@ pub async fn run_event_loop(
                     engine.run_iteration().await?;
                 }
             }
-            SchedulerEvent::Cancel { external_id, reason: _ } => {
+            SchedulerEvent::Cancel {
+                external_id,
+                reason: _,
+            } => {
                 engine.cancel_request_by_external_id(&external_id).await?;
                 if engine.can_schedule() {
                     engine.run_iteration().await?;
@@ -55,6 +58,7 @@ pub async fn run_event_loop(
             }
             SchedulerEvent::FrontendShutdown => {
                 tracing::info!("Frontend transport closed, shutting down");
+                engine.shutdown_worker_best_effort();
                 return Ok(());
             }
             SchedulerEvent::WorkerShutdown => {

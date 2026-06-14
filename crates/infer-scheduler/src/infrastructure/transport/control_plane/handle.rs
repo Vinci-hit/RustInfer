@@ -86,10 +86,7 @@ pub enum ControlEvent {
 
     /// Liveness watchdog tripped. Worker is considered gone; the registry
     /// has already been updated to refuse subsequent unicasts.
-    WorkerLost {
-        worker: WorkerId,
-        last_seen_ms: u64,
-    },
+    WorkerLost { worker: WorkerId, last_seen_ms: u64 },
 
     /// Out-of-band fatal error reported by the worker itself.
     WorkerError {
@@ -102,10 +99,7 @@ pub enum ControlEvent {
     /// the relief level (0 = LRU evict, 1 = victim preempt). Sent only
     /// when `kv_allocator.alloc_indices()` actually fails on the
     /// worker — never on a periodic schedule.
-    AllocFailed {
-        worker: WorkerId,
-        req: AllocFailed,
-    },
+    AllocFailed { worker: WorkerId, req: AllocFailed },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,11 +196,7 @@ pub struct ControlPlaneCmdTx {
 
 impl ControlPlaneCmdTx {
     /// Fire-and-forget message to one worker.
-    pub fn send_to(
-        &self,
-        worker: &WorkerId,
-        msg: SchedulerControlMessage,
-    ) -> ControlResult<()> {
+    pub fn send_to(&self, worker: &WorkerId, msg: SchedulerControlMessage) -> ControlResult<()> {
         let env = ControlEnvelope::oneway(msg);
         self.tx
             .send(RouterCommand::SendTo {

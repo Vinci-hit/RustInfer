@@ -3,8 +3,8 @@
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype};
-use crate::infrastructure::cuda::ffi::cudaStream_t;
 use crate::infrastructure::cuda::Cuda;
+use crate::infrastructure::cuda::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn qkv_norm_rope_scatter_bf16(
@@ -64,15 +64,24 @@ pub fn qkv_norm_rope_scatter<T: Dtype>(
     kv_dim: usize,
 ) -> OpResult<()> {
     let Some(q_weight) = q_weight else {
-        return Err(OpError::Kernel("qkv_norm_rope_scatter: missing q_norm weight".into()));
+        return Err(OpError::Kernel(
+            "qkv_norm_rope_scatter: missing q_norm weight".into(),
+        ));
     };
     let Some(k_weight) = k_weight else {
-        return Err(OpError::Kernel("qkv_norm_rope_scatter: missing k_norm weight".into()));
+        return Err(OpError::Kernel(
+            "qkv_norm_rope_scatter: missing k_norm weight".into(),
+        ));
     };
     let batch = seq_positions.shape().as_slice()[0];
-    if batch == 0 || positions.numel() == 0 { return Ok(()); }
+    if batch == 0 || positions.numel() == 0 {
+        return Ok(());
+    }
     if T::DATA_TYPE != DataType::BF16 {
-        return Err(OpError::Kernel(format!("qkv_norm_rope_scatter: unsupported dtype {:?}", T::DATA_TYPE)));
+        return Err(OpError::Kernel(format!(
+            "qkv_norm_rope_scatter: unsupported dtype {:?}",
+            T::DATA_TYPE
+        )));
     }
 
     let q_row_stride = q.strides().as_slice()[0] as i64;

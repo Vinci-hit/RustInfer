@@ -8,7 +8,9 @@
 use infer_protocol::scheduler_to_server::{
     ChunkType, ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
 };
-use infer_protocol::worker_to_scheduler_data::{DiffusionBatchOutput, DiffusionOutputStatus, StepOutput};
+use infer_protocol::worker_to_scheduler_data::{
+    DiffusionBatchOutput, DiffusionOutputStatus, StepOutput,
+};
 
 use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::{Decoding, InferenceSession, Prefilling};
@@ -74,7 +76,15 @@ pub async fn fail_prefilling_session(
     let external_id = seq.meta.external_id.clone();
     let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
     let stream = seq.meta.stream;
-    send_request_error(frontend, client_id, external_id, stream, message.to_string(), 0).await
+    send_request_error(
+        frontend,
+        client_id,
+        external_id,
+        stream,
+        message.to_string(),
+        0,
+    )
+    .await
 }
 
 /// Fail a session caught in `Decoding`.
@@ -179,32 +189,20 @@ pub fn feed_radix_assigned_indices(
         return;
     }
 
-    let mut by_seq: std::collections::HashMap<u64, Vec<u32>> =
-        std::collections::HashMap::new();
     for a in &output.assigned_indices {
-        let entry = by_seq.entry(a.sequence_id).or_default();
-        for k in 0..a.len as u32 {
-            entry.push(a.base + k);
-        }
-    }
-
-    let mut seq_cursor: std::collections::HashMap<u64, usize> =
-        std::collections::HashMap::with_capacity(by_seq.len());
-    for tk in &output.tokens {
-        let Some(slots) = by_seq.get(&tk.sequence_id) else {
+        let len = a.len as usize;
+        if a.token_ids.len() != len {
+            tracing::warn!(
+                sequence_id = a.sequence_id,
+                base = a.base,
+                len,
+                token_ids = a.token_ids.len(),
+                "assigned_indices missing KV token ids; skipping RadixTree append"
+            );
             continue;
-        };
-        let cursor = seq_cursor.entry(tk.sequence_id).or_insert(0);
-        if *cursor < slots.len() {
-            radix.append_token(tk.sequence_id, tk.token_id, slots[*cursor]);
-            *cursor += 1;
         }
-    }
-    for (sid, slots) in &by_seq {
-        let cursor = seq_cursor.entry(*sid).or_insert(0);
-        while *cursor < slots.len() {
-            radix.append_token(*sid, 0, slots[*cursor]);
-            *cursor += 1;
+        for (offset, &token_id) in a.token_ids.iter().enumerate() {
+            radix.append_token(a.sequence_id, token_id, a.base + offset as u32);
         }
     }
 }
@@ -230,11 +228,7 @@ pub async fn process_llm_step_decoded(
         match sessions.ack_prefill(SequenceId(*sequence_id)) {
             Ok(PrefillAckOutcome::MovedToDecoding { .. })
             | Ok(PrefillAckOutcome::Continue { .. }) => {}
-            Err(e) => tracing::warn!(
-                "PrefillDone for sequence_id={} failed: {}",
-                sequence_id,
-                e
-            ),
+            Err(e) => tracing::warn!("PrefillDone for sequence_id={} failed: {}", sequence_id, e),
         }
     }
 
@@ -310,10 +304,7 @@ pub async fn process_diffusion_step_decoded(
             continue;
         };
         let Some(item_request_id) = sessions.request_id_for_sequence(seq_id) else {
-            tracing::warn!(
-                "Diffusion output: sequence_id={} no longer active",
-                seq_id
-            );
+            tracing::warn!("Diffusion output: sequence_id={} no longer active", seq_id);
             continue;
         };
         let Some(seq) = sessions.take_prefilling_by_request(&item_request_id)? else {

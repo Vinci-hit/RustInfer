@@ -94,26 +94,52 @@ pub struct RustInferConfig {
     pub log_level: String,
 }
 
-fn default_cluster_id() -> String { "rustinfer".to_string() }
-fn default_device() -> String { "cuda:0".to_string() }
-fn default_host() -> String { "0.0.0.0".to_string() }
-fn default_port() -> u16 { 8000 }
-fn default_request_timeout_secs() -> u64 { 120 }
-fn default_max_batch_tokens() -> usize { 8192 }
-fn default_max_batch_seqs() -> usize { 32 }
-fn default_max_model_len() -> usize { 4096 }
-fn default_paged_block_size() -> usize { 1 }
-fn default_mem_fraction_static() -> f32 { 0.9 }
-fn default_mode() -> String { "llm".to_string() }
-fn default_worker_id() -> String { "worker-0".to_string() }
-fn default_log_level() -> String { "info".to_string() }
+fn default_cluster_id() -> String {
+    "rustinfer".to_string()
+}
+fn default_device() -> String {
+    "cuda:0".to_string()
+}
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    8000
+}
+fn default_request_timeout_secs() -> u64 {
+    120
+}
+fn default_max_batch_tokens() -> usize {
+    8192
+}
+fn default_max_batch_seqs() -> usize {
+    32
+}
+fn default_max_model_len() -> usize {
+    4096
+}
+fn default_paged_block_size() -> usize {
+    1
+}
+fn default_mem_fraction_static() -> f32 {
+    0.9
+}
+fn default_mode() -> String {
+    "llm".to_string()
+}
+fn default_worker_id() -> String {
+    "worker-0".to_string()
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
 
 impl RustInferConfig {
     /// Load and parse a TOML config file. Errors are returned as `String`
     /// (infer-protocol has no error-handling dep); callers wrap with context.
     pub fn load(path: &str) -> Result<Self, String> {
-        let bytes = std::fs::read_to_string(path)
-            .map_err(|e| format!("read config {}: {}", path, e))?;
+        let bytes =
+            std::fs::read_to_string(path).map_err(|e| format!("read config {}: {}", path, e))?;
         let cfg: RustInferConfig =
             toml::from_str(&bytes).map_err(|e| format!("parse config {}: {}", path, e))?;
         if cfg.model.trim().is_empty() {
@@ -139,7 +165,10 @@ impl RustInferConfig {
 
     /// Control plane endpoint (lifecycle handshake + runtime control).
     pub fn worker_control_endpoint(&self) -> String {
-        format!("ipc:///tmp/rustinfer-{}-worker-control.ipc", self.cluster_id)
+        format!(
+            "ipc:///tmp/rustinfer-{}-worker-control.ipc",
+            self.cluster_id
+        )
     }
 
     /// All four endpoints (for cleanup).
@@ -191,8 +220,8 @@ impl RustInferConfig {
 /// otherwise `"llama3"`.
 pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
     let cfg_path = Path::new(model_path).join("config.json");
-    let bytes = std::fs::read(&cfg_path)
-        .map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
+    let bytes =
+        std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
 
@@ -210,6 +239,10 @@ pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
         .unwrap_or_default()
         .to_lowercase();
 
-    let resolved = if hint.contains("qwen") { "qwen3" } else { "llama3" };
+    let resolved = if hint.contains("qwen") {
+        "qwen3"
+    } else {
+        "llama3"
+    };
     Ok(resolved.to_string())
 }

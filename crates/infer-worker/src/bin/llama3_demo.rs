@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use half::bf16;
 use serde::Deserialize;
@@ -120,9 +120,15 @@ struct HfConfig {
     architectures: Vec<String>,
 }
 
-fn default_max_position() -> usize { 4096 }
-fn default_rms_eps() -> f32 { 1e-5 }
-fn default_rope_theta() -> f64 { 10000.0 }
+fn default_max_position() -> usize {
+    4096
+}
+fn default_rms_eps() -> f32 {
+    1e-5
+}
+fn default_rope_theta() -> f64 {
+    10000.0
+}
 
 #[derive(Debug, Deserialize)]
 struct HfRopeScaling {
@@ -139,13 +145,17 @@ struct HfRopeScaling {
 }
 
 fn parse_device_id(spec: &str) -> Result<i32> {
-    let suffix = spec.strip_prefix("cuda:")
+    let suffix = spec
+        .strip_prefix("cuda:")
         .ok_or_else(|| anyhow!("expected 'cuda:N', got '{}'", spec))?;
-    suffix.parse().with_context(|| format!("invalid device id in '{}'", spec))
+    suffix
+        .parse()
+        .with_context(|| format!("invalid device id in '{}'", spec))
 }
 
 fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
-    let head_dim = cfg.head_dim
+    let head_dim = cfg
+        .head_dim
         .unwrap_or_else(|| cfg.hidden_size / cfg.num_attention_heads);
     let rope_scaling = cfg.rope_scaling.as_ref().and_then(|rs| {
         // Only Llama-3 NTK rescaling is supported; fall back to bare RoPE for
@@ -155,7 +165,9 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
         let low = rs.low_freq_factor?;
         let high = rs.high_freq_factor?;
         let orig = rs.original_max_position_embeddings?;
-        if !is_llama3 { return None; }
+        if !is_llama3 {
+            return None;
+        }
         Some(RopeScaling {
             factor,
             low_freq_factor: low,
@@ -188,14 +200,20 @@ fn main() -> Result<()> {
 
     // 1. Parse config.json.
     let config_path = args.model_path.join("config.json");
-    let config_bytes = std::fs::read(&config_path)
-        .with_context(|| format!("read {}", config_path.display()))?;
+    let config_bytes =
+        std::fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?;
     let hf_cfg: HfConfig = serde_json::from_slice(&config_bytes)
         .with_context(|| format!("parse {}", config_path.display()))?;
     let arch = hf_cfg.architectures.first().cloned().unwrap_or_default();
-    eprintln!("[demo] architecture = {} ({} layers, dim={}, heads={}/{}, vocab={})",
-        arch, hf_cfg.num_hidden_layers, hf_cfg.hidden_size,
-        hf_cfg.num_attention_heads, hf_cfg.num_key_value_heads, hf_cfg.vocab_size);
+    eprintln!(
+        "[demo] architecture = {} ({} layers, dim={}, heads={}/{}, vocab={})",
+        arch,
+        hf_cfg.num_hidden_layers,
+        hf_cfg.hidden_size,
+        hf_cfg.num_attention_heads,
+        hf_cfg.num_key_value_heads,
+        hf_cfg.vocab_size
+    );
 
     let load_cfg = build_load_config(&hf_cfg, args.max_seq_len);
     if load_cfg.rope_scaling.is_some() {
@@ -204,38 +222,41 @@ fn main() -> Result<()> {
 
     // 2. Initialize CUDA device.
     let device_id = parse_device_id(&args.device)?;
-    let cuda = Cuda::new(device_id)
-        .map_err(|e| anyhow!("Cuda::new({}): {:?}", device_id, e))?;
+    let cuda = Cuda::new(device_id).map_err(|e| anyhow!("Cuda::new({}): {:?}", device_id, e))?;
     eprintln!("[demo] cuda device  = id {}", device_id);
 
     // 3. Open weights and build the model.
     let st_path = &args.model_path;
-    let reader = SafetensorsReader::open(st_path)
-        .map_err(|e| anyhow!("open weights: {}", e))?;
-    eprintln!("[demo] tensors      = {} (loading...)", reader.names().len());
+    let reader = SafetensorsReader::open(st_path).map_err(|e| anyhow!("open weights: {}", e))?;
+    eprintln!(
+        "[demo] tensors      = {} (loading...)",
+        reader.names().len()
+    );
 
     let loader = WeightLoader::new(&reader);
     let load_start = std::time::Instant::now();
-    let model = loader.load_llama3::<bf16, Cuda>(&load_cfg, &cuda)
+    let model = loader
+        .load_llama3::<bf16, Cuda>(&load_cfg, &cuda)
         .map_err(|e| anyhow!("load_llama3: {:?}", e))?;
     let _ = hf_cfg.tie_word_embeddings; // already handled inside load_llama3
-    eprintln!("[demo] weights loaded in {:.2}s", load_start.elapsed().as_secs_f32());
+    eprintln!(
+        "[demo] weights loaded in {:.2}s",
+        load_start.elapsed().as_secs_f32()
+    );
 
     // 4. Build runner. If batch-prompts mode is on, allocate enough slots.
-    let batch_prompts: Option<Vec<Vec<i32>>> =
-        if let Some(p) = args.batch_prompts_file.as_ref() {
-            let bytes = std::fs::read(p)
-                .with_context(|| format!("read {}", p.display()))?;
-            let v: Vec<Vec<i64>> = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse {} as nested JSON array", p.display()))?;
-            Some(
-                v.into_iter()
-                    .map(|s| s.into_iter().map(|i| i as i32).collect::<Vec<_>>())
-                    .collect(),
-            )
-        } else {
-            None
-        };
+    let batch_prompts: Option<Vec<Vec<i32>>> = if let Some(p) = args.batch_prompts_file.as_ref() {
+        let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+        let v: Vec<Vec<i64>> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {} as nested JSON array", p.display()))?;
+        Some(
+            v.into_iter()
+                .map(|s| s.into_iter().map(|i| i as i32).collect::<Vec<_>>())
+                .collect(),
+        )
+    } else {
+        None
+    };
     let max_batch_seqs = batch_prompts.as_ref().map(|v| v.len().max(1)).unwrap_or(1);
     // Paged KV pool sizing: block_size=1 — every token gets its own slot in
     // the global KV pool. With block_size=1 the paged scatter/attention
@@ -259,14 +280,25 @@ fn main() -> Result<()> {
             cap_batch.max(1), 128, 256,
         );
     let mut runner = ModelRunner::new(
-        model, cuda, pool_blocks, block_size, max_blocks_per_seq, args.max_seq_len,
-        cap_num_tokens, cap_batch, flash_decode_capacity_f32,
+        model,
+        cuda,
+        pool_blocks,
+        block_size,
+        max_blocks_per_seq,
+        args.max_seq_len,
+        cap_num_tokens,
+        cap_batch,
+        flash_decode_capacity_f32,
         vec![1, 2, 4, 8, 16, 32],
-    ).map_err(|e| anyhow!("ModelRunner::new: {:?}", e))?;
+    )
+    .map_err(|e| anyhow!("ModelRunner::new: {:?}", e))?;
 
     // Prime CUDA Graphs (decode-only).
     if let Err(e) = runner.prime_graphs_cuda() {
-        eprintln!("[demo] CUDA Graph priming FAILED, continuing eager: {:?}", e);
+        eprintln!(
+            "[demo] CUDA Graph priming FAILED, continuing eager: {:?}",
+            e
+        );
     } else {
         eprintln!("[demo] CUDA Graphs primed for {:?}", runner.capture_sizes);
     }
@@ -281,7 +313,8 @@ fn main() -> Result<()> {
             let p0 = &prompts[0];
             let p1 = &prompts[1];
             let bt0: Vec<u32> = (0..max_blocks_per_seq as u32).collect();
-            let bt1: Vec<u32> = (max_blocks_per_seq as u32..2 * max_blocks_per_seq as u32).collect();
+            let bt1: Vec<u32> =
+                (max_blocks_per_seq as u32..2 * max_blocks_per_seq as u32).collect();
 
             eprintln!("[staggered] p0 len={}, p1 len={}", p0.len(), p1.len());
 
@@ -293,7 +326,8 @@ fn main() -> Result<()> {
                 kv_len_after: p0.len() as i32,
                 block_table: bt0.clone(),
             };
-            let t0_first = runner.step_batch(&[prefill0])
+            let t0_first = runner
+                .step_batch(&[prefill0])
                 .map_err(|e| anyhow!("staggered prefill0: {:?}", e))?[0];
             eprintln!("[staggered] prefill0 done, first_token={}", t0_first);
 
@@ -309,7 +343,8 @@ fn main() -> Result<()> {
                     kv_len_after: pos + 1,
                     block_table: bt0.clone(),
                 };
-                t0_last = runner.step_batch(&[step])
+                t0_last = runner
+                    .step_batch(&[step])
                     .map_err(|e| anyhow!("staggered decode0 step {}: {:?}", i, e))?[0];
                 t0_tokens.push(t0_last);
             }
@@ -323,7 +358,8 @@ fn main() -> Result<()> {
                 kv_len_after: p1.len() as i32,
                 block_table: bt1.clone(),
             };
-            let t1_first = runner.step_batch(&[prefill1])
+            let t1_first = runner
+                .step_batch(&[prefill1])
                 .map_err(|e| anyhow!("staggered prefill1: {:?}", e))?[0];
             eprintln!("[staggered] prefill1 done, first_token={}", t1_first);
             let mut t1_tokens = vec![t1_first];
@@ -349,7 +385,8 @@ fn main() -> Result<()> {
                         block_table: bt1.clone(),
                     },
                 ];
-                let new = runner.step_batch(&steps)
+                let new = runner
+                    .step_batch(&steps)
                     .map_err(|e| anyhow!("staggered joint decode step {}: {:?}", i, e))?;
                 t0_last = new[0];
                 t1_last = new[1];
@@ -357,12 +394,28 @@ fn main() -> Result<()> {
                 t1_tokens.push(t1_last);
             }
 
-            let txt0 = tokenizer.decode(&t0_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap_or_default();
-            let txt1 = tokenizer.decode(&t1_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), false).unwrap_or_default();
+            let txt0 = tokenizer
+                .decode(
+                    &t0_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+                    false,
+                )
+                .unwrap_or_default();
+            let txt1 = tokenizer
+                .decode(
+                    &t1_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+                    false,
+                )
+                .unwrap_or_default();
             println!("[staggered-output] seq=0 tokens={:?}", t0_tokens);
-            println!("[staggered-text]   seq=0 text={:?}", &txt0[..txt0.len().min(200)]);
+            println!(
+                "[staggered-text]   seq=0 text={:?}",
+                &txt0[..txt0.len().min(200)]
+            );
             println!("[staggered-output] seq=1 tokens={:?}", t1_tokens);
-            println!("[staggered-text]   seq=1 text={:?}", &txt1[..txt1.len().min(200)]);
+            println!(
+                "[staggered-text]   seq=1 text={:?}",
+                &txt1[..txt1.len().min(200)]
+            );
             return Ok(());
         }
 
@@ -388,28 +441,35 @@ fn main() -> Result<()> {
             });
         }
         let gen_start = std::time::Instant::now();
-        let first_tokens = runner.step_batch_with_graph(&steps)
+        let first_tokens = runner
+            .step_batch_with_graph(&steps)
             .map_err(|e| anyhow!("step_batch: {:?}", e))?;
-        eprintln!("[demo] batch prefill: {:.2}s, first tokens: {:?}",
-            gen_start.elapsed().as_secs_f32(), first_tokens);
+        eprintln!(
+            "[demo] batch prefill: {:.2}s, first tokens: {:?}",
+            gen_start.elapsed().as_secs_f32(),
+            first_tokens
+        );
 
         // Decode loop for batch mode
         let batch_size = prompts.len();
-        let mut all_generated: Vec<Vec<i32>> = (0..batch_size)
-            .map(|i| vec![first_tokens[i]])
-            .collect();
+        let mut all_generated: Vec<Vec<i32>> =
+            (0..batch_size).map(|i| vec![first_tokens[i]]).collect();
         let mut last_tokens = first_tokens.clone();
         let eos_ids: &[i32] = &[128001, 128008, 128009];
         let mut active: Vec<bool> = vec![true; batch_size];
 
         for step in 0..args.max_new_tokens.saturating_sub(1) {
             // Check if all done
-            if active.iter().all(|&a| !a) { break; }
+            if active.iter().all(|&a| !a) {
+                break;
+            }
 
             // Build decode steps for all active sequences
             let mut decode_steps = Vec::new();
             for i in 0..batch_size {
-                if !active[i] { continue; }
+                if !active[i] {
+                    continue;
+                }
                 let kv_write_start = (prompts[i].len() + all_generated[i].len() - 1) as i32;
                 let kv_len_after = kv_write_start + 1;
                 let bt_start = (i * max_blocks_per_seq) as u32;
@@ -425,13 +485,16 @@ fn main() -> Result<()> {
                 });
             }
 
-            let new_tokens = runner.step_batch_with_graph(&decode_steps)
+            let new_tokens = runner
+                .step_batch_with_graph(&decode_steps)
                 .map_err(|e| anyhow!("step_batch decode step {}: {:?}", step, e))?;
 
             // Map back to active sequences
             let mut tok_idx = 0;
             for i in 0..batch_size {
-                if !active[i] { continue; }
+                if !active[i] {
+                    continue;
+                }
                 let t = new_tokens[tok_idx];
                 all_generated[i].push(t);
                 last_tokens[i] = t;
@@ -445,12 +508,21 @@ fn main() -> Result<()> {
         let elapsed = gen_start.elapsed().as_secs_f32();
         eprintln!("[demo] batch decode done in {:.2}s", elapsed);
         for i in 0..batch_size {
-            let txt = tokenizer.decode(
-                &all_generated[i].iter().map(|&x| x as u32).collect::<Vec<_>>(),
-                false,
-            ).unwrap_or_default();
+            let txt = tokenizer
+                .decode(
+                    &all_generated[i]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect::<Vec<_>>(),
+                    false,
+                )
+                .unwrap_or_default();
             println!("[batch-output] seq={} tokens={:?}", i, all_generated[i]);
-            println!("[batch-text]   seq={} text={:?}", i, &txt[..txt.len().min(200)]);
+            println!(
+                "[batch-text]   seq={} text={:?}",
+                i,
+                &txt[..txt.len().min(200)]
+            );
             println!();
         }
         return Ok(());
@@ -462,11 +534,15 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("load tokenizer {}: {:?}", tok_path.display(), e))?;
 
     let prompt_ids: Vec<i32> = if let Some(ids_path) = args.prompt_ids_file.as_ref() {
-        let bytes = std::fs::read(ids_path)
-            .with_context(|| format!("read {}", ids_path.display()))?;
+        let bytes =
+            std::fs::read(ids_path).with_context(|| format!("read {}", ids_path.display()))?;
         let ids: Vec<i64> = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse {} as JSON array", ids_path.display()))?;
-        eprintln!("[demo] loaded {} prompt ids from {}", ids.len(), ids_path.display());
+        eprintln!(
+            "[demo] loaded {} prompt ids from {}",
+            ids.len(),
+            ids_path.display()
+        );
         ids.into_iter().map(|v| v as i32).collect()
     } else {
         let rendered: String = if args.chat {
@@ -476,15 +552,17 @@ fn main() -> Result<()> {
         } else {
             args.prompt.clone()
         };
-        let encoding = tokenizer.encode(rendered.as_str(), true)
+        let encoding = tokenizer
+            .encode(rendered.as_str(), true)
             .map_err(|e| anyhow!("tokenize: {:?}", e))?;
         encoding.get_ids().iter().map(|&id| id as i32).collect()
     };
     eprintln!("[demo] prompt tokens = {} ids", prompt_ids.len());
     eprintln!("[demo] prompt_ids   = {:?}", prompt_ids);
-    let id_to_str: Vec<String> = prompt_ids.iter().map(|&i| {
-        tokenizer.decode(&[i as u32], false).unwrap_or_default()
-    }).collect();
+    let id_to_str: Vec<String> = prompt_ids
+        .iter()
+        .map(|&i| tokenizer.decode(&[i as u32], false).unwrap_or_default())
+        .collect();
     eprintln!("[demo] prompt tokens (decoded per id):");
     for (i, (id, s)) in prompt_ids.iter().zip(id_to_str.iter()).enumerate() {
         eprintln!("  [{:>3}] {:>6}  {:?}", i, id, s);
@@ -494,21 +572,28 @@ fn main() -> Result<()> {
     // Llama 3.2 generation_config: eos = {128001, 128008, 128009}.
     let eos_ids: &[i32] = &[128001, 128008, 128009];
     let gen_start = std::time::Instant::now();
-    let new_tokens = runner.generate_with_graph(&prompt_ids, args.max_new_tokens, eos_ids)
+    let new_tokens = runner
+        .generate_with_graph(&prompt_ids, args.max_new_tokens, eos_ids)
         .map_err(|e| anyhow!("generate: {:?}", e))?;
     let elapsed = gen_start.elapsed().as_secs_f32();
     eprintln!(
         "[demo] generated {} tokens in {:.2}s ({:.1} tok/s)",
-        new_tokens.len(), elapsed, new_tokens.len() as f32 / elapsed,
+        new_tokens.len(),
+        elapsed,
+        new_tokens.len() as f32 / elapsed,
     );
     if std::env::var("RUSTINFER_PROFILE_GPU").is_ok() && runner.prof_step_count > 0 {
         let n = runner.prof_step_count as f64;
-        let wall_us  = runner.prof_step_wall_ns as f64 / 1000.0 / n;
-        let gpu_us   = runner.prof_graph_gpu_ns as f64 / 1000.0 / n;
-        let host_us  = wall_us - gpu_us;
+        let wall_us = runner.prof_step_wall_ns as f64 / 1000.0 / n;
+        let gpu_us = runner.prof_graph_gpu_ns as f64 / 1000.0 / n;
+        let host_us = wall_us - gpu_us;
         eprintln!(
             "[profile] decode steps={}  wall={:.1}µs/tok  gpu_graph={:.1}µs/tok  host_overhead={:.1}µs/tok ({:.1}%)",
-            runner.prof_step_count, wall_us, gpu_us, host_us, 100.0 * host_us / wall_us,
+            runner.prof_step_count,
+            wall_us,
+            gpu_us,
+            host_us,
+            100.0 * host_us / wall_us,
         );
         eprintln!(
             "[profile] tok/s ceiling if host_overhead → 0: {:.1}",
@@ -519,7 +604,8 @@ fn main() -> Result<()> {
     // 7. Decode and print.
     let mut all_ids: Vec<u32> = prompt_ids.iter().map(|&i| i as u32).collect();
     all_ids.extend(new_tokens.iter().map(|&i| i as u32));
-    let text = tokenizer.decode(&all_ids, true)
+    let text = tokenizer
+        .decode(&all_ids, true)
         .map_err(|e| anyhow!("decode: {:?}", e))?;
     println!("\n=== generated text ===\n{}\n======================", text);
 

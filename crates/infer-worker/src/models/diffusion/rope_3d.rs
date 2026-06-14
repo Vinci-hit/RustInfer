@@ -4,7 +4,7 @@
 //! host. `embed_into` gathers per-axis slices into a unified
 //! `[seq_len, half_dim_total]` cos/sin tensor on the target CUDA device.
 
-use crate::domain::ports::{OpResult, OpError, MemoryPort};
+use crate::domain::ports::{MemoryPort, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::infrastructure::cpu::Cpu;
 use crate::infrastructure::cuda::Cuda;
@@ -31,7 +31,13 @@ impl RopeEmbedder3D {
             Self::precompute_axis(axes_dims[1], axes_lens[1], theta, true),
             Self::precompute_axis(axes_dims[2], axes_lens[2], theta, true),
         ];
-        Ok(Self { theta, axes_dims, axes_lens, cos_cached, sin_cached })
+        Ok(Self {
+            theta,
+            axes_dims,
+            axes_lens,
+            cos_cached,
+            sin_cached,
+        })
     }
 
     fn precompute_axis(d: usize, max_len: usize, theta: f64, is_sin: bool) -> Vec<f32> {
@@ -44,7 +50,11 @@ impl RopeEmbedder3D {
             let base = pos * half_d;
             for j in 0..half_d {
                 let val = pos as f64 * freqs[j];
-                data[base + j] = if is_sin { val.sin() as f32 } else { val.cos() as f32 };
+                data[base + j] = if is_sin {
+                    val.sin() as f32
+                } else {
+                    val.cos() as f32
+                };
             }
         }
         data
@@ -68,7 +78,8 @@ impl RopeEmbedder3D {
         if pos_ids.len() != seq_len * 3 {
             return Err(OpError::Shape(format!(
                 "embed_into_cuda: pos_ids length {} != seq_len*3 = {}",
-                pos_ids.len(), seq_len * 3,
+                pos_ids.len(),
+                seq_len * 3,
             )));
         }
         let half_dim = self.half_dim();
@@ -77,7 +88,10 @@ impl RopeEmbedder3D {
         {
             return Err(OpError::Shape(format!(
                 "embed_into_cuda: dst shape mismatch (expected [{}, {}], got cos={:?}, sin={:?})",
-                seq_len, half_dim, cos_dst.shape(), sin_dst.shape(),
+                seq_len,
+                half_dim,
+                cos_dst.shape(),
+                sin_dst.shape(),
             )));
         }
 
@@ -134,11 +148,16 @@ impl RopeEmbedder3D {
         {
             return Err(OpError::Shape(format!(
                 "embed_into_cpu: dst shape mismatch (expected [{}, {}], got cos={:?}, sin={:?})",
-                seq_len, half_dim, cos_dst.shape(), sin_dst.shape(),
+                seq_len,
+                half_dim,
+                cos_dst.shape(),
+                sin_dst.shape(),
             )));
         }
         if pos_ids.len() != seq_len * 3 {
-            return Err(OpError::Shape("embed_into_cpu: pos_ids length mismatch".into()));
+            return Err(OpError::Shape(
+                "embed_into_cpu: pos_ids length mismatch".into(),
+            ));
         }
         let mut cos_host = vec![0.0_f32; seq_len * half_dim];
         let mut sin_host = vec![0.0_f32; seq_len * half_dim];
@@ -190,7 +209,9 @@ pub fn fill_cap_pos_ids(seq_len: usize) -> Vec<i32> {
 /// patchified latent. Padding tokens share the position of the last real
 /// patch.
 pub fn fill_image_pos_ids(
-    f_t: usize, h_t: usize, w_t: usize,
+    f_t: usize,
+    h_t: usize,
+    w_t: usize,
     axis0_offset: usize,
     pad_count: usize,
 ) -> Vec<i32> {
@@ -245,11 +266,16 @@ mod tests {
         let mut cos: Tensor<f32, Cpu> = Tensor::zeros([1, half_dim], &cpu).unwrap();
         let mut sin: Tensor<f32, Cpu> = Tensor::zeros([1, half_dim], &cpu).unwrap();
         let pos_ids = vec![0_i32, 0, 0];
-        rope.embed_into_cpu(&pos_ids, 1, &mut cos, &mut sin).unwrap();
+        rope.embed_into_cpu(&pos_ids, 1, &mut cos, &mut sin)
+            .unwrap();
         let cos_v = cos.to_host_vec().unwrap();
         let sin_v = sin.to_host_vec().unwrap();
-        for c in cos_v { assert!((c - 1.0).abs() < 1e-5); }
-        for s in sin_v { assert!(s.abs() < 1e-5); }
+        for c in cos_v {
+            assert!((c - 1.0).abs() < 1e-5);
+        }
+        for s in sin_v {
+            assert!(s.abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -261,7 +287,8 @@ mod tests {
         let mut sin: Tensor<f32, Cpu> = Tensor::zeros([1, half_dim], &cpu).unwrap();
         // pos = (3, 0, 0) → axes 0..2 (the first 2 bins out of 6) use pos=3
         let pos_ids = vec![3_i32, 0, 0];
-        rope.embed_into_cpu(&pos_ids, 1, &mut cos, &mut sin).unwrap();
+        rope.embed_into_cpu(&pos_ids, 1, &mut cos, &mut sin)
+            .unwrap();
         let cos_v = cos.to_host_vec().unwrap();
         let sin_v = sin.to_host_vec().unwrap();
         // Bin 0 of axis 0: freq = 1 / 10000^(2*0/4) = 1.0; cos(3) / sin(3).
@@ -297,13 +324,15 @@ mod tests {
 
         let mut cos_cpu: Tensor<f32, Cpu> = Tensor::zeros([seq_len, half_dim], &cpu).unwrap();
         let mut sin_cpu: Tensor<f32, Cpu> = Tensor::zeros([seq_len, half_dim], &cpu).unwrap();
-        rope.embed_into_cpu(&pos_ids, seq_len, &mut cos_cpu, &mut sin_cpu).unwrap();
+        rope.embed_into_cpu(&pos_ids, seq_len, &mut cos_cpu, &mut sin_cpu)
+            .unwrap();
         let cpu_cos = cos_cpu.to_host_vec().unwrap();
         let cpu_sin = sin_cpu.to_host_vec().unwrap();
 
         let mut cos_gpu: Tensor<f32, Cuda> = Tensor::zeros([seq_len, half_dim], &cuda).unwrap();
         let mut sin_gpu: Tensor<f32, Cuda> = Tensor::zeros([seq_len, half_dim], &cuda).unwrap();
-        rope.embed_into_cuda(&pos_ids, seq_len, &mut cos_gpu, &mut sin_gpu).unwrap();
+        rope.embed_into_cuda(&pos_ids, seq_len, &mut cos_gpu, &mut sin_gpu)
+            .unwrap();
         let gpu_cos = cos_gpu.to_host_vec().unwrap();
         let gpu_sin = sin_gpu.to_host_vec().unwrap();
 
@@ -314,7 +343,7 @@ mod tests {
     #[test]
     fn fill_cap_pos_ids_basic() {
         let ids = fill_cap_pos_ids(3);
-        assert_eq!(ids, vec![1, 0, 0,   2, 0, 0,   3, 0, 0]);
+        assert_eq!(ids, vec![1, 0, 0, 2, 0, 0, 3, 0, 0]);
     }
 
     #[test]

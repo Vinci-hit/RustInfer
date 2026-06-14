@@ -16,14 +16,20 @@ use crate::infrastructure::cuda::ffi::cudaStream_t;
 unsafe extern "C" {
     fn rope_interleaved_f32_forward(
         x: *mut f32,
-        cos: *const f32, sin: *const f32,
-        seq: i32, n_heads: i32, head_dim: i32,
+        cos: *const f32,
+        sin: *const f32,
+        seq: i32,
+        n_heads: i32,
+        head_dim: i32,
         stream: cudaStream_t,
     );
     fn rope_interleaved_bf16_forward(
         x: *mut half::bf16,
-        cos: *const f32, sin: *const f32,
-        seq: i32, n_heads: i32, head_dim: i32,
+        cos: *const f32,
+        sin: *const f32,
+        seq: i32,
+        n_heads: i32,
+        head_dim: i32,
         stream: cudaStream_t,
     );
 }
@@ -39,18 +45,21 @@ pub fn apply_rope_interleaved<T: Dtype>(
     let xs = x.shape().as_slice();
     if xs.len() != 3 {
         return Err(OpError::Shape(format!(
-            "apply_rope_interleaved: expected [seq, n_heads, head_dim], got {:?}", xs
+            "apply_rope_interleaved: expected [seq, n_heads, head_dim], got {:?}",
+            xs
         )));
     }
     let (seq, n_heads, hd) = (xs[0], xs[1], xs[2]);
     if hd != head_dim {
         return Err(OpError::Shape(format!(
-            "apply_rope_interleaved: head_dim mismatch x_shape={} arg={}", hd, head_dim,
+            "apply_rope_interleaved: head_dim mismatch x_shape={} arg={}",
+            hd, head_dim,
         )));
     }
     if head_dim % 2 != 0 {
         return Err(OpError::Shape(format!(
-            "apply_rope_interleaved: head_dim must be even, got {}", head_dim,
+            "apply_rope_interleaved: head_dim must be even, got {}",
+            head_dim,
         )));
     }
     let half = head_dim / 2;
@@ -69,17 +78,26 @@ pub fn apply_rope_interleaved<T: Dtype>(
                 x.data_ptr_mut() as *mut f32,
                 cos.data_ptr() as *const f32,
                 sin.data_ptr() as *const f32,
-                seq as i32, n_heads as i32, head_dim as i32, stream,
+                seq as i32,
+                n_heads as i32,
+                head_dim as i32,
+                stream,
             ),
             DataType::BF16 => rope_interleaved_bf16_forward(
                 x.data_ptr_mut() as *mut half::bf16,
                 cos.data_ptr() as *const f32,
                 sin.data_ptr() as *const f32,
-                seq as i32, n_heads as i32, head_dim as i32, stream,
+                seq as i32,
+                n_heads as i32,
+                head_dim as i32,
+                stream,
             ),
-            _ => return Err(OpError::Kernel(format!(
-                "apply_rope_interleaved: unsupported dtype {:?}", T::DATA_TYPE,
-            ))),
+            _ => {
+                return Err(OpError::Kernel(format!(
+                    "apply_rope_interleaved: unsupported dtype {:?}",
+                    T::DATA_TYPE,
+                )));
+            }
         }
     }
     Ok(())
@@ -96,7 +114,9 @@ mod tests {
         x: &mut [f32],
         cos: &[f32],
         sin: &[f32],
-        seq: usize, n_heads: usize, head_dim: usize,
+        seq: usize,
+        n_heads: usize,
+        head_dim: usize,
     ) {
         let half = head_dim / 2;
         for s in 0..seq {
@@ -107,7 +127,7 @@ mod tests {
                     let base = (s * n_heads + h) * head_dim;
                     let a = x[base + 2 * k];
                     let b = x[base + 2 * k + 1];
-                    x[base + 2 * k]     = a * c - b * si;
+                    x[base + 2 * k] = a * c - b * si;
                     x[base + 2 * k + 1] = a * si + b * c;
                 }
             }
@@ -124,34 +144,34 @@ mod tests {
         let mut x_host: Vec<f32> = (0..seq * n_heads * head_dim)
             .map(|i| (i as f32 * 0.13).sin())
             .collect();
-        let cos_host: Vec<f32> = (0..seq * half)
-            .map(|i| (i as f32 * 0.07).cos())
-            .collect();
-        let sin_host: Vec<f32> = (0..seq * half)
-            .map(|i| (i as f32 * 0.07).sin())
-            .collect();
+        let cos_host: Vec<f32> = (0..seq * half).map(|i| (i as f32 * 0.07).cos()).collect();
+        let sin_host: Vec<f32> = (0..seq * half).map(|i| (i as f32 * 0.07).sin()).collect();
 
         // CPU reference.
         let mut ref_x = x_host.clone();
         rope_interleaved_cpu_f32(&mut ref_x, &cos_host, &sin_host, seq, n_heads, head_dim);
 
         // CUDA execution.
-        let mut x_dev: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &x_host, Shape::from_slice(&[seq, n_heads, head_dim]), &cuda,
-        ).unwrap();
-        let cos_dev: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &cos_host, Shape::from_slice(&[seq, half]), &cuda,
-        ).unwrap();
-        let sin_dev: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &sin_host, Shape::from_slice(&[seq, half]), &cuda,
-        ).unwrap();
+        let mut x_dev: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&x_host, Shape::from_slice(&[seq, n_heads, head_dim]), &cuda)
+                .unwrap();
+        let cos_dev: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&cos_host, Shape::from_slice(&[seq, half]), &cuda).unwrap();
+        let sin_dev: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&sin_host, Shape::from_slice(&[seq, half]), &cuda).unwrap();
 
         apply_rope_interleaved(&mut x_dev, &cos_dev, &sin_dev, head_dim).unwrap();
 
         let got = x_dev.to_host_vec().unwrap();
         let _ = x_host; // shadow drop
         for (i, (a, b)) in ref_x.iter().zip(got.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-5, "mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                (a - b).abs() < 1e-5,
+                "mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
 
@@ -164,36 +184,44 @@ mod tests {
         let x_host_f32: Vec<f32> = (0..seq * n_heads * head_dim)
             .map(|i| (i as f32 * 0.21).sin())
             .collect();
-        let cos_host: Vec<f32> = (0..seq * half)
-            .map(|i| (i as f32 * 0.05).cos())
-            .collect();
-        let sin_host: Vec<f32> = (0..seq * half)
-            .map(|i| (i as f32 * 0.05).sin())
-            .collect();
+        let cos_host: Vec<f32> = (0..seq * half).map(|i| (i as f32 * 0.05).cos()).collect();
+        let sin_host: Vec<f32> = (0..seq * half).map(|i| (i as f32 * 0.05).sin()).collect();
 
         let mut ref_x = x_host_f32.clone();
         rope_interleaved_cpu_f32(&mut ref_x, &cos_host, &sin_host, seq, n_heads, head_dim);
 
         let x_host_bf16: Vec<bf16> = x_host_f32.iter().map(|&v| bf16::from_f32(v)).collect();
         let mut x_dev: Tensor<bf16, Cuda> = Tensor::from_host_slice(
-            &x_host_bf16, Shape::from_slice(&[seq, n_heads, head_dim]), &cuda,
-        ).unwrap();
-        let cos_dev: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &cos_host, Shape::from_slice(&[seq, half]), &cuda,
-        ).unwrap();
-        let sin_dev: Tensor<f32, Cuda> = Tensor::from_host_slice(
-            &sin_host, Shape::from_slice(&[seq, half]), &cuda,
-        ).unwrap();
+            &x_host_bf16,
+            Shape::from_slice(&[seq, n_heads, head_dim]),
+            &cuda,
+        )
+        .unwrap();
+        let cos_dev: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&cos_host, Shape::from_slice(&[seq, half]), &cuda).unwrap();
+        let sin_dev: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&sin_host, Shape::from_slice(&[seq, half]), &cuda).unwrap();
 
         apply_rope_interleaved(&mut x_dev, &cos_dev, &sin_dev, head_dim).unwrap();
 
-        let got: Vec<f32> = x_dev.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = x_dev
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         for (i, (a, b)) in ref_x.iter().zip(got.iter()).enumerate() {
             // bf16 has ~7-bit mantissa → ~1% relative error at most.
             let abs_err = (a - b).abs();
             let rel_err = abs_err / a.abs().max(1e-3);
-            assert!(abs_err < 0.05 || rel_err < 0.03,
-                "mismatch at {}: cpu={} gpu={} abs={}", i, a, b, abs_err);
+            assert!(
+                abs_err < 0.05 || rel_err < 0.03,
+                "mismatch at {}: cpu={} gpu={} abs={}",
+                i,
+                a,
+                b,
+                abs_err
+            );
         }
     }
 }

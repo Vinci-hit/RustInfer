@@ -29,17 +29,17 @@
 
 use std::path::Path;
 
-use crate::domain::ports::{OpResult, OpError, OpBackend, CoreOps, DiffusionOps};
+use crate::domain::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::io::SafetensorsReader;
-use crate::models::layers::{Linear, RMSNorm, LayerNorm};
+use crate::models::layers::{LayerNorm, Linear, RMSNorm};
 use crate::models::loader::WeightLoader;
 
 use super::dit_block::DiTBlock;
 use super::rope_3d::{RopeEmbedder3D, fill_cap_pos_ids, fill_image_pos_ids};
-use super::state::{DitState, ADALN_EMBED_DIM, SEQ_MULTI_OF, T_FREQ_DIM, T_EMBEDDER_MID};
+use super::state::{ADALN_EMBED_DIM, DitState, SEQ_MULTI_OF, T_EMBEDDER_MID, T_FREQ_DIM};
 use super::timestep_embedder::TimestepEmbedder;
 
 /// One-shot dump latch for the transformer-level intermediates (latent_5d,
@@ -54,7 +54,10 @@ fn vp2<T: Dtype>(src: &Tensor<T, Cuda>, rows: usize, cols: usize) -> OpResult<Te
     if rows * cols > src.numel() {
         return Err(OpError::Shape(format!(
             "vp2: requested {}*{}={} > storage numel {}",
-            rows, cols, rows * cols, src.numel(),
+            rows,
+            cols,
+            rows * cols,
+            src.numel(),
         )));
     }
     Ok(src.view_raw(
@@ -66,11 +69,22 @@ fn vp2<T: Dtype>(src: &Tensor<T, Cuda>, rows: usize, cols: usize) -> OpResult<Te
 }
 
 /// 4D variant of vp2 for `[c, f, h, w]`-style image views.
-fn vp4<T: Dtype>(src: &Tensor<T, Cuda>, a: usize, b: usize, c: usize, d: usize) -> OpResult<Tensor<T, Cuda>> {
+fn vp4<T: Dtype>(
+    src: &Tensor<T, Cuda>,
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+) -> OpResult<Tensor<T, Cuda>> {
     if a * b * c * d > src.numel() {
         return Err(OpError::Shape(format!(
             "vp4: requested {}*{}*{}*{}={} > storage numel {}",
-            a, b, c, d, a * b * c * d, src.numel(),
+            a,
+            b,
+            c,
+            d,
+            a * b * c * d,
+            src.numel(),
         )));
     }
     Ok(src.view_raw(
@@ -121,10 +135,13 @@ impl ZImageTransformerConfig {
         let arr = |k: &str| -> OpResult<Vec<usize>> {
             v[k].as_array()
                 .ok_or_else(|| OpError::Kernel(format!("missing {} in transformer config", k)))?
-                .iter().map(|x| {
-                    x.as_u64().map(|x| x as usize)
+                .iter()
+                .map(|x| {
+                    x.as_u64()
+                        .map(|x| x as usize)
                         .ok_or_else(|| OpError::Kernel(format!("bad entry in {}", k)))
-                }).collect()
+                })
+                .collect()
         };
 
         let axes_dims_v = arr("axes_dims")?;
@@ -179,8 +196,8 @@ pub struct ZImageTransformer<T: Dtype, D: OpBackend> {
 
     // Final layer: layer-norm + adaLN-scale + linear → patch space.
     pub final_norm: LayerNorm<T, D>,
-    pub final_adaln: Linear<T, D>,        // [dim, ADALN_EMBED_DIM]
-    pub final_proj: Linear<T, D>,         // [final_out_dim, dim]
+    pub final_adaln: Linear<T, D>, // [dim, ADALN_EMBED_DIM]
+    pub final_proj: Linear<T, D>,  // [final_out_dim, dim]
 
     pub rope: RopeEmbedder3D,
 }
@@ -216,9 +233,8 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
 
         // cap_embedder is RMSNorm + Linear: `cap_embedder.0.weight` (RMSNorm),
         // `cap_embedder.1.{weight,bias}` (Linear).
-        let cap_embedder_norm: RMSNorm<T, Cuda> = loader.load_rmsnorm::<T, Cuda>(
-            "cap_embedder.0.weight", device, config.norm_eps,
-        )?;
+        let cap_embedder_norm: RMSNorm<T, Cuda> =
+            loader.load_rmsnorm::<T, Cuda>("cap_embedder.0.weight", device, config.norm_eps)?;
         let cap_embedder_linear = loader.load_linear::<T, Cuda>(
             "cap_embedder.1.weight",
             Some("cap_embedder.1.bias"),
@@ -252,22 +268,40 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let mut noise_refiner = Vec::with_capacity(config.n_refiner_layers);
         for i in 0..config.n_refiner_layers {
             noise_refiner.push(load_dit_block::<T>(
-                &loader, &format!("noise_refiner.{}", i),
-                dim, n_heads, head_dim, config.norm_eps, true, device,
+                &loader,
+                &format!("noise_refiner.{}", i),
+                dim,
+                n_heads,
+                head_dim,
+                config.norm_eps,
+                true,
+                device,
             )?);
         }
         let mut context_refiner = Vec::with_capacity(config.n_refiner_layers);
         for i in 0..config.n_refiner_layers {
             context_refiner.push(load_dit_block::<T>(
-                &loader, &format!("context_refiner.{}", i),
-                dim, n_heads, head_dim, config.norm_eps, false, device,
+                &loader,
+                &format!("context_refiner.{}", i),
+                dim,
+                n_heads,
+                head_dim,
+                config.norm_eps,
+                false,
+                device,
             )?);
         }
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             layers.push(load_dit_block::<T>(
-                &loader, &format!("layers.{}", i),
-                dim, n_heads, head_dim, config.norm_eps, true, device,
+                &loader,
+                &format!("layers.{}", i),
+                dim,
+                n_heads,
+                head_dim,
+                config.norm_eps,
+                true,
+                device,
             )?);
         }
 
@@ -283,25 +317,34 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
                     final_norm_w_buf[off..off + 4].copy_from_slice(&1.0_f32.to_le_bytes());
                 }
                 crate::domain::types::DataType::BF16 => {
-                    final_norm_w_buf[off..off + 2].copy_from_slice(&half::bf16::from_f32(1.0).to_le_bytes());
+                    final_norm_w_buf[off..off + 2]
+                        .copy_from_slice(&half::bf16::from_f32(1.0).to_le_bytes());
                 }
                 crate::domain::types::DataType::F16 => {
-                    final_norm_w_buf[off..off + 2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+                    final_norm_w_buf[off..off + 2]
+                        .copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
                 }
                 other => return Err(OpError::Kernel(format!("final_norm dtype {:?}", other))),
             }
         }
         let final_norm_w = Tensor::<T, Cuda>::from_host_bytes(
-            &final_norm_w_buf, Shape::from_slice(&[dim]), device,
+            &final_norm_w_buf,
+            Shape::from_slice(&[dim]),
+            device,
         )?;
         let final_norm_b_buf = vec![0u8; dim * T::SIZE_BYTES];
         let final_norm_b = Tensor::<T, Cuda>::from_host_bytes(
-            &final_norm_b_buf, Shape::from_slice(&[dim]), device,
+            &final_norm_b_buf,
+            Shape::from_slice(&[dim]),
+            device,
         )?;
         let final_norm = LayerNorm::new(final_norm_w, final_norm_b, 1e-6);
         let final_adaln = loader.load_linear::<T, Cuda>(
             &format!("all_final_layer.{}.adaLN_modulation.1.weight", patch_key),
-            Some(&format!("all_final_layer.{}.adaLN_modulation.1.bias", patch_key)),
+            Some(&format!(
+                "all_final_layer.{}.adaLN_modulation.1.bias",
+                patch_key
+            )),
             device,
         )?;
         let final_proj = loader.load_linear::<T, Cuda>(
@@ -311,9 +354,8 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         )?;
 
         // RoPE.
-        let rope = RopeEmbedder3D::new(
-            config.axes_dims, config.axes_lens, config.rope_theta as f64,
-        )?;
+        let rope =
+            RopeEmbedder3D::new(config.axes_dims, config.axes_lens, config.rope_theta as f64)?;
 
         // Sanity-check: in_channels in config matches latent.
         let _ = patch_in_dim;
@@ -321,10 +363,18 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
 
         Ok(Self {
             config,
-            x_embedder, cap_embedder_norm, cap_embedder_linear, t_embedder,
-            x_pad_token, cap_pad_token,
-            noise_refiner, context_refiner, layers,
-            final_norm, final_adaln, final_proj,
+            x_embedder,
+            cap_embedder_norm,
+            cap_embedder_linear,
+            t_embedder,
+            x_pad_token,
+            cap_pad_token,
+            noise_refiner,
+            context_refiner,
+            layers,
+            final_norm,
+            final_adaln,
+            final_proj,
             rope,
         })
     }
@@ -374,7 +424,8 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let mut t_freq = vp2(&state.t_freq, 1, T_FREQ_DIM)?;
         let mut t_hidden = vp2(&state.t_hidden, 1, T_EMBEDDER_MID)?;
         let mut t_out = vp2(&state.t_out, 1, ADALN_EMBED_DIM)?;
-        self.t_embedder.forward_host(t_value_scaled, &mut t_freq, &mut t_hidden, &mut t_out)?;
+        self.t_embedder
+            .forward_host(t_value_scaled, &mut t_freq, &mut t_hidden, &mut t_out)?;
         let mut adaln_input = vp2(&state.adaln_input, 1, ADALN_EMBED_DIM)?;
         adaln_input.copy_from(&t_out)?;
 
@@ -401,9 +452,11 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let mut cap_padded_feats = vp2(&state.cap_feats_padded, s_cap, cap_feat_dim)?;
         Cuda::pad_last_row(cap_feats, &mut cap_padded_feats)?;
         let mut cap_normed = vp2(&state.cap_normed, s_cap, cap_feat_dim)?;
-        self.cap_embedder_norm.forward(&cap_padded_feats, &mut cap_normed)?;
+        self.cap_embedder_norm
+            .forward(&cap_padded_feats, &mut cap_normed)?;
         let mut cap_emb = vp2(&state.cap_emb, s_cap, dim)?;
-        self.cap_embedder_linear.forward(&cap_normed, &mut cap_emb)?;
+        self.cap_embedder_linear
+            .forward(&cap_normed, &mut cap_emb)?;
         let mut cap_padded = vp2(&state.cap_padded, s_cap, dim)?;
         cap_padded.copy_from(&cap_emb)?;
         Cuda::overwrite_pad_tokens_inplace(&mut cap_padded, &self.cap_pad_token, cap_ori)?;
@@ -415,8 +468,10 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let mut x_sin = vp2(&state.x_sin, s_img, half_d)?;
         let mut cap_cos = vp2(&state.cap_cos, s_cap, half_d)?;
         let mut cap_sin = vp2(&state.cap_sin, s_cap, half_d)?;
-        self.rope.embed_into_cuda(&img_pos_ids, s_img, &mut x_cos, &mut x_sin)?;
-        self.rope.embed_into_cuda(&cap_pos_ids, s_cap, &mut cap_cos, &mut cap_sin)?;
+        self.rope
+            .embed_into_cuda(&img_pos_ids, s_img, &mut x_cos, &mut x_sin)?;
+        self.rope
+            .embed_into_cuda(&cap_pos_ids, s_cap, &mut cap_cos, &mut cap_sin)?;
         if do_dump {
             super::dit_block::dump_tensor("step0_x_cos", &x_cos);
             super::dit_block::dump_tensor("step0_x_sin", &x_sin);
@@ -435,9 +490,13 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         // ── 6. noise_refiner on x ──
         run_block_chain::<T>(
             &self.noise_refiner,
-            &mut state.x_padded, &mut state.x_padded_tmp,
-            s_img, dim,
-            &x_cos, &x_sin, Some(&adaln_input),
+            &mut state.x_padded,
+            &mut state.x_padded_tmp,
+            s_img,
+            dim,
+            &x_cos,
+            &x_sin,
+            Some(&adaln_input),
             &mut state.block_scratch,
         )?;
         let x_final_in_padded = self.noise_refiner.len() % 2 == 0;
@@ -445,9 +504,13 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         // ── 7. context_refiner on cap (no modulation) ──
         run_block_chain::<T>(
             &self.context_refiner,
-            &mut state.cap_padded, &mut state.cap_padded_tmp,
-            s_cap, dim,
-            &cap_cos, &cap_sin, None,
+            &mut state.cap_padded,
+            &mut state.cap_padded_tmp,
+            s_cap,
+            dim,
+            &cap_cos,
+            &cap_sin,
+            None,
             &mut state.block_scratch,
         )?;
         let cap_final_in_padded = self.context_refiner.len() % 2 == 0;
@@ -473,9 +536,13 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         // ── 9. Main layers ──
         run_block_chain::<T>(
             &self.layers,
-            &mut state.unified, &mut state.unified_tmp,
-            s_total, dim,
-            &u_cos, &u_sin, Some(&adaln_input),
+            &mut state.unified,
+            &mut state.unified_tmp,
+            s_total,
+            dim,
+            &u_cos,
+            &u_sin,
+            Some(&adaln_input),
             &mut state.block_scratch,
         )?;
         let main_in_unified = self.layers.len() % 2 == 0;
@@ -508,7 +575,13 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         let valid_rows = vp2(&final_out, n, final_out_dim)?;
         let mut image_out = vp4(&state.image_out, self.config.in_channels, f, h, w)?;
         super::patchify::unpatchify_into(
-            &valid_rows, f, h, w, self.config.in_channels, p, pf,
+            &valid_rows,
+            f,
+            h,
+            w,
+            self.config.in_channels,
+            p,
+            pf,
             &mut image_out,
         )?;
         Ok(image_out)
@@ -539,42 +612,62 @@ fn load_dit_block<T: Dtype>(
 ) -> OpResult<DiTBlock<T, Cuda>> {
     // Norms.
     let attention_norm1 = loader.load_rmsnorm::<T, Cuda>(
-        &format!("{}.attention_norm1.weight", prefix), device, norm_eps,
+        &format!("{}.attention_norm1.weight", prefix),
+        device,
+        norm_eps,
     )?;
     let attention_norm2 = loader.load_rmsnorm::<T, Cuda>(
-        &format!("{}.attention_norm2.weight", prefix), device, norm_eps,
+        &format!("{}.attention_norm2.weight", prefix),
+        device,
+        norm_eps,
     )?;
     let ffn_norm1 = loader.load_rmsnorm::<T, Cuda>(
-        &format!("{}.ffn_norm1.weight", prefix), device, norm_eps,
+        &format!("{}.ffn_norm1.weight", prefix),
+        device,
+        norm_eps,
     )?;
     let ffn_norm2 = loader.load_rmsnorm::<T, Cuda>(
-        &format!("{}.ffn_norm2.weight", prefix), device, norm_eps,
+        &format!("{}.ffn_norm2.weight", prefix),
+        device,
+        norm_eps,
     )?;
 
     // qk-norm (per-head). Diffusers names: `attention.norm_q/norm_k.weight`.
     let norm_q = loader.load_rmsnorm::<T, Cuda>(
-        &format!("{}.attention.norm_q.weight", prefix), device, norm_eps,
+        &format!("{}.attention.norm_q.weight", prefix),
+        device,
+        norm_eps,
     )?;
     let norm_k = loader.load_rmsnorm::<T, Cuda>(
-        &format!("{}.attention.norm_k.weight", prefix), device, norm_eps,
+        &format!("{}.attention.norm_k.weight", prefix),
+        device,
+        norm_eps,
     )?;
 
     // Fused QKV: stack to_q/to_k/to_v ([dim, dim] each) → [3*dim, dim].
     let to_qkv = load_fused_qkv_dit::<T>(loader, prefix, dim, device)?;
     // to_out is `attention.to_out.0.weight` (the `.0` indexes a Sequential).
     let to_out = loader.load_linear::<T, Cuda>(
-        &format!("{}.attention.to_out.0.weight", prefix), None, device,
+        &format!("{}.attention.to_out.0.weight", prefix),
+        None,
+        device,
     )?;
 
     // FFN under `feed_forward.{w1,w2,w3}.weight`.
     let w1 = loader.load_linear::<T, Cuda>(
-        &format!("{}.feed_forward.w1.weight", prefix), None, device,
+        &format!("{}.feed_forward.w1.weight", prefix),
+        None,
+        device,
     )?;
     let w3 = loader.load_linear::<T, Cuda>(
-        &format!("{}.feed_forward.w3.weight", prefix), None, device,
+        &format!("{}.feed_forward.w3.weight", prefix),
+        None,
+        device,
     )?;
     let w2 = loader.load_linear::<T, Cuda>(
-        &format!("{}.feed_forward.w2.weight", prefix), None, device,
+        &format!("{}.feed_forward.w2.weight", prefix),
+        None,
+        device,
     )?;
 
     // AdaLN modulation (optional). diffusers uses `adaLN_modulation.0` (Linear).
@@ -589,13 +682,21 @@ fn load_dit_block<T: Dtype>(
     };
 
     Ok(DiTBlock {
-        attention_norm1, attention_norm2,
-        ffn_norm1, ffn_norm2,
-        to_qkv, to_out,
-        norm_q, norm_k,
-        w1, w3, w2,
+        attention_norm1,
+        attention_norm2,
+        ffn_norm1,
+        ffn_norm2,
+        to_qkv,
+        to_out,
+        norm_q,
+        norm_k,
+        w1,
+        w3,
+        w2,
         adaln_modulation,
-        dim, n_heads, head_dim,
+        dim,
+        n_heads,
+        head_dim,
         modulation,
     })
 }
@@ -617,7 +718,8 @@ fn load_fused_qkv_dit<T: Dtype>(
     // Read each [dim, dim] view.
     let mut host = vec![0u8; 3 * dim * dim * T::SIZE_BYTES];
     for (slot, name) in names.iter().enumerate() {
-        let view = loader.read_view(name)
+        let view = loader
+            .read_view(name)
             .map_err(|e| OpError::Kernel(format!("{}: {}", name, e)))?;
         let shape: Vec<usize> = view.shape().to_vec();
         if shape.len() != 2 || shape[0] != dim || shape[1] != dim {
@@ -644,7 +746,8 @@ fn load_fused_qkv_dit<T: Dtype>(
         } else {
             unsafe {
                 crate::models::loader::cast_bytes_pub(
-                    src, src_dt,
+                    src,
+                    src_dt,
                     host.as_mut_ptr().add(dst_off),
                     T::DATA_TYPE,
                     numel,
@@ -652,9 +755,8 @@ fn load_fused_qkv_dit<T: Dtype>(
             }
         }
     }
-    let fused = Tensor::<T, Cuda>::from_host_bytes(
-        &host, Shape::from_slice(&[3 * dim, dim]), device,
-    )?;
+    let fused =
+        Tensor::<T, Cuda>::from_host_bytes(&host, Shape::from_slice(&[3 * dim, dim]), device)?;
     Ok(Linear::new(fused, None))
 }
 
@@ -687,11 +789,13 @@ fn run_block_chain<T: Dtype>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::layers::{Linear, RMSNorm, LayerNorm};
     use crate::models::diffusion::state::ZImageCapacity;
+    use crate::models::layers::{LayerNorm, Linear, RMSNorm};
 
     fn make_linear<T: Dtype>(out: usize, in_: usize, cuda: &Cuda, seed: u64) -> Linear<T, Cuda>
-    where T: Dtype, Tensor<T, Cuda>: Sized
+    where
+        T: Dtype,
+        Tensor<T, Cuda>: Sized,
     {
         // For simplicity in this smoke test we always use f32 weights.
         unreachable!("only specialized below");
@@ -714,7 +818,12 @@ mod tests {
     }
 
     fn make_block_f32(
-        cuda: &Cuda, dim: usize, n_heads: usize, hidden: usize, modulation: bool, seed: u64,
+        cuda: &Cuda,
+        dim: usize,
+        n_heads: usize,
+        hidden: usize,
+        modulation: bool,
+        seed: u64,
     ) -> DiTBlock<f32, Cuda> {
         let head_dim = dim / n_heads;
         DiTBlock {
@@ -734,7 +843,10 @@ mod tests {
             } else {
                 None
             },
-            dim, n_heads, head_dim, modulation,
+            dim,
+            n_heads,
+            head_dim,
+            modulation,
         }
     }
 
@@ -755,17 +867,23 @@ mod tests {
         let n_layers = 2;
         let n_refiner = 2;
         // Latent 4x4 → patch 2x2 → 4 tokens, padded to SEQ_MULTI_OF=128.
-        let lh = 4; let lw = 4;
+        let lh = 4;
+        let lw = 4;
         let cap_len = 8; // < SEQ_MULTI_OF; padded to 128.
 
         // Build config + transformer.
         let cfg = ZImageTransformerConfig {
-            dim, n_layers, n_refiner_layers: n_refiner,
-            n_heads, n_kv_heads: n_heads,
+            dim,
+            n_layers,
+            n_refiner_layers: n_refiner,
+            n_heads,
+            n_kv_heads: n_heads,
             head_dim,
             intermediate_size: hidden,
-            in_channels, cap_feat_dim,
-            patch_size, f_patch_size: f_patch,
+            in_channels,
+            cap_feat_dim,
+            patch_size,
+            f_patch_size: f_patch,
             axes_dims: [4, 6, 6],     // 4+6+6=16=head_dim
             axes_lens: [256, 32, 32], // covers cap+1 (>128+1) and lh/p, lw/p
             norm_eps: 1e-5,
@@ -790,21 +908,39 @@ mod tests {
             t_embedder: t_emb,
             x_pad_token: x_pad,
             cap_pad_token: cap_pad,
-            noise_refiner: (0..n_refiner).map(|i| make_block_f32(&cuda, dim, n_heads, hidden, true, 300 + i as u64 * 10)).collect(),
-            context_refiner: (0..n_refiner).map(|i| make_block_f32(&cuda, dim, n_heads, hidden, false, 400 + i as u64 * 10)).collect(),
-            layers: (0..n_layers).map(|i| make_block_f32(&cuda, dim, n_heads, hidden, true, 500 + i as u64 * 10)).collect(),
+            noise_refiner: (0..n_refiner)
+                .map(|i| make_block_f32(&cuda, dim, n_heads, hidden, true, 300 + i as u64 * 10))
+                .collect(),
+            context_refiner: (0..n_refiner)
+                .map(|i| make_block_f32(&cuda, dim, n_heads, hidden, false, 400 + i as u64 * 10))
+                .collect(),
+            layers: (0..n_layers)
+                .map(|i| make_block_f32(&cuda, dim, n_heads, hidden, true, 500 + i as u64 * 10))
+                .collect(),
             final_norm: unit_layernorm_f32(dim, &cuda),
             final_adaln: rand_linear_f32(dim, ADALN_EMBED_DIM, &cuda, 600),
-            final_proj: rand_linear_f32(patch_size * patch_size * f_patch * in_channels, dim, &cuda, 601),
+            final_proj: rand_linear_f32(
+                patch_size * patch_size * f_patch * in_channels,
+                dim,
+                &cuda,
+                601,
+            ),
             rope: RopeEmbedder3D::new(cfg.axes_dims, cfg.axes_lens, cfg.rope_theta as f64).unwrap(),
         };
 
-        let cap = ZImageCapacity { max_height: lh * 8, max_width: lw * 8, max_cap_len: cap_len };
+        let cap = ZImageCapacity {
+            max_height: lh * 8,
+            max_width: lw * 8,
+            max_cap_len: cap_len,
+        };
         let spec = super::super::state::DitShapeSpec {
-            dim, n_heads, head_dim,
+            dim,
+            n_heads,
+            head_dim,
             hidden_dim: hidden,
             cap_feat_dim,
-            patch_size, f_patch_size: f_patch,
+            patch_size,
+            f_patch_size: f_patch,
             patch_in_dim,
             final_out_dim: patch_size * patch_size * f_patch * in_channels,
             capacity: cap,
@@ -812,8 +948,10 @@ mod tests {
         let mut state: DitState<f32, Cuda> = DitState::new(spec, &cuda).unwrap();
 
         // Random latent + cap_feats.
-        let latent: Tensor<f32, Cuda> = Tensor::randn([in_channels, 1, lh, lw], &cuda, Some(7)).unwrap();
-        let cap_feats: Tensor<f32, Cuda> = Tensor::randn([cap_len, cap_feat_dim], &cuda, Some(8)).unwrap();
+        let latent: Tensor<f32, Cuda> =
+            Tensor::randn([in_channels, 1, lh, lw], &cuda, Some(7)).unwrap();
+        let cap_feats: Tensor<f32, Cuda> =
+            Tensor::randn([cap_len, cap_feat_dim], &cuda, Some(8)).unwrap();
         let out = xform.forward(&latent, &cap_feats, 0.5, &mut state).unwrap();
         let v = out.to_host_vec().unwrap();
         // Output shape correct.
@@ -825,4 +963,6 @@ mod tests {
 }
 
 #[inline]
-fn round_up(n: usize, m: usize) -> usize { n.div_ceil(m) * m }
+fn round_up(n: usize, m: usize) -> usize {
+    n.div_ceil(m) * m
+}

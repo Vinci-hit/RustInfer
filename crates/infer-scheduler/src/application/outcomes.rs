@@ -14,9 +14,9 @@
 //! (with a fresh `&mut` borrow) for `Continue`, or unwinds the
 //! event loop with `WorkerError` for `Terminate`.
 
+use crate::domain::inference_session::lifecycle::RequestId;
 use crate::domain::worker_node::{Lost, WorkerNode};
 use crate::error::SchedulerError;
-use crate::domain::inference_session::lifecycle::RequestId;
 
 /// Result of processing a control-plane event.
 #[derive(Debug)]

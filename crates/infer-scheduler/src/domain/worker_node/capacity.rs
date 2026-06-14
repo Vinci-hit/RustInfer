@@ -67,7 +67,9 @@ impl Capacity {
     fn fold_min(self, other: &Self) -> Self {
         Self {
             max_batch_tokens: TokenCount::new(
-                self.max_batch_tokens.raw().min(other.max_batch_tokens.raw()),
+                self.max_batch_tokens
+                    .raw()
+                    .min(other.max_batch_tokens.raw()),
             ),
             max_batch_seqs: SeqCount::new(
                 self.max_batch_seqs.raw().min(other.max_batch_seqs.raw()),

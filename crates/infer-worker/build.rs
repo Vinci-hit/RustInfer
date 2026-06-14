@@ -2,14 +2,17 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    #[cfg(feature = "cuda")]{
+    #[cfg(feature = "cuda")]
+    {
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
-             return;
+            return;
         }
         let kernel_paths = find_files("src/infrastructure/cuda/kernels", "cu");
 
         if kernel_paths.is_empty() {
-            println!("cargo:warning=No CUDA kernel files (.cu) found in src/infrastructure/cuda/kernels/");
+            println!(
+                "cargo:warning=No CUDA kernel files (.cu) found in src/infrastructure/cuda/kernels/"
+            );
             // return; // 如果你希望在这种情况下停止构建
         }
         println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
@@ -24,7 +27,7 @@ fn main() {
         let cutlass_include = root.join("src/infrastructure/cuda/kernels/third_party");
         if !cutlass_include.exists() {
             panic!(
-                "Cutlass include directory not found at: {:?}", 
+                "Cutlass include directory not found at: {:?}",
                 cutlass_include
             );
         }
@@ -34,14 +37,15 @@ fn main() {
         eprintln!("RustInfer build: detected CUDA arch {}", cuda_arch);
 
         let mut build = cc::Build::new();
-        build.cuda(true)
-        .opt_level(3)
-        .debug(false)
-        .flag("-O3")
-        .flag("-w")
-        .include(&cutlass_include)
-        .flag("-std=c++17")
-        .flag(format!("-arch={}", cuda_arch));
+        build
+            .cuda(true)
+            .opt_level(3)
+            .debug(false)
+            .flag("-O3")
+            .flag("-w")
+            .include(&cutlass_include)
+            .flag("-std=c++17")
+            .flag(format!("-arch={}", cuda_arch));
 
         for path in &kernel_paths {
             build.file(path);
@@ -60,7 +64,10 @@ fn main() {
         let bindings = bindgen::Builder::default()
             .header("src/infrastructure/cuda/wrapper.h")
             // 告诉 bindgen/libclang CUDA 头文件的位置
-            .clang_arg(format!("-I{}/include", env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into())))
+            .clang_arg(format!(
+                "-I{}/include",
+                env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into())
+            ))
             .clang_arg("-I/usr/include/x86_64-linux-gnu")
             // wrapper.h 所在目录（让 #include "kernels/total_head.h" 能找到）
             .clang_arg("-Isrc/infrastructure/cuda")
@@ -175,11 +182,17 @@ fn detect_cuda_arch() -> String {
 
     // 2. 用 nvidia-smi 查询第一块 GPU 的 compute capability
     let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=compute_cap", "--format=csv,noheader,nounits", "-i", "0"])
+        .args([
+            "--query-gpu=compute_cap",
+            "--format=csv,noheader,nounits",
+            "-i",
+            "0",
+        ])
         .output();
 
     if let Ok(output) = output
-        && output.status.success() {
+        && output.status.success()
+    {
         let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
         // cap 格式如 "9.0", "8.9", "8.0"
         let sm = cap.replace('.', "");

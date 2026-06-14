@@ -76,7 +76,11 @@ impl FlowMatchEulerScheduler {
 
         let mut sigmas: Vec<f32> = (0..n)
             .map(|i| {
-                let t = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+                let t = if n == 1 {
+                    0.0
+                } else {
+                    i as f32 / (n - 1) as f32
+                };
                 1.0 + t * (sigma_min - 1.0)
             })
             .collect();
@@ -107,10 +111,18 @@ impl FlowMatchEulerScheduler {
         self.step_index = 0;
     }
 
-    pub fn timesteps(&self) -> &[f32] { &self.timesteps }
-    pub fn sigmas(&self) -> &[f32] { &self.sigmas }
-    pub fn num_steps(&self) -> usize { self.timesteps.len() }
-    pub fn reset(&mut self) { self.step_index = 0; }
+    pub fn timesteps(&self) -> &[f32] {
+        &self.timesteps
+    }
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len()
+    }
+    pub fn reset(&mut self) {
+        self.step_index = 0;
+    }
 
     /// Single Euler denoising step with the scheduler's internal counter.
     ///
@@ -194,8 +206,13 @@ mod tests {
         assert!((s.sigmas()[0] - 1.0).abs() < 1e-6);
         // Sigmas monotonically decreasing.
         for i in 1..s.sigmas().len() {
-            assert!(s.sigmas()[i] <= s.sigmas()[i - 1] + 1e-6,
-                "non-monotonic at {}: {} > {}", i, s.sigmas()[i], s.sigmas()[i - 1]);
+            assert!(
+                s.sigmas()[i] <= s.sigmas()[i - 1] + 1e-6,
+                "non-monotonic at {}: {} > {}",
+                i,
+                s.sigmas()[i],
+                s.sigmas()[i - 1]
+            );
         }
         // timesteps[i] = sigma[i] * 1000.
         for i in 0..s.num_steps() {
@@ -233,8 +250,10 @@ mod tests {
         // sigmas = [1.0, 0.3, 0.0]
         // step 0 dt = -0.7
         // step 1 dt = -0.3
-        let sample: Tensor<f32, Cpu> = Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [4], &dev).unwrap();
-        let mut velocity: Tensor<f32, Cpu> = Tensor::from_host_slice(&[10.0; 4], [4], &dev).unwrap();
+        let sample: Tensor<f32, Cpu> =
+            Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [4], &dev).unwrap();
+        let mut velocity: Tensor<f32, Cpu> =
+            Tensor::from_host_slice(&[10.0; 4], [4], &dev).unwrap();
         let mut dst_a: Tensor<f32, Cpu> = Tensor::zeros([4], &dev).unwrap();
         let mut dst_b: Tensor<f32, Cpu> = Tensor::zeros([4], &dev).unwrap();
         s.step(&mut velocity, &sample, &mut dst_a).unwrap();
@@ -243,7 +262,8 @@ mod tests {
         assert!((r1[0] - (-6.0)).abs() < 1e-5);
         assert!((r1[3] - (-3.0)).abs() < 1e-5);
         // Reset velocity (step() destructively scales it).
-        let mut velocity: Tensor<f32, Cpu> = Tensor::from_host_slice(&[10.0; 4], [4], &dev).unwrap();
+        let mut velocity: Tensor<f32, Cpu> =
+            Tensor::from_host_slice(&[10.0; 4], [4], &dev).unwrap();
         s.step(&mut velocity, &dst_a, &mut dst_b).unwrap();
         let r2 = dst_b.to_host_vec().unwrap();
         // [-6,-5,-4,-3] + (-0.3)*[10,10,10,10] = [-9,-8,-7,-6]
@@ -258,8 +278,10 @@ mod tests {
         let mut s = FlowMatchEulerScheduler::new(1000, 3.0);
         s.set_timesteps_from_sigmas(&[1.0]);
         let noise: Vec<f32> = vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
-        let sample: Tensor<f32, Cpu> = Tensor::from_host_slice(&noise, [noise.len()], &dev).unwrap();
-        let mut velocity: Tensor<f32, Cpu> = Tensor::from_host_slice(&noise, [noise.len()], &dev).unwrap();
+        let sample: Tensor<f32, Cpu> =
+            Tensor::from_host_slice(&noise, [noise.len()], &dev).unwrap();
+        let mut velocity: Tensor<f32, Cpu> =
+            Tensor::from_host_slice(&noise, [noise.len()], &dev).unwrap();
         let mut dst: Tensor<f32, Cpu> = Tensor::zeros([noise.len()], &dev).unwrap();
         s.step(&mut velocity, &sample, &mut dst).unwrap();
         for v in dst.to_host_vec().unwrap() {
@@ -283,7 +305,8 @@ mod tests {
         let n = 16usize;
         let sample_host: Vec<f32> = (0..n).map(|i| i as f32 + 1.0).collect();
         let vel_host: Vec<f32> = vec![10.0; n];
-        let cpu_sample: Tensor<f32, Cpu> = Tensor::from_host_slice(&sample_host, [n], &cpu).unwrap();
+        let cpu_sample: Tensor<f32, Cpu> =
+            Tensor::from_host_slice(&sample_host, [n], &cpu).unwrap();
         let mut cpu_vel: Tensor<f32, Cpu> = Tensor::from_host_slice(&vel_host, [n], &cpu).unwrap();
         let mut cpu_dst: Tensor<f32, Cpu> = Tensor::zeros([n], &cpu).unwrap();
         s_cpu.step(&mut cpu_vel, &cpu_sample, &mut cpu_dst).unwrap();
@@ -292,11 +315,18 @@ mod tests {
         // GPU bf16.
         let sample_bf16: Vec<bf16> = sample_host.iter().map(|x| bf16::from_f32(*x)).collect();
         let vel_bf16: Vec<bf16> = vel_host.iter().map(|x| bf16::from_f32(*x)).collect();
-        let gpu_sample: Tensor<bf16, Cuda> = Tensor::from_host_slice(&sample_bf16, [n], &cuda).unwrap();
-        let mut gpu_vel: Tensor<bf16, Cuda> = Tensor::from_host_slice(&vel_bf16, [n], &cuda).unwrap();
+        let gpu_sample: Tensor<bf16, Cuda> =
+            Tensor::from_host_slice(&sample_bf16, [n], &cuda).unwrap();
+        let mut gpu_vel: Tensor<bf16, Cuda> =
+            Tensor::from_host_slice(&vel_bf16, [n], &cuda).unwrap();
         let mut gpu_dst: Tensor<bf16, Cuda> = Tensor::zeros([n], &cuda).unwrap();
         s_gpu.step(&mut gpu_vel, &gpu_sample, &mut gpu_dst).unwrap();
-        let gpu_r: Vec<f32> = gpu_dst.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let gpu_r: Vec<f32> = gpu_dst
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
 
         for (a, b) in cpu_r.iter().zip(gpu_r.iter()) {
             assert!((a - b).abs() < 0.5, "cpu={} gpu={}", a, b);

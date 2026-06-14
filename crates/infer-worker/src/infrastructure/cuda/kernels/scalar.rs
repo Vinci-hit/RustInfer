@@ -1,33 +1,84 @@
 //! Scalar ops CUDA kernel wrappers (scalar mul/add, silu/tanh, device-scalar variants).
 
-use crate::domain::ports::{OpResult, OpError};
-use crate::domain::types::{DataType, Dtype};
+use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::{DataType, Dtype};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::cudaStream_t;
 use half::{bf16, f16};
 
 unsafe extern "C" {
     // dst = src * val
-    fn scalar_mul_f32_forward(dst: *mut f32,  src: *const f32,  val: f32, n: i32, stream: cudaStream_t);
-    fn scalar_mul_bf16_forward(dst: *mut bf16, src: *const bf16, val: f32, n: i32, stream: cudaStream_t);
-    fn scalar_mul_f16_forward (dst: *mut f16,  src: *const f16,  val: f32, n: i32, stream: cudaStream_t);
+    fn scalar_mul_f32_forward(
+        dst: *mut f32,
+        src: *const f32,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    fn scalar_mul_bf16_forward(
+        dst: *mut bf16,
+        src: *const bf16,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    fn scalar_mul_f16_forward(
+        dst: *mut f16,
+        src: *const f16,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
     // dst = src + val
-    fn scalar_add_f32_forward(dst: *mut f32,  src: *const f32,  val: f32, n: i32, stream: cudaStream_t);
-    fn scalar_add_bf16_forward(dst: *mut bf16, src: *const bf16, val: f32, n: i32, stream: cudaStream_t);
-    fn scalar_add_f16_forward (dst: *mut f16,  src: *const f16,  val: f32, n: i32, stream: cudaStream_t);
+    fn scalar_add_f32_forward(
+        dst: *mut f32,
+        src: *const f32,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    fn scalar_add_bf16_forward(
+        dst: *mut bf16,
+        src: *const bf16,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    fn scalar_add_f16_forward(
+        dst: *mut f16,
+        src: *const f16,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
     // x = silu(x), in-place
-    fn silu_inplace_f32_forward (data: *mut f32,  n: i32, stream: cudaStream_t);
+    fn silu_inplace_f32_forward(data: *mut f32, n: i32, stream: cudaStream_t);
     fn silu_inplace_bf16_forward(data: *mut bf16, n: i32, stream: cudaStream_t);
-    fn silu_inplace_f16_forward (data: *mut f16,  n: i32, stream: cudaStream_t);
+    fn silu_inplace_f16_forward(data: *mut f16, n: i32, stream: cudaStream_t);
     // x = tanh(x), in-place
-    fn tanh_inplace_f32_forward (data: *mut f32,  n: i32, stream: cudaStream_t);
+    fn tanh_inplace_f32_forward(data: *mut f32, n: i32, stream: cudaStream_t);
     fn tanh_inplace_bf16_forward(data: *mut bf16, n: i32, stream: cudaStream_t);
-    fn tanh_inplace_f16_forward (data: *mut f16,  n: i32, stream: cudaStream_t);
+    fn tanh_inplace_f16_forward(data: *mut f16, n: i32, stream: cudaStream_t);
     // x *= *d_val (device-side scalar pointer; CUDA Graph friendly)
-    fn scalar_mul_inplace_from_dev_f32_forward (x: *mut f32,  d_val: *const f32, n: i32, stream: cudaStream_t);
-    fn scalar_mul_inplace_from_dev_bf16_forward(x: *mut bf16, d_val: *const f32, n: i32, stream: cudaStream_t);
-    fn scalar_mul_inplace_from_dev_f16_forward (x: *mut f16,  d_val: *const f32, n: i32, stream: cudaStream_t);
+    fn scalar_mul_inplace_from_dev_f32_forward(
+        x: *mut f32,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    fn scalar_mul_inplace_from_dev_bf16_forward(
+        x: *mut bf16,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    fn scalar_mul_inplace_from_dev_f16_forward(
+        x: *mut f16,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
 }
 
 /// In-place scalar multiply: `x *= val`. Implemented as `dst=src,val` with
@@ -42,7 +93,12 @@ pub fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, scalar: f64) -> OpR
             DataType::F32 => scalar_mul_f32_forward(p as _, p as _, val, n, stream),
             DataType::BF16 => scalar_mul_bf16_forward(p as _, p as _, val, n, stream),
             DataType::F16 => scalar_mul_f16_forward(p as _, p as _, val, n, stream),
-            _ => return Err(OpError::Kernel(format!("scalar_mul_inplace: {:?}", T::DATA_TYPE))),
+            _ => {
+                return Err(OpError::Kernel(format!(
+                    "scalar_mul_inplace: {:?}",
+                    T::DATA_TYPE
+                )));
+            }
         }
     }
     Ok(())
@@ -59,7 +115,12 @@ pub fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, scalar: f64) -> OpR
             DataType::F32 => scalar_add_f32_forward(p as _, p as _, val, n, stream),
             DataType::BF16 => scalar_add_bf16_forward(p as _, p as _, val, n, stream),
             DataType::F16 => scalar_add_f16_forward(p as _, p as _, val, n, stream),
-            _ => return Err(OpError::Kernel(format!("scalar_add_inplace: {:?}", T::DATA_TYPE))),
+            _ => {
+                return Err(OpError::Kernel(format!(
+                    "scalar_add_inplace: {:?}",
+                    T::DATA_TYPE
+                )));
+            }
         }
     }
     Ok(())
@@ -113,7 +174,12 @@ pub fn scalar_mul_inplace_from_dev<T: Dtype>(
             DataType::F32 => scalar_mul_inplace_from_dev_f32_forward(p as _, dv, n, stream),
             DataType::BF16 => scalar_mul_inplace_from_dev_bf16_forward(p as _, dv, n, stream),
             DataType::F16 => scalar_mul_inplace_from_dev_f16_forward(p as _, dv, n, stream),
-            _ => return Err(OpError::Kernel(format!("scalar_mul_inplace_from_dev: {:?}", T::DATA_TYPE))),
+            _ => {
+                return Err(OpError::Kernel(format!(
+                    "scalar_mul_inplace_from_dev: {:?}",
+                    T::DATA_TYPE
+                )));
+            }
         }
     }
     Ok(())
@@ -139,10 +205,18 @@ mod tests {
     #[test]
     fn scalar_mul_inplace_bf16_basic() {
         let cuda = Cuda::new(0).unwrap();
-        let host: Vec<bf16> = vec![1.0, 2.0, -3.0, 4.5].iter().map(|&x| bf16::from_f32(x)).collect();
+        let host: Vec<bf16> = vec![1.0, 2.0, -3.0, 4.5]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
         let mut t: Tensor<bf16, Cuda> = Tensor::from_host_slice(&host, [4], &cuda).unwrap();
         scalar_mul_inplace(&mut t, 2.0).unwrap();
-        let got: Vec<f32> = t.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = t
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         let expected: Vec<f32> = host.iter().map(|x| x.to_f32() * 2.0).collect();
         for (a, b) in expected.iter().zip(got.iter()) {
             assert!((a - b).abs() < 0.05);
@@ -170,8 +244,14 @@ mod tests {
         let got = t.to_host_vec().unwrap();
         for (i, &x) in host.iter().enumerate() {
             let expected = x / (1.0 + (-x).exp());
-            assert!((got[i] - expected).abs() < 1e-5,
-                "silu mismatch at {}: x={}, got={}, expected={}", i, x, got[i], expected);
+            assert!(
+                (got[i] - expected).abs() < 1e-5,
+                "silu mismatch at {}: x={}, got={}, expected={}",
+                i,
+                x,
+                got[i],
+                expected
+            );
         }
     }
 
@@ -184,8 +264,14 @@ mod tests {
         let got = t.to_host_vec().unwrap();
         for (i, &x) in host.iter().enumerate() {
             let expected = x.tanh();
-            assert!((got[i] - expected).abs() < 1e-5,
-                "tanh mismatch at {}: x={}, got={}, expected={}", i, x, got[i], expected);
+            assert!(
+                (got[i] - expected).abs() < 1e-5,
+                "tanh mismatch at {}: x={}, got={}, expected={}",
+                i,
+                x,
+                got[i],
+                expected
+            );
         }
     }
 

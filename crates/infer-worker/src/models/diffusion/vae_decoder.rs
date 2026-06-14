@@ -12,7 +12,7 @@
 //! reusable scratches don't help much — eager allocation matches the
 //! reference implementation).
 
-use crate::domain::ports::{OpResult, OpError, OpBackend, CoreOps, DiffusionOps};
+use crate::domain::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
@@ -53,9 +53,12 @@ impl VaeConfig {
             .map_err(|e| OpError::Kernel(format!("vae config: {}", e)))?;
         let v: serde_json::Value = serde_json::from_str(&s)
             .map_err(|e| OpError::Kernel(format!("vae config parse: {}", e)))?;
-        let block_out_channels: Vec<usize> = v["block_out_channels"].as_array()
+        let block_out_channels: Vec<usize> = v["block_out_channels"]
+            .as_array()
             .ok_or_else(|| OpError::Kernel("vae config: missing block_out_channels".into()))?
-            .iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect();
+            .iter()
+            .map(|x| x.as_u64().unwrap_or(0) as usize)
+            .collect();
         Ok(Self {
             latent_channels: v["latent_channels"].as_u64().unwrap_or(16) as usize,
             out_channels: v["out_channels"].as_u64().unwrap_or(3) as usize,
@@ -70,10 +73,14 @@ impl VaeConfig {
 // ───────────────────────── ResnetBlock ─────────────────────────
 
 pub struct ResnetBlock<T: Dtype, D: OpBackend> {
-    pub norm1_w: Tensor<T, D>, pub norm1_b: Tensor<T, D>,
-    pub conv1_w: Tensor<T, D>, pub conv1_b: Tensor<T, D>,
-    pub norm2_w: Tensor<T, D>, pub norm2_b: Tensor<T, D>,
-    pub conv2_w: Tensor<T, D>, pub conv2_b: Tensor<T, D>,
+    pub norm1_w: Tensor<T, D>,
+    pub norm1_b: Tensor<T, D>,
+    pub conv1_w: Tensor<T, D>,
+    pub conv1_b: Tensor<T, D>,
+    pub norm2_w: Tensor<T, D>,
+    pub norm2_b: Tensor<T, D>,
+    pub conv2_w: Tensor<T, D>,
+    pub conv2_b: Tensor<T, D>,
     pub shortcut_w: Option<Tensor<T, D>>,
     pub shortcut_b: Option<Tensor<T, D>>,
     pub in_ch: usize,
@@ -127,7 +134,14 @@ impl<T: Dtype> VaeAttnBlock<T, Cuda> {
         let n = h * w;
         // GroupNorm.
         let mut normed: Tensor<T, Cuda> = Tensor::zeros([b, c, h, w], dev)?;
-        Cuda::groupnorm(x, &self.group_norm_w, &self.group_norm_b, &mut normed, NORM_GROUPS, EPS)?;
+        Cuda::groupnorm(
+            x,
+            &self.group_norm_w,
+            &self.group_norm_b,
+            &mut normed,
+            NORM_GROUPS,
+            EPS,
+        )?;
 
         // [B, C, H, W] → [B*N, C]: permute(0,2,3,1) then flatten last two.
         // We do this on-host via D2H → permute-by-index → H2D, since the new
@@ -148,17 +162,20 @@ impl<T: Dtype> VaeAttnBlock<T, Cuda> {
         let q3 = q.view_raw(
             Shape::from_slice(&[b * n, 1, c]),
             Shape::from_slice(&[c, c, 1]).contiguous_strides(),
-            q.offset_elems(), true,
+            q.offset_elems(),
+            true,
         );
         let k3 = k.view_raw(
             Shape::from_slice(&[b * n, 1, c]),
             Shape::from_slice(&[c, c, 1]).contiguous_strides(),
-            k.offset_elems(), true,
+            k.offset_elems(),
+            true,
         );
         let v3 = v.view_raw(
             Shape::from_slice(&[b * n, 1, c]),
             Shape::from_slice(&[c, c, 1]).contiguous_strides(),
-            v.offset_elems(), true,
+            v.offset_elems(),
+            true,
         );
         let mut attn: Tensor<T, Cuda> = Tensor::zeros([b * n, 1, c], dev)?;
         let scale = 1.0 / (c as f32).sqrt();
@@ -166,7 +183,8 @@ impl<T: Dtype> VaeAttnBlock<T, Cuda> {
         let attn_2d = attn.view_raw(
             Shape::from_slice(&[b * n, c]),
             Shape::from_slice(&[c, 1]).contiguous_strides(),
-            attn.offset_elems(), true,
+            attn.offset_elems(),
+            true,
         );
 
         // to_out projection.
@@ -187,12 +205,19 @@ impl<T: Dtype> VaeAttnBlock<T, Cuda> {
 /// Reshape `[B, C, H, W]` → `[B*N, C]` (`N = H*W`) where the inner-most
 /// axis is `C`. Goes through host memory (D2H → permute → H2D).
 fn permute_bchw_to_bnc<T: Dtype>(
-    x: &Tensor<T, Cuda>, b: usize, c: usize, h: usize, w: usize, dev: &Cuda,
+    x: &Tensor<T, Cuda>,
+    b: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    dev: &Cuda,
 ) -> OpResult<Tensor<T, Cuda>> {
     let n = h * w;
     let host = x.to_host_vec()?;
     let mut out: Vec<T> = Vec::with_capacity(b * n * c);
-    unsafe { out.set_len(b * n * c); }
+    unsafe {
+        out.set_len(b * n * c);
+    }
     // src indexed as src[bi, ci, hi, wi] = src[(((bi*c+ci)*h+hi)*w+wi)]
     // dst indexed as dst[bi*n + (hi*w + wi), ci]
     for bi in 0..b {
@@ -211,12 +236,19 @@ fn permute_bchw_to_bnc<T: Dtype>(
 
 /// Inverse: `[B*N, C]` → `[B, C, H, W]`.
 fn permute_bnc_to_bchw<T: Dtype>(
-    x: &Tensor<T, Cuda>, b: usize, c: usize, h: usize, w: usize, dev: &Cuda,
+    x: &Tensor<T, Cuda>,
+    b: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+    dev: &Cuda,
 ) -> OpResult<Tensor<T, Cuda>> {
     let n = h * w;
     let host = x.to_host_vec()?;
     let mut out: Vec<T> = Vec::with_capacity(b * c * h * w);
-    unsafe { out.set_len(b * c * h * w); }
+    unsafe {
+        out.set_len(b * c * h * w);
+    }
     for bi in 0..b {
         for ci in 0..c {
             for hi in 0..h {
@@ -249,7 +281,8 @@ impl<T: Dtype> UpBlock<T, Cuda> {
             let (bn, c, hi, wi) = (s[0], s[1], s[2], s[3]);
             let mut up: Tensor<T, Cuda> = Tensor::zeros([bn, c, 2 * hi, 2 * wi], dev)?;
             Cuda::upsample_nearest_2x(&x, &mut up)?;
-            let mut conv_out: Tensor<T, Cuda> = Tensor::zeros([bn, self.out_ch, 2 * hi, 2 * wi], dev)?;
+            let mut conv_out: Tensor<T, Cuda> =
+                Tensor::zeros([bn, self.out_ch, 2 * hi, 2 * wi], dev)?;
             Cuda::conv2d(&up, w, Some(b), &mut conv_out, 1, 1)?;
             x = conv_out;
         }
@@ -261,7 +294,8 @@ impl<T: Dtype> UpBlock<T, Cuda> {
 
 pub struct VaeDecoder<T: Dtype, D: OpBackend> {
     pub config: VaeConfig,
-    pub conv_in_w: Tensor<T, D>, pub conv_in_b: Tensor<T, D>,
+    pub conv_in_w: Tensor<T, D>,
+    pub conv_in_b: Tensor<T, D>,
     pub mid_resnet_0: ResnetBlock<T, D>,
     pub mid_attn: VaeAttnBlock<T, D>,
     pub mid_resnet_1: ResnetBlock<T, D>,
@@ -275,14 +309,11 @@ pub struct VaeDecoder<T: Dtype, D: OpBackend> {
 impl<T: Dtype> VaeDecoder<T, Cuda> {
     /// Load VAE decoder from a diffusers `vae/` directory.
     /// Expected: `config.json`, single `diffusion_pytorch_model.safetensors`.
-    pub fn from_pretrained<P: AsRef<std::path::Path>>(
-        vae_dir: P,
-        device: &Cuda,
-    ) -> OpResult<Self> {
+    pub fn from_pretrained<P: AsRef<std::path::Path>>(vae_dir: P, device: &Cuda) -> OpResult<Self> {
         let dir = vae_dir.as_ref();
         let config = VaeConfig::from_json(dir.join("config.json"))?;
-        let reader = SafetensorsReader::open(dir)
-            .map_err(|e| OpError::Kernel(format!("vae: {}", e)))?;
+        let reader =
+            SafetensorsReader::open(dir).map_err(|e| OpError::Kernel(format!("vae: {}", e)))?;
         let loader = WeightLoader::new(&reader);
 
         let boc = &config.block_out_channels;
@@ -293,9 +324,21 @@ impl<T: Dtype> VaeDecoder<T, Cuda> {
         let conv_in_b = loader.load_tensor::<T, Cuda>("decoder.conv_in.bias", device)?;
 
         // mid block: resnet_0 → attn → resnet_1
-        let mid_resnet_0 = load_resnet::<T>(&loader, "decoder.mid_block.resnets.0", mid_ch, mid_ch, device)?;
+        let mid_resnet_0 = load_resnet::<T>(
+            &loader,
+            "decoder.mid_block.resnets.0",
+            mid_ch,
+            mid_ch,
+            device,
+        )?;
         let mid_attn = load_attn::<T>(&loader, "decoder.mid_block.attentions.0", mid_ch, device)?;
-        let mid_resnet_1 = load_resnet::<T>(&loader, "decoder.mid_block.resnets.1", mid_ch, mid_ch, device)?;
+        let mid_resnet_1 = load_resnet::<T>(
+            &loader,
+            "decoder.mid_block.resnets.1",
+            mid_ch,
+            mid_ch,
+            device,
+        )?;
 
         // up_blocks: reversed channel order [512, 512, 256, 128].
         let n_blocks = boc.len();
@@ -308,35 +351,56 @@ impl<T: Dtype> VaeDecoder<T, Cuda> {
             for r in 0..num_resnets {
                 let in_c = if r == 0 { prev_out } else { out_ch_block };
                 let prefix = format!("decoder.up_blocks.{}.resnets.{}", i, r);
-                resnets.push(load_resnet::<T>(&loader, &prefix, in_c, out_ch_block, device)?);
+                resnets.push(load_resnet::<T>(
+                    &loader,
+                    &prefix,
+                    in_c,
+                    out_ch_block,
+                    device,
+                )?);
             }
             // Upsampler: present in up_blocks[0..n_blocks-1].
             let upsampler = if i < n_blocks - 1 {
                 let w = loader.load_tensor::<T, Cuda>(
-                    &format!("decoder.up_blocks.{}.upsamplers.0.conv.weight", i), device,
+                    &format!("decoder.up_blocks.{}.upsamplers.0.conv.weight", i),
+                    device,
                 )?;
                 let b = loader.load_tensor::<T, Cuda>(
-                    &format!("decoder.up_blocks.{}.upsamplers.0.conv.bias", i), device,
+                    &format!("decoder.up_blocks.{}.upsamplers.0.conv.bias", i),
+                    device,
                 )?;
                 Some((w, b))
-            } else { None };
-            up_blocks.push(UpBlock { resnets, upsampler, out_ch: out_ch_block });
+            } else {
+                None
+            };
+            up_blocks.push(UpBlock {
+                resnets,
+                upsampler,
+                out_ch: out_ch_block,
+            });
             prev_out = out_ch_block;
         }
 
         // Final norm + conv.
-        let conv_norm_out_w = loader.load_tensor::<T, Cuda>("decoder.conv_norm_out.weight", device)?;
-        let conv_norm_out_b = loader.load_tensor::<T, Cuda>("decoder.conv_norm_out.bias", device)?;
+        let conv_norm_out_w =
+            loader.load_tensor::<T, Cuda>("decoder.conv_norm_out.weight", device)?;
+        let conv_norm_out_b =
+            loader.load_tensor::<T, Cuda>("decoder.conv_norm_out.bias", device)?;
         let conv_out_w = loader.load_tensor::<T, Cuda>("decoder.conv_out.weight", device)?;
         let conv_out_b = loader.load_tensor::<T, Cuda>("decoder.conv_out.bias", device)?;
 
         Ok(Self {
             config,
-            conv_in_w, conv_in_b,
-            mid_resnet_0, mid_attn, mid_resnet_1,
+            conv_in_w,
+            conv_in_b,
+            mid_resnet_0,
+            mid_attn,
+            mid_resnet_1,
             up_blocks,
-            conv_norm_out_w, conv_norm_out_b,
-            conv_out_w, conv_out_b,
+            conv_norm_out_w,
+            conv_norm_out_b,
+            conv_out_w,
+            conv_out_b,
         })
     }
 
@@ -347,7 +411,14 @@ impl<T: Dtype> VaeDecoder<T, Cuda> {
         let mid_ch = self.mid_resnet_0.out_ch;
         // conv_in.
         let mut x: Tensor<T, Cuda> = Tensor::zeros([b, mid_ch, h, w], dev)?;
-        Cuda::conv2d(latents, &self.conv_in_w, Some(&self.conv_in_b), &mut x, 1, 1)?;
+        Cuda::conv2d(
+            latents,
+            &self.conv_in_w,
+            Some(&self.conv_in_b),
+            &mut x,
+            1,
+            1,
+        )?;
         // mid: resnet → attn → resnet.
         x = self.mid_resnet_0.forward(&x, dev)?;
         x = self.mid_attn.forward(&x, dev)?;
@@ -360,9 +431,23 @@ impl<T: Dtype> VaeDecoder<T, Cuda> {
         let s2 = x.shape().as_slice().to_vec();
         let (bn, ch_out, hh, ww) = (s2[0], s2[1], s2[2], s2[3]);
         let mut h2: Tensor<T, Cuda> = Tensor::zeros([bn, ch_out, hh, ww], dev)?;
-        Cuda::groupnorm_silu(&x, &self.conv_norm_out_w, &self.conv_norm_out_b, &mut h2, NORM_GROUPS, EPS)?;
+        Cuda::groupnorm_silu(
+            &x,
+            &self.conv_norm_out_w,
+            &self.conv_norm_out_b,
+            &mut h2,
+            NORM_GROUPS,
+            EPS,
+        )?;
         let mut out: Tensor<T, Cuda> = Tensor::zeros([bn, self.config.out_channels, hh, ww], dev)?;
-        Cuda::conv2d(&h2, &self.conv_out_w, Some(&self.conv_out_b), &mut out, 1, 1)?;
+        Cuda::conv2d(
+            &h2,
+            &self.conv_out_w,
+            Some(&self.conv_out_b),
+            &mut out,
+            1,
+            1,
+        )?;
         Ok(out)
     }
 }
@@ -388,15 +473,28 @@ fn load_resnet<T: Dtype>(
         let w_name = format!("{}.conv_shortcut.weight", prefix);
         if loader.has_tensor(&w_name) {
             let sw = loader.load_tensor::<T, Cuda>(&w_name, device)?;
-            let sb = loader.load_tensor::<T, Cuda>(&format!("{}.conv_shortcut.bias", prefix), device)?;
+            let sb =
+                loader.load_tensor::<T, Cuda>(&format!("{}.conv_shortcut.bias", prefix), device)?;
             (Some(sw), Some(sb))
-        } else { (None, None) }
-    } else { (None, None) };
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
     Ok(ResnetBlock {
-        norm1_w, norm1_b, conv1_w, conv1_b,
-        norm2_w, norm2_b, conv2_w, conv2_b,
-        shortcut_w, shortcut_b,
-        in_ch, out_ch,
+        norm1_w,
+        norm1_b,
+        conv1_w,
+        conv1_b,
+        norm2_w,
+        norm2_b,
+        conv2_w,
+        conv2_b,
+        shortcut_w,
+        shortcut_b,
+        in_ch,
+        out_ch,
     })
 }
 
@@ -406,21 +504,39 @@ fn load_attn<T: Dtype>(
     ch: usize,
     device: &Cuda,
 ) -> OpResult<VaeAttnBlock<T, Cuda>> {
-    let group_norm_w = loader.load_tensor::<T, Cuda>(&format!("{}.group_norm.weight", prefix), device)?;
-    let group_norm_b = loader.load_tensor::<T, Cuda>(&format!("{}.group_norm.bias", prefix), device)?;
+    let group_norm_w =
+        loader.load_tensor::<T, Cuda>(&format!("{}.group_norm.weight", prefix), device)?;
+    let group_norm_b =
+        loader.load_tensor::<T, Cuda>(&format!("{}.group_norm.bias", prefix), device)?;
     let to_q = loader.load_linear::<T, Cuda>(
-        &format!("{}.to_q.weight", prefix), Some(&format!("{}.to_q.bias", prefix)), device,
+        &format!("{}.to_q.weight", prefix),
+        Some(&format!("{}.to_q.bias", prefix)),
+        device,
     )?;
     let to_k = loader.load_linear::<T, Cuda>(
-        &format!("{}.to_k.weight", prefix), Some(&format!("{}.to_k.bias", prefix)), device,
+        &format!("{}.to_k.weight", prefix),
+        Some(&format!("{}.to_k.bias", prefix)),
+        device,
     )?;
     let to_v = loader.load_linear::<T, Cuda>(
-        &format!("{}.to_v.weight", prefix), Some(&format!("{}.to_v.bias", prefix)), device,
+        &format!("{}.to_v.weight", prefix),
+        Some(&format!("{}.to_v.bias", prefix)),
+        device,
     )?;
     let to_out = loader.load_linear::<T, Cuda>(
-        &format!("{}.to_out.0.weight", prefix), Some(&format!("{}.to_out.0.bias", prefix)), device,
+        &format!("{}.to_out.0.weight", prefix),
+        Some(&format!("{}.to_out.0.bias", prefix)),
+        device,
     )?;
-    Ok(VaeAttnBlock { group_norm_w, group_norm_b, to_q, to_k, to_v, to_out, channels: ch })
+    Ok(VaeAttnBlock {
+        group_norm_w,
+        group_norm_b,
+        to_q,
+        to_k,
+        to_v,
+        to_out,
+        channels: ch,
+    })
 }
 
 /// Load a ResnetBlock from `{prefix}.norm{1,2}.{weight,bias}`,
@@ -436,15 +552,23 @@ mod tests {
         (w, b)
     }
 
-    fn rand_conv_f32(out: usize, in_: usize, k: usize, cuda: &Cuda, seed: u64) -> (Tensor<f32, Cuda>, Tensor<f32, Cuda>) {
+    fn rand_conv_f32(
+        out: usize,
+        in_: usize,
+        k: usize,
+        cuda: &Cuda,
+        seed: u64,
+    ) -> (Tensor<f32, Cuda>, Tensor<f32, Cuda>) {
         let w: Tensor<f32, Cuda> = Tensor::randn([out, in_, k, k], cuda, Some(seed)).unwrap();
-        let b: Tensor<f32, Cuda> = Tensor::from_host_slice(&vec![0.0_f32; out], [out], cuda).unwrap();
+        let b: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&vec![0.0_f32; out], [out], cuda).unwrap();
         (w, b)
     }
 
     fn rand_linear_f32(out: usize, in_: usize, cuda: &Cuda, seed: u64) -> Linear<f32, Cuda> {
         let w: Tensor<f32, Cuda> = Tensor::randn([out, in_], cuda, Some(seed)).unwrap();
-        let b: Tensor<f32, Cuda> = Tensor::from_host_slice(&vec![0.0_f32; out], [out], cuda).unwrap();
+        let b: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&vec![0.0_f32; out], [out], cuda).unwrap();
         Linear::new(w, Some(b))
     }
 
@@ -477,12 +601,18 @@ mod tests {
             let (c1w, c1b) = rand_conv_f32(out_ch, in_ch, 3, &cuda, 1);
             let (c2w, c2b) = rand_conv_f32(out_ch, out_ch, 3, &cuda, 2);
             ResnetBlock {
-                norm1_w: n1w, norm1_b: n1b,
-                conv1_w: c1w, conv1_b: c1b,
-                norm2_w: n2w, norm2_b: n2b,
-                conv2_w: c2w, conv2_b: c2b,
-                shortcut_w: None, shortcut_b: None,
-                in_ch, out_ch,
+                norm1_w: n1w,
+                norm1_b: n1b,
+                conv1_w: c1w,
+                conv1_b: c1b,
+                norm2_w: n2w,
+                norm2_b: n2b,
+                conv2_w: c2w,
+                conv2_b: c2b,
+                shortcut_w: None,
+                shortcut_b: None,
+                in_ch,
+                out_ch,
             }
         };
         let x: Tensor<f32, Cuda> = Tensor::randn([b, in_ch, h, w], &cuda, Some(7)).unwrap();
@@ -502,16 +632,26 @@ mod tests {
             let (c1w, c1b) = rand_conv_f32(in_ch, in_ch, 3, &cuda, 10);
             let (c2w, c2b) = rand_conv_f32(in_ch, in_ch, 3, &cuda, 11);
             ResnetBlock {
-                norm1_w: n1w, norm1_b: n1b,
-                conv1_w: c1w, conv1_b: c1b,
-                norm2_w: n2w, norm2_b: n2b,
-                conv2_w: c2w, conv2_b: c2b,
-                shortcut_w: None, shortcut_b: None,
-                in_ch, out_ch: in_ch,
+                norm1_w: n1w,
+                norm1_b: n1b,
+                conv1_w: c1w,
+                conv1_b: c1b,
+                norm2_w: n2w,
+                norm2_b: n2b,
+                conv2_w: c2w,
+                conv2_b: c2b,
+                shortcut_w: None,
+                shortcut_b: None,
+                in_ch,
+                out_ch: in_ch,
             }
         };
         let (uw, ub) = rand_conv_f32(in_ch, in_ch, 3, &cuda, 20);
-        let up = UpBlock { resnets: vec![resnet], upsampler: Some((uw, ub)), out_ch: in_ch };
+        let up = UpBlock {
+            resnets: vec![resnet],
+            upsampler: Some((uw, ub)),
+            out_ch: in_ch,
+        };
         let x: Tensor<f32, Cuda> = Tensor::randn([b, in_ch, h, w], &cuda, Some(15)).unwrap();
         let out = up.forward(x, &cuda).unwrap();
         assert_eq!(out.shape().as_slice(), &[b, in_ch, h * 2, w * 2]);
@@ -524,7 +664,8 @@ mod tests {
         let (b, h, w) = (1, 4, 4);
         let (gw, gb) = unit_norm_f32(c, &cuda);
         let attn: VaeAttnBlock<f32, Cuda> = VaeAttnBlock {
-            group_norm_w: gw, group_norm_b: gb,
+            group_norm_w: gw,
+            group_norm_b: gb,
             to_q: rand_linear_f32(c, c, &cuda, 30),
             to_k: rand_linear_f32(c, c, &cuda, 31),
             to_v: rand_linear_f32(c, c, &cuda, 32),

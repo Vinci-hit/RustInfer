@@ -10,14 +10,14 @@
 use std::collections::HashSet;
 
 use crate::config::SchedulerConfig;
-use crate::error::{Result, SchedulerError};
 use crate::domain::inference_session::lifecycle::{InferenceSession, Prefilling, RequestId};
+use crate::error::{Result, SchedulerError};
 use crate::infrastructure::kv_cache::radix_tree::GlobalIndex;
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 
 use infer_protocol::scheduler_to_worker_data::{
-    BatchCommand, DiffusionBatchCmd, DiffusionBatchItem, PrefillBatchCmd,
-    PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams as WorkerSamplingParams,
+    BatchCommand, DiffusionBatchCmd, DiffusionBatchItem, PrefillBatchCmd, PrefillSegmentCompletion,
+    PrefillSegmentMeta, SamplingParams as WorkerSamplingParams,
 };
 
 /// Serializes scheduler output into wire-format `BatchCommand`s,
@@ -76,8 +76,7 @@ impl BatchBuilder {
         if scheduled_requests.is_empty() {
             return Ok(Vec::new());
         }
-        let selected: HashSet<&RequestId> =
-            scheduled_requests.iter().map(|(id, _)| id).collect();
+        let selected: HashSet<&RequestId> = scheduled_requests.iter().map(|(id, _)| id).collect();
         self.diffusion_requests.clear();
 
         for seq in prefilling {
@@ -114,7 +113,9 @@ impl BatchBuilder {
         }
         // We hand ownership to the wire frame to avoid a Vec clone.
         let requests = std::mem::take(&mut self.diffusion_requests);
-        codec.encode(&BatchCommand::DiffusionBatch(DiffusionBatchCmd { requests }))
+        codec.encode(&BatchCommand::DiffusionBatch(DiffusionBatchCmd {
+            requests,
+        }))
     }
 
     fn build_prefill_cmd(
@@ -128,8 +129,7 @@ impl BatchBuilder {
         self.input_ids_all.clear();
         self.q_start_loc.clear();
         self.segments.clear();
-        let selected: HashSet<&RequestId> =
-            scheduled_segments.iter().map(|(id, _)| id).collect();
+        let selected: HashSet<&RequestId> = scheduled_segments.iter().map(|(id, _)| id).collect();
 
         for seq in prefilling {
             if !selected.contains(&seq.meta.id) {
@@ -315,7 +315,10 @@ mod tests {
             panic!("expected prefill command");
         };
         let segment = &prefill.segments[0];
-        assert_eq!(segment.prefix_hint.as_deref(), Some(&[100u32, 101, 102][..]));
+        assert_eq!(
+            segment.prefix_hint.as_deref(),
+            Some(&[100u32, 101, 102][..])
+        );
     }
 
     /// After a build, reusing the same builder for a second batch

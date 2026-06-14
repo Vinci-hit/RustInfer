@@ -38,16 +38,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 
-use crate::infrastructure::kv_cache::traits::PrefixMatch;
-use crate::error::{Result, SchedulerError};
 use crate::domain::inference_session::handle::{ClientId, RequestHandle};
 use crate::domain::inference_session::lifecycle::{
-    Decoding, InFlightPrefillSegment, InferenceSession, Prefilling, Queued, RequestId,
-    RequestMeta, SequenceId,
+    Decoding, InFlightPrefillSegment, InferenceSession, Prefilling, Queued, RequestId, RequestMeta,
+    SequenceId,
 };
 use crate::domain::inference_session::queue::WaitingQueue;
+use crate::error::{Result, SchedulerError};
+use crate::infrastructure::kv_cache::traits::PrefixMatch;
 
 new_key_type! {
     /// Generational handle into a state-bucket SlotMap.
@@ -301,10 +301,9 @@ impl RequestTable {
     }
 
     pub fn take_waiting(&mut self, request_id: &RequestId) -> Result<InferenceSession<Queued>> {
-        let seq = self
-            .waiting
-            .remove(request_id)
-            .ok_or_else(|| SchedulerError::Internal(format!("waiting request not found: {}", request_id)))?;
+        let seq = self.waiting.remove(request_id).ok_or_else(|| {
+            SchedulerError::Internal(format!("waiting request not found: {}", request_id))
+        })?;
         self.expect_bucket(seq.meta.sequence_id, Bucket::Waiting)?;
         self.locations.remove(&seq.meta.sequence_id);
         Ok(seq)
@@ -420,14 +419,13 @@ impl RequestTable {
                 request_id
             )));
         }
-        let sequence_id = self
-            .sequence_id_for(request_id)
-            .ok_or_else(|| SchedulerError::Internal(format!("request not found: {}", request_id)))?;
+        let sequence_id = self.sequence_id_for(request_id).ok_or_else(|| {
+            SchedulerError::Internal(format!("request not found: {}", request_id))
+        })?;
         let key = self.prefilling_key(sequence_id)?;
-        let seq = self
-            .prefilling
-            .get_mut(key)
-            .ok_or_else(|| SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id)))?;
+        let seq = self.prefilling.get_mut(key).ok_or_else(|| {
+            SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
+        })?;
         if seq.has_inflight() {
             return Err(SchedulerError::Internal(format!(
                 "prefilling sequence already has inflight segment: {}",
@@ -450,15 +448,17 @@ impl RequestTable {
             )));
         }
         seq.set_inflight(start, end);
-        Ok(seq.state.inflight.expect("set_inflight must populate segment"))
+        Ok(seq
+            .state
+            .inflight
+            .expect("set_inflight must populate segment"))
     }
 
     pub fn ack_prefill(&mut self, sequence_id: SequenceId) -> Result<PrefillAckOutcome> {
         let key = self.prefilling_key(sequence_id)?;
-        let mut seq = self
-            .prefilling
-            .remove(key)
-            .ok_or_else(|| SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id)))?;
+        let mut seq = self.prefilling.remove(key).ok_or_else(|| {
+            SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
+        })?;
         let Some(inflight) = seq.ack_inflight() else {
             // Restore so the table doesn't lose the session on a non-fatal error.
             let new_key = self.prefilling.insert(seq);
@@ -516,10 +516,9 @@ impl RequestTable {
         worker_finished: bool,
     ) -> Result<TokenAppendOutcome> {
         let key = self.decoding_key(sequence_id)?;
-        let seq = self
-            .decoding
-            .get_mut(key)
-            .ok_or_else(|| SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id)))?;
+        let seq = self.decoding.get_mut(key).ok_or_else(|| {
+            SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
+        })?;
         seq.append_token(token_id);
         Ok(TokenAppendOutcome {
             request_id: seq.meta.id.clone(),
@@ -532,12 +531,14 @@ impl RequestTable {
         })
     }
 
-    pub fn finish_decoding(&mut self, sequence_id: SequenceId) -> Result<InferenceSession<Decoding>> {
+    pub fn finish_decoding(
+        &mut self,
+        sequence_id: SequenceId,
+    ) -> Result<InferenceSession<Decoding>> {
         let key = self.decoding_key(sequence_id)?;
-        let seq = self
-            .decoding
-            .remove(key)
-            .ok_or_else(|| SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id)))?;
+        let seq = self.decoding.remove(key).ok_or_else(|| {
+            SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
+        })?;
         self.remove_active(seq.meta.id.clone(), sequence_id)?;
         debug_assert!(self.validate_consistency().is_ok());
         Ok(seq)
@@ -568,7 +569,11 @@ impl RequestTable {
         }
     }
 
-    pub fn fail_sequence(&mut self, sequence_id: SequenceId, _message: &str) -> Result<FailedOutcome> {
+    pub fn fail_sequence(
+        &mut self,
+        sequence_id: SequenceId,
+        _message: &str,
+    ) -> Result<FailedOutcome> {
         let Some(addr) = self.locations.get(&sequence_id).copied() else {
             return Ok(FailedOutcome::NotFound { sequence_id });
         };
@@ -580,10 +585,7 @@ impl RequestTable {
                 })?;
                 let request_id = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(
-                    request_id.clone(),
-                    sequence_id,
-                )?;
+                self.remove_active(request_id.clone(), sequence_id)?;
                 Ok(FailedOutcome::RemovedPrefilling {
                     request_id,
                     external_id,
@@ -597,10 +599,7 @@ impl RequestTable {
                 })?;
                 let request_id = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(
-                    request_id.clone(),
-                    sequence_id,
-                )?;
+                self.remove_active(request_id.clone(), sequence_id)?;
                 Ok(FailedOutcome::RemovedDecoding {
                     request_id,
                     external_id,
@@ -635,17 +634,14 @@ impl RequestTable {
         let Some(sequence_id) = self.sequence_id_for(request_id) else {
             return Ok(CancelOutcome::NotFound);
         };
-        let addr = self
-            .locations
-            .get(&sequence_id)
-            .copied()
-            .ok_or_else(|| SchedulerError::Internal(format!("request index has no location: {}", request_id)))?;
+        let addr = self.locations.get(&sequence_id).copied().ok_or_else(|| {
+            SchedulerError::Internal(format!("request index has no location: {}", request_id))
+        })?;
         match addr.bucket {
             Bucket::Waiting => {
-                let seq = self
-                    .waiting
-                    .remove(request_id)
-                    .ok_or_else(|| SchedulerError::Internal(format!("waiting request not found: {}", request_id)))?;
+                let seq = self.waiting.remove(request_id).ok_or_else(|| {
+                    SchedulerError::Internal(format!("waiting request not found: {}", request_id))
+                })?;
                 self.remove_active(request_id.clone(), sequence_id)?;
                 Ok(CancelOutcome::RemovedWaiting {
                     request_id: seq.meta.id.clone(),
@@ -733,16 +729,12 @@ impl RequestTable {
     /// Returns `Err(Internal)` if the sequence is missing or in a
     /// non-active bucket.
     pub fn preempt_to_queued(&mut self, sequence_id: SequenceId) -> Result<()> {
-        let addr = self
-            .locations
-            .get(&sequence_id)
-            .copied()
-            .ok_or_else(|| {
-                SchedulerError::Internal(format!(
-                    "preempt_to_queued: sequence_id={} has no active location",
-                    sequence_id
-                ))
-            })?;
+        let addr = self.locations.get(&sequence_id).copied().ok_or_else(|| {
+            SchedulerError::Internal(format!(
+                "preempt_to_queued: sequence_id={} has no active location",
+                sequence_id
+            ))
+        })?;
 
         match addr.bucket {
             Bucket::Decoding => {
@@ -758,8 +750,7 @@ impl RequestTable {
                     handle: seq.handle,
                     state: Queued { prefix_match: None },
                 };
-                self.locations
-                    .insert(sequence_id, Address::waiting());
+                self.locations.insert(sequence_id, Address::waiting());
                 self.waiting.push_front(queued);
                 debug_assert!(self.validate_consistency().is_ok());
                 Ok(())
@@ -776,8 +767,7 @@ impl RequestTable {
                     handle: seq.handle,
                     state: Queued { prefix_match: None },
                 };
-                self.locations
-                    .insert(sequence_id, Address::waiting());
+                self.locations.insert(sequence_id, Address::waiting());
                 self.waiting.push_front(queued);
                 debug_assert!(self.validate_consistency().is_ok());
                 Ok(())
@@ -899,7 +889,10 @@ impl RequestTable {
 
     fn prefilling_key(&self, sequence_id: SequenceId) -> Result<SessionKey> {
         let addr = self.locations.get(&sequence_id).copied().ok_or_else(|| {
-            SchedulerError::Internal(format!("sequence_id={} has no active location", sequence_id))
+            SchedulerError::Internal(format!(
+                "sequence_id={} has no active location",
+                sequence_id
+            ))
         })?;
         if addr.bucket != Bucket::Prefilling {
             return Err(SchedulerError::Internal(format!(
@@ -912,7 +905,10 @@ impl RequestTable {
 
     fn decoding_key(&self, sequence_id: SequenceId) -> Result<SessionKey> {
         let addr = self.locations.get(&sequence_id).copied().ok_or_else(|| {
-            SchedulerError::Internal(format!("sequence_id={} has no active location", sequence_id))
+            SchedulerError::Internal(format!(
+                "sequence_id={} has no active location",
+                sequence_id
+            ))
         })?;
         if addr.bucket != Bucket::Decoding {
             return Err(SchedulerError::Internal(format!(
@@ -923,11 +919,7 @@ impl RequestTable {
         Ok(addr.key)
     }
 
-    fn remove_active(
-        &mut self,
-        request_id: RequestId,
-        sequence_id: SequenceId,
-    ) -> Result<()> {
+    fn remove_active(&mut self, request_id: RequestId, sequence_id: SequenceId) -> Result<()> {
         match self.by_request.remove(&request_id) {
             Some(id) if id == sequence_id => {}
             Some(id) => {
@@ -956,11 +948,16 @@ impl RequestTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::kv_cache::traits::PrefixMatch;
     use crate::domain::inference_session::lifecycle::{Priority, SamplingParams};
+    use crate::infrastructure::kv_cache::traits::PrefixMatch;
     use std::time::Instant;
 
-    fn meta(request_id: &str, sequence_id: u64, prompt_len: usize, max_tokens: usize) -> Arc<RequestMeta> {
+    fn meta(
+        request_id: &str,
+        sequence_id: u64,
+        prompt_len: usize,
+        max_tokens: usize,
+    ) -> Arc<RequestMeta> {
         Arc::new(RequestMeta {
             id: RequestId::new_v4(),
             external_id: request_id.to_string(),
@@ -984,7 +981,9 @@ mod tests {
     #[test]
     fn insert_allows_duplicate_external_id_distinct_internal_ids() {
         let mut table = RequestTable::new();
-        table.insert_new(meta("req", 1, 4, 8), RequestHandle::noop()).unwrap();
+        table
+            .insert_new(meta("req", 1, 4, 8), RequestHandle::noop())
+            .unwrap();
         table
             .insert_new(meta("req", 2, 4, 8), RequestHandle::noop())
             .expect("duplicate external_id is allowed; internal ids are uuids");
@@ -995,10 +994,14 @@ mod tests {
     #[test]
     fn insert_rejects_duplicate_sequence_id() {
         let mut table = RequestTable::new();
-        table.insert_new(meta("req-a", 1, 4, 8), RequestHandle::noop()).unwrap();
-        assert!(table
-            .insert_new(meta("req-b", 1, 4, 8), RequestHandle::noop())
-            .is_err());
+        table
+            .insert_new(meta("req-a", 1, 4, 8), RequestHandle::noop())
+            .unwrap();
+        assert!(
+            table
+                .insert_new(meta("req-b", 1, 4, 8), RequestHandle::noop())
+                .is_err()
+        );
         assert!(table.validate_consistency().is_ok());
     }
 
@@ -1009,13 +1012,13 @@ mod tests {
         let request_id = m.id.clone();
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&request_id).unwrap();
-        let outcome = table
-            .commit_prefill_start(queued, no_prefix(), 4)
-            .unwrap();
+        let outcome = table.commit_prefill_start(queued, no_prefix(), 4).unwrap();
         assert!(matches!(outcome, PrefillStartOutcome::Scheduled { .. }));
         let ack = table.ack_prefill(SequenceId(7)).unwrap();
         assert!(matches!(ack, PrefillAckOutcome::MovedToDecoding { .. }));
-        let token = table.append_generated_token(SequenceId(7), 42, true).unwrap();
+        let token = table
+            .append_generated_token(SequenceId(7), 42, true)
+            .unwrap();
         assert_eq!(token.token_id, 42);
         let seq = table.finish_decoding(SequenceId(7)).unwrap();
         assert_eq!(seq.state.output_tokens, vec![42]);
@@ -1106,33 +1109,19 @@ mod tests {
         let m = meta("req", 5, 2, 4);
         let req = m.id.clone();
         table.insert_new(m, RequestHandle::noop()).unwrap();
-        assert_eq!(
-            table.location_for_request(&req),
-            Some(Bucket::Waiting)
-        );
+        assert_eq!(table.location_for_request(&req), Some(Bucket::Waiting));
         let queued = table.take_waiting(&req).unwrap();
         // Schedule a chunked prefill (1 token of 2): leaves session in Prefilling.
-        table
-            .commit_prefill_start(queued, no_prefix(), 1)
-            .unwrap();
-        assert_eq!(
-            table.location_for_request(&req),
-            Some(Bucket::Prefilling)
-        );
+        table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
+        assert_eq!(table.location_for_request(&req), Some(Bucket::Prefilling));
         // Ack the partial; remaining=1 so still Prefilling, no inflight set.
         let _ = table.ack_prefill(SequenceId(5)).unwrap();
-        assert_eq!(
-            table.location_for_request(&req),
-            Some(Bucket::Prefilling)
-        );
+        assert_eq!(table.location_for_request(&req), Some(Bucket::Prefilling));
         // Reschedule the trailing token.
         let _ = table.set_prefill_inflight(&req, 1).unwrap();
         // Ack the final segment → moves to Decoding.
         let _ = table.ack_prefill(SequenceId(5)).unwrap();
-        assert_eq!(
-            table.location_for_request(&req),
-            Some(Bucket::Decoding)
-        );
+        assert_eq!(table.location_for_request(&req), Some(Bucket::Decoding));
     }
 
     // ─── Preemption candidate / preempt_to_queued ────────────────────
@@ -1147,9 +1136,7 @@ mod tests {
         let queued = table.take_waiting(&req_a).unwrap();
         // Schedule a tiny chunk → enters Prefilling with inflight set,
         // but num_computed_tokens still 0.
-        table
-            .commit_prefill_start(queued, no_prefix(), 1)
-            .unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
         let cands = table.preemption_candidates();
         assert!(
             cands.iter().all(|c| c.sequence_id != 1),
@@ -1164,9 +1151,7 @@ mod tests {
         let req = m.id.clone();
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
-        table
-            .commit_prefill_start(queued, no_prefix(), 1)
-            .unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
         // Ack first chunk → num_computed_tokens = 1, still Prefilling.
         let _ = table.ack_prefill(SequenceId(5)).unwrap();
         let cands = table.preemption_candidates();
@@ -1190,11 +1175,11 @@ mod tests {
         let req = m.id.clone();
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
-        table
-            .commit_prefill_start(queued, no_prefix(), 2)
-            .unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 2).unwrap();
         let _ = table.ack_prefill(SequenceId(7)).unwrap();
-        let _ = table.append_generated_token(SequenceId(7), 99, false).unwrap();
+        let _ = table
+            .append_generated_token(SequenceId(7), 99, false)
+            .unwrap();
 
         table.preempt_to_queued(SequenceId(7)).unwrap();
 
@@ -1204,9 +1189,7 @@ mod tests {
         // Bumped preemption_count survives a full lifecycle (meta is Arc).
         // Re-promote → Decode → Finish, and inspect num_preemptions.
         let queued = table.take_waiting(&req).unwrap();
-        table
-            .commit_prefill_start(queued, no_prefix(), 2)
-            .unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 2).unwrap();
         let _ = table.ack_prefill(SequenceId(7)).unwrap();
         // The counter resides on Decoding state; preempt-then-rebuild
         // rebuilds Decoding starting at preemption_count=0. The bump
@@ -1214,7 +1197,9 @@ mod tests {
         // — confirmed by the front-of-waiting check above. The
         // post-rebuild state is a fresh Decoding by design.
         // Instead assert that another preempt round bumps cleanly.
-        let _ = table.append_generated_token(SequenceId(7), 11, false).unwrap();
+        let _ = table
+            .append_generated_token(SequenceId(7), 11, false)
+            .unwrap();
         table.preempt_to_queued(SequenceId(7)).unwrap();
         let _ = req_back; // keep alive
     }
@@ -1226,9 +1211,7 @@ mod tests {
         let req = m.id.clone();
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
-        table
-            .commit_prefill_start(queued, no_prefix(), 1)
-            .unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
         let _ = table.ack_prefill(SequenceId(3)).unwrap();
 
         table.preempt_to_queued(SequenceId(3)).unwrap();
@@ -1245,9 +1228,7 @@ mod tests {
     #[test]
     fn preempt_to_queued_unknown_seq_errors() {
         let mut table = RequestTable::new();
-        let err = table
-            .preempt_to_queued(SequenceId(999))
-            .unwrap_err();
+        let err = table.preempt_to_queued(SequenceId(999)).unwrap_err();
         assert!(matches!(err, SchedulerError::Internal(_)));
     }
 }

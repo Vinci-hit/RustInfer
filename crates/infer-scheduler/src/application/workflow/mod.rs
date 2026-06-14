@@ -74,8 +74,8 @@ pub trait EngineWorkflow: Send + Sync {
     ) -> ControlOutcome;
 }
 
-mod llm;
 mod diffusion;
+mod llm;
 
 pub use diffusion::DiffusionWorkflow;
 pub use llm::LlmWorkflow;

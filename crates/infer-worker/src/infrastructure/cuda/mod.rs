@@ -4,12 +4,12 @@
 //! Contains: FFI bindings, CudaConfig (handles), thread-local stream,
 //! and kernel dispatch wrappers.
 
-pub mod ffi;
-pub mod error;
-pub mod device_utils;
-pub mod thread_stream;
 pub mod config;
+pub mod device_utils;
+pub mod error;
+pub mod ffi;
 pub mod kernels;
+pub mod thread_stream;
 
 pub use config::{CudaConfig, GraphSlot};
 pub use error::CudaError;
@@ -18,9 +18,9 @@ pub use thread_stream::{get_current_cuda_stream, with_cuda_stream};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::domain::ports::{Device, MemoryPort, CoreOps, LlmOps, DiffusionOps, OpError, OpResult};
+use crate::domain::ports::{CoreOps, Device, DiffusionOps, LlmOps, MemoryPort, OpError, OpResult};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::{Dtype};
+use crate::domain::types::Dtype;
 
 /// CUDA device — carries device_id + shared CudaConfig (handles, stream).
 #[derive(Debug, Clone)]
@@ -31,8 +31,12 @@ pub struct Cuda {
 
 impl Device for Cuda {
     type ExecCtx = CudaConfig;
-    fn exec_ctx(&self) -> &CudaConfig { &self.config }
-    fn name(&self) -> &'static str { "cuda" }
+    fn exec_ctx(&self) -> &CudaConfig {
+        &self.config
+    }
+    fn name(&self) -> &'static str {
+        "cuda"
+    }
 }
 
 impl Cuda {
@@ -40,8 +44,10 @@ impl Cuda {
     pub fn new(device_id: i32) -> Result<Self, OpError> {
         device_utils::set_current_device(device_id)
             .map_err(|e| OpError::Kernel(format!("set device failed: {}", e)))?;
-        let config = Arc::new(CudaConfig::new()
-            .map_err(|e| OpError::Kernel(format!("CudaConfig::new failed: {}", e)))?);
+        let config = Arc::new(
+            CudaConfig::new()
+                .map_err(|e| OpError::Kernel(format!("CudaConfig::new failed: {}", e)))?,
+        );
         Ok(Self { device_id, config })
     }
 }
@@ -56,7 +62,10 @@ impl MemoryPort for Cuda {
         unsafe {
             let code = ffi::cudaMalloc(&mut ptr, n);
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaMalloc({}) failed: {:?}", n, code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaMalloc({}) failed: {:?}",
+                    n, code
+                )));
             }
             let code = ffi::cudaMemset(ptr, 0, n);
             if code != ffi::cudaError_cudaSuccess {
@@ -70,11 +79,15 @@ impl MemoryPort for Cuda {
 
     unsafe fn free_bytes(&self, ptr: NonNull<u8>, _size: usize) {
         // SAFETY: ptr came from cudaMalloc.
-        unsafe { ffi::cudaFree(ptr.as_ptr() as *mut std::ffi::c_void); }
+        unsafe {
+            ffi::cudaFree(ptr.as_ptr() as *mut std::ffi::c_void);
+        }
     }
 
     unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
-        if size == 0 { return Ok(()); }
+        if size == 0 {
+            return Ok(());
+        }
         let stream = self.config.stream;
         // SAFETY: caller asserts dst is a device ptr with `size` bytes,
         // src is a host ptr with `size` bytes.
@@ -87,19 +100,27 @@ impl MemoryPort for Cuda {
                 stream,
             );
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaMemcpyAsync H2D failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaMemcpyAsync H2D failed: {:?}",
+                    code
+                )));
             }
             // Sync so the host buffer can be freed/reused safely after this returns.
             let code = ffi::cudaStreamSynchronize(stream);
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaStreamSynchronize failed: {:?}",
+                    code
+                )));
             }
         }
         Ok(())
     }
 
     unsafe fn upload_async(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
-        if size == 0 { return Ok(()); }
+        if size == 0 {
+            return Ok(());
+        }
         let stream = self.config.stream;
         // SAFETY: caller asserts the host pointer remains valid until the
         // device stream consumes the copy (workspaces own host staging
@@ -113,7 +134,10 @@ impl MemoryPort for Cuda {
                 stream,
             );
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaMemcpyAsync H2D async failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaMemcpyAsync H2D async failed: {:?}",
+                    code
+                )));
             }
             // NO cudaStreamSynchronize — graph capture friendly.
         }
@@ -121,7 +145,9 @@ impl MemoryPort for Cuda {
     }
 
     unsafe fn download(&self, dst: *mut u8, src: NonNull<u8>, size: usize) -> OpResult<()> {
-        if size == 0 { return Ok(()); }
+        if size == 0 {
+            return Ok(());
+        }
         let stream = self.config.stream;
         // SAFETY: caller asserts ptrs and size.
         unsafe {
@@ -133,11 +159,17 @@ impl MemoryPort for Cuda {
                 stream,
             );
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaMemcpyAsync D2H failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaMemcpyAsync D2H failed: {:?}",
+                    code
+                )));
             }
             let code = ffi::cudaStreamSynchronize(stream);
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaStreamSynchronize failed: {:?}",
+                    code
+                )));
             }
         }
         Ok(())
@@ -148,13 +180,23 @@ impl MemoryPort for Cuda {
         // SAFETY: stream is owned by self.config.
         let code = unsafe { ffi::cudaStreamSynchronize(stream) };
         if code != ffi::cudaError_cudaSuccess {
-            return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+            return Err(OpError::Kernel(format!(
+                "cudaStreamSynchronize failed: {:?}",
+                code
+            )));
         }
         Ok(())
     }
 
-    unsafe fn copy_device_to_device(&self, dst: NonNull<u8>, src: NonNull<u8>, size: usize) -> OpResult<()> {
-        if size == 0 { return Ok(()); }
+    unsafe fn copy_device_to_device(
+        &self,
+        dst: NonNull<u8>,
+        src: NonNull<u8>,
+        size: usize,
+    ) -> OpResult<()> {
+        if size == 0 {
+            return Ok(());
+        }
         let stream = self.config.stream;
         // SAFETY: caller asserts dst/src are device ptrs with `size` bytes,
         // and regions do not overlap.
@@ -167,11 +209,17 @@ impl MemoryPort for Cuda {
                 stream,
             );
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaMemcpyAsync D2D failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaMemcpyAsync D2D failed: {:?}",
+                    code
+                )));
             }
             let code = ffi::cudaStreamSynchronize(stream);
             if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!("cudaStreamSynchronize failed: {:?}", code)));
+                return Err(OpError::Kernel(format!(
+                    "cudaStreamSynchronize failed: {:?}",
+                    code
+                )));
             }
         }
         Ok(())
@@ -183,23 +231,37 @@ impl MemoryPort for Cuda {
 impl CoreOps for Cuda {
     // alloc_tensor uses the default impl (Tensor::zeros via MemoryPort).
 
-    fn add<T: Dtype>(a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
+    fn add<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
         kernels::add::add(a, b, dst)
     }
     fn add_inplace<T: Dtype>(dst: &mut Tensor<T, Self>, src: &Tensor<T, Self>) -> OpResult<()> {
         kernels::add::add_inplace(dst, src)
     }
     fn ewise_mul<T: Dtype>(
-        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         kernels::ewise_mul::ewise_mul(a, b, dst)
     }
-    fn matmul<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+    fn matmul<T: Dtype>(
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
         kernels::matmul::matmul(input, weight, output)
     }
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
-        input: &Tensor<A, Self>, weight: &Tensor<W, Self>, output: &mut Tensor<O, Self>,
-        scales: &Tensor<A, Self>, zeros: Option<&Tensor<W, Self>>, group_size: usize,
+        input: &Tensor<A, Self>,
+        weight: &Tensor<W, Self>,
+        output: &mut Tensor<O, Self>,
+        scales: &Tensor<A, Self>,
+        zeros: Option<&Tensor<W, Self>>,
+        group_size: usize,
     ) -> OpResult<()> {
         kernels::matmul::matmul_quant(input, weight, output, scales, zeros, group_size)
     }
@@ -209,7 +271,11 @@ impl CoreOps for Cuda {
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::softmax::softmax(input, output)
     }
-    fn embedding<T: Dtype>(table: &Tensor<T, Self>, indices: &Tensor<i32, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
+    fn embedding<T: Dtype>(
+        table: &Tensor<T, Self>,
+        indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
         kernels::embedding::embedding(table, indices, output)
     }
     fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
@@ -219,17 +285,20 @@ impl CoreOps for Cuda {
         kernels::scalar::scalar_add_inplace(x, scalar)
     }
     fn scalar_mul_inplace_from_dev<T: Dtype>(
-        x: &mut Tensor<T, Self>, d_scalar: &Tensor<f32, Self>,
+        x: &mut Tensor<T, Self>,
+        d_scalar: &Tensor<f32, Self>,
     ) -> OpResult<()> {
         kernels::scalar::scalar_mul_inplace_from_dev(x, d_scalar)
     }
     fn broadcast_mul_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>, scale: &Tensor<T, Self>,
+        x: &mut Tensor<T, Self>,
+        scale: &Tensor<T, Self>,
     ) -> OpResult<()> {
         kernels::broadcast_mul::broadcast_mul_inplace(x, scale)
     }
     fn broadcast_add_inplace<T: Dtype>(
-        x: &mut Tensor<T, Self>, bias: &Tensor<T, Self>,
+        x: &mut Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
     ) -> OpResult<()> {
         kernels::broadcast_mul::broadcast_add_inplace(x, bias)
     }
@@ -242,18 +311,24 @@ impl CoreOps for Cuda {
         dst_cols: usize,
     ) -> OpResult<()> {
         kernels::split_cols::split_cols(
-            src, dst,
-            rows as i32, total_cols as i32,
-            col_offset as i32, dst_cols as i32,
+            src,
+            dst,
+            rows as i32,
+            total_cols as i32,
+            col_offset as i32,
+            dst_cols as i32,
         )
     }
     fn concat_seq<T: Dtype>(
-        a: &Tensor<T, Self>, b: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         kernels::concat_seq::concat_seq_into(a, b, dst)
     }
     fn cast_dtype<S: Dtype, D2: Dtype>(
-        src: &Tensor<S, Self>, dst: &mut Tensor<D2, Self>,
+        src: &Tensor<S, Self>,
+        dst: &mut Tensor<D2, Self>,
     ) -> OpResult<()> {
         kernels::cast_dtype::cast_dtype(src, dst)
     }
@@ -261,15 +336,27 @@ impl CoreOps for Cuda {
 
 /// LlmOps for Cuda — decoder + paged-KV kernels (Llama3 / Qwen3 / Qwen3_5).
 impl LlmOps for Cuda {
-    fn rmsnorm<T: Dtype>(input: &Tensor<T, Self>, weight: &Tensor<T, Self>, output: &mut Tensor<T, Self>, eps: f32) -> OpResult<()> {
+    fn rmsnorm<T: Dtype>(
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
         kernels::rmsnorm::rmsnorm(input, weight, output, eps)
     }
-    fn rmsnorm_inplace<T: Dtype>(x: &mut Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32) -> OpResult<()> {
+    fn rmsnorm_inplace<T: Dtype>(
+        x: &mut Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
         kernels::rmsnorm::rmsnorm_inplace(x, weight, eps)
     }
     fn fused_add_rmsnorm<T: Dtype>(
-        output: &mut Tensor<T, Self>, residual: &mut Tensor<T, Self>,
-        input: &Tensor<T, Self>, weight: &Tensor<T, Self>, eps: f32,
+        output: &mut Tensor<T, Self>,
+        residual: &mut Tensor<T, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        eps: f32,
     ) -> OpResult<()> {
         kernels::fused_add_rmsnorm::fused_add_rmsnorm(output, residual, input, weight, eps)
     }
@@ -277,22 +364,34 @@ impl LlmOps for Cuda {
         kernels::activation::swiglu_inplace(x, gate)
     }
     fn swiglu_packed<T: Dtype>(
-        gate_up: &Tensor<T, Self>, out: &mut Tensor<T, Self>,
-        rows: usize, inter: usize,
+        gate_up: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+        rows: usize,
+        inter: usize,
     ) -> OpResult<()> {
         kernels::activation::swiglu_packed(gate_up, out, rows, inter)
     }
     fn rope_inplace<T: Dtype>(
-        q: &mut Tensor<T, Self>, k: &mut Tensor<T, Self>,
-        sin: &Tensor<T, Self>, cos: &Tensor<T, Self>,
+        q: &mut Tensor<T, Self>,
+        k: &mut Tensor<T, Self>,
+        sin: &Tensor<T, Self>,
+        cos: &Tensor<T, Self>,
         positions: &Tensor<i32, Self>,
-        head_num: usize, kv_head_num: usize, head_dim: usize,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
     ) -> OpResult<()> {
         let num_tokens = q.shape().as_slice()[0] as i32;
         kernels::rope::rope_inplace(
-            q, k, sin, cos,
+            q,
+            k,
+            sin,
+            cos,
             positions.data_ptr(),
-            num_tokens, head_num as i32, kv_head_num as i32, head_dim as i32,
+            num_tokens,
+            head_num as i32,
+            kv_head_num as i32,
+            head_dim as i32,
         )
     }
 
@@ -321,9 +420,28 @@ impl LlmOps for Cuda {
         kv_dim: usize,
     ) -> OpResult<()> {
         kernels::qkv_norm_rope_scatter::qkv_norm_rope_scatter(
-            q, k, v, q_weight, k_weight, q_eps, k_eps, sin, cos, positions,
-            k_pool, v_pool, block_tables, seq_positions, cu_q_lens, seq_lens_step,
-            max_blocks_per_seq, block_size, head_num, kv_head_num, head_dim, kv_dim,
+            q,
+            k,
+            v,
+            q_weight,
+            k_weight,
+            q_eps,
+            k_eps,
+            sin,
+            cos,
+            positions,
+            k_pool,
+            v_pool,
+            block_tables,
+            seq_positions,
+            cu_q_lens,
+            seq_lens_step,
+            max_blocks_per_seq,
+            block_size,
+            head_num,
+            kv_head_num,
+            head_dim,
+            kv_dim,
         )
     }
     fn attention_paged<T: Dtype>(
@@ -339,8 +457,16 @@ impl LlmOps for Cuda {
         scale: f32,
     ) -> OpResult<()> {
         kernels::attention_paged::attention_paged(
-            q, k_pool, v_pool, output, plan, workspace,
-            head_num, kv_head_num, head_dim, scale,
+            q,
+            k_pool,
+            v_pool,
+            output,
+            plan,
+            workspace,
+            head_num,
+            kv_head_num,
+            head_dim,
+            scale,
         )
     }
 
@@ -357,7 +483,14 @@ impl LlmOps for Cuda {
         let rows = num_tokens as i32;
         kernels::split_cols::split_cols(qkv, q, rows, total_cols, 0, q_dim as i32)?;
         kernels::split_cols::split_cols(qkv, k, rows, total_cols, q_dim as i32, kv_dim as i32)?;
-        kernels::split_cols::split_cols(qkv, v, rows, total_cols, (q_dim + kv_dim) as i32, kv_dim as i32)?;
+        kernels::split_cols::split_cols(
+            qkv,
+            v,
+            rows,
+            total_cols,
+            (q_dim + kv_dim) as i32,
+            kv_dim as i32,
+        )?;
         Ok(())
     }
 
@@ -375,9 +508,17 @@ impl LlmOps for Cuda {
         kv_dim: usize,
     ) -> OpResult<()> {
         kernels::scatter_kv_paged::scatter_kv_paged(
-            k_src, v_src, k_pool, v_pool,
-            block_tables, seq_positions, cu_q_lens, seq_lens_step,
-            max_blocks_per_seq, block_size, kv_dim,
+            k_src,
+            v_src,
+            k_pool,
+            v_pool,
+            block_tables,
+            seq_positions,
+            cu_q_lens,
+            seq_lens_step,
+            max_blocks_per_seq,
+            block_size,
+            kv_dim,
         )
     }
 
@@ -396,54 +537,90 @@ impl LlmOps for Cuda {
 /// DiffusionOps for Cuda — Conv / Norm / Spatial / DiT kernels (Z_Image).
 impl DiffusionOps for Cuda {
     fn conv2d<T: Dtype>(
-        input: &Tensor<T, Self>, weight: &Tensor<T, Self>,
-        bias: Option<&Tensor<T, Self>>, output: &mut Tensor<T, Self>,
-        stride: usize, padding: usize,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: Option<&Tensor<T, Self>>,
+        output: &mut Tensor<T, Self>,
+        stride: usize,
+        padding: usize,
     ) -> OpResult<()> {
         kernels::conv2d::conv2d(input, weight, bias, output, stride, padding)
     }
 
     fn groupnorm<T: Dtype>(
-        input: &Tensor<T, Self>, weight: &Tensor<T, Self>, bias: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>, num_groups: usize, eps: f32,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_groups: usize,
+        eps: f32,
     ) -> OpResult<()> {
         kernels::groupnorm::groupnorm(input, weight, bias, output, num_groups, eps)
     }
 
     fn groupnorm_silu<T: Dtype>(
-        input: &Tensor<T, Self>, weight: &Tensor<T, Self>, bias: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>, num_groups: usize, eps: f32,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_groups: usize,
+        eps: f32,
     ) -> OpResult<()> {
         kernels::groupnorm::groupnorm_silu(input, weight, bias, output, num_groups, eps)
     }
 
     fn layernorm<T: Dtype>(
-        input: &Tensor<T, Self>, weight: &Tensor<T, Self>, bias: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>, eps: f32,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
     ) -> OpResult<()> {
         kernels::layernorm::layernorm(input, weight, bias, output, eps)
     }
 
     fn upsample_nearest_2x<T: Dtype>(
-        input: &Tensor<T, Self>, output: &mut Tensor<T, Self>,
+        input: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         kernels::upsample::upsample_nearest_2x(input, output)
     }
 
     fn sdpa<T: Dtype>(
-        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
+        q: &Tensor<T, Self>,
+        k: &Tensor<T, Self>,
+        v: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
     ) -> OpResult<()> {
         kernels::sdpa::sdpa(q, k, v, output, num_heads, num_kv_heads, head_dim, scale)
     }
 
     fn sdpa_masked<T: Dtype>(
-        q: &Tensor<T, Self>, k: &Tensor<T, Self>, v: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>, mask: &Tensor<T, Self>,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize, scale: f32,
+        q: &Tensor<T, Self>,
+        k: &Tensor<T, Self>,
+        v: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        mask: &Tensor<T, Self>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
     ) -> OpResult<()> {
-        kernels::sdpa::sdpa_masked(q, k, v, output, mask, num_heads, num_kv_heads, head_dim, scale)
+        kernels::sdpa::sdpa_masked(
+            q,
+            k,
+            v,
+            output,
+            mask,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
     }
 
     fn apply_rope_interleaved<T: Dtype>(
@@ -456,19 +633,21 @@ impl DiffusionOps for Cuda {
     }
 
     fn pad_with_token<T: Dtype>(
-        src: &Tensor<T, Self>, pad_token: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
+        src: &Tensor<T, Self>,
+        pad_token: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         kernels::pad::pad_with_token_into(src, pad_token, dst)
     }
 
-    fn pad_last_row<T: Dtype>(
-        src: &Tensor<T, Self>, dst: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
+    fn pad_last_row<T: Dtype>(src: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::pad::pad_last_row_into(src, dst)
     }
 
     fn overwrite_pad_tokens_inplace<T: Dtype>(
-        dst: &mut Tensor<T, Self>, pad_token: &Tensor<T, Self>, keep_prefix: usize,
+        dst: &mut Tensor<T, Self>,
+        pad_token: &Tensor<T, Self>,
+        keep_prefix: usize,
     ) -> OpResult<()> {
         kernels::pad::overwrite_pad_tokens_inplace(dst, pad_token, keep_prefix)
     }
@@ -481,4 +660,3 @@ impl DiffusionOps for Cuda {
         kernels::scalar::tanh_inplace(x)
     }
 }
-

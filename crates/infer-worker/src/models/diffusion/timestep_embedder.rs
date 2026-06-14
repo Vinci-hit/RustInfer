@@ -4,7 +4,7 @@
 //! `frequency_embedding_size = 256` (= ADALN_EMBED_DIM), an MLP with
 //! `mid = 1024`, output dim = 256, SiLU between layers.
 
-use crate::domain::ports::{OpResult, OpError, OpBackend};
+use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype};
 use crate::models::layers::Linear;
@@ -39,9 +39,8 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
         let mut host: Vec<u8> = vec![0u8; dim * bytes_per_elem];
         match T::DATA_TYPE {
             DataType::F32 => {
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, dim)
-                };
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, dim) };
                 for i in 0..half {
                     let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
                     let arg = t_value_scaled * freq;
@@ -50,9 +49,8 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
                 }
             }
             DataType::BF16 => {
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut bf16, dim)
-                };
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut bf16, dim) };
                 for i in 0..half {
                     let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
                     let arg = t_value_scaled * freq;
@@ -61,9 +59,8 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
                 }
             }
             DataType::F16 => {
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f16, dim)
-                };
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f16, dim) };
                 for i in 0..half {
                     let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
                     let arg = t_value_scaled * freq;
@@ -71,9 +68,12 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
                     dst[half + i] = f16::from_f32(arg.sin());
                 }
             }
-            other => return Err(OpError::Kernel(format!(
-                "TimestepEmbedder: unsupported dtype {:?}", other,
-            ))),
+            other => {
+                return Err(OpError::Kernel(format!(
+                    "TimestepEmbedder: unsupported dtype {:?}",
+                    other,
+                )));
+            }
         }
 
         // Upload to device slot.
@@ -81,7 +81,9 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
         let dst_bytes = dim * bytes_per_elem;
         if t_freq_slot.numel() != dim {
             return Err(OpError::Shape(format!(
-                "TimestepEmbedder: t_freq_slot numel {} != dim {}", t_freq_slot.numel(), dim,
+                "TimestepEmbedder: t_freq_slot numel {} != dim {}",
+                t_freq_slot.numel(),
+                dim,
             )));
         }
         unsafe {
@@ -109,14 +111,25 @@ mod tests {
     /// sinusoid → MLP path numerically end-to-end. mlp1 is `[mid, freq_dim]`
     /// init to `mid_inv * I` (rectangular identity-ish); mlp2 is
     /// `[out, mid]` likewise. SiLU is applied between.
-    fn make_embedder(freq_dim: usize, mid: usize, out: usize, cuda: &Cuda) -> TimestepEmbedder<f32, Cuda> {
+    fn make_embedder(
+        freq_dim: usize,
+        mid: usize,
+        out: usize,
+        cuda: &Cuda,
+    ) -> TimestepEmbedder<f32, Cuda> {
         // mlp1 weight: shape [mid, freq_dim], values w[i,j] = (i==j ? 1 : 0)
         let mut w1 = vec![0.0_f32; mid * freq_dim];
-        for i in 0..mid.min(freq_dim) { w1[i * freq_dim + i] = 1.0; }
+        for i in 0..mid.min(freq_dim) {
+            w1[i * freq_dim + i] = 1.0;
+        }
         let mut w2 = vec![0.0_f32; out * mid];
-        for i in 0..out.min(mid) { w2[i * mid + i] = 1.0; }
-        let w1_t: Tensor<f32, Cuda> = Tensor::from_host_slice(&w1, Shape::from_slice(&[mid, freq_dim]), cuda).unwrap();
-        let w2_t: Tensor<f32, Cuda> = Tensor::from_host_slice(&w2, Shape::from_slice(&[out, mid]), cuda).unwrap();
+        for i in 0..out.min(mid) {
+            w2[i * mid + i] = 1.0;
+        }
+        let w1_t: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&w1, Shape::from_slice(&[mid, freq_dim]), cuda).unwrap();
+        let w2_t: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&w2, Shape::from_slice(&[out, mid]), cuda).unwrap();
         TimestepEmbedder {
             mlp1: Linear::new(w1_t, None),
             mlp2: Linear::new(w2_t, None),
@@ -135,10 +148,15 @@ mod tests {
         let mut t_hidden: Tensor<f32, Cuda> = Tensor::zeros([1, mid], &cuda).unwrap();
         let mut t_out: Tensor<f32, Cuda> = Tensor::zeros([1, out], &cuda).unwrap();
         // t=0: cos(0*freq)=1, sin(0*freq)=0 → first half = 1, second half = 0.
-        emb.forward_host(0.0, &mut t_freq, &mut t_hidden, &mut t_out).unwrap();
+        emb.forward_host(0.0, &mut t_freq, &mut t_hidden, &mut t_out)
+            .unwrap();
         let freq_v = t_freq.to_host_vec().unwrap();
-        for v in &freq_v[..freq_dim / 2] { assert!((v - 1.0).abs() < 1e-5); }
-        for v in &freq_v[freq_dim / 2..] { assert!(v.abs() < 1e-5); }
+        for v in &freq_v[..freq_dim / 2] {
+            assert!((v - 1.0).abs() < 1e-5);
+        }
+        for v in &freq_v[freq_dim / 2..] {
+            assert!(v.abs() < 1e-5);
+        }
 
         // After mlp1 (identity) + silu + mlp2 (identity):
         // hidden_pre = t_freq, hidden_post = silu(hidden_pre)
@@ -148,7 +166,9 @@ mod tests {
         for v in &out_v[..freq_dim / 2] {
             assert!((v - silu1).abs() < 1e-5, "got {}, expected {}", v, silu1);
         }
-        for v in &out_v[freq_dim / 2..] { assert!(v.abs() < 1e-5); }
+        for v in &out_v[freq_dim / 2..] {
+            assert!(v.abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -159,7 +179,8 @@ mod tests {
         let mut t_freq: Tensor<f32, Cuda> = Tensor::zeros([1, freq_dim], &cuda).unwrap();
         let mut t_hidden: Tensor<f32, Cuda> = Tensor::zeros([1, freq_dim], &cuda).unwrap();
         let mut t_out: Tensor<f32, Cuda> = Tensor::zeros([1, freq_dim], &cuda).unwrap();
-        emb.forward_host(1.0, &mut t_freq, &mut t_hidden, &mut t_out).unwrap();
+        emb.forward_host(1.0, &mut t_freq, &mut t_hidden, &mut t_out)
+            .unwrap();
         let v = t_freq.to_host_vec().unwrap();
         let half = freq_dim / 2;
         let log_max = (10000.0_f64).ln();

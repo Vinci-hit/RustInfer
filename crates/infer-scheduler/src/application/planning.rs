@@ -22,18 +22,16 @@
 //! - [`PlanningSystem::scheduled_segments`] — read-only access to
 //!   the current chunk-size list.
 
-use crate::infrastructure::kv_cache::radix_tree::{GlobalIndex, RadixTree};
-use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use crate::config::{SchedulerConfig, SchedulerMode};
-use crate::domain::inference_session::lifecycle::{
-    InferenceSession, Prefilling, RequestId,
-};
+use crate::domain::inference_session::lifecycle::{InferenceSession, Prefilling, RequestId};
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::inference_session::table::{Bucket, PrefillStartOutcome, RequestTable};
+use crate::domain::policy::token_budget::TokenBudget;
 use crate::domain::policy::traits::{BatchPlan, RunningSet, SchedulingPolicy};
 use crate::error::Result;
+use crate::infrastructure::kv_cache::radix_tree::{GlobalIndex, RadixTree};
+use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use crate::infrastructure::transport::codec::MsgPackCodec;
-use crate::domain::policy::token_budget::TokenBudget;
 
 use super::batch_builder::BatchBuilder;
 
@@ -113,8 +111,8 @@ impl PlanningSystem {
                 continue;
             }
 
-            let is_continuation = sessions.location_for_request(&entry.request_id)
-                == Some(Bucket::Prefilling);
+            let is_continuation =
+                sessions.location_for_request(&entry.request_id) == Some(Bucket::Prefilling);
 
             if is_continuation {
                 match sessions.set_prefill_inflight(&entry.request_id, scheduled_len) {
@@ -147,18 +145,24 @@ impl PlanningSystem {
                 // the matched chain — the chain is pinned for the
                 // lifetime of this seq.
                 let hit = radix.lookup_prefix(&seq.meta.input_ids, seq.meta.sequence_id.0);
+                let mut matched_indices = hit.matched_indices;
+                if matched_indices.len() >= seq.meta.input_ids.len() {
+                    // A full prompt KV hit is not enough to start decoding:
+                    // the worker would have no active sequence and no logits
+                    // for the first generated token. Until cached logits or a
+                    // no-write prefill path exists, recompute the prompt.
+                    radix.mark_finished_chain(seq.meta.sequence_id.0);
+                    matched_indices.clear();
+                }
                 let prefix_match = PrefixMatch {
-                    num_cached_tokens: hit.matched_indices.len(),
+                    num_cached_tokens: matched_indices.len(),
                 };
-                let matched_indices = hit.matched_indices;
 
-                match sessions.commit_prefill_start(
-                    seq,
-                    prefix_match,
-                    scheduled_len,
-                )? {
+                match sessions.commit_prefill_start(seq, prefix_match, scheduled_len)? {
                     PrefillStartOutcome::Scheduled {
-                        request_id, segment, ..
+                        request_id,
+                        segment,
+                        ..
                     } => {
                         self.current_chunk_sizes.push((
                             request_id.clone(),

@@ -24,12 +24,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{OpResult, OpError, OpBackend, CoreOps, LlmOps, DiffusionOps};
+use crate::domain::ports::{CoreOps, DiffusionOps, LlmOps, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::io::SafetensorsReader;
-use crate::models::layers::{Linear, RMSNorm, Embedding};
+use crate::models::layers::{Embedding, Linear, RMSNorm};
 use crate::models::loader::WeightLoader;
 
 /// Maximum prompt length the encoder supports.
@@ -66,13 +66,12 @@ impl Qwen3Config {
             n_layers: v["num_hidden_layers"].as_u64().unwrap_or(28) as usize,
             n_heads,
             n_kv_heads: v["num_key_value_heads"].as_u64().unwrap_or(n_heads as u64) as usize,
-            head_dim: v["head_dim"].as_u64()
-                .unwrap_or((dim / n_heads) as u64) as usize,
+            head_dim: v["head_dim"].as_u64().unwrap_or((dim / n_heads) as u64) as usize,
             intermediate_size: v["intermediate_size"].as_u64().unwrap_or(9728) as usize,
             norm_eps: v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             rope_theta: v["rope_theta"].as_f64().unwrap_or(1_000_000.0) as f32,
-            max_position_embeddings: v["max_position_embeddings"]
-                .as_u64().unwrap_or(40960) as usize,
+            max_position_embeddings: v["max_position_embeddings"].as_u64().unwrap_or(40960)
+                as usize,
         })
     }
 }
@@ -80,10 +79,10 @@ impl Qwen3Config {
 pub struct Qwen3TextEncoderLayer<T: Dtype, D: OpBackend> {
     pub input_layernorm: RMSNorm<T, D>,
     pub post_attention_layernorm: RMSNorm<T, D>,
-    pub qkv_proj: Linear<T, D>,        // [q_dim+2*kv_dim, dim]
-    pub o_proj: Linear<T, D>,          // [dim, dim]
-    pub gate_up_proj: Linear<T, D>,    // [2*intermediate, dim]
-    pub down_proj: Linear<T, D>,       // [dim, intermediate]
+    pub qkv_proj: Linear<T, D>,     // [q_dim+2*kv_dim, dim]
+    pub o_proj: Linear<T, D>,       // [dim, dim]
+    pub gate_up_proj: Linear<T, D>, // [2*intermediate, dim]
+    pub down_proj: Linear<T, D>,    // [dim, intermediate]
     pub q_norm: RMSNorm<T, D>,
     pub k_norm: RMSNorm<T, D>,
 }
@@ -139,33 +138,48 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         for i in 0..cfg.n_layers {
             let prefix = format!("model.layers.{}", i);
             let input_layernorm: RMSNorm<T, Cuda> = loader.load_rmsnorm::<T, Cuda>(
-                &format!("{}.input_layernorm.weight", prefix), device, cfg.norm_eps,
+                &format!("{}.input_layernorm.weight", prefix),
+                device,
+                cfg.norm_eps,
             )?;
             let post_attention_layernorm: RMSNorm<T, Cuda> = loader.load_rmsnorm::<T, Cuda>(
-                &format!("{}.post_attention_layernorm.weight", prefix), device, cfg.norm_eps,
+                &format!("{}.post_attention_layernorm.weight", prefix),
+                device,
+                cfg.norm_eps,
             )?;
             // Build fused QKV [q_dim+2*kv_dim, dim] from individual q/k/v_proj.
             let qkv_proj = loader.load_fused_qkv::<T, Cuda>(i, q_dim, kv_dim, dim, device)?;
             let o_proj = loader.load_linear::<T, Cuda>(
                 &format!("{}.self_attn.o_proj.weight", prefix),
-                None, device,
+                None,
+                device,
             )?;
             let q_norm: RMSNorm<T, Cuda> = loader.load_rmsnorm::<T, Cuda>(
-                &format!("{}.self_attn.q_norm.weight", prefix), device, cfg.norm_eps,
+                &format!("{}.self_attn.q_norm.weight", prefix),
+                device,
+                cfg.norm_eps,
             )?;
             let k_norm: RMSNorm<T, Cuda> = loader.load_rmsnorm::<T, Cuda>(
-                &format!("{}.self_attn.k_norm.weight", prefix), device, cfg.norm_eps,
+                &format!("{}.self_attn.k_norm.weight", prefix),
+                device,
+                cfg.norm_eps,
             )?;
             // Fused gate_up [2*inter, dim] from gate/up_proj.
             let gate_up_proj = loader.load_fused_gate_up::<T, Cuda>(i, inter, dim, device)?;
             let down_proj = loader.load_linear::<T, Cuda>(
                 &format!("{}.mlp.down_proj.weight", prefix),
-                None, device,
+                None,
+                device,
             )?;
             layers.push(Qwen3TextEncoderLayer {
-                input_layernorm, post_attention_layernorm,
-                qkv_proj, o_proj, gate_up_proj, down_proj,
-                q_norm, k_norm,
+                input_layernorm,
+                post_attention_layernorm,
+                qkv_proj,
+                o_proj,
+                gate_up_proj,
+                down_proj,
+                q_norm,
+                k_norm,
             });
         }
 
@@ -178,7 +192,9 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         let mut cos_host_bytes = vec![0u8; max_pos * half * T::SIZE_BYTES];
         let mut sin_host_bytes = vec![0u8; max_pos * half * T::SIZE_BYTES];
         let theta = cfg.rope_theta as f64;
-        let freqs: Vec<f64> = (0..half).map(|i| 1.0 / theta.powf(2.0 * i as f64 / cfg.head_dim as f64)).collect();
+        let freqs: Vec<f64> = (0..half)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f64 / cfg.head_dim as f64))
+            .collect();
         for p in 0..max_pos {
             for i in 0..half {
                 let arg = p as f64 * freqs[i];
@@ -191,26 +207,31 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                         sin_host_bytes[off..off + 4].copy_from_slice(&s.to_le_bytes());
                     }
                     crate::domain::types::DataType::BF16 => {
-                        cos_host_bytes[off..off + 2].copy_from_slice(&half::bf16::from_f32(c).to_le_bytes());
-                        sin_host_bytes[off..off + 2].copy_from_slice(&half::bf16::from_f32(s).to_le_bytes());
+                        cos_host_bytes[off..off + 2]
+                            .copy_from_slice(&half::bf16::from_f32(c).to_le_bytes());
+                        sin_host_bytes[off..off + 2]
+                            .copy_from_slice(&half::bf16::from_f32(s).to_le_bytes());
                     }
                     crate::domain::types::DataType::F16 => {
-                        cos_host_bytes[off..off + 2].copy_from_slice(&half::f16::from_f32(c).to_le_bytes());
-                        sin_host_bytes[off..off + 2].copy_from_slice(&half::f16::from_f32(s).to_le_bytes());
+                        cos_host_bytes[off..off + 2]
+                            .copy_from_slice(&half::f16::from_f32(c).to_le_bytes());
+                        sin_host_bytes[off..off + 2]
+                            .copy_from_slice(&half::f16::from_f32(s).to_le_bytes());
                     }
-                    other => return Err(OpError::Kernel(format!(
-                        "Qwen3TextEncoder: unsupported dtype {:?}", other,
-                    ))),
+                    other => {
+                        return Err(OpError::Kernel(format!(
+                            "Qwen3TextEncoder: unsupported dtype {:?}",
+                            other,
+                        )));
+                    }
                 }
             }
         }
         let _ = sin_host; // unused
-        let cos_cache: Tensor<T, Cuda> = Tensor::from_host_bytes(
-            &cos_host_bytes, Shape::from_slice(&[max_pos, half]), device,
-        )?;
-        let sin_cache: Tensor<T, Cuda> = Tensor::from_host_bytes(
-            &sin_host_bytes, Shape::from_slice(&[max_pos, half]), device,
-        )?;
+        let cos_cache: Tensor<T, Cuda> =
+            Tensor::from_host_bytes(&cos_host_bytes, Shape::from_slice(&[max_pos, half]), device)?;
+        let sin_cache: Tensor<T, Cuda> =
+            Tensor::from_host_bytes(&sin_host_bytes, Shape::from_slice(&[max_pos, half]), device)?;
 
         Ok(Self {
             output_layer_count: cfg.n_layers.saturating_sub(1),
@@ -223,7 +244,6 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         })
     }
 }
-
 
 impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
     /// One-shot forward: input ids `[seq_len]` (i32, host-built) →
@@ -239,12 +259,15 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         if input_ids.len() != attention_mask.len() {
             return Err(OpError::Shape(format!(
                 "Qwen3TextEncoder::forward: input/mask length mismatch {} vs {}",
-                input_ids.len(), attention_mask.len(),
+                input_ids.len(),
+                attention_mask.len(),
             )));
         }
         let seq_len = input_ids.len();
         if seq_len == 0 {
-            return Err(OpError::Shape("Qwen3TextEncoder::forward: empty input".into()));
+            return Err(OpError::Shape(
+                "Qwen3TextEncoder::forward: empty input".into(),
+            ));
         }
 
         let dim = self.config.dim;
@@ -289,21 +312,26 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                         mask_host_bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
                     }
                     crate::domain::types::DataType::BF16 => {
-                        mask_host_bytes[off..off + 2].copy_from_slice(
-                            &half::bf16::from_f32(v).to_le_bytes());
+                        mask_host_bytes[off..off + 2]
+                            .copy_from_slice(&half::bf16::from_f32(v).to_le_bytes());
                     }
                     crate::domain::types::DataType::F16 => {
-                        mask_host_bytes[off..off + 2].copy_from_slice(
-                            &half::f16::from_f32(v).to_le_bytes());
+                        mask_host_bytes[off..off + 2]
+                            .copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
                     }
-                    other => return Err(OpError::Kernel(format!(
-                        "Qwen3TextEncoder: unsupported dtype {:?}", other,
-                    ))),
+                    other => {
+                        return Err(OpError::Kernel(format!(
+                            "Qwen3TextEncoder: unsupported dtype {:?}",
+                            other,
+                        )));
+                    }
                 }
             }
         }
         let mask_dev: Tensor<T, Cuda> = Tensor::from_host_bytes(
-            &mask_host_bytes, Shape::from_slice(&[seq_len, seq_len]), dev,
+            &mask_host_bytes,
+            Shape::from_slice(&[seq_len, seq_len]),
+            dev,
         )?;
 
         // Per-layer scratches.
@@ -327,54 +355,64 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
 
             // 2.2 qkv_proj(h) → qkv
             layer.qkv_proj.forward(&h, &mut qkv)?;
-            Cuda::split_cols(&qkv, &mut q, seq_len, qkv_cols, 0,                  q_dim)?;
-            Cuda::split_cols(&qkv, &mut k, seq_len, qkv_cols, q_dim,             kv_dim)?;
-            Cuda::split_cols(&qkv, &mut v, seq_len, qkv_cols, q_dim + kv_dim,    kv_dim)?;
+            Cuda::split_cols(&qkv, &mut q, seq_len, qkv_cols, 0, q_dim)?;
+            Cuda::split_cols(&qkv, &mut k, seq_len, qkv_cols, q_dim, kv_dim)?;
+            Cuda::split_cols(&qkv, &mut v, seq_len, qkv_cols, q_dim + kv_dim, kv_dim)?;
 
             // 2.3 q_norm(q) per-head + k_norm(k) per-head.
             // Reshape Q [seq, q_dim] → [seq*n_heads, head_dim].
             let mut q_reshape = q.view_raw(
                 Shape::from_slice(&[seq_len * n_heads, head_dim]),
                 Shape::from_slice(&[head_dim, 1]).contiguous_strides(),
-                q.offset_elems(), true,
+                q.offset_elems(),
+                true,
             );
             layer.q_norm.forward_inplace(&mut q_reshape)?;
             let mut k_reshape = k.view_raw(
                 Shape::from_slice(&[seq_len * n_kv_heads, head_dim]),
                 Shape::from_slice(&[head_dim, 1]).contiguous_strides(),
-                k.offset_elems(), true,
+                k.offset_elems(),
+                true,
             );
             layer.k_norm.forward_inplace(&mut k_reshape)?;
 
             // 2.4 RoPE (standard, not interleaved). The new OpBackend
             // exposes `rope_inplace` for the standard LLM path.
             Cuda::rope_inplace(
-                &mut q, &mut k,
-                &self.sin_cache, &self.cos_cache,
+                &mut q,
+                &mut k,
+                &self.sin_cache,
+                &self.cos_cache,
                 &positions,
-                n_heads, n_kv_heads, head_dim,
+                n_heads,
+                n_kv_heads,
+                head_dim,
             )?;
 
             // 2.5 SDPA (GQA-aware): SDPA gathers KV per query head via head/group.
             let q3 = q.view_raw(
                 Shape::from_slice(&[seq_len, n_heads, head_dim]),
                 Shape::from_slice(&[head_dim * n_heads, head_dim, 1]).contiguous_strides(),
-                q.offset_elems(), true,
+                q.offset_elems(),
+                true,
             );
             let k3 = k.view_raw(
                 Shape::from_slice(&[seq_len, n_kv_heads, head_dim]),
                 Shape::from_slice(&[head_dim * n_kv_heads, head_dim, 1]).contiguous_strides(),
-                k.offset_elems(), true,
+                k.offset_elems(),
+                true,
             );
             let v3 = v.view_raw(
                 Shape::from_slice(&[seq_len, n_kv_heads, head_dim]),
                 Shape::from_slice(&[head_dim * n_kv_heads, head_dim, 1]).contiguous_strides(),
-                v.offset_elems(), true,
+                v.offset_elems(),
+                true,
             );
             let mut attn3 = attn_out.view_raw(
                 Shape::from_slice(&[seq_len, n_heads, head_dim]),
                 Shape::from_slice(&[head_dim * n_heads, head_dim, 1]).contiguous_strides(),
-                attn_out.offset_elems(), true,
+                attn_out.offset_elems(),
+                true,
             );
             let scale = 1.0 / (head_dim as f32).sqrt();
             // Qwen3 is a *causal* decoder-only LM (Qwen3Model = Qwen3 stack
@@ -389,8 +427,9 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
             // hidden state shifts from O(8) to O(13000) at layer 10).
             //
             // The mask is built once per forward (cached in `mask_dev`).
-            Cuda::sdpa_masked(&q3, &k3, &v3, &mut attn3, &mask_dev,
-                              n_heads, n_kv_heads, head_dim, scale)?;
+            Cuda::sdpa_masked(
+                &q3, &k3, &v3, &mut attn3, &mask_dev, n_heads, n_kv_heads, head_dim, scale,
+            )?;
 
             // 2.6 o_proj(attn) → o_out
             layer.o_proj.forward(&attn_out, &mut o_out)?;
@@ -421,16 +460,20 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
             return Ok(x);
         }
         // Slice prefix (mask is left-aligned in our pipeline; verify here).
-        for i in 0..actual_len { if attention_mask[i] != 1 {
-            return Err(OpError::Kernel(format!(
-                "Qwen3TextEncoder: attention mask must be left-aligned (mask[{}]=0)", i,
-            )));
-        }}
+        for i in 0..actual_len {
+            if attention_mask[i] != 1 {
+                return Err(OpError::Kernel(format!(
+                    "Qwen3TextEncoder: attention mask must be left-aligned (mask[{}]=0)",
+                    i,
+                )));
+            }
+        }
         // Take rows [0..actual_len].
         Ok(x.view_raw(
             Shape::from_slice(&[actual_len, dim]),
             Shape::from_slice(&[dim, 1]).contiguous_strides(),
-            x.offset_elems(), true,
+            x.offset_elems(),
+            true,
         ))
     }
 }
@@ -462,7 +505,9 @@ mod tests {
         // read a few fields).
         let dir = tempdir_for_test();
         let path = dir.join("config.json");
-        std::fs::write(&path, r#"{
+        std::fs::write(
+            &path,
+            r#"{
             "hidden_size": 2560,
             "num_attention_heads": 16,
             "num_hidden_layers": 28,
@@ -473,7 +518,9 @@ mod tests {
             "rope_theta": 1000000.0,
             "max_position_embeddings": 40960,
             "vocab_size": 151936
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let cfg = Qwen3Config::from_json(&path).unwrap();
         assert_eq!(cfg.dim, 2560);
         assert_eq!(cfg.n_layers, 28);

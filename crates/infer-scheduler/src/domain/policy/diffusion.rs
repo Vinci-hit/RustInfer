@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 
-use crate::domain::policy::traits::{BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy};
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::policy::token_budget::TokenBudget;
+use crate::domain::policy::traits::{BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy};
 
 /// Shape/schedule key for batching: only requests with identical generation
 /// geometry and denoise schedule can share one diffusion batch.
@@ -62,9 +62,10 @@ impl SchedulingPolicy for DiffusionPolicy {
                 height: req.height,
                 width: req.width,
                 num_inference_steps: req.num_inference_steps,
-                sigmas_bits: req.sigmas.as_ref().map(|sigmas| {
-                    sigmas.iter().map(|sigma| sigma.to_bits()).collect()
-                }),
+                sigmas_bits: req
+                    .sigmas
+                    .as_ref()
+                    .map(|sigmas| sigmas.iter().map(|sigma| sigma.to_bits()).collect()),
             };
             if !groups.contains_key(&key) {
                 key_order.push(key.clone());
@@ -81,7 +82,12 @@ impl SchedulingPolicy for DiffusionPolicy {
 
         let selected = groups
             .get(best_key)
-            .map(|ids| ids.iter().take(self.max_batch_size).cloned().collect::<Vec<_>>())
+            .map(|ids| {
+                ids.iter()
+                    .take(self.max_batch_size)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
 
         let prefill_batch: Vec<PrefillEntry> = selected
@@ -117,7 +123,8 @@ mod tests {
         let mut q = WaitingQueue::new();
         for id in ids {
             let meta = Arc::new(RequestMeta {
-                id: RequestId::new_v4(), external_id: id.to_string(),
+                id: RequestId::new_v4(),
+                external_id: id.to_string(),
                 sequence_id: SequenceId(1),
                 input_ids: vec![0],
                 max_tokens: 1,
@@ -154,7 +161,10 @@ mod tests {
         let policy = DiffusionPolicy::new(4);
         let waiting = WaitingQueue::new();
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
+        let budget = TokenBudget {
+            max_tokens: 9999,
+            max_seqs: 99,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert!(!plan.has_work());
@@ -165,7 +175,10 @@ mod tests {
         let policy = DiffusionPolicy::new(3);
         let waiting = make_waiting(&["a", "b", "c", "d", "e"]);
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
+        let budget = TokenBudget {
+            max_tokens: 9999,
+            max_seqs: 99,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 3);
@@ -181,7 +194,10 @@ mod tests {
             num_decoding: 0,
             prefilling_continuations: vec![],
         };
-        let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
+        let budget = TokenBudget {
+            max_tokens: 9999,
+            max_seqs: 99,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert!(!plan.has_work());
@@ -192,7 +208,10 @@ mod tests {
         let policy = DiffusionPolicy::new(8);
         let waiting = make_waiting(&["a", "b"]);
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 9999, max_seqs: 99 };
+        let budget = TokenBudget {
+            max_tokens: 9999,
+            max_seqs: 99,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 2);

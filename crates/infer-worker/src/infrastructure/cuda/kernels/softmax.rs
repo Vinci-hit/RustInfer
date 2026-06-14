@@ -1,16 +1,34 @@
 //! Softmax CUDA kernel wrapper.
 
-use crate::domain::ports::{OpResult, OpError};
-use crate::domain::types::{DataType, Dtype};
+use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::{DataType, Dtype};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::cudaStream_t;
 use half::{bf16, f16};
 
 unsafe extern "C" {
-    fn softmax_f32_forward(output: *mut f32, input: *const f32, rows: i32, cols: i32, stream: cudaStream_t);
-    fn softmax_bf16_forward(output: *mut bf16, input: *const bf16, rows: i32, cols: i32, stream: cudaStream_t);
-    fn softmax_f16_forward(output: *mut f16, input: *const f16, rows: i32, cols: i32, stream: cudaStream_t);
+    fn softmax_f32_forward(
+        output: *mut f32,
+        input: *const f32,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    );
+    fn softmax_bf16_forward(
+        output: *mut bf16,
+        input: *const bf16,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    );
+    fn softmax_f16_forward(
+        output: *mut f16,
+        input: *const f16,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    );
 }
 
 /// Row-wise softmax over the last dimension.
@@ -21,13 +39,25 @@ pub fn softmax<T: Dtype>(input: &Tensor<T, Cuda>, output: &mut Tensor<T, Cuda>) 
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => softmax_f32_forward(
-                output.data_ptr_mut() as _, input.data_ptr() as _, rows, dim as i32, stream,
+                output.data_ptr_mut() as _,
+                input.data_ptr() as _,
+                rows,
+                dim as i32,
+                stream,
             ),
             DataType::BF16 => softmax_bf16_forward(
-                output.data_ptr_mut() as _, input.data_ptr() as _, rows, dim as i32, stream,
+                output.data_ptr_mut() as _,
+                input.data_ptr() as _,
+                rows,
+                dim as i32,
+                stream,
             ),
             DataType::F16 => softmax_f16_forward(
-                output.data_ptr_mut() as _, input.data_ptr() as _, rows, dim as i32, stream,
+                output.data_ptr_mut() as _,
+                input.data_ptr() as _,
+                rows,
+                dim as i32,
+                stream,
             ),
             _ => return Err(OpError::Kernel(format!("softmax: {:?}", T::DATA_TYPE))),
         }
@@ -46,11 +76,14 @@ mod tests {
             let row = &x[r * cols..(r + 1) * cols];
             let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut s = 0.0;
-            let exps: Vec<f32> = row.iter().map(|v| {
-                let e = (v - m).exp();
-                s += e;
-                e
-            }).collect();
+            let exps: Vec<f32> = row
+                .iter()
+                .map(|v| {
+                    let e = (v - m).exp();
+                    s += e;
+                    e
+                })
+                .collect();
             for (i, &e) in exps.iter().enumerate() {
                 out[r * cols + i] = e / s;
             }
@@ -86,10 +119,16 @@ mod tests {
         let cols = 16usize;
         let host_f32: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.1).cos()).collect();
         let host_bf16: Vec<bf16> = host_f32.iter().map(|&x| bf16::from_f32(x)).collect();
-        let input: Tensor<bf16, Cuda> = Tensor::from_host_slice(&host_bf16, [rows, cols], &cuda).unwrap();
+        let input: Tensor<bf16, Cuda> =
+            Tensor::from_host_slice(&host_bf16, [rows, cols], &cuda).unwrap();
         let mut output: Tensor<bf16, Cuda> = Tensor::zeros([rows, cols], &cuda).unwrap();
         softmax(&input, &mut output).unwrap();
-        let got: Vec<f32> = output.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = output
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         let host_rt: Vec<f32> = host_bf16.iter().map(|x| x.to_f32()).collect();
         let expected = softmax_ref(&host_rt, rows, cols);
         for (a, b) in expected.iter().zip(got.iter()) {

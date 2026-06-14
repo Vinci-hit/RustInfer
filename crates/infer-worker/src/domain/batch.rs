@@ -106,5 +106,7 @@ pub struct PagedKvPool<T: Dtype, D: MemoryPort> {
 }
 
 impl<T: Dtype, D: MemoryPort> PagedKvPool<T, D> {
-    pub fn num_layers(&self) -> usize { self.layers.len() }
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
 }

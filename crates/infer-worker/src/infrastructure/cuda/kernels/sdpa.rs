@@ -16,33 +16,59 @@ use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
-use crate::infrastructure::cuda::ffi::{cudaMemcpyAsync, cudaMemcpyKind, cudaError_cudaSuccess, cudaStream_t};
+use crate::infrastructure::cuda::ffi::{
+    cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t,
+};
 
 unsafe extern "C" {
     fn gemm_strided_batched_bf16_axbt(
-        a: *const half::bf16, b: *const half::bf16, c: *mut half::bf16,
-        m: i32, n: i32, k: i32,
-        stride_a: i64, stride_b: i64, stride_c: i64,
-        batch: i32, stream: cudaStream_t,
+        a: *const half::bf16,
+        b: *const half::bf16,
+        c: *mut half::bf16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        batch: i32,
+        stream: cudaStream_t,
     );
     fn gemm_strided_batched_f32_axbt(
-        a: *const f32, b: *const f32, c: *mut f32,
-        m: i32, n: i32, k: i32,
-        stride_a: i64, stride_b: i64, stride_c: i64,
-        batch: i32, stream: cudaStream_t,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        batch: i32,
+        stream: cudaStream_t,
     );
 
     fn permute_bf16_forward(
-        dst: *mut half::bf16, src: *const half::bf16,
+        dst: *mut half::bf16,
+        src: *const half::bf16,
         ndim: i32,
-        new_shape: *const i64, new_strides: *const i64, old_strides: *const i64,
-        perm: *const i32, num_elements: i64, stream: cudaStream_t,
+        new_shape: *const i64,
+        new_strides: *const i64,
+        old_strides: *const i64,
+        perm: *const i32,
+        num_elements: i64,
+        stream: cudaStream_t,
     );
     fn permute_f32_forward(
-        dst: *mut f32, src: *const f32,
+        dst: *mut f32,
+        src: *const f32,
         ndim: i32,
-        new_shape: *const i64, new_strides: *const i64, old_strides: *const i64,
-        perm: *const i32, num_elements: i64, stream: cudaStream_t,
+        new_shape: *const i64,
+        new_strides: *const i64,
+        old_strides: *const i64,
+        perm: *const i32,
+        num_elements: i64,
+        stream: cudaStream_t,
     );
 }
 
@@ -51,7 +77,10 @@ unsafe extern "C" {
 /// `dst` must be pre-allocated with shape `[new0, new1, new2]` where
 /// `new_i = src.shape[perm[i]]`.
 fn permute_3d<T: Dtype>(
-    src: *const T, dst: *mut T, src_shape: [i64; 3], perm: [i32; 3],
+    src: *const T,
+    dst: *mut T,
+    src_shape: [i64; 3],
+    perm: [i32; 3],
     stream: cudaStream_t,
 ) -> OpResult<()> {
     let new_shape: [i64; 3] = [
@@ -65,16 +94,33 @@ fn permute_3d<T: Dtype>(
     unsafe {
         match T::DATA_TYPE {
             DataType::BF16 => permute_bf16_forward(
-                dst as *mut half::bf16, src as *const half::bf16,
-                3, new_shape.as_ptr(), new_strides.as_ptr(), old_strides.as_ptr(),
-                perm.as_ptr(), numel, stream,
+                dst as *mut half::bf16,
+                src as *const half::bf16,
+                3,
+                new_shape.as_ptr(),
+                new_strides.as_ptr(),
+                old_strides.as_ptr(),
+                perm.as_ptr(),
+                numel,
+                stream,
             ),
             DataType::F32 => permute_f32_forward(
-                dst as *mut f32, src as *const f32,
-                3, new_shape.as_ptr(), new_strides.as_ptr(), old_strides.as_ptr(),
-                perm.as_ptr(), numel, stream,
+                dst as *mut f32,
+                src as *const f32,
+                3,
+                new_shape.as_ptr(),
+                new_strides.as_ptr(),
+                old_strides.as_ptr(),
+                perm.as_ptr(),
+                numel,
+                stream,
             ),
-            other => return Err(OpError::Kernel(format!("permute_3d: unsupported dtype {:?}", other))),
+            other => {
+                return Err(OpError::Kernel(format!(
+                    "permute_3d: unsupported dtype {:?}",
+                    other
+                )));
+            }
         }
     }
     Ok(())
@@ -101,14 +147,20 @@ pub fn sdpa<T: Dtype>(
     }
     let group = num_heads / num_kv_heads;
     if !matches!(T::DATA_TYPE, DataType::F32 | DataType::BF16) {
-        return Err(OpError::Kernel(format!("sdpa: unsupported dtype {:?}", T::DATA_TYPE)));
+        return Err(OpError::Kernel(format!(
+            "sdpa: unsupported dtype {:?}",
+            T::DATA_TYPE
+        )));
     }
     let qs = q.shape().as_slice();
     let ks = k.shape().as_slice();
     let vs = v.shape().as_slice();
     let os = output.shape().as_slice();
     if qs.len() != 3 {
-        return Err(OpError::Shape(format!("sdpa: Q expected SHD, got {:?}", qs)));
+        return Err(OpError::Shape(format!(
+            "sdpa: Q expected SHD, got {:?}",
+            qs
+        )));
     }
     let (seq, h_q, d) = (qs[0], qs[1], qs[2]);
     if h_q != num_heads || d != head_dim {
@@ -124,7 +176,10 @@ pub fn sdpa<T: Dtype>(
         )));
     }
     if os != qs {
-        return Err(OpError::Shape(format!("sdpa: output shape {:?} != Q shape {:?}", os, qs)));
+        return Err(OpError::Shape(format!(
+            "sdpa: output shape {:?} != Q shape {:?}",
+            os, qs
+        )));
     }
 
     let stream = q.device().config.stream;
@@ -133,23 +188,29 @@ pub fn sdpa<T: Dtype>(
     // ── 1. Permute Q [S, H, D] → [H, S, D] ──
     let q_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
-        q.data_ptr(), q_hsd.data_ptr_mut(),
+        q.data_ptr(),
+        q_hsd.data_ptr_mut(),
         [seq as i64, num_heads as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
 
     // ── 2. Permute K, V [S, Hkv, D] → [Hkv, S, D] ──
     let k_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
     let v_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
-        k.data_ptr(), k_hsd_kv.data_ptr_mut(),
+        k.data_ptr(),
+        k_hsd_kv.data_ptr_mut(),
         [seq as i64, num_kv_heads as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
     permute_3d::<T>(
-        v.data_ptr(), v_hsd_kv.data_ptr_mut(),
+        v.data_ptr(),
+        v_hsd_kv.data_ptr_mut(),
         [seq as i64, num_kv_heads as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
 
     // ── 3. GQA: replicate KV from [Hkv, S, D] to [H, S, D] by copying each
@@ -171,14 +232,22 @@ pub fn sdpa<T: Dtype>(
                     let vsrc = (v_hsd_kv.data_ptr() as *const u8).add(src_off);
                     let vdst = (v_full.data_ptr_mut() as *mut u8).add(dst_off);
                     let r1 = cudaMemcpyAsync(
-                        kdst as *mut _, ksrc as *const _, head_bytes,
-                        cudaMemcpyKind::cudaMemcpyDeviceToDevice, stream);
+                        kdst as *mut _,
+                        ksrc as *const _,
+                        head_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                        stream,
+                    );
                     if r1 != cudaError_cudaSuccess {
                         return Err(OpError::Kernel(format!("sdpa K replicate: {:?}", r1)));
                     }
                     let r2 = cudaMemcpyAsync(
-                        vdst as *mut _, vsrc as *const _, head_bytes,
-                        cudaMemcpyKind::cudaMemcpyDeviceToDevice, stream);
+                        vdst as *mut _,
+                        vsrc as *const _,
+                        head_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                        stream,
+                    );
                     if r2 != cudaError_cudaSuccess {
                         return Err(OpError::Kernel(format!("sdpa V replicate: {:?}", r2)));
                     }
@@ -198,17 +267,27 @@ pub fn sdpa<T: Dtype>(
                 q_hsd.data_ptr() as *const half::bf16,
                 k_hsd.data_ptr() as *const half::bf16,
                 scores.data_ptr_mut() as *mut half::bf16,
-                seq as i32, seq as i32, head_dim as i32,
-                stride_qkv, stride_qkv, stride_scores,
-                num_heads as i32, stream,
+                seq as i32,
+                seq as i32,
+                head_dim as i32,
+                stride_qkv,
+                stride_qkv,
+                stride_scores,
+                num_heads as i32,
+                stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
                 q_hsd.data_ptr() as *const f32,
                 k_hsd.data_ptr() as *const f32,
                 scores.data_ptr_mut() as *mut f32,
-                seq as i32, seq as i32, head_dim as i32,
-                stride_qkv, stride_qkv, stride_scores,
-                num_heads as i32, stream,
+                seq as i32,
+                seq as i32,
+                head_dim as i32,
+                stride_qkv,
+                stride_qkv,
+                stride_scores,
+                num_heads as i32,
+                stream,
             ),
             _ => unreachable!(),
         }
@@ -228,9 +307,11 @@ pub fn sdpa<T: Dtype>(
     //   Permute v_hsd [H, S, D] → v_hds [H, D, S].
     let v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
     permute_3d::<T>(
-        v_hsd.data_ptr(), v_hds.data_ptr_mut(),
+        v_hsd.data_ptr(),
+        v_hds.data_ptr_mut(),
         [num_heads as i64, seq as i64, head_dim as i64],
-        [0, 2, 1], stream,
+        [0, 2, 1],
+        stream,
     )?;
     let out_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     let stride_attn = (seq * seq) as i64;
@@ -242,17 +323,27 @@ pub fn sdpa<T: Dtype>(
                 attn.data_ptr() as *const half::bf16,
                 v_hds.data_ptr() as *const half::bf16,
                 out_hsd.data_ptr_mut() as *mut half::bf16,
-                seq as i32, head_dim as i32, seq as i32,
-                stride_attn, stride_v_hds, stride_out,
-                num_heads as i32, stream,
+                seq as i32,
+                head_dim as i32,
+                seq as i32,
+                stride_attn,
+                stride_v_hds,
+                stride_out,
+                num_heads as i32,
+                stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
                 attn.data_ptr() as *const f32,
                 v_hds.data_ptr() as *const f32,
                 out_hsd.data_ptr_mut() as *mut f32,
-                seq as i32, head_dim as i32, seq as i32,
-                stride_attn, stride_v_hds, stride_out,
-                num_heads as i32, stream,
+                seq as i32,
+                head_dim as i32,
+                seq as i32,
+                stride_attn,
+                stride_v_hds,
+                stride_out,
+                num_heads as i32,
+                stream,
             ),
             _ => unreachable!(),
         }
@@ -260,9 +351,11 @@ pub fn sdpa<T: Dtype>(
 
     // ── 7. Permute [H, S, D] → [S, H, D] back into output.
     permute_3d::<T>(
-        out_hsd.data_ptr(), output.data_ptr_mut(),
+        out_hsd.data_ptr(),
+        output.data_ptr_mut(),
         [num_heads as i64, seq as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
 
     let _ = Shape::from_slice(&[seq, num_heads, head_dim]);
@@ -293,7 +386,10 @@ pub fn sdpa_masked<T: Dtype>(
     }
     let group = num_heads / num_kv_heads;
     if !matches!(T::DATA_TYPE, DataType::F32 | DataType::BF16) {
-        return Err(OpError::Kernel(format!("sdpa_masked: unsupported dtype {:?}", T::DATA_TYPE)));
+        return Err(OpError::Kernel(format!(
+            "sdpa_masked: unsupported dtype {:?}",
+            T::DATA_TYPE
+        )));
     }
     let qs = q.shape().as_slice();
     let ks = k.shape().as_slice();
@@ -301,7 +397,10 @@ pub fn sdpa_masked<T: Dtype>(
     let os = output.shape().as_slice();
     let ms = mask.shape().as_slice();
     if qs.len() != 3 {
-        return Err(OpError::Shape(format!("sdpa_masked: Q expected SHD, got {:?}", qs)));
+        return Err(OpError::Shape(format!(
+            "sdpa_masked: Q expected SHD, got {:?}",
+            qs
+        )));
     }
     let (seq, h_q, d) = (qs[0], qs[1], qs[2]);
     if h_q != num_heads || d != head_dim {
@@ -317,7 +416,10 @@ pub fn sdpa_masked<T: Dtype>(
         )));
     }
     if os != qs {
-        return Err(OpError::Shape(format!("sdpa_masked: output shape {:?} != Q shape {:?}", os, qs)));
+        return Err(OpError::Shape(format!(
+            "sdpa_masked: output shape {:?} != Q shape {:?}",
+            os, qs
+        )));
     }
     if ms != [seq, seq] {
         return Err(OpError::Shape(format!(
@@ -332,21 +434,27 @@ pub fn sdpa_masked<T: Dtype>(
     // ── 1. Permute Q [S, H, D] → [H, S, D] ──
     let q_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
-        q.data_ptr(), q_hsd.data_ptr_mut(),
+        q.data_ptr(),
+        q_hsd.data_ptr_mut(),
         [seq as i64, num_heads as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
     let k_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
     let v_hsd_kv: Tensor<T, Cuda> = Tensor::zeros([num_kv_heads, seq, head_dim], &dev)?;
     permute_3d::<T>(
-        k.data_ptr(), k_hsd_kv.data_ptr_mut(),
+        k.data_ptr(),
+        k_hsd_kv.data_ptr_mut(),
         [seq as i64, num_kv_heads as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
     permute_3d::<T>(
-        v.data_ptr(), v_hsd_kv.data_ptr_mut(),
+        v.data_ptr(),
+        v_hsd_kv.data_ptr_mut(),
         [seq as i64, num_kv_heads as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
 
     // GQA replicate.
@@ -367,16 +475,30 @@ pub fn sdpa_masked<T: Dtype>(
                     let vsrc = (v_hsd_kv.data_ptr() as *const u8).add(src_off);
                     let vdst = (v_full.data_ptr_mut() as *mut u8).add(dst_off);
                     let r1 = cudaMemcpyAsync(
-                        kdst as *mut _, ksrc as *const _, head_bytes,
-                        cudaMemcpyKind::cudaMemcpyDeviceToDevice, stream);
+                        kdst as *mut _,
+                        ksrc as *const _,
+                        head_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                        stream,
+                    );
                     if r1 != cudaError_cudaSuccess {
-                        return Err(OpError::Kernel(format!("sdpa_masked K replicate: {:?}", r1)));
+                        return Err(OpError::Kernel(format!(
+                            "sdpa_masked K replicate: {:?}",
+                            r1
+                        )));
                     }
                     let r2 = cudaMemcpyAsync(
-                        vdst as *mut _, vsrc as *const _, head_bytes,
-                        cudaMemcpyKind::cudaMemcpyDeviceToDevice, stream);
+                        vdst as *mut _,
+                        vsrc as *const _,
+                        head_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                        stream,
+                    );
                     if r2 != cudaError_cudaSuccess {
-                        return Err(OpError::Kernel(format!("sdpa_masked V replicate: {:?}", r2)));
+                        return Err(OpError::Kernel(format!(
+                            "sdpa_masked V replicate: {:?}",
+                            r2
+                        )));
                     }
                 }
             }
@@ -394,17 +516,27 @@ pub fn sdpa_masked<T: Dtype>(
                 q_hsd.data_ptr() as *const half::bf16,
                 k_hsd.data_ptr() as *const half::bf16,
                 scores.data_ptr_mut() as *mut half::bf16,
-                seq as i32, seq as i32, head_dim as i32,
-                stride_qkv, stride_qkv, stride_scores,
-                num_heads as i32, stream,
+                seq as i32,
+                seq as i32,
+                head_dim as i32,
+                stride_qkv,
+                stride_qkv,
+                stride_scores,
+                num_heads as i32,
+                stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
                 q_hsd.data_ptr() as *const f32,
                 k_hsd.data_ptr() as *const f32,
                 scores.data_ptr_mut() as *mut f32,
-                seq as i32, seq as i32, head_dim as i32,
-                stride_qkv, stride_qkv, stride_scores,
-                num_heads as i32, stream,
+                seq as i32,
+                seq as i32,
+                head_dim as i32,
+                stride_qkv,
+                stride_qkv,
+                stride_scores,
+                num_heads as i32,
+                stream,
             ),
             _ => unreachable!(),
         }
@@ -421,9 +553,11 @@ pub fn sdpa_masked<T: Dtype>(
     // out = attn @ V (via V permute to [H, D, S] + axbt)
     let v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
     permute_3d::<T>(
-        v_hsd.data_ptr(), v_hds.data_ptr_mut(),
+        v_hsd.data_ptr(),
+        v_hds.data_ptr_mut(),
         [num_heads as i64, seq as i64, head_dim as i64],
-        [0, 2, 1], stream,
+        [0, 2, 1],
+        stream,
     )?;
     let out_hsd: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, head_dim], &dev)?;
     let stride_attn = (seq * seq) as i64;
@@ -435,25 +569,37 @@ pub fn sdpa_masked<T: Dtype>(
                 attn.data_ptr() as *const half::bf16,
                 v_hds.data_ptr() as *const half::bf16,
                 out_hsd.data_ptr_mut() as *mut half::bf16,
-                seq as i32, head_dim as i32, seq as i32,
-                stride_attn, stride_v_hds, stride_out,
-                num_heads as i32, stream,
+                seq as i32,
+                head_dim as i32,
+                seq as i32,
+                stride_attn,
+                stride_v_hds,
+                stride_out,
+                num_heads as i32,
+                stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
                 attn.data_ptr() as *const f32,
                 v_hds.data_ptr() as *const f32,
                 out_hsd.data_ptr_mut() as *mut f32,
-                seq as i32, head_dim as i32, seq as i32,
-                stride_attn, stride_v_hds, stride_out,
-                num_heads as i32, stream,
+                seq as i32,
+                head_dim as i32,
+                seq as i32,
+                stride_attn,
+                stride_v_hds,
+                stride_out,
+                num_heads as i32,
+                stream,
             ),
             _ => unreachable!(),
         }
     }
     permute_3d::<T>(
-        out_hsd.data_ptr(), output.data_ptr_mut(),
+        out_hsd.data_ptr(),
+        output.data_ptr_mut(),
         [num_heads as i64, seq as i64, head_dim as i64],
-        [1, 0, 2], stream,
+        [1, 0, 2],
+        stream,
     )?;
     Ok(())
 }
@@ -465,8 +611,15 @@ mod tests {
 
     /// CPU reference SDPA on SHD layout (Q) and SHD-kv layout (K, V), F32.
     fn sdpa_cpu_f32(
-        q: &[f32], k: &[f32], v: &[f32], out: &mut [f32],
-        seq: usize, n_heads: usize, n_kv: usize, head_dim: usize, scale: f32,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        seq: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        scale: f32,
     ) {
         let group = n_heads / n_kv;
         for h in 0..n_heads {
@@ -486,15 +639,19 @@ mod tests {
                 let row = &mut scores[sq * seq..(sq + 1) * seq];
                 let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut s = 0.0f32;
-                for x in row.iter_mut() { *x = (*x - mx).exp(); s += *x; }
-                for x in row.iter_mut() { *x /= s; }
+                for x in row.iter_mut() {
+                    *x = (*x - mx).exp();
+                    s += *x;
+                }
+                for x in row.iter_mut() {
+                    *x /= s;
+                }
             }
             for sq in 0..seq {
                 for d in 0..head_dim {
                     let mut acc = 0.0f32;
                     for sk in 0..seq {
-                        acc += scores[sq * seq + sk]
-                            * v[(sk * n_kv + kv_h) * head_dim + d];
+                        acc += scores[sq * seq + sk] * v[(sk * n_kv + kv_h) * head_dim + d];
                     }
                     out[(sq * n_heads + h) * head_dim + d] = acc;
                 }
@@ -521,7 +678,13 @@ mod tests {
         sdpa(&q, &k, &v, &mut out, h, h, d, scale).unwrap();
         let got = out.to_host_vec().unwrap();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "mha sdpa mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                (a - b).abs() < 1e-3,
+                "mha sdpa mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
 
@@ -531,12 +694,26 @@ mod tests {
         // GQA: 4 query heads, 2 kv heads, group=2.
         let (seq, n_h, n_kv, d) = (4usize, 4usize, 2usize, 8usize);
         let scale = 1.0 / (d as f32).sqrt();
-        let q_host: Vec<f32> = (0..seq * n_h * d).map(|i| (i as f32 * 0.011).sin()).collect();
-        let k_host: Vec<f32> = (0..seq * n_kv * d).map(|i| (i as f32 * 0.019).cos()).collect();
+        let q_host: Vec<f32> = (0..seq * n_h * d)
+            .map(|i| (i as f32 * 0.011).sin())
+            .collect();
+        let k_host: Vec<f32> = (0..seq * n_kv * d)
+            .map(|i| (i as f32 * 0.019).cos())
+            .collect();
         let v_host: Vec<f32> = (0..seq * n_kv * d).map(|i| i as f32 * 0.05 - 0.3).collect();
 
         let mut ref_out = vec![0.0f32; seq * n_h * d];
-        sdpa_cpu_f32(&q_host, &k_host, &v_host, &mut ref_out, seq, n_h, n_kv, d, scale);
+        sdpa_cpu_f32(
+            &q_host,
+            &k_host,
+            &v_host,
+            &mut ref_out,
+            seq,
+            n_h,
+            n_kv,
+            d,
+            scale,
+        );
 
         let q: Tensor<f32, Cuda> = Tensor::from_host_slice(&q_host, [seq, n_h, d], &cuda).unwrap();
         let k: Tensor<f32, Cuda> = Tensor::from_host_slice(&k_host, [seq, n_kv, d], &cuda).unwrap();
@@ -545,7 +722,13 @@ mod tests {
         sdpa(&q, &k, &v, &mut out, n_h, n_kv, d, scale).unwrap();
         let got = out.to_host_vec().unwrap();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "gqa sdpa mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                (a - b).abs() < 1e-3,
+                "gqa sdpa mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
 
@@ -572,12 +755,22 @@ mod tests {
         let v: Tensor<bf16, Cuda> = Tensor::from_host_slice(&v_bf16, [seq, h, d], &cuda).unwrap();
         let mut out: Tensor<bf16, Cuda> = Tensor::zeros([seq, h, d], &cuda).unwrap();
         sdpa(&q, &k, &v, &mut out, h, h, d, scale).unwrap();
-        let got: Vec<f32> = out.to_host_vec().unwrap().iter().map(|v| v.to_f32()).collect();
+        let got: Vec<f32> = out
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_f32())
+            .collect();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
             let abs = (a - b).abs();
             let rel = abs / a.abs().max(1e-3);
-            assert!(abs < 0.1 || rel < 0.05,
-                "bf16 sdpa mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                abs < 0.1 || rel < 0.05,
+                "bf16 sdpa mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
 
@@ -595,7 +788,9 @@ mod tests {
         let mut mask_host = vec![0.0f32; seq * seq];
         for i in 0..seq {
             for j in 0..seq {
-                if j > i { mask_host[i * seq + j] = neg; }
+                if j > i {
+                    mask_host[i * seq + j] = neg;
+                }
             }
         }
 
@@ -607,8 +802,7 @@ mod tests {
                 for sk in 0..seq {
                     let mut acc = 0.0f32;
                     for dd in 0..d {
-                        acc += q_host[(sq * h + hi) * d + dd]
-                             * k_host[(sk * h + hi) * d + dd];
+                        acc += q_host[(sq * h + hi) * d + dd] * k_host[(sk * h + hi) * d + dd];
                     }
                     scores[sq * seq + sk] = acc * scale + mask_host[sq * seq + sk];
                 }
@@ -617,15 +811,19 @@ mod tests {
                 let row = &mut scores[sq * seq..(sq + 1) * seq];
                 let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut s = 0.0f32;
-                for x in row.iter_mut() { *x = (*x - mx).exp(); s += *x; }
-                for x in row.iter_mut() { *x /= s; }
+                for x in row.iter_mut() {
+                    *x = (*x - mx).exp();
+                    s += *x;
+                }
+                for x in row.iter_mut() {
+                    *x /= s;
+                }
             }
             for sq in 0..seq {
                 for dd in 0..d {
                     let mut acc = 0.0f32;
                     for sk in 0..seq {
-                        acc += scores[sq * seq + sk]
-                             * v_host[(sk * h + hi) * d + dd];
+                        acc += scores[sq * seq + sk] * v_host[(sk * h + hi) * d + dd];
                     }
                     ref_out[(sq * h + hi) * d + dd] = acc;
                 }
@@ -640,8 +838,13 @@ mod tests {
         sdpa_masked(&q, &k, &v, &mut out, &m, h, h, d, scale).unwrap();
         let got = out.to_host_vec().unwrap();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
-            assert!((a - b).abs() < 5e-3,
-                "masked sdpa f32 mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                (a - b).abs() < 5e-3,
+                "masked sdpa f32 mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
 
@@ -661,7 +864,9 @@ mod tests {
         let mut mask_host = vec![neg; seq * seq];
         for i in 0..seq {
             for j in 0..seq {
-                if j <= i && am[j] == 1 { mask_host[i * seq + j] = 0.0; }
+                if j <= i && am[j] == 1 {
+                    mask_host[i * seq + j] = 0.0;
+                }
             }
         }
         let q_bf: Vec<half::bf16> = q_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
@@ -680,8 +885,7 @@ mod tests {
                 for sk in 0..seq {
                     let mut acc = 0.0f32;
                     for dd in 0..d {
-                        acc += q_rt[(sq * h + hi) * d + dd]
-                             * k_rt[(sk * h + hi) * d + dd];
+                        acc += q_rt[(sq * h + hi) * d + dd] * k_rt[(sk * h + hi) * d + dd];
                     }
                     scores[sq * seq + sk] = acc * scale + mask_host[sq * seq + sk];
                 }
@@ -690,33 +894,51 @@ mod tests {
                 let row = &mut scores[sq * seq..(sq + 1) * seq];
                 let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut s = 0.0f32;
-                for x in row.iter_mut() { *x = (*x - mx).exp(); s += *x; }
-                for x in row.iter_mut() { *x /= s; }
+                for x in row.iter_mut() {
+                    *x = (*x - mx).exp();
+                    s += *x;
+                }
+                for x in row.iter_mut() {
+                    *x /= s;
+                }
             }
             for sq in 0..seq {
                 for dd in 0..d {
                     let mut acc = 0.0f32;
                     for sk in 0..seq {
-                        acc += scores[sq * seq + sk]
-                             * v_rt[(sk * h + hi) * d + dd];
+                        acc += scores[sq * seq + sk] * v_rt[(sk * h + hi) * d + dd];
                     }
                     ref_out[(sq * h + hi) * d + dd] = acc;
                 }
             }
         }
 
-        let q: Tensor<half::bf16, Cuda> = Tensor::from_host_slice(&q_bf, [seq, h, d], &cuda).unwrap();
-        let k: Tensor<half::bf16, Cuda> = Tensor::from_host_slice(&k_bf, [seq, h, d], &cuda).unwrap();
-        let v: Tensor<half::bf16, Cuda> = Tensor::from_host_slice(&v_bf, [seq, h, d], &cuda).unwrap();
-        let m: Tensor<half::bf16, Cuda> = Tensor::from_host_slice(&mask_bf, [seq, seq], &cuda).unwrap();
+        let q: Tensor<half::bf16, Cuda> =
+            Tensor::from_host_slice(&q_bf, [seq, h, d], &cuda).unwrap();
+        let k: Tensor<half::bf16, Cuda> =
+            Tensor::from_host_slice(&k_bf, [seq, h, d], &cuda).unwrap();
+        let v: Tensor<half::bf16, Cuda> =
+            Tensor::from_host_slice(&v_bf, [seq, h, d], &cuda).unwrap();
+        let m: Tensor<half::bf16, Cuda> =
+            Tensor::from_host_slice(&mask_bf, [seq, seq], &cuda).unwrap();
         let mut out: Tensor<half::bf16, Cuda> = Tensor::zeros([seq, h, d], &cuda).unwrap();
         sdpa_masked(&q, &k, &v, &mut out, &m, h, h, d, scale).unwrap();
-        let got: Vec<f32> = out.to_host_vec().unwrap().iter().map(|x| x.to_f32()).collect();
+        let got: Vec<f32> = out
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
             let abs = (a - b).abs();
             let rel = abs / a.abs().max(1e-3);
-            assert!(abs < 0.1 || rel < 0.06,
-                "masked bf16 sdpa mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                abs < 0.1 || rel < 0.06,
+                "masked bf16 sdpa mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
 
@@ -726,8 +948,12 @@ mod tests {
         // input/output. batch=2, M=3, N=4, K=5.
         let cuda = Cuda::new(0).unwrap();
         let (batch, m, n, k) = (2usize, 8usize, 16usize, 8usize);
-        let a_host: Vec<bf16> = (0..batch * m * k).map(|i| bf16::from_f32(i as f32 * 0.01)).collect();
-        let b_host: Vec<bf16> = (0..batch * n * k).map(|i| bf16::from_f32(i as f32 * 0.02)).collect();
+        let a_host: Vec<bf16> = (0..batch * m * k)
+            .map(|i| bf16::from_f32(i as f32 * 0.01))
+            .collect();
+        let b_host: Vec<bf16> = (0..batch * n * k)
+            .map(|i| bf16::from_f32(i as f32 * 0.02))
+            .collect();
         let a: Tensor<bf16, Cuda> = Tensor::from_host_slice(&a_host, [batch, m, k], &cuda).unwrap();
         let b: Tensor<bf16, Cuda> = Tensor::from_host_slice(&b_host, [batch, n, k], &cuda).unwrap();
         let mut c: Tensor<bf16, Cuda> = Tensor::zeros([batch, m, n], &cuda).unwrap();
@@ -736,13 +962,25 @@ mod tests {
         let stride_c = (m * n) as i64;
         unsafe {
             super::gemm_strided_batched_bf16_axbt(
-                a.data_ptr(), b.data_ptr(), c.data_ptr_mut(),
-                m as i32, n as i32, k as i32,
-                stride_a, stride_b, stride_c, batch as i32,
+                a.data_ptr(),
+                b.data_ptr(),
+                c.data_ptr_mut(),
+                m as i32,
+                n as i32,
+                k as i32,
+                stride_a,
+                stride_b,
+                stride_c,
+                batch as i32,
                 cuda.config.stream,
             );
         }
-        let got: Vec<f32> = c.to_host_vec().unwrap().iter().map(|x| x.to_f32()).collect();
+        let got: Vec<f32> = c
+            .to_host_vec()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_f32())
+            .collect();
         // CPU ref: c[b, i, j] = sum_k a[b, i, k] * b[b, j, k]
         let mut ref_c = vec![0.0_f32; batch * m * n];
         for bi in 0..batch {
@@ -751,15 +989,20 @@ mod tests {
                     let mut acc = 0.0_f32;
                     for kk in 0..k {
                         acc += a_host[(bi * m + i) * k + kk].to_f32()
-                             * b_host[(bi * n + j) * k + kk].to_f32();
+                            * b_host[(bi * n + j) * k + kk].to_f32();
                     }
                     ref_c[(bi * m + i) * n + j] = acc;
                 }
             }
         }
         for (i, (a, b)) in ref_c.iter().zip(got.iter()).enumerate() {
-            assert!((a - b).abs() < 0.5, "axbt mismatch at {}: cpu={} gpu={}", i, a, b);
+            assert!(
+                (a - b).abs() < 0.5,
+                "axbt mismatch at {}: cpu={} gpu={}",
+                i,
+                a,
+                b
+            );
         }
     }
-
 }

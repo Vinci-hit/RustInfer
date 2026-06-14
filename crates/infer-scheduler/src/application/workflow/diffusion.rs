@@ -10,8 +10,8 @@ use crate::application::planning::PlanningSystem;
 use crate::application::scheduler_event::SchedulerEvent;
 use crate::application::workflow::{EngineWorkflow, ResourceContext};
 use crate::domain::inference_session::table::RequestTable;
-use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::domain::policy::token_budget::TokenBudget;
+use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::error::Result;
 use crate::infrastructure::transport::control_plane::{
     ControlEvent, ControlPlaneCmdTx, WorkerGroup, WorkerId,
@@ -77,15 +77,12 @@ impl EngineWorkflow for DiffusionWorkflow {
         {
             return Ok(());
         }
-        self.planning
-            .execute_plan(&plan, ctx.requests, ctx.radix)?;
+        self.planning.execute_plan(&plan, ctx.requests, ctx.radix)?;
 
         let prefilling_view = ctx.requests.prefilling();
-        let batch_data = self.planning.build_batch(
-            &prefilling_view,
-            ctx.config,
-            ctx.codec,
-        )?;
+        let batch_data = self
+            .planning
+            .build_batch(&prefilling_view, ctx.config, ctx.codec)?;
 
         if !batch_data.is_empty() {
             if let Some(first) = prefilling_view.first() {
@@ -108,7 +105,10 @@ impl EngineWorkflow for DiffusionWorkflow {
         event: SchedulerEvent,
     ) -> Result<()> {
         let SchedulerEvent::WorkerDiffusionStep(output) = event else {
-            tracing::warn!("DiffusionWorkflow received non-Diffusion step event: {:?}", event);
+            tracing::warn!(
+                "DiffusionWorkflow received non-Diffusion step event: {:?}",
+                event
+            );
             return Ok(());
         };
         self.in_flight = false;
@@ -134,6 +134,7 @@ impl EngineWorkflow for DiffusionWorkflow {
             control_cmd,
             worker_group,
             default_worker,
+            false,
         )
     }
 }

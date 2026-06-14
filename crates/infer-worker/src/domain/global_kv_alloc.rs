@@ -29,7 +29,6 @@
 //! hence the same sorted result. Required for future TP/PP rank
 //! consistency.
 
-
 /// Returned when alloc cannot satisfy the request even after merging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocFull {
@@ -313,7 +312,11 @@ mod tests {
         a.free(&[0, 1, 2]);
         // Pool is now sorted to [0, 1, 2, 5, 6, 7, 8, 9], head=0.
         let v = a.alloc_indices(3).unwrap();
-        assert_eq!(v, vec![0, 1, 2], "next alloc takes the smallest free indices");
+        assert_eq!(
+            v,
+            vec![0, 1, 2],
+            "next alloc takes the smallest free indices"
+        );
         assert_eq!(a.head(), 3);
         assert_eq!(a.outstanding(), 5);
     }

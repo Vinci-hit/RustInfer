@@ -34,13 +34,13 @@ use std::marker::PhantomData;
 
 use infer_protocol::worker_to_scheduler_control::{AllocFailed, WorkerStepError};
 
-use crate::error::SchedulerError;
 use crate::domain::inference_session::lifecycle::SequenceId;
 use crate::domain::inference_session::table::{PreemptCandidate, RequestTable};
 use crate::domain::kv_budget::KvBudget;
+use crate::error::SchedulerError;
 use crate::infrastructure::kv_cache::radix_tree::RadixTree;
-use crate::infrastructure::transport::control_plane::{ControlEvent, ControlPlaneCmdTx, WorkerId};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
+use crate::infrastructure::transport::control_plane::{ControlEvent, ControlPlaneCmdTx, WorkerId};
 
 use super::outcomes::ControlOutcome;
 
@@ -74,9 +74,10 @@ impl ControlEventSystem {
             ControlEvent::StepError { worker: _, err } => {
                 self.handle_worker_step_error(err, sessions)
             }
-            ControlEvent::WorkerLost { worker, last_seen_ms } => {
-                self.handle_worker_lost(worker, last_seen_ms, sessions)
-            }
+            ControlEvent::WorkerLost {
+                worker,
+                last_seen_ms,
+            } => self.handle_worker_lost(worker, last_seen_ms, sessions),
             ControlEvent::WorkerError {
                 worker,
                 message,
@@ -106,18 +107,16 @@ impl ControlEventSystem {
                 );
                 ControlOutcome::noop()
             }
-            ControlEvent::AllocFailed { worker, req } => {
-                self.handle_alloc_failed(
-                    req,
-                    sessions,
-                    radix,
-                    kv_budget,
-                    control_cmd,
-                    worker_group,
-                    &worker,
-                    default_worker,
-                )
-            }
+            ControlEvent::AllocFailed { worker, req } => self.handle_alloc_failed(
+                req,
+                sessions,
+                radix,
+                kv_budget,
+                control_cmd,
+                worker_group,
+                &worker,
+                default_worker,
+            ),
         }
     }
 
@@ -262,11 +261,7 @@ impl ControlEventSystem {
         for sid in &victims {
             radix.mark_finished_chain(*sid);
             if let Err(e) = sessions.preempt_to_queued(SequenceId(*sid)) {
-                tracing::error!(
-                    sequence_id = sid,
-                    "preempt_to_queued failed: {}",
-                    e
-                );
+                tracing::error!(sequence_id = sid, "preempt_to_queued failed: {}", e);
             }
         }
 
@@ -283,6 +278,7 @@ impl ControlEventSystem {
             infer_protocol::scheduler_to_worker_control::Preempt {
                 model_instance_id: worker_group.model_instance_id.clone(),
                 sequence_ids: victims,
+                free_indices: Vec::new(),
             },
         );
         let _ = control_cmd.send_to(target_worker, msg);
@@ -361,8 +357,7 @@ impl ControlEventSystem {
     ) -> Vec<crate::domain::inference_session::lifecycle::RequestId> {
         let mut sequence_ids = err.sequence_ids.clone();
         if err.fatal || sequence_ids.is_empty() {
-            sequence_ids
-                .extend(sessions.running_sequence_ids().into_iter().map(|id| id.0));
+            sequence_ids.extend(sessions.running_sequence_ids().into_iter().map(|id| id.0));
         }
         sequence_ids.sort_unstable();
         sequence_ids.dedup();
@@ -377,7 +372,9 @@ impl ControlEventSystem {
 mod tests {
     use super::*;
     use crate::domain::inference_session::handle::RequestHandle;
-    use crate::domain::inference_session::lifecycle::{Priority, RequestId, RequestMeta, SamplingParams};
+    use crate::domain::inference_session::lifecycle::{
+        Priority, RequestId, RequestMeta, SamplingParams,
+    };
     use infer_protocol::worker_to_scheduler_control::{WorkerHeartbeat, WorkerState};
     use std::sync::Arc;
     use std::time::Instant;
@@ -458,7 +455,8 @@ mod tests {
         >,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let pending = crate::infrastructure::transport::control_plane::pending_calls::PendingCalls::new();
+        let pending =
+            crate::infrastructure::transport::control_plane::pending_calls::PendingCalls::new();
         (
             ControlPlaneCmdTx {
                 tx,

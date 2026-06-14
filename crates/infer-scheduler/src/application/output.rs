@@ -23,12 +23,14 @@ pub struct CompleteOutcome {
 mod tests {
     use crate::domain::inference_session::handle::RequestHandle;
     use crate::domain::inference_session::lifecycle::{
-        Decoding, InferenceSession, Prefilling, Priority, RequestId, RequestMeta,
-        SamplingParams, SequenceId,
+        Decoding, InferenceSession, Prefilling, Priority, RequestId, RequestMeta, SamplingParams,
+        SequenceId,
     };
     use crate::infrastructure::metrics::MetricsRecorder;
     use async_trait::async_trait;
-    use infer_protocol::scheduler_to_server::{ChunkType, InferenceResponse, ResponseStatus, StreamChunk};
+    use infer_protocol::scheduler_to_server::{
+        ChunkType, InferenceResponse, ResponseStatus, StreamChunk,
+    };
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 

@@ -149,7 +149,11 @@ fn drive_router(
                         }
                     }
                 }
-                RouterCommand::CallOne { worker, env, deadline: _ } => {
+                RouterCommand::CallOne {
+                    worker,
+                    env,
+                    deadline: _,
+                } => {
                     if let Err(e) = send_to(&socket, &worker, &env) {
                         tracing::error!("call_one {}: {:?}", worker, e);
                         // Resolve the pending entry with the error immediately.

@@ -14,8 +14,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use crate::domain::inference_session::handle::RequestHandle;
+use crate::infrastructure::kv_cache::traits::PrefixMatch;
 use infer_protocol::server_to_scheduler::DiffusionRequest;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -63,10 +63,8 @@ impl std::fmt::Display for SequenceId {
 }
 
 /// Priority level (higher = more important).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Priority(pub i32);
-
 
 /// Sampling parameters.
 #[derive(Debug, Clone)]
@@ -314,14 +312,19 @@ impl InferenceSession<Prefilling> {
 
     /// Remaining tokens to prefill.
     pub fn remaining_tokens(&self) -> usize {
-        self.state.prompt_len.saturating_sub(self.state.num_computed_tokens)
+        self.state
+            .prompt_len
+            .saturating_sub(self.state.num_computed_tokens)
     }
 }
 
 impl InferenceSession<Decoding> {
     /// Transition: Decoding → Finished.
     pub fn finish(self, reason: FinishReason) -> InferenceSession<Finished> {
-        let ttft = self.state.first_token_time.duration_since(self.meta.arrival_time);
+        let ttft = self
+            .state
+            .first_token_time
+            .duration_since(self.meta.arrival_time);
         let e2e = self.meta.arrival_time.elapsed();
         let num_tokens = self.state.output_tokens.len() as u32;
 
@@ -429,4 +432,3 @@ mod tests {
         assert_eq!(d.state.preemption_count, 2);
     }
 }
-

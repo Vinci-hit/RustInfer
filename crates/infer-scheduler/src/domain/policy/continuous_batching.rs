@@ -11,11 +11,9 @@
 //! policy only drives prefill scheduling — both fresh prompts and
 //! continuation chunks for already-prefilling sequences.
 
-use crate::domain::policy::traits::{
-    BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy,
-};
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::policy::token_budget::TokenBudget;
+use crate::domain::policy::traits::{BatchPlan, PrefillEntry, RunningSet, SchedulingPolicy};
 
 /// FCFS continuous batching policy.
 ///
@@ -29,7 +27,9 @@ pub struct ContinuousBatchingPolicy {
 
 impl ContinuousBatchingPolicy {
     pub fn new(chunked_prefill_size: Option<usize>) -> Self {
-        Self { chunked_prefill_size }
+        Self {
+            chunked_prefill_size,
+        }
     }
 
     /// Compute the chunk size for a given remaining token count.
@@ -124,8 +124,8 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::inference_session::lifecycle::*;
     use crate::domain::inference_session::handle::RequestHandle;
+    use crate::domain::inference_session::lifecycle::*;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -133,7 +133,8 @@ mod tests {
         let mut q = WaitingQueue::new();
         for (id, len) in ids {
             let meta = Arc::new(RequestMeta {
-                id: RequestId::new_v4(), external_id: id.to_string(),
+                id: RequestId::new_v4(),
+                external_id: id.to_string(),
                 sequence_id: SequenceId(1),
                 input_ids: vec![1i32; *len],
                 max_tokens: 100,
@@ -163,7 +164,10 @@ mod tests {
         let policy = ContinuousBatchingPolicy::new(None);
         let waiting = WaitingQueue::new();
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 512, max_seqs: 4 };
+        let budget = TokenBudget {
+            max_tokens: 512,
+            max_seqs: 4,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert!(!plan.has_work());
@@ -174,7 +178,10 @@ mod tests {
         let policy = ContinuousBatchingPolicy::new(None);
         let waiting = make_waiting(&[("a", 10), ("b", 10), ("c", 10)]);
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 25, max_seqs: 4 };
+        let budget = TokenBudget {
+            max_tokens: 25,
+            max_seqs: 4,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         // Budget = 25 tokens, each request is 10 → can fit 2.
@@ -187,7 +194,10 @@ mod tests {
         let policy = ContinuousBatchingPolicy::new(None);
         let waiting = make_waiting(&[("a", 5), ("b", 5), ("c", 5)]);
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 512, max_seqs: 2 };
+        let budget = TokenBudget {
+            max_tokens: 512,
+            max_seqs: 2,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 2);
@@ -198,7 +208,10 @@ mod tests {
         let policy = ContinuousBatchingPolicy::new(Some(10));
         let waiting = make_waiting(&[("long", 25)]);
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 512, max_seqs: 4 };
+        let budget = TokenBudget {
+            max_tokens: 512,
+            max_seqs: 4,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         // chunk_size=10, prompt=25 → first chunk is 10 tokens, is_partial=true
@@ -220,7 +233,10 @@ mod tests {
             num_decoding: 0,
             prefilling_continuations: vec![(cont_id, 15)],
         };
-        let budget = TokenBudget { max_tokens: 12, max_seqs: 4 };
+        let budget = TokenBudget {
+            max_tokens: 12,
+            max_seqs: 4,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         // Continuation chunk takes 10 tokens (chunk_size), leaving 2 for new.
@@ -238,7 +254,10 @@ mod tests {
         let policy = ContinuousBatchingPolicy::new(None);
         let waiting = make_waiting(&[("full", 100)]);
         let running = empty_running();
-        let budget = TokenBudget { max_tokens: 512, max_seqs: 4 };
+        let budget = TokenBudget {
+            max_tokens: 512,
+            max_seqs: 4,
+        };
 
         let plan = policy.schedule(&waiting, &running, &budget);
         assert_eq!(plan.prefill_batch.len(), 1);

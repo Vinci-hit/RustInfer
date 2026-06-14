@@ -1,10 +1,10 @@
 //! Qwen3 model — same as Llama3 + QK-norm before RoPE.
 
+use super::layers::{Embedding, Linear, RMSNorm};
+use crate::domain::model::{ForwardContext, LlmForwardWorkspace, LlmModel};
 use crate::domain::ports::{LlmOps, OpResult};
-use crate::domain::types::Dtype;
 use crate::domain::tensor::Tensor;
-use crate::domain::model::{LlmModel, ForwardContext};
-use super::layers::{Linear, RMSNorm, Embedding};
+use crate::domain::types::Dtype;
 
 pub struct Qwen3Layer<T: Dtype, D: LlmOps> {
     pub input_layernorm: RMSNorm<T, D>,
@@ -34,11 +34,16 @@ pub struct Qwen3Model<T: Dtype, D: LlmOps> {
     pub vocab_size: usize,
 }
 
-impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
+impl<T, D, W> LlmModel<T, D, W> for Qwen3Model<T, D>
+where
+    T: Dtype,
+    D: LlmOps,
+    W: LlmForwardWorkspace<T, D>,
+{
     fn forward(
         &self,
         input_ids: &Tensor<i32, D>,
-        ctx: &mut ForwardContext<'_, T, D>,
+        ctx: &mut ForwardContext<'_, T, D, W>,
     ) -> OpResult<Tensor<T, D>> {
         let num_tokens = input_ids.numel();
         let q_dim = self.head_num * self.head_dim;
@@ -46,15 +51,15 @@ impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
         let plan = ctx.plan;
 
         // Workspace views (Arc-cloned, address-stable).
-        let mut x        = ctx.workspace.x_view(num_tokens);
-        let mut h        = ctx.workspace.h_view(num_tokens);
-        let mut qkv_buf  = ctx.workspace.qkv_view(num_tokens);
+        let mut x = ctx.workspace.x_view(num_tokens);
+        let mut h = ctx.workspace.h_view(num_tokens);
+        let mut qkv_buf = ctx.workspace.qkv_view(num_tokens);
         let mut attn_out = ctx.workspace.attn_out_view(num_tokens);
-        let mut gate_up  = ctx.workspace.gate_up_view(num_tokens);
+        let mut gate_up = ctx.workspace.gate_up_view(num_tokens);
         let mut gate_buf = ctx.workspace.gate_view(num_tokens);
-        let mut ffn_out  = ctx.workspace.ffn_view(num_tokens);
-        let mut o_out    = ctx.workspace.o_out_view(num_tokens);
-        let logits       = ctx.workspace.logits_view(num_tokens);
+        let mut ffn_out = ctx.workspace.ffn_view(num_tokens);
+        let mut o_out = ctx.workspace.o_out_view(num_tokens);
+        let logits = ctx.workspace.logits_view(num_tokens);
 
         // ── 1. Embedding ──
         self.embed_tokens.forward(input_ids, &mut x)?;
@@ -71,7 +76,7 @@ impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
             // Zero-copy QKV split via strided views (saves 3 split_cols launches).
             let mut q = qkv_buf.narrow(1, 0, q_dim)?;
             let mut k = qkv_buf.narrow(1, q_dim, kv_dim)?;
-            let v       = qkv_buf.narrow(1, q_dim + kv_dim, kv_dim)?;
+            let v = qkv_buf.narrow(1, q_dim + kv_dim, kv_dim)?;
 
             // ── QK-norm + RoPE + KV scatter (fused Qwen3 path) ──
             {
@@ -109,10 +114,15 @@ impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
                 let v_pool = &layer_kv.v;
                 let scratch = ctx.workspace.flash_decode_workspace();
                 D::attention_paged(
-                    &q, k_pool, v_pool,
-                    &mut attn_out, plan,
+                    &q,
+                    k_pool,
+                    v_pool,
+                    &mut attn_out,
+                    plan,
                     scratch,
-                    self.head_num, self.kv_head_num, self.head_dim,
+                    self.head_num,
+                    self.kv_head_num,
+                    self.head_dim,
                     1.0 / (self.head_dim as f32).sqrt(),
                 )?;
             }
@@ -120,8 +130,11 @@ impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
             // ── O proj + residual (fused) ──
             layer.o_proj.forward(&attn_out, &mut o_out)?;
             D::fused_add_rmsnorm(
-                &mut h, &mut x, &o_out,
-                &layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps,
+                &mut h,
+                &mut x,
+                &o_out,
+                &layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.eps,
             )?;
 
             // ── MLP (fused gate_up + swiglu_packed) ──
@@ -149,13 +162,31 @@ impl<T: Dtype, D: LlmOps> LlmModel<T, D> for Qwen3Model<T, D> {
         Ok(logits_mut)
     }
 
-    fn num_layers(&self) -> usize { self.layers.len() }
-    fn vocab_size(&self) -> usize { self.vocab_size }
-    fn dim(&self) -> usize { self.dim }
-    fn kv_dim(&self) -> usize { self.kv_dim }
-    fn q_dim(&self) -> usize { self.head_num * self.head_dim }
-    fn head_num(&self) -> usize { self.head_num }
-    fn head_dim(&self) -> usize { self.head_dim }
-    fn kv_head_num(&self) -> usize { self.kv_head_num }
-    fn intermediate_size(&self) -> usize { self.intermediate_size }
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+    fn q_dim(&self) -> usize {
+        self.head_num * self.head_dim
+    }
+    fn head_num(&self) -> usize {
+        self.head_num
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    fn kv_head_num(&self) -> usize {
+        self.kv_head_num
+    }
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
 }

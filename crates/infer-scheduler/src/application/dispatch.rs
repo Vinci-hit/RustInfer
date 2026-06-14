@@ -28,10 +28,7 @@ pub struct DispatchSystem {
 }
 
 impl DispatchSystem {
-    pub fn new(
-        frontend: Box<dyn FrontendTransport>,
-        worker: Box<dyn WorkerTransport>,
-    ) -> Self {
+    pub fn new(frontend: Box<dyn FrontendTransport>, worker: Box<dyn WorkerTransport>) -> Self {
         Self { frontend, worker }
     }
 
@@ -69,7 +66,9 @@ mod tests {
     }
     #[async_trait]
     impl FrontendTransport for CapturingFrontend {
-        async fn recv_event(&mut self) -> Result<crate::infrastructure::transport::traits::FrontendEvent> {
+        async fn recv_event(
+            &mut self,
+        ) -> Result<crate::infrastructure::transport::traits::FrontendEvent> {
             Err(crate::error::SchedulerError::Shutdown)
         }
         async fn send_response(&mut self, _: &ClientId, r: InferenceResponse) -> Result<()> {

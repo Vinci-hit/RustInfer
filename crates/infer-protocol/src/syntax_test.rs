@@ -46,15 +46,11 @@ fn test_protocol_types() {
 
 #[cfg(test)]
 mod phase4_kv_protocol {
-    use crate::scheduler_to_worker_control::{
-        FreeKvIndices, SchedulerControlMessage,
-    };
+    use crate::scheduler_to_worker_control::{FreeKvIndices, SchedulerControlMessage};
     use crate::scheduler_to_worker_data::{
         PrefillBatchCmd, PrefillSegmentCompletion, PrefillSegmentMeta, SamplingParams,
     };
-    use crate::worker_to_scheduler_data::{
-        AssignedIndices, GeneratedToken, StepOutput,
-    };
+    use crate::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
     fn rt<T>(v: &T) -> T
     where
@@ -138,8 +134,18 @@ mod phase4_kv_protocol {
                 finished: false,
             }],
             assigned_indices: vec![
-                AssignedIndices { sequence_id: 1, base: 0, len: 1 },
-                AssignedIndices { sequence_id: 2, base: 1, len: 5 },
+                AssignedIndices {
+                    sequence_id: 1,
+                    base: 0,
+                    len: 1,
+                    token_ids: vec![42],
+                },
+                AssignedIndices {
+                    sequence_id: 2,
+                    base: 1,
+                    len: 5,
+                    token_ids: vec![1, 2, 3, 4, 5],
+                },
             ],
         };
         let r = rt(&out);
@@ -147,6 +153,7 @@ mod phase4_kv_protocol {
         assert_eq!(r.assigned_indices[0].base, 0);
         assert_eq!(r.assigned_indices[0].len, 1);
         assert_eq!(r.assigned_indices[1].end(), 6);
+        assert_eq!(r.assigned_indices[1].token_ids, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -180,8 +187,7 @@ mod phase4_kv_protocol {
             indices: vec![5, 6, 7, 100, 101],
         });
         let bytes = rmp_serde::to_vec(&msg).expect("serialize");
-        let parsed: SchedulerControlMessage =
-            rmp_serde::from_slice(&bytes).expect("deserialize");
+        let parsed: SchedulerControlMessage = rmp_serde::from_slice(&bytes).expect("deserialize");
         match parsed {
             SchedulerControlMessage::FreeKvIndices(f) => {
                 assert_eq!(f.indices, vec![5, 6, 7, 100, 101]);
@@ -195,9 +201,8 @@ mod phase4_kv_protocol {
     fn validate_passes_when_block_table_empty_but_prefix_hint_present() {
         // The scheduler currently emits `block_table: vec![]` and relies
         // entirely on `prefix_hint` + worker-side allocation, but
-        // `PrefillBatchCmd::validate()` still rejects empty block_tables.
-        // This test pins down that current behavior; relax `validate` if
-        // the field is ever removed from the wire.
+        // `PrefillBatchCmd::validate()` accepts empty block_tables because the
+        // worker owns physical KV allocation.
         let cmd = PrefillBatchCmd {
             input_ids: vec![1, 2, 3],
             q_start_loc: vec![0],
@@ -219,7 +224,7 @@ mod phase4_kv_protocol {
                 prefix_hint: Some(vec![]),
             }],
         };
-        assert!(cmd.validate(8192, 16).is_err());
+        assert!(cmd.validate(8192, 16).is_ok());
     }
 
     // ─── KV pressure relief: AllocFailed / Preempt round trips ────────
@@ -233,8 +238,7 @@ mod phase4_kv_protocol {
             round: 1,
         });
         let bytes = rmp_serde::to_vec(&msg).expect("serialize");
-        let parsed: WorkerControlMessage =
-            rmp_serde::from_slice(&bytes).expect("deserialize");
+        let parsed: WorkerControlMessage = rmp_serde::from_slice(&bytes).expect("deserialize");
         match parsed {
             WorkerControlMessage::AllocFailed(a) => {
                 assert_eq!(a.worker_id, "worker-test");
@@ -251,17 +255,17 @@ mod phase4_kv_protocol {
         let msg = SchedulerControlMessage::Preempt(Preempt {
             model_instance_id: "m0".to_string(),
             sequence_ids: vec![7, 19, 256],
+            free_indices: vec![10, 11],
         });
         let bytes = rmp_serde::to_vec(&msg).expect("serialize");
-        let parsed: SchedulerControlMessage =
-            rmp_serde::from_slice(&bytes).expect("deserialize");
+        let parsed: SchedulerControlMessage = rmp_serde::from_slice(&bytes).expect("deserialize");
         match parsed {
             SchedulerControlMessage::Preempt(p) => {
                 assert_eq!(p.model_instance_id, "m0");
                 assert_eq!(p.sequence_ids, vec![7, 19, 256]);
+                assert_eq!(p.free_indices, vec![10, 11]);
             }
             other => panic!("expected Preempt, got {:?}", other),
         }
     }
 }
-

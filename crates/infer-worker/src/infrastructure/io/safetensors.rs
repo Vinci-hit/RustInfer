@@ -25,18 +25,19 @@ struct Shard {
 
 impl Shard {
     fn open(path: &Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("open {}: {}", path.display(), e))?;
-        let mmap = unsafe { Mmap::map(&file) }
-            .map_err(|e| format!("mmap {}: {}", path.display(), e))?;
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {}: {}", path.display(), e))?;
         let mmap = Box::new(mmap);
         // SAFETY: Box<Mmap> stays in self; pointer is stable.
-        let bytes: &'static [u8] = unsafe {
-            std::slice::from_raw_parts(mmap.as_ptr(), mmap.len())
-        };
+        let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
         let header = SafeTensors::deserialize(bytes)
             .map_err(|e| format!("safetensors deserialize {}: {}", path.display(), e))?;
-        Ok(Self { header, _mmap: mmap })
+        Ok(Self {
+            header,
+            _mmap: mmap,
+        })
     }
 }
 
@@ -60,8 +61,8 @@ impl SafetensorsReader {
     ///     - else fall back to a single `*.safetensors` file
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let meta = std::fs::metadata(path)
-            .map_err(|e| format!("stat {}: {}", path.display(), e))?;
+        let meta =
+            std::fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
         if meta.is_file() {
             return Self::open_single(path);
         }
@@ -94,7 +95,10 @@ impl SafetensorsReader {
                 path.display(),
             ));
         }
-        Err(format!("path is neither file nor directory: {}", path.display()))
+        Err(format!(
+            "path is neither file nor directory: {}",
+            path.display()
+        ))
     }
 
     fn open_single(path: &Path) -> Result<Self, String> {
@@ -135,21 +139,25 @@ impl SafetensorsReader {
         }
 
         // Build name_to_shard map.
-        let mut name_to_shard: HashMap<String, usize> =
-            HashMap::with_capacity(weight_map.len());
+        let mut name_to_shard: HashMap<String, usize> = HashMap::with_capacity(weight_map.len());
         for (name, file_val) in weight_map.iter() {
             let fname = file_val.as_str().unwrap();
             let idx = file_idx[fname];
             name_to_shard.insert(name.clone(), idx);
         }
 
-        Ok(Self { shards, name_to_shard })
+        Ok(Self {
+            shards,
+            name_to_shard,
+        })
     }
 
     /// Borrow a tensor view by name (zero copy into the mmap).
     pub fn read_view(&self, name: &str) -> Result<TensorView<'_>, String> {
         if !self.name_to_shard.is_empty() {
-            let idx = *self.name_to_shard.get(name)
+            let idx = *self
+                .name_to_shard
+                .get(name)
                 .ok_or_else(|| format!("tensor '{}' not in weight_map", name))?;
             self.shards[idx]
                 .header

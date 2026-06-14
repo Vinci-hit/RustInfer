@@ -5,25 +5,30 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{OpResult, OpError, CoreOps};
+use crate::domain::ports::{CoreOps, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
 
 use super::scheduler::FlowMatchEulerScheduler;
-use super::state::{DitState, DitShapeSpec, PipelineState, ZImageCapacity, LATENT_CHANNELS};
-use super::text_encoder::{Qwen3TextEncoder, TEXT_ENCODER_MAX_SEQ_LEN, PAD_TOKEN_ID, apply_chat_template};
-use super::transformer::{ZImageTransformer};
-use super::vae_decoder::{VaeDecoder};
+use super::state::{DitShapeSpec, DitState, LATENT_CHANNELS, PipelineState, ZImageCapacity};
+use super::text_encoder::{
+    PAD_TOKEN_ID, Qwen3TextEncoder, TEXT_ENCODER_MAX_SEQ_LEN, apply_chat_template,
+};
+use super::transformer::ZImageTransformer;
+use super::vae_decoder::VaeDecoder;
 
 /// Load a `[16, 1, H, W]` (or `[1, 16, H, W]`) F32 NPY file into a
 /// `Tensor<T, Cuda>` of shape `[1, 16, H, W]` (cast to T).
 fn load_latent_from_npy<T: Dtype>(
-    path: &str, latent_h: usize, latent_w: usize, dev: &Cuda,
+    path: &str,
+    latent_h: usize,
+    latent_w: usize,
+    dev: &Cuda,
 ) -> OpResult<Tensor<T, Cuda>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| OpError::Kernel(format!("open {}: {}", path, e)))?;
+    let mut f =
+        std::fs::File::open(path).map_err(|e| OpError::Kernel(format!("open {}: {}", path, e)))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)
         .map_err(|e| OpError::Kernel(format!("read {}: {}", path, e)))?;
@@ -43,29 +48,39 @@ fn load_latent_from_npy<T: Dtype>(
         )));
     }
     // Read raw f32 values.
-    let f32_data: Vec<f32> = unsafe {
-        std::slice::from_raw_parts(buf.as_ptr().add(data_start) as *const f32, n_f32)
-    }.to_vec();
+    let f32_data: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr().add(data_start) as *const f32, n_f32) }
+            .to_vec();
     // Cast to T host bytes.
     let mut host: Vec<u8> = vec![0u8; n_f32 * T::SIZE_BYTES];
     match T::DATA_TYPE {
         crate::domain::types::DataType::F32 => {
-            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, n_f32) };
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, n_f32) };
             dst.copy_from_slice(&f32_data);
         }
         crate::domain::types::DataType::BF16 => {
-            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::bf16, n_f32) };
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::bf16, n_f32)
+            };
             for (i, &v) in f32_data.iter().enumerate() {
                 dst[i] = half::bf16::from_f32(v);
             }
         }
         crate::domain::types::DataType::F16 => {
-            let dst = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::f16, n_f32) };
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::f16, n_f32)
+            };
             for (i, &v) in f32_data.iter().enumerate() {
                 dst[i] = half::f16::from_f32(v);
             }
         }
-        other => return Err(OpError::Kernel(format!("load_latent: unsupported {:?}", other))),
+        other => {
+            return Err(OpError::Kernel(format!(
+                "load_latent: unsupported {:?}",
+                other
+            )));
+        }
     }
     Tensor::<T, Cuda>::from_host_bytes(
         &host,
@@ -87,8 +102,10 @@ pub struct GenerateParams {
 impl Default for GenerateParams {
     fn default() -> Self {
         Self {
-            height: 1024, width: 1024,
-            num_inference_steps: 9, guidance_scale: 0.0,
+            height: 1024,
+            width: 1024,
+            num_inference_steps: 9,
+            guidance_scale: 0.0,
             seed: Some(42),
             sigmas: None,
         }
@@ -109,9 +126,7 @@ pub struct ZImagePipeline<T: Dtype> {
 }
 
 impl<T: Dtype> ZImagePipeline<T> {
-    pub fn from_pretrained<P: AsRef<Path>>(
-        model_dir: P, device: &Cuda,
-    ) -> OpResult<Self> {
+    pub fn from_pretrained<P: AsRef<Path>>(model_dir: P, device: &Cuda) -> OpResult<Self> {
         Self::from_pretrained_with_capacity(model_dir, device, ZImageCapacity::default())
     }
 
@@ -131,10 +146,14 @@ impl<T: Dtype> ZImagePipeline<T> {
                 let v: serde_json::Value = serde_json::from_str(&s)
                     .map_err(|e| OpError::Kernel(format!("scheduler cfg parse: {}", e)))?;
                 (
-                    v.get("num_train_timesteps").and_then(|x| x.as_u64()).unwrap_or(1000) as usize,
+                    v.get("num_train_timesteps")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(1000) as usize,
                     v.get("shift").and_then(|x| x.as_f64()).unwrap_or(3.0) as f32,
                 )
-            } else { (1000, 3.0) };
+            } else {
+                (1000, 3.0)
+            };
             FlowMatchEulerScheduler::new(num_train, shift)
         };
 
@@ -173,9 +192,15 @@ impl<T: Dtype> ZImagePipeline<T> {
         let pipeline_state: PipelineState<T, Cuda> = PipelineState::new(capacity, device)?;
 
         Ok(Self {
-            transformer, vae, text_encoder, tokenizer,
-            scheduler, dit_state, pipeline_state,
-            model_dir, capacity,
+            transformer,
+            vae,
+            text_encoder,
+            tokenizer,
+            scheduler,
+            dit_state,
+            pipeline_state,
+            model_dir,
+            capacity,
         })
     }
 
@@ -183,7 +208,9 @@ impl<T: Dtype> ZImagePipeline<T> {
     /// Returns `(token_ids, attention_mask)` both of length `max_seq_len`.
     pub fn tokenize(&self, prompt: &str, max_seq_len: usize) -> OpResult<(Vec<i32>, Vec<i32>)> {
         let formatted = apply_chat_template(prompt);
-        let encoding = self.tokenizer.encode(formatted, true)
+        let encoding = self
+            .tokenizer
+            .encode(formatted, true)
             .map_err(|e| OpError::Kernel(format!("tokenize: {}", e)))?;
         let ids = encoding.get_ids();
         let actual_len = ids.len().min(max_seq_len);
@@ -198,9 +225,12 @@ impl<T: Dtype> ZImagePipeline<T> {
 
     /// Run the full pipeline end-to-end. Returns `[1, 3, H, W]` BF16 image
     /// tensor on device (caller may need to cast/clamp/quantize for output).
-    pub fn generate(&mut self, prompt: &str, params: &GenerateParams, device: &Cuda)
-        -> OpResult<Tensor<T, Cuda>>
-    {
+    pub fn generate(
+        &mut self,
+        prompt: &str,
+        params: &GenerateParams,
+        device: &Cuda,
+    ) -> OpResult<Tensor<T, Cuda>> {
         // 1. Tokenize and encode prompt.
         let (tokens, mask) = self.tokenize(prompt, TEXT_ENCODER_MAX_SEQ_LEN)?;
         let prompt_embeds = self.text_encoder.forward(&tokens, &mask, device)?;
@@ -222,7 +252,9 @@ impl<T: Dtype> ZImagePipeline<T> {
             load_latent_from_npy::<T>(&path, latent_h, latent_w, device)?
         } else {
             Tensor::randn(
-                [1, LATENT_CHANNELS, latent_h, latent_w], device, params.seed,
+                [1, LATENT_CHANNELS, latent_h, latent_w],
+                device,
+                params.seed,
             )?
         };
         // Copy into pipeline_state.latents (which is sized to capacity).
@@ -238,7 +270,8 @@ impl<T: Dtype> ZImagePipeline<T> {
             None => {
                 let patch = self.transformer.config.patch_size;
                 let img_seq_len = (latent_h / patch) * (latent_w / patch);
-                self.scheduler.set_timesteps_default(params.num_inference_steps, Some(img_seq_len));
+                self.scheduler
+                    .set_timesteps_default(params.num_inference_steps, Some(img_seq_len));
             }
         }
         let _n_steps = self.scheduler.num_steps();
@@ -260,18 +293,24 @@ impl<T: Dtype> ZImagePipeline<T> {
             let latent_5d = sample.view_raw(
                 crate::domain::types::Shape::from_slice(&[c, 1, h, w]),
                 crate::domain::types::Shape::from_slice(&[h * w, h * w, w, 1]).contiguous_strides(),
-                sample.offset_elems(), true,
+                sample.offset_elems(),
+                true,
             );
 
             // Transformer forward.
             let model_out = self.transformer.forward(
-                &latent_5d, &prompt_embeds, t_scaled, &mut self.dit_state,
+                &latent_5d,
+                &prompt_embeds,
+                t_scaled,
+                &mut self.dit_state,
             )?;
             // model_out shape [C, 1, H, W]. Reshape to [1, C, H, W] for scheduler step.
             let mo_4d = model_out.view_raw(
                 crate::domain::types::Shape::from_slice(&[1, c, h, w]),
-                crate::domain::types::Shape::from_slice(&[c * h * w, h * w, w, 1]).contiguous_strides(),
-                model_out.offset_elems(), true,
+                crate::domain::types::Shape::from_slice(&[c * h * w, h * w, w, 1])
+                    .contiguous_strides(),
+                model_out.offset_elems(),
+                true,
             );
             // Negate (diffusers does `noise_pred = -model_out`).
             let mut neg_mo: Tensor<T, Cuda> = Tensor::zeros([1, c, h, w], device)?;
@@ -280,7 +319,8 @@ impl<T: Dtype> ZImagePipeline<T> {
 
             // Scheduler step: produces new sample.
             let mut next_sample: Tensor<T, Cuda> = Tensor::zeros([1, c, h, w], device)?;
-            self.scheduler.step(&mut neg_mo, &sample, &mut next_sample)?;
+            self.scheduler
+                .step(&mut neg_mo, &sample, &mut next_sample)?;
             sample = next_sample;
             let _ = i;
         }

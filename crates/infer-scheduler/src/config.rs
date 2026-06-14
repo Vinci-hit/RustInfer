@@ -3,8 +3,7 @@
 use crate::domain::ids::BlockSize;
 
 /// Scheduler operating mode — determines scheduling behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SchedulerMode {
     /// LLM: prefill → decode, continuous batching, chunked prefill.
     #[default]
@@ -13,7 +12,6 @@ pub enum SchedulerMode {
     /// all requests in a batch finish together.
     Diffusion,
 }
-
 
 /// Top-level scheduler configuration.
 #[derive(Debug, Clone)]

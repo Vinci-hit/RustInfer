@@ -7,13 +7,13 @@
 
 use safetensors::tensor::TensorView;
 
-use crate::domain::ports::{MemoryPort, OpBackend, OpResult, OpError};
-use crate::domain::types::{Dtype, DataType, Shape};
+use super::layers::{Embedding, Linear, RMSNorm};
+use super::llama3::{Llama3Layer, Llama3Model};
+use super::qwen3::{Qwen3Layer, Qwen3Model};
+use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::{DataType, Dtype, Shape};
 use crate::infrastructure::io::SafetensorsReader;
-use super::layers::{Linear, RMSNorm, Embedding};
-use super::llama3::{Llama3Model, Llama3Layer};
-use super::qwen3::{Qwen3Model, Qwen3Layer};
 
 /// Llama-3 NTK-aware RoPE scaling parameters.
 ///
@@ -68,14 +68,25 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// Load a tensor by name, cast to target dtype T, place on device D.
-    pub fn load_tensor<T: Dtype, D: MemoryPort>(&self, name: &str, device: &D) -> OpResult<Tensor<T, D>> {
-        let view = self.reader.read_view(name)
+    pub fn load_tensor<T: Dtype, D: MemoryPort>(
+        &self,
+        name: &str,
+        device: &D,
+    ) -> OpResult<Tensor<T, D>> {
+        let view = self
+            .reader
+            .read_view(name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}' not found: {}", name, e)))?;
         tensor_from_safetensor_view::<T, D>(&view, device)
     }
 
     /// Load a Linear layer (weight + optional bias).
-    pub fn load_linear<T: Dtype, D: OpBackend>(&self, weight_name: &str, bias_name: Option<&str>, device: &D) -> OpResult<Linear<T, D>> {
+    pub fn load_linear<T: Dtype, D: OpBackend>(
+        &self,
+        weight_name: &str,
+        bias_name: Option<&str>,
+        device: &D,
+    ) -> OpResult<Linear<T, D>> {
         let weight = self.load_tensor::<T, D>(weight_name, device)?;
         let bias = if let Some(bn) = bias_name {
             Some(self.load_tensor::<T, D>(bn, device)?)
@@ -86,13 +97,22 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// Load an RMSNorm layer.
-    pub fn load_rmsnorm<T: Dtype, D: OpBackend>(&self, name: &str, device: &D, eps: f32) -> OpResult<RMSNorm<T, D>> {
+    pub fn load_rmsnorm<T: Dtype, D: OpBackend>(
+        &self,
+        name: &str,
+        device: &D,
+        eps: f32,
+    ) -> OpResult<RMSNorm<T, D>> {
         let weight = self.load_tensor::<T, D>(name, device)?;
         Ok(RMSNorm::new(weight, eps))
     }
 
     /// Load an Embedding table.
-    pub fn load_embedding<T: Dtype, D: OpBackend>(&self, name: &str, device: &D) -> OpResult<Embedding<T, D>> {
+    pub fn load_embedding<T: Dtype, D: OpBackend>(
+        &self,
+        name: &str,
+        device: &D,
+    ) -> OpResult<Embedding<T, D>> {
         let table = self.load_tensor::<T, D>(name, device)?;
         Ok(Embedding { table })
     }
@@ -103,13 +123,33 @@ impl<'a> WeightLoader<'a> {
     /// concatenate at the host-bytes level (in target dtype T) and upload
     /// the fused result in a single `Tensor::from_host_bytes`.
     pub fn load_fused_qkv<T: Dtype, D: OpBackend>(
-        &self, layer_idx: usize, q_dim: usize, kv_dim: usize, dim: usize, device: &D,
+        &self,
+        layer_idx: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        dim: usize,
+        device: &D,
     ) -> OpResult<Linear<T, D>> {
-        let q_view = self.reader.read_view(&format!("model.layers.{}.self_attn.q_proj.weight", layer_idx))
+        let q_view = self
+            .reader
+            .read_view(&format!(
+                "model.layers.{}.self_attn.q_proj.weight",
+                layer_idx
+            ))
             .map_err(|e| OpError::Kernel(format!("q_proj layer {}: {}", layer_idx, e)))?;
-        let k_view = self.reader.read_view(&format!("model.layers.{}.self_attn.k_proj.weight", layer_idx))
+        let k_view = self
+            .reader
+            .read_view(&format!(
+                "model.layers.{}.self_attn.k_proj.weight",
+                layer_idx
+            ))
             .map_err(|e| OpError::Kernel(format!("k_proj layer {}: {}", layer_idx, e)))?;
-        let v_view = self.reader.read_view(&format!("model.layers.{}.self_attn.v_proj.weight", layer_idx))
+        let v_view = self
+            .reader
+            .read_view(&format!(
+                "model.layers.{}.self_attn.v_proj.weight",
+                layer_idx
+            ))
             .map_err(|e| OpError::Kernel(format!("v_proj layer {}: {}", layer_idx, e)))?;
 
         let total_rows = q_dim + 2 * kv_dim;
@@ -118,7 +158,10 @@ impl<'a> WeightLoader<'a> {
         let mut host = vec![0u8; total_bytes];
 
         // Helper: cast a single weight view into the host buffer at `row_offset`.
-        let mut cast_into = |view: &TensorView, row_offset: usize, expected_rows: usize| -> OpResult<()> {
+        let mut cast_into = |view: &TensorView,
+                             row_offset: usize,
+                             expected_rows: usize|
+         -> OpResult<()> {
             let shape: Vec<usize> = view.shape().to_vec();
             if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
                 return Err(OpError::Shape(format!(
@@ -140,7 +183,9 @@ impl<'a> WeightLoader<'a> {
             if src_dt == T::DATA_TYPE {
                 let n = numel * elem;
                 // SAFETY: host buffer has at least row_offset*dim*elem + n bytes by construction.
-                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len())); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len()));
+                }
             } else {
                 cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
             }
@@ -151,11 +196,8 @@ impl<'a> WeightLoader<'a> {
         cast_into(&k_view, q_dim, kv_dim)?;
         cast_into(&v_view, q_dim + kv_dim, kv_dim)?;
 
-        let fused = Tensor::<T, D>::from_host_bytes(
-            &host,
-            Shape::from_slice(&[total_rows, dim]),
-            device,
-        )?;
+        let fused =
+            Tensor::<T, D>::from_host_bytes(&host, Shape::from_slice(&[total_rows, dim]), device)?;
         Ok(Linear::new(fused, None))
     }
 
@@ -165,11 +207,19 @@ impl<'a> WeightLoader<'a> {
     /// One GEMV computes both gate and up in a single launch; downstream
     /// `swiglu_packed` consumes the fused output without splitting.
     pub fn load_fused_gate_up<T: Dtype, D: OpBackend>(
-        &self, layer_idx: usize, intermediate_size: usize, dim: usize, device: &D,
+        &self,
+        layer_idx: usize,
+        intermediate_size: usize,
+        dim: usize,
+        device: &D,
     ) -> OpResult<Linear<T, D>> {
-        let g_view = self.reader.read_view(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
+        let g_view = self
+            .reader
+            .read_view(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
             .map_err(|e| OpError::Kernel(format!("gate_proj layer {}: {}", layer_idx, e)))?;
-        let u_view = self.reader.read_view(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
+        let u_view = self
+            .reader
+            .read_view(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
             .map_err(|e| OpError::Kernel(format!("up_proj layer {}: {}", layer_idx, e)))?;
 
         let total_rows = 2 * intermediate_size;
@@ -177,7 +227,10 @@ impl<'a> WeightLoader<'a> {
         let total_bytes = total_rows * dim * elem;
         let mut host = vec![0u8; total_bytes];
 
-        let mut cast_into = |view: &TensorView, row_offset: usize, expected_rows: usize| -> OpResult<()> {
+        let mut cast_into = |view: &TensorView,
+                             row_offset: usize,
+                             expected_rows: usize|
+         -> OpResult<()> {
             let shape: Vec<usize> = view.shape().to_vec();
             if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
                 return Err(OpError::Shape(format!(
@@ -198,7 +251,9 @@ impl<'a> WeightLoader<'a> {
             let dst = unsafe { host.as_mut_ptr().add(row_offset * dim * elem) };
             if src_dt == T::DATA_TYPE {
                 let n = numel * elem;
-                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len())); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len()));
+                }
             } else {
                 cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
             }
@@ -208,16 +263,17 @@ impl<'a> WeightLoader<'a> {
         cast_into(&g_view, 0, intermediate_size)?;
         cast_into(&u_view, intermediate_size, intermediate_size)?;
 
-        let fused = Tensor::<T, D>::from_host_bytes(
-            &host,
-            Shape::from_slice(&[total_rows, dim]),
-            device,
-        )?;
+        let fused =
+            Tensor::<T, D>::from_host_bytes(&host, Shape::from_slice(&[total_rows, dim]), device)?;
         Ok(Linear::new(fused, None))
     }
 
     /// Load a complete Llama3 model.
-    pub fn load_llama3<T: Dtype, D: OpBackend>(&self, cfg: &LoadConfig, device: &D) -> OpResult<Llama3Model<T, D>> {
+    pub fn load_llama3<T: Dtype, D: OpBackend>(
+        &self,
+        cfg: &LoadConfig,
+        device: &D,
+    ) -> OpResult<Llama3Model<T, D>> {
         let embed_tokens = self.load_embedding("model.embed_tokens.weight", device)?;
         let norm = self.load_rmsnorm("model.norm.weight", device, cfg.rms_norm_eps)?;
 
@@ -231,28 +287,69 @@ impl<'a> WeightLoader<'a> {
         let mut layers = Vec::with_capacity(cfg.layer_num);
         for i in 0..cfg.layer_num {
             layers.push(Llama3Layer {
-                input_layernorm: self.load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), device, cfg.rms_norm_eps)?,
-                post_attention_layernorm: self.load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), device, cfg.rms_norm_eps)?,
-                qkv_proj: self.load_fused_qkv(i, cfg.head_num * cfg.head_dim, cfg.kv_head_num * cfg.head_dim, cfg.dim, device)?,
-                o_proj: self.load_linear(&format!("model.layers.{}.self_attn.o_proj.weight", i), None, device)?,
+                input_layernorm: self.load_rmsnorm(
+                    &format!("model.layers.{}.input_layernorm.weight", i),
+                    device,
+                    cfg.rms_norm_eps,
+                )?,
+                post_attention_layernorm: self.load_rmsnorm(
+                    &format!("model.layers.{}.post_attention_layernorm.weight", i),
+                    device,
+                    cfg.rms_norm_eps,
+                )?,
+                qkv_proj: self.load_fused_qkv(
+                    i,
+                    cfg.head_num * cfg.head_dim,
+                    cfg.kv_head_num * cfg.head_dim,
+                    cfg.dim,
+                    device,
+                )?,
+                o_proj: self.load_linear(
+                    &format!("model.layers.{}.self_attn.o_proj.weight", i),
+                    None,
+                    device,
+                )?,
                 gate_up_proj: self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?,
-                down_proj: self.load_linear(&format!("model.layers.{}.mlp.down_proj.weight", i), None, device)?,
+                down_proj: self.load_linear(
+                    &format!("model.layers.{}.mlp.down_proj.weight", i),
+                    None,
+                    device,
+                )?,
             });
         }
 
         // RoPE sin/cos cache — precomputed from theta
-        let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(cfg.seq_len, cfg.head_dim, cfg.rope_theta, cfg.rope_scaling.as_ref(), device)?;
+        let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
+            cfg.seq_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            cfg.rope_scaling.as_ref(),
+            device,
+        )?;
 
         Ok(Llama3Model {
-            embed_tokens, layers, norm, lm_head, sin_cache, cos_cache,
-            head_num: cfg.head_num, kv_head_num: cfg.kv_head_num, head_dim: cfg.head_dim,
-            dim: cfg.dim, kv_dim: cfg.kv_head_num * cfg.head_dim,
-            intermediate_size: cfg.intermediate_size, vocab_size: cfg.vocab_size,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            sin_cache,
+            cos_cache,
+            head_num: cfg.head_num,
+            kv_head_num: cfg.kv_head_num,
+            head_dim: cfg.head_dim,
+            dim: cfg.dim,
+            kv_dim: cfg.kv_head_num * cfg.head_dim,
+            intermediate_size: cfg.intermediate_size,
+            vocab_size: cfg.vocab_size,
         })
     }
 
     /// Load a complete Qwen3 model (adds q_norm / k_norm per layer).
-    pub fn load_qwen3<T: Dtype, D: OpBackend>(&self, cfg: &LoadConfig, device: &D) -> OpResult<Qwen3Model<T, D>> {
+    pub fn load_qwen3<T: Dtype, D: OpBackend>(
+        &self,
+        cfg: &LoadConfig,
+        device: &D,
+    ) -> OpResult<Qwen3Model<T, D>> {
         let embed_tokens = self.load_embedding("model.embed_tokens.weight", device)?;
         let norm = self.load_rmsnorm("model.norm.weight", device, cfg.rms_norm_eps)?;
         let lm_head = if self.reader.contains("lm_head.weight") {
@@ -267,30 +364,71 @@ impl<'a> WeightLoader<'a> {
             let k_norm_name = format!("model.layers.{}.self_attn.k_norm.weight", i);
             let q_norm = if self.reader.contains(&q_norm_name) {
                 Some(self.load_rmsnorm(&q_norm_name, device, cfg.rms_norm_eps)?)
-            } else { None };
+            } else {
+                None
+            };
             let k_norm = if self.reader.contains(&k_norm_name) {
                 Some(self.load_rmsnorm(&k_norm_name, device, cfg.rms_norm_eps)?)
-            } else { None };
+            } else {
+                None
+            };
 
             layers.push(Qwen3Layer {
-                input_layernorm: self.load_rmsnorm(&format!("model.layers.{}.input_layernorm.weight", i), device, cfg.rms_norm_eps)?,
-                post_attention_layernorm: self.load_rmsnorm(&format!("model.layers.{}.post_attention_layernorm.weight", i), device, cfg.rms_norm_eps)?,
-                qkv_proj: self.load_fused_qkv(i, cfg.head_num * cfg.head_dim, cfg.kv_head_num * cfg.head_dim, cfg.dim, device)?,
-                o_proj: self.load_linear(&format!("model.layers.{}.self_attn.o_proj.weight", i), None, device)?,
+                input_layernorm: self.load_rmsnorm(
+                    &format!("model.layers.{}.input_layernorm.weight", i),
+                    device,
+                    cfg.rms_norm_eps,
+                )?,
+                post_attention_layernorm: self.load_rmsnorm(
+                    &format!("model.layers.{}.post_attention_layernorm.weight", i),
+                    device,
+                    cfg.rms_norm_eps,
+                )?,
+                qkv_proj: self.load_fused_qkv(
+                    i,
+                    cfg.head_num * cfg.head_dim,
+                    cfg.kv_head_num * cfg.head_dim,
+                    cfg.dim,
+                    device,
+                )?,
+                o_proj: self.load_linear(
+                    &format!("model.layers.{}.self_attn.o_proj.weight", i),
+                    None,
+                    device,
+                )?,
                 gate_up_proj: self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?,
-                down_proj: self.load_linear(&format!("model.layers.{}.mlp.down_proj.weight", i), None, device)?,
+                down_proj: self.load_linear(
+                    &format!("model.layers.{}.mlp.down_proj.weight", i),
+                    None,
+                    device,
+                )?,
                 q_norm,
                 k_norm,
             });
         }
 
-        let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(cfg.seq_len, cfg.head_dim, cfg.rope_theta, cfg.rope_scaling.as_ref(), device)?;
+        let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
+            cfg.seq_len,
+            cfg.head_dim,
+            cfg.rope_theta,
+            cfg.rope_scaling.as_ref(),
+            device,
+        )?;
 
         Ok(Qwen3Model {
-            embed_tokens, layers, norm, lm_head, sin_cache, cos_cache,
-            head_num: cfg.head_num, kv_head_num: cfg.kv_head_num, head_dim: cfg.head_dim,
-            dim: cfg.dim, kv_dim: cfg.kv_head_num * cfg.head_dim,
-            intermediate_size: cfg.intermediate_size, vocab_size: cfg.vocab_size,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            sin_cache,
+            cos_cache,
+            head_num: cfg.head_num,
+            kv_head_num: cfg.kv_head_num,
+            head_dim: cfg.head_dim,
+            dim: cfg.dim,
+            kv_dim: cfg.kv_head_num * cfg.head_dim,
+            intermediate_size: cfg.intermediate_size,
+            vocab_size: cfg.vocab_size,
         })
     }
 }
@@ -310,7 +448,12 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
         safetensors::Dtype::BF16 => DataType::BF16,
         safetensors::Dtype::I32 => DataType::I32,
         safetensors::Dtype::I8 => DataType::I8,
-        other => return Err(OpError::Kernel(format!("unsupported safetensor dtype: {:?}", other))),
+        other => {
+            return Err(OpError::Kernel(format!(
+                "unsupported safetensor dtype: {:?}",
+                other
+            )));
+        }
     };
 
     let shape = Shape::from_slice(&shape_vec);
@@ -324,14 +467,26 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
         host_buf[..n].copy_from_slice(&src_bytes[..n]);
     } else {
         // Element-wise cast through f64 intermediate.
-        cast_bytes(src_bytes, src_dtype, host_buf.as_mut_ptr(), T::DATA_TYPE, numel);
+        cast_bytes(
+            src_bytes,
+            src_dtype,
+            host_buf.as_mut_ptr(),
+            T::DATA_TYPE,
+            numel,
+        );
     }
 
     Tensor::<T, D>::from_host_bytes(&host_buf, shape, device)
 }
 
 /// Public re-export of the internal cast helper for diffusion loaders.
-pub unsafe fn cast_bytes_pub(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, numel: usize) {
+pub unsafe fn cast_bytes_pub(
+    src: &[u8],
+    src_dt: DataType,
+    dst: *mut u8,
+    dst_dt: DataType,
+    numel: usize,
+) {
     cast_bytes(src, src_dt, dst, dst_dt, numel);
 }
 
@@ -340,19 +495,57 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
     use half::{bf16, f16};
     for i in 0..numel {
         let val: f64 = match src_dt {
-            DataType::F32 => { let b = &src[i*4..i*4+4]; f64::from(f32::from_le_bytes(b.try_into().unwrap())) }
-            DataType::BF16 => { let b = &src[i*2..i*2+2]; f64::from(bf16::from_le_bytes(b.try_into().unwrap()).to_f32()) }
-            DataType::F16 => { let b = &src[i*2..i*2+2]; f64::from(f16::from_le_bytes(b.try_into().unwrap()).to_f32()) }
-            DataType::I32 => { let b = &src[i*4..i*4+4]; i32::from_le_bytes(b.try_into().unwrap()) as f64 }
-            DataType::I8 => { src[i] as i8 as f64 }
+            DataType::F32 => {
+                let b = &src[i * 4..i * 4 + 4];
+                f64::from(f32::from_le_bytes(b.try_into().unwrap()))
+            }
+            DataType::BF16 => {
+                let b = &src[i * 2..i * 2 + 2];
+                f64::from(bf16::from_le_bytes(b.try_into().unwrap()).to_f32())
+            }
+            DataType::F16 => {
+                let b = &src[i * 2..i * 2 + 2];
+                f64::from(f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+            }
+            DataType::I32 => {
+                let b = &src[i * 4..i * 4 + 4];
+                i32::from_le_bytes(b.try_into().unwrap()) as f64
+            }
+            DataType::I8 => src[i] as i8 as f64,
         };
         unsafe {
             match dst_dt {
-                DataType::F32 => { std::ptr::copy_nonoverlapping((val as f32).to_le_bytes().as_ptr(), dst.add(i*4), 4); }
-                DataType::BF16 => { std::ptr::copy_nonoverlapping(bf16::from_f64(val).to_le_bytes().as_ptr(), dst.add(i*2), 2); }
-                DataType::F16 => { std::ptr::copy_nonoverlapping(f16::from_f64(val).to_le_bytes().as_ptr(), dst.add(i*2), 2); }
-                DataType::I32 => { std::ptr::copy_nonoverlapping((val as i32).to_le_bytes().as_ptr(), dst.add(i*4), 4); }
-                DataType::I8 => { *dst.add(i) = val as i8 as u8; }
+                DataType::F32 => {
+                    std::ptr::copy_nonoverlapping(
+                        (val as f32).to_le_bytes().as_ptr(),
+                        dst.add(i * 4),
+                        4,
+                    );
+                }
+                DataType::BF16 => {
+                    std::ptr::copy_nonoverlapping(
+                        bf16::from_f64(val).to_le_bytes().as_ptr(),
+                        dst.add(i * 2),
+                        2,
+                    );
+                }
+                DataType::F16 => {
+                    std::ptr::copy_nonoverlapping(
+                        f16::from_f64(val).to_le_bytes().as_ptr(),
+                        dst.add(i * 2),
+                        2,
+                    );
+                }
+                DataType::I32 => {
+                    std::ptr::copy_nonoverlapping(
+                        (val as i32).to_le_bytes().as_ptr(),
+                        dst.add(i * 4),
+                        4,
+                    );
+                }
+                DataType::I8 => {
+                    *dst.add(i) = val as i8 as u8;
+                }
             }
         }
     }
@@ -406,9 +599,8 @@ fn compute_rope_cache<T: Dtype, D: OpBackend>(
                 *f /= factor;
             } else {
                 // Smooth transition (linear ramp on the inverse-factor side).
-                let smooth =
-                    (orig / wavelength - s.low_freq_factor as f64)
-                        / (s.high_freq_factor as f64 - s.low_freq_factor as f64);
+                let smooth = (orig / wavelength - s.low_freq_factor as f64)
+                    / (s.high_freq_factor as f64 - s.low_freq_factor as f64);
                 *f = (1.0 - smooth) * (*f / factor) + smooth * *f;
             }
         }
@@ -441,12 +633,25 @@ fn compute_rope_cache<T: Dtype, D: OpBackend>(
 unsafe fn write_dtype_bytes(dst: *mut u8, val: f64, dt: DataType) {
     unsafe {
         match dt {
-            DataType::F32 => std::ptr::copy_nonoverlapping((val as f32).to_le_bytes().as_ptr(), dst, 4),
-            DataType::BF16 => std::ptr::copy_nonoverlapping(half::bf16::from_f64(val).to_le_bytes().as_ptr(), dst, 2),
-            DataType::F16 => std::ptr::copy_nonoverlapping(half::f16::from_f64(val).to_le_bytes().as_ptr(), dst, 2),
-            DataType::I32 => std::ptr::copy_nonoverlapping((val as i32).to_le_bytes().as_ptr(), dst, 4),
-            DataType::I8 => { *dst = val as i8 as u8; }
+            DataType::F32 => {
+                std::ptr::copy_nonoverlapping((val as f32).to_le_bytes().as_ptr(), dst, 4)
+            }
+            DataType::BF16 => std::ptr::copy_nonoverlapping(
+                half::bf16::from_f64(val).to_le_bytes().as_ptr(),
+                dst,
+                2,
+            ),
+            DataType::F16 => std::ptr::copy_nonoverlapping(
+                half::f16::from_f64(val).to_le_bytes().as_ptr(),
+                dst,
+                2,
+            ),
+            DataType::I32 => {
+                std::ptr::copy_nonoverlapping((val as i32).to_le_bytes().as_ptr(), dst, 4)
+            }
+            DataType::I8 => {
+                *dst = val as i8 as u8;
+            }
         }
     }
 }
-

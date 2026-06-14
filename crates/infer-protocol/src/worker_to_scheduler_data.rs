@@ -28,11 +28,17 @@ pub struct StepOutput {
 }
 
 /// 一个 seq 在某 step 中拿到的连续全局索引段 `[base, base+len)`。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssignedIndices {
     pub sequence_id: u64,
     pub base: u32,
     pub len: u16,
+    /// Token ids written into the KV slots represented by this run.
+    ///
+    /// Empty when prefix caching is disabled and the scheduler only needs slot
+    /// accounting. When present, `token_ids.len()` must equal `len`.
+    #[serde(default)]
+    pub token_ids: Vec<i32>,
 }
 
 impl AssignedIndices {

@@ -198,12 +198,7 @@ impl RadixTree {
     ///
     /// Worker-side `assigned_indices` from one StepOutput drive a sequence
     /// of `append_token` calls; the scheduler handles them serially.
-    pub fn append_token(
-        &mut self,
-        seq_id: SeqId,
-        token_id: i32,
-        global_idx: GlobalIndex,
-    ) {
+    pub fn append_token(&mut self, seq_id: SeqId, token_id: i32, global_idx: GlobalIndex) {
         // Snapshot tip; we'll write back at the end. Avoids holding a
         // mutable borrow on `self.seqs` across calls into `self.split_edge`
         // / `self.add_owner`.
@@ -221,8 +216,7 @@ impl RadixTree {
                 debug_assert_eq!(
                     self.nodes[tip.leaf].global_indices[tip.pos], global_idx,
                     "global index drift mid-edge: seq {} pos {} expected {}, got {}",
-                    seq_id, tip.pos,
-                    self.nodes[tip.leaf].global_indices[tip.pos], global_idx,
+                    seq_id, tip.pos, self.nodes[tip.leaf].global_indices[tip.pos], global_idx,
                 );
                 tip.pos += 1;
                 self.seqs.insert(seq_id, tip);
@@ -291,11 +285,7 @@ impl RadixTree {
     /// Caller must call `append_token` for every prompt token *not* covered
     /// by `matched_indices`. Worker side will see `prefix_hint =
     /// Some(matched_indices)` in the prefill segment and skip those tokens.
-    pub fn lookup_prefix(
-        &mut self,
-        tokens: &[i32],
-        new_seq_id: SeqId,
-    ) -> PrefixHit {
+    pub fn lookup_prefix(&mut self, tokens: &[i32], new_seq_id: SeqId) -> PrefixHit {
         let mut node = self.root;
         let mut pos = 0usize;
         let mut matched: Vec<GlobalIndex> = Vec::new();
@@ -345,7 +335,10 @@ impl RadixTree {
             // No prefix hit at all — fresh seq starts at root.
             self.seqs.insert(
                 new_seq_id,
-                ChainTip { leaf: self.root, pos: 0 },
+                ChainTip {
+                    leaf: self.root,
+                    pos: 0,
+                },
             );
         }
 
@@ -423,9 +416,7 @@ impl RadixTree {
             };
             // The node may have been re-pinned between push and pop (lookup
             // raised owners 0→1) — skip in that case.
-            if self.nodes[node_id].owners.is_empty()
-                && self.nodes[node_id].children.is_empty()
-            {
+            if self.nodes[node_id].owners.is_empty() && self.nodes[node_id].children.is_empty() {
                 self.nodes[node_id].in_lru = false;
                 let parent = self.nodes[node_id]
                     .parent
@@ -535,8 +526,7 @@ impl RadixTree {
         // collecting the union of their owner sets. Owners absent from
         // that union but present in the original owner set with tip at
         // (node, pos) belong only to the prefix.
-        let suffix_inherited_children: Vec<NodeId> =
-            original_children.values().copied().collect();
+        let suffix_inherited_children: Vec<NodeId> = original_children.values().copied().collect();
         let mut suffix_transitive_owners: HashSet<SeqId> = HashSet::new();
         for c in &suffix_inherited_children {
             for &o in self.nodes[*c].owners.iter() {
@@ -628,10 +618,8 @@ impl RadixTree {
             return;
         }
         let n = &self.nodes[node];
-        if !n.in_lru
-            && n.owners.is_empty()
-            && n.children.is_empty()
-            && !n.edge_tokens.is_empty() // not a logically-deleted node
+        if !n.in_lru && n.owners.is_empty() && n.children.is_empty() && !n.edge_tokens.is_empty()
+        // not a logically-deleted node
         {
             self.nodes[node].in_lru = true;
             self.lru.push_tail(node);
@@ -696,7 +684,11 @@ mod tests {
         // Pinning lifts the chain out of LRU. evict(target=10) returns nothing
         // because the chain is now pinned by seq 2.
         let evicted = t.evict(10);
-        assert!(evicted.is_empty(), "pinned nodes must not evict, got {:?}", evicted);
+        assert!(
+            evicted.is_empty(),
+            "pinned nodes must not evict, got {:?}",
+            evicted
+        );
     }
 
     #[test]
@@ -837,7 +829,11 @@ mod tests {
         // Seq 1 finishes: only its private suffix index 102 is releasable.
         t.mark_finished_chain(1);
         let evicted = t.evict(10);
-        assert_eq!(evicted, vec![102], "shared prefix must remain pinned by seq 2");
+        assert_eq!(
+            evicted,
+            vec![102],
+            "shared prefix must remain pinned by seq 2"
+        );
 
         // Indices 100, 101 are still pinned by seq 2 — also still reusable.
         let hit_again = t.lookup_prefix(&[10, 20], 3);
@@ -913,14 +909,21 @@ mod tests {
 
         // 1. A single sequence — nothing should be in LRU while it lives.
         append_seq(&mut t, 42, &[(5, 500), (6, 501)]);
-        assert_eq!(t.lru_len_estimate(), 0, "live owner must keep nodes off LRU");
+        assert_eq!(
+            t.lru_len_estimate(),
+            0,
+            "live owner must keep nodes off LRU"
+        );
         // evict() with anything in flight returns nothing.
         assert!(t.evict(10).is_empty());
 
         // 2. Finish the seq. `owners.is_empty()` becomes true on the
         // leaf, which is the sole driver of LRU admission.
         t.mark_finished_chain(42);
-        assert!(t.lru_len_estimate() >= 1, "empty owners on a leaf must enter LRU");
+        assert!(
+            t.lru_len_estimate() >= 1,
+            "empty owners on a leaf must enter LRU"
+        );
 
         // 3. Re-pin via lookup. `add_owner` flipping owners 0→1 must
         // remove the node from the LRU — again, purely by reference count.
@@ -959,7 +962,11 @@ mod tests {
         // Now evict: the LRU's remembered entry is stale; pop_front_valid
         // skips it via the generation stamp, returning nothing.
         let evicted = t.evict(10);
-        assert!(evicted.is_empty(), "stale LRU entry must not surface; got {:?}", evicted);
+        assert!(
+            evicted.is_empty(),
+            "stale LRU entry must not surface; got {:?}",
+            evicted
+        );
     }
 
     // ─── lru_total_indices / evict_collect_at_least ──────────────────

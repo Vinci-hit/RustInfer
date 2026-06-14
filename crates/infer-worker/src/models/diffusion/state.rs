@@ -31,13 +31,21 @@ pub struct ZImageCapacity {
 
 impl Default for ZImageCapacity {
     fn default() -> Self {
-        Self { max_height: 1024, max_width: 1024, max_cap_len: 512 }
+        Self {
+            max_height: 1024,
+            max_width: 1024,
+            max_cap_len: 512,
+        }
     }
 }
 
 impl ZImageCapacity {
-    pub fn max_latent_h(&self) -> usize { self.max_height / VAE_SCALE_FACTOR }
-    pub fn max_latent_w(&self) -> usize { self.max_width / VAE_SCALE_FACTOR }
+    pub fn max_latent_h(&self) -> usize {
+        self.max_height / VAE_SCALE_FACTOR
+    }
+    pub fn max_latent_w(&self) -> usize {
+        self.max_width / VAE_SCALE_FACTOR
+    }
 }
 
 /// Shape spec describing all transformer-internal buffer sizes.
@@ -115,41 +123,41 @@ pub struct DitState<T: Dtype, D: OpBackend> {
     pub spec: DitShapeSpec,
 
     // Timestep embedding chain.
-    pub t_freq: Tensor<T, D>,        // [1, T_FREQ_DIM]
-    pub t_hidden: Tensor<T, D>,      // [1, T_EMBEDDER_MID]
-    pub t_out: Tensor<T, D>,         // [1, ADALN_EMBED_DIM]
-    pub adaln_input: Tensor<T, D>,   // [1, ADALN_EMBED_DIM]
+    pub t_freq: Tensor<T, D>,      // [1, T_FREQ_DIM]
+    pub t_hidden: Tensor<T, D>,    // [1, T_EMBEDDER_MID]
+    pub t_out: Tensor<T, D>,       // [1, ADALN_EMBED_DIM]
+    pub adaln_input: Tensor<T, D>, // [1, ADALN_EMBED_DIM]
 
     // Patch embedder.
-    pub patches: Tensor<T, D>,       // [n_patches_max, patch_in_dim]
-    pub x_emb: Tensor<T, D>,         // [n_patches_max, dim]
-    pub x_padded: Tensor<T, D>,      // [s_img_max, dim]
-    pub x_padded_tmp: Tensor<T, D>,  // [s_img_max, dim]
+    pub patches: Tensor<T, D>,      // [n_patches_max, patch_in_dim]
+    pub x_emb: Tensor<T, D>,        // [n_patches_max, dim]
+    pub x_padded: Tensor<T, D>,     // [s_img_max, dim]
+    pub x_padded_tmp: Tensor<T, D>, // [s_img_max, dim]
 
     // Caption embedder.
     pub cap_feats_padded: Tensor<T, D>, // [s_cap_max, cap_feat_dim]
-    pub cap_normed: Tensor<T, D>,    // [s_cap_max, cap_feat_dim]
-    pub cap_emb: Tensor<T, D>,       // [s_cap_max, dim]
-    pub cap_padded: Tensor<T, D>,    // [s_cap_max, dim]
-    pub cap_padded_tmp: Tensor<T, D>,// [s_cap_max, dim]
+    pub cap_normed: Tensor<T, D>,       // [s_cap_max, cap_feat_dim]
+    pub cap_emb: Tensor<T, D>,          // [s_cap_max, dim]
+    pub cap_padded: Tensor<T, D>,       // [s_cap_max, dim]
+    pub cap_padded_tmp: Tensor<T, D>,   // [s_cap_max, dim]
 
     // RoPE caches (F32 device).
-    pub x_cos: Tensor<f32, D>,       // [s_img_max, head_dim/2]
+    pub x_cos: Tensor<f32, D>, // [s_img_max, head_dim/2]
     pub x_sin: Tensor<f32, D>,
-    pub cap_cos: Tensor<f32, D>,     // [s_cap_max, head_dim/2]
+    pub cap_cos: Tensor<f32, D>, // [s_cap_max, head_dim/2]
     pub cap_sin: Tensor<f32, D>,
     pub unified_cos: Tensor<f32, D>, // [s_total_max, head_dim/2]
     pub unified_sin: Tensor<f32, D>,
 
     // Unified main stream.
-    pub unified: Tensor<T, D>,       // [s_total_max, dim]
-    pub unified_tmp: Tensor<T, D>,   // [s_total_max, dim]
+    pub unified: Tensor<T, D>,     // [s_total_max, dim]
+    pub unified_tmp: Tensor<T, D>, // [s_total_max, dim]
 
     // Final layer.
-    pub final_normed: Tensor<T, D>,  // [s_img_max, dim]
-    pub final_scale: Tensor<T, D>,   // [1, dim]
-    pub final_out: Tensor<T, D>,     // [s_img_max, final_out_dim]
-    pub image_out: Tensor<T, D>,     // [LATENT_CHANNELS, 1, lh, lw]
+    pub final_normed: Tensor<T, D>, // [s_img_max, dim]
+    pub final_scale: Tensor<T, D>,  // [1, dim]
+    pub final_out: Tensor<T, D>,    // [s_img_max, final_out_dim]
+    pub image_out: Tensor<T, D>,    // [LATENT_CHANNELS, 1, lh, lw]
 
     /// Per-block scratch shared across all blocks. Block forwards overwrite
     /// these every call; cross-block state flows through `x_padded` /
@@ -227,9 +235,13 @@ mod tests {
             cap_feat_dim: 2560,
             patch_size: 2,
             f_patch_size: 1,
-            patch_in_dim: 1 * 2 * 2 * 16,        // 64
-            final_out_dim: 2 * 2 * 1 * 16,       // 64
-            capacity: ZImageCapacity { max_height: 256, max_width: 256, max_cap_len: 64 },
+            patch_in_dim: 1 * 2 * 2 * 16,  // 64
+            final_out_dim: 2 * 2 * 1 * 16, // 64
+            capacity: ZImageCapacity {
+                max_height: 256,
+                max_width: 256,
+                max_cap_len: 64,
+            },
         }
     }
 
@@ -246,7 +258,11 @@ mod tests {
     #[test]
     fn pipeline_state_allocates_correct_shapes() {
         let cuda = Cuda::new(0).unwrap();
-        let cap = ZImageCapacity { max_height: 512, max_width: 512, max_cap_len: 64 };
+        let cap = ZImageCapacity {
+            max_height: 512,
+            max_width: 512,
+            max_cap_len: 64,
+        };
         let ps: PipelineState<half::bf16, Cuda> = PipelineState::new(cap, &cuda).unwrap();
         assert_eq!(ps.latents.shape().as_slice(), &[1, 16, 64, 64]);
         assert_eq!(ps.latents_tmp.shape().as_slice(), &[1, 16, 64, 64]);
@@ -268,7 +284,11 @@ mod tests {
             f_patch_size: 1,
             patch_in_dim: 1 * 2 * 2 * 16,
             final_out_dim: 2 * 2 * 16,
-            capacity: ZImageCapacity { max_height: 64, max_width: 64, max_cap_len: 16 },
+            capacity: ZImageCapacity {
+                max_height: 64,
+                max_width: 64,
+                max_cap_len: 16,
+            },
         };
         let state: DitState<f32, Cuda> = DitState::new(spec, &cuda).unwrap();
         // Sanity: a few key shapes.

@@ -80,7 +80,9 @@ pub fn scatter_kv_paged<T: Dtype>(
     kv_dim: usize,
 ) -> OpResult<()> {
     let batch = seq_positions.shape().as_slice()[0];
-    if batch == 0 { return Ok(()); }
+    if batch == 0 {
+        return Ok(());
+    }
     let stream = k_src.device().config.stream;
 
     // Read row stride from the tensors directly so strided views (e.g.
@@ -141,7 +143,12 @@ pub fn scatter_kv_paged<T: Dtype>(
                 v_stride,
                 stream,
             ),
-            _ => return Err(OpError::Kernel(format!("scatter_kv_paged: dtype {:?}", T::DATA_TYPE))),
+            _ => {
+                return Err(OpError::Kernel(format!(
+                    "scatter_kv_paged: dtype {:?}",
+                    T::DATA_TYPE
+                )));
+            }
         }
     }
     Ok(())

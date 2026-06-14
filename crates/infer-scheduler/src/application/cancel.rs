@@ -10,7 +10,9 @@ use infer_protocol::scheduler_to_worker_control::{CancelSequence, SchedulerContr
 
 use crate::domain::inference_session::lifecycle::{RequestId, SequenceId};
 use crate::domain::inference_session::table::{CancelOutcome, RequestTable};
+use crate::domain::kv_budget::KvBudget;
 use crate::error::{Result, SchedulerError};
+use crate::infrastructure::kv_cache::radix_tree::RadixTree;
 use crate::infrastructure::transport::control_plane::{ControlPlaneCmdTx, WorkerId};
 
 /// Attempt to cancel a request by its internal id.
@@ -46,6 +48,41 @@ pub async fn cancel_request_by_external_id(
         return Ok(());
     };
     cancel_request(sessions, control_cmd, default_worker, request_id).await
+}
+
+/// Cancel by external id and keep scheduler-side KV state aligned with the
+/// worker-side active removal.
+pub async fn cancel_request_by_external_id_with_kv(
+    sessions: &mut RequestTable,
+    radix: &mut RadixTree,
+    kv_budget: &mut KvBudget,
+    control_cmd: &ControlPlaneCmdTx,
+    default_worker: &WorkerId,
+    external_id: &str,
+    enable_prefix_caching: bool,
+) -> Result<()> {
+    let Some(seq_id) = sessions.sequence_id_for_external(external_id) else {
+        tracing::debug!("Cancel for unknown external_id={}", external_id);
+        return Ok(());
+    };
+    let Some(request_id) = sessions.request_id_for_sequence(seq_id) else {
+        tracing::debug!("Cancel: sequence_id={} no longer active", seq_id);
+        return Ok(());
+    };
+    let kv_slots = sessions.kv_slots_for_sequence(seq_id);
+
+    match sessions.cancel_request(&request_id)? {
+        CancelOutcome::RemovedWaiting { .. } | CancelOutcome::NotFound => Ok(()),
+        CancelOutcome::RemovedPrefilling { sequence_id, .. }
+        | CancelOutcome::RemovedDecoding { sequence_id, .. } => {
+            if enable_prefix_caching {
+                radix.mark_finished_chain(sequence_id.0);
+            } else if let Some(n) = kv_slots {
+                kv_budget.release(n);
+            }
+            send_cancel_to_worker(control_cmd, default_worker, sequence_id)
+        }
+    }
 }
 
 /// Unicast a `Cancel` control message to the worker that owns this

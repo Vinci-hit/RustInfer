@@ -35,8 +35,10 @@ impl MetricsRecorder {
     pub fn record_completion(&self, latency_ms: u64, num_tokens: u32) {
         if self.enabled {
             self.total_completions.fetch_add(1, Ordering::Relaxed);
-            self.total_tokens_generated.fetch_add(num_tokens as u64, Ordering::Relaxed);
-            self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+            self.total_tokens_generated
+                .fetch_add(num_tokens as u64, Ordering::Relaxed);
+            self.total_latency_ms
+                .fetch_add(latency_ms, Ordering::Relaxed);
         }
     }
 
