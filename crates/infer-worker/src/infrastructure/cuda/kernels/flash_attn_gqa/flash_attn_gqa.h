@@ -2,6 +2,7 @@
 #include <cuda_runtime.h> // 包含 cudaStream_t 定义
 #include <cuda_bf16.h>
 #include <cublasLt.h>
+#include <cudnn.h>
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
         cudaError_t err = call;                                                   \
@@ -168,6 +169,42 @@ void launch_flash_attn_paged_decode_fp16(
     int block_size,
     const int32_t* kv_lens,
     float* workspace,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
+    cudaStream_t stream);
+
+int launch_cudnn_paged_decode_bf16(
+    cudnnHandle_t handle,
+    const __nv_bfloat16* q, int64_t qsb, int64_t qsh,
+    const __nv_bfloat16* k_pool,
+    const __nv_bfloat16* v_pool,
+          __nv_bfloat16* o, int64_t osb, int64_t osh,
+    const uint32_t* block_tables,
+    int max_blocks_per_seq,
+    int block_size,
+    const int32_t* q_lens,
+    const int32_t* kv_lens,
+    int num_blocks,
+    void* workspace,
+    size_t workspace_bytes,
+    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    float softmax_scale,
+    cudaStream_t stream);
+
+int launch_cudnn_paged_decode_fp16(
+    cudnnHandle_t handle,
+    const __half* q, int64_t qsb, int64_t qsh,
+    const __half* k_pool,
+    const __half* v_pool,
+          __half* o, int64_t osb, int64_t osh,
+    const uint32_t* block_tables,
+    int max_blocks_per_seq,
+    int block_size,
+    const int32_t* q_lens,
+    const int32_t* kv_lens,
+    int num_blocks,
+    void* workspace,
+    size_t workspace_bytes,
     int batch, int num_q_heads, int num_kv_heads, int head_dim,
     float softmax_scale,
     cudaStream_t stream);

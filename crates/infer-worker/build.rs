@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     #[cfg(feature = "cuda")]
@@ -22,13 +22,30 @@ fn main() {
         println!("cargo:rustc-link-lib=cublasLt");
         // cuDNN (Conv2d 等)
         println!("cargo:rustc-link-lib=cudnn");
+        println!("cargo:rustc-link-lib=nvrtc");
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         let root = PathBuf::from(manifest_dir);
+        let rustinfer_root = root
+            .parent()
+            .and_then(|p| p.parent())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.clone());
         let cutlass_include = root.join("src/infrastructure/cuda/kernels/third_party");
+        let cudnn_frontend_include = find_cudnn_frontend_include(&rustinfer_root);
         if !cutlass_include.exists() {
             panic!(
                 "Cutlass include directory not found at: {:?}",
                 cutlass_include
+            );
+        }
+        eprintln!(
+            "RustInfer build: using cuDNN frontend headers from {}",
+            cudnn_frontend_include.display()
+        );
+        if !cudnn_frontend_include.exists() {
+            panic!(
+                "cuDNN frontend include directory not found at: {:?}",
+                cudnn_frontend_include
             );
         }
         // 自动检测 GPU 架构，无需手动修改。
@@ -44,6 +61,8 @@ fn main() {
             .flag("-O3")
             .flag("-w")
             .include(&cutlass_include)
+            .include("/usr/include/x86_64-linux-gnu")
+            .include(&cudnn_frontend_include)
             .flag("-std=c++17")
             .flag(format!("-arch={}", cuda_arch));
 
@@ -169,6 +188,55 @@ fn main() {
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
+}
+
+#[cfg(feature = "cuda")]
+fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
+    println!("cargo:rerun-if-env-changed=CUDNN_FRONTEND_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=CUDNN_FRONTEND_ROOT");
+    println!("cargo:rerun-if-env-changed=CUDNN_FRONTEND_PATH");
+
+    let mut candidates = Vec::new();
+    for var in [
+        "CUDNN_FRONTEND_INCLUDE_DIR",
+        "CUDNN_FRONTEND_ROOT",
+        "CUDNN_FRONTEND_PATH",
+    ] {
+        if let Ok(value) = env::var(var) {
+            let path = PathBuf::from(value);
+            candidates.push(path.clone());
+            candidates.push(path.join("include"));
+        }
+    }
+
+    let venv_lib = repo_root.join(".venv/lib");
+    if let Ok(entries) = std::fs::read_dir(&venv_lib) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("python") {
+                candidates.push(entry.path().join("site-packages/include"));
+            }
+        }
+    }
+
+    candidates.extend([
+        repo_root.join(".venv/lib/python3/site-packages/include"),
+        PathBuf::from("/usr/local/cuda/include"),
+        PathBuf::from("/usr/local/include"),
+        PathBuf::from("/usr/include"),
+    ]);
+
+    for candidate in candidates {
+        if candidate.join("cudnn_frontend.h").exists()
+            && candidate.join("cudnn_frontend/graph_interface.h").exists()
+        {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "cuDNN frontend headers not found. Set CUDNN_FRONTEND_INCLUDE_DIR to a directory containing cudnn_frontend.h"
+    );
 }
 
 /// 自动检测当前 GPU 的 compute capability，返回如 "sm_90" 的字符串
