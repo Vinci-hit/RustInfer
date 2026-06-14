@@ -1,7 +1,8 @@
 //! LLM workflow — continuous batching with KV cache management.
 
 use async_trait::async_trait;
-use infer_protocol::worker_to_scheduler_data::StepOutput;
+use infer_protocol::scheduler_to_worker_control::{FreeKvIndices, SchedulerControlMessage};
+use infer_protocol::worker_to_scheduler_data::{AssignedIndices, StepOutput};
 
 use crate::application::dispatch::DispatchSystem;
 use crate::application::outcomes::ControlOutcome;
@@ -10,7 +11,7 @@ use crate::application::planning::PlanningSystem;
 use crate::application::scheduler_event::SchedulerEvent;
 use crate::application::workflow::{EngineWorkflow, ResourceContext};
 use crate::domain::inference_session::lifecycle::SequenceId;
-use crate::domain::inference_session::table::RequestTable;
+use crate::domain::inference_session::table::{Bucket, RequestTable};
 use crate::domain::policy::token_budget::TokenBudget;
 use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::error::Result;
@@ -44,8 +45,8 @@ impl LlmWorkflow {
 
 #[async_trait]
 impl EngineWorkflow for LlmWorkflow {
-    fn can_schedule(&self, _requests: &RequestTable) -> bool {
-        true // LLM: continuous batching — always schedulable
+    fn can_schedule(&self, requests: &RequestTable) -> bool {
+        !requests.has_inflight_prefill()
     }
 
     fn has_in_flight_batch(&self) -> bool {
@@ -57,17 +58,19 @@ impl EngineWorkflow for LlmWorkflow {
         ctx: &mut ResourceContext<'_>,
         dispatch: &mut DispatchSystem,
     ) -> Result<()> {
+        if ctx.requests.has_inflight_prefill() {
+            tracing::debug!(
+                "prefill batch still in flight; deferring additional LLM prefill scheduling"
+            );
+            return Ok(());
+        }
+
         if !ctx.requests.has_pending_work() {
             return Ok(());
         }
 
         let running = running_set(ctx.requests);
-        let kv_limited_tokens = if ctx.config.enable_prefix_caching {
-            ctx.config.max_batch_tokens
-        } else {
-            let decode_reserve = running.num_decoding;
-            (ctx.kv_budget.headroom() as usize).saturating_sub(decode_reserve)
-        };
+        let kv_limited_tokens = prefill_kv_budget(ctx);
         if kv_limited_tokens == 0
             && (!ctx.requests.waiting().is_empty() || !running.prefilling_continuations.is_empty())
         {
@@ -93,6 +96,11 @@ impl EngineWorkflow for LlmWorkflow {
             return Ok(());
         }
         self.planning.execute_plan(&plan, ctx.requests, ctx.radix)?;
+
+        if ctx.config.enable_prefix_caching {
+            let new_kv_tokens = self.planning.scheduled_new_kv_tokens() as u32;
+            ensure_worker_kv_headroom(ctx, new_kv_tokens, "pre_dispatch_prefix_evict");
+        }
 
         let prefilling_view = ctx.requests.prefilling();
         let batch_data = self
@@ -156,6 +164,49 @@ fn running_set(requests: &RequestTable) -> RunningSet {
     }
 }
 
+fn prefill_kv_budget(ctx: &ResourceContext<'_>) -> usize {
+    let future_decode_reserve = ctx.requests.future_decode_reserve_tokens();
+    if ctx.config.enable_prefix_caching {
+        let immediately_free = ctx.kv_budget.headroom() as usize;
+        let reclaimable_cache = ctx.radix.lru_total_indices();
+        immediately_free
+            .saturating_add(reclaimable_cache)
+            .saturating_sub(future_decode_reserve)
+    } else {
+        (ctx.kv_budget.headroom() as usize).saturating_sub(future_decode_reserve)
+    }
+}
+
+fn ensure_worker_kv_headroom(
+    ctx: &mut ResourceContext<'_>,
+    new_kv_tokens: u32,
+    reason: &'static str,
+) {
+    if new_kv_tokens == 0 {
+        return;
+    }
+    let future_decode_reserve =
+        u32::try_from(ctx.requests.future_decode_reserve_tokens()).unwrap_or(u32::MAX);
+    let required = new_kv_tokens.saturating_add(future_decode_reserve);
+    let headroom = ctx.kv_budget.headroom();
+    if headroom >= required {
+        return;
+    }
+    let missing = required - headroom;
+    let indices = ctx.radix.evict_collect_at_least(missing as usize);
+    if indices.is_empty() {
+        tracing::debug!(
+            required,
+            headroom,
+            missing,
+            "prefix cache proactive eviction found no LRU entries"
+        );
+        return;
+    }
+    release_budget_up_to(ctx.kv_budget, indices.len() as u32, reason);
+    send_free_indices(ctx, indices, reason);
+}
+
 /// Core LLM step-output processing. Separated from the trait impl
 /// so it can be called from both the workflow and legacy code paths.
 ///
@@ -169,6 +220,12 @@ async fn handle_llm_step(
     step: &StepOutput,
 ) -> Result<()> {
     let enable_prefix = ctx.config.enable_prefix_caching;
+    let sanitized_step = if enable_prefix {
+        sanitize_step_output(ctx, step)
+    } else {
+        step.clone()
+    };
+    let step = &sanitized_step;
 
     // KV budget tracking — always needed for admission control.
     if !step.assigned_indices.is_empty() {
@@ -215,6 +272,76 @@ async fn handle_llm_step(
     }
 
     Ok(())
+}
+
+fn sanitize_step_output(ctx: &mut ResourceContext<'_>, step: &StepOutput) -> StepOutput {
+    let mut stale_indices = Vec::new();
+    let assigned_indices: Vec<AssignedIndices> = step
+        .assigned_indices
+        .iter()
+        .filter_map(|assigned| {
+            if is_sequence_running(ctx.requests, assigned.sequence_id) {
+                Some(assigned.clone())
+            } else {
+                stale_indices.extend(assigned_indices(assigned));
+                None
+            }
+        })
+        .collect();
+
+    if !stale_indices.is_empty() {
+        tracing::warn!(
+            count = stale_indices.len(),
+            "freeing stale KV indices from late StepOutput"
+        );
+        send_free_indices(ctx, stale_indices, "stale_step_output");
+    }
+
+    StepOutput {
+        prefill_done: step
+            .prefill_done
+            .iter()
+            .copied()
+            .filter(|sid| is_sequence_running(ctx.requests, *sid))
+            .collect(),
+        tokens: step
+            .tokens
+            .iter()
+            .filter(|tk| is_sequence_running(ctx.requests, tk.sequence_id))
+            .cloned()
+            .collect(),
+        assigned_indices,
+    }
+}
+
+fn is_sequence_running(requests: &RequestTable, sequence_id: u64) -> bool {
+    matches!(
+        requests.location_for_sequence(SequenceId(sequence_id)),
+        Some(Bucket::Prefilling | Bucket::Decoding)
+    )
+}
+
+fn assigned_indices(assigned: &AssignedIndices) -> impl Iterator<Item = u32> + '_ {
+    assigned.base..assigned.end()
+}
+
+fn send_free_indices(ctx: &ResourceContext<'_>, indices: Vec<u32>, reason: &'static str) {
+    if indices.is_empty() {
+        return;
+    }
+    let len = indices.len();
+    let msg = SchedulerControlMessage::FreeKvIndices(FreeKvIndices {
+        model_instance_id: ctx.worker_group.model_instance_id.clone(),
+        indices,
+    });
+    if let Err(err) = ctx.control_cmd.send_to(ctx.default_worker, msg) {
+        tracing::error!(
+            count = len,
+            reason,
+            "failed to send FreeKvIndices to worker: {}",
+            err
+        );
+    }
 }
 
 fn reserve_reported_kv(kv_budget: &mut crate::domain::kv_budget::KvBudget, requested: u32) {

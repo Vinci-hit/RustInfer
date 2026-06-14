@@ -33,7 +33,7 @@ max_model_len = 4096
 # Paged KV.
 paged_block_size = 1
 chunked_prefill_size = 0      # 0 => disabled
-enable_prefix_caching = false
+enable_prefix_caching = true
 mem_fraction_static = 0.9
 num_blocks = 0                # 0 => auto-size
 

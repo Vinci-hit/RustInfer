@@ -32,13 +32,16 @@ pub struct ResourceContext<'a> {
     pub metrics: &'a MetricsRecorder,
     pub codec: &'a MsgPackCodec,
     pub config: &'a SchedulerConfig,
+    pub control_cmd: &'a ControlPlaneCmdTx,
+    pub worker_group: &'a WorkerGroup,
+    pub default_worker: &'a WorkerId,
 }
 
 /// Mode-specific scheduling and output processing.
 #[async_trait]
 pub trait EngineWorkflow: Send + Sync {
     /// Whether a new batch can be scheduled right now.
-    /// LLM: always true (continuous batching).
+    /// LLM: false while a prefill batch is awaiting worker acknowledgement.
     /// Diffusion: false while a batch is in-flight.
     fn can_schedule(&self, requests: &RequestTable) -> bool;
 

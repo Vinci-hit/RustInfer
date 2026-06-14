@@ -197,6 +197,15 @@ where
         }
 
         for cmd in pending_prefills {
+            if drain_control(
+                control,
+                &mut active,
+                &mut decode_rows,
+                &mut kv_allocator,
+                enable_prefix_caching,
+            ) {
+                return Ok(());
+            }
             if let Err(e) = handle_prefill(
                 &mut runner,
                 &cmd,

@@ -1,5 +1,7 @@
 //! RustInfer Scheduler binary entry point.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -115,7 +117,14 @@ async fn main() -> Result<()> {
     // Bind the control-plane ROUTER, optionally assign a model, then
     // wait for `WorkerReady`. The same socket continues to serve
     // runtime control once the handshake completes.
-    let cp_cfg = ControlPlaneConfig::default();
+    let mut cp_cfg = ControlPlaneConfig::default();
+    cp_cfg.heartbeat_interval = Duration::from_secs(1);
+    cp_cfg.heartbeat_timeout = Duration::from_secs(cfg.request_timeout_secs.saturating_add(30));
+    tracing::info!(
+        "  worker heartbeat_interval: {:?}",
+        cp_cfg.heartbeat_interval
+    );
+    tracing::info!("  worker heartbeat_timeout: {:?}", cp_cfg.heartbeat_timeout);
     let (mut control_plane, worker_group) =
         ControlPlane::bootstrap(&worker_control_endpoint, load_model, cp_cfg).await?;
     tracing::info!(

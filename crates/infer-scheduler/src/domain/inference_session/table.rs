@@ -207,6 +207,10 @@ impl RequestTable {
         self.locations.get(&sequence_id).map(|a| a.bucket)
     }
 
+    pub fn location_for_sequence(&self, sequence_id: SequenceId) -> Option<Bucket> {
+        self.locations.get(&sequence_id).map(|a| a.bucket)
+    }
+
     /// All currently prefilling sessions, in arbitrary (slot) order.
     ///
     /// Order is *not* arrival order. Callers that need a deterministic
@@ -221,6 +225,10 @@ impl RequestTable {
 
     pub fn prefilling_len(&self) -> usize {
         self.prefilling.len()
+    }
+
+    pub fn has_inflight_prefill(&self) -> bool {
+        self.prefilling.values().any(|seq| seq.has_inflight())
     }
 
     pub fn decoding_len(&self) -> usize {
@@ -567,6 +575,31 @@ impl RequestTable {
             }
             _ => None,
         }
+    }
+
+    /// KV slots that must stay free for already-admitted requests to finish
+    /// decoding without relying on worker-side emergency relief.
+    ///
+    /// Prefill produces the first output token without writing that generated
+    /// token into KV, so a request with `max_tokens = N` needs at most `N - 1`
+    /// future decode allocations after prefill. For sessions already decoding,
+    /// subtract the output tokens the scheduler has observed.
+    pub fn future_decode_reserve_tokens(&self) -> usize {
+        let prefilling_reserve: usize = self
+            .prefilling
+            .values()
+            .map(|seq| seq.meta.max_tokens.saturating_sub(1))
+            .sum();
+        let decoding_reserve: usize = self
+            .decoding
+            .values()
+            .map(|seq| {
+                seq.meta
+                    .max_tokens
+                    .saturating_sub(seq.state.output_tokens.len())
+            })
+            .sum();
+        prefilling_reserve.saturating_add(decoding_reserve)
     }
 
     pub fn fail_sequence(

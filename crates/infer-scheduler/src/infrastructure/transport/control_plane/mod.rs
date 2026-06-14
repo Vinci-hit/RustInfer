@@ -163,6 +163,7 @@ impl ControlPlane {
             cfg.heartbeat_interval,
             cfg.heartbeat_timeout,
             outcome.registry_view,
+            cmd_tx.clone(),
             outcome.event_tx_for_liveness,
         );
 

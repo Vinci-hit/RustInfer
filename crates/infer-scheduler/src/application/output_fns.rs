@@ -130,9 +130,16 @@ pub async fn complete_session(
     let finished = seq.finish(reason);
 
     let elapsed_ms = finished.state.metrics.e2e_latency.as_millis() as u64;
+    let ttft_ms = finished.state.metrics.ttft.as_millis() as u64;
+    let decode_ms = elapsed_ms.saturating_sub(ttft_ms);
     let num_tokens = finished.state.metrics.num_output_tokens;
     let tokens_per_second = if elapsed_ms > 0 {
         (num_tokens as f64 / elapsed_ms as f64) * 1000.0
+    } else {
+        0.0
+    };
+    let decode_tokens_per_second = if decode_ms > 0 {
+        (num_tokens as f64 / decode_ms as f64) * 1000.0
     } else {
         0.0
     };
@@ -174,7 +181,10 @@ pub async fn complete_session(
         request_id_display,
         num_tokens,
         elapsed_ms,
+        ttft_ms,
+        decode_ms,
         tokens_per_second,
+        decode_tokens_per_second,
     })
 }
 
@@ -276,11 +286,14 @@ pub async fn process_llm_step_decoded(
         let seq = sessions.finish_decoding(sequence_id)?;
         let outcome = complete_session(frontend, metrics, seq).await?;
         tracing::info!(
-            "Completed {}: {} tokens in {}ms ({:.1} tok/s)",
+            "Completed {}: {} tokens e2e={}ms ttft={}ms decode={}ms e2e_tps={:.1} decode_tps={:.1}",
             outcome.request_id_display,
             outcome.num_tokens,
             outcome.elapsed_ms,
+            outcome.ttft_ms,
+            outcome.decode_ms,
             outcome.tokens_per_second,
+            outcome.decode_tokens_per_second,
         );
     }
 

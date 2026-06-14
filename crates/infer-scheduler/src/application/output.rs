@@ -7,7 +7,7 @@
 
 /// Diagnostic bundle returned by [`super::output_fns::complete_session`].
 ///
-/// The engine's tracing line wants all four fields together; instead
+/// The engine's tracing line wants these fields together; instead
 /// of forcing a destructure we hand back a small typed record so the
 /// log line is unambiguous and future fields (e.g. `prefill_latency`)
 /// extend without breaking callers.
@@ -16,7 +16,10 @@ pub struct CompleteOutcome {
     pub request_id_display: String,
     pub num_tokens: u32,
     pub elapsed_ms: u64,
+    pub ttft_ms: u64,
+    pub decode_ms: u64,
     pub tokens_per_second: f64,
+    pub decode_tokens_per_second: f64,
 }
 
 #[cfg(test)]

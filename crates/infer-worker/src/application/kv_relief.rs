@@ -16,8 +16,10 @@ pub fn wait_for_relief(
     control: &ControlPump,
     kv_allocator: &mut GlobalKvAllocator,
     active: &mut ActiveSeqMap,
+    needed_slots: u32,
     wait_ms: i64,
     enable_prefix_caching: bool,
+    shrink_to_active: bool,
 ) -> bool {
     let deadline = Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
     while Instant::now() < deadline {
@@ -28,11 +30,25 @@ pub fn wait_for_relief(
         match control.try_recv(poll_ms) {
             Ok(Some((SchedulerControlMessage::FreeKvIndices(f), _))) => {
                 if !f.indices.is_empty() {
+                    eprintln!(
+                        "[serve] relief received: FreeKvIndices count={}",
+                        f.indices.len()
+                    );
                     kv_allocator.free(&f.indices);
+                } else {
+                    eprintln!("[serve] relief received: FreeKvIndices count=0");
                 }
-                return true;
+                if relief_satisfies_request(kv_allocator, active, needed_slots, shrink_to_active) {
+                    return true;
+                }
+                log_partial_relief(kv_allocator, needed_slots);
             }
             Ok(Some((SchedulerControlMessage::Preempt(p), _))) => {
+                eprintln!(
+                    "[serve] relief received: Preempt victims={} free_indices={}",
+                    p.sequence_ids.len(),
+                    p.free_indices.len()
+                );
                 for sid in &p.sequence_ids {
                     if let Some(entry) = active.remove(sid) {
                         release_removed(entry, kv_allocator, enable_prefix_caching);
@@ -41,7 +57,10 @@ pub fn wait_for_relief(
                 if !p.free_indices.is_empty() {
                     kv_allocator.free(&p.free_indices);
                 }
-                return true;
+                if relief_satisfies_request(kv_allocator, active, needed_slots, shrink_to_active) {
+                    return true;
+                }
+                log_partial_relief(kv_allocator, needed_slots);
             }
             Ok(Some((SchedulerControlMessage::Shutdown, _))) => {
                 eprintln!("[serve] Shutdown received during wait_for_relief");
@@ -54,6 +73,9 @@ pub fn wait_for_relief(
                         "[serve] cancelled seq {} (during relief wait)",
                         c.sequence_id
                     );
+                }
+                if relief_satisfies_request(kv_allocator, active, needed_slots, shrink_to_active) {
+                    return true;
                 }
             }
             Ok(Some((SchedulerControlMessage::Ping, req_id))) => {
@@ -107,8 +129,10 @@ pub fn alloc_with_relief(
                     control,
                     kv_allocator,
                     active,
+                    n,
                     RELIEF_TIMEOUT_MS,
                     enable_prefix_caching,
+                    shrink_to_active,
                 );
                 if shrink_to_active {
                     let active_now = active.len() as u32;
@@ -136,6 +160,30 @@ pub fn alloc_with_relief(
             }
         }
     }
+}
+
+fn relief_satisfies_request(
+    kv_allocator: &GlobalKvAllocator,
+    active: &ActiveSeqMap,
+    needed_slots: u32,
+    shrink_to_active: bool,
+) -> bool {
+    if needed_slots == 0 {
+        return true;
+    }
+    if shrink_to_active && (active.len() as u32) < needed_slots {
+        return true;
+    }
+    kv_allocator.total_free() >= needed_slots
+}
+
+fn log_partial_relief(kv_allocator: &GlobalKvAllocator, needed_slots: u32) {
+    eprintln!(
+        "[serve] relief partial: need={} available={} total_free={} -- continuing wait",
+        needed_slots,
+        kv_allocator.available(),
+        kv_allocator.total_free(),
+    );
 }
 
 fn release_removed(

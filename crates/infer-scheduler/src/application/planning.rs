@@ -191,6 +191,26 @@ impl PlanningSystem {
         &self.current_chunk_sizes
     }
 
+    /// Number of new worker KV slots the current LLM plan needs.
+    ///
+    /// Prefix hits do not allocate new slots on the worker, so they are
+    /// subtracted from the scheduled segment length. Continuation chunks
+    /// never carry prefix hints and count in full.
+    pub fn scheduled_new_kv_tokens(&self) -> usize {
+        self.current_chunk_sizes
+            .iter()
+            .map(|(request_id, scheduled_len)| {
+                let prefix_hit = self
+                    .current_prefix_hints
+                    .iter()
+                    .find(|(id, _)| id == request_id)
+                    .map(|(_, indices)| indices.len())
+                    .unwrap_or(0);
+                scheduled_len.saturating_sub(prefix_hit)
+            })
+            .sum()
+    }
+
     /// Build the LLM-mode `Prefill` batch, reusing internal buffers.
     /// Decoding is the worker's responsibility; the scheduler only
     /// emits prefill commands.

@@ -293,8 +293,11 @@ fn handle_inbound(
         }
         // RPC replies must carry a non-zero id; if we get here with a reply
         // shape and id=NONE, something is wrong with the worker side.
-        WorkerControlMessage::Pong
-        | WorkerControlMessage::CancelAck(_)
+        WorkerControlMessage::Pong => {
+            tracing::trace!("one-way Pong received; liveness refreshed");
+            return;
+        }
+        WorkerControlMessage::CancelAck(_)
         | WorkerControlMessage::DrainAck(_)
         | WorkerControlMessage::UnloadAck(_) => {
             tracing::warn!("RPC reply received with RequestId::NONE; dropping");

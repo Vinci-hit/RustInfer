@@ -6,7 +6,7 @@ use std::time::Instant;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::scheduler_to_worker_data::BatchCommand;
 use infer_protocol::worker_to_scheduler_control::WorkerStepError;
-use infer_protocol::worker_to_scheduler_data::{GeneratedToken, StepOutput};
+use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
 use crate::config::SchedulerConfig;
 use crate::domain::ids::BlockSize;
@@ -216,6 +216,169 @@ async fn step_output_final_prefill_decodes_with_existing_blocks() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn stale_step_output_frees_indices_without_pinning_radix() -> Result<()> {
+    use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+
+    let (mut engine, _default_worker, _event_tx, mut cmd_rx) = make_engine();
+    engine.config.enable_prefix_caching = true;
+
+    let output = StepOutput {
+        prefill_done: vec![99],
+        tokens: vec![GeneratedToken {
+            sequence_id: 99,
+            token_id: 42,
+            finished: false,
+        }],
+        assigned_indices: vec![AssignedIndices {
+            sequence_id: 99,
+            base: 10,
+            len: 3,
+            token_ids: vec![1, 2, 3],
+        }],
+    };
+    let codec = MsgPackCodec;
+    engine
+        .handle_step_output_llm(codec.encode(&output)?)
+        .await?;
+
+    assert_eq!(engine.radix.token_count(), 0);
+    assert_eq!(engine.kv_budget.outstanding(), 0);
+    let cmd = cmd_rx
+        .try_recv()
+        .expect("expected stale FreeKvIndices command");
+    match cmd {
+        crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo {
+            env,
+            ..
+        } => match env.payload {
+            SchedulerControlMessage::FreeKvIndices(f) => {
+                assert_eq!(f.indices, vec![10, 11, 12]);
+            }
+            other => panic!("expected FreeKvIndices, got {:?}", other),
+        },
+        _ => panic!("expected SendTo router command"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn prefix_cache_prefill_proactively_evicts_lru_before_dispatch() -> Result<()> {
+    use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+
+    let (mut engine, _default_worker, _event_tx, mut cmd_rx) = make_engine();
+    engine.config.enable_prefix_caching = true;
+    engine.config.max_batch_tokens = 8;
+    engine.kv_budget.try_reserve(31).unwrap();
+
+    for (tok, idx) in [1, 2, 3, 4].into_iter().zip([20, 21, 22, 23]) {
+        engine.radix.append_token(500, tok, idx);
+    }
+    engine.radix.mark_finished_chain(500);
+    assert_eq!(engine.radix.lru_total_indices(), 4);
+
+    let meta = Arc::new(RequestMeta {
+        id: RequestId::new_v4(),
+        external_id: "prefill-needs-evict".to_string(),
+        sequence_id: SequenceId(77),
+        input_ids: vec![10, 11, 12, 13],
+        max_tokens: 1,
+        sampling: SamplingParams::default(),
+        priority: Priority::default(),
+        stream: false,
+        stop_sequences: vec![],
+        ignore_eos: false,
+        diffusion: None,
+        arrival_time: Instant::now(),
+    });
+    engine
+        .requests
+        .insert_new(Arc::clone(&meta), RequestHandle::noop())?;
+
+    engine.run_iteration().await?;
+
+    assert_eq!(engine.requests.prefilling_len(), 1);
+    let cmd = cmd_rx
+        .try_recv()
+        .expect("expected proactive FreeKvIndices command");
+    match cmd {
+        crate::infrastructure::transport::control_plane::handle::RouterCommand::SendTo {
+            env,
+            ..
+        } => match env.payload {
+            SchedulerControlMessage::FreeKvIndices(f) => {
+                assert_eq!(f.indices, vec![20, 21, 22, 23]);
+            }
+            other => panic!("expected FreeKvIndices, got {:?}", other),
+        },
+        _ => panic!("expected SendTo router command"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn llm_prefill_inflight_blocks_additional_prefill_dispatch() -> Result<()> {
+    let config = SchedulerConfig {
+        paged_block_size: BlockSize::new(4),
+        max_batch_tokens: 16,
+        ..Default::default()
+    };
+    let worker = MockWorker::default();
+    let sent = Arc::clone(&worker.sent);
+    let (control_cmd, control_events, _event_tx, _cmd_rx) = mock_control_plane();
+    let default_worker = WorkerId::from_identity(b"worker-test");
+    let mut engine = SchedulerEngine::new(
+        config,
+        Box::new(ContinuousBatchingPolicy::new(None)),
+        worker_group(),
+        MockFrontend,
+        worker,
+        control_cmd,
+        control_events,
+        default_worker,
+    );
+
+    let make_meta = |external_id: &str, sequence_id: u64| {
+        Arc::new(RequestMeta {
+            id: RequestId::new_v4(),
+            external_id: external_id.to_string(),
+            sequence_id: SequenceId(sequence_id),
+            input_ids: vec![1, 2, 3, 4],
+            max_tokens: 8,
+            sampling: SamplingParams::default(),
+            priority: Priority::default(),
+            stream: false,
+            stop_sequences: vec![],
+            ignore_eos: false,
+            diffusion: None,
+            arrival_time: Instant::now(),
+        })
+    };
+
+    engine
+        .requests
+        .insert_new(make_meta("first", 101), RequestHandle::noop())?;
+    engine.run_iteration().await?;
+
+    assert_eq!(sent.lock().unwrap().len(), 1);
+    assert!(engine.requests.has_inflight_prefill());
+    assert!(!engine.can_schedule());
+
+    engine
+        .requests
+        .insert_new(make_meta("second", 102), RequestHandle::noop())?;
+    engine.run_iteration().await?;
+
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "second prefill must wait for the first prefill ACK"
+    );
+    assert_eq!(engine.requests.waiting().len(), 1);
+    assert_eq!(engine.requests.prefilling_len(), 1);
+    Ok(())
+}
+
 /// Build a SchedulerEngine ready for control-plane event injection. Tests
 /// hold the test side of the `cmd_rx` so they can assert what the engine
 /// emitted, and the test side of `event_tx` so they can drive events.
@@ -247,6 +410,39 @@ fn make_engine() -> (
         default_worker.clone(),
     );
     (engine, default_worker, event_tx, cmd_rx)
+}
+
+fn insert_decoding_session(engine: &mut SchedulerEngine, sid: u64, input_len: usize) -> RequestId {
+    let meta = Arc::new(RequestMeta {
+        id: RequestId::new_v4(),
+        external_id: format!("ext-{}", sid),
+        sequence_id: SequenceId(sid),
+        input_ids: (0..input_len as i32).collect(),
+        max_tokens: 128,
+        sampling: SamplingParams::default(),
+        priority: Priority::default(),
+        stream: false,
+        stop_sequences: vec![],
+        ignore_eos: false,
+        diffusion: None,
+        arrival_time: Instant::now(),
+    });
+    let request_id = meta.id.clone();
+    engine
+        .requests
+        .insert_new(Arc::clone(&meta), RequestHandle::noop())
+        .unwrap();
+    let queued = engine.requests.take_waiting(&request_id).unwrap();
+    engine
+        .requests
+        .commit_prefill_start(
+            queued,
+            crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
+            input_len,
+        )
+        .unwrap();
+    let _ = engine.requests.ack_prefill(SequenceId(sid)).unwrap();
+    request_id
 }
 
 /// `WorkerStepError` arriving on the control plane should fail the listed
@@ -390,12 +586,12 @@ async fn step_output_assigned_indices_drive_radix_and_budget() -> Result<()> {
         default_worker,
     );
 
-    // Build a StepOutput with assigned_indices populated. We skip the
-    // prefill_done / tokens machinery (those sequences aren't actually
-    // registered) — `handle_step_output_llm` first peels the
-    // assigned_indices fields, which exercise the radix/budget path,
-    // and then `process_llm_step` warns on unknown sequence_ids but
-    // does not fail.
+    insert_decoding_session(&mut engine, 100, 1);
+    insert_decoding_session(&mut engine, 200, 1);
+
+    // Build a StepOutput with assigned_indices populated for active
+    // sequences. Unknown sequence ids are treated as stale and freed
+    // instead of being inserted into the prefix cache.
     let codec = MsgPackCodec;
     let output = StepOutput {
         prefill_done: vec![],
@@ -454,6 +650,7 @@ async fn finished_token_marks_chain_for_lru_eviction() -> Result<()> {
         control_events,
         default_worker,
     );
+    insert_decoding_session(&mut engine, 7, 1);
 
     let codec = MsgPackCodec;
     // Write 4 slots for seq 7.
@@ -545,6 +742,7 @@ async fn phase8_full_admission_cycle_through_engine() -> Result<()> {
     // Use distinct first tokens so the seqs hang off different
     // root-level branches and don't collide in the prefix tree.
     for sid in [101u64, 102, 103] {
+        insert_decoding_session(&mut engine, sid, 1);
         let out = StepOutput {
             prefill_done: vec![],
             tokens: vec![GeneratedToken {
@@ -609,6 +807,7 @@ async fn phase8_full_admission_cycle_through_engine() -> Result<()> {
     );
 
     // ── 5. New seq 104 with 16 slots fits exactly into the headroom. ──
+    insert_decoding_session(&mut engine, 104, 1);
     let out104 = StepOutput {
         prefill_done: vec![],
         tokens: vec![GeneratedToken {

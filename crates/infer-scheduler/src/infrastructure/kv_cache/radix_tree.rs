@@ -373,32 +373,22 @@ impl RadixTree {
         }
     }
 
-    /// Sum of `global_indices.len()` across every node currently in
-    /// the LRU. This is the cap on what `evict_collect_at_least` can
-    /// possibly return on a single call.
+    /// Sum of `global_indices.len()` across every node that can be
+    /// reclaimed by repeated LRU eviction from the current tree state.
     ///
-    /// Walks the LRU queue once and skips stale entries by checking
-    /// each node's `in_lru` flag (the generation stamp on the queue
-    /// itself can't be peeked without popping). Cheap because the
-    /// LRU only ever contains unowned leaves — typical loads keep
-    /// this under a few thousand entries.
+    /// The physical LRU queue only contains unowned leaves. Evicting a
+    /// leaf can turn its unowned parent into the next LRU leaf, so admission
+    /// must count the whole reclaimable subtree, not just nodes already
+    /// present in `lru.queue`. Otherwise long finished chains look like a
+    /// few dozen freeable slots and the scheduler can starve waiting work
+    /// even though `evict_collect_at_least` could free enough KV.
     pub fn lru_total_indices(&self) -> usize {
-        let mut total = 0usize;
-        for &(node_id, _g) in &self.lru.queue {
-            // Only count entries that are still actually in LRU
-            // (un-pinned and a leaf at this instant).
-            if !self.nodes[node_id].in_lru {
-                continue;
-            }
-            if !self.nodes[node_id].owners.is_empty() {
-                continue;
-            }
-            if !self.nodes[node_id].children.is_empty() {
-                continue;
-            }
-            total += self.nodes[node_id].global_indices.len();
-        }
-        total
+        self.nodes[self.root]
+            .children
+            .values()
+            .copied()
+            .map(|child| self.reclaimable_subtree_total(child).0)
+            .sum()
     }
 
     /// Evict from the LRU front until at least `target_n` global
@@ -624,6 +614,24 @@ impl RadixTree {
             self.nodes[node].in_lru = true;
             self.lru.push_tail(node);
         }
+    }
+
+    fn reclaimable_subtree_total(&self, node: NodeId) -> (usize, bool) {
+        let mut total = 0usize;
+        let mut children_fully_reclaimable = true;
+
+        for &child in self.nodes[node].children.values() {
+            let (child_total, child_fully_reclaimable) = self.reclaimable_subtree_total(child);
+            total += child_total;
+            children_fully_reclaimable &= child_fully_reclaimable;
+        }
+
+        let fully_reclaimable = self.nodes[node].owners.is_empty() && children_fully_reclaimable;
+        if fully_reclaimable {
+            total += self.nodes[node].global_indices.len();
+        }
+
+        (total, fully_reclaimable)
     }
 }
 
@@ -984,6 +992,21 @@ mod tests {
             t.mark_finished_chain(s);
         }
         assert_eq!(t.lru_total_indices(), 12);
+    }
+
+    #[test]
+    fn lru_total_indices_counts_finished_long_chain_ancestors() {
+        let mut t = RadixTree::new();
+        let n = (EDGE_SPLIT_THRESHOLD * 3) as u32;
+        for k in 0..n {
+            t.append_token(1, k as i32, k);
+        }
+        t.mark_finished_chain(1);
+
+        assert_eq!(t.lru_total_indices(), n as usize);
+
+        let got = t.evict_collect_at_least(n as usize);
+        assert_eq!(got.len(), n as usize);
     }
 
     #[test]

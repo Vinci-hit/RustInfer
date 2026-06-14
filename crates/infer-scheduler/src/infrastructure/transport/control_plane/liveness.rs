@@ -1,15 +1,18 @@
 //! Heartbeat watchdog.
 //!
-//! Owns a tokio `interval` task spawned by `ControlPlane::bootstrap`. Reads
-//! the shared `RegistryView`, removes any worker whose `last_seen` has aged
-//! past the configured timeout, and emits [`ControlEvent::WorkerLost`].
+//! Owns a tokio `interval` task spawned by `ControlPlane::bootstrap`. On each
+//! tick it actively probes workers with a control-plane `Ping`, reads the
+//! shared `RegistryView`, removes any worker whose `last_seen` has aged past
+//! the configured timeout, and emits [`ControlEvent::WorkerLost`].
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use infer_protocol::ControlEnvelope;
+use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use tokio::sync::{mpsc, oneshot};
 
-use super::handle::{ControlEvent, WorkerId};
+use super::handle::{ControlEvent, RouterCommand, WorkerId};
 use super::registry::RegistryView;
 
 /// Spawn the watchdog task. The returned `cancel_tx` lets the owner stop the
@@ -18,10 +21,11 @@ pub(crate) fn spawn(
     interval: Duration,
     timeout: Duration,
     view: Arc<RwLock<RegistryView>>,
+    cmd_tx: mpsc::UnboundedSender<RouterCommand>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
 ) -> oneshot::Sender<()> {
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    tokio::spawn(run(interval, timeout, view, event_tx, cancel_rx));
+    tokio::spawn(run(interval, timeout, view, cmd_tx, event_tx, cancel_rx));
     cancel_tx
 }
 
@@ -29,6 +33,7 @@ async fn run(
     interval: Duration,
     timeout: Duration,
     view: Arc<RwLock<RegistryView>>,
+    cmd_tx: mpsc::UnboundedSender<RouterCommand>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     mut cancel: oneshot::Receiver<()>,
 ) {
@@ -43,6 +48,7 @@ async fn run(
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                ping_workers(&view, &cmd_tx);
                 let lost = collect_lost(&view, now, timeout);
                 for (worker, last_seen) in lost {
                     let last_seen_ms = now.saturating_duration_since(last_seen).as_millis() as u64;
@@ -57,6 +63,19 @@ async fn run(
                     }
                 }
             }
+        }
+    }
+}
+
+fn ping_workers(view: &Arc<RwLock<RegistryView>>, cmd_tx: &mpsc::UnboundedSender<RouterCommand>) {
+    let workers: Vec<WorkerId> = {
+        let g = view.read().expect("registry view poisoned");
+        g.by_worker_id.keys().cloned().collect()
+    };
+    for worker in workers {
+        let env = ControlEnvelope::oneway(SchedulerControlMessage::Ping);
+        if cmd_tx.send(RouterCommand::SendTo { worker, env }).is_err() {
+            return;
         }
     }
 }

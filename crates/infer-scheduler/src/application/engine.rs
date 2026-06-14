@@ -225,6 +225,9 @@ impl SchedulerEngine {
             metrics,
             codec,
             config,
+            control_cmd,
+            worker_group,
+            default_worker,
             ..
         } = self;
 
@@ -235,6 +238,9 @@ impl SchedulerEngine {
             metrics,
             codec,
             config,
+            control_cmd,
+            worker_group,
+            default_worker,
         };
         workflow.try_schedule(&mut ctx, dispatch).await
     }
@@ -253,6 +259,9 @@ impl SchedulerEngine {
             metrics,
             codec,
             config,
+            control_cmd,
+            worker_group,
+            default_worker,
             ..
         } = self;
 
@@ -263,6 +272,9 @@ impl SchedulerEngine {
             metrics,
             codec,
             config,
+            control_cmd,
+            worker_group,
+            default_worker,
         };
         workflow.handle_step_output(&mut ctx, dispatch, event).await
     }
@@ -275,9 +287,6 @@ impl SchedulerEngine {
     pub(crate) async fn on_control_event(&mut self, event: ControlEvent) -> Result<()> {
         use crate::application::ControlOutcome;
 
-        let default_worker = self.default_worker.clone();
-        let control_cmd = self.control_cmd.clone();
-
         let outcome = {
             let SchedulerEngine {
                 workflow,
@@ -288,6 +297,8 @@ impl SchedulerEngine {
                 codec,
                 config,
                 worker_group,
+                control_cmd,
+                default_worker,
                 ..
             } = self;
 
@@ -298,13 +309,16 @@ impl SchedulerEngine {
                 metrics,
                 codec,
                 config,
+                control_cmd,
+                worker_group,
+                default_worker,
             };
             workflow.handle_control_event(
                 event,
                 &mut ctx,
-                &control_cmd,
+                control_cmd,
                 worker_group,
-                &default_worker,
+                default_worker,
             )
         };
         match outcome {
@@ -417,8 +431,8 @@ impl SchedulerEngine {
             tokio::select! {
                 biased;
                 Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
-                Some(event) = decoded_rx.recv() => event,
                 result = frontend.recv_event() => frontend_result_to_event(result),
+                Some(event) = decoded_rx.recv() => event,
             }
         } else {
             let frontend = self.dispatch.frontend_mut();

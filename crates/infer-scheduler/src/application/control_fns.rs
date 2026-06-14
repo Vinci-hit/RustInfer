@@ -33,9 +33,16 @@ pub fn handle_control_event(
     enable_prefix_caching: bool,
 ) -> ControlOutcome {
     match event {
-        ControlEvent::StepError { worker: _, err } => {
-            handle_worker_step_error(err, sessions, radix, kv_budget, enable_prefix_caching)
-        }
+        ControlEvent::StepError { worker, err } => handle_worker_step_error(
+            err,
+            sessions,
+            radix,
+            kv_budget,
+            enable_prefix_caching,
+            control_cmd,
+            worker_group,
+            &worker,
+        ),
         ControlEvent::WorkerLost {
             worker,
             last_seen_ms,
@@ -248,14 +255,35 @@ fn handle_worker_step_error(
     radix: &mut RadixTree,
     kv_budget: &mut KvBudget,
     enable_prefix_caching: bool,
+    control_cmd: &ControlPlaneCmdTx,
+    worker_group: &WorkerGroup,
+    target_worker: &WorkerId,
 ) -> ControlOutcome {
     let failed_sequence_ids = collect_failed_sequence_ids(&err, sessions);
+    let failed_kv_slots: u32 = failed_sequence_ids
+        .iter()
+        .filter_map(|raw| sessions.kv_slots_for_sequence(SequenceId(*raw)))
+        .sum();
     for raw in &failed_sequence_ids {
         let sid = SequenceId(*raw);
         if enable_prefix_caching {
             radix.mark_finished_chain(*raw);
         } else if let Some(n) = sessions.kv_slots_for_sequence(sid) {
             release_budget_up_to(kv_budget, n, "worker_step_error");
+        }
+    }
+    if enable_prefix_caching && failed_kv_slots > 0 {
+        let indices = radix.evict_collect_at_least(failed_kv_slots as usize);
+        if !indices.is_empty() {
+            release_budget_up_to(kv_budget, indices.len() as u32, "worker_step_error_prefix");
+            let msg =
+                infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
+                    infer_protocol::scheduler_to_worker_control::FreeKvIndices {
+                        model_instance_id: worker_group.model_instance_id.clone(),
+                        indices,
+                    },
+                );
+            let _ = control_cmd.send_to(target_worker, msg);
         }
     }
     let failed_ids = failed_sequence_ids
