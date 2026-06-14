@@ -7,7 +7,9 @@ use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, 
 use crate::application::forward_workspace::ForwardWorkspace;
 use crate::application::kv_relief::alloc_with_relief;
 use crate::application::model_runner::{ModelRunner, SeqStep};
-use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, DecodeRows};
+use crate::application::worker_state::{
+    ActiveSeq, ActiveSeqMap, DecodeRows, PrefillSeq, PrefillSeqMap,
+};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
 use crate::domain::ports::OpResult;
@@ -26,6 +28,7 @@ pub fn handle_prefill<M>(
     runner: &mut ModelRunner<bf16, Cuda, M>,
     cmd: &PrefillBatchCmd,
     active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
     kv_allocator: &mut GlobalKvAllocator,
     control: &ControlPump,
     data: &DataPump,
@@ -95,6 +98,7 @@ where
         kv_allocator,
         control,
         active,
+        prefilling,
         total_new,
         enable_prefix_caching,
         false,
@@ -121,10 +125,29 @@ where
     let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
     let mut per_seg_indices: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
     let mut per_seg_token_ids: Vec<Vec<i32>> = Vec::with_capacity(cmd.segments.len());
+    let mut per_seg_base_tables: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
+    let mut per_seg_skipped: Vec<bool> = Vec::with_capacity(cmd.segments.len());
+    let mut unused_indices: Vec<u32> = Vec::new();
     let mut idx_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
         let new_tokens = per_seg_new_tokens[i] as usize;
         let prefix = &per_seg_prefix_hint[i];
+        let base_table = prefilling
+            .get(&seg.sequence_id)
+            .map(|state| state.block_table.clone())
+            .unwrap_or_else(|| prefix.clone());
+        let expected_base_len = seg.segment_start as usize;
+        let skip_segment = if base_table.len() != expected_base_len {
+            eprintln!(
+                "[serve] skipping stale prefill segment seq={} base_len={} expected={}",
+                seg.sequence_id,
+                base_table.len(),
+                expected_base_len,
+            );
+            true
+        } else {
+            false
+        };
         let range = cmd.segment_token_range(i);
         let (input_ids, positions): (Vec<i32>, Vec<i32>) = if seg.segment_start == 0
             && !prefix.is_empty()
@@ -143,8 +166,17 @@ where
 
         let new_indices: Vec<u32> = base_indices[idx_cursor..idx_cursor + new_tokens].to_vec();
         idx_cursor += new_tokens;
-        let mut block_table: Vec<u32> = Vec::with_capacity(prefix.len() + new_tokens);
-        block_table.extend_from_slice(prefix);
+        if skip_segment {
+            unused_indices.extend_from_slice(&new_indices);
+            per_seg_indices.push(Vec::new());
+            per_seg_token_ids.push(Vec::new());
+            per_seg_base_tables.push(base_table);
+            per_seg_skipped.push(true);
+            continue;
+        }
+
+        let mut block_table: Vec<u32> = Vec::with_capacity(base_table.len() + new_tokens);
+        block_table.extend_from_slice(&base_table);
         block_table.extend_from_slice(&new_indices);
 
         let kv_write_start = block_table.len() as i32 - new_tokens as i32;
@@ -158,14 +190,28 @@ where
         });
         per_seg_indices.push(new_indices);
         per_seg_token_ids.push(input_ids);
+        per_seg_base_tables.push(base_table);
+        per_seg_skipped.push(false);
     }
     debug_assert_eq!(idx_cursor, total_new as usize);
+
+    if steps.is_empty() {
+        if !base_indices.is_empty() {
+            kv_allocator.free(&base_indices);
+        }
+        return Ok(());
+    }
 
     let first_tokens = match runner.step_batch(&steps) {
         Ok(tokens) => tokens,
         Err(e) => {
             if !base_indices.is_empty() {
                 kv_allocator.free(&base_indices);
+            }
+            for seg in &cmd.segments {
+                if let Some(removed) = prefilling.remove(&seg.sequence_id) {
+                    release_prefill_state(removed, kv_allocator, enable_prefix_caching);
+                }
             }
             let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
             let _ = control.send(
@@ -179,6 +225,9 @@ where
             return Ok(());
         }
     };
+    if !unused_indices.is_empty() {
+        kv_allocator.free(&unused_indices);
+    }
     let assigned = assigned_runs(
         cmd,
         &per_seg_indices,
@@ -191,14 +240,31 @@ where
         tokens: Vec::new(),
         assigned_indices: assigned,
     };
+    let mut token_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
-        let token = first_tokens[i];
+        if per_seg_skipped[i] {
+            continue;
+        }
+        let token = first_tokens[token_cursor];
+        token_cursor += 1;
         let new_indices = &per_seg_indices[i];
+        let mut full_block_table =
+            Vec::with_capacity(per_seg_base_tables[i].len() + new_indices.len());
+        full_block_table.extend_from_slice(&per_seg_base_tables[i]);
+        full_block_table.extend_from_slice(new_indices);
         match seg.completion {
             PrefillSegmentCompletion::ContinuePrefill => {
+                prefilling.insert(
+                    seg.sequence_id,
+                    PrefillSeq {
+                        kv_len: full_block_table.len(),
+                        block_table: full_block_table,
+                    },
+                );
                 output.prefill_done.push(seg.sequence_id);
             }
             PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
+                prefilling.remove(&seg.sequence_id);
                 output.prefill_done.push(seg.sequence_id);
                 let finished = (!seg.ignore_eos && eos_ids.contains(&token)) || seg.max_tokens <= 1;
                 output.tokens.push(GeneratedToken {
@@ -207,23 +273,19 @@ where
                     finished,
                 });
                 if !finished {
-                    let prefix = &per_seg_prefix_hint[i];
-                    let mut bt: Vec<u32> = Vec::with_capacity(prefix.len() + new_indices.len());
-                    bt.extend_from_slice(prefix);
-                    bt.extend_from_slice(new_indices);
                     active.insert(
                         seg.sequence_id,
                         ActiveSeq {
                             last_token: token,
-                            kv_len: bt.len(),
-                            block_table: bt,
+                            kv_len: full_block_table.len(),
+                            block_table: full_block_table,
                             max_tokens: seg.max_tokens,
                             generated_count: 1,
                             ignore_eos: seg.ignore_eos,
                         },
                     );
-                } else if !enable_prefix_caching && !new_indices.is_empty() {
-                    kv_allocator.release(new_indices);
+                } else if !enable_prefix_caching && !full_block_table.is_empty() {
+                    kv_allocator.release(&full_block_table);
                 }
             }
         }
@@ -236,6 +298,7 @@ where
 pub fn run_decode_step<M>(
     runner: &mut ModelRunner<bf16, Cuda, M>,
     active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
     decode_rows: &mut DecodeRows,
     kv_allocator: &mut GlobalKvAllocator,
     control: &ControlPump,
@@ -293,6 +356,7 @@ where
         kv_allocator,
         control,
         active,
+        prefilling,
         initial_n,
         enable_prefix_caching,
         true,
@@ -485,6 +549,19 @@ where
     decode_rows.replace_rows(next_rows);
     let _ = data.send_step_output(&output);
     Ok(())
+}
+
+fn release_prefill_state(
+    removed: PrefillSeq,
+    kv_allocator: &mut GlobalKvAllocator,
+    enable_prefix_caching: bool,
+) {
+    if removed.block_table.is_empty() {
+        return;
+    }
+    if !enable_prefix_caching {
+        kv_allocator.release(&removed.block_table);
+    }
 }
 
 fn assigned_runs(

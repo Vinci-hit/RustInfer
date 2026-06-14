@@ -1,5 +1,13 @@
 use std::collections::HashMap;
 
+/// Per-sequence prefill state held between chunked prefill segments.
+pub struct PrefillSeq {
+    pub kv_len: usize,
+    pub block_table: Vec<u32>,
+}
+
+pub type PrefillSeqMap = HashMap<u64, PrefillSeq>;
+
 /// Per-sequence decode state held by the worker between iterations.
 pub struct ActiveSeq {
     pub last_token: i32,

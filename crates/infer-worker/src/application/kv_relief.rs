@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WorkerControlMessage;
 
-use crate::application::worker_state::{ActiveSeq, ActiveSeqMap};
+use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::infrastructure::transport::control_pump::ControlPump;
 
@@ -16,6 +16,7 @@ pub fn wait_for_relief(
     control: &ControlPump,
     kv_allocator: &mut GlobalKvAllocator,
     active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
     needed_slots: u32,
     wait_ms: i64,
     enable_prefix_caching: bool,
@@ -51,7 +52,10 @@ pub fn wait_for_relief(
                 );
                 for sid in &p.sequence_ids {
                     if let Some(entry) = active.remove(sid) {
-                        release_removed(entry, kv_allocator, enable_prefix_caching);
+                        release_removed_active(entry, kv_allocator, enable_prefix_caching);
+                    }
+                    if let Some(entry) = prefilling.remove(sid) {
+                        release_removed_prefill(entry, kv_allocator, enable_prefix_caching);
                     }
                 }
                 if !p.free_indices.is_empty() {
@@ -67,8 +71,16 @@ pub fn wait_for_relief(
                 std::process::exit(0);
             }
             Ok(Some((SchedulerControlMessage::Cancel(c), _))) => {
+                let mut cancelled = false;
                 if let Some(removed) = active.remove(&c.sequence_id) {
-                    release_removed(removed, kv_allocator, enable_prefix_caching);
+                    release_removed_active(removed, kv_allocator, enable_prefix_caching);
+                    cancelled = true;
+                }
+                if let Some(removed) = prefilling.remove(&c.sequence_id) {
+                    release_removed_prefill(removed, kv_allocator, enable_prefix_caching);
+                    cancelled = true;
+                }
+                if cancelled {
                     eprintln!(
                         "[serve] cancelled seq {} (during relief wait)",
                         c.sequence_id
@@ -95,6 +107,7 @@ pub fn alloc_with_relief(
     kv_allocator: &mut GlobalKvAllocator,
     control: &ControlPump,
     active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
     n_initial: u32,
     enable_prefix_caching: bool,
     shrink_to_active: bool,
@@ -129,6 +142,7 @@ pub fn alloc_with_relief(
                     control,
                     kv_allocator,
                     active,
+                    prefilling,
                     n,
                     RELIEF_TIMEOUT_MS,
                     enable_prefix_caching,
@@ -186,8 +200,21 @@ fn log_partial_relief(kv_allocator: &GlobalKvAllocator, needed_slots: u32) {
     );
 }
 
-fn release_removed(
+fn release_removed_active(
     removed: ActiveSeq,
+    kv_allocator: &mut GlobalKvAllocator,
+    enable_prefix_caching: bool,
+) {
+    if removed.block_table.is_empty() {
+        return;
+    }
+    if !enable_prefix_caching {
+        kv_allocator.release(&removed.block_table);
+    }
+}
+
+fn release_removed_prefill(
+    removed: PrefillSeq,
     kv_allocator: &mut GlobalKvAllocator,
     enable_prefix_caching: bool,
 ) {

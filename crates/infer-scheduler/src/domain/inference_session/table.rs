@@ -567,7 +567,7 @@ impl RequestTable {
         match addr.bucket {
             Bucket::Decoding => {
                 let seq = self.decoding.get(addr.key)?;
-                Some(seq.state.seq_position as u32)
+                Some(decoding_kv_slots(seq) as u32)
             }
             Bucket::Prefilling => {
                 let seq = self.prefilling.get(addr.key)?;
@@ -727,7 +727,7 @@ impl RequestTable {
                 sequence_id: seq.meta.sequence_id.0,
                 output_len: seq.state.output_tokens.len() as u32,
                 input_len: seq.meta.input_ids.len() as u32,
-                kv_used: seq.state.seq_position as u32,
+                kv_used: decoding_kv_slots(seq) as u32,
             });
         }
         for seq in self.prefilling.values() {
@@ -978,6 +978,12 @@ impl RequestTable {
     }
 }
 
+fn decoding_kv_slots(seq: &InferenceSession<Decoding>) -> usize {
+    seq.state
+        .prompt_len
+        .saturating_add(seq.state.output_tokens.len().saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,6 +1199,35 @@ mod tests {
         assert_eq!(cands[0].output_len, 0);
         assert_eq!(cands[0].input_len, 4);
         assert_eq!(cands[0].kv_used, 1);
+    }
+
+    #[test]
+    fn decoding_kv_slots_excludes_latest_unwritten_output_token() {
+        let mut table = RequestTable::new();
+        let m = meta("d", 8, 4, 8);
+        let req = m.id.clone();
+        table.insert_new(m, RequestHandle::noop()).unwrap();
+        let queued = table.take_waiting(&req).unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 4).unwrap();
+        let _ = table.ack_prefill(SequenceId(8)).unwrap();
+
+        assert_eq!(table.kv_slots_for_sequence(SequenceId(8)), Some(4));
+        let _ = table
+            .append_generated_token(SequenceId(8), 100, false)
+            .unwrap();
+        assert_eq!(
+            table.kv_slots_for_sequence(SequenceId(8)),
+            Some(4),
+            "first generated token is not in KV until the next decode step"
+        );
+        let _ = table
+            .append_generated_token(SequenceId(8), 101, false)
+            .unwrap();
+        assert_eq!(table.kv_slots_for_sequence(SequenceId(8)), Some(5));
+
+        let cands = table.preemption_candidates();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].kv_used, 5);
     }
 
     #[test]

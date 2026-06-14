@@ -12,7 +12,7 @@ use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
 use crate::application::forward_workspace::ForwardWorkspace;
 use crate::application::model_runner::ModelRunner;
 use crate::application::worker_scheduler::{handle_prefill, run_decode_step};
-use crate::application::worker_state::{ActiveSeqMap, DecodeRows};
+use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
 use crate::infrastructure::cuda::{Cuda, device_utils, kernels::attention_paged};
@@ -146,6 +146,7 @@ where
     eprintln!("[serve] heartbeat interval = {:?}", heartbeat_interval);
     let mut last_heartbeat = Instant::now();
     let mut active = ActiveSeqMap::new();
+    let mut prefilling = PrefillSeqMap::new();
     let mut kv_allocator = GlobalKvAllocator::new(num_blocks as u32);
     eprintln!(
         "[serve] worker-owned KV allocator: total={} (block_size={})",
@@ -168,6 +169,7 @@ where
         if drain_control(
             control,
             &mut active,
+            &mut prefilling,
             &mut decode_rows,
             &mut kv_allocator,
             enable_prefix_caching,
@@ -179,7 +181,7 @@ where
         if pending_prefills.is_empty() && active.is_empty() {
             maybe_heartbeat(
                 control,
-                active.len(),
+                active.len() + prefilling.len(),
                 &mut last_heartbeat,
                 heartbeat_interval,
             );
@@ -193,31 +195,6 @@ where
             }
             if pending_prefills.is_empty() && active.is_empty() {
                 continue;
-            }
-        }
-
-        for cmd in pending_prefills {
-            if drain_control(
-                control,
-                &mut active,
-                &mut decode_rows,
-                &mut kv_allocator,
-                enable_prefix_caching,
-            ) {
-                return Ok(());
-            }
-            if let Err(e) = handle_prefill(
-                &mut runner,
-                &cmd,
-                &mut active,
-                &mut kv_allocator,
-                control,
-                data,
-                eos_ids,
-                enable_prefix_caching,
-                cap_batch,
-            ) {
-                eprintln!("[serve] prefill error: {}", e);
             }
         }
 
@@ -238,6 +215,7 @@ where
             if let Err(e) = run_decode_step(
                 &mut runner,
                 &mut active,
+                &mut prefilling,
                 &mut decode_rows,
                 &mut kv_allocator,
                 control,
@@ -265,9 +243,36 @@ where
             }
         }
 
+        for cmd in pending_prefills {
+            if drain_control(
+                control,
+                &mut active,
+                &mut prefilling,
+                &mut decode_rows,
+                &mut kv_allocator,
+                enable_prefix_caching,
+            ) {
+                return Ok(());
+            }
+            if let Err(e) = handle_prefill(
+                &mut runner,
+                &cmd,
+                &mut active,
+                &mut prefilling,
+                &mut kv_allocator,
+                control,
+                data,
+                eos_ids,
+                enable_prefix_caching,
+                cap_batch,
+            ) {
+                eprintln!("[serve] prefill error: {}", e);
+            }
+        }
+
         maybe_heartbeat(
             control,
-            active.len(),
+            active.len() + prefilling.len(),
             &mut last_heartbeat,
             heartbeat_interval,
         );
@@ -277,6 +282,7 @@ where
 fn drain_control(
     control: &ControlPump,
     active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
     decode_rows: &mut DecodeRows,
     kv_allocator: &mut GlobalKvAllocator,
     enable_prefix_caching: bool,
@@ -290,11 +296,16 @@ fn drain_control(
                 }
                 SchedulerControlMessage::Cancel(c) => {
                     let removed = active.remove(&c.sequence_id);
-                    let removed_flag = removed.is_some();
+                    let removed_prefill = prefilling.remove(&c.sequence_id);
+                    let removed_flag = removed.is_some() || removed_prefill.is_some();
                     if let Some(removed) = removed {
                         release_removed(removed.block_table, kv_allocator, enable_prefix_caching);
                         decode_rows.retain_active(active);
                         eprintln!("[serve] cancelled seq {}", c.sequence_id);
+                    }
+                    if let Some(removed) = removed_prefill {
+                        release_removed(removed.block_table, kv_allocator, enable_prefix_caching);
+                        eprintln!("[serve] cancelled prefilling seq {}", c.sequence_id);
                     }
                     if req_id.is_correlated() {
                         let _ = control.send(
@@ -321,6 +332,14 @@ fn drain_control(
                             );
                             eprintln!("[serve] preempted seq {}", sid);
                         }
+                        if let Some(removed) = prefilling.remove(sid) {
+                            release_removed(
+                                removed.block_table,
+                                kv_allocator,
+                                enable_prefix_caching,
+                            );
+                            eprintln!("[serve] preempted prefilling seq {}", sid);
+                        }
                     }
                     decode_rows.retain_active(active);
                     if !p.free_indices.is_empty() {
@@ -336,12 +355,17 @@ fn drain_control(
                         for seq in removed {
                             release_removed(seq.block_table, kv_allocator, enable_prefix_caching);
                         }
+                        let removed_prefills: Vec<_> =
+                            prefilling.drain().map(|(_, seq)| seq).collect();
+                        for seq in removed_prefills {
+                            release_removed(seq.block_table, kv_allocator, enable_prefix_caching);
+                        }
                         decode_rows.clear();
                     }
                     if req_id.is_correlated() {
                         let _ = control.send(
                             WorkerControlMessage::DrainAck(DrainAck {
-                                remaining_requests: active.len(),
+                                remaining_requests: active.len() + prefilling.len(),
                             }),
                             req_id,
                         );

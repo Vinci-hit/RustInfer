@@ -23,7 +23,7 @@ device = "cuda:0"
 # HTTP API server.
 host = "0.0.0.0"
 port = 8000
-request_timeout_secs = 120
+request_timeout_secs = 600
 
 # Batching / capacity.
 max_batch_tokens = 8192

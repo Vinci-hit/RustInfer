@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use infer_protocol::scheduler_to_worker_control::{FreeKvIndices, SchedulerControlMessage};
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, StepOutput};
+use std::collections::HashMap;
 
 use crate::application::dispatch::DispatchSystem;
 use crate::application::outcomes::ControlOutcome;
@@ -220,11 +221,7 @@ async fn handle_llm_step(
     step: &StepOutput,
 ) -> Result<()> {
     let enable_prefix = ctx.config.enable_prefix_caching;
-    let sanitized_step = if enable_prefix {
-        sanitize_step_output(ctx, step)
-    } else {
-        step.clone()
-    };
+    let sanitized_step = sanitize_step_output(ctx, step, enable_prefix);
     let step = &sanitized_step;
 
     // KV budget tracking — always needed for admission control.
@@ -248,12 +245,21 @@ async fn handle_llm_step(
     // scheduler must release the budget itself instead of waiting for
     // RadixTree LRU eviction.
     let finished_kv_slots: u32 = if !enable_prefix {
+        let assigned_slots = assigned_slots_by_sequence(step);
         step.tokens
             .iter()
             .filter(|tk| tk.finished)
-            .filter_map(|tk| {
-                ctx.requests
+            .map(|tk| {
+                let before_step = ctx
+                    .requests
                     .kv_slots_for_sequence(SequenceId(tk.sequence_id))
+                    .unwrap_or(0);
+                before_step.saturating_add(
+                    assigned_slots
+                        .get(&tk.sequence_id)
+                        .copied()
+                        .unwrap_or_default(),
+                )
             })
             .sum()
     } else {
@@ -274,7 +280,11 @@ async fn handle_llm_step(
     Ok(())
 }
 
-fn sanitize_step_output(ctx: &mut ResourceContext<'_>, step: &StepOutput) -> StepOutput {
+fn sanitize_step_output(
+    ctx: &mut ResourceContext<'_>,
+    step: &StepOutput,
+    release_stale_indices: bool,
+) -> StepOutput {
     let mut stale_indices = Vec::new();
     let assigned_indices: Vec<AssignedIndices> = step
         .assigned_indices
@@ -290,11 +300,14 @@ fn sanitize_step_output(ctx: &mut ResourceContext<'_>, step: &StepOutput) -> Ste
         .collect();
 
     if !stale_indices.is_empty() {
-        tracing::warn!(
+        tracing::debug!(
             count = stale_indices.len(),
-            "freeing stale KV indices from late StepOutput"
+            release_stale_indices,
+            "dropping stale KV indices from late StepOutput"
         );
-        send_free_indices(ctx, stale_indices, "stale_step_output");
+        if release_stale_indices {
+            send_free_indices(ctx, stale_indices, "stale_step_output");
+        }
     }
 
     StepOutput {
@@ -319,6 +332,15 @@ fn is_sequence_running(requests: &RequestTable, sequence_id: u64) -> bool {
         requests.location_for_sequence(SequenceId(sequence_id)),
         Some(Bucket::Prefilling | Bucket::Decoding)
     )
+}
+
+fn assigned_slots_by_sequence(step: &StepOutput) -> HashMap<u64, u32> {
+    let mut out = HashMap::new();
+    for assigned in &step.assigned_indices {
+        let slots = out.entry(assigned.sequence_id).or_insert(0u32);
+        *slots = slots.saturating_add(assigned.len as u32);
+    }
+    out
 }
 
 fn assigned_indices(assigned: &AssignedIndices) -> impl Iterator<Item = u32> + '_ {

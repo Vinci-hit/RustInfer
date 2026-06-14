@@ -263,6 +263,84 @@ async fn stale_step_output_frees_indices_without_pinning_radix() -> Result<()> {
 }
 
 #[tokio::test]
+async fn non_prefix_stale_step_output_does_not_reserve_budget() -> Result<()> {
+    let (mut engine, _default_worker, _event_tx, mut cmd_rx) = make_engine();
+    engine.config.enable_prefix_caching = false;
+
+    let output = StepOutput {
+        prefill_done: vec![99],
+        tokens: vec![GeneratedToken {
+            sequence_id: 99,
+            token_id: 42,
+            finished: false,
+        }],
+        assigned_indices: vec![AssignedIndices {
+            sequence_id: 99,
+            base: 10,
+            len: 3,
+            token_ids: Vec::new(),
+        }],
+    };
+    let codec = MsgPackCodec;
+    engine
+        .handle_step_output_llm(codec.encode(&output)?)
+        .await?;
+
+    assert_eq!(engine.kv_budget.outstanding(), 0);
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "non-prefix stale output must not send FreeKvIndices"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_prefix_finished_prefill_releases_current_step_kv_budget() -> Result<()> {
+    let (mut engine, _default_worker, _event_tx, mut cmd_rx) = make_engine();
+    engine.config.enable_prefix_caching = false;
+
+    let seq = prefilling_sequence();
+    let request_id = seq.meta.id.clone();
+    engine
+        .requests
+        .insert_new(Arc::clone(&seq.meta), RequestHandle::noop())?;
+    let queued = engine.requests.take_waiting(&request_id)?;
+    engine.requests.commit_prefill_start(
+        queued,
+        crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
+        4,
+    )?;
+
+    let output = StepOutput {
+        prefill_done: vec![7],
+        tokens: vec![GeneratedToken {
+            sequence_id: 7,
+            token_id: 42,
+            finished: true,
+        }],
+        assigned_indices: vec![AssignedIndices {
+            sequence_id: 7,
+            base: 10,
+            len: 4,
+            token_ids: Vec::new(),
+        }],
+    };
+    let codec = MsgPackCodec;
+    engine
+        .handle_step_output_llm(codec.encode(&output)?)
+        .await?;
+
+    assert_eq!(engine.requests.prefilling_len(), 0);
+    assert_eq!(engine.requests.decoding_len(), 0);
+    assert_eq!(engine.kv_budget.outstanding(), 0);
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "non-prefix completion must not send FreeKvIndices"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn prefix_cache_prefill_proactively_evicts_lru_before_dispatch() -> Result<()> {
     use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 
