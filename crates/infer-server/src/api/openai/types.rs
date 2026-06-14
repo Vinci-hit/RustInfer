@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 /// POST /v1/chat/completions 请求体
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
 
     #[serde(default = "default_max_tokens")]
@@ -102,7 +103,8 @@ pub struct ChatChoice {
 /// POST /v1/completions 请求体
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     pub prompt: CompletionPrompt,
 
     #[serde(default = "default_max_tokens")]
@@ -212,7 +214,8 @@ pub struct CompletionChunkChoice {
 
 #[derive(Debug, Deserialize)]
 pub struct ImageGenerationRequest {
-    pub model: String,
+    #[serde(default)]
+    pub model: Option<String>,
     pub prompt: String,
 
     #[serde(default)]
@@ -302,4 +305,28 @@ pub struct ModelObject {
 
 fn default_max_tokens() -> Option<usize> {
     Some(2048)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_accepts_missing_model() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"messages":[{"role":"user","content":"hello"}]}"#).unwrap();
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn completion_request_accepts_missing_model() {
+        let req: CompletionRequest = serde_json::from_str(r#"{"prompt":"hello"}"#).unwrap();
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn image_request_accepts_missing_model() {
+        let req: ImageGenerationRequest = serde_json::from_str(r#"{"prompt":"hello"}"#).unwrap();
+        assert!(req.model.is_none());
+    }
 }

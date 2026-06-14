@@ -10,7 +10,7 @@ use crate::client::ZmqClient;
 /// 模型信息
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
-    /// 模型 ID（用于 /v1/models 和请求校验）
+    /// 模型 ID（用于 /v1/models 和 OpenAI-compatible responses）
     pub model_id: String,
     /// 模型所有者
     pub owned_by: String,

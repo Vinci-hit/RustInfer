@@ -3,15 +3,15 @@
 //! 支持流式 (SSE) 和非流式两种模式。
 
 use axum::{
+    Json,
     extract::State,
     response::{IntoResponse, Response},
-    Json,
 };
 
+use crate::chat::get_template;
 use crate::client::InferClient;
 use crate::error::AppError;
 use crate::state::SharedState;
-use crate::chat::get_template;
 use std::time::Instant;
 
 use super::streaming;
@@ -27,16 +27,20 @@ pub async fn chat_completions(
 
     // 1. 校验请求
     validate_request(&req)?;
+    let response_model = state.model_info.model_id.clone();
 
     // 2. 应用 chat template → 生成 prompt 文本
     //    模板必须基于服务端实际加载的 model_type，而不是客户端请求里的
     //    req.model（客户端可能填任意名字，填错会套错模板导致输出乱码 + 不停止）。
     let template = get_template(&state.model_type);
-    let prompt = template.apply(&req.messages)
+    let prompt = template
+        .apply(&req.messages)
         .map_err(|e| AppError::bad_request(format!("Template error: {}", e)))?;
 
     // 3. Tokenize
-    let encoding = state.tokenizer.encode(prompt.as_str(), true)
+    let encoding = state
+        .tokenizer
+        .encode(prompt.as_str(), true)
         .map_err(|e| AppError::internal(anyhow::anyhow!("Tokenize error: {}", e)))?;
     let input_ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
     let prompt_tokens = input_ids.len() as u32;
@@ -68,7 +72,10 @@ pub async fn chat_completions(
     // 5. 根据 stream 字段分流
     if req.stream {
         // 流式路径 → SSE
-        let rx = state.client.infer_stream(engine_req).await
+        let rx = state
+            .client
+            .infer_stream(engine_req)
+            .await
             .map_err(AppError::internal)?;
         tracing::info!(
             request_id = %request_id,
@@ -76,14 +83,15 @@ pub async fn chat_completions(
             "TTFT_TRACE: stream submitted to scheduler"
         );
 
-        let include_usage = req.stream_options
+        let include_usage = req
+            .stream_options
             .as_ref()
             .map(|o| o.include_usage)
             .unwrap_or(false);
 
         let sse = streaming::stream_chat_completion(
             request_id,
-            req.model.clone(),
+            response_model,
             prompt_tokens,
             rx,
             state.tokenizer.clone(),
@@ -93,7 +101,10 @@ pub async fn chat_completions(
         Ok(sse.into_response())
     } else {
         // 非流式路径
-        let engine_resp = state.client.infer(engine_req).await
+        let engine_resp = state
+            .client
+            .infer(engine_req)
+            .await
             .map_err(AppError::internal)?;
         tracing::debug!(
             request_id = %request_id,
@@ -110,14 +121,20 @@ pub async fn chat_completions(
         }
 
         // Decode output tokens → 文本
-        let output_ids_u32: Vec<u32> = engine_resp.output_token_ids.iter()
-            .map(|&id| id as u32).collect();
-        let generated_text = state.tokenizer.decode(&output_ids_u32, true)
+        let output_ids_u32: Vec<u32> = engine_resp
+            .output_token_ids
+            .iter()
+            .map(|&id| id as u32)
+            .collect();
+        let generated_text = state
+            .tokenizer
+            .decode(&output_ids_u32, true)
             .map_err(|e| AppError::internal(anyhow::anyhow!("Decode error: {}", e)))?;
         let completion_tokens = engine_resp.output_token_ids.len() as u32;
 
         // 确定 finish_reason
-        let finish_reason = engine_resp.finish_reason
+        let finish_reason = engine_resp
+            .finish_reason
             .unwrap_or_else(|| "stop".to_string());
 
         // 构造 OpenAI 格式响应
@@ -125,7 +142,7 @@ pub async fn chat_completions(
             id: format!("chatcmpl-{}", request_id),
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp(),
-            model: req.model,
+            model: response_model,
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessage {
@@ -152,19 +169,22 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
     }
 
     if let Some(temp) = req.temperature
-        && (!(0.0..=2.0).contains(&temp)) {
-            return Err(AppError::bad_request("temperature must be between 0 and 2"));
-        }
+        && (!(0.0..=2.0).contains(&temp))
+    {
+        return Err(AppError::bad_request("temperature must be between 0 and 2"));
+    }
 
     if let Some(top_p) = req.top_p
-        && !(0.0..=1.0).contains(&top_p) {
-            return Err(AppError::bad_request("top_p must be between 0 and 1"));
-        }
+        && !(0.0..=1.0).contains(&top_p)
+    {
+        return Err(AppError::bad_request("top_p must be between 0 and 1"));
+    }
 
     if let Some(max_tokens) = req.max_tokens
-        && max_tokens == 0 {
-            return Err(AppError::bad_request("max_tokens must be greater than 0"));
-        }
+        && max_tokens == 0
+    {
+        return Err(AppError::bad_request("max_tokens must be greater than 0"));
+    }
 
     Ok(())
 }
