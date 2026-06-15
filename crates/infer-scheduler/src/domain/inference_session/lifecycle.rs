@@ -305,6 +305,11 @@ impl InferenceSession<Prefilling> {
         self.state.inflight.is_some()
     }
 
+    /// The in-flight segment, if one is currently dispatched-but-unacked.
+    pub fn inflight_segment(&self) -> Option<InFlightPrefillSegment> {
+        self.state.inflight
+    }
+
     /// Check if prefill is complete.
     pub fn is_complete(&self) -> bool {
         self.state.num_computed_tokens >= self.state.prompt_len

@@ -231,6 +231,26 @@ impl RequestTable {
         self.prefilling.values().any(|seq| seq.has_inflight())
     }
 
+    /// Total prompt tokens currently in flight across all prefilling
+    /// sequences whose segment has been dispatched but not yet acked.
+    ///
+    /// This is the projected worker KV-slot footprint of unreported prefill
+    /// work. It is recomputed from live session state, so sequences that are
+    /// cancelled / preempted / failed before their ack simply stop
+    /// contributing — there is no separate counter to leak.
+    ///
+    /// Slightly conservative: it counts the full segment width and ignores
+    /// prefix-cache hits (which consume no new worker slots), so it can only
+    /// *over*-estimate pending pressure, never under-estimate. Over-estimating
+    /// is the safe direction for over-commit protection.
+    pub fn inflight_prefill_tokens(&self) -> u32 {
+        self.prefilling
+            .values()
+            .filter_map(|seq| seq.inflight_segment())
+            .map(|seg| (seg.segment_end - seg.segment_start) as u32)
+            .sum()
+    }
+
     pub fn decoding_len(&self) -> usize {
         self.decoding.len()
     }

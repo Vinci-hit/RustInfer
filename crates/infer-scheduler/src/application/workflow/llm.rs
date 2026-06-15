@@ -47,7 +47,15 @@ impl LlmWorkflow {
 #[async_trait]
 impl EngineWorkflow for LlmWorkflow {
     fn can_schedule(&self, requests: &RequestTable) -> bool {
-        !requests.has_inflight_prefill()
+        // Continuous batching: schedulable whenever there is pending work.
+        //
+        // Concurrent prefills no longer need to be serialized: admission
+        // reserves projected KV slots via `KvBudget::reserve_pending` when a
+        // batch is dispatched, so back-to-back prefill scheduling sees a
+        // pressure-accurate `headroom()` and cannot over-commit the worker
+        // pool. (The old `!has_inflight_prefill()` gate serialized prefills
+        // to dodge the pre-report over-commit window, at the cost of TTFT.)
+        requests.has_pending_work()
     }
 
     fn has_in_flight_batch(&self) -> bool {
@@ -59,16 +67,20 @@ impl EngineWorkflow for LlmWorkflow {
         ctx: &mut ResourceContext<'_>,
         dispatch: &mut DispatchSystem,
     ) -> Result<()> {
-        if ctx.requests.has_inflight_prefill() {
-            tracing::debug!(
-                "prefill batch still in flight; deferring additional LLM prefill scheduling"
-            );
-            return Ok(());
-        }
-
         if !ctx.requests.has_pending_work() {
             return Ok(());
         }
+
+        // Recompute the in-flight prefill reservation from live session
+        // state before reading headroom. This is what lets us admit new
+        // prefills while earlier ones are still unacked without
+        // over-committing: the pending footprint of already-dispatched
+        // prefills is subtracted from the headroom this decision sees.
+        // Recomputing (rather than incrementing/decrementing a counter)
+        // means cancelled / preempted / failed sequences self-heal out of
+        // the reservation with no leak.
+        ctx.kv_budget
+            .set_pending_prefill(ctx.requests.inflight_prefill_tokens());
 
         let running = running_set(ctx.requests);
         let kv_limited_tokens = prefill_kv_budget(ctx);
@@ -117,6 +129,10 @@ impl EngineWorkflow for LlmWorkflow {
                 );
             }
             dispatch.send_batch(batch_data).await?;
+            // The pending KV reservation for this batch is not bumped here:
+            // the segments are now recorded as `inflight` on their sessions,
+            // so the next `try_schedule` recomputes `pending_prefill` from
+            // `inflight_prefill_tokens()` and accounts for them automatically.
         }
         Ok(())
     }
@@ -370,6 +386,10 @@ fn reserve_reported_kv(kv_budget: &mut crate::domain::kv_budget::KvBudget, reque
     if requested == 0 {
         return;
     }
+    // Book the worker-reported slots as confirmed outstanding. The matching
+    // prefill segment is acked in the same step output, so the next
+    // `try_schedule` recomputes `pending_prefill` without this segment —
+    // headroom stays consistent (pending drops, outstanding rises).
     if let Err(err) = kv_budget.try_reserve(requested) {
         let headroom = kv_budget.headroom();
         tracing::warn!(

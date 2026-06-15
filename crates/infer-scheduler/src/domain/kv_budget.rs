@@ -57,6 +57,20 @@ impl std::error::Error for KvBudgetFull {}
 pub struct KvBudget {
     outstanding: u32,
     capacity: u32,
+    /// KV slots that have been admitted into an in-flight prefill batch but
+    /// whose `assigned_indices` the worker has **not yet reported back**.
+    ///
+    /// `outstanding` is only bumped when the worker confirms real slot usage
+    /// (reserve-on-report). Without an admission-time reservation, two
+    /// prefill batches scheduled back-to-back would both read the same
+    /// pre-report `headroom()` and over-commit the worker pool — the bug the
+    /// old `!has_inflight_prefill()` gate worked around by serializing
+    /// prefills (which inflated TTFT at low QPS).
+    ///
+    /// We instead reserve *projected* slots here at admission time and net
+    /// them out when the matching report arrives, so `headroom()` is always
+    /// pressure-accurate and prefills no longer need to be serialized.
+    pending_prefill: u32,
 }
 
 impl KvBudget {
@@ -64,6 +78,7 @@ impl KvBudget {
         Self {
             outstanding: 0,
             capacity,
+            pending_prefill: 0,
         }
     }
 
@@ -75,8 +90,31 @@ impl KvBudget {
         self.outstanding
     }
 
+    /// Slots admitted into in-flight prefill batches but not yet reported.
+    pub fn pending_prefill(&self) -> u32 {
+        self.pending_prefill
+    }
+
+    /// Free slots available for the next admission decision.
+    ///
+    /// Subtracts both confirmed (`outstanding`) and admitted-but-unreported
+    /// (`pending_prefill`) usage, so concurrent prefill scheduling cannot
+    /// over-commit the worker pool.
     pub fn headroom(&self) -> u32 {
-        self.capacity.saturating_sub(self.outstanding)
+        self.capacity
+            .saturating_sub(self.outstanding)
+            .saturating_sub(self.pending_prefill)
+    }
+
+    /// Set the projected in-flight prefill footprint (slots dispatched to the
+    /// worker but not yet reported via `assigned_indices`).
+    ///
+    /// Recomputed from live session state at the head of every scheduling
+    /// iteration, so it self-heals: sequences cancelled / preempted / failed
+    /// before their ack simply drop out of the recomputation and free their
+    /// pending pressure automatically — there is no counter to leak.
+    pub fn set_pending_prefill(&mut self, tokens: u32) {
+        self.pending_prefill = tokens;
     }
 
     /// True when `outstanding > capacity * threshold` (in basis points,
@@ -223,5 +261,59 @@ mod tests {
         assert_eq!(b.outstanding(), 80);
         assert_eq!(b.headroom(), 0);
         assert!(b.try_reserve(1).is_err());
+    }
+
+    #[test]
+    fn pending_prefill_reduces_headroom() {
+        let mut b = KvBudget::new(100);
+        b.set_pending_prefill(30);
+        // 30 slots are admitted-but-unreported: headroom must exclude them.
+        assert_eq!(b.pending_prefill(), 30);
+        assert_eq!(b.outstanding(), 0);
+        assert_eq!(b.headroom(), 70);
+    }
+
+    #[test]
+    fn pending_and_outstanding_both_subtract_from_headroom() {
+        let mut b = KvBudget::new(100);
+        b.try_reserve(40).unwrap(); // worker-confirmed
+        b.set_pending_prefill(25); // in-flight prefill
+        assert_eq!(b.headroom(), 35);
+    }
+
+    #[test]
+    fn report_settles_pending_via_recompute() {
+        // Models the scheduler flow: dispatch sets pending; the worker
+        // report books outstanding; the next iteration recomputes pending
+        // (segment now acked → 0). Net headroom is unchanged across the
+        // hand-off, so no over-commit window opens.
+        let mut b = KvBudget::new(100);
+        b.set_pending_prefill(20); // batch dispatched, 20 slots in flight
+        assert_eq!(b.headroom(), 80);
+
+        b.try_reserve(20).unwrap(); // worker reports 20 real slots
+        // Next scheduling iteration recomputes pending from live state; the
+        // segment is acked so it no longer contributes.
+        b.set_pending_prefill(0);
+        assert_eq!(b.outstanding(), 20);
+        assert_eq!(b.headroom(), 80);
+    }
+
+    #[test]
+    fn pending_self_heals_to_zero_when_inflight_drains() {
+        let mut b = KvBudget::new(100);
+        b.set_pending_prefill(50);
+        assert_eq!(b.headroom(), 50);
+        // Sequences cancelled/failed before ack → recompute yields 0.
+        b.set_pending_prefill(0);
+        assert_eq!(b.headroom(), 100);
+    }
+
+    #[test]
+    fn pending_over_capacity_saturates_headroom_to_zero() {
+        let mut b = KvBudget::new(100);
+        b.try_reserve(70).unwrap();
+        b.set_pending_prefill(50); // 70 + 50 > 100
+        assert_eq!(b.headroom(), 0);
     }
 }

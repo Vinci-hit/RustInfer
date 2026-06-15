@@ -395,10 +395,18 @@ async fn prefix_cache_prefill_proactively_evicts_lru_before_dispatch() -> Result
 }
 
 #[tokio::test]
-async fn llm_prefill_inflight_blocks_additional_prefill_dispatch() -> Result<()> {
+async fn llm_prefill_admits_concurrently_when_kv_has_headroom() -> Result<()> {
+    // With KV headroom available, a second prefill arriving while the first
+    // is still in flight is admitted immediately rather than serialized.
+    // (The old behavior deferred it until the first prefill was acked, which
+    // inflated TTFT at low QPS. Over-commit is now prevented by the pending
+    // KV reservation, not by blanket serialization.)
     let config = SchedulerConfig {
         paged_block_size: BlockSize::new(4),
         max_batch_tokens: 16,
+        // Ample KV so both prefills fit; over-commit protection is exercised
+        // separately by the KV pressure benchmark.
+        num_gpu_blocks: 256,
         ..Default::default()
     };
     let worker = MockWorker::default();
@@ -440,7 +448,8 @@ async fn llm_prefill_inflight_blocks_additional_prefill_dispatch() -> Result<()>
 
     assert_eq!(sent.lock().unwrap().len(), 1);
     assert!(engine.requests.has_inflight_prefill());
-    assert!(!engine.can_schedule());
+    // Continuous batching: still schedulable while a prefill is in flight.
+    assert!(engine.can_schedule());
 
     engine
         .requests
@@ -449,11 +458,11 @@ async fn llm_prefill_inflight_blocks_additional_prefill_dispatch() -> Result<()>
 
     assert_eq!(
         sent.lock().unwrap().len(),
-        1,
-        "second prefill must wait for the first prefill ACK"
+        2,
+        "second prefill is admitted concurrently when KV headroom allows"
     );
-    assert_eq!(engine.requests.waiting().len(), 1);
-    assert_eq!(engine.requests.prefilling_len(), 1);
+    assert_eq!(engine.requests.waiting().len(), 0);
+    assert_eq!(engine.requests.prefilling_len(), 2);
     Ok(())
 }
 
