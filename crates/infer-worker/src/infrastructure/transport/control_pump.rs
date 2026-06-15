@@ -120,6 +120,12 @@ impl ControlPump {
         Ok((envelope.payload, envelope.request_id))
     }
 
+    /// Borrow the underlying DEALER socket, e.g. to build a `zmq::PollItem`
+    /// for multiplexed polling alongside the data plane.
+    pub fn recv_socket(&self) -> &zmq::Socket {
+        &self.socket
+    }
+
     /// Non-blocking receive. Returns None if no message available.
     pub fn try_recv(
         &self,

@@ -177,6 +177,21 @@ where
             return Ok(());
         }
 
+        // ── Wait policy: zero-latency event-driven scheduling ──
+        //
+        // We multiplex the data PULL and control DEALER sockets through a
+        // single `zmq::poll`, so *any* arriving message wakes us up
+        // immediately — no per-socket polling phase that could stall a
+        // freshly-arrived prefill behind a 500ms idle window.
+        //
+        // Timeout selection:
+        //   * active decode in flight  → 0   : never sleep; the decode step
+        //     below is the loop's natural clock. We only peek for new work.
+        //   * fully idle               → block until the next heartbeat
+        //     deadline, but get woken the instant a socket becomes readable.
+        //
+        // This removes the old `idle_wait_ms = heartbeat/2` polling window
+        // that dominated TTFT at low QPS.
         let mut pending_prefills = drain_data(data);
         if pending_prefills.is_empty() && active.is_empty() {
             maybe_heartbeat(
@@ -185,19 +200,96 @@ where
                 &mut last_heartbeat,
                 heartbeat_interval,
             );
-            let idle_wait_ms = (heartbeat_interval.as_millis() as i64 / 2).max(50);
-            match data.try_recv_batch(idle_wait_ms) {
-                Ok(Some(BatchCommand::Prefill(p))) => pending_prefills.push(p),
-                Ok(Some(BatchCommand::DiffusionBatch(_))) => {
-                    let _ = data.send_diffusion_output(&DiffusionBatchOutput { results: vec![] });
+
+            // Block until a socket is readable or the next heartbeat is due.
+            // `-1`-style infinite waits are avoided so heartbeats still fire
+            // during long idle periods; the cap is the remaining time to the
+            // next heartbeat (min 1ms to avoid a busy 0-timeout spin).
+            let until_next_hb = heartbeat_interval
+                .saturating_sub(last_heartbeat.elapsed())
+                .as_millis() as i64;
+            let idle_timeout_ms = until_next_hb.max(1);
+
+            let mut items = [
+                data.recv_socket().as_poll_item(zmq::POLLIN),
+                control.recv_socket().as_poll_item(zmq::POLLIN),
+            ];
+            match zmq::poll(&mut items, idle_timeout_ms) {
+                Ok(_) => {}
+                Err(zmq::Error::EINTR) => continue,
+                Err(e) => {
+                    eprintln!("[serve] zmq::poll error: {:?}", e);
+                    continue;
                 }
-                _ => {}
             }
+            // Snapshot readiness and release the `PollItem` borrows on the
+            // sockets before re-entering `drain_data` / `drain_control`.
+            let data_ready = items[0].is_readable();
+            let control_ready = items[1].is_readable();
+            drop(items);
+
+            // Data plane ready → pull every queued prefill in one go.
+            if data_ready {
+                pending_prefills.extend(drain_data(data));
+            }
+            // Control plane ready → handle it now (may be a cancel/shutdown
+            // that voids the prefill we are about to run).
+            if control_ready
+                && drain_control(
+                    control,
+                    &mut active,
+                    &mut prefilling,
+                    &mut decode_rows,
+                    &mut kv_allocator,
+                    enable_prefix_caching,
+                )
+            {
+                return Ok(());
+            }
+
             if pending_prefills.is_empty() && active.is_empty() {
                 continue;
             }
         }
 
+        // ── Prefill first ──
+        //
+        // New prefills are admitted *before* the decode step so the first
+        // token is produced on this very iteration instead of waiting for a
+        // full decode round-trip. `handle_prefill` emits the first token
+        // directly (FinishPrefillAndStartDecode), so TTFT no longer eats an
+        // extra decode-step latency.
+        for cmd in pending_prefills {
+            if drain_control(
+                control,
+                &mut active,
+                &mut prefilling,
+                &mut decode_rows,
+                &mut kv_allocator,
+                enable_prefix_caching,
+            ) {
+                return Ok(());
+            }
+            if let Err(e) = handle_prefill(
+                &mut runner,
+                &cmd,
+                &mut active,
+                &mut prefilling,
+                &mut kv_allocator,
+                control,
+                data,
+                eos_ids,
+                enable_prefix_caching,
+                cap_batch,
+            ) {
+                eprintln!("[serve] prefill error: {}", e);
+            }
+        }
+
+        // ── Decode step ──
+        //
+        // Drives every active sequence one token forward. With no active
+        // sequences this is skipped and the loop parks on the poll above.
         if !active.is_empty() {
             if let Some(max_steps) = profile_cuda_steps {
                 if !profile_started {
@@ -240,33 +332,6 @@ where
                         return Ok(());
                     }
                 }
-            }
-        }
-
-        for cmd in pending_prefills {
-            if drain_control(
-                control,
-                &mut active,
-                &mut prefilling,
-                &mut decode_rows,
-                &mut kv_allocator,
-                enable_prefix_caching,
-            ) {
-                return Ok(());
-            }
-            if let Err(e) = handle_prefill(
-                &mut runner,
-                &cmd,
-                &mut active,
-                &mut prefilling,
-                &mut kv_allocator,
-                control,
-                data,
-                eos_ids,
-                enable_prefix_caching,
-                cap_batch,
-            ) {
-                eprintln!("[serve] prefill error: {}", e);
             }
         }
 

@@ -50,6 +50,12 @@ impl DataPump {
         rmp_serde::from_slice(&bytes).map_err(|e| format!("deserialize BatchCommand: {}", e))
     }
 
+    /// Borrow the underlying PULL socket, e.g. to build a `zmq::PollItem`
+    /// for multiplexed polling alongside the control plane.
+    pub fn recv_socket(&self) -> &zmq::Socket {
+        &self.recv_socket
+    }
+
     /// Non-blocking receive with timeout (ms). Returns None if no message.
     pub fn try_recv_batch(&self, timeout_ms: i64) -> Result<Option<BatchCommand>, String> {
         if self
