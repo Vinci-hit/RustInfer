@@ -221,10 +221,14 @@ impl IngestionSystem {
         if request.max_tokens == 0 {
             return Err(RejectReason::MaxTokensZero);
         }
-        let requested = request.input_ids.len().saturating_add(request.max_tokens);
-        if requested > config.max_model_len {
+        // vLLM 语义：prompt + max_tokens 必须 ≤ max_model_len。worker 的
+        // SeqStep validate 在 kv_len_after > max_seq_len 时会抛 Shape error，
+        // 所以这里要兜底 cap（OpenAI server 已先 cap，但其他客户端也可能
+        // 直连 scheduler，避免硬错）。
+        let total = request.input_ids.len().saturating_add(request.max_tokens);
+        if total > config.max_model_len {
             return Err(RejectReason::TotalTokensTooLong {
-                requested,
+                requested: total,
                 limit: config.max_model_len,
             });
         }

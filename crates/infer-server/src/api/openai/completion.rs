@@ -43,12 +43,29 @@ pub async fn completions(
     };
 
     // 3. 构建 InferenceRequest
+    //
+    // vLLM 语义：未传 max_tokens 时默认为 max_model_len - prompt_len；
+    // 传了也会被 cap 到该上限。否则 worker 解到 prompt+max_tokens > max_seq_len
+    // 会在 SeqStep validate 处抛 kv_len_after > max。
+    let max_model_len = state.config.max_model_len;
+    let prompt_len_usize = prompt_tokens as usize;
+    if prompt_len_usize >= max_model_len {
+        return Err(AppError::bad_request(format!(
+            "prompt_tokens {} exceeds max_model_len {}",
+            prompt_len_usize, max_model_len
+        )));
+    }
+    let remaining = max_model_len - prompt_len_usize;
+    let effective_max_tokens = match req.max_tokens {
+        Some(n) => n.min(remaining),
+        None => remaining,
+    };
     let request_id = uuid::Uuid::new_v4().to_string();
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         request_id: request_id.clone(),
         modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,
         input_ids,
-        max_tokens: req.max_tokens.unwrap_or(2048),
+        max_tokens: effective_max_tokens,
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.unwrap_or(-1),

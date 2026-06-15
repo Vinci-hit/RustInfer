@@ -219,6 +219,45 @@ fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
         }
     }
 
+    // conda environments: CONDA_PREFIX env var, or common conda locations
+    if let Ok(conda_prefix) = env::var("CONDA_PREFIX") {
+        let prefix = PathBuf::from(conda_prefix);
+        candidates.push(prefix.join("include"));
+        // conda's own python site-packages (where pip installs cudnn_frontend)
+        if let Ok(entries) = std::fs::read_dir(prefix.join("lib")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("python") {
+                    candidates.push(entry.path().join("site-packages/include"));
+                }
+            }
+        }
+    }
+    // also check CONDA_ENVS_DIR / ~/miniconda3/envs/*/include etc.
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        for conda_root in [
+            home.join("miniconda3/envs"),
+            home.join("anaconda3/envs"),
+            home.join(".conda/envs"),
+        ] {
+            if let Ok(entries) = std::fs::read_dir(&conda_root) {
+                for entry in entries.flatten() {
+                    candidates.push(entry.path().join("include"));
+                    // also check lib/python*/site-packages/include in each env
+                    if let Ok(lib_entries) = std::fs::read_dir(entry.path().join("lib")) {
+                        for lib_entry in lib_entries.flatten() {
+                            let name = lib_entry.file_name();
+                            if name.to_string_lossy().starts_with("python") {
+                                candidates.push(lib_entry.path().join("site-packages/include"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     candidates.extend([
         repo_root.join(".venv/lib/python3/site-packages/include"),
         PathBuf::from("/usr/local/cuda/include"),

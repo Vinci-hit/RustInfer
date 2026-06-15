@@ -46,6 +46,26 @@ pub async fn chat_completions(
     let prompt_tokens = input_ids.len() as u32;
 
     // 4. 构建 InferenceRequest
+    //
+    // vLLM 语义对齐：当 client 不传 max_tokens 时，vLLM 默认 max_tokens =
+    // max_model_len - prompt_len（见 vllm/entrypoints/openai/serving_chat.py
+    // 中的 _get_max_tokens 逻辑）。即使 client 传了 max_tokens，vLLM 也会把
+    // 它 cap 到 max_model_len - prompt_len 以保证 prompt+output ≤ ctx 窗口。
+    // 这里不对齐就会让 ignore_eos 测试解到 prompt+512 token，触发 worker
+    // SeqStep validate 的 kv_len_after > max_seq_len。
+    let max_model_len = state.config.max_model_len;
+    let prompt_len_usize = prompt_tokens as usize;
+    if prompt_len_usize >= max_model_len {
+        return Err(AppError::bad_request(format!(
+            "prompt_tokens {} exceeds max_model_len {}",
+            prompt_len_usize, max_model_len
+        )));
+    }
+    let remaining = max_model_len - prompt_len_usize;
+    let effective_max_tokens = match req.max_tokens {
+        Some(n) => n.min(remaining),
+        None => remaining,
+    };
     let request_id = uuid::Uuid::new_v4().to_string();
     let tokenize_elapsed = request_start.elapsed();
     tracing::info!(
@@ -58,7 +78,7 @@ pub async fn chat_completions(
         request_id: request_id.clone(),
         modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,
         input_ids,
-        max_tokens: req.max_tokens.unwrap_or(2048),
+        max_tokens: effective_max_tokens,
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
         top_k: req.top_k.unwrap_or(-1),

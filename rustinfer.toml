@@ -8,7 +8,7 @@
 # config.json so the worker dispatch / chat template always match the weights.
 
 # Model directory (weights + tokenizer.json + config.json). Required.
-model = "/root/models/Qwen3-4B-Instruct-2507"
+model = "/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
@@ -26,19 +26,19 @@ port = 8000
 request_timeout_secs = 600
 
 # Batching / capacity.
-max_batch_tokens = 8192
+max_batch_tokens = 4096
 max_batch_seqs = 32
-max_model_len = 4096
+max_model_len = 1024
 
 # Paged KV.
 paged_block_size = 1
-chunked_prefill_size = 0      # 0 => disabled
-enable_prefix_caching = true
+chunked_prefill_size = 1      # 0 => disabled
+enable_prefix_caching = false
 mem_fraction_static = 0.9
 num_blocks = 0                # 0 => auto-size
 
 # Generation.
-ignore_eos = false
+ignore_eos = true
 
 # Scheduler mode: "llm" or "diffusion".
 mode = "llm"

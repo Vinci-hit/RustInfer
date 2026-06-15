@@ -40,7 +40,6 @@ VLLM_MODEL = "default"
 async def send_rustinfer(session, url, prompt):
     """Send chat completion to RustInfer server."""
     payload = {
-        "model": RUSTINFER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
@@ -72,8 +71,8 @@ async def send_vllm(session, url, prompt):
     payload = {
         # "model": VLLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 512,
         "temperature": 0.0,
+        "ignore_eos": True,
     }
     start = time.perf_counter()
     try:
@@ -219,7 +218,7 @@ async def main():
     elif args.port:
         url = f"http://localhost:{args.port}"
     else:
-        url = "http://localhost:8000" if args.target == "rustinfer" else "http://localhost:8001"
+        url = "http://localhost:8000" if args.target == "rustinfer" else "http://localhost:8000"
 
     with open(args.prompts) as f:
         pool = json.load(f)

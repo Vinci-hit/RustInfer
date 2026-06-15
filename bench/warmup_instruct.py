@@ -108,7 +108,6 @@ async def send_request(
     index: int,
 ) -> dict[str, Any]:
     payload = {
-        "model": "qwen3",
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
