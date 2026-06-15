@@ -188,7 +188,7 @@ impl SchedulerEngine {
             .ingest(client_id, request, &self.config, &mut self.requests);
         match outcome {
             IngestOutcome::Admitted { request_id, .. } => {
-                tracing::info!(
+                tracing::debug!(
                     %request_id,
                     %external_id,
                     "TTFT_TRACE: scheduler received request"

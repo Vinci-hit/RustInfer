@@ -86,7 +86,7 @@ impl EngineWorkflow for DiffusionWorkflow {
 
         if !batch_data.is_empty() {
             if let Some(first) = prefilling_view.first() {
-                tracing::info!(
+                tracing::debug!(
                     request_id = %first.meta.id,
                     sched_latency_ms = first.meta.arrival_time.elapsed().as_secs_f64() * 1000.0,
                     "TTFT_TRACE: batch sent to worker"

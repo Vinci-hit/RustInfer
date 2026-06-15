@@ -68,7 +68,7 @@ pub async fn chat_completions(
     };
     let request_id = uuid::Uuid::new_v4().to_string();
     let tokenize_elapsed = request_start.elapsed();
-    tracing::info!(
+    tracing::debug!(
         request_id = %request_id,
         prompt_tokens,
         tokenize_ms = tokenize_elapsed.as_secs_f64() * 1000.0,
@@ -97,7 +97,7 @@ pub async fn chat_completions(
             .infer_stream(engine_req)
             .await
             .map_err(AppError::internal)?;
-        tracing::info!(
+        tracing::debug!(
             request_id = %request_id,
             submit_ms = request_start.elapsed().as_secs_f64() * 1000.0,
             "TTFT_TRACE: stream submitted to scheduler"

@@ -202,9 +202,6 @@ where
         return Ok(());
     }
 
-    // TTFT_TRACE: measure the actual prefill forward (GPU) cost so we can
-    // tell apart "slow prefill compute" from "scheduling / transport" delay.
-    let prefill_t0 = std::time::Instant::now();
     let first_tokens = match runner.step_batch(&steps) {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -294,14 +291,6 @@ where
         }
     }
     let _ = data.send_step_output(&output);
-    // TTFT_TRACE: prefill forward wall time (includes the argmax D2H sync).
-    // Compare against scheduler's `sched_latency_ms` to localize TTFT cost.
-    eprintln!(
-        "[TTFT_TRACE] worker prefill forward: {:.3}ms (segments={}, tokens={})",
-        prefill_t0.elapsed().as_secs_f64() * 1000.0,
-        steps.len(),
-        steps.iter().map(|s| s.input_ids.len()).sum::<usize>(),
-    );
     Ok(())
 }
 pub fn run_decode_step<M>(
