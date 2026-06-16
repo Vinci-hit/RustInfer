@@ -19,6 +19,18 @@ impl std::fmt::Display for CudaError {
 }
 impl std::error::Error for CudaError {}
 
+pub fn check_last_error(context: &str) -> crate::domain::ports::OpResult<()> {
+    let code = unsafe { ffi::cudaGetLastError() };
+    if code != ffi::cudaError_cudaSuccess {
+        return Err(crate::domain::ports::OpError::Kernel(format!(
+            "{}: {}",
+            context,
+            CudaError(code)
+        )));
+    }
+    Ok(())
+}
+
 /// Check a CUDA FFI call. Returns `Err(OpError::Kernel(...))` on failure.
 macro_rules! cuda_check {
     ($expr:expr) => {{

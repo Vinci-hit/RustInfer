@@ -116,7 +116,7 @@ log_level = "info"
 **2. 构建**
 
 ```bash
-cargo build --release --features cuda,models
+cargo build --release
 ```
 
 **3. 启动 RustInfer（三进程）**
@@ -156,13 +156,11 @@ vllm serve ~/models/Qwen3-4B \
 ```bash
 cd bench
 pip install aiohttp
-python bench_online.py \
-  --url http://localhost:8000 \
-  --num-requests 1000 \
-  --concurrency 32 \
-  --max-tokens 256 \
-  --arrival-rate 20 \
-  --dataset bench_prompts.json
+python3 bench_online_compare.py \
+  --tag rustinfer \
+  --url http://127.0.0.1:8000 \
+  --duration 60 \
+  --concurrency 32
 ```
 
 > 数据集 `bench_prompts.json` 包含 51906 条 Alpaca prompts，请求按 20 req/s 泊松到达。
@@ -312,7 +310,7 @@ RustInfer/
 │   │   ├── chat/          # 聊天模板
 │   │   └── client/        # ZMQ 客户端
 │   └── infer-frontend/    # Web UI（Dioxus WASM）
-├── DEVELOPERS.md          # 开发者文档（架构深度解析）
+├── docs/reviews/          # 代码审查与架构风险报告
 ├── README.md              # 本文件
 └── Cargo.toml             # 工作区配置
 ```
@@ -345,11 +343,8 @@ cd RustInfer
 ### 3. 构建项目
 
 ```bash
-# CPU版本
+# 默认构建 CUDA worker/server/scheduler/frontend（infer-worker 默认启用 cuda）
 cargo build --release
-
-# CUDA版本（需要CUDA toolkit）
-cargo build --release --features cuda
 ```
 
 **注意**: `build.rs` 会自动检测GPU计算能力（通过 nvidia-smi），也可通过 `CUDA_ARCH=sm_90` 环境变量手动指定。
@@ -435,7 +430,7 @@ nsys stats \
 
 ```bash
 cd /root/RustInfer
-cargo test -p infer-worker --features cuda,models --no-run
+cargo test -p infer-worker --features cuda --no-run
 BIN=$(ls -t target/debug/deps/infer_worker-* | grep -v '\.d$' | head -n1)
 
 nsys profile \
@@ -612,27 +607,27 @@ nsys stats \
 
 ### 已实现的优化
 
-1. **CUDA内存池化** (`/crates/infer-worker/src/base/allocator.rs`)
+1. **Worker-owned KV 分配器** (`/crates/infer-worker/src/domain/global_kv_alloc.rs`)
    - 分配延迟: 800µs → 1µs
    - 线程安全并发访问（DashMap）
    - 双层池策略（小块first-fit，大块best-fit）
 
-2. **零拷贝模型加载** (`/crates/infer-worker/src/model/loader.rs`)
+2. **零拷贝模型加载** (`/crates/infer-worker/src/models/loader.rs`)
    - mmap直接映射文件
    - 无需反序列化（100x加速）
    - 安全的生命周期扩展
 
-3. **Workspace预分配** (`/crates/infer-worker/src/model/llama3.rs`)
+3. **Workspace预分配** (`/crates/infer-worker/src/application/forward_workspace.rs`)
    - 预分配最大尺寸缓冲区
    - 推理循环零内存分配
    - HashMap管理命名缓冲区
 
-4. **CUDA Graph捕获** (`/crates/infer-worker/src/cuda/config.rs`)
+4. **CUDA Graph捕获** (`/crates/infer-worker/src/infrastructure/cuda/config.rs`)
    - 首次迭代捕获计算图
    - 后续迭代回放图（10-100x加速）
    - 消除kernel启动开销
 
-5. **Flash Attention** (`/crates/infer-worker/src/op/kernels/cuda/flash_attn_gqa/`)
+5. **Flash Attention** (`/crates/infer-worker/src/infrastructure/cuda/kernels/flash_attn_gqa/`)
    - 分块注意力计算
    - 在线softmax
    - 减少3x内存访问
@@ -703,7 +698,7 @@ nsys stats \
 - Function calling
 - API认证机制
 
-详细技术实现指南请参阅 **[DEVELOPERS.md](DEVELOPERS.md)**
+更细的当前风险与整改建议见 **[docs/reviews/RustInfer_审查总报告.md](docs/reviews/RustInfer_审查总报告.md)**。
 
 ---
 
@@ -711,7 +706,9 @@ nsys stats \
 
 ### 添加新算子
 
-请参阅 [DEVELOPERS.md](DEVELOPERS.md) 中的详细模板和示例。
+参考现有端口定义与 CUDA backend 实现：
+`crates/infer-worker/src/domain/ports/op_ports.rs`、
+`crates/infer-worker/src/infrastructure/cuda/kernels/`。
 
 关键步骤:
 1. 实现 `Op` trait
@@ -721,13 +718,13 @@ nsys stats \
 
 ### 添加新模型
 
-参考 `/crates/infer-worker/src/model/llama3.rs` 实现:
+参考 `/crates/infer-worker/src/models/llama3.rs` 实现:
 1. 定义配置结构
 2. 实现层组合
 3. Workspace管理
 4. 两阶段推理（prefill/decode）
 
-完整指南: [DEVELOPERS.md](DEVELOPERS.md)
+当前架构风险与改进清单见 [docs/reviews/](docs/reviews/)。
 
 ---
 

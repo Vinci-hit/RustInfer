@@ -21,7 +21,7 @@ pub struct AppState {
     /// ZMQ 客户端（与 Scheduler 通信）
     pub client: ZmqClient,
     /// Tokenizer（Server 端负责 encode/decode）
-    pub tokenizer: Tokenizer,
+    pub tokenizer: Arc<Tokenizer>,
     /// 服务器配置（来自共享 TOML）
     pub config: RustInferConfig,
     /// 服务端实际加载的模型类型（从 config.json 解析，用于 chat template）

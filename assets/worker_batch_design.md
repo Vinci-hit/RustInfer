@@ -1,5 +1,10 @@
 # Worker Continuous Batching 设计文档
 
+> 状态：历史设计稿。当前 worker 已重构为
+> `crates/infer-worker/src/application/`、`domain/`、`infrastructure/`、`models/`
+> 四层结构，并已采用 paged KV / CUDA Graph decode 路径。本文保留设计背景和
+> 决策脉络，文件清单与部分 Phase 2/3 状态不代表当前源码布局。
+
 ## 1. 设计背景
 
 RustInfer 原有架构中，`infer-scheduler` 直接调用 `infer-worker` 的 `model.generate()` 逐请求串行推理。这种方式下 GPU 利用率极低——每个请求独占 GPU 做完整的 prefill + decode 循环，其他请求排队等待。
@@ -239,9 +244,14 @@ struct SharedBuffers {
 
 `write_input_i32` / `read_output_i32`：通过 `cudaMemcpy` 直接操作 GPU buffer 的裸指针，绕过 Rust 的 `&mut` 要求（同步协议保证独占访问）。
 
-## 6. 当前成果
+## 6. 历史实现清单
 
-### 6.1 新增文件
+> 以下清单对应早期 worker 原型，当前源码已迁移到 `application/serve_loop.rs`、
+> `application/worker_scheduler.rs`、`application/model_runner*.rs`、
+> `application/batch_workspace.rs`、`domain/batch.rs`、`domain/global_kv_alloc.rs`
+> 以及 `infrastructure/transport/*`。
+
+### 6.1 早期新增文件
 
 ```
 crates/infer-worker/
@@ -261,7 +271,7 @@ crates/infer-worker/
 │   └── test_batch_forward.rs   — Batch vs 串行一致性测试
 ```
 
-### 6.2 修改的现有文件
+### 6.2 早期修改的现有文件
 
 | 文件 | 变更 |
 |------|------|

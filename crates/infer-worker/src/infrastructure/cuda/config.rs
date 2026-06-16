@@ -174,6 +174,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaGraphLaunch(g.exec, self.stream));
         }
+        super::error::check_last_error("cuda graph launch observed prior kernel error")?;
         Ok(())
     }
 
@@ -185,6 +186,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaStreamSynchronize(self.stream));
         }
+        super::error::check_last_error("cuda stream sync observed prior kernel error")?;
         Ok(())
     }
 
@@ -252,6 +254,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaStreamSynchronize(self.copy_out_stream));
         }
+        super::error::check_last_error("cuda copy-out sync observed prior kernel error")?;
         Ok(())
     }
 
@@ -260,6 +263,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaStreamSynchronize(self.copy_in_stream));
         }
+        super::error::check_last_error("cuda copy-in sync observed prior kernel error")?;
         Ok(())
     }
 

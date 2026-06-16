@@ -14,6 +14,8 @@ pub enum OpError {
     },
     #[error("kernel failed: {0}")]
     Kernel(String),
+    #[error("shutdown requested")]
+    Shutdown,
 }
 
 impl OpError {

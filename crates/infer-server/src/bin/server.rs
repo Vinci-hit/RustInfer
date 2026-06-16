@@ -1,5 +1,5 @@
 //! Standalone HTTP API Server
-//! 
+//!
 //! 这个进程只负责运行 HTTP API 服务器。
 //! 它需要连接到已启动的 Scheduler 进程。
 //!
@@ -12,12 +12,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use infer_protocol::{resolve_model_type, RustInferConfig};
-use infer_server::{
-    AppState, ZmqClient,
-    router::build_router,
-    state::ModelInfo,
-};
+use infer_protocol::{RustInferConfig, resolve_model_type};
+use infer_server::{AppState, ZmqClient, router::build_router, state::ModelInfo};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-server")]
@@ -60,7 +56,10 @@ async fn main() -> Result<()> {
     let tokenizer_path = std::path::Path::new(&config.model).join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    tracing::info!("Tokenizer loaded (vocab_size={})", tokenizer.get_vocab_size(true));
+    tracing::info!(
+        "Tokenizer loaded (vocab_size={})",
+        tokenizer.get_vocab_size(true)
+    );
 
     // Connect to Scheduler
     let client = ZmqClient::new(&frontend_endpoint, config.request_timeout_secs).await?;
@@ -76,7 +75,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         client,
-        tokenizer,
+        tokenizer: Arc::new(tokenizer),
         config,
         model_type,
         model_info,
@@ -90,7 +89,7 @@ async fn main() -> Result<()> {
 
     // Create shutdown channel
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    
+
     // Spawn axum server
     let mut axum_rx = shutdown_tx.subscribe();
     let server_task = tokio::spawn(async move {

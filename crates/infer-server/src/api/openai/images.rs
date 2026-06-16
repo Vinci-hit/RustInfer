@@ -1,14 +1,16 @@
 //! POST /v1/images/generations handler
 
 use axum::{
+    Json,
     body::Body,
     extract::State,
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use image::{codecs::jpeg::JpegEncoder, codecs::png::PngEncoder, ColorType, ImageEncoder};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures::future::try_join_all;
+use image::{ColorType, ImageEncoder, codecs::jpeg::JpegEncoder, codecs::png::PngEncoder};
+use std::sync::Arc;
 
 use crate::client::InferClient;
 use crate::error::AppError;
@@ -36,63 +38,85 @@ pub async fn image_generations(
         return Err(AppError::bad_request("response_format=binary requires n=1"));
     }
 
-    let prompt_input_ids = tokenize_diffusion_prompt(&state.tokenizer, &req.prompt)?;
-    let negative_prompt_input_ids = match &req.negative_prompt {
-        Some(negative_prompt) if !negative_prompt.trim().is_empty() => {
-            Some(tokenize_diffusion_prompt(&state.tokenizer, negative_prompt)?)
-        }
+    let prompt = Arc::new(req.prompt);
+    let negative_prompt = Arc::new(req.negative_prompt);
+    let sigmas = Arc::new(req.sigmas);
+    let prompt_input_ids = Arc::new(tokenize_diffusion_prompt(&state.tokenizer, &prompt)?);
+    let negative_prompt_input_ids = match negative_prompt.as_deref() {
+        Some(negative_prompt) if !negative_prompt.trim().is_empty() => Some(Arc::new(
+            tokenize_diffusion_prompt(&state.tokenizer, negative_prompt)?,
+        )),
         _ => None,
     };
+    let num_inference_steps = req.num_inference_steps.unwrap_or(8);
+    let guidance_scale = req.guidance_scale.unwrap_or(0.0);
+    let seed = req.seed;
 
-    let mut encoded_images = Vec::with_capacity(n);
-    for _ in 0..n {
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
-            request_id,
-            modality: infer_protocol::server_to_scheduler::InferenceModality::Diffusion,
-            input_ids: vec![],
-            max_tokens: 1,
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: -1,
-            stream: false,
-            priority: 0,
-            stop_sequences: vec![],
-            ignore_eos: false,
-            diffusion: Some(infer_protocol::server_to_scheduler::DiffusionRequest {
-                prompt: req.prompt.clone(),
-                prompt_input_ids: prompt_input_ids.clone(),
-                negative_prompt: req.negative_prompt.clone(),
-                negative_prompt_input_ids: negative_prompt_input_ids.clone(),
-                height,
-                width,
-                num_inference_steps: req.num_inference_steps.unwrap_or(8),
-                sigmas: req.sigmas.clone(),
-                guidance_scale: req.guidance_scale.unwrap_or(0.0),
-                seed: req.seed,
-                output_format: "rgb8".to_string(),
-            }),
-        };
+    let image_futures = (0..n).map(|_| {
+        let state = state.clone();
+        let prompt = prompt.clone();
+        let negative_prompt = negative_prompt.clone();
+        let sigmas = sigmas.clone();
+        let prompt_input_ids = prompt_input_ids.clone();
+        let negative_prompt_input_ids = negative_prompt_input_ids.clone();
+        async move {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
+                request_id,
+                modality: infer_protocol::server_to_scheduler::InferenceModality::Diffusion,
+                input_ids: vec![],
+                max_tokens: 1,
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: -1,
+                stream: false,
+                priority: 0,
+                stop_sequences: vec![],
+                ignore_eos: false,
+                diffusion: Some(infer_protocol::server_to_scheduler::DiffusionRequest {
+                    prompt: (*prompt).clone(),
+                    prompt_input_ids: (*prompt_input_ids).clone(),
+                    negative_prompt: (*negative_prompt).clone(),
+                    negative_prompt_input_ids: negative_prompt_input_ids
+                        .as_ref()
+                        .map(|ids| (**ids).clone()),
+                    height,
+                    width,
+                    num_inference_steps,
+                    sigmas: (*sigmas).clone(),
+                    guidance_scale,
+                    seed,
+                    output_format: "rgb8".to_string(),
+                }),
+            };
 
-        let engine_resp = state.client.infer(engine_req).await
-            .map_err(AppError::internal)?;
+            let engine_resp = state
+                .client
+                .infer(engine_req)
+                .await
+                .map_err(AppError::internal)?;
 
-        if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
-            return Err(AppError::internal(anyhow::anyhow!(
-                "Engine error: {}",
-                engine_resp.error.unwrap_or_else(|| "Unknown".to_string())
-            )));
+            if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
+                return Err(AppError::internal(anyhow::anyhow!(
+                    "Engine error: {}",
+                    engine_resp.error.unwrap_or_else(|| "Unknown".to_string())
+                )));
+            }
+
+            let image = engine_resp
+                .images
+                .first()
+                .ok_or_else(|| AppError::internal(anyhow::anyhow!("Engine returned no image")))?;
+            encode_backend_image(image, output_format, jpeg_quality)
         }
-
-        let image = engine_resp.images.first()
-            .ok_or_else(|| AppError::internal(anyhow::anyhow!("Engine returned no image")))?;
-        let encoded = encode_backend_image(image, output_format, jpeg_quality)?;
-        encoded_images.push(encoded);
-    }
+    });
+    let encoded_images = try_join_all(image_futures).await?;
 
     match response_format {
         ImageResponseFormat::Binary => {
-            let image = encoded_images.into_iter().next()
+            let image = encoded_images
+                .into_iter()
+                .next()
                 .ok_or_else(|| AppError::internal(anyhow::anyhow!("No encoded image")))?;
             let content_type = match output_format {
                 ImageOutputFormat::Png => "image/png",
@@ -100,10 +124,9 @@ pub async fn image_generations(
             };
             let mut response = Response::new(Body::from(image));
             *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(content_type),
-            );
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
             Ok(response)
         }
         ImageResponseFormat::B64Json => {
@@ -131,17 +154,24 @@ fn validate_image_request(req: &ImageGenerationRequest) -> Result<(), AppError> 
         return Err(AppError::bad_request("prompt must not be empty"));
     }
     if let Some(n) = req.n
-        && (n == 0 || n > 16) {
-            return Err(AppError::bad_request("n must be between 1 and 16"));
-        }
+        && (n == 0 || n > 16)
+    {
+        return Err(AppError::bad_request("n must be between 1 and 16"));
+    }
     if let Some(steps) = req.num_inference_steps
-        && steps == 0 {
-            return Err(AppError::bad_request("num_inference_steps must be greater than 0"));
-        }
+        && steps == 0
+    {
+        return Err(AppError::bad_request(
+            "num_inference_steps must be greater than 0",
+        ));
+    }
     if let Some(quality) = req.jpeg_quality
-        && (quality == 0 || quality > 100) {
-            return Err(AppError::bad_request("jpeg_quality must be between 1 and 100"));
-        }
+        && (quality == 0 || quality > 100)
+    {
+        return Err(AppError::bad_request(
+            "jpeg_quality must be between 1 and 100",
+        ));
+    }
     if let Some(size) = &req.size {
         parse_size(size)?;
     }
@@ -150,25 +180,35 @@ fn validate_image_request(req: &ImageGenerationRequest) -> Result<(), AppError> 
 
 fn parse_size(size: &str) -> Result<(u32, u32), AppError> {
     let Some((w, h)) = size.split_once('x') else {
-        return Err(AppError::bad_request("size must be formatted as WIDTHxHEIGHT, e.g. 1024x1024"));
+        return Err(AppError::bad_request(
+            "size must be formatted as WIDTHxHEIGHT, e.g. 1024x1024",
+        ));
     };
-    let width: u32 = w.parse()
+    let width: u32 = w
+        .parse()
         .map_err(|_| AppError::bad_request("size width must be an integer"))?;
-    let height: u32 = h.parse()
+    let height: u32 = h
+        .parse()
         .map_err(|_| AppError::bad_request("size height must be an integer"))?;
     if width == 0 || height == 0 || !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(AppError::bad_request("image width/height must be positive multiples of 16"));
+        return Err(AppError::bad_request(
+            "image width/height must be positive multiples of 16",
+        ));
     }
     Ok((width, height))
 }
 
-fn tokenize_diffusion_prompt(tokenizer: &tokenizers::Tokenizer, prompt: &str) -> Result<Vec<i32>, AppError> {
+fn tokenize_diffusion_prompt(
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
+) -> Result<Vec<i32>, AppError> {
     let formatted = format!(
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
         prompt
     );
-    let encoding = tokenizer.encode(formatted.as_str(), true)
-        .map_err(|e| AppError::internal(anyhow::anyhow!("Diffusion prompt tokenize error: {}", e)))?;
+    let encoding = tokenizer.encode(formatted.as_str(), true).map_err(|e| {
+        AppError::internal(anyhow::anyhow!("Diffusion prompt tokenize error: {}", e))
+    })?;
     let ids: Vec<i32> = encoding
         .get_ids()
         .iter()
@@ -197,7 +237,8 @@ fn encode_backend_image(
     if image.data.len() != expected {
         return Err(AppError::internal(anyhow::anyhow!(
             "invalid backend image size: got {} bytes, expected {}",
-            image.data.len(), expected
+            image.data.len(),
+            expected
         )));
     }
 
@@ -205,12 +246,24 @@ fn encode_backend_image(
     match format {
         ImageOutputFormat::Png => {
             let encoder = PngEncoder::new(&mut out);
-            encoder.write_image(&image.data, image.width, image.height, ColorType::Rgb8.into())
+            encoder
+                .write_image(
+                    &image.data,
+                    image.width,
+                    image.height,
+                    ColorType::Rgb8.into(),
+                )
                 .map_err(|e| AppError::internal(anyhow::anyhow!("PNG encode error: {}", e)))?;
         }
         ImageOutputFormat::Jpeg => {
             let mut encoder = JpegEncoder::new_with_quality(&mut out, jpeg_quality);
-            encoder.encode(&image.data, image.width, image.height, ColorType::Rgb8.into())
+            encoder
+                .encode(
+                    &image.data,
+                    image.width,
+                    image.height,
+                    ColorType::Rgb8.into(),
+                )
                 .map_err(|e| AppError::internal(anyhow::anyhow!("JPEG encode error: {}", e)))?;
         }
     }

@@ -121,20 +121,28 @@ impl SchedulerEngine {
                 Box::new(crate::application::workflow::DiffusionWorkflow::new(policy))
             }
         };
+        let max_total_kv_tokens = match worker_group.effective_capacity.max_total_kv_tokens {
+            Some(tokens) => tokens,
+            None => {
+                tracing::warn!(
+                    "worker capacity missing max_total_kv_tokens; initializing KV budget to 0"
+                );
+                0
+            }
+        };
+        let kv_capacity = u32::try_from(max_total_kv_tokens).unwrap_or_else(|_| {
+            tracing::warn!(
+                "worker max_total_kv_tokens={} exceeds u32::MAX; clamping KV budget",
+                max_total_kv_tokens
+            );
+            u32::MAX
+        });
 
         Self {
             workflow,
             dispatch: crate::application::DispatchSystem::new(Box::new(frontend), Box::new(worker)),
             radix: RadixTree::new(),
-            kv_budget: KvBudget::new(
-                u32::try_from(
-                    worker_group
-                        .effective_capacity
-                        .max_total_kv_tokens
-                        .unwrap_or(0),
-                )
-                .unwrap_or(u32::MAX),
-            ),
+            kv_budget: KvBudget::new(kv_capacity),
             worker_group,
             requests: RequestTable::new(),
             control_cmd,

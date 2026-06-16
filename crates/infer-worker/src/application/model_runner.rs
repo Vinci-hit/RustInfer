@@ -7,7 +7,7 @@
 //! All KV addressing is paged. Single-sequence generation runs as a
 //! `batch=1` plan with a contiguous `block_table = [0, 1, 2, ...]`.
 
-use crate::application::batch_workspace::{BatchWorkspace, WsSeqStep};
+use crate::application::batch_workspace::BatchWorkspace;
 use crate::application::forward_workspace::{ForwardWorkspace, ModelDims};
 use crate::domain::batch::{PagedKvLayer, PagedKvPool};
 use crate::domain::model::{ForwardContext, LlmModel};
@@ -107,17 +107,19 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
                 max_seq_len,
             )));
         }
-        if block_size != 1 {
-            // The worker-owned `GlobalKvAllocator` (Phase 1) and the new
-            // RadixTree handle (Phase 5) both rely on
-            // `block_table[seq][i]` being the i-th token's global KV index,
-            // which only holds when block_size == 1. Other values still
-            // *function* (the kernels do `pos / block_size` either way), but
-            // the upper-layer invariants break.
-            tracing::warn!(
-                "ModelRunner: block_size={} != 1 — outside the documented worker-owned KV path",
+        if block_size != 1 && device.name() == "cuda" {
+            // The worker-owned `GlobalKvAllocator` (Phase 1) and the
+            // RadixTree handle (Phase 5) both rely on `block_table[seq][i]`
+            // being the i-th token's global KV index, which only holds when
+            // block_size == 1. Other values still *function* at the kernel
+            // level (`pos / block_size`) — CPU tests exercise paging with
+            // block_size > 1 — but the worker-owned KV-reuse / release
+            // invariants break silently on the production Cuda path (M9).
+            // Reject there rather than limp on with corrupt KV bookkeeping.
+            return Err(OpError::Shape(format!(
+                "ModelRunner::new: block_size={} != 1 is unsupported on the worker-owned (cuda) KV path",
                 block_size,
-            );
+            )));
         }
 
         let mut layers = Vec::with_capacity(num_layers);
@@ -205,54 +207,21 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
     fn step_batch_eager(&mut self, seqs: &[SeqStep]) -> OpResult<Vec<i32>> {
         self.validate_steps(seqs)?;
 
-        // Adapt SeqStep → WsSeqStep (workspace's own type).
-        let ws_seqs: Vec<WsSeqStep> = seqs
-            .iter()
-            .map(|s| WsSeqStep {
-                input_ids: s.input_ids.clone(),
-                positions: s.positions.clone(),
-                kv_write_start: s.kv_write_start,
-                kv_len_after: s.kv_len_after,
-                block_table: s.block_table.clone(),
-            })
-            .collect();
-
-        let (input_ids_dev, mut plan) = self.batch_ws.build_plan(&ws_seqs, &self.device)?;
+        // `build_plan` consumes `SeqStep` directly (H1): no per-seq adapter
+        // clone of input_ids/positions/block_table.
+        let (input_ids_dev, mut plan) = self.batch_ws.build_plan(seqs, &self.device)?;
         // Workspace doesn't know the runner's block_size; patch it in.
         plan.block_size = self.block_size;
         let batch = plan.batch;
 
-        // Profiling hook: same shape as the graph path so A/B numbers
-        // share metric definitions.
+        // Profiling hook: wall-clock only. The earlier cudaEvent-based GPU
+        // timing here was dead code (events were created and destroyed but
+        // never recorded) and relied on an unsound "D is Cuda" assumption in
+        // a generic method (H2). GPU-side timing lives in the graph path.
         #[cfg(feature = "cuda")]
-        let prof = std::env::var("RUSTINFER_PROFILE_GPU").is_ok();
+        let prof = crate::env_flags::profile_gpu();
         #[cfg(feature = "cuda")]
         let wall_t0 = std::time::Instant::now();
-        #[cfg(feature = "cuda")]
-        let mut ev_t0: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
-        #[cfg(feature = "cuda")]
-        let mut ev_t1: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
-        #[cfg(feature = "cuda")]
-        if prof {
-            // SAFETY: cuda feature gates a Cuda-specific code path; the
-            // generic `D` is Cuda here when this branch is taken at the
-            // call site. The events are stream-scoped and harmless on
-            // non-Cuda builds (this whole block is excluded then).
-            // We only care about the case where D is Cuda — see callers.
-            unsafe {
-                use crate::infrastructure::cuda::ffi as cf;
-                let r0 = cf::cudaEventCreate(&mut ev_t0);
-                let r1 = cf::cudaEventCreate(&mut ev_t1);
-                if r0 != cf::cudaError_cudaSuccess || r1 != cf::cudaError_cudaSuccess {
-                    tracing::debug!("cudaEventCreate failed — skipping GPU profiling");
-                    // Ensure null pointers stay null so the destroy block is a no-op.
-                    ev_t0 = std::ptr::null_mut();
-                    ev_t1 = std::ptr::null_mut();
-                }
-                // Stream comes from the output tensor's device handle.
-                // For non-Cuda backends this branch is never taken.
-            }
-        }
 
         let logits = {
             let mut ctx = ForwardContext {
@@ -265,23 +234,20 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
         let (out_dev, workspace, rows) = self.forward_ws.argmax_args();
         let result = D::argmax_batched(&logits, &plan.cu_q_lens, batch, out_dev, workspace, rows);
 
+        // Sticky CUDA error check at the step boundary (C1/C2): any kernel
+        // launch failure during forward sets the sticky error, which
+        // `cudaGetLastError` surfaces here as `OpError::Kernel` rather than
+        // letting a NaN/garbage token be returned silently. Only meaningful
+        // on the Cuda backend; a no-op global query otherwise.
+        #[cfg(feature = "cuda")]
+        if self.device.name() == "cuda" {
+            crate::infrastructure::cuda::error::check_last_error("step_batch_eager forward")?;
+        }
+
         #[cfg(feature = "cuda")]
         if prof {
-            // Best-effort: capture wall-clock since model.forward + argmax
-            // includes its own stream sync inside argmax_batched.
             self.prof_step_wall_ns += wall_t0.elapsed().as_nanos() as u64;
-            // We don't have a clean GPU-only timing here without threading
-            // events through every kernel; report 0 to signal "eager
-            // path (graph not used)". Use the graph path for GPU timing.
             self.prof_step_count += 1;
-            unsafe {
-                if !ev_t0.is_null() {
-                    crate::infrastructure::cuda::ffi::cudaEventDestroy(ev_t0);
-                }
-                if !ev_t1.is_null() {
-                    crate::infrastructure::cuda::ffi::cudaEventDestroy(ev_t1);
-                }
-            }
         }
 
         result
@@ -374,7 +340,7 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
         max_new_tokens: usize,
         eos_ids: &[i32],
     ) -> OpResult<Vec<i32>> {
-        let debug = std::env::var("RUSTINFER_DEBUG_LAYERS").is_ok();
+        let debug = crate::env_flags::debug_layers();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let num_prompt = prompt_ids.len();
         if num_prompt == 0 {
@@ -390,14 +356,11 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
             block_table: block_table.clone(),
         };
         if debug {
-            eprintln!(
-                "[runner] prefill: num_tokens={} kv_len_after={}",
-                num_prompt, num_prompt
-            );
+            tracing::debug!(num_tokens = num_prompt, kv_len_after = num_prompt, "prefill");
         }
         let mut last = self.step_batch(&[prefill_seq])?[0];
         if debug {
-            eprintln!("[runner] prefill argmax → token {}", last);
+            tracing::debug!(token = last, "prefill argmax");
         }
         generated.push(last);
         if eos_ids.contains(&last) {
@@ -416,9 +379,13 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
             };
             let new = self.step_batch(&[step])?[0];
             if debug {
-                eprintln!(
-                    "[runner] decode step {:>2}: in={:>6} pos={} kv_len={} → token {}",
-                    i, last, kv_write_start, kv_len_after, new,
+                tracing::debug!(
+                    step = i,
+                    input = last,
+                    pos = kv_write_start,
+                    kv_len = kv_len_after,
+                    token = new,
+                    "decode step"
                 );
             }
             last = new;

@@ -5,14 +5,14 @@ use infer_protocol::worker_to_scheduler_control::{WorkerControlMessage, WorkerSt
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
 use crate::application::forward_workspace::ForwardWorkspace;
-use crate::application::kv_relief::alloc_with_relief;
+use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
 use crate::application::model_runner::{ModelRunner, SeqStep};
 use crate::application::worker_state::{
     ActiveSeq, ActiveSeqMap, DecodeRows, PrefillSeq, PrefillSeqMap,
 };
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
-use crate::domain::ports::OpResult;
+use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
@@ -39,59 +39,84 @@ pub fn handle_prefill<M>(
 where
     M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
 {
-    let new_decode_segments = cmd
-        .segments
-        .iter()
-        .filter(|s| {
-            matches!(
-                s.completion,
-                PrefillSegmentCompletion::FinishPrefillAndStartDecode
-            )
-        })
-        .count();
-    if active.len() + new_decode_segments > cap_batch {
-        let overflow_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
-        eprintln!(
-            "[serve] prefill rejected: active ({}) + new ({}) > cap ({}) -- failing {} seqs",
-            active.len(),
-            new_decode_segments,
-            cap_batch,
-            overflow_ids.len(),
-        );
-        let _ = control.send(
-            WorkerControlMessage::StepError(WorkerStepError {
-                sequence_ids: overflow_ids,
-                message: format!(
-                    "worker batch slot exhausted: active={} + new={} > cap={}",
-                    active.len(),
-                    new_decode_segments,
-                    cap_batch,
-                ),
-                fatal: false,
-            }),
-            infer_protocol::control_envelope::RequestId(0),
-        );
-        return Ok(());
-    }
-
     let mut per_seg_new_tokens: Vec<u32> = Vec::with_capacity(cmd.segments.len());
     let mut per_seg_prefix_hint: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
+    let mut per_seg_base_tables: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
+    let mut per_seg_skipped: Vec<bool> = Vec::with_capacity(cmd.segments.len());
     let mut total_new: u32 = 0;
     for seg in &cmd.segments {
         let seg_len = seg.segment_end - seg.segment_start;
-        let prefix_hit = seg
-            .prefix_hint
-            .as_ref()
-            .map(|h| h.len() as u32)
-            .unwrap_or(0);
+        let prefix = seg.prefix_hint.clone().unwrap_or_default();
+        let prefix_hit = prefix.len() as u32;
         let new_tokens = if seg.segment_start == 0 {
             seg_len.saturating_sub(prefix_hit)
         } else {
             seg_len
         };
+        let base_table = prefilling
+            .get(&seg.sequence_id)
+            .map(|state| state.block_table.clone())
+            .unwrap_or_else(|| prefix.clone());
+        let expected_base_len = if seg.segment_start == 0 && !prefix.is_empty() {
+            prefix.len()
+        } else {
+            seg.segment_start as usize
+        };
+        let skip_segment = base_table.len() != expected_base_len;
+        if skip_segment {
+            tracing::warn!(
+                seq = seg.sequence_id,
+                base_len = base_table.len(),
+                expected = expected_base_len,
+                "skipping stale prefill segment"
+            );
+        } else {
+            total_new = total_new.saturating_add(new_tokens);
+        }
         per_seg_new_tokens.push(new_tokens);
-        per_seg_prefix_hint.push(seg.prefix_hint.clone().unwrap_or_default());
-        total_new = total_new.saturating_add(new_tokens);
+        per_seg_prefix_hint.push(prefix);
+        per_seg_base_tables.push(base_table);
+        per_seg_skipped.push(skip_segment);
+    }
+
+    let new_decode_segments = cmd
+        .segments
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            !per_seg_skipped[*i]
+                && matches!(
+                    s.completion,
+                    PrefillSegmentCompletion::FinishPrefillAndStartDecode
+                )
+        })
+        .count();
+    if active.len() + new_decode_segments > cap_batch {
+        let overflow_ids: Vec<u64> = cmd
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !per_seg_skipped[*i])
+            .map(|(_, s)| s.sequence_id)
+            .collect();
+        tracing::warn!(
+            active = active.len(),
+            new = new_decode_segments,
+            cap = cap_batch,
+            failing = overflow_ids.len(),
+            "prefill rejected: active + new > cap"
+        );
+        send_step_error(
+            control,
+            overflow_ids,
+            format!(
+                "worker batch slot exhausted: active={} + new={} > cap={}",
+                active.len(),
+                new_decode_segments,
+                cap_batch,
+            ),
+        );
+        return Ok(());
     }
 
     let base_indices = match alloc_with_relief(
@@ -103,51 +128,36 @@ where
         enable_prefix_caching,
         false,
     ) {
-        Some(v) => v,
-        None => {
-            eprintln!(
-                "[serve] prefill alloc still failing after relief -- failing batch (n={})",
-                total_new
+        AllocWithReliefOutcome::Allocated(v) => v,
+        AllocWithReliefOutcome::Unavailable => {
+            tracing::warn!(
+                n = total_new,
+                "prefill alloc still failing after relief -- failing batch"
             );
             let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
-            let _ = control.send(
-                WorkerControlMessage::StepError(WorkerStepError {
-                    sequence_ids: failed_ids,
-                    message: format!("worker KV pool exhausted (n={})", total_new),
-                    fatal: false,
-                }),
-                infer_protocol::control_envelope::RequestId(0),
+            send_step_error(
+                control,
+                failed_ids,
+                format!("worker KV pool exhausted (n={})", total_new),
             );
             return Ok(());
         }
+        AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
     };
 
     let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
     let mut per_seg_indices: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
     let mut per_seg_token_ids: Vec<Vec<i32>> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_base_tables: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_skipped: Vec<bool> = Vec::with_capacity(cmd.segments.len());
-    let mut unused_indices: Vec<u32> = Vec::new();
     let mut idx_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
         let new_tokens = per_seg_new_tokens[i] as usize;
         let prefix = &per_seg_prefix_hint[i];
-        let base_table = prefilling
-            .get(&seg.sequence_id)
-            .map(|state| state.block_table.clone())
-            .unwrap_or_else(|| prefix.clone());
-        let expected_base_len = seg.segment_start as usize;
-        let skip_segment = if base_table.len() != expected_base_len {
-            eprintln!(
-                "[serve] skipping stale prefill segment seq={} base_len={} expected={}",
-                seg.sequence_id,
-                base_table.len(),
-                expected_base_len,
-            );
-            true
-        } else {
-            false
-        };
+        let base_table = &per_seg_base_tables[i];
+        if per_seg_skipped[i] {
+            per_seg_indices.push(Vec::new());
+            per_seg_token_ids.push(Vec::new());
+            continue;
+        }
         let range = cmd.segment_token_range(i);
         let (input_ids, positions): (Vec<i32>, Vec<i32>) = if seg.segment_start == 0
             && !prefix.is_empty()
@@ -166,14 +176,6 @@ where
 
         let new_indices: Vec<u32> = base_indices[idx_cursor..idx_cursor + new_tokens].to_vec();
         idx_cursor += new_tokens;
-        if skip_segment {
-            unused_indices.extend_from_slice(&new_indices);
-            per_seg_indices.push(Vec::new());
-            per_seg_token_ids.push(Vec::new());
-            per_seg_base_tables.push(base_table);
-            per_seg_skipped.push(true);
-            continue;
-        }
 
         let mut block_table: Vec<u32> = Vec::with_capacity(base_table.len() + new_tokens);
         block_table.extend_from_slice(&base_table);
@@ -190,8 +192,6 @@ where
         });
         per_seg_indices.push(new_indices);
         per_seg_token_ids.push(input_ids);
-        per_seg_base_tables.push(base_table);
-        per_seg_skipped.push(false);
     }
     debug_assert_eq!(idx_cursor, total_new as usize);
 
@@ -214,20 +214,10 @@ where
                 }
             }
             let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
-            let _ = control.send(
-                WorkerControlMessage::StepError(WorkerStepError {
-                    sequence_ids: failed_ids,
-                    message: format!("prefill step failed: {:?}", e),
-                    fatal: false,
-                }),
-                infer_protocol::control_envelope::RequestId(0),
-            );
+            send_step_error(control, failed_ids, format!("prefill step failed: {:?}", e));
             return Ok(());
         }
     };
-    if !unused_indices.is_empty() {
-        kv_allocator.free(&unused_indices);
-    }
     let assigned = assigned_runs(
         cmd,
         &per_seg_indices,
@@ -290,7 +280,8 @@ where
             }
         }
     }
-    let _ = data.send_step_output(&output);
+    data.send_step_output(&output)
+        .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
     Ok(())
 }
 pub fn run_decode_step<M>(
@@ -323,13 +314,10 @@ where
         }
         if let Err(e) = runner.append_decode_admissions_to_a(decode_rows.len(), &admit_tokens) {
             let failed: Vec<u64> = active.keys().copied().collect();
-            let _ = control.send(
-                WorkerControlMessage::StepError(WorkerStepError {
-                    sequence_ids: failed.clone(),
-                    message: format!("decode admission append failed: {:?}", e),
-                    fatal: false,
-                }),
-                infer_protocol::control_envelope::RequestId(0),
+            send_step_error(
+                control,
+                failed.clone(),
+                format!("decode admission append failed: {:?}", e),
             );
             for sid in failed {
                 if let Some(removed) = active.remove(&sid) {
@@ -359,20 +347,17 @@ where
         enable_prefix_caching,
         true,
     ) {
-        Some(v) => v,
-        None => {
+        AllocWithReliefOutcome::Allocated(v) => v,
+        AllocWithReliefOutcome::Unavailable => {
             let order: Vec<u64> = decode_rows.as_slice().to_vec();
-            eprintln!(
-                "[serve] decode alloc still failing after relief -- failing {} seqs",
-                order.len()
+            tracing::warn!(
+                seqs = order.len(),
+                "decode alloc still failing after relief -- failing seqs"
             );
-            let _ = control.send(
-                WorkerControlMessage::StepError(WorkerStepError {
-                    sequence_ids: order.clone(),
-                    message: "worker KV pool exhausted at decode".to_string(),
-                    fatal: false,
-                }),
-                infer_protocol::control_envelope::RequestId(0),
+            send_step_error(
+                control,
+                order.clone(),
+                "worker KV pool exhausted at decode".to_string(),
             );
             for sid in &order {
                 if let Some(removed) = active.remove(sid) {
@@ -384,6 +369,7 @@ where
             decode_rows.clear();
             return Ok(());
         }
+        AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
     };
 
     decode_rows.retain_active(active);
@@ -404,17 +390,14 @@ where
     };
     if new_indices.len() < order.len() {
         let failed: Vec<u64> = order[new_indices.len()..].to_vec();
-        let _ = control.send(
-            WorkerControlMessage::StepError(WorkerStepError {
-                sequence_ids: failed.clone(),
-                message: format!(
-                    "decode KV allocation returned {} slots for {} rows",
-                    new_indices.len(),
-                    order.len()
-                ),
-                fatal: false,
-            }),
-            infer_protocol::control_envelope::RequestId(0),
+        send_step_error(
+            control,
+            failed.clone(),
+            format!(
+                "decode KV allocation returned {} slots for {} rows",
+                new_indices.len(),
+                order.len()
+            ),
         );
         for sid in &failed {
             if let Some(removed) = active.remove(sid) {
@@ -476,14 +459,7 @@ where
             if !new_indices.is_empty() {
                 kv_allocator.free(&new_indices);
             }
-            let _ = control.send(
-                WorkerControlMessage::StepError(WorkerStepError {
-                    sequence_ids: order.clone(),
-                    message: format!("decode step failed: {:?}", e),
-                    fatal: false,
-                }),
-                infer_protocol::control_envelope::RequestId(0),
-            );
+            send_step_error(control, order.clone(), format!("decode step failed: {:?}", e));
             for sid in &order {
                 if let Some(removed) = active.remove(sid) {
                     if !enable_prefix_caching && !removed.block_table.is_empty() {
@@ -545,8 +521,26 @@ where
         }
     }
     decode_rows.replace_rows(next_rows);
-    let _ = data.send_step_output(&output);
+    data.send_step_output(&output)
+        .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
     Ok(())
+}
+
+/// Send a non-fatal StepError to the scheduler, logging (not silently
+/// dropping) if the control channel is broken. Centralizes the boilerplate
+/// previously copy-pasted across every prefill/decode failure path, and
+/// makes a torn control plane observable instead of a silent hang (H8/M6).
+fn send_step_error(control: &ControlPump, sequence_ids: Vec<u64>, message: String) {
+    if let Err(e) = control.send(
+        WorkerControlMessage::StepError(WorkerStepError {
+            sequence_ids,
+            message,
+            fatal: false,
+        }),
+        infer_protocol::control_envelope::RequestId::NONE,
+    ) {
+        tracing::error!(error = %e, "failed to send StepError to scheduler (control plane may be down)");
+    }
 }
 
 fn release_prefill_state(

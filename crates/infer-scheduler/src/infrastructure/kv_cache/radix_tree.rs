@@ -142,6 +142,9 @@ pub struct RadixTree {
     /// Per-seq chain tip. Inserted on first `append_token` or
     /// `lookup_prefix`; removed when `mark_finished_chain` clears the seq.
     seqs: HashMap<SeqId, ChainTip>,
+    /// Tombstoned node slots, free for reuse by `new_node` (H5). A node lands
+    /// here when `evict` logically deletes it (no owners, no children).
+    free_ids: Vec<NodeId>,
 }
 
 /// Outcome of `lookup_prefix`. `matched_indices` is the flat list of global
@@ -170,6 +173,25 @@ impl RadixTree {
             root: 0,
             lru: LruList::default(),
             seqs: HashMap::new(),
+            free_ids: Vec::new(),
+        }
+    }
+
+    /// Allocate a node slot, reusing a tombstoned `NodeId` when one is
+    /// available (H5). Without reuse, `evict` only logically clears nodes
+    /// (id stability matters for `ChainTip`/`lru.generations`) so `nodes`
+    /// grew monotonically on long runs. The free-list bounds `nodes.len()`
+    /// to the *peak* live tree size instead. Reused ids keep their (stale,
+    /// higher) `lru.generations` stamp, so any lingering stale queue entry
+    /// for that id is still correctly skipped at pop time.
+    fn new_node(&mut self, node: Node) -> NodeId {
+        if let Some(id) = self.free_ids.pop() {
+            self.nodes[id] = node;
+            id
+        } else {
+            let id = self.nodes.len();
+            self.nodes.push(node);
+            id
         }
     }
 
@@ -257,9 +279,8 @@ impl RadixTree {
         }
 
         // Create a new child node.
-        let new_id = self.nodes.len();
         let parent = tip.leaf;
-        self.nodes.push(Node {
+        let new_id = self.new_node(Node {
             edge_tokens: vec![token_id],
             global_indices: vec![global_idx],
             parent: Some(parent),
@@ -423,6 +444,10 @@ impl RadixTree {
                 self.nodes[node_id].global_indices.clear();
                 self.nodes[node_id].parent = None;
                 self.nodes[node_id].owners.clear();
+                // Reclaim the slot for reuse (H5). `children` is already empty
+                // (eviction precondition). The id keeps its monotonic
+                // `lru.generations` stamp so stale queue entries stay invalid.
+                self.free_ids.push(node_id);
                 // Removing this child may have made the parent an unowned
                 // leaf — promote it to LRU.
                 self.maybe_promote_to_lru(parent);
@@ -546,9 +571,8 @@ impl RadixTree {
         // children was already drained via mem::take above.
 
         // Create the suffix node.
-        let suffix_id = self.nodes.len();
         let first_tok = tail_tokens[0];
-        self.nodes.push(Node {
+        let suffix_id = self.new_node(Node {
             edge_tokens: tail_tokens,
             global_indices: tail_indices,
             parent: Some(node),
@@ -651,6 +675,42 @@ mod tests {
         for &(t, idx) in tokens {
             tree.append_token(seq, t, idx);
         }
+    }
+
+    #[test]
+    fn evicted_node_ids_are_reused_bounding_node_vec() {
+        // H5: tombstoned slots must be recycled so `nodes` is bounded by the
+        // peak live tree size, not the cumulative number of nodes ever made.
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(10, 100), (20, 101)]);
+        t.mark_finished_chain(1);
+        let peak = t.nodes.len();
+        let evicted = t.evict(100);
+        assert!(!evicted.is_empty());
+        assert!(
+            !t.free_ids.is_empty(),
+            "evicted nodes must land on the free list"
+        );
+        assert_eq!(t.nodes.len(), peak, "tombstones do not shrink nodes vec");
+
+        // Repeatedly build + finish + evict equivalent chains. With reuse the
+        // node vector never grows past the first peak.
+        for s in 2..50u64 {
+            append_seq(&mut t, s, &[(10, 100), (20, 101)]);
+            t.mark_finished_chain(s);
+            let _ = t.evict(100);
+            assert!(
+                t.nodes.len() <= peak,
+                "node ids not reused: nodes grew to {} (peak {})",
+                t.nodes.len(),
+                peak
+            );
+        }
+
+        // Tree still functions correctly after heavy reuse.
+        append_seq(&mut t, 100, &[(30, 200), (40, 201)]);
+        let hit = t.lookup_prefix(&[30, 40], 101);
+        assert_eq!(hit.matched_indices, vec![200, 201]);
     }
 
     #[test]
@@ -854,6 +914,34 @@ mod tests {
         evicted2.sort_unstable();
         // seq 2's tail (200) and the shared prefix (100, 101) both surface.
         assert_eq!(evicted2, vec![100, 101, 200]);
+    }
+
+    #[test]
+    fn split_edge_keeps_prefix_only_owner_out_of_suffix() {
+        let mut t = RadixTree::new();
+        append_seq(&mut t, 1, &[(10, 100), (20, 101), (30, 102), (40, 103)]);
+
+        // Seq 2 pins only the prefix [10, 20], then diverges. This forces a
+        // split of seq 1's compact edge at pos=2.
+        let hit = t.lookup_prefix(&[10, 20], 2);
+        assert_eq!(hit.matched_indices, vec![100, 101]);
+        t.append_token(2, 99, 200);
+
+        // Finishing seq 2 may release only its private divergent suffix. The
+        // [30, 40] suffix is still owned by seq 1 and must not be evictable.
+        t.mark_finished_chain(2);
+        let evicted = t.evict(10);
+        assert_eq!(evicted, vec![200]);
+
+        // Seq 1 still pins the original full chain.
+        let hit_again = t.lookup_prefix(&[10, 20, 30, 40], 3);
+        assert_eq!(hit_again.matched_indices, vec![100, 101, 102, 103]);
+
+        t.mark_finished_chain(1);
+        t.mark_finished_chain(3);
+        let mut evicted2 = t.evict(10);
+        evicted2.sort_unstable();
+        assert_eq!(evicted2, vec![100, 101, 102, 103]);
     }
 
     #[test]

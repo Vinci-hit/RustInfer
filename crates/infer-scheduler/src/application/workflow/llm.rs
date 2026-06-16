@@ -246,7 +246,7 @@ async fn handle_llm_step(
         reserve_reported_kv(ctx.kv_budget, total);
 
         if enable_prefix {
-            output_fns::feed_radix_assigned_indices(ctx.radix, ctx.kv_budget, step);
+            output_fns::feed_radix_assigned_indices(ctx.radix, step);
             for tk in &step.tokens {
                 if tk.finished {
                     output_fns::radix_mark_finished(ctx.radix, tk.sequence_id);

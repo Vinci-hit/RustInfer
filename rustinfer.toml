@@ -8,7 +8,7 @@
 # config.json so the worker dispatch / chat template always match the weights.
 
 # Model directory (weights + tokenizer.json + config.json). Required.
-model = "/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct"
+model = "/mnt/md2/liuwenqi/Llama-3.2-1B-Instruct"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
@@ -18,7 +18,7 @@ model_name = ""
 cluster_id = "rustinfer"
 
 # CUDA device.
-device = "cuda:0"
+device = "cuda:7"
 
 # HTTP API server.
 host = "0.0.0.0"

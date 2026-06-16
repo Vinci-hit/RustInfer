@@ -146,16 +146,25 @@ impl KvBudget {
         Ok(())
     }
 
-    /// Release `n` slots. Saturating subtraction; we still log a warning
-    /// in debug builds because a release that would underflow indicates
-    /// counter drift between scheduler and worker.
+    /// Release `n` slots.
+    ///
+    /// Saturates instead of underflowing, but logs in all builds because a
+    /// release larger than `outstanding` means scheduler/worker budget drift.
     pub fn release(&mut self, n: u32) {
-        debug_assert!(
-            self.outstanding >= n,
-            "KvBudget release({}) underflows outstanding={}",
-            n,
-            self.outstanding,
-        );
+        if n > self.outstanding {
+            tracing::warn!(
+                requested = n,
+                outstanding = self.outstanding,
+                capacity = self.capacity,
+                "KvBudget release exceeds outstanding; clamping"
+            );
+            debug_assert!(
+                self.outstanding >= n,
+                "KvBudget release({}) underflows outstanding={}",
+                n,
+                self.outstanding,
+            );
+        }
         self.outstanding = self.outstanding.saturating_sub(n);
     }
 

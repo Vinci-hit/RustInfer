@@ -142,6 +142,20 @@ impl PendingCalls {
         }
     }
 
+    /// Resolve a single-target call immediately with an error, e.g. when the
+    /// router fails to put the request on the wire (H2). Without this the
+    /// caller would block until the deadline sweep — wasting a full RPC
+    /// timeout on a failure the router already knows about. No-op for `All`
+    /// entries or unknown ids.
+    pub(crate) fn fail_one(&self, id: RequestId, error: ControlError) {
+        let mut g = lock_inner(&self.inner);
+        if matches!(g.get(&id), Some(PendingEntry::One { .. })) {
+            if let Some(PendingEntry::One { tx, .. }) = g.remove(&id) {
+                let _ = tx.send(Err(error));
+            }
+        }
+    }
+
     /// Periodic sweep for deadlines. Returns the count of fired entries.
     pub(crate) fn sweep_expired(&self, now: Instant) -> usize {
         let mut g = lock_inner(&self.inner);
@@ -216,6 +230,20 @@ mod tests {
         pc.complete(id, worker, WorkerControlMessage::Pong);
         let reply = rx.await.unwrap().unwrap();
         assert!(matches!(reply, WorkerControlMessage::Pong));
+    }
+
+    #[tokio::test]
+    async fn fail_one_resolves_immediately_with_error() {
+        // H2: router send failure resolves the pending call now, not at the
+        // deadline. Deadline is far in the future so a pass proves immediacy.
+        let pc = PendingCalls::new();
+        let dl = Instant::now() + Duration::from_secs(3600);
+        let (id, rx) = pc.register_one(dl);
+        pc.fail_one(id, ControlError::Router("send failed".into()));
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(matches!(err, ControlError::Router(_)));
+        // Idempotent: failing an already-resolved id is a no-op.
+        pc.fail_one(id, ControlError::Router("again".into()));
     }
 
     #[tokio::test]

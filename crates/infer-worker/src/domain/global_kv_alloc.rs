@@ -105,7 +105,14 @@ impl GlobalKvAllocator {
 
     /// Outstanding = total − total_free.
     pub fn outstanding(&self) -> u32 {
-        self.total - self.total_free()
+        let total_free = self.total_free();
+        if total_free > self.total {
+            tracing::warn!(
+                "[kv-alloc] invariant violation: total_free={} > total={}",
+                total_free, self.total
+            );
+        }
+        self.total.saturating_sub(total_free)
     }
 
     /// Allocate `n` indices.
@@ -161,9 +168,9 @@ impl GlobalKvAllocator {
     }
 
     /// Return freed indices to the pool. Drops the already-allocated
-    /// prefix, appends the new indices, and re-sorts so the pool is
-    /// ready for the next `alloc_indices` to take the smallest indices.
-    /// O(N log N) per call.
+    /// prefix, sorts only the returned batch, then merges it with the
+    /// already-sorted free pool. This keeps allocations deterministic
+    /// without re-sorting the entire free pool on every completion.
     ///
     /// Caller is trusted to free only previously-allocated indices.
     /// Debug builds verify each input is `< total`; release builds skip
@@ -172,19 +179,73 @@ impl GlobalKvAllocator {
         if indices.is_empty() {
             return;
         }
-        if cfg!(debug_assertions) {
-            for &idx in indices {
-                debug_assert!(idx < self.total, "free index out of range: {}", idx);
-            }
-        }
         // Drop the consumed prefix first so the sort below sees only
         // currently-free slots.
         if self.head > 0 {
             self.free.drain(..self.head);
             self.head = 0;
         }
-        self.free.extend_from_slice(indices);
-        self.free.sort_unstable();
+        let returned = self.sanitize_returned_indices(indices, "free");
+        if returned.is_empty() {
+            return;
+        }
+        self.merge_sorted_returned(&returned);
+    }
+
+    fn merge_sorted_returned(&mut self, returned: &[u32]) {
+        if returned.is_empty() {
+            return;
+        }
+
+        let mut merged = Vec::with_capacity(self.free.len() + returned.len());
+        let mut i = 0usize;
+        let mut j = 0usize;
+
+        while i < self.free.len() && j < returned.len() {
+            if self.free[i] <= returned[j] {
+                merged.push(self.free[i]);
+                i += 1;
+            } else {
+                merged.push(returned[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&self.free[i..]);
+        merged.extend_from_slice(&returned[j..]);
+        self.free = merged;
+    }
+
+    fn sanitize_returned_indices(&self, indices: &[u32], op: &str) -> Vec<u32> {
+        let mut returned = indices.to_vec();
+        returned.sort_unstable();
+        returned.dedup();
+
+        let mut valid = Vec::with_capacity(returned.len());
+        for idx in returned {
+            if idx >= self.total {
+                tracing::warn!(
+                    "[kv-alloc] ignoring {} index out of range: idx={} total={}",
+                    op, idx, self.total
+                );
+                continue;
+            }
+            if self.free[self.head..].binary_search(&idx).is_ok() {
+                tracing::warn!(
+                    "[kv-alloc] ignoring {} index that is already free: idx={}",
+                    op, idx
+                );
+                continue;
+            }
+            if self.released.contains(&idx) {
+                tracing::warn!(
+                    "[kv-alloc] ignoring {} index that is already released: idx={}",
+                    op, idx
+                );
+                continue;
+            }
+            valid.push(idx);
+        }
+        valid
     }
 
     /// Move indices to the released holding list (real-time recycling mode).
@@ -199,12 +260,8 @@ impl GlobalKvAllocator {
         if indices.is_empty() {
             return;
         }
-        if cfg!(debug_assertions) {
-            for &idx in indices {
-                debug_assert!(idx < self.total, "release index out of range: {}", idx);
-            }
-        }
-        self.released.extend_from_slice(indices);
+        let returned = self.sanitize_returned_indices(indices, "release");
+        self.released.extend_from_slice(&returned);
     }
 
     /// Drain the released holding list into the free pool, drop any
@@ -300,6 +357,30 @@ mod tests {
         assert_eq!(a.head(), 0, "free() resets head to zero");
         assert_eq!(a.outstanding(), 2, "5 alloc'd − 3 freed = 2 outstanding");
         assert_eq!(a.free_snapshot(), vec![1, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn free_ignores_invalid_and_already_free_indices() {
+        let mut a = GlobalKvAllocator::new(10);
+        let _ = a.alloc_indices(5).unwrap(); // allocated [0..5), free [5..10)
+
+        a.free(&[1, 1, 8, 99]);
+
+        assert_eq!(a.outstanding(), 4);
+        assert_eq!(a.free_snapshot(), vec![1, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn release_ignores_invalid_and_already_free_indices() {
+        let mut a = GlobalKvAllocator::new(10);
+        let _ = a.alloc_indices(5).unwrap(); // allocated [0..5), free [5..10)
+
+        a.release(&[1, 1, 8, 99]);
+
+        assert_eq!(a.released_len(), 1);
+        assert_eq!(a.recycle(), 1);
+        assert_eq!(a.outstanding(), 4);
+        assert_eq!(a.free_snapshot(), vec![1, 5, 6, 7, 8, 9]);
     }
 
     #[test]

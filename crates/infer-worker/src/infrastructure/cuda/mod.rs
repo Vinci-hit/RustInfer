@@ -113,6 +113,7 @@ impl MemoryPort for Cuda {
                     code
                 )));
             }
+            error::check_last_error("cuda upload sync observed prior kernel error")?;
         }
         Ok(())
     }
@@ -171,6 +172,7 @@ impl MemoryPort for Cuda {
                     code
                 )));
             }
+            error::check_last_error("cuda download sync observed prior kernel error")?;
         }
         Ok(())
     }
@@ -185,6 +187,7 @@ impl MemoryPort for Cuda {
                 code
             )));
         }
+        error::check_last_error("cuda synchronize observed prior kernel error")?;
         Ok(())
     }
 
@@ -221,6 +224,7 @@ impl MemoryPort for Cuda {
                     code
                 )));
             }
+            error::check_last_error("cuda D2D sync observed prior kernel error")?;
         }
         Ok(())
     }

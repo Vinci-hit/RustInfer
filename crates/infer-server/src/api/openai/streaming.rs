@@ -9,11 +9,26 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use infer_protocol::scheduler_to_server::ChunkType;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
 use super::decoder::IncrementalDecoder;
 use super::types::*;
+
+fn json_event<T: serde::Serialize>(request_id: &str, payload: &T) -> Event {
+    match serde_json::to_string(payload) {
+        Ok(data) => Event::default().data(data),
+        Err(error) => {
+            tracing::error!(
+                request_id = %request_id,
+                error = %error,
+                "failed to serialize SSE payload"
+            );
+            Event::default().data("[DONE]")
+        }
+    }
+}
 
 /// 构建 Chat Completion SSE 流
 pub fn stream_chat_completion(
@@ -21,7 +36,7 @@ pub fn stream_chat_completion(
     model: String,
     prompt_tokens: u32,
     mut stream_handle: StreamHandle,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
@@ -48,7 +63,7 @@ pub fn stream_chat_completion(
             }],
             usage: None,
         };
-        yield Ok(Event::default().data(serde_json::to_string(&first_chunk).unwrap()));
+        yield Ok(json_event(&request_id, &first_chunk));
 
         // 闭包工厂：构造一个内容增量 chunk。重复使用避免代码碎片化。
         let make_content_chunk = |chunk_id: &str, model: &str, content: String| ChatCompletionChunk {
@@ -81,9 +96,7 @@ pub fn stream_chat_completion(
                                 );
                             }
                             let payload = make_content_chunk(&chunk_id, &model, delta);
-                            yield Ok(Event::default().data(
-                                serde_json::to_string(&payload).unwrap()
-                            ));
+                            yield Ok(json_event(&request_id, &payload));
                         }
                         Ok(None) => {
                             // 当前 token 仅扩展了未确认尾部（如多字节字符的中间字节），不下发。
@@ -108,9 +121,7 @@ pub fn stream_chat_completion(
                                 }],
                                 usage: None,
                             };
-                            yield Ok(Event::default().data(
-                                serde_json::to_string(&err_chunk).unwrap()
-                            ));
+                            yield Ok(json_event(&request_id, &err_chunk));
                             yield Ok(Event::default().data("[DONE]"));
                             return;
                         }
@@ -128,9 +139,7 @@ pub fn stream_chat_completion(
                     // 应当下发给客户端而不是丢弃。
                     if let Ok(Some(tail)) = decoder.flush() {
                         let payload = make_content_chunk(&chunk_id, &model, tail);
-                        yield Ok(Event::default().data(
-                            serde_json::to_string(&payload).unwrap()
-                        ));
+                        yield Ok(json_event(&request_id, &payload));
                     }
 
                     let finish_reason = chunk.finish_reason.unwrap_or_else(|| "stop".to_string());
@@ -146,9 +155,7 @@ pub fn stream_chat_completion(
                         }],
                         usage: None,
                     };
-                    yield Ok(Event::default().data(
-                        serde_json::to_string(&finish_chunk).unwrap()
-                    ));
+                    yield Ok(json_event(&request_id, &finish_chunk));
 
                     if include_usage {
                         let usage_chunk = ChatCompletionChunk {
@@ -160,12 +167,10 @@ pub fn stream_chat_completion(
                             usage: Some(Usage {
                                 prompt_tokens,
                                 completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
+                                total_tokens: prompt_tokens.saturating_add(completion_tokens),
                             }),
                         };
-                        yield Ok(Event::default().data(
-                            serde_json::to_string(&usage_chunk).unwrap()
-                        ));
+                        yield Ok(json_event(&request_id, &usage_chunk));
                     }
 
                     yield Ok(Event::default().data("[DONE]"));
@@ -189,7 +194,7 @@ pub fn stream_completion(
     model: String,
     prompt_tokens: u32,
     mut stream_handle: StreamHandle,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     include_usage: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
@@ -220,9 +225,7 @@ pub fn stream_completion(
                     match decoder.push(token_id as u32) {
                         Ok(Some(delta)) => {
                             let payload = make_content_chunk(&chunk_id, &model, delta);
-                            yield Ok(Event::default().data(
-                                serde_json::to_string(&payload).unwrap()
-                            ));
+                            yield Ok(json_event(&request_id, &payload));
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -244,9 +247,7 @@ pub fn stream_completion(
                                 }],
                                 usage: None,
                             };
-                            yield Ok(Event::default().data(
-                                serde_json::to_string(&err_chunk).unwrap()
-                            ));
+                            yield Ok(json_event(&request_id, &err_chunk));
                             yield Ok(Event::default().data("[DONE]"));
                             return;
                         }
@@ -257,9 +258,7 @@ pub fn stream_completion(
 
                     if let Ok(Some(tail)) = decoder.flush() {
                         let payload = make_content_chunk(&chunk_id, &model, tail);
-                        yield Ok(Event::default().data(
-                            serde_json::to_string(&payload).unwrap()
-                        ));
+                        yield Ok(json_event(&request_id, &payload));
                     }
 
                     let finish_reason = chunk.finish_reason.unwrap_or_else(|| "stop".to_string());
@@ -275,9 +274,7 @@ pub fn stream_completion(
                         }],
                         usage: None,
                     };
-                    yield Ok(Event::default().data(
-                        serde_json::to_string(&finish_chunk).unwrap()
-                    ));
+                    yield Ok(json_event(&request_id, &finish_chunk));
 
                     if include_usage {
                         let usage_chunk = CompletionChunk {
@@ -289,12 +286,10 @@ pub fn stream_completion(
                             usage: Some(Usage {
                                 prompt_tokens,
                                 completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
+                                total_tokens: prompt_tokens.saturating_add(completion_tokens),
                             }),
                         };
-                        yield Ok(Event::default().data(
-                            serde_json::to_string(&usage_chunk).unwrap()
-                        ));
+                        yield Ok(json_event(&request_id, &usage_chunk));
                     }
 
                     yield Ok(Event::default().data("[DONE]"));

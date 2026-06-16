@@ -154,14 +154,19 @@ fn drive_router(
                     env,
                     deadline: _,
                 } => {
+                    let request_id = env.request_id;
                     if let Err(e) = send_to(&socket, &worker, &env) {
                         tracing::error!("call_one {}: {:?}", worker, e);
-                        // Resolve the pending entry with the error immediately.
-                        // We need to forge a "decode error path" — easiest is to
-                        // mark the pending call as router error via complete()
-                        // with a fake reply. Instead use a dedicated path:
-                        // pending entry will time out at its deadline; the
-                        // engine sees Timeout. Acceptable failure mode.
+                        // Resolve the pending entry with the error immediately
+                        // (H2) instead of letting the caller burn a full RPC
+                        // deadline waiting for a reply that will never come.
+                        pending.fail_one(
+                            request_id,
+                            super::handle::ControlError::Router(format!(
+                                "send to {} failed: {:?}",
+                                worker, e
+                            )),
+                        );
                     }
                 }
                 RouterCommand::CallAll { env, deadline: _ } => {
@@ -225,16 +230,20 @@ fn recv_frame(
     // ROUTER may send a delimiter frame between identity and payload depending
     // on whether the peer is a DEALER (no delimiter) or REQ (delimiter). We
     // walk frames until the last one (which carries the payload).
-    let mut last = identity.clone();
+    let mut frame_count = 1usize;
+    let mut last = Vec::new();
     while socket.get_rcvmore().unwrap_or(false) {
         match socket.recv_bytes(0) {
-            Ok(b) => last = b,
+            Ok(b) => {
+                frame_count += 1;
+                last = b;
+            }
             Err(e) => return Err(ControlError::Router(format!("recv body: {}", e))),
         }
     }
     // If the peer is a DEALER we walked: identity → payload. If it's a REQ:
     // identity → "" → payload. Either way `last` is the payload.
-    if std::ptr::eq(last.as_slice().as_ptr(), identity.as_slice().as_ptr()) {
+    if frame_count < 2 {
         // single frame received → caller spoke without a payload, ignore.
         tracing::warn!("ROUTER received single-frame message; dropping");
         return Ok(None);

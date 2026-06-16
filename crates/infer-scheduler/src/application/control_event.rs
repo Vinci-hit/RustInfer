@@ -166,34 +166,43 @@ impl ControlEventSystem {
             return ControlOutcome::noop();
         }
 
-        // 5% of total slots, rounded down. With block_size=1 this is the
-        // common 5%-of-tokens budget.
-        let five_pct = total / 20;
+        // Minimum eviction target as a fraction of total slots, expressed as
+        // a divisor: `total / MIN_EVICT_TARGET_DIVISOR` ≈ 5% (L4). Evicting a
+        // small batch beyond the immediate shortfall amortizes the per-event
+        // eviction cost and reduces back-to-back AllocFailed churn.
+        const MIN_EVICT_TARGET_DIVISOR: u32 = 20;
+        let min_target = (total / MIN_EVICT_TARGET_DIVISOR).max(1);
+        let target_slots = req.shortfall.max(min_target).max(1);
 
         if req.round == 0 {
-            // Level 1: LRU evict, target = min(5%, lru_total).
-            let lru_total = radix.lru_total_indices() as u32;
-            let target = five_pct.min(lru_total);
-            if target > 0 {
-                let indices = radix.evict_collect_at_least(target as usize);
-                if !indices.is_empty() {
-                    kv_budget.release(indices.len() as u32);
-                    tracing::info!(
-                        worker_id = %req.worker_id,
-                        shortfall = req.shortfall,
-                        target,
-                        freed = indices.len(),
-                        "AllocFailed round=0: evicting RadixTree LRU leaves"
+            // Level 1: ask the LRU eviction path directly. It returns empty
+            // when no reclaimable leaves exist and may return fewer than the
+            // target when the cache cannot satisfy it.
+            let target = target_slots;
+            let indices = radix.evict_collect_at_least(target as usize);
+            if !indices.is_empty() {
+                kv_budget.release(indices.len() as u32);
+                tracing::info!(
+                    worker_id = %req.worker_id,
+                    shortfall = req.shortfall,
+                    target,
+                    freed = indices.len(),
+                    "AllocFailed round=0: evicting RadixTree LRU leaves"
+                );
+                let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
+                    infer_protocol::scheduler_to_worker_control::FreeKvIndices {
+                        model_instance_id: worker_group.model_instance_id.clone(),
+                        indices,
+                    },
+                );
+                if let Err(e) = control_cmd.send_to(target_worker, msg) {
+                    tracing::error!(
+                        worker = %target_worker,
+                        error = %e,
+                        "failed to send AllocFailed round=0 FreeKvIndices"
                     );
-                    let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
-                        infer_protocol::scheduler_to_worker_control::FreeKvIndices {
-                            model_instance_id: worker_group.model_instance_id.clone(),
-                            indices,
-                        },
-                    );
-                    let _ = control_cmd.send_to(target_worker, msg);
-                    return ControlOutcome::noop();
                 }
+                return ControlOutcome::noop();
             }
             // LRU is empty (or evict returned nothing). Fall through to
             // Level 2 immediately rather than forcing the worker to wait
@@ -203,14 +212,13 @@ impl ControlEventSystem {
             tracing::debug!(
                 worker_id = %req.worker_id,
                 shortfall = req.shortfall,
-                five_pct,
-                lru_total,
+                target,
                 "AllocFailed round=0: nothing in LRU — escalating to preemption"
             );
         }
 
-        // Level 2: victim preemption. Target = fixed 5%.
-        let target = five_pct;
+        // Level 2: victim preemption.
+        let target = target_slots;
 
         let mut candidates: Vec<PreemptCandidate> = sessions.preemption_candidates();
         // (output_len desc, input_len asc). Long outputs first
@@ -281,7 +289,13 @@ impl ControlEventSystem {
                 free_indices: Vec::new(),
             },
         );
-        let _ = control_cmd.send_to(target_worker, msg);
+        if let Err(e) = control_cmd.send_to(target_worker, msg) {
+            tracing::error!(
+                worker = %target_worker,
+                error = %e,
+                "failed to send AllocFailed round=1 Preempt"
+            );
+        }
 
         ControlOutcome::noop()
     }

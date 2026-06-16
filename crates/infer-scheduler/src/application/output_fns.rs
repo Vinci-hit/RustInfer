@@ -14,7 +14,6 @@ use infer_protocol::worker_to_scheduler_data::{
 
 use crate::domain::inference_session::handle::ClientId;
 use crate::domain::inference_session::lifecycle::{Decoding, InferenceSession, Prefilling};
-use crate::domain::kv_budget::KvBudget;
 use crate::error::Result;
 use crate::infrastructure::kv_cache::radix_tree::RadixTree;
 use crate::infrastructure::metrics::MetricsRecorder;
@@ -188,13 +187,11 @@ pub async fn complete_session(
     })
 }
 
-/// Feed `StepOutput.assigned_indices` into the `RadixTree` + `KvBudget`.
-pub fn feed_radix_assigned_indices(
-    radix: &mut RadixTree,
-    budget: &mut KvBudget,
-    output: &StepOutput,
-) {
-    let _ = budget;
+/// Feed `StepOutput.assigned_indices` into the `RadixTree`.
+///
+/// KV budget reservation is handled by the LLM workflow before this function
+/// runs, so this path only updates prefix-cache metadata.
+pub fn feed_radix_assigned_indices(radix: &mut RadixTree, output: &StepOutput) {
     if output.assigned_indices.is_empty() {
         return;
     }

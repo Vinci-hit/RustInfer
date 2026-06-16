@@ -15,6 +15,7 @@ pub struct CancelRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancelReason {
     ClientDisconnected,
+    RequestTimeout,
     StreamTimeout,
     ServerShutdown,
 }

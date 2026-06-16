@@ -15,6 +15,7 @@ use crate::application::worker_scheduler::{handle_prefill, run_decode_step};
 use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
+use crate::domain::ports::OpError;
 use crate::infrastructure::cuda::{Cuda, device_utils, kernels::attention_paged};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
@@ -51,10 +52,16 @@ where
     M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
 {
     let _ = bs.load_cfg;
-    let max_blocks_per_seq = (bs.max_seq_len + bs.block_size - 1) / bs.block_size;
+    if bs.block_size != 1 {
+        return Err(format!(
+            "worker-owned KV allocator requires block_size=1, got {}",
+            bs.block_size
+        ));
+    }
+    let max_blocks_per_seq = bs.max_seq_len.div_ceil(bs.block_size);
 
     let num_blocks = if bs.num_blocks_override != 0 {
-        eprintln!(
+        tracing::info!(
             "[bootstrap] num_blocks override from CLI: {} (skipping GPU mem probe)",
             bs.num_blocks_override,
         );
@@ -70,8 +77,20 @@ where
         let (free, total) =
             device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
         let budget = (free as f64 * fraction as f64) as usize;
-        let derived = (budget / bytes_per_block.max(1)).saturating_sub(1).max(1);
-        eprintln!(
+        let raw = budget / bytes_per_block.max(1);
+        // Safety reserve (M8): the `free` probe is taken before the forward
+        // activation workspace and the decode CUDA-graph capture pool are
+        // allocated (both happen in `ModelRunner::new` / `prime_graphs_cuda`
+        // *after* this point). `fraction` (default 0.9) is the primary
+        // headroom for them; on top we keep an explicit reserve so rounding +
+        // allocator fragmentation never pushes runtime peak past the probe:
+        //   - 1 block is the graph scratch block (see `pool_blocks` below),
+        //   - plus 0.5% of the raw block count (min 1) as fragmentation slack.
+        // OOM on this path is otherwise swallowed by the kernel error layer,
+        // so we err conservative here.
+        let reserve = 1 + (raw / 200).max(1);
+        let derived = raw.saturating_sub(reserve).max(1);
+        tracing::info!(
             "[bootstrap] KV mem probe: free={:.2}GiB total={:.2}GiB fraction={} bytes/block={} -> num_blocks={} (~{:.2}GiB KV pool)",
             free as f64 / (1u64 << 30) as f64,
             total as f64 / (1u64 << 30) as f64,
@@ -84,7 +103,7 @@ where
     };
 
     let pool_blocks = num_blocks + 1;
-    eprintln!(
+    tracing::info!(
         "[bootstrap] paged KV pool: block_size={} num_blocks={} pool_blocks={} (last block reserved as graph scratch) max_blocks_per_seq={}",
         bs.block_size, num_blocks, pool_blocks, max_blocks_per_seq,
     );
@@ -108,12 +127,12 @@ where
     .map_err(|e| format!("ModelRunner::new: {:?}", e))?;
 
     if let Err(e) = runner.prime_graphs_cuda() {
-        eprintln!(
+        tracing::info!(
             "[bootstrap] CUDA Graph priming FAILED, continuing in eager mode: {:?}",
             e
         );
     } else {
-        eprintln!(
+        tracing::info!(
             "[bootstrap] CUDA Graphs primed for decode-only batches in {:?}",
             runner.capture_sizes,
         );
@@ -136,24 +155,24 @@ where
             graph_mem_usage_gb: None,
         },
     )?;
-    eprintln!(
+    tracing::info!(
         "[bootstrap] Ready sent. max_total_kv_tokens={}. Entering serve loop...",
         max_total_kv_tokens,
     );
 
     let hb_ms = bs.server_heartbeat_ms.unwrap_or(1000).max(200);
     let heartbeat_interval = Duration::from_millis(hb_ms);
-    eprintln!("[serve] heartbeat interval = {:?}", heartbeat_interval);
+    tracing::info!("[serve] heartbeat interval = {:?}", heartbeat_interval);
     let mut last_heartbeat = Instant::now();
     let mut active = ActiveSeqMap::new();
     let mut prefilling = PrefillSeqMap::new();
     let mut kv_allocator = GlobalKvAllocator::new(num_blocks as u32);
-    eprintln!(
+    tracing::info!(
         "[serve] worker-owned KV allocator: total={} (block_size={})",
         num_blocks, bs.block_size,
     );
     let enable_prefix_caching = bs.load.enable_prefix_caching;
-    eprintln!(
+    tracing::info!(
         "[serve] prefix caching: {}",
         if enable_prefix_caching {
             "enabled (RadixTree)"
@@ -218,7 +237,7 @@ where
                 Ok(_) => {}
                 Err(zmq::Error::EINTR) => continue,
                 Err(e) => {
-                    eprintln!("[serve] zmq::poll error: {:?}", e);
+                    tracing::info!("[serve] zmq::poll error: {:?}", e);
                     continue;
                 }
             }
@@ -282,7 +301,11 @@ where
                 enable_prefix_caching,
                 cap_batch,
             ) {
-                eprintln!("[serve] prefill error: {}", e);
+                if matches!(e, OpError::Shutdown) {
+                    tracing::info!("[serve] prefill interrupted by shutdown.");
+                    return Ok(());
+                }
+                tracing::info!("[serve] prefill error: {}", e);
             }
         }
 
@@ -293,11 +316,13 @@ where
         if !active.is_empty() {
             if let Some(max_steps) = profile_cuda_steps {
                 if !profile_started {
-                    unsafe {
-                        cudaProfilerStart();
+                    // SAFETY: extern profiler API; returns a cudaError code.
+                    let rc = unsafe { cudaProfilerStart() };
+                    if rc != 0 {
+                        tracing::warn!(rc, "cudaProfilerStart returned non-zero");
                     }
                     profile_started = true;
-                    eprintln!(
+                    tracing::info!(
                         "[profile] cudaProfilerStart (will stop after {} steps)",
                         max_steps
                     );
@@ -315,17 +340,23 @@ where
                 eos_ids,
                 enable_prefix_caching,
             ) {
-                eprintln!("[serve] decode error: {}", e);
+                if matches!(e, OpError::Shutdown) {
+                    tracing::info!("[serve] decode interrupted by shutdown.");
+                    return Ok(());
+                }
+                tracing::info!("[serve] decode error: {}", e);
             }
 
             if let Some(max_steps) = profile_cuda_steps {
                 if profile_started {
                     profile_step_count += 1;
                     if profile_step_count >= max_steps {
-                        unsafe {
-                            cudaProfilerStop();
+                        // SAFETY: extern profiler API; returns a cudaError code.
+                        let rc = unsafe { cudaProfilerStop() };
+                        if rc != 0 {
+                            tracing::warn!(rc, "cudaProfilerStop returned non-zero");
                         }
-                        eprintln!(
+                        tracing::info!(
                             "[profile] cudaProfilerStop after {} steps. Exiting.",
                             profile_step_count
                         );
@@ -356,7 +387,7 @@ fn drain_control(
         match control.try_recv(0) {
             Ok(Some((msg, req_id))) => match msg {
                 SchedulerControlMessage::Shutdown => {
-                    eprintln!("[serve] Shutdown received, exiting.");
+                    tracing::info!("[serve] Shutdown received, exiting.");
                     return true;
                 }
                 SchedulerControlMessage::Cancel(c) => {
@@ -366,20 +397,22 @@ fn drain_control(
                     if let Some(removed) = removed {
                         release_removed(removed.block_table, kv_allocator, enable_prefix_caching);
                         decode_rows.retain_active(active);
-                        eprintln!("[serve] cancelled seq {}", c.sequence_id);
+                        tracing::info!("[serve] cancelled seq {}", c.sequence_id);
                     }
                     if let Some(removed) = removed_prefill {
                         release_removed(removed.block_table, kv_allocator, enable_prefix_caching);
-                        eprintln!("[serve] cancelled prefilling seq {}", c.sequence_id);
+                        tracing::info!("[serve] cancelled prefilling seq {}", c.sequence_id);
                     }
                     if req_id.is_correlated() {
-                        let _ = control.send(
+                        if let Err(e) = control.send(
                             WorkerControlMessage::CancelAck(CancelAck {
                                 sequence_id: c.sequence_id,
                                 removed: removed_flag,
                             }),
                             req_id,
-                        );
+                        ) {
+                            tracing::info!("[serve] failed to send CancelAck: {}", e);
+                        }
                     }
                 }
                 SchedulerControlMessage::FreeKvIndices(free) => {
@@ -395,7 +428,7 @@ fn drain_control(
                                 kv_allocator,
                                 enable_prefix_caching,
                             );
-                            eprintln!("[serve] preempted seq {}", sid);
+                            tracing::info!("[serve] preempted seq {}", sid);
                         }
                         if let Some(removed) = prefilling.remove(sid) {
                             release_removed(
@@ -403,7 +436,7 @@ fn drain_control(
                                 kv_allocator,
                                 enable_prefix_caching,
                             );
-                            eprintln!("[serve] preempted prefilling seq {}", sid);
+                            tracing::info!("[serve] preempted prefilling seq {}", sid);
                         }
                     }
                     decode_rows.retain_active(active);
@@ -412,7 +445,9 @@ fn drain_control(
                     }
                 }
                 SchedulerControlMessage::Ping => {
-                    let _ = control.send(WorkerControlMessage::Pong, req_id);
+                    if let Err(e) = control.send(WorkerControlMessage::Pong, req_id) {
+                        tracing::info!("[serve] failed to send Pong: {}", e);
+                    }
                 }
                 SchedulerControlMessage::Drain(d) => {
                     if matches!(d.mode, DrainMode::Immediate) {
@@ -428,24 +463,28 @@ fn drain_control(
                         decode_rows.clear();
                     }
                     if req_id.is_correlated() {
-                        let _ = control.send(
+                        if let Err(e) = control.send(
                             WorkerControlMessage::DrainAck(DrainAck {
                                 remaining_requests: active.len() + prefilling.len(),
                             }),
                             req_id,
-                        );
+                        ) {
+                            tracing::info!("[serve] failed to send DrainAck: {}", e);
+                        }
                     }
                 }
                 SchedulerControlMessage::UnloadModel(u) => {
                     if req_id.is_correlated() {
-                        let _ = control.send(
+                        if let Err(e) = control.send(
                             WorkerControlMessage::UnloadAck(UnloadAck {
                                 model_instance_id: u.model_instance_id,
                             }),
                             req_id,
-                        );
+                        ) {
+                            tracing::info!("[serve] failed to send UnloadAck: {}", e);
+                        }
                     }
-                    eprintln!("[serve] UnloadModel received, exiting.");
+                    tracing::info!("[serve] UnloadModel received, exiting.");
                     return true;
                 }
                 _ => {}
@@ -462,7 +501,11 @@ fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {
         match data.try_recv_batch(0) {
             Ok(Some(BatchCommand::Prefill(p))) => pending_prefills.push(p),
             Ok(Some(BatchCommand::DiffusionBatch(_))) => {
-                let _ = data.send_diffusion_output(&DiffusionBatchOutput { results: vec![] });
+                if let Err(e) =
+                    data.send_diffusion_output(&DiffusionBatchOutput { results: vec![] })
+                {
+                    tracing::info!("[serve] failed to send empty diffusion output: {}", e);
+                }
             }
             _ => break,
         }
@@ -485,7 +528,9 @@ fn release_removed(
 
 fn maybe_heartbeat(control: &ControlPump, active_n: usize, last: &mut Instant, interval: Duration) {
     if last.elapsed() >= interval {
-        let _ = control.send_heartbeat(active_n);
+        if let Err(e) = control.send_heartbeat(active_n) {
+            tracing::info!("[serve] failed to send heartbeat: {}", e);
+        }
         *last = Instant::now();
     }
 }

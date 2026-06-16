@@ -188,7 +188,36 @@ void fused_add_rmsnorm_kernel_cu_bf16(
     int rows, int dim, float eps,
     cudaStream_t stream
 ) {
-    fused_add_rmsnorm_bf16_kernel_cached<512, 2560><<<rows, 512, 0, stream>>>(norm_output, residual, input, weight, eps);
+    // The `_cached` kernel specializes on DIM at COMPILE TIME (row stride,
+    // vector count, 1/DIM normalization), so one instantiation is correct for
+    // exactly one hidden size. Launching it unconditionally as <512, 2560>
+    // silently corrupted every model whose hidden size != 2560 — e.g.
+    // Llama-3.2-1B (hidden=2048): wrong row offset, OOB vectors, /2560.
+    //
+    // It requires DIM % 8 == 0 and DIM/8 <= 512 (one uint4 vector per thread),
+    // i.e. DIM <= 4096. Dispatch the common hidden sizes to specialized fast
+    // instantiations; route anything else — including DIM > 4096 — to the
+    // generic runtime-`dim` kernel, correct for any dim divisible by 8.
+#define RMSNORM_CACHED_CASE(D)                                                 \
+    case D:                                                                    \
+        fused_add_rmsnorm_bf16_kernel_cached<512, D>                           \
+            <<<rows, 512, 0, stream>>>(norm_output, residual, input, weight,   \
+                                       eps);                                   \
+        return;
+    switch (dim) {
+        RMSNORM_CACHED_CASE(1024)
+        RMSNORM_CACHED_CASE(1536)
+        RMSNORM_CACHED_CASE(2048)
+        RMSNORM_CACHED_CASE(2560)
+        RMSNORM_CACHED_CASE(3072)
+        RMSNORM_CACHED_CASE(4096)
+        default:
+            break;
+    }
+#undef RMSNORM_CACHED_CASE
+    // Generic fallback (dim not precompiled, or dim > 4096).
+    fused_add_rmsnorm_bf16_kernel<512><<<rows, 512, 0, stream>>>(
+        norm_output, residual, input, weight, dim, eps);
 }
 
 

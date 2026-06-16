@@ -174,7 +174,7 @@ pub async fn chat_completions(
             usage: Usage {
                 prompt_tokens,
                 completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
             },
         };
 
@@ -206,5 +206,32 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
         return Err(AppError::bad_request("max_tokens must be greater than 0"));
     }
 
+    reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
+
+    Ok(())
+}
+
+fn reject_unsupported_sampling(
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    seed: Option<u64>,
+) -> Result<(), AppError> {
+    if let Some(value) = frequency_penalty
+        && value != 0.0
+    {
+        return Err(AppError::bad_request(
+            "frequency_penalty is not supported yet",
+        ));
+    }
+    if let Some(value) = presence_penalty
+        && value != 0.0
+    {
+        return Err(AppError::bad_request(
+            "presence_penalty is not supported yet",
+        ));
+    }
+    if seed.is_some() {
+        return Err(AppError::bad_request("seed is not supported for LLM yet"));
+    }
     Ok(())
 }

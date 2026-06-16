@@ -4,6 +4,30 @@ use std::path::{Path, PathBuf};
 fn main() {
     #[cfg(feature = "cuda")]
     {
+        // 1. 自动处理 libclang 环境变量 (彻底免去手动 export LIBCLANG_PATH)
+        auto_configure_libclang();
+
+        let cuda_path = find_cuda_path();
+
+        // 收集所有可能存在 CUDA 头文件和库文件的路径 (应对 Conda 的特殊目录结构)
+        let cuda_includes = get_cuda_include_paths(&cuda_path);
+        let cuda_lib_paths = get_cuda_lib_paths(&cuda_path);
+
+        // 尽早设置环境变量，供 cc-rs 查找 nvcc
+        unsafe {
+            env::set_var("CUDA_PATH", &cuda_path);
+            let nvcc_path = cuda_path.join("bin/nvcc");
+            env::set_var("NVCC", nvcc_path.to_string_lossy().to_string());
+            let new_path = format!(
+                "{}:{}",
+                cuda_path.join("bin").display(),
+                env::var("PATH").unwrap_or_default()
+            );
+            env::set_var("PATH", new_path);
+        }
+
+        eprintln!("RustInfer build: using CUDA from {}", cuda_path.display());
+
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
             return;
         }
@@ -13,16 +37,20 @@ fn main() {
             println!(
                 "cargo:warning=No CUDA kernel files (.cu) found in src/infrastructure/cuda/kernels/"
             );
-            // return; // 如果你希望在这种情况下停止构建
         }
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+
+        // 配置 Rust 链接搜索路径 (加入动态识别的 Conda lib 路径)
+        for lib_path in &cuda_lib_paths {
+            println!("cargo:rustc-link-search=native={}", lib_path.display());
+        }
         println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+
+        // 链接需要的库
         println!("cargo:rustc-link-lib=cublas");
-        // 对应 cublasLt.h
         println!("cargo:rustc-link-lib=cublasLt");
-        // cuDNN (Conv2d 等)
         println!("cargo:rustc-link-lib=cudnn");
         println!("cargo:rustc-link-lib=nvrtc");
+
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         let root = PathBuf::from(manifest_dir);
         let rustinfer_root = root
@@ -30,8 +58,10 @@ fn main() {
             .and_then(|p| p.parent())
             .map(PathBuf::from)
             .unwrap_or_else(|| root.clone());
+
         let cutlass_include = root.join("src/infrastructure/cuda/kernels/third_party");
         let cudnn_frontend_include = find_cudnn_frontend_include(&rustinfer_root);
+
         if !cutlass_include.exists() {
             panic!(
                 "Cutlass include directory not found at: {:?}",
@@ -48,11 +78,13 @@ fn main() {
                 cudnn_frontend_include
             );
         }
-        // 自动检测 GPU 架构，无需手动修改。
+
+        // 自动检测 GPU 架构
         let cuda_arch = detect_cuda_arch();
         println!("cargo:rustc-env=RUSTINFER_CUDA_ARCH={}", cuda_arch);
         eprintln!("RustInfer build: detected CUDA arch {}", cuda_arch);
 
+        // 2. 配置 cc 编译器
         let mut build = cc::Build::new();
         build
             .cuda(true)
@@ -61,10 +93,14 @@ fn main() {
             .flag("-O3")
             .flag("-w")
             .include(&cutlass_include)
-            .include("/usr/include/x86_64-linux-gnu")
             .include(&cudnn_frontend_include)
             .flag("-std=c++17")
             .flag(format!("-arch={}", cuda_arch));
+
+        // 把所有检测到的 CUDA include 路径都喂给 cc
+        for inc in &cuda_includes {
+            build.include(inc);
+        }
 
         for path in &kernel_paths {
             build.file(path);
@@ -73,31 +109,36 @@ fn main() {
         for path in find_files("src/infrastructure/cuda/kernels", "cuh") {
             println!("cargo:rerun-if-changed={}", path.display());
         }
+
         build.compile("infer_kernels");
         println!("cargo:rustc-link-lib=static=infer_kernels");
         println!("cargo:rustc-link-lib=cudart");
 
         let target = env::var("TARGET").expect("TARGET environment variable not set");
 
-        // 4. 使用 bindgen 生成 Rust FFI 绑定
-        let bindings = bindgen::Builder::default()
+        // 3. 配置 bindgen
+        let mut bindgen_builder = bindgen::Builder::default()
             .header("src/infrastructure/cuda/wrapper.h")
-            // 告诉 bindgen/libclang CUDA 头文件的位置
-            .clang_arg(format!(
-                "-I{}/include",
-                env::var("CUDA_HOME").unwrap_or("/usr/local/cuda".into())
-            ))
-            .clang_arg("-I/usr/include/x86_64-linux-gnu")
-            // wrapper.h 所在目录（让 #include "kernels/total_head.h" 能找到）
+            // .clang_arg("-I/usr/include/x86_64-linux-gnu") //Conda sysroot（系统根目录）与 Host（宿主系统）头文件冲突
             .clang_arg("-Isrc/infrastructure/cuda")
-            // 明确告诉 bindgen 本次编译的目标架构
             .clang_arg(format!("--target={}", target))
             .clang_arg(format!("-I{}", cutlass_include.to_string_lossy()))
-            // ==================== 关键的新增代码在这里 ====================
-            // 强制 libclang 使用 C++ 模式解析头文件
+            .clang_arg("-D_GNU_SOURCE")
+            .clang_arg("-D_POSIX_C_SOURCE=200809L")
+            .clang_arg("-fms-extensions")
             .clang_arg("-x")
-            .clang_arg("c++")
-            // =======================================================
+            .clang_arg("c++");
+
+        // [核心修复] 将所有 CUDA include 路径传递给 bindgen/libclang
+        for inc in &cuda_includes {
+            bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", inc.display()));
+        }
+
+        let bindings = bindgen_builder
+            .enable_cxx_namespaces()
+            .translate_enum_integer_types(true)
+            .derive_default(true)
+            // === allowlists / rustified_enum 保持不变 ===
             .allowlist_function("cudaMalloc")
             .allowlist_function("cudaFree")
             .allowlist_function("cudaMemcpy")
@@ -107,6 +148,7 @@ fn main() {
             .allowlist_function("cudaMemGetInfo")
             .allowlist_function("cudaProfilerStart")
             .allowlist_function("cudaProfilerStop")
+            .allowlist_function("cudaGetLastError")
             .allowlist_function("cudaGetErrorString")
             .allowlist_function("cudaGetErrorName")
             .allowlist_function("cudaGetDevice")
@@ -183,12 +225,75 @@ fn main() {
             .rustified_enum("cudnnMathType_t")
             .generate()
             .expect("Unable to generate bindings");
+
         let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
         bindings
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
     }
 }
+
+// ---------------------------------------------------------
+// 以下是为你新增和优化的辅助工具函数
+// ---------------------------------------------------------
+
+/// 自动配置 libclang，消除找不到 shared libraries 的问题
+#[cfg(feature = "cuda")]
+fn auto_configure_libclang() {
+    if env::var("LIBCLANG_PATH").is_ok() {
+        return; // 用户已手动设置则跳过
+    }
+    // 尝试从 Conda 环境中找
+    if let Ok(conda_prefix) = env::var("CONDA_PREFIX") {
+        let lib_path = PathBuf::from(conda_prefix).join("lib");
+        if lib_path.join("libclang.so").exists() || lib_path.join("libclang.so.1").exists() {
+            unsafe {
+                env::set_var("LIBCLANG_PATH", lib_path.to_str().unwrap());
+            }
+            eprintln!(
+                "RustInfer build: Auto-configured LIBCLANG_PATH={}",
+                lib_path.display()
+            );
+        }
+    }
+}
+
+/// 智能收集所有 CUDA 的 Include 路径（专门对付 Conda）
+#[cfg(feature = "cuda")]
+fn get_cuda_include_paths(cuda_path: &Path) -> Vec<PathBuf> {
+    let mut includes = Vec::new();
+    let candidates = vec![
+        cuda_path.join("include"),
+        cuda_path.join("targets/x86_64-linux/include"), // Conda 藏头文件的最常见位置
+    ];
+    for p in candidates {
+        if p.exists() {
+            includes.push(p);
+        }
+    }
+    includes
+}
+
+/// 智能收集所有 CUDA 的 Lib 路径
+#[cfg(feature = "cuda")]
+fn get_cuda_lib_paths(cuda_path: &Path) -> Vec<PathBuf> {
+    let mut libs = Vec::new();
+    let candidates = vec![
+        cuda_path.join("lib64"),
+        cuda_path.join("lib"),
+        cuda_path.join("targets/x86_64-linux/lib"),
+    ];
+    for p in candidates {
+        if p.exists() {
+            libs.push(p);
+        }
+    }
+    libs
+}
+
+// =========================================================
+// 以下为你原有代码（略作结构调整以保持干净）
+// =========================================================
 
 #[cfg(feature = "cuda")]
 fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
@@ -219,11 +324,9 @@ fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
         }
     }
 
-    // conda environments: CONDA_PREFIX env var, or common conda locations
     if let Ok(conda_prefix) = env::var("CONDA_PREFIX") {
         let prefix = PathBuf::from(conda_prefix);
         candidates.push(prefix.join("include"));
-        // conda's own python site-packages (where pip installs cudnn_frontend)
         if let Ok(entries) = std::fs::read_dir(prefix.join("lib")) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -233,7 +336,7 @@ fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
             }
         }
     }
-    // also check CONDA_ENVS_DIR / ~/miniconda3/envs/*/include etc.
+
     if let Ok(home) = env::var("HOME") {
         let home = PathBuf::from(home);
         for conda_root in [
@@ -244,7 +347,6 @@ fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
             if let Ok(entries) = std::fs::read_dir(&conda_root) {
                 for entry in entries.flatten() {
                     candidates.push(entry.path().join("include"));
-                    // also check lib/python*/site-packages/include in each env
                     if let Ok(lib_entries) = std::fs::read_dir(entry.path().join("lib")) {
                         for lib_entry in lib_entries.flatten() {
                             let name = lib_entry.file_name();
@@ -273,21 +375,14 @@ fn find_cudnn_frontend_include(repo_root: &Path) -> PathBuf {
         }
     }
 
-    panic!(
-        "cuDNN frontend headers not found. Set CUDNN_FRONTEND_INCLUDE_DIR to a directory containing cudnn_frontend.h"
-    );
+    panic!("cuDNN frontend headers not found.");
 }
 
-/// 自动检测当前 GPU 的 compute capability，返回如 "sm_90" 的字符串
-/// 优先读取环境变量 CUDA_ARCH（如 CUDA_ARCH=sm_90a），否则用 nvidia-smi 自动检测
 #[cfg(feature = "cuda")]
 fn detect_cuda_arch() -> String {
-    // 1. 环境变量优先，允许手动覆盖
     if let Ok(arch) = env::var("CUDA_ARCH") {
         return arch;
     }
-
-    // 2. 用 nvidia-smi 查询第一块 GPU 的 compute capability
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=compute_cap",
@@ -297,30 +392,67 @@ fn detect_cuda_arch() -> String {
         ])
         .output();
 
-    if let Ok(output) = output
-        && output.status.success()
-    {
-        let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // cap 格式如 "9.0", "8.9", "8.0"
-        let sm = cap.replace('.', "");
-        return format!("sm_{}", sm);
+    if let Ok(output) = output {
+        if output.status.success() {
+            let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let sm = cap.replace('.', "");
+            return format!("sm_{}", sm);
+        }
     }
-
-    // 3. fallback
     println!("cargo:warning=Could not detect GPU arch, falling back to sm_80");
     "sm_80".to_string()
 }
 
-/// 辅助函数：递归地查找指定目录中具有特定扩展名的文件
+#[cfg(feature = "cuda")]
+fn find_cuda_path() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
+
+    let mut candidates = Vec::new();
+
+    for var in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Ok(value) = env::var(var) {
+            candidates.push(PathBuf::from(value));
+        }
+    }
+
+    if let Ok(conda_prefix) = env::var("CONDA_PREFIX") {
+        candidates.push(PathBuf::from(conda_prefix));
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("miniconda3"));
+        candidates.push(home.join("anaconda3"));
+    }
+    candidates.extend([PathBuf::from("/usr/local/cuda"), PathBuf::from("/opt/cuda")]);
+
+    for candidate in candidates {
+        // 放宽验证条件，支持 Conda 奇特的文件布局
+        if candidate.join("include").exists()
+            || candidate.join("targets/x86_64-linux/include").exists()
+        {
+            if candidate.join("lib64").exists()
+                || candidate.join("lib").exists()
+                || candidate.join("targets/x86_64-linux/lib").exists()
+            {
+                return candidate;
+            }
+        }
+    }
+
+    panic!("CUDA not found. Set CUDA_PATH or CUDA_HOME environment variable");
+}
+
 #[cfg(feature = "cuda")]
 fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let walker = walkdir::WalkDir::new(dir).into_iter();
 
-    // 使用 filter_entry 可以高效跳过整个文件夹，不进入其内部扫描
     let iter = walker.filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        name != "third_party" // 跳过 third_party
+        name != "third_party"
     });
 
     for entry in iter {

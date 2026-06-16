@@ -123,7 +123,7 @@ pub fn matmul<T: Dtype>(
                 // with vocab≈128k) cuBLASLt's parallel scheduling wins.
                 // Threshold validated empirically (commit 6b64bfd).
                 const GEMV_VS_GEMM_N_THRESHOLD: usize = 16_384;
-                let force_gemm = std::env::var("RUSTINFER_FORCE_GEMM").is_ok();
+                let force_gemm = crate::env_flags::force_gemm();
                 if m == 1 && n <= GEMV_VS_GEMM_N_THRESHOLD && !force_gemm {
                     hgemv_bf16_cu(
                         input.data_ptr() as _,

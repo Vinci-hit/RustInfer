@@ -13,23 +13,11 @@
 //! This is application/runtime state: it encodes runner capacity, stable
 //! device addresses, and async host-staging behavior.
 
+use crate::application::model_runner::SeqStep;
 use crate::domain::batch::{BatchKind, BatchPlan, RAGGED_Q_TILE};
 use crate::domain::ports::{MemoryPort, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
-
-/// Caller's per-sequence step description.
-///
-/// Mirrors `app::model_runner::SeqStep` but stays local to the workspace
-/// builder API.
-#[derive(Debug, Clone)]
-pub struct WsSeqStep {
-    pub input_ids: Vec<i32>,
-    pub positions: Vec<i32>,
-    pub kv_write_start: i32,
-    pub kv_len_after: i32,
-    pub block_table: Vec<u32>,
-}
 
 pub struct BatchWorkspace<D: MemoryPort> {
     pub cap_num_tokens: usize,
@@ -109,7 +97,7 @@ impl<D: MemoryPort> BatchWorkspace<D> {
     /// per-step alloc path or surface the error.
     pub fn build_plan(
         &mut self,
-        seqs: &[WsSeqStep],
+        seqs: &[SeqStep],
         device: &D,
     ) -> OpResult<(Tensor<i32, D>, BatchPlan<D>)> {
         let batch = seqs.len();
@@ -131,11 +119,11 @@ impl<D: MemoryPort> BatchWorkspace<D> {
         let mut q_lens: Vec<i32> = Vec::with_capacity(batch);
         for (i, s) in seqs.iter().enumerate() {
             if s.input_ids.is_empty() {
-                return Err(OpError::Shape("WsSeqStep: empty input_ids".into()));
+                return Err(OpError::Shape("SeqStep: empty input_ids".into()));
             }
             if s.input_ids.len() != s.positions.len() {
                 return Err(OpError::Shape(format!(
-                    "WsSeqStep[{}]: input_ids ({}) != positions ({})",
+                    "SeqStep[{}]: input_ids ({}) != positions ({})",
                     i,
                     s.input_ids.len(),
                     s.positions.len(),
@@ -143,7 +131,7 @@ impl<D: MemoryPort> BatchWorkspace<D> {
             }
             if s.block_table.len() > self.cap_max_blocks_per_seq {
                 return Err(OpError::Shape(format!(
-                    "WsSeqStep[{}]: block_table ({}) > cap ({})",
+                    "SeqStep[{}]: block_table ({}) > cap ({})",
                     i,
                     s.block_table.len(),
                     self.cap_max_blocks_per_seq,
@@ -319,7 +307,7 @@ impl<D: MemoryPort> BatchWorkspace<D> {
     /// block tables, and the fixed q_len=1 schedule.
     pub fn build_decode_plan_preserve_input(
         &mut self,
-        steps: &[WsSeqStep],
+        steps: &[SeqStep],
         device: &D,
         block_size: usize,
     ) -> OpResult<(Tensor<i32, D>, BatchPlan<D>)> {

@@ -22,6 +22,8 @@
 //! - [`PlanningSystem::scheduled_segments`] — read-only access to
 //!   the current chunk-size list.
 
+use std::collections::HashMap;
+
 use crate::config::{SchedulerConfig, SchedulerMode};
 use crate::domain::inference_session::lifecycle::{InferenceSession, Prefilling, RequestId};
 use crate::domain::inference_session::queue::WaitingQueue;
@@ -197,15 +199,15 @@ impl PlanningSystem {
     /// subtracted from the scheduled segment length. Continuation chunks
     /// never carry prefix hints and count in full.
     pub fn scheduled_new_kv_tokens(&self) -> usize {
+        let prefix_lengths: HashMap<RequestId, usize> = self
+            .current_prefix_hints
+            .iter()
+            .map(|(id, indices)| (*id, indices.len()))
+            .collect();
         self.current_chunk_sizes
             .iter()
             .map(|(request_id, scheduled_len)| {
-                let prefix_hit = self
-                    .current_prefix_hints
-                    .iter()
-                    .find(|(id, _)| id == request_id)
-                    .map(|(_, indices)| indices.len())
-                    .unwrap_or(0);
+                let prefix_hit = prefix_lengths.get(request_id).copied().unwrap_or(0);
                 scheduled_len.saturating_sub(prefix_hit)
             })
             .sum()

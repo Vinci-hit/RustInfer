@@ -7,19 +7,19 @@
 //!
 //! 本模块提供 [`IncrementalDecoder`]：
 //!
-//! - 维护已收到的 token id 缓冲。
-//! - 每次 [`push`](IncrementalDecoder::push) 后用 tokenizer 重 decode 整个缓冲，
-//!   把末尾「未确认」的字符（即 `U+FFFD`）暂留，等下一个 token 到来再判定是
-//!   真正乱码还是只是被拆开的合法字符。
-//! - 通过相邻两次「已确认输出」求 prefix delta，输出对客户端永远合法的增量。
+//! - 只维护还没确认输出的 token id 窗口，不重 decode 整个历史。
+//! - 窗口末尾出现 `U+FFFD` 时暂留，等后续 token 补齐；窗口过大时按真实乱码
+//!   输出，避免坏 token 让内存和 decode 成本无限增长。
 //!
 //! 解码失败会向上传播为 [`anyhow::Error`]，由调用方决定如何处理（典型做法是
 //! yield Error chunk 并终止流）。
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 const REPLACEMENT_CHAR: char = '\u{FFFD}';
+const MAX_PENDING_TOKENS: usize = 16;
 
 /// 渐进式 UTF-8 解码器。
 ///
@@ -28,21 +28,19 @@ const REPLACEMENT_CHAR: char = '\u{FFFD}';
 ///
 /// **不是** `Sync` 安全的：每个流持有自己的实例，无并发需求。
 pub struct IncrementalDecoder {
-    tokenizer: Tokenizer,
-    /// 累积的 token id 缓冲；tokenizer.decode 需要看到完整序列才能正确处理 BPE 等。
-    token_buffer: Vec<u32>,
-    /// 上次已经 yield 给客户端的「已确认」文本前缀。
-    confirmed: String,
+    tokenizer: Arc<Tokenizer>,
+    /// 还没确认输出的 token id。正常情况下每个 token decode 后立即清空；只有
+    /// UTF-8 byte fallback 等跨 token 字符会短暂积累在这里。
+    pending_tokens: Vec<u32>,
     /// 是否跳过特殊 token（与 tokenizer.decode 的 skip_special_tokens 对应）。
     skip_special_tokens: bool,
 }
 
 impl IncrementalDecoder {
-    pub fn new(tokenizer: Tokenizer) -> Self {
+    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
         Self {
             tokenizer,
-            token_buffer: Vec::new(),
-            confirmed: String::new(),
+            pending_tokens: Vec::new(),
             skip_special_tokens: true,
         }
     }
@@ -53,24 +51,20 @@ impl IncrementalDecoder {
     /// 返回 `Err` 表示 tokenizer decode 失败——上层应当 yield Error chunk 并终止流，
     /// 因为 tokenizer 状态可能已不一致。
     pub fn push(&mut self, token_id: u32) -> Result<Option<String>> {
-        self.token_buffer.push(token_id);
+        self.pending_tokens.push(token_id);
 
-        let full_text = self
+        let text = self
             .tokenizer
-            .decode(&self.token_buffer, self.skip_special_tokens)
+            .decode(&self.pending_tokens, self.skip_special_tokens)
             .map_err(|e| anyhow::anyhow!("{}", e))
             .context("tokenizer.decode failed")?;
 
-        // 取已确认部分：末尾 U+FFFD 之前。
-        let confirmed_now = trim_trailing_replacement(&full_text);
+        if text.ends_with(REPLACEMENT_CHAR) && self.pending_tokens.len() < MAX_PENDING_TOKENS {
+            return Ok(None);
+        }
 
-        // 与上次确认结果求 char-level 公共前缀，输出 delta。
-        // 用 char prefix 而非 byte prefix：tokenizer 在累积过程中可能调整空白
-        // 标准化等，char 级求 delta 更稳健。
-        let delta = char_prefix_delta(&self.confirmed, confirmed_now);
-        self.confirmed = confirmed_now.to_string();
-
-        Ok(if delta.is_empty() { None } else { Some(delta) })
+        self.pending_tokens.clear();
+        Ok(if text.is_empty() { None } else { Some(text) })
     }
 
     /// 流结束时调用，返回任何被滞留在「未确认尾部」的文本。
@@ -78,16 +72,18 @@ impl IncrementalDecoder {
     /// 含义：如果到流结束都还没补全的 `U+FFFD`，那它就是真正的乱码 / 不可解码字节，
     /// 此时应当 yield 出去而不是丢弃，否则用户会丢字。
     pub fn flush(&mut self) -> Result<Option<String>> {
-        let full_text = self
+        if self.pending_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        let text = self
             .tokenizer
-            .decode(&self.token_buffer, self.skip_special_tokens)
+            .decode(&self.pending_tokens, self.skip_special_tokens)
             .map_err(|e| anyhow::anyhow!("{}", e))
             .context("tokenizer.decode failed in flush")?;
 
-        let delta = char_prefix_delta(&self.confirmed, &full_text);
-        self.confirmed = full_text;
-
-        Ok(if delta.is_empty() { None } else { Some(delta) })
+        self.pending_tokens.clear();
+        Ok(if text.is_empty() { None } else { Some(text) })
     }
 }
 
@@ -95,6 +91,7 @@ impl IncrementalDecoder {
 ///
 /// 仅末尾的 `U+FFFD` 视为「未确认」；中间出现的 `U+FFFD` 是真实的不可解码字节
 /// （例如模型确实输出了非法序列），保留并下发，避免静默丢字。
+#[cfg(test)]
 fn trim_trailing_replacement(s: &str) -> &str {
     s.trim_end_matches(REPLACEMENT_CHAR)
 }
@@ -104,6 +101,7 @@ fn trim_trailing_replacement(s: &str) -> &str {
 /// 当 `current` 比 `prev` 短或发生分歧时，返回空串（不输出「回退」给客户端，
 /// 因为 SSE 是只增协议；这种情况通常是 tokenizer 在累积过程中调整了已输出
 /// 字符的形态，我们保守地等下一轮再说）。
+#[cfg(test)]
 fn char_prefix_delta(prev: &str, current: &str) -> String {
     let mut prev_iter = prev.char_indices();
     let mut cur_iter = current.char_indices();
@@ -114,8 +112,8 @@ fn char_prefix_delta(prev: &str, current: &str) -> String {
             (Some((_, p)), Some((ci, c))) if p == c => {
                 common_byte_len = ci + c.len_utf8();
             }
-            (None, _) => break,             // prev 耗尽，current 剩余即为新增
-            _ => return String::new(),      // 出现分歧，保守不下发回退
+            (None, _) => break,        // prev 耗尽，current 剩余即为新增
+            _ => return String::new(), // 出现分歧，保守不下发回退
         }
     }
 
@@ -135,7 +133,10 @@ mod tests {
         assert_eq!(trim_trailing_replacement("abc\u{FFFD}\u{FFFD}"), "abc");
         // 中间的 U+FFFD 必须保留（视为真实乱码）
         assert_eq!(trim_trailing_replacement("a\u{FFFD}b"), "a\u{FFFD}b");
-        assert_eq!(trim_trailing_replacement("a\u{FFFD}b\u{FFFD}"), "a\u{FFFD}b");
+        assert_eq!(
+            trim_trailing_replacement("a\u{FFFD}b\u{FFFD}"),
+            "a\u{FFFD}b"
+        );
         // 只有 U+FFFD 的情况
         assert_eq!(trim_trailing_replacement("\u{FFFD}"), "");
         assert_eq!(trim_trailing_replacement("\u{FFFD}\u{FFFD}"), "");
@@ -215,7 +216,7 @@ mod tests {
             return;
         };
 
-        let mut dec = IncrementalDecoder::new(tk);
+        let mut dec = IncrementalDecoder::new(Arc::new(tk));
         let mut out = String::new();
         for id in token_ids {
             if let Some(s) = dec.push(id).expect("decode") {
@@ -240,7 +241,7 @@ mod tests {
             return;
         };
 
-        let mut dec = IncrementalDecoder::new(tk);
+        let mut dec = IncrementalDecoder::new(Arc::new(tk));
         let mut out = String::new();
         for id in token_ids {
             if let Some(s) = dec.push(id).expect("decode") {

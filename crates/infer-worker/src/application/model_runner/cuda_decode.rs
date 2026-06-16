@@ -1,5 +1,4 @@
 use super::{ModelRunner, SeqStep};
-use crate::application::batch_workspace::WsSeqStep;
 use crate::application::cuda_graph_runner::{CudaGraphRunner, GraphDecision};
 use crate::application::forward_workspace::ForwardWorkspace;
 use crate::domain::model::{ForwardContext, LlmModel};
@@ -31,7 +30,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
     /// For each `size` (in reverse — largest first for memory-friendly
     /// allocator behaviour):
     ///
-    ///   1. Build a dummy decode-only `WsSeqStep` of `size` sequences,
+    ///   1. Build a dummy decode-only `SeqStep` of `size` sequences,
     ///      each with `input_ids=[0]`, `positions=[0]`, kv_write_start=0,
     ///      kv_len_after=1, and a block_table that points entirely at the
     ///      LAST physical block (used as a graph-only scratch block — its
@@ -59,16 +58,18 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             .filter(|&s| s <= self.cap_batch)
             .collect();
         if usable_sizes.is_empty() {
-            eprintln!(
-                "[graph] cap_batch={} too small for any capture size in {:?}; skipping",
-                self.cap_batch, self.capture_sizes,
+            tracing::warn!(
+                cap_batch = self.cap_batch,
+                capture_sizes = ?self.capture_sizes,
+                "cap_batch too small for any capture size; skipping graph capture"
             );
             return Ok(());
         }
         if usable_sizes.len() != self.capture_sizes.len() {
-            eprintln!(
-                "[graph] capping capture sizes to {:?} (cap_batch={})",
-                usable_sizes, self.cap_batch,
+            tracing::warn!(
+                usable_sizes = ?usable_sizes,
+                cap_batch = self.cap_batch,
+                "capping capture sizes"
             );
         }
         let scratch_block = (self.kv_pool.num_blocks - 1) as u32;
@@ -112,18 +113,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
     /// Run a single decode-only forward into `forward_ws.argmax_out_dev`.
     /// Includes build_plan (H2D upload). Used for warmup passes and eager fallback.
     fn run_decode_only_step(&mut self, seqs: &[SeqStep]) -> OpResult<()> {
-        let ws_seqs: Vec<WsSeqStep> = seqs
-            .iter()
-            .map(|s| WsSeqStep {
-                input_ids: s.input_ids.clone(),
-                positions: s.positions.clone(),
-                kv_write_start: s.kv_write_start,
-                kv_len_after: s.kv_len_after,
-                block_table: s.block_table.clone(),
-            })
-            .collect();
-
-        let (input_ids_dev, mut plan) = self.batch_ws.build_plan(&ws_seqs, &self.device)?;
+        let (input_ids_dev, mut plan) = self.batch_ws.build_plan(seqs, &self.device)?;
         plan.block_size = self.block_size;
 
         let logits = {
@@ -178,7 +168,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         }
         self.validate_steps(seqs)?;
         // Escape hatch for A/B benchmarking against eager.
-        if std::env::var("RUSTINFER_DISABLE_GRAPH").is_ok() {
+        if crate::env_flags::disable_graph() {
             return self.step_batch_eager(seqs);
         }
         let all_decode = seqs.iter().all(|s| s.input_ids.len() == 1);
@@ -217,32 +207,20 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             });
         }
 
-        // 1. Async-upload the (padded) plan into batch_ws.
-        let ws_seqs: Vec<WsSeqStep> = padded
-            .iter()
-            .map(|s| WsSeqStep {
-                input_ids: s.input_ids.clone(),
-                positions: s.positions.clone(),
-                kv_write_start: s.kv_write_start,
-                kv_len_after: s.kv_len_after,
-                block_table: s.block_table.clone(),
-            })
-            .collect();
-        let _ = self.batch_ws.build_plan(&ws_seqs, &self.device)?;
+        // 1. Async-upload the (padded) plan into batch_ws. `build_plan` reads
+        // `SeqStep` directly — no adapter clone (H1).
+        let _ = self.batch_ws.build_plan(&padded, &self.device)?;
 
         // 2. Launch the captured graph.
-        if std::env::var("RUSTINFER_TRACE_GRAPH").is_ok() {
-            eprintln!(
-                "[graph] replay slot={:?} batch={}->{}",
-                slot, batch, padded_size
-            );
+        if crate::env_flags::trace_graph() {
+            tracing::trace!(slot = ?slot, batch, padded_size, "graph replay");
         }
 
         // Profiling: enable with RUSTINFER_PROFILE_GPU=1. We wrap the
         // graph launch with a cudaEvent pair to measure pure GPU time.
         // The wall-clock around the whole step_batch_with_graph call is
         // measured outside the launch (build_plan + D2H included).
-        let prof = std::env::var("RUSTINFER_PROFILE_GPU").is_ok();
+        let prof = crate::env_flags::profile_gpu();
         let wall_t0 = std::time::Instant::now();
         let mut ev_t0: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
         let mut ev_t1: crate::infrastructure::cuda::ffi::cudaEvent_t = std::ptr::null_mut();
@@ -293,7 +271,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
 
     /// True when a decode-only CUDA graph replay is available for `batch`.
     pub fn can_replay_decode_graph(&self, batch: usize) -> bool {
-        if batch == 0 || std::env::var("RUSTINFER_DISABLE_GRAPH").is_ok() {
+        if batch == 0 || crate::env_flags::disable_graph() {
             return false;
         }
         let Some(graph_runner) = self.graph_runner.as_ref() else {
@@ -475,7 +453,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
                 seqs.len(),
             )));
         }
-        if std::env::var("RUSTINFER_DISABLE_GRAPH").is_ok() {
+        if crate::env_flags::disable_graph() {
             return Err(OpError::unsupported(
                 "cuda",
                 "ABC compact decode requires graph replay",
@@ -516,18 +494,8 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             });
         }
 
-        let ws_seqs: Vec<WsSeqStep> = padded
-            .iter()
-            .map(|s| WsSeqStep {
-                input_ids: s.input_ids.clone(),
-                positions: s.positions.clone(),
-                kv_write_start: s.kv_write_start,
-                kv_len_after: s.kv_len_after,
-                block_table: s.block_table.clone(),
-            })
-            .collect();
         let (_, mut plan) = self.batch_ws.build_decode_plan_preserve_input(
-            &ws_seqs,
+            &padded,
             &self.device,
             self.block_size,
         )?;
@@ -682,7 +650,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         max_new_tokens: usize,
         eos_ids: &[i32],
     ) -> OpResult<Vec<i32>> {
-        let debug = std::env::var("RUSTINFER_DEBUG_LAYERS").is_ok();
+        let debug = crate::env_flags::debug_layers();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let num_prompt = prompt_ids.len();
         if num_prompt == 0 {
@@ -700,7 +668,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         // Prefill is multi-token -> eager.
         let mut last = self.step_batch_eager(&[prefill_seq])?[0];
         if debug {
-            eprintln!("[runner] prefill argmax -> token {}", last);
+            tracing::debug!(token = last, "prefill argmax");
         }
         generated.push(last);
         if eos_ids.contains(&last) {
@@ -720,9 +688,13 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             // Decode -> graph (auto-falls-back to eager if not primed).
             let new = self.step_batch_with_graph(&[step])?[0];
             if debug {
-                eprintln!(
-                    "[runner] graph-decode {:>2}: in={:>6} pos={} kv_len={} -> token {}",
-                    i, last, kv_write_start, kv_len_after, new,
+                tracing::debug!(
+                    step = i,
+                    input = last,
+                    pos = kv_write_start,
+                    kv_len = kv_len_after,
+                    token = new,
+                    "graph-decode"
                 );
             }
             last = new;
@@ -765,7 +737,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         {
             return self.generate_with_graph(prompt_ids, max_new_tokens, eos_ids);
         }
-        let debug = std::env::var("RUSTINFER_DEBUG_LAYERS").is_ok();
+        let debug = crate::env_flags::debug_layers();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let block_table: Vec<u32> = (0..self.max_blocks_per_seq as u32).collect();
 
@@ -779,7 +751,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         };
         let mut last = self.step_batch_eager(&[prefill_seq])?[0];
         if debug {
-            eprintln!("[pipe] prefill argmax -> token {}", last);
+            tracing::debug!(token = last, "pipe prefill argmax");
         }
         generated.push(last);
         if eos_ids.contains(&last) {
@@ -817,9 +789,12 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             last = token;
             generated_count += 1;
             if debug {
-                eprintln!(
-                    "[pipe] decode {:>2}: pos={} kv_len={} -> token {}",
-                    i, kv_write_start, kv_len_after, last,
+                tracing::debug!(
+                    step = i,
+                    pos = kv_write_start,
+                    kv_len = kv_len_after,
+                    token = last,
+                    "pipe decode"
                 );
             }
             generated.push(last);

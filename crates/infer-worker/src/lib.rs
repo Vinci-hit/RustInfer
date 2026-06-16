@@ -22,5 +22,6 @@
 
 pub mod application;
 pub mod domain;
+pub mod env_flags;
 pub mod infrastructure;
 pub mod models;

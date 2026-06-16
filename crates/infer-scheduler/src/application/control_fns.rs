@@ -124,34 +124,37 @@ fn handle_alloc_failed(
     let target_slots = req.shortfall.max(five_pct).max(1);
 
     if req.round == 0 {
-        let lru_total = radix.lru_total_indices() as u32;
-        let target = target_slots.min(lru_total);
-        if target > 0 {
-            let indices = radix.evict_collect_at_least(target as usize);
-            if !indices.is_empty() {
-                release_budget_up_to(kv_budget, indices.len() as u32, "alloc_failed_round0");
-                tracing::info!(
-                    worker_id = %req.worker_id,
-                    shortfall = req.shortfall,
-                    target,
-                    freed = indices.len(),
-                    "AllocFailed round=0: evicting RadixTree LRU leaves"
-                );
-                let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
+        let target = target_slots;
+        let indices = radix.evict_collect_at_least(target as usize);
+        if !indices.is_empty() {
+            release_budget_up_to(kv_budget, indices.len() as u32, "alloc_failed_round0");
+            tracing::info!(
+                worker_id = %req.worker_id,
+                shortfall = req.shortfall,
+                target,
+                freed = indices.len(),
+                "AllocFailed round=0: evicting RadixTree LRU leaves"
+            );
+            let msg =
+                infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
                     infer_protocol::scheduler_to_worker_control::FreeKvIndices {
                         model_instance_id: worker_group.model_instance_id.clone(),
                         indices,
                     },
                 );
-                let _ = control_cmd.send_to(target_worker, msg);
-                return ControlOutcome::noop();
+            if let Err(e) = control_cmd.send_to(target_worker, msg) {
+                tracing::error!(
+                    worker = %target_worker,
+                    error = %e,
+                    "failed to send AllocFailed round=0 FreeKvIndices"
+                );
             }
+            return ControlOutcome::noop();
         }
         tracing::debug!(
             worker_id = %req.worker_id,
             shortfall = req.shortfall,
-            five_pct,
-            lru_total,
+            target,
             "AllocFailed round=0: nothing in LRU — escalating to preemption"
         );
     }
@@ -243,7 +246,13 @@ fn handle_alloc_failed(
             free_indices,
         },
     );
-    let _ = control_cmd.send_to(target_worker, msg);
+    if let Err(e) = control_cmd.send_to(target_worker, msg) {
+        tracing::error!(
+            worker = %target_worker,
+            error = %e,
+            "failed to send AllocFailed round=1 Preempt"
+        );
+    }
 
     ControlOutcome::noop()
 }
@@ -283,7 +292,13 @@ fn handle_worker_step_error(
                         indices,
                     },
                 );
-            let _ = control_cmd.send_to(target_worker, msg);
+            if let Err(e) = control_cmd.send_to(target_worker, msg) {
+                tracing::error!(
+                    worker = %target_worker,
+                    error = %e,
+                    "failed to send worker StepError FreeKvIndices"
+                );
+            }
         }
     }
     let failed_ids = failed_sequence_ids
