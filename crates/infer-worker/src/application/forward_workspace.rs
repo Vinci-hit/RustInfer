@@ -135,6 +135,11 @@ pub struct ForwardWorkspace<T: Dtype, D: MemoryPort> {
     decode_max_tokens_host: Vec<i32>,
     decode_ignore_eos_host: Vec<i32>,
     decode_eos_ids_host: Vec<i32>,
+    decode_counts_host: Vec<i32>,
+    decode_active_tokens_host: Vec<i32>,
+    decode_active_src_rows_host: Vec<i32>,
+    decode_finished_src_rows_host: Vec<i32>,
+    decode_finished_tokens_host: Vec<i32>,
 }
 
 impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
@@ -204,6 +209,11 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
         let decode_max_tokens_host = vec![0i32; cap_batch.max(1)];
         let decode_ignore_eos_host = vec![0i32; cap_batch.max(1)];
         let decode_eos_ids_host = vec![0i32; cap_num_tokens.max(1)];
+        let decode_counts_host = vec![0i32; 3];
+        let decode_active_tokens_host = vec![0i32; cap_batch.max(1)];
+        let decode_active_src_rows_host = vec![0i32; cap_batch.max(1)];
+        let decode_finished_src_rows_host = vec![0i32; cap_batch.max(1)];
+        let decode_finished_tokens_host = vec![0i32; cap_batch.max(1)];
 
         Ok(Self {
             cap_num_tokens,
@@ -241,6 +251,11 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
             decode_max_tokens_host,
             decode_ignore_eos_host,
             decode_eos_ids_host,
+            decode_counts_host,
+            decode_active_tokens_host,
+            decode_active_src_rows_host,
+            decode_finished_src_rows_host,
+            decode_finished_tokens_host,
         })
     }
 
@@ -302,6 +317,9 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
     }
     pub fn argmax_out_host_mut(&mut self) -> &mut [i32] {
         &mut self.argmax_out_host
+    }
+    pub fn argmax_out_host(&self) -> &[i32] {
+        &self.argmax_out_host
     }
     pub fn argmax_workspace_mut(&mut self) -> &mut Tensor<f32, D> {
         &mut self.argmax_workspace
@@ -383,6 +401,36 @@ impl<T: Dtype, D: MemoryPort> ForwardWorkspace<T, D> {
     }
     pub fn decode_eos_ids_host_mut(&mut self) -> &mut [i32] {
         &mut self.decode_eos_ids_host
+    }
+    pub fn decode_counts_host_mut(&mut self) -> &mut [i32] {
+        &mut self.decode_counts_host
+    }
+    pub fn decode_counts_host(&self) -> &[i32] {
+        &self.decode_counts_host
+    }
+    pub fn decode_active_tokens_host_mut(&mut self) -> &mut [i32] {
+        &mut self.decode_active_tokens_host
+    }
+    pub fn decode_active_tokens_host(&self) -> &[i32] {
+        &self.decode_active_tokens_host
+    }
+    pub fn decode_active_src_rows_host_mut(&mut self) -> &mut [i32] {
+        &mut self.decode_active_src_rows_host
+    }
+    pub fn decode_active_src_rows_host(&self) -> &[i32] {
+        &self.decode_active_src_rows_host
+    }
+    pub fn decode_finished_src_rows_host_mut(&mut self) -> &mut [i32] {
+        &mut self.decode_finished_src_rows_host
+    }
+    pub fn decode_finished_src_rows_host(&self) -> &[i32] {
+        &self.decode_finished_src_rows_host
+    }
+    pub fn decode_finished_tokens_host_mut(&mut self) -> &mut [i32] {
+        &mut self.decode_finished_tokens_host
+    }
+    pub fn decode_finished_tokens_host(&self) -> &[i32] {
+        &self.decode_finished_tokens_host
     }
 }
 

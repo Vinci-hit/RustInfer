@@ -10,14 +10,15 @@ use infer_protocol::worker_to_scheduler_control::{
 };
 use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
 
+use crate::application::decode_engine::DecodeEngine;
 use crate::application::forward_workspace::ForwardWorkspace;
 use crate::application::model_runner::ModelRunner;
-use crate::application::worker_scheduler::{PrefillCtx, handle_prefill, run_decode_step};
-use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
+use crate::application::worker_scheduler::{handle_prefill, PrefillCtx};
+use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
 use crate::domain::ports::OpError;
-use crate::infrastructure::cuda::{Cuda, device_utils, kernels::attention_paged};
+use crate::infrastructure::cuda::{device_utils, kernels::attention_paged, Cuda};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
 use crate::models::loader::LoadConfig;
@@ -33,7 +34,7 @@ unsafe extern "C" {
 struct WorkerCtx<'a> {
     active: &'a mut ActiveSeqMap,
     prefilling: &'a mut PrefillSeqMap,
-    decode_rows: &'a mut DecodeRows,
+    decode_engine: &'a mut DecodeEngine,
     kv_allocator: &'a mut GlobalKvAllocator,
     enable_prefix_caching: bool,
 }
@@ -82,14 +83,10 @@ where
     } else {
         let bytes_per_block =
             model.num_layers() * 2 * bs.block_size * model.kv_dim() * std::mem::size_of::<bf16>();
-        let fraction = bs
-            .load
-            .kv_cache_memory_fraction
-            .unwrap_or(0.9)
-            .clamp(
-                crate::application::tuning::KV_MEM_FRACTION_MIN,
-                crate::application::tuning::KV_MEM_FRACTION_MAX,
-            );
+        let fraction = bs.load.kv_cache_memory_fraction.unwrap_or(0.9).clamp(
+            crate::application::tuning::KV_MEM_FRACTION_MIN,
+            crate::application::tuning::KV_MEM_FRACTION_MAX,
+        );
         let (free, total) =
             device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
         let budget = (free as f64 * fraction as f64) as usize;
@@ -121,7 +118,10 @@ where
     let pool_blocks = num_blocks + 1;
     tracing::info!(
         "[bootstrap] paged KV pool: block_size={} num_blocks={} pool_blocks={} (last block reserved as graph scratch) max_blocks_per_seq={}",
-        bs.block_size, num_blocks, pool_blocks, max_blocks_per_seq,
+        bs.block_size,
+        num_blocks,
+        pool_blocks,
+        max_blocks_per_seq,
     );
 
     let cap_num_tokens = bs.load.max_batch_tokens;
@@ -185,7 +185,8 @@ where
     let mut kv_allocator = GlobalKvAllocator::new(num_blocks as u32);
     tracing::info!(
         "[serve] worker-owned KV allocator: total={} (block_size={})",
-        num_blocks, bs.block_size,
+        num_blocks,
+        bs.block_size,
     );
     let enable_prefix_caching = bs.load.enable_prefix_caching;
     tracing::info!(
@@ -198,13 +199,13 @@ where
     );
     let mut profile_step_count: u32 = 0;
     let mut profile_started = false;
-    let mut decode_rows = DecodeRows::new();
+    let mut decode_engine = DecodeEngine::new();
 
     loop {
         let mut ctx = WorkerCtx {
             active: &mut active,
             prefilling: &mut prefilling,
-            decode_rows: &mut decode_rows,
+            decode_engine: &mut decode_engine,
             kv_allocator: &mut kv_allocator,
             enable_prefix_caching,
         };
@@ -275,7 +276,7 @@ where
                 let mut ctx = WorkerCtx {
                     active: &mut active,
                     prefilling: &mut prefilling,
-                    decode_rows: &mut decode_rows,
+                    decode_engine: &mut decode_engine,
                     kv_allocator: &mut kv_allocator,
                     enable_prefix_caching,
                 };
@@ -308,7 +309,7 @@ where
                 let mut ctx = WorkerCtx {
                     active: &mut active,
                     prefilling: &mut prefilling,
-                    decode_rows: &mut decode_rows,
+                    decode_engine: &mut decode_engine,
                     kv_allocator: &mut kv_allocator,
                     enable_prefix_caching,
                 };
@@ -342,11 +343,10 @@ where
             // (the main-cadence decode below covers it) and during a dedicated
             // CUDA profiling run (which counts only main-cadence steps).
             if i + 1 < num_prefills && !active.is_empty() && profile_cuda_steps.is_none() {
-                if let Err(e) = run_decode_step(
+                if let Err(e) = decode_engine.run_step(
                     &mut runner,
                     &mut active,
                     &mut prefilling,
-                    &mut decode_rows,
                     &mut kv_allocator,
                     control,
                     data,
@@ -382,11 +382,10 @@ where
                 }
             }
 
-            if let Err(e) = run_decode_step(
+            if let Err(e) = decode_engine.run_step(
                 &mut runner,
                 &mut active,
                 &mut prefilling,
-                &mut decode_rows,
                 &mut kv_allocator,
                 control,
                 data,
@@ -428,10 +427,7 @@ where
     }
 }
 
-fn drain_control(
-    control: &ControlPump,
-    ctx: &mut WorkerCtx<'_>,
-) -> bool {
+fn drain_control(control: &ControlPump, ctx: &mut WorkerCtx<'_>) -> bool {
     loop {
         match control.try_recv(0) {
             Ok(Some((msg, req_id))) => match msg {
@@ -440,12 +436,7 @@ fn drain_control(
                     return true;
                 }
                 SchedulerControlMessage::Cancel(c) => {
-                    apply_cancel(
-                        control,
-                        ctx,
-                        c.sequence_id,
-                        req_id,
-                    );
+                    apply_cancel(control, ctx, c.sequence_id, req_id);
                 }
                 SchedulerControlMessage::FreeKvIndices(free) => {
                     if !free.indices.is_empty() {
@@ -453,11 +444,7 @@ fn drain_control(
                     }
                 }
                 SchedulerControlMessage::Preempt(p) => {
-                    apply_preempt(
-                        ctx,
-                        &p.sequence_ids,
-                        &p.free_indices,
-                    );
+                    apply_preempt(ctx, &p.sequence_ids, &p.free_indices);
                 }
                 SchedulerControlMessage::Ping => {
                     if let Err(e) = control.send(WorkerControlMessage::Pong, req_id) {
@@ -465,12 +452,7 @@ fn drain_control(
                     }
                 }
                 SchedulerControlMessage::Drain(d) => {
-                    apply_drain(
-                        control,
-                        ctx,
-                        d.mode,
-                        req_id,
-                    );
+                    apply_drain(control, ctx, d.mode, req_id);
                 }
                 SchedulerControlMessage::UnloadModel(u) => {
                     if req_id.is_correlated() {
@@ -506,12 +488,14 @@ fn apply_cancel(
     let removed_prefill = ctx.prefilling.remove(&sequence_id);
     let removed_flag = removed.is_some() || removed_prefill.is_some();
     if let Some(removed) = removed {
-        ctx.kv_allocator.release_owned(&removed.block_table, ctx.enable_prefix_caching);
-        ctx.decode_rows.retain_active(ctx.active);
+        ctx.kv_allocator
+            .release_owned(&removed.block_table, ctx.enable_prefix_caching);
+        ctx.decode_engine.retain_active(ctx.active);
         tracing::info!("[serve] cancelled seq {}", sequence_id);
     }
     if let Some(removed) = removed_prefill {
-        ctx.kv_allocator.release_owned(&removed.block_table, ctx.enable_prefix_caching);
+        ctx.kv_allocator
+            .release_owned(&removed.block_table, ctx.enable_prefix_caching);
         tracing::info!("[serve] cancelled prefilling seq {}", sequence_id);
     }
     if req_id.is_correlated() {
@@ -529,22 +513,20 @@ fn apply_cancel(
 
 /// Preempt a set of victims: evict each from `active`/`prefilling`, release
 /// their KV, resync decode rows, then return any scheduler-freed slots.
-fn apply_preempt(
-    ctx: &mut WorkerCtx<'_>,
-    sequence_ids: &[u64],
-    free_indices: &[u32],
-) {
+fn apply_preempt(ctx: &mut WorkerCtx<'_>, sequence_ids: &[u64], free_indices: &[u32]) {
     for sid in sequence_ids {
         if let Some(removed) = ctx.active.remove(sid) {
-            ctx.kv_allocator.release_owned(&removed.block_table, ctx.enable_prefix_caching);
+            ctx.kv_allocator
+                .release_owned(&removed.block_table, ctx.enable_prefix_caching);
             tracing::info!("[serve] preempted seq {}", sid);
         }
         if let Some(removed) = ctx.prefilling.remove(sid) {
-            ctx.kv_allocator.release_owned(&removed.block_table, ctx.enable_prefix_caching);
+            ctx.kv_allocator
+                .release_owned(&removed.block_table, ctx.enable_prefix_caching);
             tracing::info!("[serve] preempted prefilling seq {}", sid);
         }
     }
-    ctx.decode_rows.retain_active(ctx.active);
+    ctx.decode_engine.retain_active(ctx.active);
     if !free_indices.is_empty() {
         ctx.kv_allocator.free(free_indices);
     }
@@ -552,21 +534,18 @@ fn apply_preempt(
 
 /// Drain: on `Immediate`, evict every sequence and release all KV; always ack
 /// with the post-drain remaining-request count if correlated.
-fn apply_drain(
-    control: &ControlPump,
-    ctx: &mut WorkerCtx<'_>,
-    mode: DrainMode,
-    req_id: RequestId,
-) {
+fn apply_drain(control: &ControlPump, ctx: &mut WorkerCtx<'_>, mode: DrainMode, req_id: RequestId) {
     if matches!(mode, DrainMode::Immediate) {
         // P1: Iterate drain() directly instead of collecting into a Vec.
         for (_, seq) in ctx.active.drain() {
-            ctx.kv_allocator.release_owned(&seq.block_table, ctx.enable_prefix_caching);
+            ctx.kv_allocator
+                .release_owned(&seq.block_table, ctx.enable_prefix_caching);
         }
         for (_, seq) in ctx.prefilling.drain() {
-            ctx.kv_allocator.release_owned(&seq.block_table, ctx.enable_prefix_caching);
+            ctx.kv_allocator
+                .release_owned(&seq.block_table, ctx.enable_prefix_caching);
         }
-        ctx.decode_rows.clear();
+        ctx.decode_engine.clear();
     }
     if req_id.is_correlated() {
         if let Err(e) = control.send(

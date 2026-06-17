@@ -5,11 +5,11 @@ use crate::domain::model::{ForwardContext, LlmModel};
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::{
-    Cuda,
     kernels::argmax_batched::argmax_batched_decode_into,
     kernels::gather_merge::{
-        MergeCompactDecodeArgs, append_decode_admissions_into, merge_compact_decode_into,
+        append_decode_admissions_into, merge_compact_decode_into, MergeCompactDecodeArgs,
     },
+    Cuda,
 };
 
 #[derive(Debug, Clone)]
@@ -25,6 +25,92 @@ pub struct DecodeCompactOutput {
 }
 
 impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, Cuda, M> {
+    fn wait_for_prior_copy_out_before_overwrite(&mut self) -> OpResult<()> {
+        if self.decode_copy_out_recorded {
+            self.device.config.compute_wait_copy_out()?;
+        }
+        Ok(())
+    }
+
+    fn download_argmax_out_copy_out(&mut self, count: usize) -> OpResult<Vec<i32>> {
+        let host_cap = self.forward_ws.argmax_out_host().len();
+        if count > host_cap {
+            return Err(OpError::Shape(format!(
+                "download_argmax_out_copy_out: count ({}) > host capacity ({})",
+                count, host_cap,
+            )));
+        }
+
+        let cfg = self.device.config.clone();
+        cfg.record_compute_a()?;
+        cfg.copy_out_wait_compute_a()?;
+
+        let dst_ptr = {
+            let host = self.forward_ws.argmax_out_host_mut();
+            host.as_mut_ptr() as *mut std::ffi::c_void
+        };
+        let src_ptr = self.forward_ws.argmax_out_dev().data_ptr() as *const std::ffi::c_void;
+        unsafe {
+            cfg.download_d2h_copy_out(dst_ptr, src_ptr, count * std::mem::size_of::<i32>())?;
+        }
+        cfg.record_copy_out()?;
+        self.decode_copy_out_recorded = true;
+        cfg.synchronize_copy_out()?;
+
+        Ok(self.forward_ws.argmax_out_host()[..count].to_vec())
+    }
+
+    fn download_decode_compact_output_copy_out(&mut self, batch: usize) -> OpResult<()> {
+        if batch > self.cap_batch {
+            return Err(OpError::Shape(format!(
+                "download_decode_compact_output_copy_out: batch ({}) > cap ({})",
+                batch, self.cap_batch,
+            )));
+        }
+
+        let cfg = self.device.config.clone();
+        cfg.record_compute_a()?;
+        cfg.copy_out_wait_compute_a()?;
+
+        let counts_dev = self.forward_ws.decode_counts_dev().data_ptr() as *const std::ffi::c_void;
+        let active_tokens_dev = self.batch_ws.input_ids_dev().data_ptr() as *const std::ffi::c_void;
+        let active_src_rows_dev =
+            self.forward_ws.decode_active_src_rows_dev().data_ptr() as *const std::ffi::c_void;
+        let finished_src_rows_dev =
+            self.forward_ws.decode_finished_src_rows_dev().data_ptr() as *const std::ffi::c_void;
+        let finished_tokens_dev =
+            self.forward_ws.decode_finished_tokens_dev().data_ptr() as *const std::ffi::c_void;
+
+        let (
+            counts_host,
+            active_tokens_host,
+            active_src_rows_host,
+            finished_src_rows_host,
+            finished_tokens_host,
+        ) = {
+            let ws = &mut self.forward_ws;
+            (
+                ws.decode_counts_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
+                ws.decode_active_tokens_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
+                ws.decode_active_src_rows_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
+                ws.decode_finished_src_rows_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
+                ws.decode_finished_tokens_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+
+        let elem = std::mem::size_of::<i32>();
+        unsafe {
+            cfg.download_d2h_copy_out(counts_host, counts_dev, 3 * elem)?;
+            cfg.download_d2h_copy_out(active_tokens_host, active_tokens_dev, batch * elem)?;
+            cfg.download_d2h_copy_out(active_src_rows_host, active_src_rows_dev, batch * elem)?;
+            cfg.download_d2h_copy_out(finished_src_rows_host, finished_src_rows_dev, batch * elem)?;
+            cfg.download_d2h_copy_out(finished_tokens_host, finished_tokens_dev, batch * elem)?;
+        }
+        cfg.record_copy_out()?;
+        self.decode_copy_out_recorded = true;
+        cfg.synchronize_copy_out()
+    }
+
     /// Capture all decode-only graphs in `capture_sizes`.
     ///
     /// For each `size` (in reverse — largest first for memory-friendly
@@ -243,6 +329,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
                 }
             }
         }
+        self.wait_for_prior_copy_out_before_overwrite()?;
         self.device.config.launch(slot)?;
         let prof_ok = prof && !ev_t0.is_null() && !ev_t1.is_null();
         if prof_ok {
@@ -251,9 +338,9 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             }
         }
 
-        // 3. Synchronous D2H of the argmax_out_dev (just `padded_size` ints).
+        // 3. Copy-out stream D2H of argmax_out_dev (just `padded_size` ints).
         // We only return the first `batch` of them.
-        let host = self.forward_ws.argmax_out_dev().to_host_vec()?;
+        let host = self.download_argmax_out_copy_out(padded_size)?;
 
         if prof_ok {
             unsafe {
@@ -513,6 +600,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         )?;
 
         let cfg = self.device.config.clone();
+        self.wait_for_prior_copy_out_before_overwrite()?;
         cfg.launch(slot)?;
         cfg.compute_wait_copy_in()?;
 
@@ -540,7 +628,9 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             })?;
         }
 
-        let counts = self.forward_ws.decode_counts_dev().to_host_vec()?;
+        self.download_decode_compact_output_copy_out(batch)?;
+
+        let counts = self.forward_ws.decode_counts_host();
         if counts.len() < 3 {
             return Err(OpError::Kernel("compact counts buffer too small".into()));
         }
@@ -560,46 +650,11 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             )));
         }
 
-        let active_tokens = self
-            .batch_ws
-            .input_ids_dev()
-            .view_raw(
-                Shape::from_slice(&[active_n]),
-                Shape::from_slice(&[active_n.max(1)]).contiguous_strides(),
-                0,
-                true,
-            )
-            .to_host_vec()?;
-        let active_src_rows = self
-            .forward_ws
-            .decode_active_src_rows_dev()
-            .view_raw(
-                Shape::from_slice(&[active_n]),
-                Shape::from_slice(&[active_n.max(1)]).contiguous_strides(),
-                0,
-                true,
-            )
-            .to_host_vec()?;
-        let finished_src_rows = self
-            .forward_ws
-            .decode_finished_src_rows_dev()
-            .view_raw(
-                Shape::from_slice(&[finished_n]),
-                Shape::from_slice(&[finished_n.max(1)]).contiguous_strides(),
-                0,
-                true,
-            )
-            .to_host_vec()?;
-        let finished_tokens = self
-            .forward_ws
-            .decode_finished_tokens_dev()
-            .view_raw(
-                Shape::from_slice(&[finished_n]),
-                Shape::from_slice(&[finished_n.max(1)]).contiguous_strides(),
-                0,
-                true,
-            )
-            .to_host_vec()?;
+        let active_tokens = self.forward_ws.decode_active_tokens_host()[..active_n].to_vec();
+        let active_src_rows = self.forward_ws.decode_active_src_rows_host()[..active_n].to_vec();
+        let finished_src_rows =
+            self.forward_ws.decode_finished_src_rows_host()[..finished_n].to_vec();
+        let finished_tokens = self.forward_ws.decode_finished_tokens_host()[..finished_n].to_vec();
 
         let active: Vec<DecodeRowToken> = active_src_rows
             .into_iter()

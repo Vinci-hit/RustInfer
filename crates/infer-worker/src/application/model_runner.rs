@@ -71,6 +71,10 @@ pub struct ModelRunner<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspac
     /// Number of decode steps profiled.
     #[cfg(feature = "cuda")]
     pub prof_step_count: u64,
+    /// True after this runner has recorded at least one copy-out event on
+    /// CUDA's decode copy-out stream.
+    #[cfg(feature = "cuda")]
+    pub decode_copy_out_recorded: bool,
 }
 
 impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRunner<T, D, M> {
@@ -186,6 +190,8 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
             prof_graph_gpu_ns: 0,
             #[cfg(feature = "cuda")]
             prof_step_count: 0,
+            #[cfg(feature = "cuda")]
+            decode_copy_out_recorded: false,
         })
     }
 
@@ -359,7 +365,11 @@ impl<T: Dtype, D: OpBackend, M: LlmModel<T, D, ForwardWorkspace<T, D>>> ModelRun
             block_table: block_table.clone(),
         };
         if debug {
-            tracing::debug!(num_tokens = num_prompt, kv_len_after = num_prompt, "prefill");
+            tracing::debug!(
+                num_tokens = num_prompt,
+                kv_len_after = num_prompt,
+                "prefill"
+            );
         }
         let mut last = self.step_batch(&[prefill_seq])?[0];
         if debug {
