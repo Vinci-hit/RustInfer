@@ -27,6 +27,31 @@ pub async fn run_event_loop(
 ) -> Result<()> {
     tracing::info!("Event loop starting...");
 
+    // Spawn periodic metrics summary (every 5s)
+    use tokio::time::{interval, Duration};
+    let metrics_for_summary = engine.metrics.clone();
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(5));
+        ticker.tick().await; // skip first immediate tick
+        let mut last = metrics_for_summary.snapshot();
+        loop {
+            ticker.tick().await;
+            let current = metrics_for_summary.snapshot();
+            let elapsed = 5.0; // interval is fixed at 5s
+            let delta = current.delta(&last);
+            if delta.completions > 0 {
+                tracing::info!(
+                    "Summary (last 5s): {} reqs, {} tokens, throughput: {:.1} tok/s, avg latency: {:.1} ms",
+                    delta.completions,
+                    delta.tokens_generated,
+                    delta.throughput_tps(elapsed),
+                    delta.avg_latency_ms(),
+                );
+            }
+            last = current;
+        }
+    });
+
     loop {
         let event = engine.poll_next_event(&mut decoded_rx).await;
 

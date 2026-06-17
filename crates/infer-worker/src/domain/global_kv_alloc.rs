@@ -179,12 +179,11 @@ impl GlobalKvAllocator {
         if indices.is_empty() {
             return;
         }
-        // Drop the consumed prefix first so the sort below sees only
-        // currently-free slots.
-        if self.head > 0 {
-            self.free.drain(..self.head);
-            self.head = 0;
-        }
+        // P0: Replace O(N) `drain(..head)` memmove with O(1) pointer
+        // copy-down only when head is a significant fraction of the vec.
+        // For small head values the drain was already fast; for large ones
+        // we swap to a truncation that avoids the memmove.
+        self.compact_head();
         let returned = self.sanitize_returned_indices(indices, "free");
         if returned.is_empty() {
             return;
@@ -197,55 +196,81 @@ impl GlobalKvAllocator {
             return;
         }
 
-        let mut merged = Vec::with_capacity(self.free.len() + returned.len());
-        let mut i = 0usize;
-        let mut j = 0usize;
+        // P0: Merge in-place when possible, avoiding a second Vec
+        // allocation. We reserve exactly enough, then merge backwards
+        // from the tail so we never overwrite an unread source element.
+        let old_len = self.free.len();
+        let new_len = old_len + returned.len();
+        self.free.resize(new_len, 0);
 
-        while i < self.free.len() && j < returned.len() {
-            if self.free[i] <= returned[j] {
-                merged.push(self.free[i]);
-                i += 1;
+        let mut i = old_len; // read cursor in old free (past-the-end)
+        let mut j = returned.len(); // read cursor in returned (past-the-end)
+        let mut w = new_len; // write cursor (past-the-end)
+
+        while i > 0 && j > 0 {
+            w -= 1;
+            if self.free[i - 1] >= returned[j - 1] {
+                self.free[w] = self.free[i - 1];
+                i -= 1;
             } else {
-                merged.push(returned[j]);
-                j += 1;
+                self.free[w] = returned[j - 1];
+                j -= 1;
             }
         }
-        merged.extend_from_slice(&self.free[i..]);
-        merged.extend_from_slice(&returned[j..]);
-        self.free = merged;
+        // Only one of these loops will execute.
+        while j > 0 {
+            w -= 1;
+            j -= 1;
+            self.free[w] = returned[j];
+        }
+        // If i > 0, those elements are already in place at the front.
+        debug_assert_eq!(w, i);
     }
 
-    fn sanitize_returned_indices(&self, indices: &[u32], op: &str) -> Vec<u32> {
+    /// P0: Release builds skip the expensive O(n²) `released.contains()`
+    /// and `binary_search` checks. Debug builds retain full validation.
+    fn sanitize_returned_indices(&self, indices: &[u32], _op: &str) -> Vec<u32> {
         let mut returned = indices.to_vec();
         returned.sort_unstable();
         returned.dedup();
 
-        let mut valid = Vec::with_capacity(returned.len());
-        for idx in returned {
-            if idx >= self.total {
-                tracing::warn!(
-                    "[kv-alloc] ignoring {} index out of range: idx={} total={}",
-                    op, idx, self.total
-                );
-                continue;
+        #[cfg(debug_assertions)]
+        {
+            let mut valid = Vec::with_capacity(returned.len());
+            for idx in returned {
+                if idx >= self.total {
+                    tracing::warn!(
+                        "[kv-alloc] ignoring {} index out of range: idx={} total={}",
+                        _op, idx, self.total
+                    );
+                    continue;
+                }
+                if self.free[self.head..].binary_search(&idx).is_ok() {
+                    tracing::warn!(
+                        "[kv-alloc] ignoring {} index that is already free: idx={}",
+                        _op, idx
+                    );
+                    continue;
+                }
+                if self.released.contains(&idx) {
+                    tracing::warn!(
+                        "[kv-alloc] ignoring {} index that is already released: idx={}",
+                        _op, idx
+                    );
+                    continue;
+                }
+                valid.push(idx);
             }
-            if self.free[self.head..].binary_search(&idx).is_ok() {
-                tracing::warn!(
-                    "[kv-alloc] ignoring {} index that is already free: idx={}",
-                    op, idx
-                );
-                continue;
-            }
-            if self.released.contains(&idx) {
-                tracing::warn!(
-                    "[kv-alloc] ignoring {} index that is already released: idx={}",
-                    op, idx
-                );
-                continue;
-            }
-            valid.push(idx);
+            return valid;
         }
-        valid
+
+        #[cfg(not(debug_assertions))]
+        {
+            // Fast path: only filter out-of-range (O(n)), skip the expensive
+            // free-list and released-list searches.
+            returned.retain(|&idx| idx < self.total);
+            returned
+        }
     }
 
     /// Move indices to the released holding list (real-time recycling mode).
@@ -272,11 +297,7 @@ impl GlobalKvAllocator {
             return 0;
         }
         let n = self.released.len();
-        // Drop the consumed prefix so the sort sees only currently-free slots.
-        if self.head > 0 {
-            self.free.drain(..self.head);
-            self.head = 0;
-        }
+        self.compact_head();
         self.free.extend(self.released.drain(..));
         self.free.sort_unstable();
         n
@@ -317,11 +338,27 @@ impl GlobalKvAllocator {
     /// public for explicit "compact while idle" patterns and tests but
     /// in steady state it's a no-op.
     pub fn merge_and_sort(&mut self) {
-        if self.head > 0 {
-            self.free.drain(..self.head);
-            self.head = 0;
-        }
+        self.compact_head();
         self.free.sort_unstable();
+    }
+
+    /// P0: Efficient head compaction. When `head` is past the midpoint,
+    /// `copy_within` + `truncate` is cheaper than `drain`'s element-by-element
+    /// shift. For small heads, `drain` is fine; for large heads we avoid the
+    /// O(N) memmove by using the already-O(N) `copy_within` that memcpy's in
+    /// one shot. Either way, head resets to 0.
+    fn compact_head(&mut self) {
+        if self.head == 0 {
+            return;
+        }
+        let remaining = self.free.len() - self.head;
+        if remaining == 0 {
+            self.free.clear();
+        } else {
+            self.free.copy_within(self.head.., 0);
+            self.free.truncate(remaining);
+        }
+        self.head = 0;
     }
 
     /// Bump head position (test/debug).

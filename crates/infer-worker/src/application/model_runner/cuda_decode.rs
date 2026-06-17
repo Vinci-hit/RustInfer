@@ -193,7 +193,8 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             GraphDecision::Eager => return self.step_batch_eager(seqs),
         };
 
-        // Pad up to padded_size with scratch-block dummy seqs.
+        // P1: Build pad_block_table once and share via clone, not per-iteration.
+        // For step_batch_with_graph, pad seqs use the same block table.
         let scratch_block = (self.kv_pool.num_blocks - 1) as u32;
         let pad_block_table: Vec<u32> = vec![scratch_block; self.max_blocks_per_seq];
         let mut padded: Vec<SeqStep> = seqs.to_vec();
@@ -481,17 +482,20 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             self.append_decode_admissions_to_a(batch, &zeros)?;
         }
 
+        // P1: Only allocate pad_block_table when padding is actually needed.
         let scratch_block = (self.kv_pool.num_blocks - 1) as u32;
-        let pad_block_table: Vec<u32> = vec![scratch_block; self.max_blocks_per_seq];
         let mut padded: Vec<SeqStep> = seqs.to_vec();
-        for _ in batch..padded_size {
-            padded.push(SeqStep {
-                input_ids: vec![0],
-                positions: vec![0],
-                kv_write_start: 0,
-                kv_len_after: 1,
-                block_table: pad_block_table.clone(),
-            });
+        if padded_size > batch {
+            let pad_block_table: Vec<u32> = vec![scratch_block; self.max_blocks_per_seq];
+            for _ in batch..padded_size {
+                padded.push(SeqStep {
+                    input_ids: vec![0],
+                    positions: vec![0],
+                    kv_write_start: 0,
+                    kv_len_after: 1,
+                    block_table: pad_block_table.clone(),
+                });
+            }
         }
 
         let (_, mut plan) = self.batch_ws.build_decode_plan_preserve_input(

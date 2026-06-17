@@ -69,7 +69,10 @@ pub fn wait_for_relief<C: ReliefControl>(
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .as_millis() as i64;
-        let poll_ms = remaining.min(50).max(1);
+        // P1: Reduced poll granularity from 50ms to 5ms. The scheduler
+        // answers AllocFailed within single-digit ms; a coarser poll added
+        // up to 50ms of wasted latency per round.
+        let poll_ms = remaining.min(5).max(1);
         match control.try_recv(poll_ms) {
             Ok(Some((SchedulerControlMessage::FreeKvIndices(f), _))) => {
                 if !f.indices.is_empty() {

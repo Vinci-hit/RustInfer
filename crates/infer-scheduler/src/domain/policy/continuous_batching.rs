@@ -110,62 +110,102 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
             && seq_budget > 0
             && !waiting.is_empty()
         {
-            // Build the candidate order. Default: FCFS within priority (the
-            // queue's native order). With SJF (B2): shortest prompt first, so
-            // long prompts don't head-of-line block short ones this iteration.
-            let mut candidates: Vec<_> = waiting.iter().collect();
+            // P1: Only collect into a Vec when SJF sorting is needed.
+            // For the common FCFS path, iterate the queue directly.
             if self.sjf {
+                let mut candidates: Vec<_> = waiting.iter().collect();
                 candidates.sort_by_key(|seq| seq.meta.input_ids.len());
-            }
 
-            let mut new_admitted = 0usize;
-            for (seqs_used, seq) in candidates.into_iter().enumerate() {
-                if seqs_used >= seq_budget || kv_budget_remaining == 0 || tile_budget_remaining == 0
-                {
-                    break;
-                }
-                // B1 admission cap: stop after N new prefills this iteration.
-                if self.max_new_prefills_per_iter != 0
-                    && new_admitted >= self.max_new_prefills_per_iter
-                {
-                    break;
-                }
-
-                let prompt_len = seq.meta.input_ids.len();
-                let requested_tokens = match self.chunked_prefill_size {
-                    Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
-                    None => {
-                        // Runtime KV pressure can make the current token
-                        // budget smaller than a full prompt even when static
-                        // chunked prefill is disabled. Emit a partial segment
-                        // instead of either overscheduling the worker or
-                        // starving the request forever.
-                        prompt_len.min(kv_budget_remaining)
+                let mut new_admitted = 0usize;
+                for (seqs_used, seq) in candidates.into_iter().enumerate() {
+                    if seqs_used >= seq_budget || kv_budget_remaining == 0 || tile_budget_remaining == 0
+                    {
+                        break;
                     }
-                };
-                let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
-                let tokens_to_prefill = fit_new_prefill_tokens(
-                    requested_tokens,
-                    kv_budget_remaining,
-                    tile_budget_remaining,
-                    decode_reserve,
-                );
-                if tokens_to_prefill == 0 {
-                    break;
+                    if self.max_new_prefills_per_iter != 0
+                        && new_admitted >= self.max_new_prefills_per_iter
+                    {
+                        break;
+                    }
+
+                    let prompt_len = seq.meta.input_ids.len();
+                    let requested_tokens = match self.chunked_prefill_size {
+                        Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
+                        None => {
+                            prompt_len.min(kv_budget_remaining)
+                        }
+                    };
+                    let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
+                    let tokens_to_prefill = fit_new_prefill_tokens(
+                        requested_tokens,
+                        kv_budget_remaining,
+                        tile_budget_remaining,
+                        decode_reserve,
+                    );
+                    if tokens_to_prefill == 0 {
+                        break;
+                    }
+
+                    let is_partial = tokens_to_prefill < prompt_len;
+                    prefill_batch.push(PrefillEntry {
+                        request_id: seq.meta.id.clone(),
+                        token_range: 0..tokens_to_prefill,
+                        is_partial,
+                    });
+                    new_admitted += 1;
+
+                    kv_budget_remaining =
+                        kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
+                    tile_budget_remaining = tile_budget_remaining
+                        .saturating_sub(prefill_tiles_for_tokens(tokens_to_prefill));
                 }
+            } else {
+                // FCFS: iterate queue directly without collecting.
+                let mut new_admitted = 0usize;
+                let mut seqs_used = 0usize;
+                for seq in waiting.iter() {
+                    if seqs_used >= seq_budget || kv_budget_remaining == 0 || tile_budget_remaining == 0
+                    {
+                        break;
+                    }
+                    if self.max_new_prefills_per_iter != 0
+                        && new_admitted >= self.max_new_prefills_per_iter
+                    {
+                        break;
+                    }
 
-                let is_partial = tokens_to_prefill < prompt_len;
-                prefill_batch.push(PrefillEntry {
-                    request_id: seq.meta.id.clone(),
-                    token_range: 0..tokens_to_prefill,
-                    is_partial,
-                });
-                new_admitted += 1;
+                    let prompt_len = seq.meta.input_ids.len();
+                    let requested_tokens = match self.chunked_prefill_size {
+                        Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
+                        None => {
+                            prompt_len.min(kv_budget_remaining)
+                        }
+                    };
+                    let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
+                    let tokens_to_prefill = fit_new_prefill_tokens(
+                        requested_tokens,
+                        kv_budget_remaining,
+                        tile_budget_remaining,
+                        decode_reserve,
+                    );
+                    if tokens_to_prefill == 0 {
+                        break;
+                    }
 
-                kv_budget_remaining =
-                    kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
-                tile_budget_remaining = tile_budget_remaining
-                    .saturating_sub(prefill_tiles_for_tokens(tokens_to_prefill));
+                    let is_partial = tokens_to_prefill < prompt_len;
+                    prefill_batch.push(PrefillEntry {
+                        request_id: seq.meta.id.clone(),
+                        token_range: 0..tokens_to_prefill,
+                        is_partial,
+                    });
+                    new_admitted += 1;
+                    seqs_used += 1;
+
+                    kv_budget_remaining =
+                        kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
+                    tile_budget_remaining = tile_budget_remaining
+                        .saturating_sub(prefill_tiles_for_tokens(tokens_to_prefill));
+                }
             }
         }
 

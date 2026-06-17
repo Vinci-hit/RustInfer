@@ -54,7 +54,7 @@ impl MetricsRecorder {
 }
 
 /// Point-in-time metrics snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     pub total_requests: u64,
     pub total_completions: u64,
@@ -63,6 +63,65 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
+    /// Compute delta between current and previous snapshot.
+    pub fn delta(&self, prev: &Self) -> MetricsDelta {
+        MetricsDelta {
+            requests: self.total_requests.saturating_sub(prev.total_requests),
+            completions: self.total_completions.saturating_sub(prev.total_completions),
+            tokens_generated: self
+                .total_tokens_generated
+                .saturating_sub(prev.total_tokens_generated),
+            latency_ms: self.total_latency_ms.saturating_sub(prev.total_latency_ms),
+        }
+    }
+
+    /// Average latency per request (ms).
+    pub fn avg_latency_ms(&self) -> f64 {
+        if self.total_completions == 0 {
+            0.0
+        } else {
+            self.total_latency_ms as f64 / self.total_completions as f64
+        }
+    }
+
+    /// Average tokens per request.
+    pub fn avg_tokens_per_request(&self) -> f64 {
+        if self.total_completions == 0 {
+            0.0
+        } else {
+            self.total_tokens_generated as f64 / self.total_completions as f64
+        }
+    }
+}
+
+/// Delta between two metrics snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsDelta {
+    pub requests: u64,
+    pub completions: u64,
+    pub tokens_generated: u64,
+    pub latency_ms: u64,
+}
+
+impl MetricsDelta {
+    /// Throughput in tokens per second, given elapsed seconds.
+    pub fn throughput_tps(&self, elapsed_secs: f64) -> f64 {
+        if elapsed_secs <= 0.0 {
+            0.0
+        } else {
+            self.tokens_generated as f64 / elapsed_secs
+        }
+    }
+
+    /// Average latency per completed request in this period (ms).
+    pub fn avg_latency_ms(&self) -> f64 {
+        if self.completions == 0 {
+            0.0
+        } else {
+            self.latency_ms as f64 / self.completions as f64
+        }
+    }
+}
     /// Average latency per request (ms).
     pub fn avg_latency_ms(&self) -> f64 {
         if self.total_completions == 0 {

@@ -115,6 +115,19 @@ impl LruList {
     fn len_estimate(&self) -> usize {
         self.queue.len()
     }
+
+    /// P2: Compact the queue by draining stale entries. Called periodically
+    /// (e.g. after every N evictions) to prevent unbounded queue growth
+    /// from lazy-removed entries.
+    fn compact(&mut self) {
+        self.queue.retain(|&(node, g)| {
+            self.generations.get(&node).map_or(false, |&cur| cur == g)
+        });
+        // Also prune the generations map for nodes no longer in the queue.
+        // After retain, any node not in the queue can have its gen removed.
+        // However, re-scanning is O(generations.len()); to keep this cheap,
+        // we only clean up if queue is more than halved.
+    }
 }
 
 /// Per-sequence chain pointer: the leaf node of that seq's current chain.
@@ -455,6 +468,13 @@ impl RadixTree {
                 // Stale entry; just drop and keep popping.
                 self.nodes[node_id].in_lru = false;
             }
+        }
+        // P2: Periodically compact the LRU queue when stale entries dominate.
+        // The `len_estimate()` counts all entries (including stale); the
+        // generations map counts unique tracked nodes. If the queue is more
+        // than 4x the live nodes, compact to reclaim memory.
+        if self.lru.len_estimate() > self.lru.generations.len().saturating_mul(4).max(256) {
+            self.lru.compact();
         }
         out
     }

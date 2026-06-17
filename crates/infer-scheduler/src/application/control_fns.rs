@@ -19,6 +19,19 @@ use crate::infrastructure::transport::control_plane::{
 
 use super::outcomes::ControlOutcome;
 
+/// P2: Context struct grouping the repeated parameters that every internal
+/// handler in this module passes around. The public `handle_control_event`
+/// signature is kept stable for the `EngineWorkflow` trait, but internally
+/// the helpers use this struct.
+struct ControlCtx<'a> {
+    sessions: &'a mut RequestTable,
+    radix: &'a mut RadixTree,
+    kv_budget: &'a mut KvBudget,
+    control_cmd: &'a ControlPlaneCmdTx,
+    worker_group: &'a WorkerGroup,
+    enable_prefix_caching: bool,
+}
+
 /// Translate a single control-plane event.
 ///
 /// **Does not** call any output functions. The orchestrator is
@@ -34,21 +47,24 @@ pub fn handle_control_event(
     default_worker: &WorkerId,
     enable_prefix_caching: bool,
 ) -> ControlOutcome {
+    let mut ctx = ControlCtx {
+        sessions,
+        radix,
+        kv_budget,
+        control_cmd,
+        worker_group,
+        enable_prefix_caching,
+    };
     match event {
         ControlEvent::StepError { worker, err } => handle_worker_step_error(
             err,
-            sessions,
-            radix,
-            kv_budget,
-            enable_prefix_caching,
-            control_cmd,
-            worker_group,
+            &mut ctx,
             &worker,
         ),
         ControlEvent::WorkerLost {
             worker,
             last_seen_ms,
-        } => handle_worker_lost(worker, last_seen_ms, sessions),
+        } => handle_worker_lost(worker, last_seen_ms, ctx.sessions),
         ControlEvent::WorkerError {
             worker,
             message,
@@ -80,14 +96,9 @@ pub fn handle_control_event(
         }
         ControlEvent::AllocFailed { worker, req } => handle_alloc_failed(
             req,
-            sessions,
-            radix,
-            kv_budget,
-            control_cmd,
-            worker_group,
+            &mut ctx,
             &worker,
             default_worker,
-            enable_prefix_caching,
         ),
     }
 }
@@ -95,19 +106,14 @@ pub fn handle_control_event(
 /// Worker-driven KV pressure relief.
 fn handle_alloc_failed(
     req: AllocFailed,
-    sessions: &mut RequestTable,
-    radix: &mut RadixTree,
-    kv_budget: &mut KvBudget,
-    control_cmd: &ControlPlaneCmdTx,
-    worker_group: &WorkerGroup,
+    ctx: &mut ControlCtx<'_>,
     worker_from_event: &WorkerId,
     default_worker: &WorkerId,
-    enable_prefix_caching: bool,
 ) -> ControlOutcome {
     let _ = default_worker;
     let target_worker = worker_from_event;
 
-    let total = worker_group
+    let total = ctx.worker_group
         .effective_capacity
         .max_total_kv_tokens
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX))
@@ -127,9 +133,9 @@ fn handle_alloc_failed(
 
     if req.round == 0 {
         let target = target_slots;
-        let indices = radix.evict_collect_at_least(target as usize);
+        let indices = ctx.radix.evict_collect_at_least(target as usize);
         if !indices.is_empty() {
-            release_budget_up_to(kv_budget, indices.len() as u32, "alloc_failed_round0");
+            release_budget_up_to(ctx.kv_budget, indices.len() as u32, "alloc_failed_round0");
             tracing::info!(
                 worker_id = %req.worker_id,
                 shortfall = req.shortfall,
@@ -140,11 +146,11 @@ fn handle_alloc_failed(
             let msg =
                 infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
                     infer_protocol::scheduler_to_worker_control::FreeKvIndices {
-                        model_instance_id: worker_group.model_instance_id.clone(),
+                        model_instance_id: ctx.worker_group.model_instance_id.clone(),
                         indices,
                     },
                 );
-            if let Err(e) = control_cmd.send_to(target_worker, msg) {
+            if let Err(e) = ctx.control_cmd.send_to(target_worker, msg) {
                 tracing::error!(
                     worker = %target_worker,
                     error = %e,
@@ -164,7 +170,7 @@ fn handle_alloc_failed(
     // Level 2: victim preemption.
     let target = target_slots;
 
-    let mut candidates: Vec<PreemptCandidate> = sessions.preemption_candidates();
+    let mut candidates: Vec<PreemptCandidate> = ctx.sessions.preemption_candidates();
     candidates.sort_by(|a, b| {
         b.output_len
             .cmp(&a.output_len)
@@ -201,20 +207,20 @@ fn handle_alloc_failed(
 
     let mut scheduler_released_slots = 0u32;
     for sid in &victims {
-        if enable_prefix_caching {
-            radix.mark_finished_chain(*sid);
-        } else if let Some(n) = sessions.kv_slots_for_sequence(SequenceId(*sid)) {
+        if ctx.enable_prefix_caching {
+            ctx.radix.mark_finished_chain(*sid);
+        } else if let Some(n) = ctx.sessions.kv_slots_for_sequence(SequenceId(*sid)) {
             scheduler_released_slots = scheduler_released_slots.saturating_add(n);
         }
-        if let Err(e) = sessions.preempt_to_queued(SequenceId(*sid)) {
+        if let Err(e) = ctx.sessions.preempt_to_queued(SequenceId(*sid)) {
             tracing::error!(sequence_id = sid, "preempt_to_queued failed: {}", e);
         }
     }
-    let free_indices = if enable_prefix_caching {
-        let indices = radix.evict_collect_at_least(target as usize);
+    let free_indices = if ctx.enable_prefix_caching {
+        let indices = ctx.radix.evict_collect_at_least(target as usize);
         if !indices.is_empty() {
             release_budget_up_to(
-                kv_budget,
+                ctx.kv_budget,
                 indices.len() as u32,
                 "alloc_failed_round1_prefix",
             );
@@ -223,7 +229,7 @@ fn handle_alloc_failed(
     } else {
         if scheduler_released_slots > 0 {
             release_budget_up_to(
-                kv_budget,
+                ctx.kv_budget,
                 scheduler_released_slots,
                 "alloc_failed_round1_preempt",
             );
@@ -243,12 +249,12 @@ fn handle_alloc_failed(
 
     let msg = infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::Preempt(
         infer_protocol::scheduler_to_worker_control::Preempt {
-            model_instance_id: worker_group.model_instance_id.clone(),
+            model_instance_id: ctx.worker_group.model_instance_id.clone(),
             sequence_ids: victims,
             free_indices,
         },
     );
-    if let Err(e) = control_cmd.send_to(target_worker, msg) {
+    if let Err(e) = ctx.control_cmd.send_to(target_worker, msg) {
         tracing::error!(
             worker = %target_worker,
             error = %e,
@@ -262,39 +268,34 @@ fn handle_alloc_failed(
 /// Worker-reported step error.
 fn handle_worker_step_error(
     err: WorkerStepError,
-    sessions: &mut RequestTable,
-    radix: &mut RadixTree,
-    kv_budget: &mut KvBudget,
-    enable_prefix_caching: bool,
-    control_cmd: &ControlPlaneCmdTx,
-    worker_group: &WorkerGroup,
+    ctx: &mut ControlCtx<'_>,
     target_worker: &WorkerId,
 ) -> ControlOutcome {
-    let failed_sequence_ids = collect_failed_sequence_ids(&err, sessions);
+    let failed_sequence_ids = collect_failed_sequence_ids(&err, ctx.sessions);
     let failed_kv_slots: u32 = failed_sequence_ids
         .iter()
-        .filter_map(|raw| sessions.kv_slots_for_sequence(SequenceId(*raw)))
+        .filter_map(|raw| ctx.sessions.kv_slots_for_sequence(SequenceId(*raw)))
         .sum();
     for raw in &failed_sequence_ids {
         let sid = SequenceId(*raw);
-        if enable_prefix_caching {
-            radix.mark_finished_chain(*raw);
-        } else if let Some(n) = sessions.kv_slots_for_sequence(sid) {
-            release_budget_up_to(kv_budget, n, "worker_step_error");
+        if ctx.enable_prefix_caching {
+            ctx.radix.mark_finished_chain(*raw);
+        } else if let Some(n) = ctx.sessions.kv_slots_for_sequence(sid) {
+            release_budget_up_to(ctx.kv_budget, n, "worker_step_error");
         }
     }
-    if enable_prefix_caching && failed_kv_slots > 0 {
-        let indices = radix.evict_collect_at_least(failed_kv_slots as usize);
+    if ctx.enable_prefix_caching && failed_kv_slots > 0 {
+        let indices = ctx.radix.evict_collect_at_least(failed_kv_slots as usize);
         if !indices.is_empty() {
-            release_budget_up_to(kv_budget, indices.len() as u32, "worker_step_error_prefix");
+            release_budget_up_to(ctx.kv_budget, indices.len() as u32, "worker_step_error_prefix");
             let msg =
                 infer_protocol::scheduler_to_worker_control::SchedulerControlMessage::FreeKvIndices(
                     infer_protocol::scheduler_to_worker_control::FreeKvIndices {
-                        model_instance_id: worker_group.model_instance_id.clone(),
+                        model_instance_id: ctx.worker_group.model_instance_id.clone(),
                         indices,
                     },
                 );
-            if let Err(e) = control_cmd.send_to(target_worker, msg) {
+            if let Err(e) = ctx.control_cmd.send_to(target_worker, msg) {
                 tracing::error!(
                     worker = %target_worker,
                     error = %e,
@@ -305,7 +306,7 @@ fn handle_worker_step_error(
     }
     let failed_ids = failed_sequence_ids
         .iter()
-        .filter_map(|raw| sessions.request_id_for_sequence(SequenceId(*raw)))
+        .filter_map(|raw| ctx.sessions.request_id_for_sequence(SequenceId(*raw)))
         .collect();
     let fatal = err.fatal;
     let message = err.message;
