@@ -92,6 +92,11 @@ pub struct RustInferConfig {
     /// Log level (tracing filter).
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// CUDA graph capture sizes for decode batches.
+    /// Determines which batch sizes have pre-captured CUDA graphs.
+    #[serde(default = "default_capture_sizes")]
+    pub capture_sizes: Vec<usize>,
 }
 
 fn default_cluster_id() -> String {
@@ -132,6 +137,9 @@ fn default_worker_id() -> String {
 }
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_capture_sizes() -> Vec<usize> {
+    vec![1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
 }
 
 impl RustInferConfig {

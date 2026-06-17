@@ -8,7 +8,7 @@
 # config.json so the worker dispatch / chat template always match the weights.
 
 # Model directory (weights + tokenizer.json + config.json). Required.
-model = "/mnt/md2/liuwenqi/Llama-3.2-1B-Instruct"
+model = "/mnt/geminicephfs/vinciililu/model/ft_local/checkpoint-650"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
@@ -18,7 +18,7 @@ model_name = ""
 cluster_id = "rustinfer"
 
 # CUDA device.
-device = "cuda:7"
+device = "cuda:0"
 
 # HTTP API server.
 host = "0.0.0.0"
@@ -26,8 +26,8 @@ port = 8000
 request_timeout_secs = 600
 
 # Batching / capacity.
-max_batch_tokens = 4096
-max_batch_seqs = 32
+max_batch_tokens = 8192
+max_batch_seqs = 256
 max_model_len = 1024
 
 # Paged KV.
@@ -48,3 +48,8 @@ worker_id = "worker-0"
 
 # Logging.
 log_level = "info"
+
+# CUDA graph capture sizes for decode batches.
+# Determines which batch sizes have pre-captured CUDA graphs.
+# Batch sizes not in this list will fall back to eager mode.
+capture_sizes = [1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 80, 96, 128, 192, 256]

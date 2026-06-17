@@ -232,6 +232,7 @@ fn main() -> Result<(), String> {
         num_blocks_override,
         server_heartbeat_ms,
         model_type: model_type.clone(),
+        capture_sizes: cfg.capture_sizes.clone(),
     };
     let eos_ids: Vec<i32> = match model_type.as_str() {
         "qwen3" => vec![151643, 151645],   // <|endoftext|>, <|im_end|>

@@ -38,6 +38,8 @@ pub struct Bootstrap<'a> {
     pub server_heartbeat_ms: Option<u64>,
     /// Resolved from config.json, not `load.model_type`.
     pub model_type: String,
+    /// CUDA graph capture sizes for decode batches.
+    pub capture_sizes: Vec<usize>,
 }
 
 pub fn run_with_model<M>(
@@ -122,7 +124,7 @@ where
         cap_num_tokens,
         cap_batch,
         flash_decode_capacity_f32,
-        (1..=32).collect(),
+        bs.capture_sizes.clone(),
     )
     .map_err(|e| format!("ModelRunner::new: {:?}", e))?;
 
@@ -131,10 +133,10 @@ where
             "[bootstrap] CUDA Graph priming FAILED, continuing in eager mode: {:?}",
             e
         );
-    } else {
+    } else if let Some(ref graph_runner) = runner.graph_runner {
         tracing::info!(
             "[bootstrap] CUDA Graphs primed for decode-only batches in {:?}",
-            runner.capture_sizes,
+            graph_runner.capture_sizes(),
         );
     }
 

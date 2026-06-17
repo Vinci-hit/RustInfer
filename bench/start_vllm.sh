@@ -6,12 +6,12 @@
 set -euo pipefail
 
 # === Model Config ===
-MODEL_PATH="/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct"
+MODEL_PATH="/mnt/geminicephfs/vinciililu/model/ft_local/checkpoint-650"
 
 # === Runtime Config (from bootstrap log) ===
-MAX_NUM_SEQS=32
+MAX_NUM_SEQS=256
 MAX_MODEL_LEN=1024
-MAX_NUM_BATCHED_TOKENS=4096
+MAX_NUM_BATCHED_TOKENS=8192
 
 # === GPU Memory ===
 # Total: 95GB, Free: 83GB → use ~0.87 to leave headroom
