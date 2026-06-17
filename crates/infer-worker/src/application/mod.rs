@@ -9,6 +9,7 @@ pub mod kv_relief;
 pub mod model_runner;
 #[cfg(feature = "cuda")]
 pub mod serve_loop;
+pub mod tuning;
 #[cfg(feature = "cuda")]
 pub mod worker_scheduler;
 pub mod worker_state;

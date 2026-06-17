@@ -217,13 +217,19 @@ impl SchedulerEngine {
         }
     }
 
-    /// Run one scheduling iteration — delegates to the workflow.
-    pub(crate) async fn run_iteration(&mut self) -> Result<()> {
-        if !self.workflow.can_schedule(&self.requests) {
-            return Ok(());
-        }
-        self.iteration_id += 1;
-
+    /// Split disjoint borrows of `self` into the workflow handle, the dispatch
+    /// system, and a freshly built [`ResourceContext`]. Collapses the 11-field
+    /// destructure + 9-field context build that `run_iteration`,
+    /// `handle_step_output`, and `on_control_event` would otherwise each repeat
+    /// verbatim — the boilerplate the borrow checker forces out of methods that
+    /// hand most of `self` to a `&mut`-borrowing callee.
+    fn split_for_workflow(
+        &mut self,
+    ) -> (
+        &mut Box<dyn EngineWorkflow>,
+        &mut crate::application::DispatchSystem,
+        crate::application::workflow::ResourceContext<'_>,
+    ) {
         let SchedulerEngine {
             workflow,
             dispatch,
@@ -238,8 +244,7 @@ impl SchedulerEngine {
             default_worker,
             ..
         } = self;
-
-        let mut ctx = crate::application::workflow::ResourceContext {
+        let ctx = crate::application::workflow::ResourceContext {
             requests,
             radix,
             kv_budget,
@@ -250,6 +255,17 @@ impl SchedulerEngine {
             worker_group,
             default_worker,
         };
+        (workflow, dispatch, ctx)
+    }
+
+    /// Run one scheduling iteration — delegates to the workflow.
+    pub(crate) async fn run_iteration(&mut self) -> Result<()> {
+        if !self.workflow.can_schedule(&self.requests) {
+            return Ok(());
+        }
+        self.iteration_id += 1;
+
+        let (workflow, dispatch, mut ctx) = self.split_for_workflow();
         workflow.try_schedule(&mut ctx, dispatch).await
     }
 
@@ -258,32 +274,7 @@ impl SchedulerEngine {
     /// The event is already decoded by the background decode task;
     /// no MsgPack deserialization happens here.
     pub(crate) async fn handle_step_output(&mut self, event: SchedulerEvent) -> Result<()> {
-        let SchedulerEngine {
-            workflow,
-            dispatch,
-            requests,
-            radix,
-            kv_budget,
-            metrics,
-            codec,
-            config,
-            control_cmd,
-            worker_group,
-            default_worker,
-            ..
-        } = self;
-
-        let mut ctx = crate::application::workflow::ResourceContext {
-            requests,
-            radix,
-            kv_budget,
-            metrics,
-            codec,
-            config,
-            control_cmd,
-            worker_group,
-            default_worker,
-        };
+        let (workflow, dispatch, mut ctx) = self.split_for_workflow();
         workflow.handle_step_output(&mut ctx, dispatch, event).await
     }
 
@@ -296,31 +287,13 @@ impl SchedulerEngine {
         use crate::application::ControlOutcome;
 
         let outcome = {
-            let SchedulerEngine {
-                workflow,
-                requests,
-                radix,
-                kv_budget,
-                metrics,
-                codec,
-                config,
-                worker_group,
-                control_cmd,
-                default_worker,
-                ..
-            } = self;
-
-            let mut ctx = crate::application::workflow::ResourceContext {
-                requests,
-                radix,
-                kv_budget,
-                metrics,
-                codec,
-                config,
-                control_cmd,
-                worker_group,
-                default_worker,
-            };
+            let (workflow, _dispatch, mut ctx) = self.split_for_workflow();
+            // These are shared (`&`) refs also held inside `ctx`; copy them out
+            // as independent shared borrows before the `&mut ctx` call so the
+            // borrows don't overlap in the call expression.
+            let control_cmd = ctx.control_cmd;
+            let worker_group = ctx.worker_group;
+            let default_worker = ctx.default_worker;
             workflow.handle_control_event(
                 event,
                 &mut ctx,

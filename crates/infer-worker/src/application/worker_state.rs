@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Per-sequence prefill state held between chunked prefill segments.
 pub struct PrefillSeq {
@@ -29,12 +29,20 @@ pub type ActiveSeqMap = HashMap<u64, ActiveSeq>;
 /// per-step sorting after the GPU has compacted rows in-place.
 #[derive(Debug, Default)]
 pub struct DecodeRows {
+    /// Device-row order of buffer A.
     rows: Vec<u64>,
+    /// Membership mirror of `rows` for O(1) `pending_admissions` lookups.
+    /// Kept in sync by every mutator; `pending_admissions` would otherwise be
+    /// O(active × rows) via `Vec::contains`.
+    present: HashSet<u64>,
 }
 
 impl DecodeRows {
     pub fn new() -> Self {
-        Self { rows: Vec::new() }
+        Self {
+            rows: Vec::new(),
+            present: HashSet::new(),
+        }
     }
 
     pub fn as_slice(&self) -> &[u64] {
@@ -52,6 +60,7 @@ impl DecodeRows {
     /// Drop rows whose sequence is no longer active.
     pub fn retain_active(&mut self, active: &ActiveSeqMap) {
         self.rows.retain(|sid| active.contains_key(sid));
+        self.present.retain(|sid| active.contains_key(sid));
     }
 
     /// Active sequences not yet materialized in A. These are copied through
@@ -60,7 +69,7 @@ impl DecodeRows {
         let mut pending: Vec<u64> = active
             .keys()
             .copied()
-            .filter(|sid| !self.rows.contains(sid))
+            .filter(|sid| !self.present.contains(sid))
             .collect();
         pending.sort_unstable();
         pending
@@ -68,13 +77,16 @@ impl DecodeRows {
 
     pub fn append_admissions(&mut self, admissions: &[u64]) {
         self.rows.extend_from_slice(admissions);
+        self.present.extend(admissions.iter().copied());
     }
 
     pub fn replace_rows(&mut self, rows: Vec<u64>) {
+        self.present = rows.iter().copied().collect();
         self.rows = rows;
     }
 
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.present.clear();
     }
 }

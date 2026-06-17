@@ -2,14 +2,14 @@
 //!
 //! Systems can't directly mutate every other System without aliasing
 //! through `SchedulerEngine` —
-//! `ControlEventSystem::handle` cannot hold `&mut sessions` and
+//! `control_fns::handle_control_event` cannot hold `&mut sessions` and
 //! `&mut output_system` at the same time, for instance. Instead each
 //! System returns an enriched outcome enum that the engine
 //! orchestrator interprets and dispatches.
 //!
 //! ## `ControlOutcome`
 //!
-//! Result of `ControlEventSystem::handle()`. The engine inspects
+//! Result of `control_fns::handle_control_event()`. The engine inspects
 //! the variant and either calls `output_fns::fail_sessions`
 //! (with a fresh `&mut` borrow) for `Continue`, or unwinds the
 //! event loop with `WorkerError` for `Terminate`.

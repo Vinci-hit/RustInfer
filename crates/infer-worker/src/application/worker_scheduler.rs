@@ -6,7 +6,7 @@ use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, 
 
 use crate::application::forward_workspace::ForwardWorkspace;
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
-use crate::application::model_runner::{ModelRunner, SeqStep};
+use crate::application::model_runner::{DecodeCompactOutput, ModelRunner, SeqStep};
 use crate::application::worker_state::{
     ActiveSeq, ActiveSeqMap, DecodeRows, PrefillSeq, PrefillSeqMap,
 };
@@ -16,6 +16,35 @@ use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
+
+/// Per-segment prefill plan. Replaces the parallel `per_seg_*` arrays that
+/// were index-correlated across three loops: each segment now carries its own
+/// data in one place, indexed 1:1 with `cmd.segments`. Skipped segments keep
+/// `indices`/`token_ids` empty so downstream loops produce no work for them.
+struct SegmentPlan {
+    /// New (non-prefix) tokens this segment writes.
+    new_tokens: u32,
+    /// Prefix-hint slots prepended verbatim (already hold valid KV).
+    prefix: Vec<u32>,
+    /// Block table covering everything before this segment's new tokens.
+    base_table: Vec<u32>,
+    /// True when the segment is stale (base table length mismatch) and skipped.
+    skipped: bool,
+    /// KV slots allocated for the new tokens (filled during step building).
+    indices: Vec<u32>,
+    /// Input token ids fed for the new tokens (filled during step building).
+    token_ids: Vec<i32>,
+}
+
+/// Concatenate a base block table with freshly allocated slots. Centralizes
+/// the `base ++ appended` construction shared by step building and the
+/// post-forward `prefilling`/`active` insert.
+fn concat_block_table(base: &[u32], appended: &[u32]) -> Vec<u32> {
+    let mut bt = Vec::with_capacity(base.len() + appended.len());
+    bt.extend_from_slice(base);
+    bt.extend_from_slice(appended);
+    bt
+}
 
 /// Run one prefill batch (one PrefillBatchCmd = potentially many segments).
 ///
@@ -39,10 +68,7 @@ pub fn handle_prefill<M>(
 where
     M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
 {
-    let mut per_seg_new_tokens: Vec<u32> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_prefix_hint: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_base_tables: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_skipped: Vec<bool> = Vec::with_capacity(cmd.segments.len());
+    let mut plans: Vec<SegmentPlan> = Vec::with_capacity(cmd.segments.len());
     let mut total_new: u32 = 0;
     for seg in &cmd.segments {
         let seg_len = seg.segment_end - seg.segment_start;
@@ -62,8 +88,8 @@ where
         } else {
             seg.segment_start as usize
         };
-        let skip_segment = base_table.len() != expected_base_len;
-        if skip_segment {
+        let skipped = base_table.len() != expected_base_len;
+        if skipped {
             tracing::warn!(
                 seq = seg.sequence_id,
                 base_len = base_table.len(),
@@ -73,10 +99,14 @@ where
         } else {
             total_new = total_new.saturating_add(new_tokens);
         }
-        per_seg_new_tokens.push(new_tokens);
-        per_seg_prefix_hint.push(prefix);
-        per_seg_base_tables.push(base_table);
-        per_seg_skipped.push(skip_segment);
+        plans.push(SegmentPlan {
+            new_tokens,
+            prefix,
+            base_table,
+            skipped,
+            indices: Vec::new(),
+            token_ids: Vec::new(),
+        });
     }
 
     let new_decode_segments = cmd
@@ -84,7 +114,7 @@ where
         .iter()
         .enumerate()
         .filter(|(i, s)| {
-            !per_seg_skipped[*i]
+            !plans[*i].skipped
                 && matches!(
                     s.completion,
                     PrefillSegmentCompletion::FinishPrefillAndStartDecode
@@ -96,7 +126,7 @@ where
             .segments
             .iter()
             .enumerate()
-            .filter(|(i, _)| !per_seg_skipped[*i])
+            .filter(|(i, _)| !plans[*i].skipped)
             .map(|(_, s)| s.sequence_id)
             .collect();
         tracing::warn!(
@@ -146,23 +176,17 @@ where
     };
 
     let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_indices: Vec<Vec<u32>> = Vec::with_capacity(cmd.segments.len());
-    let mut per_seg_token_ids: Vec<Vec<i32>> = Vec::with_capacity(cmd.segments.len());
     let mut idx_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
-        let new_tokens = per_seg_new_tokens[i] as usize;
-        let prefix = &per_seg_prefix_hint[i];
-        let base_table = &per_seg_base_tables[i];
-        if per_seg_skipped[i] {
-            per_seg_indices.push(Vec::new());
-            per_seg_token_ids.push(Vec::new());
+        if plans[i].skipped {
             continue;
         }
+        let new_tokens = plans[i].new_tokens as usize;
         let range = cmd.segment_token_range(i);
         let (input_ids, positions): (Vec<i32>, Vec<i32>) = if seg.segment_start == 0
-            && !prefix.is_empty()
+            && !plans[i].prefix.is_empty()
         {
-            let prefix_len = prefix.len();
+            let prefix_len = plans[i].prefix.len();
             let prompt = &cmd.input_ids[range.clone()];
             let trimmed: Vec<i32> = prompt.iter().skip(prefix_len).copied().collect();
             let positions: Vec<i32> =
@@ -177,10 +201,7 @@ where
         let new_indices: Vec<u32> = base_indices[idx_cursor..idx_cursor + new_tokens].to_vec();
         idx_cursor += new_tokens;
 
-        let mut block_table: Vec<u32> = Vec::with_capacity(base_table.len() + new_tokens);
-        block_table.extend_from_slice(&base_table);
-        block_table.extend_from_slice(&new_indices);
-
+        let block_table = concat_block_table(&plans[i].base_table, &new_indices);
         let kv_write_start = block_table.len() as i32 - new_tokens as i32;
         let kv_len_after = block_table.len() as i32;
         steps.push(SeqStep {
@@ -190,8 +211,8 @@ where
             kv_len_after,
             block_table,
         });
-        per_seg_indices.push(new_indices);
-        per_seg_token_ids.push(input_ids);
+        plans[i].indices = new_indices;
+        plans[i].token_ids = input_ids;
     }
     debug_assert_eq!(idx_cursor, total_new as usize);
 
@@ -210,7 +231,7 @@ where
             }
             for seg in &cmd.segments {
                 if let Some(removed) = prefilling.remove(&seg.sequence_id) {
-                    release_prefill_state(removed, kv_allocator, enable_prefix_caching);
+                    kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
                 }
             }
             let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
@@ -218,12 +239,7 @@ where
             return Ok(());
         }
     };
-    let assigned = assigned_runs(
-        cmd,
-        &per_seg_indices,
-        &per_seg_token_ids,
-        enable_prefix_caching,
-    );
+    let assigned = assigned_runs(cmd, &plans, enable_prefix_caching);
 
     let mut output = StepOutput {
         prefill_done: Vec::new(),
@@ -232,16 +248,12 @@ where
     };
     let mut token_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
-        if per_seg_skipped[i] {
+        if plans[i].skipped {
             continue;
         }
         let token = first_tokens[token_cursor];
         token_cursor += 1;
-        let new_indices = &per_seg_indices[i];
-        let mut full_block_table =
-            Vec::with_capacity(per_seg_base_tables[i].len() + new_indices.len());
-        full_block_table.extend_from_slice(&per_seg_base_tables[i]);
-        full_block_table.extend_from_slice(new_indices);
+        let full_block_table = concat_block_table(&plans[i].base_table, &plans[i].indices);
         match seg.completion {
             PrefillSegmentCompletion::ContinuePrefill => {
                 prefilling.insert(
@@ -274,8 +286,8 @@ where
                             ignore_eos: seg.ignore_eos,
                         },
                     );
-                } else if !enable_prefix_caching && !full_block_table.is_empty() {
-                    kv_allocator.release(&full_block_table);
+                } else {
+                    kv_allocator.release_owned(&full_block_table, enable_prefix_caching);
                 }
             }
         }
@@ -303,6 +315,117 @@ where
         return Ok(());
     }
 
+    let (order, new_indices) = match prepare_decode_step(
+        runner,
+        active,
+        prefilling,
+        decode_rows,
+        kv_allocator,
+        control,
+        enable_prefix_caching,
+    )? {
+        DecodePrep::Ready { order, new_indices } => (order, new_indices),
+        DecodePrep::Done => return Ok(()),
+    };
+
+    let inputs = build_decode_inputs(&order, &new_indices, active, enable_prefix_caching);
+
+    let compact = match runner.step_decode_abc_compact(
+        &inputs.steps,
+        &inputs.generated_counts,
+        &inputs.max_tokens,
+        &inputs.ignore_eos,
+        eos_ids,
+    ) {
+        Ok(output) => output,
+        Err(e) => {
+            if !new_indices.is_empty() {
+                kv_allocator.free(&new_indices);
+            }
+            fail_decode_seqs(
+                control,
+                active,
+                kv_allocator,
+                &order,
+                format!("decode step failed: {:?}", e),
+                enable_prefix_caching,
+            );
+            decode_rows.clear();
+            return Ok(());
+        }
+    };
+
+    let output = commit_decode_results(
+        active,
+        decode_rows,
+        kv_allocator,
+        &order,
+        &new_indices,
+        inputs.assigned,
+        &compact,
+        enable_prefix_caching,
+    );
+
+    data.send_step_output(&output)
+        .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
+    Ok(())
+}
+
+/// Outcome of [`prepare_decode_step`]: either a ready-to-forward batch or a
+/// signal that the caller should return `Ok(())` (nothing to run, or the step
+/// already failed and reported its sequences).
+enum DecodePrep {
+    Ready { order: Vec<u64>, new_indices: Vec<u32> },
+    Done,
+}
+
+/// Per-row inputs for one decode forward. The three trailing vectors mirror
+/// `steps` row-for-row and are passed as separate slices because
+/// `step_decode_abc_compact` consumes them that way.
+struct DecodeInputs {
+    steps: Vec<SeqStep>,
+    assigned: Vec<AssignedIndices>,
+    generated_counts: Vec<usize>,
+    max_tokens: Vec<usize>,
+    ignore_eos: Vec<bool>,
+}
+
+/// Report a non-fatal decode failure for `sids`, evict them from `active`, and
+/// release their KV. The shared rollback for every decode alloc/forward
+/// failure path (previously copy-pasted four times inline).
+fn fail_decode_seqs(
+    control: &ControlPump,
+    active: &mut ActiveSeqMap,
+    kv_allocator: &mut GlobalKvAllocator,
+    sids: &[u64],
+    message: String,
+    enable_prefix_caching: bool,
+) {
+    send_step_error(control, sids.to_vec(), message);
+    for sid in sids {
+        if let Some(removed) = active.remove(sid) {
+            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+        }
+    }
+}
+
+/// Admit pending rows into buffer A, allocate one KV slot per active row, and
+/// reconcile the row order against late cancellations. Returns
+/// [`DecodePrep::Ready`] with the surviving row order and its freshly
+/// allocated slots, or [`DecodePrep::Done`] when there is nothing left to run.
+/// Returns `Err(OpError::Shutdown)` only on a shutdown during relief.
+fn prepare_decode_step<M>(
+    runner: &mut ModelRunner<bf16, Cuda, M>,
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    decode_rows: &mut DecodeRows,
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
+    enable_prefix_caching: bool,
+) -> OpResult<DecodePrep>
+where
+    M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
+{
     decode_rows.retain_active(active);
     let pending = decode_rows.pending_admissions(active);
     if !pending.is_empty() {
@@ -314,27 +437,23 @@ where
         }
         if let Err(e) = runner.append_decode_admissions_to_a(decode_rows.len(), &admit_tokens) {
             let failed: Vec<u64> = active.keys().copied().collect();
-            send_step_error(
+            fail_decode_seqs(
                 control,
-                failed.clone(),
+                active,
+                kv_allocator,
+                &failed,
                 format!("decode admission append failed: {:?}", e),
+                enable_prefix_caching,
             );
-            for sid in failed {
-                if let Some(removed) = active.remove(&sid) {
-                    if !enable_prefix_caching && !removed.block_table.is_empty() {
-                        kv_allocator.release(&removed.block_table);
-                    }
-                }
-            }
             decode_rows.clear();
-            return Ok(());
+            return Ok(DecodePrep::Done);
         }
         decode_rows.append_admissions(&pending);
     }
 
     let mut order: Vec<u64> = decode_rows.as_slice().to_vec();
     if order.is_empty() {
-        return Ok(());
+        return Ok(DecodePrep::Done);
     }
 
     let initial_n = order.len() as u32;
@@ -354,31 +473,29 @@ where
                 seqs = order.len(),
                 "decode alloc still failing after relief -- failing seqs"
             );
-            send_step_error(
+            fail_decode_seqs(
                 control,
-                order.clone(),
+                active,
+                kv_allocator,
+                &order,
                 "worker KV pool exhausted at decode".to_string(),
+                enable_prefix_caching,
             );
-            for sid in &order {
-                if let Some(removed) = active.remove(sid) {
-                    if !enable_prefix_caching && !removed.block_table.is_empty() {
-                        kv_allocator.release(&removed.block_table);
-                    }
-                }
-            }
             decode_rows.clear();
-            return Ok(());
+            return Ok(DecodePrep::Done);
         }
         AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
     };
 
+    // Relief may have evicted rows (preempt/cancel) while we waited; re-sync
+    // the order against the surviving active set before binding slots to rows.
     decode_rows.retain_active(active);
     order = decode_rows.as_slice().to_vec();
     if order.is_empty() {
         if !new_indices.is_empty() {
             kv_allocator.free(&new_indices);
         }
-        return Ok(());
+        return Ok(DecodePrep::Done);
     }
 
     let new_indices: Vec<u32> = if new_indices.len() > order.len() {
@@ -390,50 +507,59 @@ where
     };
     if new_indices.len() < order.len() {
         let failed: Vec<u64> = order[new_indices.len()..].to_vec();
-        send_step_error(
+        fail_decode_seqs(
             control,
-            failed.clone(),
+            active,
+            kv_allocator,
+            &failed,
             format!(
                 "decode KV allocation returned {} slots for {} rows",
                 new_indices.len(),
                 order.len()
             ),
+            enable_prefix_caching,
         );
-        for sid in &failed {
-            if let Some(removed) = active.remove(sid) {
-                if !enable_prefix_caching && !removed.block_table.is_empty() {
-                    kv_allocator.release(&removed.block_table);
-                }
-            }
-        }
         decode_rows.retain_active(active);
         order.truncate(new_indices.len());
         if order.is_empty() {
             if !new_indices.is_empty() {
                 kv_allocator.free(&new_indices);
             }
-            return Ok(());
+            return Ok(DecodePrep::Done);
         }
     }
 
-    let mut steps: Vec<SeqStep> = Vec::with_capacity(order.len());
-    let mut assigned: Vec<AssignedIndices> = Vec::with_capacity(order.len());
-    let mut generated_counts: Vec<usize> = Vec::with_capacity(order.len());
-    let mut max_tokens_vec: Vec<usize> = Vec::with_capacity(order.len());
-    let mut ignore_eos_vec: Vec<bool> = Vec::with_capacity(order.len());
+    Ok(DecodePrep::Ready { order, new_indices })
+}
+
+/// Build the per-row decode forward inputs: one appended KV slot per row, the
+/// single-token step, and the metadata slices the sampler consumes.
+fn build_decode_inputs(
+    order: &[u64],
+    new_indices: &[u32],
+    active: &ActiveSeqMap,
+    enable_prefix_caching: bool,
+) -> DecodeInputs {
+    let mut inputs = DecodeInputs {
+        steps: Vec::with_capacity(order.len()),
+        assigned: Vec::with_capacity(order.len()),
+        generated_counts: Vec::with_capacity(order.len()),
+        max_tokens: Vec::with_capacity(order.len()),
+        ignore_eos: Vec::with_capacity(order.len()),
+    };
     for (i, &sid) in order.iter().enumerate() {
         let new_idx = new_indices[i];
         let seq = active.get(&sid).unwrap();
         let mut bt = seq.block_table.clone();
         bt.push(new_idx);
-        steps.push(SeqStep {
+        inputs.steps.push(SeqStep {
             input_ids: vec![seq.last_token],
             positions: vec![seq.kv_len as i32],
             kv_write_start: seq.kv_len as i32,
             kv_len_after: (seq.kv_len + 1) as i32,
             block_table: bt,
         });
-        assigned.push(AssignedIndices {
+        inputs.assigned.push(AssignedIndices {
             sequence_id: sid,
             base: new_idx,
             len: 1,
@@ -443,35 +569,26 @@ where
                 Vec::new()
             },
         });
-        generated_counts.push(seq.generated_count);
-        max_tokens_vec.push(seq.max_tokens);
-        ignore_eos_vec.push(seq.ignore_eos);
+        inputs.generated_counts.push(seq.generated_count);
+        inputs.max_tokens.push(seq.max_tokens);
+        inputs.ignore_eos.push(seq.ignore_eos);
     }
-    let compact = match runner.step_decode_abc_compact(
-        &steps,
-        &generated_counts,
-        &max_tokens_vec,
-        &ignore_eos_vec,
-        eos_ids,
-    ) {
-        Ok(output) => output,
-        Err(e) => {
-            if !new_indices.is_empty() {
-                kv_allocator.free(&new_indices);
-            }
-            send_step_error(control, order.clone(), format!("decode step failed: {:?}", e));
-            for sid in &order {
-                if let Some(removed) = active.remove(sid) {
-                    if !enable_prefix_caching && !removed.block_table.is_empty() {
-                        kv_allocator.release(&removed.block_table);
-                    }
-                }
-            }
-            decode_rows.clear();
-            return Ok(());
-        }
-    };
+    inputs
+}
 
+/// Apply the compacted forward output: advance surviving sequences one token,
+/// emit their tokens, evict finished ones (releasing KV), and rewrite the row
+/// order to the compacted survivors. Returns the `StepOutput` to ship.
+fn commit_decode_results(
+    active: &mut ActiveSeqMap,
+    decode_rows: &mut DecodeRows,
+    kv_allocator: &mut GlobalKvAllocator,
+    order: &[u64],
+    new_indices: &[u32],
+    assigned: Vec<AssignedIndices>,
+    compact: &DecodeCompactOutput,
+    enable_prefix_caching: bool,
+) -> StepOutput {
     let mut output = StepOutput {
         prefill_done: Vec::new(),
         tokens: Vec::new(),
@@ -513,17 +630,12 @@ where
         });
     }
     for sid in &to_remove {
-        let removed = active.remove(sid);
-        if let Some(removed) = removed {
-            if !enable_prefix_caching && !removed.block_table.is_empty() {
-                kv_allocator.release(&removed.block_table);
-            }
+        if let Some(removed) = active.remove(sid) {
+            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
         }
     }
     decode_rows.replace_rows(next_rows);
-    data.send_step_output(&output)
-        .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
-    Ok(())
+    output
 }
 
 /// Send a non-fatal StepError to the scheduler, logging (not silently
@@ -543,29 +655,15 @@ fn send_step_error(control: &ControlPump, sequence_ids: Vec<u64>, message: Strin
     }
 }
 
-fn release_prefill_state(
-    removed: PrefillSeq,
-    kv_allocator: &mut GlobalKvAllocator,
-    enable_prefix_caching: bool,
-) {
-    if removed.block_table.is_empty() {
-        return;
-    }
-    if !enable_prefix_caching {
-        kv_allocator.release(&removed.block_table);
-    }
-}
-
 fn assigned_runs(
     cmd: &PrefillBatchCmd,
-    per_seg_indices: &[Vec<u32>],
-    per_seg_token_ids: &[Vec<i32>],
+    plans: &[SegmentPlan],
     include_token_ids: bool,
 ) -> Vec<AssignedIndices> {
     let mut assigned = Vec::new();
     for (i, seg) in cmd.segments.iter().enumerate() {
-        let indices = &per_seg_indices[i];
-        let token_ids = &per_seg_token_ids[i];
+        let indices = &plans[i].indices;
+        let token_ids = &plans[i].token_ids;
         debug_assert_eq!(indices.len(), token_ids.len());
         let mut run_start = 0usize;
         while run_start < indices.len() {

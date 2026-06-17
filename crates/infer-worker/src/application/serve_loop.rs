@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use half::bf16;
 
+use infer_protocol::control_envelope::RequestId;
 use infer_protocol::scheduler_to_worker_control::{DrainMode, LoadModel, SchedulerControlMessage};
 use infer_protocol::scheduler_to_worker_data::{BatchCommand, PrefillBatchCmd};
 use infer_protocol::worker_to_scheduler_control::{
@@ -75,7 +76,10 @@ where
             .load
             .kv_cache_memory_fraction
             .unwrap_or(0.9)
-            .clamp(0.05, 0.98);
+            .clamp(
+                crate::application::tuning::KV_MEM_FRACTION_MIN,
+                crate::application::tuning::KV_MEM_FRACTION_MAX,
+            );
         let (free, total) =
             device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
         let budget = (free as f64 * fraction as f64) as usize;
@@ -393,29 +397,16 @@ fn drain_control(
                     return true;
                 }
                 SchedulerControlMessage::Cancel(c) => {
-                    let removed = active.remove(&c.sequence_id);
-                    let removed_prefill = prefilling.remove(&c.sequence_id);
-                    let removed_flag = removed.is_some() || removed_prefill.is_some();
-                    if let Some(removed) = removed {
-                        release_removed(removed.block_table, kv_allocator, enable_prefix_caching);
-                        decode_rows.retain_active(active);
-                        tracing::info!("[serve] cancelled seq {}", c.sequence_id);
-                    }
-                    if let Some(removed) = removed_prefill {
-                        release_removed(removed.block_table, kv_allocator, enable_prefix_caching);
-                        tracing::info!("[serve] cancelled prefilling seq {}", c.sequence_id);
-                    }
-                    if req_id.is_correlated() {
-                        if let Err(e) = control.send(
-                            WorkerControlMessage::CancelAck(CancelAck {
-                                sequence_id: c.sequence_id,
-                                removed: removed_flag,
-                            }),
-                            req_id,
-                        ) {
-                            tracing::info!("[serve] failed to send CancelAck: {}", e);
-                        }
-                    }
+                    apply_cancel(
+                        control,
+                        active,
+                        prefilling,
+                        decode_rows,
+                        kv_allocator,
+                        enable_prefix_caching,
+                        c.sequence_id,
+                        req_id,
+                    );
                 }
                 SchedulerControlMessage::FreeKvIndices(free) => {
                     if !free.indices.is_empty() {
@@ -423,28 +414,15 @@ fn drain_control(
                     }
                 }
                 SchedulerControlMessage::Preempt(p) => {
-                    for sid in &p.sequence_ids {
-                        if let Some(removed) = active.remove(sid) {
-                            release_removed(
-                                removed.block_table,
-                                kv_allocator,
-                                enable_prefix_caching,
-                            );
-                            tracing::info!("[serve] preempted seq {}", sid);
-                        }
-                        if let Some(removed) = prefilling.remove(sid) {
-                            release_removed(
-                                removed.block_table,
-                                kv_allocator,
-                                enable_prefix_caching,
-                            );
-                            tracing::info!("[serve] preempted prefilling seq {}", sid);
-                        }
-                    }
-                    decode_rows.retain_active(active);
-                    if !p.free_indices.is_empty() {
-                        kv_allocator.free(&p.free_indices);
-                    }
+                    apply_preempt(
+                        active,
+                        prefilling,
+                        decode_rows,
+                        kv_allocator,
+                        enable_prefix_caching,
+                        &p.sequence_ids,
+                        &p.free_indices,
+                    );
                 }
                 SchedulerControlMessage::Ping => {
                     if let Err(e) = control.send(WorkerControlMessage::Pong, req_id) {
@@ -452,28 +430,16 @@ fn drain_control(
                     }
                 }
                 SchedulerControlMessage::Drain(d) => {
-                    if matches!(d.mode, DrainMode::Immediate) {
-                        let removed: Vec<_> = active.drain().map(|(_, seq)| seq).collect();
-                        for seq in removed {
-                            release_removed(seq.block_table, kv_allocator, enable_prefix_caching);
-                        }
-                        let removed_prefills: Vec<_> =
-                            prefilling.drain().map(|(_, seq)| seq).collect();
-                        for seq in removed_prefills {
-                            release_removed(seq.block_table, kv_allocator, enable_prefix_caching);
-                        }
-                        decode_rows.clear();
-                    }
-                    if req_id.is_correlated() {
-                        if let Err(e) = control.send(
-                            WorkerControlMessage::DrainAck(DrainAck {
-                                remaining_requests: active.len() + prefilling.len(),
-                            }),
-                            req_id,
-                        ) {
-                            tracing::info!("[serve] failed to send DrainAck: {}", e);
-                        }
-                    }
+                    apply_drain(
+                        control,
+                        active,
+                        prefilling,
+                        decode_rows,
+                        kv_allocator,
+                        enable_prefix_caching,
+                        d.mode,
+                        req_id,
+                    );
                 }
                 SchedulerControlMessage::UnloadModel(u) => {
                     if req_id.is_correlated() {
@@ -497,6 +463,105 @@ fn drain_control(
     false
 }
 
+/// Cancel one sequence: evict it from `active`/`prefilling`, release its KV,
+/// resync decode rows, and ack if the request was correlated.
+fn apply_cancel(
+    control: &ControlPump,
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    decode_rows: &mut DecodeRows,
+    kv_allocator: &mut GlobalKvAllocator,
+    enable_prefix_caching: bool,
+    sequence_id: u64,
+    req_id: RequestId,
+) {
+    let removed = active.remove(&sequence_id);
+    let removed_prefill = prefilling.remove(&sequence_id);
+    let removed_flag = removed.is_some() || removed_prefill.is_some();
+    if let Some(removed) = removed {
+        kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+        decode_rows.retain_active(active);
+        tracing::info!("[serve] cancelled seq {}", sequence_id);
+    }
+    if let Some(removed) = removed_prefill {
+        kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+        tracing::info!("[serve] cancelled prefilling seq {}", sequence_id);
+    }
+    if req_id.is_correlated() {
+        if let Err(e) = control.send(
+            WorkerControlMessage::CancelAck(CancelAck {
+                sequence_id,
+                removed: removed_flag,
+            }),
+            req_id,
+        ) {
+            tracing::info!("[serve] failed to send CancelAck: {}", e);
+        }
+    }
+}
+
+/// Preempt a set of victims: evict each from `active`/`prefilling`, release
+/// their KV, resync decode rows, then return any scheduler-freed slots.
+fn apply_preempt(
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    decode_rows: &mut DecodeRows,
+    kv_allocator: &mut GlobalKvAllocator,
+    enable_prefix_caching: bool,
+    sequence_ids: &[u64],
+    free_indices: &[u32],
+) {
+    for sid in sequence_ids {
+        if let Some(removed) = active.remove(sid) {
+            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+            tracing::info!("[serve] preempted seq {}", sid);
+        }
+        if let Some(removed) = prefilling.remove(sid) {
+            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+            tracing::info!("[serve] preempted prefilling seq {}", sid);
+        }
+    }
+    decode_rows.retain_active(active);
+    if !free_indices.is_empty() {
+        kv_allocator.free(free_indices);
+    }
+}
+
+/// Drain: on `Immediate`, evict every sequence and release all KV; always ack
+/// with the post-drain remaining-request count if correlated.
+fn apply_drain(
+    control: &ControlPump,
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    decode_rows: &mut DecodeRows,
+    kv_allocator: &mut GlobalKvAllocator,
+    enable_prefix_caching: bool,
+    mode: DrainMode,
+    req_id: RequestId,
+) {
+    if matches!(mode, DrainMode::Immediate) {
+        let removed: Vec<_> = active.drain().map(|(_, seq)| seq).collect();
+        for seq in removed {
+            kv_allocator.release_owned(&seq.block_table, enable_prefix_caching);
+        }
+        let removed_prefills: Vec<_> = prefilling.drain().map(|(_, seq)| seq).collect();
+        for seq in removed_prefills {
+            kv_allocator.release_owned(&seq.block_table, enable_prefix_caching);
+        }
+        decode_rows.clear();
+    }
+    if req_id.is_correlated() {
+        if let Err(e) = control.send(
+            WorkerControlMessage::DrainAck(DrainAck {
+                remaining_requests: active.len() + prefilling.len(),
+            }),
+            req_id,
+        ) {
+            tracing::info!("[serve] failed to send DrainAck: {}", e);
+        }
+    }
+}
+
 fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {
     let mut pending_prefills = Vec::new();
     loop {
@@ -513,19 +578,6 @@ fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {
         }
     }
     pending_prefills
-}
-
-fn release_removed(
-    block_table: Vec<u32>,
-    kv_allocator: &mut GlobalKvAllocator,
-    enable_prefix_caching: bool,
-) {
-    if block_table.is_empty() {
-        return;
-    }
-    if !enable_prefix_caching {
-        kv_allocator.release(&block_table);
-    }
 }
 
 fn maybe_heartbeat(control: &ControlPump, active_n: usize, last: &mut Instant, interval: Duration) {

@@ -4,7 +4,7 @@ use infer_protocol::control_envelope::RequestId;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WorkerControlMessage;
 
-use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
+use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::infrastructure::transport::control_pump::ControlPump;
 
@@ -94,10 +94,10 @@ pub fn wait_for_relief<C: ReliefControl>(
                 );
                 for sid in &p.sequence_ids {
                     if let Some(entry) = active.remove(sid) {
-                        release_removed_active(entry, kv_allocator, enable_prefix_caching);
+                        kv_allocator.release_owned(&entry.block_table, enable_prefix_caching);
                     }
                     if let Some(entry) = prefilling.remove(sid) {
-                        release_removed_prefill(entry, kv_allocator, enable_prefix_caching);
+                        kv_allocator.release_owned(&entry.block_table, enable_prefix_caching);
                     }
                 }
                 if !p.free_indices.is_empty() {
@@ -115,11 +115,11 @@ pub fn wait_for_relief<C: ReliefControl>(
             Ok(Some((SchedulerControlMessage::Cancel(c), _))) => {
                 let mut cancelled = false;
                 if let Some(removed) = active.remove(&c.sequence_id) {
-                    release_removed_active(removed, kv_allocator, enable_prefix_caching);
+                    kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
                     cancelled = true;
                 }
                 if let Some(removed) = prefilling.remove(&c.sequence_id) {
-                    release_removed_prefill(removed, kv_allocator, enable_prefix_caching);
+                    kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
                     cancelled = true;
                 }
                 if cancelled {
@@ -157,7 +157,7 @@ pub fn alloc_with_relief<C: ReliefControl>(
     enable_prefix_caching: bool,
     shrink_to_active: bool,
 ) -> AllocWithReliefOutcome {
-    const RELIEF_TIMEOUT_MS: i64 = 500;
+    use crate::application::tuning::RELIEF_TIMEOUT_MS;
     let mut round: u8 = 0;
     let mut n = n_initial;
     let mut retried_after_round1_relief = false;
@@ -249,32 +249,6 @@ fn log_partial_relief(kv_allocator: &GlobalKvAllocator, needed_slots: u32) {
         kv_allocator.available(),
         kv_allocator.total_free(),
     );
-}
-
-fn release_removed_active(
-    removed: ActiveSeq,
-    kv_allocator: &mut GlobalKvAllocator,
-    enable_prefix_caching: bool,
-) {
-    if removed.block_table.is_empty() {
-        return;
-    }
-    if !enable_prefix_caching {
-        kv_allocator.release(&removed.block_table);
-    }
-}
-
-fn release_removed_prefill(
-    removed: PrefillSeq,
-    kv_allocator: &mut GlobalKvAllocator,
-    enable_prefix_caching: bool,
-) {
-    if removed.block_table.is_empty() {
-        return;
-    }
-    if !enable_prefix_caching {
-        kv_allocator.release(&removed.block_table);
-    }
 }
 
 #[cfg(test)]

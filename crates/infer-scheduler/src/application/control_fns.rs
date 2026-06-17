@@ -1,8 +1,10 @@
-//! Free-function counterpart for [`super::ControlEventSystem`].
+//! Control-plane event handling (free functions).
 //!
-//! `ControlEventSystem` is a stateless singleton (`PhantomData<()>`).
-//! Converting to a free function simplifies the borrow shape and
-//! prepares for the `EngineWorkflow` trait.
+//! Translates a single `ControlEvent` into a [`ControlOutcome`] the engine
+//! then dispatches. Stateless: the engine drives any returned
+//! `failed_request_ids` through `output_fns::fail_sessions(...)` with a fresh
+//! borrow, keeping the `&mut requests` borrow here disjoint from the follow-up
+//! `&mut output`.
 
 use infer_protocol::worker_to_scheduler_control::{AllocFailed, WorkerStepError};
 
@@ -363,4 +365,275 @@ fn collect_failed_sequence_ids(err: &WorkerStepError, sessions: &RequestTable) -
     sequence_ids.sort_unstable();
     sequence_ids.dedup();
     sequence_ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::inference_session::handle::RequestHandle;
+    use crate::domain::inference_session::lifecycle::{
+        Priority, RequestId, RequestMeta, SamplingParams,
+    };
+    use infer_protocol::worker_to_scheduler_control::{WorkerHeartbeat, WorkerState};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn empty_table() -> RequestTable {
+        RequestTable::new()
+    }
+
+    fn fresh_radix() -> RadixTree {
+        RadixTree::new()
+    }
+
+    fn fresh_budget(cap: u32) -> KvBudget {
+        KvBudget::new(cap)
+    }
+
+    fn worker_group_for_test() -> WorkerGroup {
+        use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerReady};
+        WorkerGroup::from_single_ready(WorkerReady {
+            worker_id: "worker-test".into(),
+            model_instance_id: "default".into(),
+            model_path: "model".into(),
+            model_type: "llama".into(),
+            device: "cuda:0".into(),
+            capacity: WorkerCapacity {
+                max_batch_tokens: 0,
+                max_batch_seqs: 0,
+                max_running_requests: 0,
+                max_total_kv_tokens: None,
+                free_mem_before_load_gb: None,
+                free_mem_after_load_gb: None,
+                weight_mem_usage_gb: None,
+                workspace_mem_usage_gb: None,
+                graph_mem_usage_gb: None,
+            },
+        })
+    }
+
+    fn dummy_running_session(table: &mut RequestTable, external_id: &str, sid: u64) -> RequestId {
+        let request_id = RequestId::new_v4();
+        let meta = Arc::new(RequestMeta {
+            id: request_id.clone(),
+            external_id: external_id.into(),
+            sequence_id: SequenceId(sid),
+            input_ids: vec![1, 2, 3, 4],
+            max_tokens: 8,
+            sampling: SamplingParams::default(),
+            priority: Priority::default(),
+            stream: false,
+            stop_sequences: vec![],
+            ignore_eos: false,
+            diffusion: None,
+            arrival_time: Instant::now(),
+        });
+        table.insert_new(meta, RequestHandle::noop()).unwrap();
+        // Promote to decoding so running_sequence_ids() picks it up.
+        let queued = table.take_waiting(&request_id).unwrap();
+        table
+            .commit_prefill_start(
+                queued,
+                crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
+                4,
+            )
+            .unwrap();
+        let _ = table.ack_prefill(SequenceId(sid)).unwrap();
+        request_id
+    }
+
+    /// Build a `ControlPlaneCmdTx` whose router channel has a live
+    /// receiver, so `send_to(...)` never fails (it would otherwise
+    /// hit `ControlError::Shutdown` and our outcomes would all be
+    /// `Terminate`). The receiver handle is returned so the caller
+    /// keeps it alive for the duration of the test.
+    fn dummy_cmd_tx_with_rx() -> (
+        ControlPlaneCmdTx,
+        tokio::sync::mpsc::UnboundedReceiver<
+            crate::infrastructure::transport::control_plane::handle::RouterCommand,
+        >,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending =
+            crate::infrastructure::transport::control_plane::pending_calls::PendingCalls::new();
+        (
+            ControlPlaneCmdTx {
+                tx,
+                pending,
+                default_rpc_deadline: std::time::Duration::from_secs(5),
+            },
+            rx,
+        )
+    }
+
+    /// Invoke the free handler with `enable_prefix_caching = false` and the
+    /// test worker identity. The migrated tests do not exercise the
+    /// prefix-caching branches, so the flag value is immaterial to their
+    /// assertions.
+    fn invoke(
+        event: ControlEvent,
+        sessions: &mut RequestTable,
+        radix: &mut RadixTree,
+        budget: &mut KvBudget,
+        cmd: &ControlPlaneCmdTx,
+        wg: &WorkerGroup,
+    ) -> ControlOutcome {
+        handle_control_event(
+            event,
+            sessions,
+            radix,
+            budget,
+            cmd,
+            wg,
+            &WorkerId::from_identity(b"worker-test"),
+            false,
+        )
+    }
+
+    #[test]
+    fn worker_error_fatal_emits_terminate() {
+        let mut sessions = empty_table();
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
+        let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let outcome = invoke(
+            ControlEvent::WorkerError {
+                worker: WorkerId::from_identity(b"w"),
+                message: "boom".into(),
+                fatal: true,
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+        match outcome {
+            ControlOutcome::Terminate {
+                lost: None,
+                error: SchedulerError::WorkerError(msg),
+            } => assert_eq!(msg, "boom"),
+            other => panic!("expected Terminate(WorkerError), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn worker_error_nonfatal_is_noop() {
+        let mut sessions = empty_table();
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
+        let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let outcome = invoke(
+            ControlEvent::WorkerError {
+                worker: WorkerId::from_identity(b"w"),
+                message: "transient".into(),
+                fatal: false,
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+        assert!(matches!(
+            outcome,
+            ControlOutcome::Continue {
+                ref failed_request_ids,
+                fail_message: None,
+            } if failed_request_ids.is_empty()
+        ));
+    }
+
+    #[test]
+    fn worker_lost_terminates() {
+        let mut sessions = empty_table();
+        // One running session: the synthetic StepError gathers it.
+        let _ = dummy_running_session(&mut sessions, "ext-1", 1);
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
+        let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let outcome = invoke(
+            ControlEvent::WorkerLost {
+                worker: WorkerId::from_identity(b"w"),
+                last_seen_ms: 5000,
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+        assert!(matches!(
+            outcome,
+            ControlOutcome::Terminate {
+                lost: None,
+                error: SchedulerError::WorkerError(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn step_error_nonfatal_returns_failed_request_ids() {
+        let mut sessions = empty_table();
+        let rid = dummy_running_session(&mut sessions, "ext-2", 7);
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(0);
+        let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let outcome = invoke(
+            ControlEvent::StepError {
+                worker: WorkerId::from_identity(b"w"),
+                err: WorkerStepError {
+                    sequence_ids: vec![7],
+                    message: "step glitch".into(),
+                    fatal: false,
+                },
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+        match outcome {
+            ControlOutcome::Continue {
+                failed_request_ids,
+                fail_message,
+            } => {
+                assert_eq!(failed_request_ids, vec![rid]);
+                assert_eq!(fail_message.as_deref(), Some("step glitch"));
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    /// Heartbeat is liveness-only now — no KV pressure inspection.
+    #[test]
+    fn heartbeat_is_noop() {
+        let mut sessions = empty_table();
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(100);
+        let (cmd, mut cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let outcome = invoke(
+            ControlEvent::Heartbeat {
+                worker: WorkerId::from_identity(b"w"),
+                hb: WorkerHeartbeat {
+                    worker_id: "w".into(),
+                    state: WorkerState::Running,
+                    active_requests: 0,
+                },
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+        assert!(matches!(outcome, ControlOutcome::Continue { .. }));
+        assert!(cmd_rx.try_recv().is_err(), "no FreeKvIndices expected");
+    }
 }

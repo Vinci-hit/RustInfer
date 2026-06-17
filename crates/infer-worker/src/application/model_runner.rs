@@ -19,6 +19,9 @@ use crate::domain::types::{Dtype, Shape};
 mod cuda_decode;
 
 #[cfg(feature = "cuda")]
+pub use cuda_decode::DecodeCompactOutput;
+
+#[cfg(feature = "cuda")]
 use crate::application::cuda_graph_runner::CudaGraphRunner;
 
 /// Per-sequence step description fed by callers (host side). The runner

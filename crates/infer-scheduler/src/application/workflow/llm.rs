@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use infer_protocol::scheduler_to_worker_control::{FreeKvIndices, SchedulerControlMessage};
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, StepOutput};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::application::dispatch::DispatchSystem;
@@ -238,7 +239,7 @@ async fn handle_llm_step(
 ) -> Result<()> {
     let enable_prefix = ctx.config.enable_prefix_caching;
     let sanitized_step = sanitize_step_output(ctx, step, enable_prefix);
-    let step = &sanitized_step;
+    let step = &*sanitized_step;
 
     // KV budget tracking — always needed for admission control.
     if !step.assigned_indices.is_empty() {
@@ -296,11 +297,34 @@ async fn handle_llm_step(
     Ok(())
 }
 
-fn sanitize_step_output(
+fn sanitize_step_output<'s>(
     ctx: &mut ResourceContext<'_>,
-    step: &StepOutput,
+    step: &'s StepOutput,
     release_stale_indices: bool,
-) -> StepOutput {
+) -> Cow<'s, StepOutput> {
+    // Fast path: when every reported sequence is still running there is
+    // nothing to drop, so borrow the original instead of cloning the whole
+    // StepOutput (assigned_indices carry `token_ids: Vec<i32>` — the bulk of
+    // the per-step allocation). Most steps have no stale rows.
+    let all_running = step
+        .assigned_indices
+        .iter()
+        .all(|a| is_sequence_running(ctx.requests, a.sequence_id))
+        && step
+            .prefill_done
+            .iter()
+            .all(|sid| is_sequence_running(ctx.requests, *sid))
+        && step
+            .tokens
+            .iter()
+            .all(|tk| is_sequence_running(ctx.requests, tk.sequence_id));
+    if all_running {
+        return Cow::Borrowed(step);
+    }
+
+    // Slow path: at least one sequence went stale (late output for a
+    // cancelled/finished request). Rebuild with the stale rows dropped and
+    // optionally hand their KV indices back to the worker.
     let mut stale_indices = Vec::new();
     let assigned_indices: Vec<AssignedIndices> = step
         .assigned_indices
@@ -326,7 +350,7 @@ fn sanitize_step_output(
         }
     }
 
-    StepOutput {
+    Cow::Owned(StepOutput {
         prefill_done: step
             .prefill_done
             .iter()
@@ -340,7 +364,7 @@ fn sanitize_step_output(
             .cloned()
             .collect(),
         assigned_indices,
-    }
+    })
 }
 
 fn is_sequence_running(requests: &RequestTable, sequence_id: u64) -> bool {

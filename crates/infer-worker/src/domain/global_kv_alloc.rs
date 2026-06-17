@@ -287,6 +287,21 @@ impl GlobalKvAllocator {
         self.released.len()
     }
 
+    /// Release a finished/evicted sequence's block table back to the pool.
+    ///
+    /// With prefix caching enabled the slots stay pinned by the
+    /// scheduler-side RadixTree, so this is a no-op. With it disabled the
+    /// slots are recycled via `release()`. Empty tables are ignored. This is
+    /// the single choke point for the "free a sequence's KV" decision that
+    /// was previously copy-pasted across serve_loop / kv_relief /
+    /// worker_scheduler.
+    pub fn release_owned(&mut self, block_table: &[u32], enable_prefix_caching: bool) {
+        if enable_prefix_caching || block_table.is_empty() {
+            return;
+        }
+        self.release(block_table);
+    }
+
     /// Drop the consumed prefix and sort the remaining free indices.
     /// Pool is fully sorted after every `free()` call; this method stays
     /// public for explicit "compact while idle" patterns and tests but
