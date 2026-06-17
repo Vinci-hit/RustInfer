@@ -550,7 +550,11 @@ fn build_decode_inputs(
     for (i, &sid) in order.iter().enumerate() {
         let new_idx = new_indices[i];
         let seq = active.get(&sid).unwrap();
-        let mut bt = seq.block_table.clone();
+        // C1: build the step's block table in one allocation. The old
+        // `clone()` then `push()` allocated twice (clone sized to len, push
+        // reallocated to len+1); reserving len+1 up front does it once.
+        let mut bt = Vec::with_capacity(seq.block_table.len() + 1);
+        bt.extend_from_slice(&seq.block_table);
         bt.push(new_idx);
         inputs.steps.push(SeqStep {
             input_ids: vec![seq.last_token],

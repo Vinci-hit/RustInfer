@@ -65,6 +65,19 @@ pub struct RustInferConfig {
     #[serde(default)]
     pub chunked_prefill_size: usize,
 
+    /// Max NEW prefill sequences admitted per scheduling iteration (B1
+    /// admission control). 0 => unlimited (default; bounded only by the
+    /// token/seq budget). A smaller value smooths the TTFT tail under bursty
+    /// arrivals by capping how much fresh prefill work enters at once.
+    #[serde(default)]
+    pub max_prefill_seqs_per_iter: usize,
+
+    /// Shortest-job-first prefill ordering (B2). When true the scheduler
+    /// admits shorter prompts first within an iteration, reducing
+    /// head-of-line blocking from long prompts. Default false (strict FCFS).
+    #[serde(default)]
+    pub prefill_sjf: bool,
+
     /// Enable RadixTree prefix caching (paged mode only).
     #[serde(default)]
     pub enable_prefix_caching: bool,

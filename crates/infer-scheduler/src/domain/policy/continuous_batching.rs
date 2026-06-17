@@ -26,13 +26,28 @@ const PREFILL_Q_TILE: usize = 128;
 pub struct ContinuousBatchingPolicy {
     /// Max tokens per prefill chunk (None = no chunking, entire prompt at once).
     pub chunked_prefill_size: Option<usize>,
+    /// Max NEW prefill sequences admitted per iteration (B1). 0 = unlimited.
+    pub max_new_prefills_per_iter: usize,
+    /// Shortest-job-first ordering of new prefills within an iteration (B2).
+    pub sjf: bool,
 }
 
 impl ContinuousBatchingPolicy {
     pub fn new(chunked_prefill_size: Option<usize>) -> Self {
         Self {
             chunked_prefill_size,
+            max_new_prefills_per_iter: 0,
+            sjf: false,
         }
+    }
+
+    /// Configure admission control (B1) and shortest-job-first ordering (B2).
+    /// Both default off in [`Self::new`]; this opt-in keeps strict FCFS and
+    /// unbounded admission as the default behaviour.
+    pub fn with_admission(mut self, max_new_prefills_per_iter: usize, sjf: bool) -> Self {
+        self.max_new_prefills_per_iter = max_new_prefills_per_iter;
+        self.sjf = sjf;
+        self
     }
 
     /// Compute the chunk size for a given remaining token count.
@@ -95,8 +110,23 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
             && seq_budget > 0
             && !waiting.is_empty()
         {
-            for (seqs_used, seq) in waiting.iter().enumerate() {
+            // Build the candidate order. Default: FCFS within priority (the
+            // queue's native order). With SJF (B2): shortest prompt first, so
+            // long prompts don't head-of-line block short ones this iteration.
+            let mut candidates: Vec<_> = waiting.iter().collect();
+            if self.sjf {
+                candidates.sort_by_key(|seq| seq.meta.input_ids.len());
+            }
+
+            let mut new_admitted = 0usize;
+            for (seqs_used, seq) in candidates.into_iter().enumerate() {
                 if seqs_used >= seq_budget || kv_budget_remaining == 0 || tile_budget_remaining == 0
+                {
+                    break;
+                }
+                // B1 admission cap: stop after N new prefills this iteration.
+                if self.max_new_prefills_per_iter != 0
+                    && new_admitted >= self.max_new_prefills_per_iter
                 {
                     break;
                 }
@@ -130,6 +160,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                     token_range: 0..tokens_to_prefill,
                     is_partial,
                 });
+                new_admitted += 1;
 
                 kv_budget_remaining =
                     kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);

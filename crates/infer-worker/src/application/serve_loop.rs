@@ -277,14 +277,21 @@ where
             }
         }
 
-        // ── Prefill first ──
+        // ── Prefill first, interleaved with decode ──
         //
         // New prefills are admitted *before* the decode step so the first
         // token is produced on this very iteration instead of waiting for a
         // full decode round-trip. `handle_prefill` emits the first token
         // directly (FinishPrefillAndStartDecode), so TTFT no longer eats an
         // extra decode-step latency.
-        for cmd in pending_prefills {
+        //
+        // A2: when several prefill commands have queued (a burst arriving
+        // while the worker was busy), run a decode step *between* them so the
+        // already-active sequences keep advancing instead of stalling behind
+        // the whole prefill backlog. The trailing decode below still runs the
+        // main-cadence step.
+        let num_prefills = pending_prefills.len();
+        for (i, cmd) in pending_prefills.into_iter().enumerate() {
             if drain_control(
                 control,
                 &mut active,
@@ -312,6 +319,30 @@ where
                     return Ok(());
                 }
                 tracing::info!("[serve] prefill error: {}", e);
+            }
+
+            // Interleave a decode step between remaining prefills so a burst
+            // does not starve active decoding. Skipped after the last prefill
+            // (the main-cadence decode below covers it) and during a dedicated
+            // CUDA profiling run (which counts only main-cadence steps).
+            if i + 1 < num_prefills && !active.is_empty() && profile_cuda_steps.is_none() {
+                if let Err(e) = run_decode_step(
+                    &mut runner,
+                    &mut active,
+                    &mut prefilling,
+                    &mut decode_rows,
+                    &mut kv_allocator,
+                    control,
+                    data,
+                    eos_ids,
+                    enable_prefix_caching,
+                ) {
+                    if matches!(e, OpError::Shutdown) {
+                        tracing::info!("[serve] interleaved decode interrupted by shutdown.");
+                        return Ok(());
+                    }
+                    tracing::info!("[serve] interleaved decode error: {}", e);
+                }
             }
         }
 

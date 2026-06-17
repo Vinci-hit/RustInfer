@@ -291,15 +291,25 @@ impl GlobalKvAllocator {
     ///
     /// With prefix caching enabled the slots stay pinned by the
     /// scheduler-side RadixTree, so this is a no-op. With it disabled the
-    /// slots are recycled via `release()`. Empty tables are ignored. This is
-    /// the single choke point for the "free a sequence's KV" decision that
-    /// was previously copy-pasted across serve_loop / kv_relief /
+    /// slots are returned via `free()` — merged into the free pool
+    /// **immediately** so the very next `alloc_indices` (e.g. the same decode
+    /// step admitting a new row) can reuse them. Empty tables are ignored.
+    ///
+    /// This is the single choke point for the "free a sequence's KV" decision
+    /// that was previously copy-pasted across serve_loop / kv_relief /
     /// worker_scheduler.
+    ///
+    /// Eager merge (A1): the older `release()` path parked slots in a holding
+    /// list that was only drained on the next allocation *failure*. Under
+    /// continuous batching that starved the decode batch — completed
+    /// sequences freed slots that stayed invisible while `alloc_indices`
+    /// succeeded via bump, so the batch filled below capacity. `free()` makes
+    /// freed slots allocatable on the spot.
     pub fn release_owned(&mut self, block_table: &[u32], enable_prefix_caching: bool) {
         if enable_prefix_caching || block_table.is_empty() {
             return;
         }
-        self.release(block_table);
+        self.free(block_table);
     }
 
     /// Drop the consumed prefix and sort the remaining free indices.

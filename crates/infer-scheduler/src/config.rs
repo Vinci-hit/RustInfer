@@ -36,6 +36,10 @@ pub struct SchedulerConfig {
     // ─── Scheduling ───
     /// Max tokens per prefill chunk (None = no chunking).
     pub chunked_prefill_size: Option<usize>,
+    /// Max NEW prefill sequences admitted per iteration (B1). 0 = unlimited.
+    pub max_prefill_seqs_per_iter: usize,
+    /// Shortest-job-first prefill ordering within an iteration (B2).
+    pub prefill_sjf: bool,
     /// Whether prefix caching is enabled (requires Paged mode).
     pub enable_prefix_caching: bool,
 
@@ -62,6 +66,8 @@ impl Default for SchedulerConfig {
             paged_block_size: BlockSize::new(1),
             num_gpu_blocks: 256,
             chunked_prefill_size: None,
+            max_prefill_seqs_per_iter: 0,
+            prefill_sjf: false,
             enable_prefix_caching: false,
             frontend_endpoint: "ipc:///tmp/rustinfer.ipc".to_string(),
             worker_push_endpoint: "ipc:///tmp/rustinfer-worker-in.ipc".to_string(),

@@ -85,6 +85,8 @@ async fn main() -> Result<()> {
         max_model_len: cfg.max_model_len,
         paged_block_size,
         chunked_prefill_size: cfg.chunked_prefill(),
+        max_prefill_seqs_per_iter: cfg.max_prefill_seqs_per_iter,
+        prefill_sjf: cfg.prefill_sjf,
         enable_prefix_caching: cfg.enable_prefix_caching,
         frontend_endpoint: frontend_endpoint.clone(),
         worker_push_endpoint: worker_push_endpoint.clone(),
@@ -164,7 +166,10 @@ async fn main() -> Result<()> {
 
     let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
         SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(cfg.max_batch_seqs)),
-        SchedulerMode::Llm => Box::new(ContinuousBatchingPolicy::new(config.chunked_prefill_size)),
+        SchedulerMode::Llm => Box::new(
+            ContinuousBatchingPolicy::new(config.chunked_prefill_size)
+                .with_admission(config.max_prefill_seqs_per_iter, config.prefill_sjf),
+        ),
     };
 
     // Build and run engine.
