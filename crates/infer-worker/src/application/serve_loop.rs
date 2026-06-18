@@ -290,7 +290,7 @@ where
             }
         }
 
-        // ── Prefill first, interleaved with decode ──
+        // ── Prefill first, then decode ──
         //
         // New prefills are admitted *before* the decode step so the first
         // token is produced on this very iteration instead of waiting for a
@@ -298,67 +298,57 @@ where
         // directly (FinishPrefillAndStartDecode), so TTFT no longer eats an
         // extra decode-step latency.
         //
-        // A2: when several prefill commands have queued (a burst arriving
-        // while the worker was busy), run a decode step *between* them so the
-        // already-active sequences keep advancing instead of stalling behind
-        // the whole prefill backlog. The trailing decode below still runs the
-        // main-cadence step.
-        let num_prefills = pending_prefills.len();
-        for (i, cmd) in pending_prefills.into_iter().enumerate() {
-            {
-                let mut ctx = WorkerCtx {
-                    active: &mut active,
-                    prefilling: &mut prefilling,
-                    decode_engine: &mut decode_engine,
-                    kv_allocator: &mut kv_allocator,
-                    enable_prefix_caching,
-                };
-                if drain_control(control, &mut ctx) {
-                    return Ok(());
-                }
-            }
-            if let Err(e) = handle_prefill(
-                &mut PrefillCtx {
-                    runner: &mut runner,
-                    active: &mut active,
-                    prefilling: &mut prefilling,
-                    kv_allocator: &mut kv_allocator,
-                    control,
-                    data,
-                    eos_ids,
-                    enable_prefix_caching,
-                    cap_batch,
-                },
-                &cmd,
-            ) {
-                if matches!(e, OpError::Shutdown) {
-                    tracing::info!("[serve] prefill interrupted by shutdown.");
-                    return Ok(());
-                }
-                tracing::info!("[serve] prefill error: {}", e);
-            }
-
-            // Interleave a decode step between remaining prefills so a burst
-            // does not starve active decoding. Skipped after the last prefill
-            // (the main-cadence decode below covers it) and during a dedicated
-            // CUDA profiling run (which counts only main-cadence steps).
-            if i + 1 < num_prefills && !active.is_empty() && profile_cuda_steps.is_none() {
-                if let Err(e) = decode_engine.run_step(
-                    &mut runner,
-                    &mut active,
-                    &mut prefilling,
-                    &mut kv_allocator,
-                    control,
-                    data,
-                    eos_ids,
-                    enable_prefix_caching,
-                ) {
-                    if matches!(e, OpError::Shutdown) {
-                        tracing::info!("[serve] interleaved decode interrupted by shutdown.");
+        // Decode is intentionally not interleaved between prefills in the
+        // same drained backlog. Interleaving makes identical burst requests
+        // enter decode at different batch shapes (1, 2, 3, ...), which can
+        // expose shape-dependent kernel/numeric differences and permanently
+        // diverge greedy outputs. Drain the currently available prefills first
+        // so a short burst starts decode as one cohort.
+        let mut prefill_rounds = 0usize;
+        while !pending_prefills.is_empty() {
+            prefill_rounds += 1;
+            for cmd in std::mem::take(&mut pending_prefills) {
+                {
+                    let mut ctx = WorkerCtx {
+                        active: &mut active,
+                        prefilling: &mut prefilling,
+                        decode_engine: &mut decode_engine,
+                        kv_allocator: &mut kv_allocator,
+                        enable_prefix_caching,
+                    };
+                    if drain_control(control, &mut ctx) {
                         return Ok(());
                     }
-                    tracing::info!("[serve] interleaved decode error: {}", e);
                 }
+                if let Err(e) = handle_prefill(
+                    &mut PrefillCtx {
+                        runner: &mut runner,
+                        active: &mut active,
+                        prefilling: &mut prefilling,
+                        kv_allocator: &mut kv_allocator,
+                        control,
+                        data,
+                        eos_ids,
+                        enable_prefix_caching,
+                        cap_batch,
+                    },
+                    &cmd,
+                ) {
+                    if matches!(e, OpError::Shutdown) {
+                        tracing::info!("[serve] prefill interrupted by shutdown.");
+                        return Ok(());
+                    }
+                    tracing::info!("[serve] prefill error: {}", e);
+                }
+            }
+
+            if prefill_rounds >= 16 {
+                break;
+            }
+
+            pending_prefills = drain_data(data);
+            if pending_prefills.is_empty() {
+                pending_prefills = wait_for_prefill_quiet(data, Duration::from_millis(1));
             }
         }
 
@@ -575,6 +565,26 @@ fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {
         }
     }
     pending_prefills
+}
+
+fn wait_for_prefill_quiet(data: &DataPump, quiet: Duration) -> Vec<PrefillBatchCmd> {
+    let timeout_ms = quiet.as_millis().max(1) as i64;
+    let mut items = [data.recv_socket().as_poll_item(zmq::POLLIN)];
+    match zmq::poll(&mut items, timeout_ms) {
+        Ok(_) => {}
+        Err(zmq::Error::EINTR) => return Vec::new(),
+        Err(e) => {
+            tracing::info!("[serve] prefill quiet poll error: {:?}", e);
+            return Vec::new();
+        }
+    }
+    let data_ready = items[0].is_readable();
+    drop(items);
+    if data_ready {
+        drain_data(data)
+    } else {
+        Vec::new()
+    }
 }
 
 fn maybe_heartbeat(control: &ControlPump, active_n: usize, last: &mut Instant, interval: Duration) {

@@ -11,8 +11,8 @@ use crate::domain::batch::{BatchKind, BatchPlan};
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype};
-use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::{cudaStream_t, cudnnHandle_t};
+use crate::infrastructure::cuda::Cuda;
 use std::ffi::c_void;
 
 unsafe extern "C" {
