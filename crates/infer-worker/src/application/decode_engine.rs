@@ -1,4 +1,6 @@
 use half::bf16;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::application::forward_workspace::ForwardWorkspace;
 use infer_protocol::worker_to_scheduler_control::{WorkerControlMessage, WorkerStepError};
@@ -56,15 +58,19 @@ impl DecodeEngine {
             return Ok(());
         }
 
-        let (order, new_indices) = match self.prepare_step(
-            runner,
+        let (order, new_indices, append_start_row, append_tokens) = match self.prepare_step(
             active,
             prefilling,
             kv_allocator,
             control,
             enable_prefix_caching,
         )? {
-            DecodePrep::Ready { order, new_indices } => (order, new_indices),
+            DecodePrep::Ready {
+                order,
+                new_indices,
+                append_start_row,
+                append_tokens,
+            } => (order, new_indices, append_start_row, append_tokens),
             DecodePrep::Done => return Ok(()),
         };
 
@@ -72,6 +78,8 @@ impl DecodeEngine {
 
         let compact = match runner.step_decode_abc_compact(
             &inputs.steps,
+            append_start_row,
+            &append_tokens,
             &inputs.generated_counts,
             &inputs.max_tokens,
             &inputs.ignore_eos,
@@ -110,40 +118,17 @@ impl DecodeEngine {
         Ok(())
     }
 
-    fn prepare_step<M>(
+    fn prepare_step(
         &mut self,
-        runner: &mut ModelRunner<bf16, Cuda, M>,
         active: &mut ActiveSeqMap,
         prefilling: &mut PrefillSeqMap,
         kv_allocator: &mut GlobalKvAllocator,
         control: &ControlPump,
         enable_prefix_caching: bool,
-    ) -> OpResult<DecodePrep>
-    where
-        M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
-    {
+    ) -> OpResult<DecodePrep> {
         self.rows.retain_active(active);
         let pending = self.rows.pending_admissions(active);
         if !pending.is_empty() {
-            let mut admit_tokens = Vec::with_capacity(pending.len());
-            for sid in &pending {
-                if let Some(seq) = active.get(sid) {
-                    admit_tokens.push(seq.last_token);
-                }
-            }
-            if let Err(e) = runner.append_decode_admissions_to_a(self.rows.len(), &admit_tokens) {
-                let failed: Vec<u64> = active.keys().copied().collect();
-                fail_decode_seqs(
-                    control,
-                    active,
-                    kv_allocator,
-                    &failed,
-                    format!("decode admission append failed: {:?}", e),
-                    enable_prefix_caching,
-                );
-                self.rows.clear();
-                return Ok(DecodePrep::Done);
-            }
             self.rows.append_admissions(&pending);
         }
 
@@ -223,7 +208,14 @@ impl DecodeEngine {
             }
         }
 
-        Ok(DecodePrep::Ready { order, new_indices })
+        let (append_start_row, append_tokens) = build_a_append(&order, &pending, active);
+
+        Ok(DecodePrep::Ready {
+            order,
+            new_indices,
+            append_start_row,
+            append_tokens,
+        })
     }
 
     fn commit_results(
@@ -259,6 +251,8 @@ impl DecodeEngine {
             row_results[row.src_row] = Some((row.token_id, true));
             to_remove.push(order[row.src_row]);
         }
+
+        trace_decode_commit(order, new_indices, active, &row_results, compact);
 
         for (i, &sid) in order.iter().enumerate() {
             let Some((token, finished)) = row_results[i] else {
@@ -296,6 +290,8 @@ enum DecodePrep {
     Ready {
         order: Vec<u64>,
         new_indices: Vec<u32>,
+        append_start_row: usize,
+        append_tokens: Vec<i32>,
     },
     Done,
 }
@@ -349,6 +345,68 @@ fn build_decode_inputs(
         inputs.ignore_eos.push(seq.ignore_eos);
     }
     inputs
+}
+
+fn build_a_append(
+    order: &[u64],
+    pending_admissions: &[u64],
+    active: &ActiveSeqMap,
+) -> (usize, Vec<i32>) {
+    if pending_admissions.is_empty() {
+        return (order.len(), Vec::new());
+    }
+
+    let pending: HashSet<u64> = pending_admissions.iter().copied().collect();
+    let start = order
+        .iter()
+        .position(|sid| pending.contains(sid))
+        .unwrap_or(order.len());
+    let tokens = order[start..]
+        .iter()
+        .filter_map(|sid| active.get(sid).map(|seq| seq.last_token))
+        .collect();
+    (start, tokens)
+}
+
+fn trace_decode_commit(
+    order: &[u64],
+    new_indices: &[u32],
+    active: &ActiveSeqMap,
+    row_results: &[Option<(i32, bool)>],
+    compact: &DecodeCompactOutput,
+) {
+    if !crate::env_flags::trace_decode_compact() {
+        return;
+    }
+    static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let step = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if step >= 32 {
+        return;
+    }
+
+    tracing::warn!(
+        step,
+        rows = order.len(),
+        active_rows = compact.active.len(),
+        finished_rows = compact.finished.len(),
+        "decode commit trace"
+    );
+    for (row, &sid) in order.iter().enumerate().take(8) {
+        let (token, finished) = row_results.get(row).and_then(|v| *v).unwrap_or((-1, false));
+        let seq = active.get(&sid);
+        tracing::warn!(
+            step,
+            row,
+            sequence_id = sid,
+            input_token = seq.map(|s| s.last_token).unwrap_or(-1),
+            kv_len = seq.map(|s| s.kv_len).unwrap_or(0),
+            block_table_len = seq.map(|s| s.block_table.len()).unwrap_or(0),
+            new_idx = new_indices.get(row).copied().unwrap_or(u32::MAX),
+            token,
+            finished,
+            "decode commit row"
+        );
+    }
 }
 
 fn fail_decode_seqs(

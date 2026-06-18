@@ -67,7 +67,9 @@ impl MetricsSnapshot {
     pub fn delta(&self, prev: &Self) -> MetricsDelta {
         MetricsDelta {
             requests: self.total_requests.saturating_sub(prev.total_requests),
-            completions: self.total_completions.saturating_sub(prev.total_completions),
+            completions: self
+                .total_completions
+                .saturating_sub(prev.total_completions),
             tokens_generated: self
                 .total_tokens_generated
                 .saturating_sub(prev.total_tokens_generated),
@@ -119,24 +121,6 @@ impl MetricsDelta {
             0.0
         } else {
             self.latency_ms as f64 / self.completions as f64
-        }
-    }
-}
-    /// Average latency per request (ms).
-    pub fn avg_latency_ms(&self) -> f64 {
-        if self.total_completions == 0 {
-            0.0
-        } else {
-            self.total_latency_ms as f64 / self.total_completions as f64
-        }
-    }
-
-    /// Average tokens per request.
-    pub fn avg_tokens_per_request(&self) -> f64 {
-        if self.total_completions == 0 {
-            0.0
-        } else {
-            self.total_tokens_generated as f64 / self.total_completions as f64
         }
     }
 }

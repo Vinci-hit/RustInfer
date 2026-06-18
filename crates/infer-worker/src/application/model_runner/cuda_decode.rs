@@ -24,6 +24,64 @@ pub struct DecodeCompactOutput {
     pub finished: Vec<DecodeRowToken>,
 }
 
+fn trace_decode_compact_rows(
+    seqs: &[SeqStep],
+    active: &[DecodeRowToken],
+    finished: &[DecodeRowToken],
+    raw_c: &[i32],
+    compact_a: &[i32],
+) {
+    if !crate::env_flags::trace_decode_compact() {
+        return;
+    }
+    static TRACE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let step = TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if step >= 32 {
+        return;
+    }
+
+    tracing::warn!(
+        step,
+        rows = seqs.len(),
+        active_rows = active.len(),
+        finished_rows = finished.len(),
+        "decode compact trace"
+    );
+    for (row, seq) in seqs.iter().enumerate().take(8) {
+        tracing::warn!(
+            step,
+            row,
+            input_token = seq.input_ids.first().copied().unwrap_or(-1),
+            pos = seq.positions.first().copied().unwrap_or(-1),
+            kv_write_start = seq.kv_write_start,
+            kv_len_after = seq.kv_len_after,
+            block_table_len = seq.block_table.len(),
+            last_block = seq.block_table.last().copied().unwrap_or(u32::MAX),
+            raw_c = raw_c.get(row).copied().unwrap_or(-1),
+            "decode compact input row"
+        );
+    }
+    for (dst, row) in active.iter().enumerate().take(8) {
+        tracing::warn!(
+            step,
+            dst,
+            src_row = row.src_row,
+            token = row.token_id,
+            compact_a = compact_a.get(dst).copied().unwrap_or(-1),
+            "decode compact active row"
+        );
+    }
+    for (dst, row) in finished.iter().enumerate().take(8) {
+        tracing::warn!(
+            step,
+            dst,
+            src_row = row.src_row,
+            token = row.token_id,
+            "decode compact finished row"
+        );
+    }
+}
+
 impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, Cuda, M> {
     fn wait_for_prior_copy_out_before_overwrite(&mut self) -> OpResult<()> {
         if self.decode_copy_out_recorded {
@@ -72,8 +130,10 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         cfg.record_compute_a()?;
         cfg.copy_out_wait_compute_a()?;
 
+        let trace_compact = crate::env_flags::trace_decode_compact();
         let counts_dev = self.forward_ws.decode_counts_dev().data_ptr() as *const std::ffi::c_void;
         let active_tokens_dev = self.batch_ws.input_ids_dev().data_ptr() as *const std::ffi::c_void;
+        let raw_c_dev = self.forward_ws.argmax_out_dev().data_ptr() as *const std::ffi::c_void;
         let active_src_rows_dev =
             self.forward_ws.decode_active_src_rows_dev().data_ptr() as *const std::ffi::c_void;
         let finished_src_rows_dev =
@@ -87,6 +147,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             active_src_rows_host,
             finished_src_rows_host,
             finished_tokens_host,
+            raw_c_host,
         ) = {
             let ws = &mut self.forward_ws;
             (
@@ -95,6 +156,11 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
                 ws.decode_active_src_rows_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
                 ws.decode_finished_src_rows_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
                 ws.decode_finished_tokens_host_mut().as_mut_ptr() as *mut std::ffi::c_void,
+                if trace_compact {
+                    ws.argmax_out_host_mut().as_mut_ptr() as *mut std::ffi::c_void
+                } else {
+                    std::ptr::null_mut()
+                },
             )
         };
 
@@ -105,6 +171,9 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             cfg.download_d2h_copy_out(active_src_rows_host, active_src_rows_dev, batch * elem)?;
             cfg.download_d2h_copy_out(finished_src_rows_host, finished_src_rows_dev, batch * elem)?;
             cfg.download_d2h_copy_out(finished_tokens_host, finished_tokens_dev, batch * elem)?;
+            if trace_compact {
+                cfg.download_d2h_copy_out(raw_c_host, raw_c_dev, batch * elem)?;
+            }
         }
         cfg.record_copy_out()?;
         self.decode_copy_out_recorded = true;
@@ -371,19 +440,14 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         matches!(graph_runner.decide(batch), GraphDecision::Replay { .. })
     }
 
-    /// Copy newly-admitted decode seed tokens through buffer B and append
-    /// them into stable buffer A.
-    pub fn append_decode_admissions_to_a(
-        &mut self,
-        start_row: usize,
-        tokens: &[i32],
-    ) -> OpResult<()> {
+    /// Copy decode seed/pad tokens through buffer B and append them into A.
+    pub fn append_decode_tokens_to_a(&mut self, start_row: usize, tokens: &[i32]) -> OpResult<()> {
         if tokens.is_empty() {
             return Ok(());
         }
         if start_row + tokens.len() > self.cap_batch {
             return Err(OpError::Shape(format!(
-                "append_decode_admissions_to_a: rows {}..{} exceed cap_batch {}",
+                "append_decode_tokens_to_a: rows {}..{} exceed cap_batch {}",
                 start_row,
                 start_row + tokens.len(),
                 self.cap_batch,
@@ -391,7 +455,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
         }
         if tokens.len() > self.forward_ws.new_token_host_mut().len() {
             return Err(OpError::Shape(format!(
-                "append_decode_admissions_to_a: tokens ({}) > B capacity ({})",
+                "append_decode_tokens_to_a: tokens ({}) > B capacity ({})",
                 tokens.len(),
                 self.forward_ws.new_token_host_mut().len(),
             )));
@@ -512,6 +576,8 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
     pub fn step_decode_abc_compact(
         &mut self,
         seqs: &[SeqStep],
+        append_start_row: usize,
+        append_tokens: &[i32],
         generated_counts: &[usize],
         max_tokens: &[usize],
         ignore_eos: &[bool],
@@ -551,6 +617,28 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             OpError::unsupported("cuda", "ABC compact decode requires primed CUDA graphs")
         })?;
         let batch = seqs.len();
+        if append_start_row > batch {
+            return Err(OpError::Shape(format!(
+                "step_decode_abc_compact: append_start_row ({}) > batch ({})",
+                append_start_row, batch,
+            )));
+        }
+        if append_start_row + append_tokens.len() > batch {
+            return Err(OpError::Shape(format!(
+                "step_decode_abc_compact: append rows {}..{} exceed batch {}",
+                append_start_row,
+                append_start_row + append_tokens.len(),
+                batch,
+            )));
+        }
+        if !append_tokens.is_empty() && append_start_row + append_tokens.len() != batch {
+            return Err(OpError::Shape(format!(
+                "step_decode_abc_compact: append rows {}..{} must end at batch {} to combine padding",
+                append_start_row,
+                append_start_row + append_tokens.len(),
+                batch,
+            )));
+        }
         let decision = graph_runner.decide(batch);
         let (slot, padded_size) = match decision {
             GraphDecision::Replay {
@@ -564,9 +652,17 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             }
         };
 
-        if padded_size > batch {
-            let zeros = vec![0i32; padded_size - batch];
-            self.append_decode_admissions_to_a(batch, &zeros)?;
+        let pad_len = padded_size - batch;
+        if !append_tokens.is_empty() || pad_len > 0 {
+            let append_start = if append_tokens.is_empty() {
+                batch
+            } else {
+                append_start_row
+            };
+            let mut staged = Vec::with_capacity(append_tokens.len() + pad_len);
+            staged.extend_from_slice(append_tokens);
+            staged.resize(staged.len() + pad_len, 0);
+            self.append_decode_tokens_to_a(append_start, &staged)?;
         }
 
         // P1: Only allocate pad_block_table when padding is actually needed.
@@ -695,6 +791,14 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             ));
         }
 
+        trace_decode_compact_rows(
+            seqs,
+            &active,
+            &finished,
+            self.forward_ws.argmax_out_host(),
+            self.forward_ws.decode_active_tokens_host(),
+        );
+
         Ok(DecodeCompactOutput { active, finished })
     }
 
@@ -817,7 +921,7 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             return Ok(generated);
         }
 
-        self.append_decode_admissions_to_a(0, &[last])?;
+        self.append_decode_tokens_to_a(0, &[last])?;
         let mut generated_count = 1usize;
         for i in 0..max_new_tokens.saturating_sub(1) {
             let kv_write_start = (num_prompt + i) as i32;
@@ -831,6 +935,8 @@ impl<T: Dtype, M: LlmModel<T, Cuda, ForwardWorkspace<T, Cuda>>> ModelRunner<T, C
             };
             let compact = self.step_decode_abc_compact(
                 &[step],
+                1,
+                &[],
                 &[generated_count],
                 &[max_new_tokens],
                 &[false],

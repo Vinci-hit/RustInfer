@@ -26,7 +26,7 @@ use crate::domain::kv_budget::KvBudget;
 use crate::domain::policy::traits::SchedulingPolicy;
 use crate::error::Result;
 use crate::infrastructure::kv_cache::radix_tree::RadixTree;
-use crate::infrastructure::metrics::MetricsRecorder;
+use crate::infrastructure::metrics::{MetricsHandle, MetricsRecorder};
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
 use crate::infrastructure::transport::control_plane::{
@@ -67,7 +67,7 @@ pub struct SchedulerEngine {
     codec: MsgPackCodec,
 
     // ─── Metrics ───
-    metrics: MetricsRecorder,
+    metrics: MetricsHandle,
 
     // ─── Config ───
     config: SchedulerConfig,
@@ -149,7 +149,7 @@ impl SchedulerEngine {
             control_events,
             default_worker,
             codec: MsgPackCodec,
-            metrics: MetricsRecorder::new(config.metrics_enabled),
+            metrics: std::sync::Arc::new(MetricsRecorder::new(config.metrics_enabled)),
             config,
             iteration_id: 0,
             ingestion: crate::application::IngestionSystem::new(),
@@ -248,7 +248,7 @@ impl SchedulerEngine {
             requests,
             radix,
             kv_budget,
-            metrics,
+            metrics: &**metrics,
             codec,
             config,
             control_cmd,
@@ -267,6 +267,10 @@ impl SchedulerEngine {
 
         let (workflow, dispatch, mut ctx) = self.split_for_workflow();
         workflow.try_schedule(&mut ctx, dispatch).await
+    }
+
+    pub(crate) fn metrics_handle(&self) -> MetricsHandle {
+        self.metrics.clone()
     }
 
     /// Handle a decoded worker step output — delegates to the workflow.

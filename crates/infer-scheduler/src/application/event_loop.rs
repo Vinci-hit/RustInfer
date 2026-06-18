@@ -28,8 +28,8 @@ pub async fn run_event_loop(
     tracing::info!("Event loop starting...");
 
     // Spawn periodic metrics summary (every 5s)
-    use tokio::time::{interval, Duration};
-    let metrics_for_summary = engine.metrics.clone();
+    use tokio::time::{Duration, interval};
+    let metrics_for_summary = engine.metrics_handle();
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(5));
         ticker.tick().await; // skip first immediate tick

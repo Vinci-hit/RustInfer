@@ -44,3 +44,9 @@ pub fn debug_layers() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
     cached(&F, "RUSTINFER_DEBUG_LAYERS")
 }
+
+/// `RUSTINFER_TRACE_DECODE_COMPACT` — emit compact decode row/token traces.
+pub fn trace_decode_compact() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    cached(&F, "RUSTINFER_TRACE_DECODE_COMPACT")
+}

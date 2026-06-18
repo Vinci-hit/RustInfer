@@ -1,4 +1,5 @@
 use half::bf16;
+use std::collections::HashSet;
 
 use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, PrefillSegmentCompletion};
 use infer_protocol::worker_to_scheduler_control::{WorkerControlMessage, WorkerStepError};
@@ -335,8 +336,7 @@ where
         return Ok(());
     }
 
-    let (order, new_indices) = match prepare_decode_step(
-        runner,
+    let (order, new_indices, append_start_row, append_tokens) = match prepare_decode_step(
         active,
         prefilling,
         decode_rows,
@@ -344,7 +344,12 @@ where
         control,
         enable_prefix_caching,
     )? {
-        DecodePrep::Ready { order, new_indices } => (order, new_indices),
+        DecodePrep::Ready {
+            order,
+            new_indices,
+            append_start_row,
+            append_tokens,
+        } => (order, new_indices, append_start_row, append_tokens),
         DecodePrep::Done => return Ok(()),
     };
 
@@ -352,6 +357,8 @@ where
 
     let compact = match runner.step_decode_abc_compact(
         &inputs.steps,
+        append_start_row,
+        &append_tokens,
         &inputs.generated_counts,
         &inputs.max_tokens,
         &inputs.ignore_eos,
@@ -395,7 +402,12 @@ where
 /// signal that the caller should return `Ok(())` (nothing to run, or the step
 /// already failed and reported its sequences).
 enum DecodePrep {
-    Ready { order: Vec<u64>, new_indices: Vec<u32> },
+    Ready {
+        order: Vec<u64>,
+        new_indices: Vec<u32>,
+        append_start_row: usize,
+        append_tokens: Vec<i32>,
+    },
     Done,
 }
 
@@ -429,45 +441,22 @@ fn fail_decode_seqs(
     }
 }
 
-/// Admit pending rows into buffer A, allocate one KV slot per active row, and
-/// reconcile the row order against late cancellations. Returns
+/// Track pending rows for a later A-buffer append, allocate one KV slot per
+/// active row, and reconcile the row order against late cancellations. Returns
 /// [`DecodePrep::Ready`] with the surviving row order and its freshly
 /// allocated slots, or [`DecodePrep::Done`] when there is nothing left to run.
 /// Returns `Err(OpError::Shutdown)` only on a shutdown during relief.
-fn prepare_decode_step<M>(
-    runner: &mut ModelRunner<bf16, Cuda, M>,
+fn prepare_decode_step(
     active: &mut ActiveSeqMap,
     prefilling: &mut PrefillSeqMap,
     decode_rows: &mut DecodeRows,
     kv_allocator: &mut GlobalKvAllocator,
     control: &ControlPump,
     enable_prefix_caching: bool,
-) -> OpResult<DecodePrep>
-where
-    M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
-{
+) -> OpResult<DecodePrep> {
     decode_rows.retain_active(active);
     let pending = decode_rows.pending_admissions(active);
     if !pending.is_empty() {
-        let mut admit_tokens = Vec::with_capacity(pending.len());
-        for sid in &pending {
-            if let Some(seq) = active.get(sid) {
-                admit_tokens.push(seq.last_token);
-            }
-        }
-        if let Err(e) = runner.append_decode_admissions_to_a(decode_rows.len(), &admit_tokens) {
-            let failed: Vec<u64> = active.keys().copied().collect();
-            fail_decode_seqs(
-                control,
-                active,
-                kv_allocator,
-                &failed,
-                format!("decode admission append failed: {:?}", e),
-                enable_prefix_caching,
-            );
-            decode_rows.clear();
-            return Ok(DecodePrep::Done);
-        }
         decode_rows.append_admissions(&pending);
     }
 
@@ -549,7 +538,14 @@ where
         }
     }
 
-    Ok(DecodePrep::Ready { order, new_indices })
+    let (append_start_row, append_tokens) = build_a_append(&order, &pending, active);
+
+    Ok(DecodePrep::Ready {
+        order,
+        new_indices,
+        append_start_row,
+        append_tokens,
+    })
 }
 
 /// Build the per-row decode forward inputs: one appended KV slot per row, the
@@ -598,6 +594,27 @@ fn build_decode_inputs(
         inputs.ignore_eos.push(seq.ignore_eos);
     }
     inputs
+}
+
+fn build_a_append(
+    order: &[u64],
+    pending_admissions: &[u64],
+    active: &ActiveSeqMap,
+) -> (usize, Vec<i32>) {
+    if pending_admissions.is_empty() {
+        return (order.len(), Vec::new());
+    }
+
+    let pending: HashSet<u64> = pending_admissions.iter().copied().collect();
+    let start = order
+        .iter()
+        .position(|sid| pending.contains(sid))
+        .unwrap_or(order.len());
+    let tokens = order[start..]
+        .iter()
+        .filter_map(|sid| active.get(sid).map(|seq| seq.last_token))
+        .collect();
+    (start, tokens)
 }
 
 /// Apply the compacted forward output: advance surviving sequences one token,

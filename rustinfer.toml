@@ -8,7 +8,7 @@
 # config.json so the worker dispatch / chat template always match the weights.
 
 # Model directory (weights + tokenizer.json + config.json). Required.
-model = "/mnt/geminicephfs/vinciililu/model/ft_local/checkpoint-650"
+model = "/root/models/Qwen3-4B-Instruct-2507"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
