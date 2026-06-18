@@ -298,14 +298,12 @@ where
                 if !finished {
                     ctx.active.insert(
                         seg.sequence_id,
-                        ActiveSeq {
-                            last_token: token,
-                            kv_len: full_block_table.len(),
-                            block_table: full_block_table,
-                            max_tokens: seg.max_tokens,
-                            generated_count: 1,
-                            ignore_eos: seg.ignore_eos,
-                        },
+                        ActiveSeq::new(
+                            token,
+                            full_block_table,
+                            seg.max_tokens,
+                            seg.ignore_eos,
+                        ),
                     );
                 } else {
                     ctx.kv_allocator.release_owned(&full_block_table, ctx.enable_prefix_caching);

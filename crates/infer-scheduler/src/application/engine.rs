@@ -408,26 +408,14 @@ impl SchedulerEngine {
         decoded_rx: &mut mpsc::UnboundedReceiver<SchedulerEvent>,
     ) -> SchedulerEvent {
         let has_work = self.has_pending_work() || self.has_in_flight_batch();
+        let frontend = self.dispatch.frontend_mut();
+        let control_events = &mut self.control_events;
 
-        if has_work {
-            let frontend = self.dispatch.frontend_mut();
-            let control_events = &mut self.control_events;
-
-            tokio::select! {
-                biased;
-                Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
-                result = frontend.recv_event() => frontend_result_to_event(result),
-                Some(event) = decoded_rx.recv() => event,
-            }
-        } else {
-            let frontend = self.dispatch.frontend_mut();
-            let control_events = &mut self.control_events;
-
-            tokio::select! {
-                biased;
-                Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
-                result = frontend.recv_event() => frontend_result_to_event(result),
-            }
+        tokio::select! {
+            biased;
+            Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
+            result = frontend.recv_event() => frontend_result_to_event(result),
+            Some(event) = decoded_rx.recv(), if has_work => event,
         }
     }
 }

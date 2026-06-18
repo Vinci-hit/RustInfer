@@ -66,6 +66,16 @@ pub struct WorkerHeartbeat {
     pub worker_id: String,
     pub state: WorkerState,
     pub active_requests: usize,
+    /// Worker-side outstanding KV slots (`allocator.outstanding()`).
+    /// Enables scheduler-side drift detection against its own `KvBudget`.
+    #[serde(default)]
+    pub kv_outstanding: Option<u32>,
+    /// Worker-side total free KV slots (`allocator.total_free()`).
+    #[serde(default)]
+    pub kv_total_free: Option<u32>,
+    /// Number of released-but-not-recycled indices on the worker side.
+    #[serde(default)]
+    pub kv_released_pending: Option<u32>,
 }
 
 /// Worker-originated KV-pressure signal: `alloc_indices(n)` failed

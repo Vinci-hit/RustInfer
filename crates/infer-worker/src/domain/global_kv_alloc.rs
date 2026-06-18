@@ -94,13 +94,14 @@ impl GlobalKvAllocator {
         (self.free.len() - self.head) as u32
     }
 
-    /// Total free slots (head-side + freed-at-tail). Equal to
+    /// Total free slots (bump-available + released holding list). Equal to
     /// `total - outstanding`.
     pub fn total_free(&self) -> u32 {
-        // Indices in `free[head..]` are unique (invariant). Each freed
-        // index, once pushed at tail, appears exactly once until consumed
-        // by a future bump. So `free.len() - head` is the total count.
-        (self.free.len() - self.head) as u32
+        // `free[head..]` contains immediately allocable slots; `released`
+        // holds slots returned by completed sequences but not yet recycled
+        // into the free pool. Both are logically free from the budget's
+        // perspective.
+        (self.free.len() - self.head) as u32 + self.released.len() as u32
     }
 
     /// Outstanding = total − total_free.

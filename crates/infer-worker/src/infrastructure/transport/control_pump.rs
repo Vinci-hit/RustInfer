@@ -60,15 +60,23 @@ impl ControlPump {
     }
 
     /// Send heartbeat. `active_requests` is the worker's current load
-    /// (decode + waiting prefills). Heartbeats no longer carry KV
-    /// occupancy — KV pressure flows through `send_alloc_failed`
-    /// (worker → scheduler) on actual alloc failures only.
-    pub fn send_heartbeat(&self, active_requests: usize) -> Result<(), String> {
+    /// (decode + waiting prefills). Optional KV stats enable scheduler-side
+    /// drift detection against its own `KvBudget`.
+    pub fn send_heartbeat(
+        &self,
+        active_requests: usize,
+        kv_outstanding: Option<u32>,
+        kv_total_free: Option<u32>,
+        kv_released_pending: Option<u32>,
+    ) -> Result<(), String> {
         self.send(
             WorkerControlMessage::Heartbeat(WorkerHeartbeat {
                 worker_id: self.worker_id.clone(),
                 state: WorkerState::Running,
                 active_requests,
+                kv_outstanding,
+                kv_total_free,
+                kv_released_pending,
             }),
             RequestId::NONE,
         )

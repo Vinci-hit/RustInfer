@@ -174,6 +174,25 @@ impl KvBudget {
     pub fn set_capacity(&mut self, capacity: u32) {
         self.capacity = capacity;
     }
+
+    /// Force-recalibrate `outstanding` to match the worker-reported value.
+    ///
+    /// Used by the heartbeat-based drift detection: if the scheduler's
+    /// `outstanding` has drifted too far from the worker's actual usage
+    /// (e.g. due to a dropped `StepOutput` or race), this brings them
+    /// back into alignment. Clamped to `capacity`.
+    pub fn force_set_outstanding(&mut self, value: u32) {
+        let clamped = value.min(self.capacity);
+        if clamped != self.outstanding {
+            tracing::info!(
+                old = self.outstanding,
+                new = clamped,
+                capacity = self.capacity,
+                "KvBudget: recalibrating outstanding via heartbeat drift correction"
+            );
+        }
+        self.outstanding = clamped;
+    }
 }
 
 #[cfg(test)]

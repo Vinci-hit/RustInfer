@@ -237,6 +237,7 @@ where
                 active.len() + prefilling.len(),
                 &mut last_heartbeat,
                 heartbeat_interval,
+                &kv_allocator,
             );
 
             // Block until a socket is readable or the next heartbeat is due.
@@ -342,7 +343,7 @@ where
                 }
             }
 
-            if prefill_rounds >= 16 {
+            if prefill_rounds >= MAX_CONSECUTIVE_PREFILL_ROUNDS {
                 break;
             }
 
@@ -413,6 +414,7 @@ where
             active.len() + prefilling.len(),
             &mut last_heartbeat,
             heartbeat_interval,
+            &kv_allocator,
         );
     }
 }
@@ -587,9 +589,20 @@ fn wait_for_prefill_quiet(data: &DataPump, quiet: Duration) -> Vec<PrefillBatchC
     }
 }
 
-fn maybe_heartbeat(control: &ControlPump, active_n: usize, last: &mut Instant, interval: Duration) {
+fn maybe_heartbeat(
+    control: &ControlPump,
+    active_n: usize,
+    last: &mut Instant,
+    interval: Duration,
+    kv_allocator: &GlobalKvAllocator,
+) {
     if last.elapsed() >= interval {
-        if let Err(e) = control.send_heartbeat(active_n) {
+        if let Err(e) = control.send_heartbeat(
+            active_n,
+            Some(kv_allocator.outstanding()),
+            Some(kv_allocator.total_free()),
+            Some(kv_allocator.released_len() as u32),
+        ) {
             tracing::info!("[serve] failed to send heartbeat: {}", e);
         }
         *last = Instant::now();

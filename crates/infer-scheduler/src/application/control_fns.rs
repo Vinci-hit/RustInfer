@@ -92,6 +92,29 @@ pub fn handle_control_event(
                 hb.state,
                 hb.active_requests,
             );
+            // ── KV drift detection ──
+            // If the worker reports its outstanding KV count, compare it
+            // with the scheduler's own `KvBudget::outstanding()`. A drift
+            // beyond the threshold indicates lost messages / decode errors
+            // that caused the two counters to permanently diverge.
+            if let Some(worker_outstanding) = hb.kv_outstanding {
+                let sched_outstanding = ctx.kv_budget.outstanding();
+                let drift = (sched_outstanding as i64) - (worker_outstanding as i64);
+                // Threshold: max(8, capacity / 1000) — covers normal in-flight
+                // jitter while catching systematic drift.
+                let cap = ctx.kv_budget.capacity();
+                let threshold = 8i64.max(cap as i64 / 1000);
+                if drift.unsigned_abs() > threshold as u64 {
+                    tracing::warn!(
+                        scheduler = sched_outstanding,
+                        worker = worker_outstanding,
+                        drift,
+                        threshold,
+                        "KV budget drift detected; recalibrating to worker value"
+                    );
+                    ctx.kv_budget.force_set_outstanding(worker_outstanding);
+                }
+            }
             ControlOutcome::noop()
         }
         ControlEvent::AllocFailed { worker, req } => handle_alloc_failed(

@@ -20,6 +20,29 @@ pub struct ActiveSeq {
     pub ignore_eos: bool,
 }
 
+impl ActiveSeq {
+    /// Create a new `ActiveSeq` with `block_table` pre-allocated to hold
+    /// up to `max_tokens` additional decode steps, avoiding per-step
+    /// `Vec::push` reallocation on long sequences.
+    pub fn new(
+        last_token: i32,
+        mut block_table: Vec<u32>,
+        max_tokens: usize,
+        ignore_eos: bool,
+    ) -> Self {
+        let remaining = max_tokens.saturating_sub(1); // first token already counted
+        block_table.reserve(remaining);
+        Self {
+            last_token,
+            kv_len: block_table.len(),
+            block_table,
+            max_tokens,
+            generated_count: 1,
+            ignore_eos,
+        }
+    }
+}
+
 pub type ActiveSeqMap = HashMap<u64, ActiveSeq>;
 
 /// Physical row order of buffer A (`BatchWorkspace::input_ids`).
