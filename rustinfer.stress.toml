@@ -1,0 +1,55 @@
+# RustInfer shared launch config.
+#
+# One file drives all processes: rustinfer-scheduler, rustinfer-worker,
+# rustinfer-server. Each binary takes only `--config <path>` (defaults to
+# ./rustinfer.toml).
+#
+# `model_type` is intentionally NOT here — it is resolved from the model's
+# config.json so the worker dispatch / chat template always match the weights.
+
+# Model directory (weights + tokenizer.json + config.json). Required.
+model = "/mnt/md2/liuwenqi/Llama-3.2-1B-Instruct"
+
+# Display name for /v1/models. Empty => derive from `model` basename.
+model_name = "llama3.2-1b"
+
+# Cluster id. All four IPC endpoints derive from this. Use a distinct id to
+# run multiple independent instances on the same host.
+cluster_id = "rustinfer"
+
+# CUDA device.
+device = "cuda:0"
+
+# HTTP API server.
+host = "0.0.0.0"
+port = 8000
+request_timeout_secs = 600
+
+# Batching / capacity.
+max_batch_tokens = 8192
+max_batch_seqs = 256
+max_model_len = 1024
+
+# Paged KV.
+paged_block_size = 1
+chunked_prefill_size = 0      # 0 => disabled (prefill the whole prompt in one step)
+enable_prefix_caching = false
+mem_fraction_static = 0.9
+num_blocks = 12000
+
+# Generation.
+ignore_eos = true
+
+# Scheduler mode: "llm" or "diffusion".
+mode = "llm"
+
+# Worker.
+worker_id = "worker-0"
+
+# Logging.
+log_level = "info"
+
+# CUDA graph capture sizes for decode batches.
+# Determines which batch sizes have pre-captured CUDA graphs.
+# Batch sizes not in this list will fall back to eager mode.
+capture_sizes = [1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 80, 96, 128, 192, 256]

@@ -1,13 +1,14 @@
 use half::bf16;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::application::forward_workspace::ForwardWorkspace;
-use infer_protocol::worker_to_scheduler_control::{WorkerControlMessage, WorkerStepError};
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
+use crate::application::decode_common::{
+    build_a_append, build_decode_inputs, fail_decode_seqs, DecodePrep,
+};
 use crate::application::kv_relief::{alloc_with_relief, AllocWithReliefOutcome};
-use crate::application::model_runner::{DecodeCompactOutput, ModelRunner, SeqStep};
+use crate::application::model_runner::{DecodeCompactOutput, ModelRunner};
 use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
@@ -286,88 +287,6 @@ impl Default for DecodeEngine {
     }
 }
 
-enum DecodePrep {
-    Ready {
-        order: Vec<u64>,
-        new_indices: Vec<u32>,
-        append_start_row: usize,
-        append_tokens: Vec<i32>,
-    },
-    Done,
-}
-
-struct DecodeInputs {
-    steps: Vec<SeqStep>,
-    assigned: Vec<AssignedIndices>,
-    generated_counts: Vec<usize>,
-    max_tokens: Vec<usize>,
-    ignore_eos: Vec<bool>,
-}
-
-fn build_decode_inputs(
-    order: &[u64],
-    new_indices: &[u32],
-    active: &ActiveSeqMap,
-    enable_prefix_caching: bool,
-) -> DecodeInputs {
-    let mut inputs = DecodeInputs {
-        steps: Vec::with_capacity(order.len()),
-        assigned: Vec::with_capacity(order.len()),
-        generated_counts: Vec::with_capacity(order.len()),
-        max_tokens: Vec::with_capacity(order.len()),
-        ignore_eos: Vec::with_capacity(order.len()),
-    };
-    for (i, &sid) in order.iter().enumerate() {
-        let new_idx = new_indices[i];
-        let seq = active.get(&sid).unwrap();
-        let mut bt = Vec::with_capacity(seq.block_table.len() + 1);
-        bt.extend_from_slice(&seq.block_table);
-        bt.push(new_idx);
-        inputs.steps.push(SeqStep {
-            input_ids: vec![seq.last_token],
-            positions: vec![seq.kv_len as i32],
-            kv_write_start: seq.kv_len as i32,
-            kv_len_after: (seq.kv_len + 1) as i32,
-            block_table: bt,
-        });
-        inputs.assigned.push(AssignedIndices {
-            sequence_id: sid,
-            base: new_idx,
-            len: 1,
-            token_ids: if enable_prefix_caching {
-                vec![seq.last_token]
-            } else {
-                Vec::new()
-            },
-        });
-        inputs.generated_counts.push(seq.generated_count);
-        inputs.max_tokens.push(seq.max_tokens);
-        inputs.ignore_eos.push(seq.ignore_eos);
-    }
-    inputs
-}
-
-fn build_a_append(
-    order: &[u64],
-    pending_admissions: &[u64],
-    active: &ActiveSeqMap,
-) -> (usize, Vec<i32>) {
-    if pending_admissions.is_empty() {
-        return (order.len(), Vec::new());
-    }
-
-    let pending: HashSet<u64> = pending_admissions.iter().copied().collect();
-    let start = order
-        .iter()
-        .position(|sid| pending.contains(sid))
-        .unwrap_or(order.len());
-    let tokens = order[start..]
-        .iter()
-        .filter_map(|sid| active.get(sid).map(|seq| seq.last_token))
-        .collect();
-    (start, tokens)
-}
-
 fn trace_decode_commit(
     order: &[u64],
     new_indices: &[u32],
@@ -406,34 +325,5 @@ fn trace_decode_commit(
             finished,
             "decode commit row"
         );
-    }
-}
-
-fn fail_decode_seqs(
-    control: &ControlPump,
-    active: &mut ActiveSeqMap,
-    kv_allocator: &mut GlobalKvAllocator,
-    sids: &[u64],
-    message: String,
-    enable_prefix_caching: bool,
-) {
-    send_step_error(control, sids.to_vec(), message);
-    for sid in sids {
-        if let Some(removed) = active.remove(sid) {
-            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
-        }
-    }
-}
-
-fn send_step_error(control: &ControlPump, sequence_ids: Vec<u64>, message: String) {
-    if let Err(e) = control.send(
-        WorkerControlMessage::StepError(WorkerStepError {
-            sequence_ids,
-            message,
-            fatal: false,
-        }),
-        infer_protocol::control_envelope::RequestId::NONE,
-    ) {
-        tracing::error!(error = %e, "failed to send StepError to scheduler (control plane may be down)");
     }
 }

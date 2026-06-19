@@ -4,6 +4,8 @@ pub mod batch_workspace;
 #[cfg(feature = "cuda")]
 pub mod cuda_graph_runner;
 #[cfg(feature = "cuda")]
+pub mod decode_common;
+#[cfg(feature = "cuda")]
 pub mod decode_engine;
 pub mod forward_workspace;
 #[cfg(feature = "cuda")]

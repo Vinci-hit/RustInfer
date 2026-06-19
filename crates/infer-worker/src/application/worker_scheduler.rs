@@ -1,16 +1,13 @@
 use half::bf16;
-use std::collections::HashSet;
 
 use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, PrefillSegmentCompletion};
-use infer_protocol::worker_to_scheduler_control::{WorkerControlMessage, WorkerStepError};
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
+use crate::application::decode_common::send_step_error;
 use crate::application::forward_workspace::ForwardWorkspace;
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
-use crate::application::model_runner::{DecodeCompactOutput, ModelRunner, SeqStep};
-use crate::application::worker_state::{
-    ActiveSeq, ActiveSeqMap, DecodeRows, PrefillSeq, PrefillSeqMap,
-};
+use crate::application::model_runner::{ModelRunner, SeqStep};
+use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::LlmModel;
 use crate::domain::ports::{OpError, OpResult};
@@ -50,12 +47,18 @@ struct SegmentPlan {
     skipped: bool,
     /// KV slots allocated for the new tokens (filled during step building).
     indices: Vec<u32>,
-    /// Input token ids fed for the new tokens (filled during step building).
+    /// Input token ids fed for the new tokens. Moved out of the forwarded
+    /// `SeqStep` after the forward (#6 zero-copy) — see `step_idx`.
     token_ids: Vec<i32>,
     /// P0: Full block table (base ++ indices), built once during step building
     /// and reused in the post-forward commit phase, eliminating the duplicate
-    /// `concat_block_table` call.
+    /// `concat_block_table` call. Moved out of the forwarded `SeqStep` after the
+    /// forward (#6 zero-copy) rather than cloned up front.
     full_block_table: Vec<u32>,
+    /// Index of this segment's entry in `steps`, or `None` if skipped. The
+    /// forward only borrows `steps`, so afterwards `token_ids`/`full_block_table`
+    /// are reclaimed by move from `steps[step_idx]` instead of being cloned.
+    step_idx: Option<usize>,
 }
 
 /// Concatenate a base block table with freshly allocated slots. Centralizes
@@ -121,6 +124,7 @@ where
             indices: Vec::new(),
             token_ids: Vec::new(),
             full_block_table: Vec::new(),
+            step_idx: None,
         });
     }
 
@@ -221,17 +225,18 @@ where
         let block_table = concat_block_table(&plans[i].base_table, &new_indices);
         let kv_write_start = block_table.len() as i32 - new_tokens as i32;
         let kv_len_after = block_table.len() as i32;
+        // #6 zero-copy: hand `input_ids`/`block_table` to the step by move. The
+        // forward only borrows them; they are reclaimed below (post-forward)
+        // into `token_ids`/`full_block_table` rather than cloned here.
+        plans[i].step_idx = Some(steps.len());
         steps.push(SeqStep {
-            input_ids: input_ids.clone(),
+            input_ids,
             positions,
             kv_write_start,
             kv_len_after,
-            block_table: block_table.clone(),
+            block_table,
         });
         plans[i].indices = new_indices;
-        plans[i].token_ids = input_ids;
-        // P0: Store full block table once, reuse in commit phase.
-        plans[i].full_block_table = block_table;
     }
     debug_assert_eq!(idx_cursor, total_new as usize);
 
@@ -258,6 +263,17 @@ where
             return Ok(());
         }
     };
+    // #6 zero-copy: the forward is done and only borrowed `steps`, so move the
+    // input tokens and block tables back into their plans instead of having
+    // cloned them during step building. `assigned_runs` and the commit loop
+    // below consume `token_ids`/`full_block_table` from here.
+    for plan in plans.iter_mut() {
+        if let Some(k) = plan.step_idx {
+            plan.token_ids = std::mem::take(&mut steps[k].input_ids);
+            plan.full_block_table = std::mem::take(&mut steps[k].block_table);
+        }
+    }
+
     let assigned = assigned_runs(cmd, &plans, ctx.enable_prefix_caching);
 
     let mut output = StepOutput {
@@ -314,384 +330,6 @@ where
     ctx.data.send_step_output(&output)
         .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
     Ok(())
-}
-pub fn run_decode_step<M>(
-    runner: &mut ModelRunner<bf16, Cuda, M>,
-    active: &mut ActiveSeqMap,
-    prefilling: &mut PrefillSeqMap,
-    decode_rows: &mut DecodeRows,
-    kv_allocator: &mut GlobalKvAllocator,
-    control: &ControlPump,
-    data: &DataPump,
-    eos_ids: &[i32],
-    enable_prefix_caching: bool,
-) -> OpResult<()>
-where
-    M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
-{
-    if active.is_empty() {
-        decode_rows.clear();
-        return Ok(());
-    }
-
-    let (order, new_indices, append_start_row, append_tokens) = match prepare_decode_step(
-        active,
-        prefilling,
-        decode_rows,
-        kv_allocator,
-        control,
-        enable_prefix_caching,
-    )? {
-        DecodePrep::Ready {
-            order,
-            new_indices,
-            append_start_row,
-            append_tokens,
-        } => (order, new_indices, append_start_row, append_tokens),
-        DecodePrep::Done => return Ok(()),
-    };
-
-    let inputs = build_decode_inputs(&order, &new_indices, active, enable_prefix_caching);
-
-    let compact = match runner.step_decode_abc_compact(
-        &inputs.steps,
-        append_start_row,
-        &append_tokens,
-        &inputs.generated_counts,
-        &inputs.max_tokens,
-        &inputs.ignore_eos,
-        eos_ids,
-    ) {
-        Ok(output) => output,
-        Err(e) => {
-            if !new_indices.is_empty() {
-                kv_allocator.free(&new_indices);
-            }
-            fail_decode_seqs(
-                control,
-                active,
-                kv_allocator,
-                &order,
-                format!("decode step failed: {:?}", e),
-                enable_prefix_caching,
-            );
-            decode_rows.clear();
-            return Ok(());
-        }
-    };
-
-    let output = commit_decode_results(
-        active,
-        decode_rows,
-        kv_allocator,
-        &order,
-        &new_indices,
-        inputs.assigned,
-        &compact,
-        enable_prefix_caching,
-    );
-
-    data.send_step_output(&output)
-        .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
-    Ok(())
-}
-
-/// Outcome of [`prepare_decode_step`]: either a ready-to-forward batch or a
-/// signal that the caller should return `Ok(())` (nothing to run, or the step
-/// already failed and reported its sequences).
-enum DecodePrep {
-    Ready {
-        order: Vec<u64>,
-        new_indices: Vec<u32>,
-        append_start_row: usize,
-        append_tokens: Vec<i32>,
-    },
-    Done,
-}
-
-/// Per-row inputs for one decode forward. The three trailing vectors mirror
-/// `steps` row-for-row and are passed as separate slices because
-/// `step_decode_abc_compact` consumes them that way.
-struct DecodeInputs {
-    steps: Vec<SeqStep>,
-    assigned: Vec<AssignedIndices>,
-    generated_counts: Vec<usize>,
-    max_tokens: Vec<usize>,
-    ignore_eos: Vec<bool>,
-}
-
-/// Report a non-fatal decode failure for `sids`, evict them from `active`, and
-/// release their KV. The shared rollback for every decode alloc/forward
-/// failure path (previously copy-pasted four times inline).
-fn fail_decode_seqs(
-    control: &ControlPump,
-    active: &mut ActiveSeqMap,
-    kv_allocator: &mut GlobalKvAllocator,
-    sids: &[u64],
-    message: String,
-    enable_prefix_caching: bool,
-) {
-    send_step_error(control, sids.to_vec(), message);
-    for sid in sids {
-        if let Some(removed) = active.remove(sid) {
-            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
-        }
-    }
-}
-
-/// Track pending rows for a later A-buffer append, allocate one KV slot per
-/// active row, and reconcile the row order against late cancellations. Returns
-/// [`DecodePrep::Ready`] with the surviving row order and its freshly
-/// allocated slots, or [`DecodePrep::Done`] when there is nothing left to run.
-/// Returns `Err(OpError::Shutdown)` only on a shutdown during relief.
-fn prepare_decode_step(
-    active: &mut ActiveSeqMap,
-    prefilling: &mut PrefillSeqMap,
-    decode_rows: &mut DecodeRows,
-    kv_allocator: &mut GlobalKvAllocator,
-    control: &ControlPump,
-    enable_prefix_caching: bool,
-) -> OpResult<DecodePrep> {
-    decode_rows.retain_active(active);
-    let pending = decode_rows.pending_admissions(active);
-    if !pending.is_empty() {
-        decode_rows.append_admissions(&pending);
-    }
-
-    let mut order: Vec<u64> = decode_rows.as_slice().to_vec();
-    if order.is_empty() {
-        return Ok(DecodePrep::Done);
-    }
-
-    let initial_n = order.len() as u32;
-    let new_indices = match alloc_with_relief(
-        kv_allocator,
-        control,
-        active,
-        prefilling,
-        initial_n,
-        enable_prefix_caching,
-        true,
-    ) {
-        AllocWithReliefOutcome::Allocated(v) => v,
-        AllocWithReliefOutcome::Unavailable => {
-            let order: Vec<u64> = decode_rows.as_slice().to_vec();
-            tracing::warn!(
-                seqs = order.len(),
-                "decode alloc still failing after relief -- failing seqs"
-            );
-            fail_decode_seqs(
-                control,
-                active,
-                kv_allocator,
-                &order,
-                "worker KV pool exhausted at decode".to_string(),
-                enable_prefix_caching,
-            );
-            decode_rows.clear();
-            return Ok(DecodePrep::Done);
-        }
-        AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
-    };
-
-    // Relief may have evicted rows (preempt/cancel) while we waited; re-sync
-    // the order against the surviving active set before binding slots to rows.
-    decode_rows.retain_active(active);
-    order = decode_rows.as_slice().to_vec();
-    if order.is_empty() {
-        if !new_indices.is_empty() {
-            kv_allocator.free(&new_indices);
-        }
-        return Ok(DecodePrep::Done);
-    }
-
-    let new_indices: Vec<u32> = if new_indices.len() > order.len() {
-        let (take, give_back) = new_indices.split_at(order.len());
-        kv_allocator.free(give_back);
-        take.to_vec()
-    } else {
-        new_indices
-    };
-    if new_indices.len() < order.len() {
-        let failed: Vec<u64> = order[new_indices.len()..].to_vec();
-        fail_decode_seqs(
-            control,
-            active,
-            kv_allocator,
-            &failed,
-            format!(
-                "decode KV allocation returned {} slots for {} rows",
-                new_indices.len(),
-                order.len()
-            ),
-            enable_prefix_caching,
-        );
-        decode_rows.retain_active(active);
-        order.truncate(new_indices.len());
-        if order.is_empty() {
-            if !new_indices.is_empty() {
-                kv_allocator.free(&new_indices);
-            }
-            return Ok(DecodePrep::Done);
-        }
-    }
-
-    let (append_start_row, append_tokens) = build_a_append(&order, &pending, active);
-
-    Ok(DecodePrep::Ready {
-        order,
-        new_indices,
-        append_start_row,
-        append_tokens,
-    })
-}
-
-/// Build the per-row decode forward inputs: one appended KV slot per row, the
-/// single-token step, and the metadata slices the sampler consumes.
-fn build_decode_inputs(
-    order: &[u64],
-    new_indices: &[u32],
-    active: &ActiveSeqMap,
-    enable_prefix_caching: bool,
-) -> DecodeInputs {
-    let mut inputs = DecodeInputs {
-        steps: Vec::with_capacity(order.len()),
-        assigned: Vec::with_capacity(order.len()),
-        generated_counts: Vec::with_capacity(order.len()),
-        max_tokens: Vec::with_capacity(order.len()),
-        ignore_eos: Vec::with_capacity(order.len()),
-    };
-    for (i, &sid) in order.iter().enumerate() {
-        let new_idx = new_indices[i];
-        let seq = active.get(&sid).unwrap();
-        // C1: build the step's block table in one allocation. The old
-        // `clone()` then `push()` allocated twice (clone sized to len, push
-        // reallocated to len+1); reserving len+1 up front does it once.
-        let mut bt = Vec::with_capacity(seq.block_table.len() + 1);
-        bt.extend_from_slice(&seq.block_table);
-        bt.push(new_idx);
-        inputs.steps.push(SeqStep {
-            input_ids: vec![seq.last_token],
-            positions: vec![seq.kv_len as i32],
-            kv_write_start: seq.kv_len as i32,
-            kv_len_after: (seq.kv_len + 1) as i32,
-            block_table: bt,
-        });
-        inputs.assigned.push(AssignedIndices {
-            sequence_id: sid,
-            base: new_idx,
-            len: 1,
-            token_ids: if enable_prefix_caching {
-                vec![seq.last_token]
-            } else {
-                Vec::new()
-            },
-        });
-        inputs.generated_counts.push(seq.generated_count);
-        inputs.max_tokens.push(seq.max_tokens);
-        inputs.ignore_eos.push(seq.ignore_eos);
-    }
-    inputs
-}
-
-fn build_a_append(
-    order: &[u64],
-    pending_admissions: &[u64],
-    active: &ActiveSeqMap,
-) -> (usize, Vec<i32>) {
-    if pending_admissions.is_empty() {
-        return (order.len(), Vec::new());
-    }
-
-    let pending: HashSet<u64> = pending_admissions.iter().copied().collect();
-    let start = order
-        .iter()
-        .position(|sid| pending.contains(sid))
-        .unwrap_or(order.len());
-    let tokens = order[start..]
-        .iter()
-        .filter_map(|sid| active.get(sid).map(|seq| seq.last_token))
-        .collect();
-    (start, tokens)
-}
-
-/// Apply the compacted forward output: advance surviving sequences one token,
-/// emit their tokens, evict finished ones (releasing KV), and rewrite the row
-/// order to the compacted survivors. Returns the `StepOutput` to ship.
-fn commit_decode_results(
-    active: &mut ActiveSeqMap,
-    decode_rows: &mut DecodeRows,
-    kv_allocator: &mut GlobalKvAllocator,
-    order: &[u64],
-    new_indices: &[u32],
-    assigned: Vec<AssignedIndices>,
-    compact: &DecodeCompactOutput,
-    enable_prefix_caching: bool,
-) -> StepOutput {
-    let mut output = StepOutput {
-        prefill_done: Vec::new(),
-        tokens: Vec::new(),
-        assigned_indices: assigned,
-    };
-
-    let mut row_results: Vec<Option<(i32, bool)>> = vec![None; order.len()];
-    let mut next_rows: Vec<u64> = Vec::with_capacity(compact.active.len());
-    for row in &compact.active {
-        if row.src_row >= order.len() {
-            continue;
-        }
-        row_results[row.src_row] = Some((row.token_id, false));
-        next_rows.push(order[row.src_row]);
-    }
-    let mut to_remove: Vec<u64> = Vec::with_capacity(compact.finished.len());
-    for row in &compact.finished {
-        if row.src_row >= order.len() {
-            continue;
-        }
-        row_results[row.src_row] = Some((row.token_id, true));
-        to_remove.push(order[row.src_row]);
-    }
-
-    for (i, &sid) in order.iter().enumerate() {
-        let Some((token, finished)) = row_results[i] else {
-            continue;
-        };
-        if let Some(seq) = active.get_mut(&sid) {
-            seq.last_token = token;
-            seq.kv_len += 1;
-            seq.generated_count += 1;
-            seq.block_table.push(new_indices[i]);
-        }
-        output.tokens.push(GeneratedToken {
-            sequence_id: sid,
-            token_id: token,
-            finished,
-        });
-    }
-    for sid in &to_remove {
-        if let Some(removed) = active.remove(sid) {
-            kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
-        }
-    }
-    decode_rows.replace_rows(next_rows);
-    output
-}
-
-/// Send a non-fatal StepError to the scheduler, logging (not silently
-/// dropping) if the control channel is broken. Centralizes the boilerplate
-/// previously copy-pasted across every prefill/decode failure path, and
-/// makes a torn control plane observable instead of a silent hang (H8/M6).
-fn send_step_error(control: &ControlPump, sequence_ids: Vec<u64>, message: String) {
-    if let Err(e) = control.send(
-        WorkerControlMessage::StepError(WorkerStepError {
-            sequence_ids,
-            message,
-            fatal: false,
-        }),
-        infer_protocol::control_envelope::RequestId::NONE,
-    ) {
-        tracing::error!(error = %e, "failed to send StepError to scheduler (control plane may be down)");
-    }
 }
 
 fn assigned_runs(

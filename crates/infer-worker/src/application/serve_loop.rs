@@ -23,6 +23,11 @@ use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
 use crate::models::loader::LoadConfig;
 
+/// Upper bound on how many consecutive prefill rounds the serve loop drains
+/// before forcing a decode step. Caps prefill starvation of decode under a
+/// sustained prefill backlog (extracted magic number, refactor #16).
+const MAX_CONSECUTIVE_PREFILL_ROUNDS: usize = 16;
+
 // cudaProfiler API for precise nsys capture.
 unsafe extern "C" {
     fn cudaProfilerStart() -> u32;
