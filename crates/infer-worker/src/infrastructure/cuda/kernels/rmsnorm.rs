@@ -57,6 +57,7 @@ unsafe extern "C" {
 
 /// `output = rmsnorm(input, weight, eps)` on CUDA.
 pub fn rmsnorm<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     output: &mut Tensor<T, Cuda>,
@@ -65,7 +66,6 @@ pub fn rmsnorm<T: Dtype>(
     let dim = weight.numel();
     let in_layout = derive_layout(input, dim)?;
     let out_layout = derive_layout(output, dim)?;
-    let stream = input.device().config.stream;
 
     unsafe {
         dispatch::<T>(
@@ -82,13 +82,13 @@ pub fn rmsnorm<T: Dtype>(
 
 /// In-place: `x = rmsnorm(x, weight, eps)`.
 pub fn rmsnorm_inplace<T: Dtype>(
+    stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     eps: f32,
 ) -> OpResult<()> {
     let dim = weight.numel();
     let layout = derive_layout(x, dim)?;
-    let stream = x.device().config.stream;
     let ptr = x.data_ptr_mut();
 
     unsafe {

@@ -788,7 +788,7 @@ impl BatchPlan {
 
 /// 供调用方传入的 per-seq host 描述（今天的 `SeqStep`，形状不变）。
 #[derive(Debug, Clone)]
-pub struct SeqStep { pub input_ids: Vec<i32>, pub positions: Vec<i32>, pub kv_write_start: i32, pub kv_len_after: i32, pub block_table: Vec<u32> }
+pub struct SeqStep { pub sequence_id: SeqId, pub input_ids: Vec<i32>, pub positions: Vec<i32>, pub kv_write_start: i32, pub kv_len_after: i32, pub block_table: Vec<u32> }
 
 /// 一个 token 结果，带 probability 信息（修复“只有 argmax、没有概率”的结构问题）。
 #[derive(Debug, Clone)]

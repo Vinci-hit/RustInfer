@@ -97,6 +97,7 @@ unsafe extern "C" {
 /// * `head_dim`    — head dimension
 /// * `eps`         — Layernorm epsilon
 pub fn fused_qk_norm_rope<T: Dtype>(
+    stream: cudaStream_t,
     q_out: &mut Tensor<T, Cuda>,
     k_out: &mut Tensor<T, Cuda>,
     q_in: &Tensor<T, Cuda>,
@@ -114,7 +115,6 @@ pub fn fused_qk_norm_rope<T: Dtype>(
 ) -> OpResult<()> {
     let q_dim = head_num * head_dim;
     let kv_dim = kv_head_num * head_dim;
-    let stream = q_in.device().config.stream;
 
     unsafe {
         match T::DATA_TYPE {

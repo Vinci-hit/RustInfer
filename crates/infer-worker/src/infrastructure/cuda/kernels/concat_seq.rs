@@ -6,13 +6,16 @@ use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
-use crate::infrastructure::cuda::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind};
+use crate::infrastructure::cuda::ffi::{
+    cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t,
+};
 
 /// In-place concat: `dst = [a; b]` along dim 0.
 ///
 /// `a`, `b` must be 2D with matching last dim and dtype; `dst` must be
 /// `[a.shape()[0] + b.shape()[0], a.shape()[1]]`.
 pub fn concat_seq_into<T: Dtype>(
+    stream: cudaStream_t,
     a: &Tensor<T, Cuda>,
     b: &Tensor<T, Cuda>,
     dst: &mut Tensor<T, Cuda>,
@@ -42,7 +45,6 @@ pub fn concat_seq_into<T: Dtype>(
     let bytes_per_row = d * T::SIZE_BYTES;
     let a_bytes = as_[0] * bytes_per_row;
     let b_bytes = bs_[0] * bytes_per_row;
-    let stream = a.device().config.stream;
     unsafe {
         let dst_base = dst.data_ptr_mut() as *mut std::ffi::c_void;
         if a_bytes > 0 {
@@ -89,7 +91,7 @@ mod tests {
         let a: Tensor<f32, Cuda> = Tensor::from_host_slice(&a_host, [s_a, d], &cuda).unwrap();
         let b: Tensor<f32, Cuda> = Tensor::from_host_slice(&b_host, [s_b, d], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([s_a + s_b, d], &cuda).unwrap();
-        concat_seq_into(&a, &b, &mut dst).unwrap();
+        concat_seq_into(cuda.config.stream, &a, &b, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
         for i in 0..s_a * d {
             assert_eq!(got[i], a_host[i]);
@@ -108,7 +110,7 @@ mod tests {
         let a: Tensor<bf16, Cuda> = Tensor::from_host_slice(&a_host, [2, d], &cuda).unwrap();
         let b: Tensor<bf16, Cuda> = Tensor::from_host_slice(&b_host, [3, d], &cuda).unwrap();
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([5, d], &cuda).unwrap();
-        concat_seq_into(&a, &b, &mut dst).unwrap();
+        concat_seq_into(cuda.config.stream, &a, &b, &mut dst).unwrap();
         let got: Vec<f32> = dst
             .to_host_vec()
             .unwrap()
@@ -129,7 +131,7 @@ mod tests {
         let a: Tensor<f32, Cuda> = Tensor::zeros([2, 4], &cuda).unwrap();
         let b: Tensor<f32, Cuda> = Tensor::zeros([3, 5], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([5, 4], &cuda).unwrap();
-        let err = concat_seq_into(&a, &b, &mut dst).unwrap_err();
+        let err = concat_seq_into(cuda.config.stream, &a, &b, &mut dst).unwrap_err();
         match err {
             OpError::Shape(_) => {}
             other => panic!("got {:?}", other),

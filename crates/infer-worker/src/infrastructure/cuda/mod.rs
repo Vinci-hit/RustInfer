@@ -1,24 +1,21 @@
 //! CUDA infrastructure adapter.
 //!
 //! Implements `Device`, `MemoryPort`, and `OpBackend` for `Cuda`.
-//! Contains: FFI bindings, CudaConfig (handles), thread-local stream,
-//! and kernel dispatch wrappers.
+//! Contains: FFI bindings, CudaConfig (handles), and kernel dispatch wrappers.
 
 pub mod config;
 pub mod device_utils;
 pub mod error;
 pub mod ffi;
 pub mod kernels;
-pub mod thread_stream;
 
 pub use config::{CudaConfig, GraphSlot};
 pub use error::CudaError;
-pub use thread_stream::{get_current_cuda_stream, with_cuda_stream};
 
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::domain::ports::{CoreOps, Device, DiffusionOps, LlmOps, MemoryPort, OpError, OpResult};
+use crate::domain::ports::{CoreOps, Device, DiffusionOps, MemoryPort, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 
@@ -29,13 +26,549 @@ pub struct Cuda {
     pub config: Arc<CudaConfig>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CudaStream(pub ffi::cudaStream_t);
+
+unsafe impl Send for CudaStream {}
+unsafe impl Sync for CudaStream {}
+
+impl crate::domain::exec::Stream for CudaStream {}
+
+#[derive(Debug)]
+pub struct CudaScope {
+    device: Cuda,
+    stream: CudaStream,
+    rank: crate::domain::exec::Rank,
+    topology: crate::domain::exec::TopologyShape,
+    quant_tier: crate::domain::exec::QuantTier,
+    workspace: crate::domain::exec::Workspace<Cuda>,
+}
+
+impl CudaScope {
+    pub fn new(device: Cuda) -> Self {
+        let stream = CudaStream(device.config.stream);
+        let workspace = crate::domain::exec::Workspace::from_raw(
+            NonNull::new(device.config.workspace as *mut u8),
+            device.config.workspace_size,
+        );
+        Self {
+            device,
+            stream,
+            rank: crate::domain::exec::Rank::SINGLE,
+            topology: crate::domain::exec::TopologyShape::SINGLE,
+            quant_tier: crate::domain::exec::QuantTier::None,
+            workspace,
+        }
+    }
+
+    pub fn with_topology(mut self, topology: crate::domain::exec::TopologyShape) -> Self {
+        self.rank = crate::domain::exec::Rank {
+            tp_rank: topology.tp.rank,
+            pp_rank: topology.pp.rank,
+            dp_rank: topology.dp.rank,
+            node_rank: topology.node.rank,
+            world_rank: 0,
+        };
+        self.topology = topology;
+        self
+    }
+}
+
+impl crate::domain::exec::ExecScope for CudaScope {
+    type Device = Cuda;
+    type Stream = CudaStream;
+
+    fn device(&self) -> &Self::Device {
+        &self.device
+    }
+
+    fn enter(&self) -> crate::domain::exec::ActiveGuard<'_, Self::Device> {
+        let previous = <Cuda as crate::domain::exec::Device>::enter_device(&self.device);
+        crate::domain::exec::ActiveGuard::new(self, previous)
+    }
+
+    fn stream(&self) -> &Self::Stream {
+        &self.stream
+    }
+
+    fn rank(&self) -> crate::domain::exec::Rank {
+        self.rank
+    }
+
+    fn topology(&self) -> crate::domain::exec::TopologyShape {
+        self.topology
+    }
+
+    fn quant_tier(&self) -> crate::domain::exec::QuantTier {
+        self.quant_tier
+    }
+
+    fn workspace(&self) -> &crate::domain::exec::Workspace<Self::Device> {
+        &self.workspace
+    }
+
+    fn synchronize(&self) -> OpResult<()> {
+        self.device.config.synchronize()
+    }
+}
+
 impl Device for Cuda {
     type ExecCtx = CudaConfig;
     fn exec_ctx(&self) -> &CudaConfig {
         &self.config
     }
+    fn device_id(&self) -> i32 {
+        self.device_id
+    }
     fn name(&self) -> &'static str {
         "cuda"
+    }
+}
+
+impl crate::domain::exec::Device for Cuda {
+    type Scope = CudaScope;
+
+    fn enter_device(&self) -> crate::domain::exec::DeviceId {
+        let previous = device_utils::current_device().unwrap_or(self.device_id);
+        device_utils::set_current_device(self.device_id).unwrap_or_else(|e| {
+            panic!(
+                "cudaSetDevice({}) in ExecScope::enter failed: {e:?}",
+                self.device_id
+            )
+        });
+        crate::domain::exec::DeviceId(previous)
+    }
+
+    fn restore_device(&self, previous: crate::domain::exec::DeviceId) {
+        if previous.0 >= 0 && previous.0 != self.device_id {
+            let _ = device_utils::set_current_device(previous.0);
+        }
+    }
+}
+
+#[inline]
+fn scope_stream(scope: &CudaScope) -> ffi::cudaStream_t {
+    crate::domain::exec::ExecScope::stream(scope).0
+}
+
+impl crate::domain::ports::MathOps for Cuda {
+    fn add<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::add::add(scope_stream(scope), a, b, dst)
+    }
+
+    fn add_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        dst: &mut Tensor<T, Self>,
+        src: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::add::add_inplace(scope_stream(scope), dst, src)
+    }
+
+    fn ewise_mul<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::ewise_mul::ewise_mul(scope_stream(scope), a, b, dst)
+    }
+
+    fn scalar_mul_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        x: &mut Tensor<T, Self>,
+        scalar: f64,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::scalar::scalar_mul_inplace(scope_stream(scope), x, scalar)
+    }
+
+    fn broadcast_mul_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        x: &mut Tensor<T, Self>,
+        scale: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::broadcast_mul::broadcast_mul_inplace(scope_stream(scope), x, scale)
+    }
+
+    fn broadcast_add_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        x: &mut Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::broadcast_mul::broadcast_add_inplace(scope_stream(scope), x, bias)
+    }
+
+    fn matmul<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::matmul::matmul(scope_stream(scope), input, weight, output)
+    }
+
+    fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        input: &Tensor<A, Self>,
+        weight: &Tensor<W, Self>,
+        output: &mut Tensor<O, Self>,
+        scales: &Tensor<A, Self>,
+        zeros: Option<&Tensor<W, Self>>,
+        scheme: &crate::domain::dtype::quant::QuantScheme,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::matmul::matmul_quant(
+            scope_stream(scope),
+            input,
+            weight,
+            output,
+            scales,
+            zeros,
+            scheme.group,
+        )
+    }
+
+    fn rmsnorm<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::rmsnorm::rmsnorm(scope_stream(scope), input, weight, output, eps)
+    }
+
+    fn rmsnorm_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        x: &mut Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::rmsnorm::rmsnorm_inplace(scope_stream(scope), x, weight, eps)
+    }
+
+    fn silu_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        x: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::activation::silu_inplace(scope_stream(scope), x)
+    }
+
+    fn softmax<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        input: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::softmax::softmax(scope_stream(scope), input, output)
+    }
+
+    fn rope_inplace<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        q: &mut Tensor<T, Self>,
+        k: &mut Tensor<T, Self>,
+        sin: &Tensor<T, Self>,
+        cos: &Tensor<T, Self>,
+        positions: &Tensor<i32, Self>,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        let num_tokens = q.shape().as_slice()[0] as i32;
+        kernels::rope::rope_inplace(
+            scope_stream(scope),
+            q,
+            k,
+            sin,
+            cos,
+            positions.data_ptr(),
+            num_tokens,
+            head_num as i32,
+            kv_head_num as i32,
+            head_dim as i32,
+        )
+    }
+
+    fn sdpa<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        q: &Tensor<T, Self>,
+        k: &Tensor<T, Self>,
+        v: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        mask: Option<&Tensor<T, Self>>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        let stream = scope_stream(scope);
+        match mask {
+            Some(mask) => kernels::sdpa::sdpa_masked(
+                stream,
+                q,
+                k,
+                v,
+                output,
+                mask,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+            ),
+            None => kernels::sdpa::sdpa(
+                stream,
+                q,
+                k,
+                v,
+                output,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+            ),
+        }
+    }
+
+    fn embedding<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        table: &Tensor<T, Self>,
+        indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::embedding::embedding(scope_stream(scope), table, indices, output)
+    }
+
+    fn split_cols<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+        rows: usize,
+        total_cols: usize,
+        col_offset: usize,
+        dst_cols: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::split_cols::split_cols(
+            scope_stream(scope),
+            src,
+            dst,
+            rows as i32,
+            total_cols as i32,
+            col_offset as i32,
+            dst_cols as i32,
+        )
+    }
+
+    fn concat_seq<T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::concat_seq::concat_seq_into(scope_stream(scope), a, b, dst)
+    }
+
+    fn cast<S: Dtype, T: Dtype>(
+        scope: &<Self as crate::domain::exec::Device>::Scope,
+        src: &Tensor<S, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(scope);
+        kernels::cast_dtype::cast_dtype(scope_stream(scope), src, dst)
+    }
+}
+
+impl crate::domain::ports::FusedOps for Cuda {
+    fn fused_add_rmsnorm<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        output: &mut Tensor<T, Self>,
+        residual: &mut Tensor<T, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::fused_add_rmsnorm::fused_add_rmsnorm(
+            scope_stream(ctx.scope()),
+            output,
+            residual,
+            input,
+            weight,
+            eps,
+        )
+    }
+
+    fn swiglu_packed<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        gate_up: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+        rows: usize,
+        inter: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::activation::swiglu_packed(scope_stream(ctx.scope()), gate_up, out, rows, inter)
+    }
+
+    fn scatter_kv_paged<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        k_src: &Tensor<T, Self>,
+        v_src: &Tensor<T, Self>,
+        layer: &mut crate::domain::kv::LayerKv<'_, T, Self>,
+        kv_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::scatter_kv_paged::scatter_kv_paged(
+            scope_stream(ctx.scope()),
+            k_src,
+            v_src,
+            layer.k,
+            layer.v,
+            &layer.index.block_tables,
+            &layer.index.seq_positions,
+            &layer.index.cu_q_lens,
+            &layer.index.seq_lens_step,
+            ctx.plan().max_blocks_per_seq,
+            ctx.plan().block_size,
+            kv_dim,
+        )
+    }
+
+    fn qkv_norm_rope_scatter<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        q: &mut Tensor<T, Self>,
+        k: &mut Tensor<T, Self>,
+        v: &Tensor<T, Self>,
+        q_weight: Option<&Tensor<T, Self>>,
+        k_weight: Option<&Tensor<T, Self>>,
+        q_eps: f32,
+        k_eps: f32,
+        sin: &Tensor<T, Self>,
+        cos: &Tensor<T, Self>,
+        positions: &Tensor<i32, Self>,
+        layer: &mut crate::domain::kv::LayerKv<'_, T, Self>,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+        kv_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        match (q_weight, k_weight) {
+            (Some(q_weight), Some(k_weight)) => {
+                kernels::qkv_norm_rope_scatter::qkv_norm_rope_scatter(
+                    scope_stream(ctx.scope()),
+                    q,
+                    k,
+                    v,
+                    Some(q_weight),
+                    Some(k_weight),
+                    q_eps,
+                    k_eps,
+                    sin,
+                    cos,
+                    positions,
+                    layer.k,
+                    layer.v,
+                    &layer.index.block_tables,
+                    &layer.index.seq_positions,
+                    &layer.index.cu_q_lens,
+                    &layer.index.seq_lens_step,
+                    ctx.plan().max_blocks_per_seq,
+                    ctx.plan().block_size,
+                    head_num,
+                    kv_head_num,
+                    head_dim,
+                    kv_dim,
+                )
+            }
+            (None, None) => {
+                kernels::rope::rope_inplace(
+                    scope_stream(ctx.scope()),
+                    q,
+                    k,
+                    sin,
+                    cos,
+                    positions.data_ptr(),
+                    q.shape().as_slice()[0] as i32,
+                    head_num as i32,
+                    kv_head_num as i32,
+                    head_dim as i32,
+                )?;
+                kernels::scatter_kv_paged::scatter_kv_paged(
+                    scope_stream(ctx.scope()),
+                    k,
+                    v,
+                    layer.k,
+                    layer.v,
+                    &layer.index.block_tables,
+                    &layer.index.seq_positions,
+                    &layer.index.cu_q_lens,
+                    &layer.index.seq_lens_step,
+                    ctx.plan().max_blocks_per_seq,
+                    ctx.plan().block_size,
+                    kv_dim,
+                )
+            }
+            _ => Err(OpError::Kernel(
+                "qkv_norm_rope_scatter: q/k norm weights must be both present or both absent"
+                    .into(),
+            )),
+        }
+    }
+
+    fn attention_paged<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        q: &Tensor<T, Self>,
+        kv: &crate::domain::kv::KvView<'_, T, Self>,
+        output: &mut Tensor<T, Self>,
+        head_num: usize,
+        kv_head_num: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        let (k_pool, v_pool) = kv.layer(0);
+        let workspace_elems = if ctx.plan().is_decode_only() {
+            kernels::attention_paged::flash_decode_workspace_capacity_f32(
+                ctx.plan().batch,
+                head_num,
+                head_dim,
+            )
+            .max(1)
+        } else {
+            1
+        };
+        let mut workspace = Tensor::<f32, Cuda>::zeros([workspace_elems], q.device())?;
+        kernels::attention_paged::attention_paged(
+            scope_stream(ctx.scope()),
+            q,
+            k_pool,
+            v_pool,
+            output,
+            kernels::attention_paged::PagedAttentionPlan::from_v2(ctx.plan(), kv.index),
+            &mut workspace,
+            head_num,
+            kv_head_num,
+            head_dim,
+            scale,
+        )
     }
 }
 
@@ -49,6 +582,10 @@ impl Cuda {
                 .map_err(|e| OpError::Kernel(format!("CudaConfig::new failed: {}", e)))?,
         );
         Ok(Self { device_id, config })
+    }
+
+    pub fn scope(&self) -> CudaScope {
+        CudaScope::new(self.clone())
     }
 }
 
@@ -230,8 +767,9 @@ impl MemoryPort for Cuda {
     }
 }
 
-/// CoreOps for Cuda — primitives shared by all model families.
-/// Each method fetches the stream from the tensor's device context.
+/// CoreOps for Cuda.
+/// The stream choice is explicit at the kernel boundary even though this trait
+/// cannot carry `ExecScope`.
 impl CoreOps for Cuda {
     // alloc_tensor uses the default impl (Tensor::zeros via MemoryPort).
 
@@ -240,24 +778,24 @@ impl CoreOps for Cuda {
         b: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::add::add(a, b, dst)
+        kernels::add::add(a.device().config.stream, a, b, dst)
     }
     fn add_inplace<T: Dtype>(dst: &mut Tensor<T, Self>, src: &Tensor<T, Self>) -> OpResult<()> {
-        kernels::add::add_inplace(dst, src)
+        kernels::add::add_inplace(dst.device().config.stream, dst, src)
     }
     fn ewise_mul<T: Dtype>(
         a: &Tensor<T, Self>,
         b: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::ewise_mul::ewise_mul(a, b, dst)
+        kernels::ewise_mul::ewise_mul(a.device().config.stream, a, b, dst)
     }
     fn matmul<T: Dtype>(
         input: &Tensor<T, Self>,
         weight: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::matmul::matmul(input, weight, output)
+        kernels::matmul::matmul(input.device().config.stream, input, weight, output)
     }
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         input: &Tensor<A, Self>,
@@ -267,44 +805,52 @@ impl CoreOps for Cuda {
         zeros: Option<&Tensor<W, Self>>,
         group_size: usize,
     ) -> OpResult<()> {
-        kernels::matmul::matmul_quant(input, weight, output, scales, zeros, group_size)
+        kernels::matmul::matmul_quant(
+            input.device().config.stream,
+            input,
+            weight,
+            output,
+            scales,
+            zeros,
+            group_size,
+        )
     }
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::activation::silu_inplace(x)
+        kernels::activation::silu_inplace(x.device().config.stream, x)
     }
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::softmax::softmax(input, output)
+        kernels::softmax::softmax(input.device().config.stream, input, output)
     }
     fn embedding<T: Dtype>(
         table: &Tensor<T, Self>,
         indices: &Tensor<i32, Self>,
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::embedding::embedding(table, indices, output)
+        kernels::embedding::embedding(table.device().config.stream, table, indices, output)
     }
     fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        kernels::scalar::scalar_mul_inplace(x, scalar)
+        kernels::scalar::scalar_mul_inplace(x.device().config.stream, x, scalar)
     }
     fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        kernels::scalar::scalar_add_inplace(x, scalar)
+        kernels::scalar::scalar_add_inplace(x.device().config.stream, x, scalar)
     }
     fn scalar_mul_inplace_from_dev<T: Dtype>(
         x: &mut Tensor<T, Self>,
         d_scalar: &Tensor<f32, Self>,
     ) -> OpResult<()> {
-        kernels::scalar::scalar_mul_inplace_from_dev(x, d_scalar)
+        kernels::scalar::scalar_mul_inplace_from_dev(x.device().config.stream, x, d_scalar)
     }
     fn broadcast_mul_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         scale: &Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::broadcast_mul::broadcast_mul_inplace(x, scale)
+        kernels::broadcast_mul::broadcast_mul_inplace(x.device().config.stream, x, scale)
     }
     fn broadcast_add_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         bias: &Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::broadcast_mul::broadcast_add_inplace(x, bias)
+        kernels::broadcast_mul::broadcast_add_inplace(x.device().config.stream, x, bias)
     }
     fn split_cols<T: Dtype>(
         src: &Tensor<T, Self>,
@@ -315,6 +861,7 @@ impl CoreOps for Cuda {
         dst_cols: usize,
     ) -> OpResult<()> {
         kernels::split_cols::split_cols(
+            src.device().config.stream,
             src,
             dst,
             rows as i32,
@@ -328,44 +875,29 @@ impl CoreOps for Cuda {
         b: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::concat_seq::concat_seq_into(a, b, dst)
+        kernels::concat_seq::concat_seq_into(a.device().config.stream, a, b, dst)
     }
     fn cast_dtype<S: Dtype, D2: Dtype>(
         src: &Tensor<S, Self>,
         dst: &mut Tensor<D2, Self>,
     ) -> OpResult<()> {
-        kernels::cast_dtype::cast_dtype(src, dst)
+        kernels::cast_dtype::cast_dtype(src.device().config.stream, src, dst)
     }
-}
 
-/// LlmOps for Cuda — decoder + paged-KV kernels (Llama3 / Qwen3 / Qwen3_5).
-impl LlmOps for Cuda {
     fn rmsnorm<T: Dtype>(
         input: &Tensor<T, Self>,
         weight: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::rmsnorm::rmsnorm(input, weight, output, eps)
+        kernels::rmsnorm::rmsnorm(input.device().config.stream, input, weight, output, eps)
     }
     fn rmsnorm_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         weight: &Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::rmsnorm::rmsnorm_inplace(x, weight, eps)
-    }
-    fn fused_add_rmsnorm<T: Dtype>(
-        output: &mut Tensor<T, Self>,
-        residual: &mut Tensor<T, Self>,
-        input: &Tensor<T, Self>,
-        weight: &Tensor<T, Self>,
-        eps: f32,
-    ) -> OpResult<()> {
-        kernels::fused_add_rmsnorm::fused_add_rmsnorm(output, residual, input, weight, eps)
-    }
-    fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()> {
-        kernels::activation::swiglu_inplace(x, gate)
+        kernels::rmsnorm::rmsnorm_inplace(x.device().config.stream, x, weight, eps)
     }
     fn swiglu_packed<T: Dtype>(
         gate_up: &Tensor<T, Self>,
@@ -373,7 +905,13 @@ impl LlmOps for Cuda {
         rows: usize,
         inter: usize,
     ) -> OpResult<()> {
-        kernels::activation::swiglu_packed(gate_up, out, rows, inter)
+        kernels::activation::swiglu_packed(
+            gate_up.device().config.stream,
+            gate_up,
+            out,
+            rows,
+            inter,
+        )
     }
     fn rope_inplace<T: Dtype>(
         q: &mut Tensor<T, Self>,
@@ -387,6 +925,7 @@ impl LlmOps for Cuda {
     ) -> OpResult<()> {
         let num_tokens = q.shape().as_slice()[0] as i32;
         kernels::rope::rope_inplace(
+            q.device().config.stream,
             q,
             k,
             sin,
@@ -397,144 +936,6 @@ impl LlmOps for Cuda {
             kv_head_num as i32,
             head_dim as i32,
         )
-    }
-
-    fn qkv_norm_rope_scatter<T: Dtype>(
-        q: &mut Tensor<T, Self>,
-        k: &mut Tensor<T, Self>,
-        v: &Tensor<T, Self>,
-        q_weight: Option<&Tensor<T, Self>>,
-        k_weight: Option<&Tensor<T, Self>>,
-        q_eps: f32,
-        k_eps: f32,
-        sin: &Tensor<T, Self>,
-        cos: &Tensor<T, Self>,
-        positions: &Tensor<i32, Self>,
-        k_pool: &mut Tensor<T, Self>,
-        v_pool: &mut Tensor<T, Self>,
-        block_tables: &Tensor<i32, Self>,
-        seq_positions: &Tensor<i32, Self>,
-        cu_q_lens: &Tensor<i32, Self>,
-        seq_lens_step: &Tensor<i32, Self>,
-        max_blocks_per_seq: usize,
-        block_size: usize,
-        head_num: usize,
-        kv_head_num: usize,
-        head_dim: usize,
-        kv_dim: usize,
-    ) -> OpResult<()> {
-        kernels::qkv_norm_rope_scatter::qkv_norm_rope_scatter(
-            q,
-            k,
-            v,
-            q_weight,
-            k_weight,
-            q_eps,
-            k_eps,
-            sin,
-            cos,
-            positions,
-            k_pool,
-            v_pool,
-            block_tables,
-            seq_positions,
-            cu_q_lens,
-            seq_lens_step,
-            max_blocks_per_seq,
-            block_size,
-            head_num,
-            kv_head_num,
-            head_dim,
-            kv_dim,
-        )
-    }
-    fn attention_paged<T: Dtype>(
-        q: &Tensor<T, Self>,
-        k_pool: &Tensor<T, Self>,
-        v_pool: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>,
-        plan: &crate::domain::batch::BatchPlan<Self>,
-        workspace: &mut Tensor<f32, Self>,
-        head_num: usize,
-        kv_head_num: usize,
-        head_dim: usize,
-        scale: f32,
-    ) -> OpResult<()> {
-        kernels::attention_paged::attention_paged(
-            q,
-            k_pool,
-            v_pool,
-            output,
-            plan,
-            workspace,
-            head_num,
-            kv_head_num,
-            head_dim,
-            scale,
-        )
-    }
-
-    fn split_qkv<T: Dtype>(
-        qkv: &Tensor<T, Self>,
-        q: &mut Tensor<T, Self>,
-        k: &mut Tensor<T, Self>,
-        v: &mut Tensor<T, Self>,
-        num_tokens: usize,
-        q_dim: usize,
-        kv_dim: usize,
-    ) -> OpResult<()> {
-        let total_cols = (q_dim + 2 * kv_dim) as i32;
-        let rows = num_tokens as i32;
-        kernels::split_cols::split_cols(qkv, q, rows, total_cols, 0, q_dim as i32)?;
-        kernels::split_cols::split_cols(qkv, k, rows, total_cols, q_dim as i32, kv_dim as i32)?;
-        kernels::split_cols::split_cols(
-            qkv,
-            v,
-            rows,
-            total_cols,
-            (q_dim + kv_dim) as i32,
-            kv_dim as i32,
-        )?;
-        Ok(())
-    }
-
-    fn scatter_kv_paged<T: Dtype>(
-        k_src: &Tensor<T, Self>,
-        v_src: &Tensor<T, Self>,
-        k_pool: &mut Tensor<T, Self>,
-        v_pool: &mut Tensor<T, Self>,
-        block_tables: &Tensor<i32, Self>,
-        seq_positions: &Tensor<i32, Self>,
-        cu_q_lens: &Tensor<i32, Self>,
-        seq_lens_step: &Tensor<i32, Self>,
-        max_blocks_per_seq: usize,
-        block_size: usize,
-        kv_dim: usize,
-    ) -> OpResult<()> {
-        kernels::scatter_kv_paged::scatter_kv_paged(
-            k_src,
-            v_src,
-            k_pool,
-            v_pool,
-            block_tables,
-            seq_positions,
-            cu_q_lens,
-            seq_lens_step,
-            max_blocks_per_seq,
-            block_size,
-            kv_dim,
-        )
-    }
-
-    fn argmax_batched<T: Dtype>(
-        logits: &Tensor<T, Self>,
-        cu_q_lens: &Tensor<i32, Self>,
-        batch: usize,
-        out_dev: &mut Tensor<i32, Self>,
-        workspace: &Tensor<f32, Self>,
-        rows: &mut Tensor<i32, Self>,
-    ) -> OpResult<Vec<i32>> {
-        kernels::argmax_batched::argmax_batched(logits, cu_q_lens, batch, out_dev, workspace, rows)
     }
 }
 
@@ -548,7 +949,15 @@ impl DiffusionOps for Cuda {
         stride: usize,
         padding: usize,
     ) -> OpResult<()> {
-        kernels::conv2d::conv2d(input, weight, bias, output, stride, padding)
+        kernels::conv2d::conv2d(
+            input.device().config.stream,
+            input,
+            weight,
+            bias,
+            output,
+            stride,
+            padding,
+        )
     }
 
     fn groupnorm<T: Dtype>(
@@ -559,7 +968,15 @@ impl DiffusionOps for Cuda {
         num_groups: usize,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::groupnorm::groupnorm(input, weight, bias, output, num_groups, eps)
+        kernels::groupnorm::groupnorm(
+            input.device().config.stream,
+            input,
+            weight,
+            bias,
+            output,
+            num_groups,
+            eps,
+        )
     }
 
     fn groupnorm_silu<T: Dtype>(
@@ -570,7 +987,15 @@ impl DiffusionOps for Cuda {
         num_groups: usize,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::groupnorm::groupnorm_silu(input, weight, bias, output, num_groups, eps)
+        kernels::groupnorm::groupnorm_silu(
+            input.device().config.stream,
+            input,
+            weight,
+            bias,
+            output,
+            num_groups,
+            eps,
+        )
     }
 
     fn layernorm<T: Dtype>(
@@ -580,14 +1005,21 @@ impl DiffusionOps for Cuda {
         output: &mut Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::layernorm::layernorm(input, weight, bias, output, eps)
+        kernels::layernorm::layernorm(
+            input.device().config.stream,
+            input,
+            weight,
+            bias,
+            output,
+            eps,
+        )
     }
 
     fn upsample_nearest_2x<T: Dtype>(
         input: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::upsample::upsample_nearest_2x(input, output)
+        kernels::upsample::upsample_nearest_2x(input.device().config.stream, input, output)
     }
 
     fn sdpa<T: Dtype>(
@@ -600,7 +1032,17 @@ impl DiffusionOps for Cuda {
         head_dim: usize,
         scale: f32,
     ) -> OpResult<()> {
-        kernels::sdpa::sdpa(q, k, v, output, num_heads, num_kv_heads, head_dim, scale)
+        kernels::sdpa::sdpa(
+            q.device().config.stream,
+            q,
+            k,
+            v,
+            output,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
     }
 
     fn sdpa_masked<T: Dtype>(
@@ -615,6 +1057,7 @@ impl DiffusionOps for Cuda {
         scale: f32,
     ) -> OpResult<()> {
         kernels::sdpa::sdpa_masked(
+            q.device().config.stream,
             q,
             k,
             v,
@@ -633,7 +1076,13 @@ impl DiffusionOps for Cuda {
         sin: &Tensor<f32, Self>,
         head_dim: usize,
     ) -> OpResult<()> {
-        kernels::rope_interleaved::apply_rope_interleaved(x, cos, sin, head_dim)
+        kernels::rope_interleaved::apply_rope_interleaved(
+            x.device().config.stream,
+            x,
+            cos,
+            sin,
+            head_dim,
+        )
     }
 
     fn pad_with_token<T: Dtype>(
@@ -641,11 +1090,11 @@ impl DiffusionOps for Cuda {
         pad_token: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::pad::pad_with_token_into(src, pad_token, dst)
+        kernels::pad::pad_with_token_into(src.device().config.stream, src, pad_token, dst)
     }
 
     fn pad_last_row<T: Dtype>(src: &Tensor<T, Self>, dst: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::pad::pad_last_row_into(src, dst)
+        kernels::pad::pad_last_row_into(src.device().config.stream, src, dst)
     }
 
     fn overwrite_pad_tokens_inplace<T: Dtype>(
@@ -653,14 +1102,130 @@ impl DiffusionOps for Cuda {
         pad_token: &Tensor<T, Self>,
         keep_prefix: usize,
     ) -> OpResult<()> {
-        kernels::pad::overwrite_pad_tokens_inplace(dst, pad_token, keep_prefix)
+        kernels::pad::overwrite_pad_tokens_inplace(
+            dst.device().config.stream,
+            dst,
+            pad_token,
+            keep_prefix,
+        )
     }
 
     fn silu_inplace_diff<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::scalar::silu_inplace(x)
+        kernels::scalar::silu_inplace(x.device().config.stream, x)
     }
 
     fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::scalar::tanh_inplace(x)
+        kernels::scalar::tanh_inplace(x.device().config.stream, x)
+    }
+}
+
+impl crate::domain::ports::diffusion_ops::DiffusionOps for Cuda {
+    fn conv2d<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: Option<&Tensor<T, Self>>,
+        output: &mut Tensor<T, Self>,
+        stride: usize,
+        padding: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::conv2d::conv2d(
+            scope_stream(ctx.scope()),
+            input,
+            weight,
+            bias,
+            output,
+            stride,
+            padding,
+        )
+    }
+
+    fn groupnorm<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_groups: usize,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::groupnorm::groupnorm(
+            scope_stream(ctx.scope()),
+            input,
+            weight,
+            bias,
+            output,
+            num_groups,
+            eps,
+        )
+    }
+
+    fn groupnorm_silu<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_groups: usize,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::groupnorm::groupnorm_silu(
+            scope_stream(ctx.scope()),
+            input,
+            weight,
+            bias,
+            output,
+            num_groups,
+            eps,
+        )
+    }
+
+    fn layernorm<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::layernorm::layernorm(scope_stream(ctx.scope()), input, weight, bias, output, eps)
+    }
+
+    fn upsample_nearest_2x<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::upsample::upsample_nearest_2x(scope_stream(ctx.scope()), input, output)
+    }
+
+    fn apply_rope_interleaved<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        x: &mut Tensor<T, Self>,
+        cos: &Tensor<f32, Self>,
+        sin: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::rope_interleaved::apply_rope_interleaved(
+            scope_stream(ctx.scope()),
+            x,
+            cos,
+            sin,
+            head_dim,
+        )
+    }
+
+    fn tanh_inplace<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        x: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        kernels::scalar::tanh_inplace(scope_stream(ctx.scope()), x)
     }
 }

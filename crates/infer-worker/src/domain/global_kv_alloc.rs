@@ -110,7 +110,8 @@ impl GlobalKvAllocator {
         if total_free > self.total {
             tracing::warn!(
                 "[kv-alloc] invariant violation: total_free={} > total={}",
-                total_free, self.total
+                total_free,
+                self.total
             );
         }
         self.total.saturating_sub(total_free)
@@ -242,21 +243,25 @@ impl GlobalKvAllocator {
                 if idx >= self.total {
                     tracing::warn!(
                         "[kv-alloc] ignoring {} index out of range: idx={} total={}",
-                        _op, idx, self.total
+                        _op,
+                        idx,
+                        self.total
                     );
                     continue;
                 }
                 if self.free[self.head..].binary_search(&idx).is_ok() {
                     tracing::warn!(
                         "[kv-alloc] ignoring {} index that is already free: idx={}",
-                        _op, idx
+                        _op,
+                        idx
                     );
                     continue;
                 }
                 if self.released.contains(&idx) {
                     tracing::warn!(
                         "[kv-alloc] ignoring {} index that is already released: idx={}",
-                        _op, idx
+                        _op,
+                        idx
                     );
                     continue;
                 }
@@ -508,14 +513,11 @@ mod tests {
 
     #[test]
     fn merge_and_sort_drops_consumed_prefix_and_sorts_rest() {
-        // After the new free()-time sort, in normal use head==0 already.
-        // We test the legacy semantics by hand-driving head past the
-        // free-time sort.
+        // In normal use, free()-time sorting has already reset head to 0.
+        // Drive head forward first so this test covers the merge path too.
         let mut a = GlobalKvAllocator::new(10);
         let _ = a.alloc_indices(7).unwrap(); // head=7
-        // Append unsorted frees directly without going through `free()`,
-        // mimicking what the old lazy path produced. Use the public API
-        // instead — `free()` will sort them in.
+        // Use the public API; free() sorts these entries into place.
         a.free(&[5, 2, 0]);
         // Already sorted by free(); merge_and_sort is a no-op.
         a.merge_and_sort();

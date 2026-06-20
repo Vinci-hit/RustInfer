@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{CoreOps, DiffusionOps, LlmOps, OpBackend, OpError, OpResult};
+use crate::domain::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;

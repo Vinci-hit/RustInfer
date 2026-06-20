@@ -251,8 +251,8 @@ mod tests {
         // 256x256 latent = 32x32, /2 = 16x16 patches = 256 tokens, padded to 256 (already divides).
         assert_eq!(spec.n_patches_max(), 16 * 16);
         assert_eq!(spec.s_img_max(), 256);
-        assert_eq!(spec.s_cap_max(), 128); // round_up(64, 128) = 128
-        assert_eq!(spec.s_total_max(), 384);
+        assert_eq!(spec.s_cap_max(), 64); // round_up(64, SEQ_MULTI_OF=32) = 64
+        assert_eq!(spec.s_total_max(), 320);
     }
 
     #[test]
@@ -294,11 +294,11 @@ mod tests {
         // Sanity: a few key shapes.
         assert_eq!(state.t_freq.shape().as_slice(), &[1, 256]);
         assert_eq!(state.t_out.shape().as_slice(), &[1, 256]);
-        // s_img_max = round_up(4*4, 128) = 128.
-        assert_eq!(state.x_padded.shape().as_slice(), &[128, 64]);
-        // s_cap_max = round_up(16, 128) = 128.
-        assert_eq!(state.cap_padded.shape().as_slice(), &[128, 64]);
-        // s_total_max = 256.
-        assert_eq!(state.unified.shape().as_slice(), &[256, 64]);
+        // s_img_max = round_up(4*4, SEQ_MULTI_OF=32) = 32.
+        assert_eq!(state.x_padded.shape().as_slice(), &[32, 64]);
+        // s_cap_max = round_up(16, SEQ_MULTI_OF=32) = 32.
+        assert_eq!(state.cap_padded.shape().as_slice(), &[32, 64]);
+        // s_total_max = 64.
+        assert_eq!(state.unified.shape().as_slice(), &[64, 64]);
     }
 }

@@ -40,6 +40,7 @@ unsafe extern "C" {
 }
 
 pub fn qkv_norm_rope_scatter<T: Dtype>(
+    stream: cudaStream_t,
     q: &mut Tensor<T, Cuda>,
     k: &mut Tensor<T, Cuda>,
     v: &Tensor<T, Cuda>,
@@ -87,7 +88,6 @@ pub fn qkv_norm_rope_scatter<T: Dtype>(
     let q_row_stride = q.strides().as_slice()[0] as i64;
     let k_row_stride = k.strides().as_slice()[0] as i64;
     let v_row_stride = v.strides().as_slice()[0] as i64;
-    let stream = q.device().config.stream;
 
     unsafe {
         qkv_norm_rope_scatter_bf16(

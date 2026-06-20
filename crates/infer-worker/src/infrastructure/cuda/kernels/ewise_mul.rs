@@ -31,12 +31,12 @@ unsafe extern "C" {
 }
 
 pub fn ewise_mul<T: Dtype>(
+    stream: cudaStream_t,
     a: &Tensor<T, Cuda>,
     b: &Tensor<T, Cuda>,
     dst: &mut Tensor<T, Cuda>,
 ) -> OpResult<()> {
     let n = a.numel() as i32;
-    let stream = a.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => ewise_mul_f32_forward(

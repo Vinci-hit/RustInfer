@@ -9,7 +9,7 @@ use std::ptr::NonNull;
 use half::{bf16, f16};
 
 use crate::domain::ports::{
-    AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, LlmOps, MemoryPort, OpError,
+    AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpError,
     OpResult,
 };
 use crate::domain::tensor::Tensor;
@@ -30,6 +30,16 @@ impl Device for Cpu {
     }
 }
 impl HostDevice for Cpu {}
+
+impl crate::domain::exec::Device for Cpu {
+    type Scope = crate::domain::exec::HostScope<Self>;
+}
+
+impl crate::domain::exec::HostDevice for Cpu {}
+
+crate::impl_math_ops_via_core_ops!(Cpu);
+
+impl crate::domain::ports::FusedOps for Cpu {}
 
 // ─── Cpu MemoryPort ──────────────────────────────────────────────────────────
 
@@ -89,7 +99,7 @@ impl MemoryPort for Cpu {
     }
 }
 
-// ─── Cpu Allocator (legacy, used by VAE pool) ────────────────────────────────
+// ─── Cpu Allocator (used by VAE pool) ────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct CpuAllocator;
@@ -350,14 +360,33 @@ impl CoreOps for Cpu {
     }
 
     fn split_cols<T: Dtype>(
-        _src: &Tensor<T, Self>,
-        _dst: &mut Tensor<T, Self>,
-        _rows: usize,
-        _total_cols: usize,
-        _col_offset: usize,
-        _dst_cols: usize,
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+        rows: usize,
+        total_cols: usize,
+        col_offset: usize,
+        dst_cols: usize,
     ) -> OpResult<()> {
-        Err(OpError::unsupported("cpu", "split_cols"))
+        if col_offset + dst_cols > total_cols {
+            return Err(OpError::Shape(format!(
+                "split_cols: col_offset {} + dst_cols {} > total_cols {}",
+                col_offset, dst_cols, total_cols
+            )));
+        }
+        let src_ptr = src.data_ptr();
+        let dst_ptr = dst.data_ptr_mut();
+        for r in 0..rows {
+            // SAFETY: contiguous [rows, total_cols] src and [rows, dst_cols] dst;
+            // the bound check above keeps the read window inside each src row.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(r * total_cols + col_offset),
+                    dst_ptr.add(r * dst_cols),
+                    dst_cols,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn concat_seq<T: Dtype>(
@@ -374,12 +403,7 @@ impl CoreOps for Cpu {
     ) -> OpResult<()> {
         Err(OpError::unsupported("cpu", "cast_dtype"))
     }
-}
 
-// ─── LlmOps for Cpu ──────────────────────────────────────────────────────────
-// Decoder + paged-KV ops shared by Llama3 / Qwen3 / Qwen3_5.
-
-impl LlmOps for Cpu {
     fn rmsnorm<T: Dtype>(
         input: &Tensor<T, Self>,
         weight: &Tensor<T, Self>,
@@ -408,7 +432,6 @@ impl LlmOps for Cpu {
         }
         Ok(())
     }
-
     fn rmsnorm_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         weight: &Tensor<T, Self>,
@@ -436,59 +459,6 @@ impl LlmOps for Cpu {
         }
         Ok(())
     }
-
-    fn fused_add_rmsnorm<T: Dtype>(
-        output: &mut Tensor<T, Self>,
-        residual: &mut Tensor<T, Self>,
-        input: &Tensor<T, Self>,
-        weight: &Tensor<T, Self>,
-        eps: f32,
-    ) -> OpResult<()> {
-        // residual += input; output = rmsnorm(residual, weight, eps)
-        let dim = weight.numel();
-        let rows = input.numel() / dim;
-        for row in 0..rows {
-            let off = row * dim;
-            // Step 1: residual += input
-            for i in 0..dim {
-                unsafe {
-                    let r = read_f64(residual.data_ptr().add(off + i));
-                    let inp = read_f64(input.data_ptr().add(off + i));
-                    write_f64(residual.data_ptr_mut().add(off + i), r + inp);
-                }
-            }
-            // Step 2: output = rmsnorm(residual)
-            let mut ss = 0.0f64;
-            for i in 0..dim {
-                unsafe {
-                    let v = read_f64(residual.data_ptr().add(off + i));
-                    ss += v * v;
-                }
-            }
-            let inv_rms = 1.0 / ((ss / dim as f64) + eps as f64).sqrt();
-            for i in 0..dim {
-                unsafe {
-                    let v = read_f64(residual.data_ptr().add(off + i));
-                    let w = read_f64(weight.data_ptr().add(i));
-                    write_f64(output.data_ptr_mut().add(off + i), v * w * inv_rms);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Self>, gate: &Tensor<T, Self>) -> OpResult<()> {
-        for i in 0..x.numel() {
-            unsafe {
-                let v = read_f64((x.data_ptr() as *const T).add(i));
-                let g = read_f64(gate.data_ptr().add(i));
-                let silu = v / (1.0 + (-v).exp());
-                write_f64(x.data_ptr_mut().add(i), silu * g);
-            }
-        }
-        Ok(())
-    }
-
     fn swiglu_packed<T: Dtype>(
         gate_up: &Tensor<T, Self>,
         out: &mut Tensor<T, Self>,
@@ -509,7 +479,6 @@ impl LlmOps for Cpu {
         }
         Ok(())
     }
-
     fn rope_inplace<T: Dtype>(
         q: &mut Tensor<T, Self>,
         k: &mut Tensor<T, Self>,
@@ -558,218 +527,6 @@ impl LlmOps for Cpu {
             }
         }
         Ok(())
-    }
-
-    fn attention_paged<T: Dtype>(
-        q: &Tensor<T, Self>,
-        k_pool: &Tensor<T, Self>,
-        v_pool: &Tensor<T, Self>,
-        output: &mut Tensor<T, Self>,
-        plan: &crate::domain::batch::BatchPlan<Self>,
-        _workspace: &mut Tensor<f32, Self>, // CPU ignores; no flash-decode scratch needed
-        head_num: usize,
-        kv_head_num: usize,
-        head_dim: usize,
-        scale: f32,
-    ) -> OpResult<()> {
-        // CPU reference: naive ragged-batch causal attention over a paged
-        // KV pool. Layout:
-        //   k_pool / v_pool : [num_blocks, block_size, kv_dim] contiguous
-        //   block_tables    : [batch, max_blocks_per_seq] (in plan)
-        // For each seq i, q has rows [cu_q_lens[i] .. cu_q_lens[i+1]); attend
-        // to the first `kv_lens[i]` tokens routed through `block_tables[i]`.
-        let kv_mul = head_num / kv_head_num;
-        let q_dim = head_num * head_dim;
-        let kv_dim = kv_head_num * head_dim;
-        let block_size = plan.block_size;
-        let max_blocks = plan.max_blocks_per_seq;
-
-        let cu_q = plan.cu_q_lens.as_slice();
-        let kv_lens_h = plan.kv_lens.as_slice();
-        let block_tables_h = plan.block_tables.as_slice();
-        let batch = plan.batch;
-
-        // Helper: fetch K/V pool row for `(seq, token_pos)`. Returns f64.
-        let fetch =
-            |pool: &Tensor<T, Self>, seq: usize, pos: usize, kv_h: usize, d: usize| -> f64 {
-                let logical_block = pos / block_size;
-                let block_off = pos % block_size;
-                let physical = block_tables_h[seq * max_blocks + logical_block] as usize;
-                let row_idx = physical * block_size + block_off;
-                unsafe { read_f64(pool.data_ptr().add(row_idx * kv_dim + kv_h * head_dim + d)) }
-            };
-
-        for seq in 0..batch {
-            let q_start = cu_q[seq] as usize;
-            let q_end = cu_q[seq + 1] as usize;
-            let q_len = q_end - q_start;
-            let kv_len = kv_lens_h[seq] as usize;
-
-            // Causal: q-row r in this seq attends to KV [0..kv_len-q_len+r+1].
-            let causal_shift = (kv_len as i64) - (q_len as i64);
-
-            for h in 0..head_num {
-                let kv_h = h / kv_mul;
-                for r in 0..q_len {
-                    let q_row_global = q_start + r;
-                    let kv_upper = (causal_shift + r as i64 + 1).max(0) as usize;
-                    let mut scores = vec![0.0f64; kv_upper];
-                    for s in 0..kv_upper {
-                        let mut dot = 0.0f64;
-                        for d in 0..head_dim {
-                            unsafe {
-                                let qi = read_f64(
-                                    q.data_ptr().add(q_row_global * q_dim + h * head_dim + d),
-                                );
-                                let ki = fetch(k_pool, seq, s, kv_h, d);
-                                dot += qi * ki;
-                            }
-                        }
-                        scores[s] = dot * scale as f64;
-                    }
-                    let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let mut sum = 0.0f64;
-                    for s in scores.iter_mut() {
-                        *s = (*s - max_s).exp();
-                        sum += *s;
-                    }
-                    if sum == 0.0 {
-                        sum = 1.0;
-                    }
-                    for s in scores.iter_mut() {
-                        *s /= sum;
-                    }
-                    for d in 0..head_dim {
-                        let mut val = 0.0f64;
-                        for s in 0..kv_upper {
-                            let vi = fetch(v_pool, seq, s, kv_h, d);
-                            val += scores[s] * vi;
-                        }
-                        unsafe {
-                            write_f64(
-                                output
-                                    .data_ptr_mut()
-                                    .add(q_row_global * q_dim + h * head_dim + d),
-                                val,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn split_qkv<T: Dtype>(
-        qkv: &Tensor<T, Self>,
-        q: &mut Tensor<T, Self>,
-        k: &mut Tensor<T, Self>,
-        v: &mut Tensor<T, Self>,
-        num_tokens: usize,
-        q_dim: usize,
-        kv_dim: usize,
-    ) -> OpResult<()> {
-        let qkv_dim = q_dim + 2 * kv_dim;
-        let elem = T::SIZE_BYTES;
-        let src = qkv.data_ptr() as *const u8;
-        let q_dst = q.data_ptr_mut() as *mut u8;
-        let k_dst = k.data_ptr_mut() as *mut u8;
-        let v_dst = v.data_ptr_mut() as *mut u8;
-        for t in 0..num_tokens {
-            unsafe {
-                let row = src.add(t * qkv_dim * elem);
-                std::ptr::copy_nonoverlapping(row, q_dst.add(t * q_dim * elem), q_dim * elem);
-                std::ptr::copy_nonoverlapping(
-                    row.add(q_dim * elem),
-                    k_dst.add(t * kv_dim * elem),
-                    kv_dim * elem,
-                );
-                std::ptr::copy_nonoverlapping(
-                    row.add((q_dim + kv_dim) * elem),
-                    v_dst.add(t * kv_dim * elem),
-                    kv_dim * elem,
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn scatter_kv_paged<T: Dtype>(
-        k_src: &Tensor<T, Self>,
-        v_src: &Tensor<T, Self>,
-        k_pool: &mut Tensor<T, Self>,
-        v_pool: &mut Tensor<T, Self>,
-        block_tables: &Tensor<i32, Self>,
-        seq_positions: &Tensor<i32, Self>,
-        cu_q_lens: &Tensor<i32, Self>,
-        seq_lens_step: &Tensor<i32, Self>,
-        max_blocks_per_seq: usize,
-        block_size: usize,
-        kv_dim: usize,
-    ) -> OpResult<()> {
-        let elem = T::SIZE_BYTES;
-        let cu_q = cu_q_lens.as_slice();
-        let seq_pos = seq_positions.as_slice();
-        let seq_lens = seq_lens_step.as_slice();
-        let block_tables_h = block_tables.as_slice();
-        let batch = seq_pos.len();
-        for seq in 0..batch {
-            let q_start = cu_q[seq] as usize;
-            let q_len = seq_lens[seq] as usize;
-            let dst_pos_start = seq_pos[seq] as usize;
-            for t in 0..q_len {
-                let dst_pos = dst_pos_start + t;
-                let logical_block = dst_pos / block_size;
-                let block_off = dst_pos % block_size;
-                let physical = block_tables_h[seq * max_blocks_per_seq + logical_block] as usize;
-                let row_idx = physical * block_size + block_off;
-                unsafe {
-                    let k_src_row =
-                        (k_src.data_ptr() as *const u8).add((q_start + t) * kv_dim * elem);
-                    let k_dst_row = (k_pool.data_ptr_mut() as *mut u8).add(row_idx * kv_dim * elem);
-                    std::ptr::copy_nonoverlapping(k_src_row, k_dst_row, kv_dim * elem);
-                    let v_src_row =
-                        (v_src.data_ptr() as *const u8).add((q_start + t) * kv_dim * elem);
-                    let v_dst_row = (v_pool.data_ptr_mut() as *mut u8).add(row_idx * kv_dim * elem);
-                    std::ptr::copy_nonoverlapping(v_src_row, v_dst_row, kv_dim * elem);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn argmax_batched<T: Dtype>(
-        logits: &Tensor<T, Self>,
-        cu_q_lens: &Tensor<i32, Self>,
-        batch: usize,
-        out_dev: &mut Tensor<i32, Self>,
-        _workspace: &Tensor<f32, Self>,
-        _rows: &mut Tensor<i32, Self>,
-    ) -> OpResult<Vec<i32>> {
-        let total_rows = if logits.shape().as_slice().len() >= 1 {
-            logits.shape().as_slice()[0]
-        } else {
-            return Err(crate::domain::ports::OpError::Shape(
-                "logits must be 2D".into(),
-            ));
-        };
-        let vocab = logits.numel() / total_rows;
-        let cu_q = cu_q_lens.as_slice();
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_dev.data_ptr_mut(), batch) };
-        for seq in 0..batch {
-            let last_row = (cu_q[seq + 1] - 1) as usize;
-            let mut max_val = f64::NEG_INFINITY;
-            let mut max_idx = 0i32;
-            for i in 0..vocab {
-                let val = unsafe { read_f64(logits.data_ptr().add(last_row * vocab + i)) };
-                if val > max_val {
-                    max_val = val;
-                    max_idx = i as i32;
-                }
-            }
-            out_slice[seq] = max_idx;
-        }
-        Ok(out_slice.to_vec())
     }
 }
 
@@ -1113,6 +870,93 @@ impl DiffusionOps for Cpu {
 
     fn tanh_inplace<T: Dtype>(_x: &mut Tensor<T, Self>) -> OpResult<()> {
         Err(OpError::unsupported("cpu", "tanh_inplace"))
+    }
+}
+
+impl crate::domain::ports::diffusion_ops::DiffusionOps for Cpu {
+    fn conv2d<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: Option<&Tensor<T, Self>>,
+        output: &mut Tensor<T, Self>,
+        stride: usize,
+        padding: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::conv2d(
+            input, weight, bias, output, stride, padding,
+        )
+    }
+
+    fn groupnorm<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_groups: usize,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::groupnorm(
+            input, weight, bias, output, num_groups, eps,
+        )
+    }
+
+    fn groupnorm_silu<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        num_groups: usize,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::groupnorm_silu(
+            input, weight, bias, output, num_groups, eps,
+        )
+    }
+
+    fn layernorm<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::layernorm(input, weight, bias, output, eps)
+    }
+
+    fn upsample_nearest_2x<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::upsample_nearest_2x(input, output)
+    }
+
+    fn apply_rope_interleaved<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        x: &mut Tensor<T, Self>,
+        cos: &Tensor<f32, Self>,
+        sin: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::apply_rope_interleaved(x, cos, sin, head_dim)
+    }
+
+    fn tanh_inplace<T: crate::domain::dtype::Dtype>(
+        ctx: &crate::domain::exec::StepCtx<'_, Self>,
+        x: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = crate::domain::exec::ExecScope::enter(ctx.scope());
+        <Self as crate::domain::ports::DiffusionOps>::tanh_inplace(x)
     }
 }
 

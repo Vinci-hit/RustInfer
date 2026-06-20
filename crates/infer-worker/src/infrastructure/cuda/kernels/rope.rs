@@ -58,6 +58,7 @@ unsafe extern "C" {
 /// sin/cos: [max_seq_len, head_dim/2]
 /// positions: device pointer to [num_tokens] i32
 pub fn rope_inplace<T: Dtype>(
+    stream: cudaStream_t,
     q: &mut Tensor<T, Cuda>,
     k: &mut Tensor<T, Cuda>,
     sin: &Tensor<T, Cuda>,
@@ -73,7 +74,6 @@ pub fn rope_inplace<T: Dtype>(
     // Row stride from tensor: stride[0] for a 2D [rows, cols] view.
     let q_row_stride = q.strides().as_slice()[0] as i32;
     let k_row_stride = k.strides().as_slice()[0] as i32;
-    let stream = q.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => rope_kernel_cu(

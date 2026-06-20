@@ -10,6 +10,10 @@ pub trait Device: Clone + Send + Sync + Debug + 'static {
     type ExecCtx: Send + Sync;
     /// Borrow the exec context.
     fn exec_ctx(&self) -> &Self::ExecCtx;
+    /// Stable physical device id inside this process. CPU defaults to 0.
+    fn device_id(&self) -> i32 {
+        0
+    }
     /// Human-readable name for errors.
     fn name(&self) -> &'static str;
 }
@@ -82,8 +86,7 @@ pub trait MemoryPort: Device {
     ) -> OpResult<()>;
 }
 
-/// Memory allocator port (legacy — kept for diffusion VAE buffer pool).
-/// New code should prefer `MemoryPort`.
+/// Layout-aware allocator port used by diffusion VAE buffer pools.
 pub trait Allocator: Debug + Send + Sync {
     /// Allocate raw bytes.
     /// # Safety: caller must dealloc with same allocator + layout.

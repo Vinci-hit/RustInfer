@@ -58,6 +58,7 @@ unsafe extern "C" {
 }
 
 pub fn groupnorm<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     bias: &Tensor<T, Cuda>,
@@ -69,7 +70,6 @@ pub fn groupnorm<T: Dtype>(
     let batch = shape[0] as i32;
     let channels = shape[1] as i32;
     let spatial: i32 = shape[2..].iter().product::<usize>() as i32;
-    let stream = input.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => groupnorm_f32_forward(
@@ -103,6 +103,7 @@ pub fn groupnorm<T: Dtype>(
 }
 
 pub fn groupnorm_silu<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     bias: &Tensor<T, Cuda>,
@@ -114,7 +115,6 @@ pub fn groupnorm_silu<T: Dtype>(
     let batch = shape[0] as i32;
     let channels = shape[1] as i32;
     let spatial: i32 = shape[2..].iter().product::<usize>() as i32;
-    let stream = input.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => groupnorm_silu_f32_forward(

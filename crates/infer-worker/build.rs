@@ -1,4 +1,6 @@
+#[cfg(feature = "cuda")]
 use std::env;
+#[cfg(feature = "cuda")]
 use std::path::{Path, PathBuf};
 
 fn main() {

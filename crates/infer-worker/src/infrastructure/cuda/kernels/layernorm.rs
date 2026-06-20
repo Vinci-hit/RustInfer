@@ -87,6 +87,7 @@ unsafe extern "C" {
 
 /// Full layernorm: normalize → scale by weight → add bias.
 pub fn layernorm<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     bias: &Tensor<T, Cuda>,
@@ -96,7 +97,6 @@ pub fn layernorm<T: Dtype>(
     let dim = *input.shape().as_slice().last().unwrap();
     let rows = (input.numel() / dim) as i32;
     let cols = dim as i32;
-    let stream = input.device().config.stream;
 
     unsafe {
         // Step 1: normalize (zero-mean, unit-variance)

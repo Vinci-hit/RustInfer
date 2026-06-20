@@ -7,9 +7,15 @@
 
 use safetensors::tensor::TensorView;
 
+use super::decoder::Decoder;
 use super::layers::{Embedding, Linear, RMSNorm};
-use super::llama3::{Llama3Layer, Llama3Model};
-use super::qwen3::{Qwen3Layer, Qwen3Model};
+use super::llama3::Llama3Model;
+use super::qwen3::Qwen3Model;
+use crate::components::{
+    Attention, DecoderBlock, DenseFfn, Embed, Linear as CompLinear, LmHead, RmsNorm as CompRmsNorm,
+};
+use crate::domain::model::ModelDims;
+use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype, Shape};
@@ -268,57 +274,24 @@ impl<'a> WeightLoader<'a> {
         Ok(Linear::new(fused, None))
     }
 
-    /// Load a complete Llama3 model.
-    pub fn load_llama3<T: Dtype, D: OpBackend>(
+    /// Build the shared dense decoder. Per-block Q/K norms are populated when
+    /// the weights contain them (Qwen3) and left absent otherwise (Llama3), so
+    /// one builder backs both `load_llama3` and `load_qwen3`.
+    fn build_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
         &self,
         cfg: &LoadConfig,
         device: &D,
-    ) -> OpResult<Llama3Model<T, D>> {
-        let embed_tokens = self.load_embedding("model.embed_tokens.weight", device)?;
-        let norm = self.load_rmsnorm("model.norm.weight", device, cfg.rms_norm_eps)?;
-
-        // lm_head — may share weights with embed_tokens
+    ) -> OpResult<Decoder<T, D>> {
+        let embed_table = self
+            .load_embedding("model.embed_tokens.weight", device)?
+            .table;
+        let final_norm = self.load_rmsnorm("model.norm.weight", device, cfg.rms_norm_eps)?;
         let lm_head = if self.reader.contains("lm_head.weight") {
             self.load_linear("lm_head.weight", None, device)?
         } else {
-            Linear::new(embed_tokens.table.clone(), None)
+            Linear::new(embed_table.clone(), None)
         };
 
-        let mut layers = Vec::with_capacity(cfg.layer_num);
-        for i in 0..cfg.layer_num {
-            layers.push(Llama3Layer {
-                input_layernorm: self.load_rmsnorm(
-                    &format!("model.layers.{}.input_layernorm.weight", i),
-                    device,
-                    cfg.rms_norm_eps,
-                )?,
-                post_attention_layernorm: self.load_rmsnorm(
-                    &format!("model.layers.{}.post_attention_layernorm.weight", i),
-                    device,
-                    cfg.rms_norm_eps,
-                )?,
-                qkv_proj: self.load_fused_qkv(
-                    i,
-                    cfg.head_num * cfg.head_dim,
-                    cfg.kv_head_num * cfg.head_dim,
-                    cfg.dim,
-                    device,
-                )?,
-                o_proj: self.load_linear(
-                    &format!("model.layers.{}.self_attn.o_proj.weight", i),
-                    None,
-                    device,
-                )?,
-                gate_up_proj: self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?,
-                down_proj: self.load_linear(
-                    &format!("model.layers.{}.mlp.down_proj.weight", i),
-                    None,
-                    device,
-                )?,
-            });
-        }
-
-        // RoPE sin/cos cache — precomputed from theta
         let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
             cfg.seq_len,
             cfg.head_dim,
@@ -327,109 +300,135 @@ impl<'a> WeightLoader<'a> {
             device,
         )?;
 
-        Ok(Llama3Model {
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            sin_cache,
-            cos_cache,
-            head_num: cfg.head_num,
-            kv_head_num: cfg.kv_head_num,
-            head_dim: cfg.head_dim,
-            dim: cfg.dim,
-            kv_dim: cfg.kv_head_num * cfg.head_dim,
-            intermediate_size: cfg.intermediate_size,
-            vocab_size: cfg.vocab_size,
-        })
-    }
+        let q_dim = cfg.head_num * cfg.head_dim;
+        let kv_dim = cfg.kv_head_num * cfg.head_dim;
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
-    /// Load a complete Qwen3 model (adds q_norm / k_norm per layer).
-    pub fn load_qwen3<T: Dtype, D: OpBackend>(
-        &self,
-        cfg: &LoadConfig,
-        device: &D,
-    ) -> OpResult<Qwen3Model<T, D>> {
-        let embed_tokens = self.load_embedding("model.embed_tokens.weight", device)?;
-        let norm = self.load_rmsnorm("model.norm.weight", device, cfg.rms_norm_eps)?;
-        let lm_head = if self.reader.contains("lm_head.weight") {
-            self.load_linear("lm_head.weight", None, device)?
-        } else {
-            Linear::new(embed_tokens.table.clone(), None)
-        };
-
-        let mut layers = Vec::with_capacity(cfg.layer_num);
+        let mut blocks = Vec::with_capacity(cfg.layer_num);
         for i in 0..cfg.layer_num {
+            let input_layernorm = self.load_rmsnorm(
+                &format!("model.layers.{}.input_layernorm.weight", i),
+                device,
+                cfg.rms_norm_eps,
+            )?;
+            let post_attention_layernorm = self.load_rmsnorm(
+                &format!("model.layers.{}.post_attention_layernorm.weight", i),
+                device,
+                cfg.rms_norm_eps,
+            )?;
+            let qkv_proj = self.load_fused_qkv(i, q_dim, kv_dim, cfg.dim, device)?;
+            let o_proj = self.load_linear(
+                &format!("model.layers.{}.self_attn.o_proj.weight", i),
+                None,
+                device,
+            )?;
+            let gate_up_proj = self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?;
+            let down_proj = self.load_linear(
+                &format!("model.layers.{}.mlp.down_proj.weight", i),
+                None,
+                device,
+            )?;
+
             let q_norm_name = format!("model.layers.{}.self_attn.q_norm.weight", i);
             let k_norm_name = format!("model.layers.{}.self_attn.k_norm.weight", i);
             let q_norm = if self.reader.contains(&q_norm_name) {
-                Some(self.load_rmsnorm(&q_norm_name, device, cfg.rms_norm_eps)?)
+                Some(comp_rms(self.load_rmsnorm(&q_norm_name, device, cfg.rms_norm_eps)?))
             } else {
                 None
             };
             let k_norm = if self.reader.contains(&k_norm_name) {
-                Some(self.load_rmsnorm(&k_norm_name, device, cfg.rms_norm_eps)?)
+                Some(comp_rms(self.load_rmsnorm(&k_norm_name, device, cfg.rms_norm_eps)?))
             } else {
                 None
             };
-
-            layers.push(Qwen3Layer {
-                input_layernorm: self.load_rmsnorm(
-                    &format!("model.layers.{}.input_layernorm.weight", i),
-                    device,
-                    cfg.rms_norm_eps,
-                )?,
-                post_attention_layernorm: self.load_rmsnorm(
-                    &format!("model.layers.{}.post_attention_layernorm.weight", i),
-                    device,
-                    cfg.rms_norm_eps,
-                )?,
-                qkv_proj: self.load_fused_qkv(
+            if q_norm.is_some() != k_norm.is_some() {
+                return Err(OpError::Shape(format!(
+                    "load: layer {} has q_norm={} but k_norm={}; require both or neither",
                     i,
-                    cfg.head_num * cfg.head_dim,
-                    cfg.kv_head_num * cfg.head_dim,
-                    cfg.dim,
-                    device,
-                )?,
-                o_proj: self.load_linear(
-                    &format!("model.layers.{}.self_attn.o_proj.weight", i),
-                    None,
-                    device,
-                )?,
-                gate_up_proj: self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?,
-                down_proj: self.load_linear(
-                    &format!("model.layers.{}.mlp.down_proj.weight", i),
-                    None,
-                    device,
-                )?,
-                q_norm,
-                k_norm,
+                    q_norm.is_some(),
+                    k_norm.is_some()
+                )));
+            }
+
+            blocks.push(DecoderBlock {
+                attention: Attention {
+                    input_layernorm: comp_rms(input_layernorm),
+                    qkv_proj: comp_linear(qkv_proj),
+                    o_proj: comp_linear(o_proj),
+                    q_norm,
+                    k_norm,
+                    sin: sin_cache.clone(),
+                    cos: cos_cache.clone(),
+                    head_num: cfg.head_num,
+                    kv_head_num: cfg.kv_head_num,
+                    head_dim: cfg.head_dim,
+                    scale,
+                },
+                ffn: DenseFfn {
+                    post_attention_layernorm: comp_rms(post_attention_layernorm),
+                    gate_up_proj: comp_linear(gate_up_proj),
+                    down_proj: comp_linear(down_proj),
+                },
             });
         }
 
-        let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
-            cfg.seq_len,
-            cfg.head_dim,
-            cfg.rope_theta,
-            cfg.rope_scaling.as_ref(),
-            device,
-        )?;
-
-        Ok(Qwen3Model {
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            sin_cache,
-            cos_cache,
-            head_num: cfg.head_num,
-            kv_head_num: cfg.kv_head_num,
-            head_dim: cfg.head_dim,
-            dim: cfg.dim,
-            kv_dim: cfg.kv_head_num * cfg.head_dim,
-            intermediate_size: cfg.intermediate_size,
-            vocab_size: cfg.vocab_size,
+        Ok(Decoder {
+            embed: Embed { table: embed_table },
+            blocks,
+            norm: comp_rms(final_norm),
+            lm_head: LmHead {
+                proj: comp_linear(lm_head),
+            },
+            dims: ModelDims {
+                dim: cfg.dim,
+                q_dim,
+                kv_dim,
+                qkv_dim: q_dim + 2 * kv_dim,
+                intermediate_size: cfg.intermediate_size,
+                vocab_size: cfg.vocab_size,
+                head_num: cfg.head_num,
+                head_dim: cfg.head_dim,
+                kv_head_num: cfg.kv_head_num,
+                num_layers: cfg.layer_num,
+                num_experts: 0,
+                experts_per_tok: 0,
+                moe_intermediate_size: 0,
+                num_shared_experts: 0,
+            },
         })
+    }
+
+    /// Load a complete Llama3 model (no per-block Q/K norms).
+    pub fn load_llama3<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        cfg: &LoadConfig,
+        device: &D,
+    ) -> OpResult<Llama3Model<T, D>> {
+        self.build_decoder(cfg, device)
+    }
+
+    /// Load a complete Qwen3 model. Per-block Q/K RMSNorms are populated when
+    /// present in the weights.
+    pub fn load_qwen3<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        cfg: &LoadConfig,
+        device: &D,
+    ) -> OpResult<Qwen3Model<T, D>> {
+        self.build_decoder(cfg, device)
+    }
+}
+
+fn comp_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(l: Linear<T, D>) -> CompLinear<T, D> {
+    CompLinear {
+        weight: l.weight,
+        bias: l.bias,
+    }
+}
+
+fn comp_rms<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(r: RMSNorm<T, D>) -> CompRmsNorm<T, D> {
+    CompRmsNorm {
+        weight: r.weight,
+        eps: r.eps,
     }
 }
 

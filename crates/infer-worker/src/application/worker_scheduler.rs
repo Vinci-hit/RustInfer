@@ -4,12 +4,12 @@ use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, PrefillSegmentCo
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
 use crate::application::decode_common::send_step_error;
-use crate::application::forward_workspace::ForwardWorkspace;
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
-use crate::application::model_runner::{ModelRunner, SeqStep};
+use crate::application::runtime::Runtime;
 use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
-use crate::domain::model::LlmModel;
+use crate::domain::model::DecoderModel;
+use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
 use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
@@ -19,9 +19,9 @@ use crate::infrastructure::transport::data_pump::DataPump;
 /// around, replacing 10 separate parameters with a single reference.
 pub struct PrefillCtx<'a, M>
 where
-    M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
+    M: DecoderModel<bf16, Cuda>,
 {
-    pub runner: &'a mut ModelRunner<bf16, Cuda, M>,
+    pub runner: &'a mut Runtime<bf16, Cuda, M>,
     pub active: &'a mut ActiveSeqMap,
     pub prefilling: &'a mut PrefillSeqMap,
     pub kv_allocator: &'a mut GlobalKvAllocator,
@@ -78,12 +78,9 @@ fn concat_block_table(base: &[u32], appended: &[u32]) -> Vec<u32> {
 /// `seg.prefix_hint` is prepended verbatim; those slots already hold valid
 /// KV from a previous request and are pinned by scheduler-side RadixTree
 /// policy while this step runs.
-pub fn handle_prefill<M>(
-    ctx: &mut PrefillCtx<'_, M>,
-    cmd: &PrefillBatchCmd,
-) -> OpResult<()>
+pub fn handle_prefill<M>(ctx: &mut PrefillCtx<'_, M>, cmd: &PrefillBatchCmd) -> OpResult<()>
 where
-    M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
+    M: DecoderModel<bf16, Cuda>,
 {
     let mut plans: Vec<SegmentPlan> = Vec::with_capacity(cmd.segments.len());
     let mut total_new: u32 = 0;
@@ -96,7 +93,8 @@ where
         } else {
             seg_len
         };
-        let base_table = ctx.prefilling
+        let base_table = ctx
+            .prefilling
             .get(&seg.sequence_id)
             .map(|state| state.block_table.clone())
             .unwrap_or_else(|| prefix.clone());
@@ -195,6 +193,8 @@ where
     };
 
     let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
+    let mut step_max_tokens: Vec<u32> = Vec::with_capacity(cmd.segments.len());
+    let mut step_ignore_eos: Vec<bool> = Vec::with_capacity(cmd.segments.len());
     let mut idx_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
         if plans[i].skipped {
@@ -230,12 +230,15 @@ where
         // into `token_ids`/`full_block_table` rather than cloned here.
         plans[i].step_idx = Some(steps.len());
         steps.push(SeqStep {
+            sequence_id: seg.sequence_id,
             input_ids,
             positions,
             kv_write_start,
             kv_len_after,
             block_table,
         });
+        step_max_tokens.push(seg.max_tokens as u32);
+        step_ignore_eos.push(seg.ignore_eos);
         plans[i].indices = new_indices;
     }
     debug_assert_eq!(idx_cursor, total_new as usize);
@@ -247,26 +250,47 @@ where
         return Ok(());
     }
 
-    let first_tokens = match ctx.runner.step_batch(&steps) {
-        Ok(tokens) => tokens,
+    // One ragged forward over every non-skipped segment. Greedy sampling
+    // (empty `sampling` → GreedySampler) keeps the first-token result
+    // byte-identical to the old argmax path. The pool commits each seq's KV
+    // length from `kv_len_after` internally.
+    let req = StepRequest {
+        sampling: Vec::new(),
+        stop: StopCriteria {
+            eos_ids: ctx.eos_ids.to_vec(),
+            generated_counts: vec![0u32; steps.len()],
+            max_tokens: step_max_tokens,
+            ignore_eos: step_ignore_eos,
+        },
+        draft_tokens: Vec::new(),
+        seqs: steps,
+    };
+    let out = match ctx.runner.step(&req) {
+        Ok(out) => out,
         Err(e) => {
             if !base_indices.is_empty() {
                 ctx.kv_allocator.free(&base_indices);
             }
             for seg in &cmd.segments {
                 if let Some(removed) = ctx.prefilling.remove(&seg.sequence_id) {
-                    ctx.kv_allocator.release_owned(&removed.block_table, ctx.enable_prefix_caching);
+                    ctx.kv_allocator
+                        .release_owned(&removed.block_table, ctx.enable_prefix_caching);
                 }
             }
             let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
-            send_step_error(ctx.control, failed_ids, format!("prefill step failed: {:?}", e));
+            send_step_error(
+                ctx.control,
+                failed_ids,
+                format!("prefill step failed: {:?}", e),
+            );
             return Ok(());
         }
     };
-    // #6 zero-copy: the forward is done and only borrowed `steps`, so move the
-    // input tokens and block tables back into their plans instead of having
-    // cloned them during step building. `assigned_runs` and the commit loop
-    // below consume `token_ids`/`full_block_table` from here.
+    // #6 zero-copy: the forward only borrowed the request, so move the input
+    // tokens and block tables back out of the owned `seqs` into their plans
+    // (reclaimed by `assigned_runs` and the commit loop below) rather than
+    // having cloned them during step building.
+    let StepRequest { seqs: mut steps, .. } = req;
     for plan in plans.iter_mut() {
         if let Some(k) = plan.step_idx {
             plan.token_ids = std::mem::take(&mut steps[k].input_ids);
@@ -286,7 +310,9 @@ where
         if plans[i].skipped {
             continue;
         }
-        let token = first_tokens[token_cursor];
+        let row = out.tokens.get(token_cursor);
+        let token = row.and_then(|r| r.first()).map(|t| t.token_id).unwrap_or(0);
+        let finished = out.finished.get(token_cursor).copied().unwrap_or(false);
         token_cursor += 1;
         // P0: Reuse the full block table built during step construction
         // instead of rebuilding it with a second concat_block_table call.
@@ -305,7 +331,6 @@ where
             PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
                 ctx.prefilling.remove(&seg.sequence_id);
                 output.prefill_done.push(seg.sequence_id);
-                let finished = (!seg.ignore_eos && ctx.eos_ids.contains(&token)) || seg.max_tokens <= 1;
                 output.tokens.push(GeneratedToken {
                     sequence_id: seg.sequence_id,
                     token_id: token,
@@ -314,20 +339,17 @@ where
                 if !finished {
                     ctx.active.insert(
                         seg.sequence_id,
-                        ActiveSeq::new(
-                            token,
-                            full_block_table,
-                            seg.max_tokens,
-                            seg.ignore_eos,
-                        ),
+                        ActiveSeq::new(token, full_block_table, seg.max_tokens, seg.ignore_eos),
                     );
                 } else {
-                    ctx.kv_allocator.release_owned(&full_block_table, ctx.enable_prefix_caching);
+                    ctx.kv_allocator
+                        .release_owned(&full_block_table, ctx.enable_prefix_caching);
                 }
             }
         }
     }
-    ctx.data.send_step_output(&output)
+    ctx.data
+        .send_step_output(&output)
         .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
     Ok(())
 }

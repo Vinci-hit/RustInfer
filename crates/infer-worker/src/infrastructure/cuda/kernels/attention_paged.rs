@@ -7,12 +7,13 @@
 //! pool per layer; per-seq routing comes from the device `block_tables`
 //! tensor (`[batch, max_blocks_per_seq]` u32).
 
-use crate::domain::batch::{BatchKind, BatchPlan};
+use crate::domain::kv::KvIndexTensors;
+use crate::domain::plan;
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype};
-use crate::infrastructure::cuda::ffi::{cudaStream_t, cudnnHandle_t};
 use crate::infrastructure::cuda::Cuda;
+use crate::infrastructure::cuda::ffi::{cudaStream_t, cudnnHandle_t};
 use std::ffi::c_void;
 
 unsafe extern "C" {
@@ -171,6 +172,51 @@ unsafe extern "C" {
 const DISABLE_CUDNN_ATTENTION_ENV: &str = "RUSTINFER_DISABLE_CUDNN_ATTENTION";
 const STRICT_CUDNN_ATTENTION_ENV: &str = "RUSTINFER_STRICT_CUDNN_ATTENTION";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedAttentionKind {
+    DecodeOnly,
+    Ragged,
+}
+
+#[derive(Clone, Copy)]
+pub struct PagedAttentionPlan<'a> {
+    pub kind: PagedAttentionKind,
+    pub num_tokens: usize,
+    pub batch: usize,
+    pub block_tables: &'a Tensor<i32, Cuda>,
+    pub cu_q_lens: &'a Tensor<i32, Cuda>,
+    pub kv_lens: &'a Tensor<i32, Cuda>,
+    pub seq_lens_step: &'a Tensor<i32, Cuda>,
+    pub max_blocks_per_seq: usize,
+    pub block_size: usize,
+    pub block2req: &'a Tensor<i32, Cuda>,
+    pub block2tile: &'a Tensor<i32, Cuda>,
+    pub total_q_tiles: i32,
+}
+
+impl<'a> PagedAttentionPlan<'a> {
+    pub fn from_v2(plan: &'a plan::BatchPlan, index: &'a KvIndexTensors<Cuda>) -> Self {
+        let kind = match plan.kind {
+            plan::BatchKind::DecodeOnly => PagedAttentionKind::DecodeOnly,
+            plan::BatchKind::Ragged | plan::BatchKind::Spec { .. } => PagedAttentionKind::Ragged,
+        };
+        Self {
+            kind,
+            num_tokens: plan.num_tokens,
+            batch: plan.batch,
+            block_tables: &index.block_tables,
+            cu_q_lens: &index.cu_q_lens,
+            kv_lens: &index.kv_lens,
+            seq_lens_step: &index.seq_lens_step,
+            max_blocks_per_seq: plan.max_blocks_per_seq,
+            block_size: plan.block_size,
+            block2req: &index.block2req,
+            block2tile: &index.block2tile,
+            total_q_tiles: plan.total_q_tiles,
+        }
+    }
+}
+
 /// f32 element count needed by the paged-decode flash attention kernel for
 /// a worst-case `(batch, num_q_heads, head_dim)`. Callers (`ForwardWorkspace`)
 /// use this to size the long-lived attention scratch.
@@ -192,7 +238,7 @@ unsafe fn try_cudnn_paged_decode<T: Dtype>(
     k_pool: &Tensor<T, Cuda>,
     v_pool: &Tensor<T, Cuda>,
     output: &mut Tensor<T, Cuda>,
-    plan: &BatchPlan<Cuda>,
+    plan: PagedAttentionPlan<'_>,
     q_stride_seq: i64,
     q_stride_head: i64,
     o_stride_seq: i64,
@@ -275,11 +321,12 @@ unsafe fn try_cudnn_paged_decode<T: Dtype>(
 }
 
 pub fn attention_paged<T: Dtype>(
+    stream: cudaStream_t,
     q: &Tensor<T, Cuda>,
     k_pool: &Tensor<T, Cuda>,
     v_pool: &Tensor<T, Cuda>,
     output: &mut Tensor<T, Cuda>,
-    plan: &BatchPlan<Cuda>,
+    plan: PagedAttentionPlan<'_>,
     workspace: &mut Tensor<f32, Cuda>,
     head_num: usize,
     kv_head_num: usize,
@@ -287,7 +334,6 @@ pub fn attention_paged<T: Dtype>(
     scale: f32,
 ) -> OpResult<()> {
     let device = q.device();
-    let stream = device.config.stream;
     let batch = plan.batch as i32;
 
     // Q / O layout: [num_tokens, num_q_heads * head_dim]; q may be a
@@ -305,7 +351,7 @@ pub fn attention_paged<T: Dtype>(
     // the base pointers.
 
     match plan.kind {
-        BatchKind::DecodeOnly => {
+        PagedAttentionKind::DecodeOnly => {
             if let Some(cudnn_status) = unsafe {
                 try_cudnn_paged_decode(
                     device,
@@ -411,7 +457,7 @@ pub fn attention_paged<T: Dtype>(
                 }
             }
         }
-        BatchKind::Ragged => unsafe {
+        PagedAttentionKind::Ragged => unsafe {
             match T::DATA_TYPE {
                 DataType::BF16 => launch_flash_attn_paged_ragged_cute_bf16(
                     q.data_ptr() as _,

@@ -11,14 +11,14 @@ use infer_protocol::worker_to_scheduler_control::{
 use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
 
 use crate::application::decode_engine::DecodeEngine;
-use crate::application::forward_workspace::ForwardWorkspace;
-use crate::application::model_runner::ModelRunner;
-use crate::application::worker_scheduler::{handle_prefill, PrefillCtx};
+use crate::application::runtime::Runtime;
+use crate::application::sampler_stack::GreedySampler;
+use crate::application::worker_scheduler::{PrefillCtx, handle_prefill};
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
-use crate::domain::model::LlmModel;
+use crate::domain::model::DecoderModel;
 use crate::domain::ports::OpError;
-use crate::infrastructure::cuda::{device_utils, kernels::attention_paged, Cuda};
+use crate::infrastructure::cuda::{Cuda, CudaScope, device_utils};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
 use crate::models::loader::LoadConfig;
@@ -68,7 +68,7 @@ pub fn run_with_model<M>(
     profile_cuda_steps: Option<u32>,
 ) -> Result<(), String>
 where
-    M: LlmModel<bf16, Cuda, ForwardWorkspace<bf16, Cuda>>,
+    M: DecoderModel<bf16, Cuda>,
 {
     let _ = bs.load_cfg;
     if bs.block_size != 1 {
@@ -78,6 +78,7 @@ where
         ));
     }
     let max_blocks_per_seq = bs.max_seq_len.div_ceil(bs.block_size);
+    let model_dims = model.dims();
 
     let num_blocks = if bs.num_blocks_override != 0 {
         tracing::info!(
@@ -86,8 +87,11 @@ where
         );
         bs.num_blocks_override
     } else {
-        let bytes_per_block =
-            model.num_layers() * 2 * bs.block_size * model.kv_dim() * std::mem::size_of::<bf16>();
+        let bytes_per_block = model_dims.num_layers
+            * 2
+            * bs.block_size
+            * model_dims.kv_dim
+            * std::mem::size_of::<bf16>();
         let fraction = bs.load.kv_cache_memory_fraction.unwrap_or(0.9).clamp(
             crate::application::tuning::KV_MEM_FRACTION_MIN,
             crate::application::tuning::KV_MEM_FRACTION_MAX,
@@ -98,7 +102,7 @@ where
         let raw = budget / bytes_per_block.max(1);
         // Safety reserve (M8): the `free` probe is taken before the forward
         // activation workspace and the decode CUDA-graph capture pool are
-        // allocated (both happen in `ModelRunner::new` / `prime_graphs_cuda`
+        // allocated (both happen in `Runtime::new` / `prime_graphs`
         // *after* this point). `fraction` (default 0.9) is the primary
         // headroom for them; on top we keep an explicit reserve so rounding +
         // allocator fragmentation never pushes runtime peak past the probe:
@@ -131,31 +135,26 @@ where
 
     let cap_num_tokens = bs.load.max_batch_tokens;
     let cap_batch = bs.load.max_batch_seqs;
-    let flash_decode_capacity_f32 =
-        attention_paged::flash_decode_workspace_capacity_f32(cap_batch.max(1), 128, 256);
-    let mut runner: ModelRunner<bf16, Cuda, M> = ModelRunner::new(
+    let mut runner: Runtime<bf16, Cuda, M> = Runtime::new(
         model,
-        bs.cuda.clone(),
+        CudaScope::new(bs.cuda.clone()),
+        Box::new(GreedySampler),
         pool_blocks,
         bs.block_size,
         max_blocks_per_seq,
         bs.max_seq_len,
         cap_num_tokens,
         cap_batch,
-        flash_decode_capacity_f32,
         bs.capture_sizes.clone(),
     )
-    .map_err(|e| format!("ModelRunner::new: {:?}", e))?;
+    .map_err(|e| format!("Runtime::new: {:?}", e))?;
 
-    if let Err(e) = runner.prime_graphs_cuda() {
+    // Graph replay is a reserved seam in v2 (decode runs eager today); this is a
+    // no-op until a scope installs real capture/replay.
+    if let Err(e) = runner.prime_graphs() {
         tracing::info!(
-            "[bootstrap] CUDA Graph priming FAILED, continuing in eager mode: {:?}",
+            "[bootstrap] graph priming skipped, eager decode: {:?}",
             e
-        );
-    } else if let Some(ref graph_runner) = runner.graph_runner {
-        tracing::info!(
-            "[bootstrap] CUDA Graphs primed for decode-only batches in {:?}",
-            graph_runner.capture_sizes(),
         );
     }
 

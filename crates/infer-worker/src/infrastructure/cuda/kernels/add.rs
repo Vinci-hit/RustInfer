@@ -44,12 +44,12 @@ unsafe extern "C" {
 }
 
 pub fn add<T: Dtype>(
+    stream: cudaStream_t,
     a: &Tensor<T, Cuda>,
     b: &Tensor<T, Cuda>,
     dst: &mut Tensor<T, Cuda>,
 ) -> OpResult<()> {
     let n = a.numel() as i32;
-    let stream = a.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => add_kernel_float2_forward(
@@ -79,9 +79,12 @@ pub fn add<T: Dtype>(
     Ok(())
 }
 
-pub fn add_inplace<T: Dtype>(dst: &mut Tensor<T, Cuda>, src: &Tensor<T, Cuda>) -> OpResult<()> {
+pub fn add_inplace<T: Dtype>(
+    stream: cudaStream_t,
+    dst: &mut Tensor<T, Cuda>,
+    src: &Tensor<T, Cuda>,
+) -> OpResult<()> {
     let n = dst.numel() as i32;
-    let stream = dst.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => add_inplace_kernel_float2_forward(

@@ -342,7 +342,7 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     cudaStream_t stream)
 {
     // Direct cuBLASLt call. No heuristic cache, no benchmarking, no private stream,
-    // no graph compatibility probe. Let cuBLASLt choose its default algorithm.
+    // no graph-specific algorithm branch. Let cuBLASLt choose its default algorithm.
     // NOTE: passing nullptr for algo lets cuBLASLt's internal runtime pick the
     // optimal kernel for the given (M,N,K) — empirically faster than any
     // heuristic-selected or benchmarked algo for the M=1 decode case.
@@ -1128,4 +1128,3 @@ extern "C" void gemm_cublas_f32_axbt(
 //    Y = A (col [K,M]) → op_N → [K,M], ldb=K
 //    ldc = N
 // ============================================================================
-

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
-//! │ application/      应用层 (ModelRunner, GraphRunner,       │
+//! │ application/      应用层 (Runtime, DecodeEngine,          │
 //! │                   ServeLoop)                             │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ models/           具体模型 (Qwen3, Llama3, Diffusion)    │
@@ -21,6 +21,7 @@
 //! domain 不 `use` infrastructure 的任何东西（通过 trait 反转依赖）。
 
 pub mod application;
+pub mod components;
 pub mod domain;
 pub mod env_flags;
 pub mod infrastructure;

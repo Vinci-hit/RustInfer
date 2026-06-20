@@ -2,9 +2,10 @@
 //!
 //! These structs hold weights and dispatch through the op-capability traits.
 //! Each struct is generic over the *minimal* trait it needs: `CoreOps` for
-//! primitives, `LlmOps` for decoder ops, `DiffusionOps` for conv/VAE/DiT.
+//! decoder primitives (matmul / rmsnorm / rope / swiglu), `DiffusionOps` for
+//! conv/VAE/DiT.
 
-use crate::domain::ports::{CoreOps, DiffusionOps, LlmOps, OpResult};
+use crate::domain::ports::{CoreOps, DiffusionOps, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Dtype;
 
@@ -55,12 +56,12 @@ impl<A: Dtype, W: Dtype, D: CoreOps> QuantLinear<A, W, D> {
 }
 
 /// RMSNorm layer
-pub struct RMSNorm<T: Dtype, D: LlmOps> {
+pub struct RMSNorm<T: Dtype, D: CoreOps> {
     pub weight: Tensor<T, D>,
     pub eps: f32,
 }
 
-impl<T: Dtype, D: LlmOps> RMSNorm<T, D> {
+impl<T: Dtype, D: CoreOps> RMSNorm<T, D> {
     pub fn new(weight: Tensor<T, D>, eps: f32) -> Self {
         Self { weight, eps }
     }

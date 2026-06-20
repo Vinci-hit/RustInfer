@@ -604,7 +604,7 @@ mod opbackend_dispatch_tests {
     //! Catches issues where the trait wiring forgets a method.
 
     use super::*;
-    use crate::domain::ports::{CoreOps, DiffusionOps, LlmOps};
+    use crate::domain::ports::{CoreOps, DiffusionOps};
     use crate::infrastructure::cuda::Cuda;
     use half::bf16;
 

@@ -130,6 +130,7 @@ fn permute_3d<T: Dtype>(
 /// `[seq, n_kv_heads, head_dim]` (K, V). GQA: `n_heads % n_kv_heads == 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa<T: Dtype>(
+    stream: cudaStream_t,
     q: &Tensor<T, Cuda>,
     k: &Tensor<T, Cuda>,
     v: &Tensor<T, Cuda>,
@@ -182,7 +183,6 @@ pub fn sdpa<T: Dtype>(
         )));
     }
 
-    let stream = q.device().config.stream;
     let dev = q.device().clone();
 
     // ── 1. Permute Q [S, H, D] → [H, S, D] ──
@@ -294,9 +294,9 @@ pub fn sdpa<T: Dtype>(
     }
 
     // ── 5. Scale + softmax (over last axis).
-    super::scalar::scalar_mul_inplace(&mut scores, scale as f64)?;
+    super::scalar::scalar_mul_inplace(stream, &mut scores, scale as f64)?;
     let mut attn: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
-    super::softmax::softmax(&scores, &mut attn)?;
+    super::softmax::softmax(stream, &scores, &mut attn)?;
 
     // ── 6. out_hsd = attn[H,S,S] @ V[H,S,D].
     //   We want axb(attn, V) → [H, S, D], but axb has subtle row/col-major
@@ -368,6 +368,7 @@ pub fn sdpa<T: Dtype>(
 /// positions and a large negative number such as `-3.39e38` for masked).
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_masked<T: Dtype>(
+    stream: cudaStream_t,
     q: &Tensor<T, Cuda>,
     k: &Tensor<T, Cuda>,
     v: &Tensor<T, Cuda>,
@@ -428,7 +429,6 @@ pub fn sdpa_masked<T: Dtype>(
         )));
     }
 
-    let stream = q.device().config.stream;
     let dev = q.device().clone();
 
     // ── 1. Permute Q [S, H, D] → [H, S, D] ──
@@ -543,12 +543,12 @@ pub fn sdpa_masked<T: Dtype>(
     }
 
     // Scale, then add mask (broadcast across heads), then softmax.
-    super::scalar::scalar_mul_inplace(&mut scores, scale as f64)?;
+    super::scalar::scalar_mul_inplace(stream, &mut scores, scale as f64)?;
     // scores is [H, S, S] viewed as [H, S*S] with bias [S*S]. Use the
     // existing broadcast_add_inplace which adds bias[j] to x[i, j].
-    super::broadcast_mul::broadcast_add_inplace(&mut scores, mask)?;
+    super::broadcast_mul::broadcast_add_inplace(stream, &mut scores, mask)?;
     let mut attn: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
-    super::softmax::softmax(&scores, &mut attn)?;
+    super::softmax::softmax(stream, &scores, &mut attn)?;
 
     // out = attn @ V (via V permute to [H, D, S] + axbt)
     let v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;
@@ -675,7 +675,7 @@ mod tests {
         let k: Tensor<f32, Cuda> = Tensor::from_host_slice(&k_host, [seq, h, d], &cuda).unwrap();
         let v: Tensor<f32, Cuda> = Tensor::from_host_slice(&v_host, [seq, h, d], &cuda).unwrap();
         let mut out: Tensor<f32, Cuda> = Tensor::zeros([seq, h, d], &cuda).unwrap();
-        sdpa(&q, &k, &v, &mut out, h, h, d, scale).unwrap();
+        sdpa(cuda.config.stream, &q, &k, &v, &mut out, h, h, d, scale).unwrap();
         let got = out.to_host_vec().unwrap();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
             assert!(
@@ -719,7 +719,18 @@ mod tests {
         let k: Tensor<f32, Cuda> = Tensor::from_host_slice(&k_host, [seq, n_kv, d], &cuda).unwrap();
         let v: Tensor<f32, Cuda> = Tensor::from_host_slice(&v_host, [seq, n_kv, d], &cuda).unwrap();
         let mut out: Tensor<f32, Cuda> = Tensor::zeros([seq, n_h, d], &cuda).unwrap();
-        sdpa(&q, &k, &v, &mut out, n_h, n_kv, d, scale).unwrap();
+        sdpa(
+            cuda.config.stream,
+            &q,
+            &k,
+            &v,
+            &mut out,
+            n_h,
+            n_kv,
+            d,
+            scale,
+        )
+        .unwrap();
         let got = out.to_host_vec().unwrap();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
             assert!(
@@ -739,7 +750,7 @@ mod tests {
         let scale = 1.0 / (d as f32).sqrt();
         let q_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.021).sin()).collect();
         let k_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.013).cos()).collect();
-        let v_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.05 - 0.3)).collect();
+        let v_f32: Vec<f32> = (0..seq * h * d).map(|i| i as f32 * 0.05 - 0.3).collect();
         let q_bf16: Vec<bf16> = q_f32.iter().map(|&x| bf16::from_f32(x)).collect();
         let k_bf16: Vec<bf16> = k_f32.iter().map(|&x| bf16::from_f32(x)).collect();
         let v_bf16: Vec<bf16> = v_f32.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -754,7 +765,7 @@ mod tests {
         let k: Tensor<bf16, Cuda> = Tensor::from_host_slice(&k_bf16, [seq, h, d], &cuda).unwrap();
         let v: Tensor<bf16, Cuda> = Tensor::from_host_slice(&v_bf16, [seq, h, d], &cuda).unwrap();
         let mut out: Tensor<bf16, Cuda> = Tensor::zeros([seq, h, d], &cuda).unwrap();
-        sdpa(&q, &k, &v, &mut out, h, h, d, scale).unwrap();
+        sdpa(cuda.config.stream, &q, &k, &v, &mut out, h, h, d, scale).unwrap();
         let got: Vec<f32> = out
             .to_host_vec()
             .unwrap()
@@ -835,7 +846,7 @@ mod tests {
         let v: Tensor<f32, Cuda> = Tensor::from_host_slice(&v_host, [seq, h, d], &cuda).unwrap();
         let m: Tensor<f32, Cuda> = Tensor::from_host_slice(&mask_host, [seq, seq], &cuda).unwrap();
         let mut out: Tensor<f32, Cuda> = Tensor::zeros([seq, h, d], &cuda).unwrap();
-        sdpa_masked(&q, &k, &v, &mut out, &m, h, h, d, scale).unwrap();
+        sdpa_masked(cuda.config.stream, &q, &k, &v, &mut out, &m, h, h, d, scale).unwrap();
         let got = out.to_host_vec().unwrap();
         for (i, (a, b)) in ref_out.iter().zip(got.iter()).enumerate() {
             assert!(
@@ -856,7 +867,7 @@ mod tests {
         let scale = 1.0 / (d as f32).sqrt();
         let q_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.011).sin()).collect();
         let k_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.019).cos()).collect();
-        let v_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.05 - 0.3)).collect();
+        let v_f32: Vec<f32> = (0..seq * h * d).map(|i| i as f32 * 0.05 - 0.3).collect();
         let neg = -3.3895313892515355e+38_f32;
 
         // mask: causal AND attention_mask[j]==1 for j in 0..5
@@ -922,7 +933,7 @@ mod tests {
         let m: Tensor<half::bf16, Cuda> =
             Tensor::from_host_slice(&mask_bf, [seq, seq], &cuda).unwrap();
         let mut out: Tensor<half::bf16, Cuda> = Tensor::zeros([seq, h, d], &cuda).unwrap();
-        sdpa_masked(&q, &k, &v, &mut out, &m, h, h, d, scale).unwrap();
+        sdpa_masked(cuda.config.stream, &q, &k, &v, &mut out, &m, h, h, d, scale).unwrap();
         let got: Vec<f32> = out
             .to_host_vec()
             .unwrap()
@@ -956,7 +967,7 @@ mod tests {
             .collect();
         let a: Tensor<bf16, Cuda> = Tensor::from_host_slice(&a_host, [batch, m, k], &cuda).unwrap();
         let b: Tensor<bf16, Cuda> = Tensor::from_host_slice(&b_host, [batch, n, k], &cuda).unwrap();
-        let mut c: Tensor<bf16, Cuda> = Tensor::zeros([batch, m, n], &cuda).unwrap();
+        let c: Tensor<bf16, Cuda> = Tensor::zeros([batch, m, n], &cuda).unwrap();
         let stride_a = (m * k) as i64;
         let stride_b = (n * k) as i64;
         let stride_c = (m * n) as i64;

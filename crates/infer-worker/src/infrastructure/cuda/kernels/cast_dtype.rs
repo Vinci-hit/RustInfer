@@ -19,6 +19,7 @@ unsafe extern "C" {
 /// Identity copy when `S == D` is delegated to `Tensor::copy_from`. Currently
 /// supports the F32 ↔ BF16 and F32 ↔ F16 pairs (the only ones Z-Image needs).
 pub fn cast_dtype<S: Dtype, D: Dtype>(
+    stream: cudaStream_t,
     src: &Tensor<S, Cuda>,
     dst: &mut Tensor<D, Cuda>,
 ) -> OpResult<()> {
@@ -33,7 +34,6 @@ pub fn cast_dtype<S: Dtype, D: Dtype>(
         return Err(OpError::NotContiguous(*src.shape()));
     }
     let n = src.numel() as i32;
-    let stream = src.device().config.stream;
     unsafe {
         match (S::DATA_TYPE, D::DATA_TYPE) {
             (DataType::F32, DataType::BF16) => cast_f32_to_bf16_forward(
@@ -88,9 +88,12 @@ pub fn cast_dtype<S: Dtype, D: Dtype>(
 }
 
 /// Allocate a new `Tensor<D, Cuda>` and cast `src` into it.
-pub fn cast_dtype_new<S: Dtype, D: Dtype>(src: &Tensor<S, Cuda>) -> OpResult<Tensor<D, Cuda>> {
+pub fn cast_dtype_new<S: Dtype, D: Dtype>(
+    stream: cudaStream_t,
+    src: &Tensor<S, Cuda>,
+) -> OpResult<Tensor<D, Cuda>> {
     let mut dst: Tensor<D, Cuda> = Tensor::zeros(*src.shape(), src.device())?;
-    cast_dtype(src, &mut dst)?;
+    cast_dtype(stream, src, &mut dst)?;
     Ok(dst)
 }
 
@@ -108,7 +111,7 @@ mod tests {
         let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&src_host, [n], &cuda).unwrap();
 
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([n], &cuda).unwrap();
-        cast_dtype(&src, &mut dst).unwrap();
+        cast_dtype(cuda.config.stream, &src, &mut dst).unwrap();
         let got: Vec<f32> = dst
             .to_host_vec()
             .unwrap()
@@ -138,7 +141,7 @@ mod tests {
         let src_host: Vec<bf16> = (0..n).map(|i| bf16::from_f32(i as f32 * 0.5)).collect();
         let src: Tensor<bf16, Cuda> = Tensor::from_host_slice(&src_host, [n], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([n], &cuda).unwrap();
-        cast_dtype(&src, &mut dst).unwrap();
+        cast_dtype(cuda.config.stream, &src, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
         for (i, (a, b)) in src_host.iter().zip(got.iter()).enumerate() {
             assert_eq!(a.to_f32(), *b, "lossless bf16→f32 at {}", i);
@@ -150,7 +153,7 @@ mod tests {
         let cuda = Cuda::new(0).expect("cuda init");
         let src: Tensor<f32, Cuda> = Tensor::zeros([4, 4], &cuda).unwrap();
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([4, 5], &cuda).unwrap();
-        let err = cast_dtype(&src, &mut dst).unwrap_err();
+        let err = cast_dtype(cuda.config.stream, &src, &mut dst).unwrap_err();
         match err {
             OpError::Shape(_) => {}
             other => panic!("expected Shape error, got {:?}", other),
@@ -162,7 +165,7 @@ mod tests {
         let cuda = Cuda::new(0).expect("cuda init");
         let src_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&src_host, [4], &cuda).unwrap();
-        let dst: Tensor<bf16, Cuda> = cast_dtype_new(&src).unwrap();
+        let dst: Tensor<bf16, Cuda> = cast_dtype_new(cuda.config.stream, &src).unwrap();
         let got: Vec<f32> = dst
             .to_host_vec()
             .unwrap()

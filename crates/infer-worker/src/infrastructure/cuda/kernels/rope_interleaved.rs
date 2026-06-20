@@ -37,6 +37,7 @@ unsafe extern "C" {
 /// Apply interleaved RoPE in-place to `x` of shape `[seq, n_heads, head_dim]`.
 /// `cos` / `sin` are `[seq, head_dim/2]`, both F32.
 pub fn apply_rope_interleaved<T: Dtype>(
+    stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     cos: &Tensor<f32, Cuda>,
     sin: &Tensor<f32, Cuda>,
@@ -71,7 +72,6 @@ pub fn apply_rope_interleaved<T: Dtype>(
             cs, ss, seq, half,
         )));
     }
-    let stream = x.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => rope_interleaved_f32_forward(
@@ -141,7 +141,7 @@ mod tests {
         let half = head_dim / 2;
 
         // Random input + cos/sin caches.
-        let mut x_host: Vec<f32> = (0..seq * n_heads * head_dim)
+        let x_host: Vec<f32> = (0..seq * n_heads * head_dim)
             .map(|i| (i as f32 * 0.13).sin())
             .collect();
         let cos_host: Vec<f32> = (0..seq * half).map(|i| (i as f32 * 0.07).cos()).collect();
@@ -160,7 +160,8 @@ mod tests {
         let sin_dev: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&sin_host, Shape::from_slice(&[seq, half]), &cuda).unwrap();
 
-        apply_rope_interleaved(&mut x_dev, &cos_dev, &sin_dev, head_dim).unwrap();
+        apply_rope_interleaved(cuda.config.stream, &mut x_dev, &cos_dev, &sin_dev, head_dim)
+            .unwrap();
 
         let got = x_dev.to_host_vec().unwrap();
         let _ = x_host; // shadow drop
@@ -202,7 +203,8 @@ mod tests {
         let sin_dev: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&sin_host, Shape::from_slice(&[seq, half]), &cuda).unwrap();
 
-        apply_rope_interleaved(&mut x_dev, &cos_dev, &sin_dev, head_dim).unwrap();
+        apply_rope_interleaved(cuda.config.stream, &mut x_dev, &cos_dev, &sin_dev, head_dim)
+            .unwrap();
 
         let got: Vec<f32> = x_dev
             .to_host_vec()

@@ -1,8 +1,8 @@
 //! Argmax sampler CUDA kernel.
 
-use crate::domain::ports::{OpResult, OpError};
-use crate::domain::types::{DataType, Dtype};
 use crate::domain::tensor::Tensor;
+use crate::domain::ports::{OpError, OpResult};
+use crate::domain::types::{DataType, Dtype};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::cuda::ffi::cudaStream_t;
 
@@ -14,10 +14,14 @@ unsafe extern "C" {
 }
 
 
-pub fn argmax<T: Dtype>(logits: &Tensor<T, Cuda>, output: &mut Tensor<i32, Cuda>, workspace: &Tensor<f32, Cuda>) -> OpResult<()> {
+pub fn argmax<T: Dtype>(
+    stream: cudaStream_t,
+    logits: &Tensor<T, Cuda>,
+    output: &mut Tensor<i32, Cuda>,
+    workspace: &Tensor<f32, Cuda>,
+) -> OpResult<()> {
     let vocab_size = *logits.shape().as_slice().last().unwrap() as i32;
     let batch_size = *logits.shape().as_slice().first().unwrap() as i32;
-    let stream = logits.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => argmax_cu_f32_ffi(logits.data_ptr() as _, vocab_size, output.data_ptr_mut(), workspace.data_ptr_mut(), stream),

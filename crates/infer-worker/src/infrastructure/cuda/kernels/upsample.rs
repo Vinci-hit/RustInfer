@@ -28,6 +28,7 @@ unsafe extern "C" {
 }
 
 pub fn upsample_nearest_2x<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     output: &mut Tensor<T, Cuda>,
 ) -> OpResult<()> {
@@ -38,7 +39,6 @@ pub fn upsample_nearest_2x<T: Dtype>(
         shape[2] as i32,
         shape[3] as i32,
     );
-    let stream = input.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => upsample_nearest_2x_f32_forward(

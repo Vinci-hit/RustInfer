@@ -4,8 +4,6 @@
 
 use std::path::Path;
 
-use infer_worker::domain::tensor::Tensor;
-use infer_worker::domain::types::Dtype;
 use infer_worker::infrastructure::cuda::Cuda;
 use infer_worker::models::diffusion::pipeline::{GenerateParams, ZImagePipeline};
 const MODEL_DIR: &str = "/apdcephfs_qy2/share_303432435/vinciiliu/models/z-image-turbo";

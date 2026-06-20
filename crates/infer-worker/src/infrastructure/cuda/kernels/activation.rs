@@ -38,9 +38,8 @@ unsafe extern "C" {
     fn silu_inplace_f32_forward(x: *mut f32, n: i32, stream: cudaStream_t);
 }
 
-pub fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn silu_inplace<T: Dtype>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
     let n = x.numel() as i32;
-    let stream = x.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => silu_inplace_f32_forward(x.data_ptr_mut() as _, n, stream),
@@ -52,9 +51,12 @@ pub fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>) -> OpResult<()> {
     Ok(())
 }
 
-pub fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, gate: &Tensor<T, Cuda>) -> OpResult<()> {
+pub fn swiglu_inplace<T: Dtype>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+    gate: &Tensor<T, Cuda>,
+) -> OpResult<()> {
     let n = x.numel() as i32;
-    let stream = x.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => swiglu_inplace_kernel_cu_fp32x4(
@@ -80,12 +82,12 @@ pub fn swiglu_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, gate: &Tensor<T, Cuda>)
 ///
 /// Replaces 2 × `split_cols` + `swiglu_inplace` with a single fused kernel.
 pub fn swiglu_packed<T: Dtype>(
+    stream: cudaStream_t,
     gate_up: &Tensor<T, Cuda>,
     out: &mut Tensor<T, Cuda>,
     rows: usize,
     inter: usize,
 ) -> OpResult<()> {
-    let stream = gate_up.device().config.stream;
     if inter % 8 != 0 {
         return Err(OpError::Shape(format!(
             "swiglu_packed: inter ({}) must be a multiple of 8",
@@ -108,6 +110,7 @@ pub fn swiglu_packed<T: Dtype>(
                 let mut gate: Tensor<T, Cuda> = Tensor::zeros([rows, inter], &dev)?;
                 let mut up: Tensor<T, Cuda> = Tensor::zeros([rows, inter], &dev)?;
                 super::split_cols::split_cols(
+                    stream,
                     gate_up,
                     &mut gate,
                     rows as i32,
@@ -116,6 +119,7 @@ pub fn swiglu_packed<T: Dtype>(
                     inter as i32,
                 )?;
                 super::split_cols::split_cols(
+                    stream,
                     gate_up,
                     &mut up,
                     rows as i32,
@@ -123,9 +127,8 @@ pub fn swiglu_packed<T: Dtype>(
                     inter as i32,
                     inter as i32,
                 )?;
-                silu_inplace(&mut gate)?;
-                super::ewise_mul::ewise_mul(&gate, &up, out)?;
-                let _ = stream;
+                silu_inplace(stream, &mut gate)?;
+                super::ewise_mul::ewise_mul(stream, &gate, &up, out)?;
             }
             _ => {
                 return Err(OpError::Kernel(format!(

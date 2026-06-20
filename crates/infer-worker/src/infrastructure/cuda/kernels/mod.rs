@@ -12,7 +12,6 @@ pub mod rope;
 pub mod scalar;
 pub mod softmax;
 // pub mod sampler;
-pub mod argmax_batched;
 pub mod broadcast_mul;
 pub mod cast_dtype;
 pub mod concat_seq;

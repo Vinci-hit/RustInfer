@@ -42,6 +42,7 @@ unsafe extern "C" {
 
 /// Fused: residual += input; output = rmsnorm(residual, weight, eps)
 pub fn fused_add_rmsnorm<T: Dtype>(
+    stream: cudaStream_t,
     output: &mut Tensor<T, Cuda>,
     residual: &mut Tensor<T, Cuda>,
     input: &Tensor<T, Cuda>,
@@ -50,7 +51,6 @@ pub fn fused_add_rmsnorm<T: Dtype>(
 ) -> OpResult<()> {
     let dim = weight.numel();
     let rows = (input.numel() / dim) as i32;
-    let stream = input.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => fused_add_rmsnorm_kernel_cu_fp32(

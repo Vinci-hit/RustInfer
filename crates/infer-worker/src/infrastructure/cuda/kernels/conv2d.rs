@@ -7,11 +7,12 @@ use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype};
 use crate::infrastructure::cuda::Cuda;
-use crate::infrastructure::cuda::ffi;
+use crate::infrastructure::cuda::ffi::{self, cudaStream_t};
 
 /// Conv2D forward using cuDNN.
 /// input: [N, Cin, H, W], weight: [Cout, Cin, Kh, Kw], output: [N, Cout, Hout, Wout]
 pub fn conv2d<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     bias: Option<&Tensor<T, Cuda>>,
@@ -21,6 +22,7 @@ pub fn conv2d<T: Dtype>(
 ) -> OpResult<()> {
     let config = &input.device().config;
     let cudnn = config.cudnn_handle;
+    check_cudnn(unsafe { ffi::cudnnSetStream(cudnn, stream) })?;
 
     let i_shape = input.shape().as_slice();
     let w_shape = weight.shape().as_slice();

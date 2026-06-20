@@ -41,6 +41,27 @@ impl ActiveSeq {
             ignore_eos,
         }
     }
+
+    pub fn commit_accepted(
+        &mut self,
+        last_token: i32,
+        accepted_count: usize,
+        new_indices: &[u32],
+    ) -> Result<(), &'static str> {
+        let kv_len = self
+            .kv_len
+            .checked_add(accepted_count)
+            .ok_or("kv_len overflow")?;
+        let generated_count = self
+            .generated_count
+            .checked_add(accepted_count)
+            .ok_or("generated_count overflow")?;
+        self.last_token = last_token;
+        self.kv_len = kv_len;
+        self.generated_count = generated_count;
+        self.block_table.extend_from_slice(new_indices);
+        Ok(())
+    }
 }
 
 pub type ActiveSeqMap = HashMap<u64, ActiveSeq>;
@@ -111,5 +132,22 @@ impl DecodeRows {
     pub fn clear(&mut self) {
         self.rows.clear();
         self.present.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_seq_commit_accepted_updates_token_counts_and_blocks() {
+        let mut seq = ActiveSeq::new(10, vec![1, 2], 8, false);
+
+        seq.commit_accepted(11, 2, &[3, 4]).unwrap();
+
+        assert_eq!(seq.last_token, 11);
+        assert_eq!(seq.kv_len, 4);
+        assert_eq!(seq.generated_count, 3);
+        assert_eq!(seq.block_table, vec![1, 2, 3, 4]);
     }
 }

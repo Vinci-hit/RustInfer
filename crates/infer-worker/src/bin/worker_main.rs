@@ -4,7 +4,7 @@
 //! plane bootstrap (Hello → LoadModel → Ready), then runs an LLM serve loop:
 //!
 //!   * receive `PrefillBatchCmd` over the data plane PULL socket
-//!   * run prefill via `ModelRunner::step_batch` (paged KV)
+//!   * run prefill via `Runtime::step` (paged KV)
 //!   * keep an internal `active_decodes` table; each iteration runs all
 //!     active decodes in one batched step until they hit EOS / max_tokens
 //!   * push `StepOutput` over the data plane PUSH socket
@@ -130,6 +130,63 @@ fn parse_device_id(spec: &str) -> Result<i32, String> {
         .map_err(|e: std::num::ParseIntError| format!("invalid device id: {}", e))
 }
 
+macro_rules! dispatch_worker_model {
+    (
+        model_type = $model_type:expr,
+        loader = $loader:expr,
+        load_cfg = $load_cfg:expr,
+        cuda = $cuda:expr,
+        control = $control:expr,
+        data = $data:expr,
+        bootstrap = $bootstrap:expr,
+        eos_ids = $eos_ids:expr,
+        profile_cuda_steps = $profile_cuda_steps:expr,
+        load_start = $load_start:expr,
+        shipped { $( $arch:literal => $load_method:ident ),+ $(,)? },
+        default => $default_method:ident
+    ) => {{
+        match $model_type.as_str() {
+            $(
+                $arch => {
+                    let model = $loader
+                        .$load_method::<bf16, Cuda>($load_cfg, $cuda)
+                        .map_err(|e| format!("{}: {:?}", stringify!($load_method), e))?;
+                    eprintln!(
+                        "[bootstrap] weights loaded in {:.2}s",
+                        $load_start.elapsed().as_secs_f32()
+                    );
+                    run_with_model(
+                        $control,
+                        $data,
+                        model,
+                        $bootstrap,
+                        $eos_ids,
+                        $profile_cuda_steps,
+                    )?;
+                }
+            )+
+            _ => {
+                let model = $loader
+                    .$default_method::<bf16, Cuda>($load_cfg, $cuda)
+                    .map_err(|e| format!("{}: {:?}", stringify!($default_method), e))?;
+                eprintln!(
+                    "[bootstrap] weights loaded in {:.2}s",
+                    $load_start.elapsed().as_secs_f32()
+                );
+                run_with_model(
+                    $control,
+                    $data,
+                    model,
+                    $bootstrap,
+                    $eos_ids,
+                    $profile_cuda_steps,
+                )?;
+            }
+        }
+        Ok::<(), String>(())
+    }};
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let cfg = infer_protocol::RustInferConfig::load(&args.config)?;
@@ -239,42 +296,22 @@ fn main() -> Result<(), String> {
         _ => vec![128001, 128008, 128009], // Llama 3.x default
     };
 
-    match model_type.as_str() {
-        "qwen3" => {
-            let model = loader
-                .load_qwen3::<bf16, Cuda>(&load_cfg, &cuda)
-                .map_err(|e| format!("load_qwen3: {:?}", e))?;
-            eprintln!(
-                "[bootstrap] weights loaded in {:.2}s",
-                load_start.elapsed().as_secs_f32()
-            );
-            run_with_model(
-                &control,
-                &data,
-                model,
-                bootstrap,
-                &eos_ids,
-                args.profile_cuda_steps,
-            )?;
-        }
-        _ => {
-            let model = loader
-                .load_llama3::<bf16, Cuda>(&load_cfg, &cuda)
-                .map_err(|e| format!("load_llama3: {:?}", e))?;
-            eprintln!(
-                "[bootstrap] weights loaded in {:.2}s",
-                load_start.elapsed().as_secs_f32()
-            );
-            run_with_model(
-                &control,
-                &data,
-                model,
-                bootstrap,
-                &eos_ids,
-                args.profile_cuda_steps,
-            )?;
-        }
-    }
+    dispatch_worker_model!(
+        model_type = model_type,
+        loader = loader,
+        load_cfg = &load_cfg,
+        cuda = &cuda,
+        control = &control,
+        data = &data,
+        bootstrap = bootstrap,
+        eos_ids = &eos_ids,
+        profile_cuda_steps = args.profile_cuda_steps,
+        load_start = load_start,
+        shipped {
+            "qwen3" => load_qwen3,
+        },
+        default => load_llama3
+    )?;
 
     Ok(())
 }

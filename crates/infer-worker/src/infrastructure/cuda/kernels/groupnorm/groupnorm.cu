@@ -74,7 +74,7 @@ __device__ __forceinline__ float block_reduce_sum_256(float v, float* shm) {
 }
 
 // ============================================================================
-// Legacy 3-pass scalar kernels (small groups)
+// 3-pass scalar kernels (small groups)
 // ============================================================================
 
 __global__ void groupnorm_f32_kernel_small(

@@ -73,6 +73,7 @@ unsafe extern "C" {
 
 /// Standard matmul: output = input @ weight^T (same dtype)
 pub fn matmul<T: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
     output: &mut Tensor<T, Cuda>,
@@ -87,7 +88,6 @@ pub fn matmul<T: Dtype>(
     let n = w_shape[0];
 
     let cfg = &input.device().config;
-    let stream = cfg.stream;
 
     unsafe {
         match T::DATA_TYPE {
@@ -167,6 +167,7 @@ pub fn matmul<T: Dtype>(
 /// - output: [M, N] (O dtype, typically bf16)
 /// - group_size: quantization group size (e.g. 128)
 pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
+    stream: cudaStream_t,
     input: &Tensor<A, Cuda>,
     weight_packed: &Tensor<W, Cuda>,
     output: &mut Tensor<O, Cuda>,
@@ -179,7 +180,6 @@ pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
     let k = wp_shape[1] * 8; // 8 int4 per int32
     let m = input.shape().as_slice()[0];
 
-    let stream = input.device().config.stream;
     let zeros_ptr = zeros.map_or(std::ptr::null(), |z| z.data_ptr() as *const _);
 
     unsafe {
@@ -245,7 +245,7 @@ mod xemb_tests {
         let wgt: Tensor<half::bf16, Cuda> =
             Tensor::from_host_slice(&wgt_bf16, [n, k], &cuda).unwrap();
         let mut out: Tensor<half::bf16, Cuda> = Tensor::zeros([m, n], &cuda).unwrap();
-        matmul(&inp, &wgt, &mut out).unwrap();
+        matmul(cuda.config.stream, &inp, &wgt, &mut out).unwrap();
         let got: Vec<f32> = out
             .to_host_vec()
             .unwrap()

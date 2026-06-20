@@ -37,6 +37,7 @@ unsafe extern "C" {
 }
 
 pub fn embedding<T: Dtype>(
+    stream: cudaStream_t,
     table: &Tensor<T, Cuda>,
     indices: &Tensor<i32, Cuda>,
     output: &mut Tensor<T, Cuda>,
@@ -45,7 +46,6 @@ pub fn embedding<T: Dtype>(
     let vocab = table_shape[0] as i32;
     let dim = table_shape[1] as i32;
     let seq_len = indices.numel() as i32;
-    let stream = table.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => embedding_kernel_cu_fp32x4(

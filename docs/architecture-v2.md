@@ -801,7 +801,7 @@ impl BatchPlan {
 
 /// Per-seq host description fed by callers (today's `SeqStep`, unchanged shape).
 #[derive(Debug, Clone)]
-pub struct SeqStep { pub input_ids: Vec<i32>, pub positions: Vec<i32>, pub kv_write_start: i32, pub kv_len_after: i32, pub block_table: Vec<u32> }
+pub struct SeqStep { pub sequence_id: SeqId, pub input_ids: Vec<i32>, pub positions: Vec<i32>, pub kv_write_start: i32, pub kv_len_after: i32, pub block_table: Vec<u32> }
 
 /// One token result carrying probability info (structural fix for "argmax-only, no probabilities").
 #[derive(Debug, Clone)]
@@ -1185,6 +1185,9 @@ impl SpecRuntime {
     /// Draft proposes `num_draft` tokens/seq; target verifies in ONE Ragged/Spec StepRequest;
     /// `Sampler::verify` yields per-seq accepted → `KvEdit` truncates the rejected suffix. Tree mode
     /// flips `BatchKind::Spec.mask` + adds a kernel arm — this signature never changes.
+    pub fn step_request<T: Dtype, D: LlmBackend>(&mut self, host: &mut ModelHost<T, D>, req: &StepRequest) -> OpResult<StepOutput>;
+    /// Compatibility wrapper for scheduler-owned active state; production callers should build
+    /// `StepRequest` and use `step_request` so verification has tokens/positions/block tables.
     pub fn step<T: Dtype, D: LlmBackend>(&mut self, host: &mut ModelHost<T, D>, active: &mut ActiveSeqMap) -> OpResult<StepOutput>;
 }
 

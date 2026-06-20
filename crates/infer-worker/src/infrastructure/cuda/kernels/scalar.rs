@@ -83,10 +83,13 @@ unsafe extern "C" {
 
 /// In-place scalar multiply: `x *= val`. Implemented as `dst=src,val` with
 /// `dst == src` aliased to the same buffer.
-pub fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, scalar: f64) -> OpResult<()> {
+pub fn scalar_mul_inplace<T: Dtype>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+    scalar: f64,
+) -> OpResult<()> {
     let n = x.numel() as i32;
     let val = scalar as f32;
-    let stream = x.device().config.stream;
     let p = x.data_ptr_mut();
     unsafe {
         match T::DATA_TYPE {
@@ -105,10 +108,13 @@ pub fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, scalar: f64) -> OpR
 }
 
 /// In-place scalar add: `x += val`.
-pub fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, scalar: f64) -> OpResult<()> {
+pub fn scalar_add_inplace<T: Dtype>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+    scalar: f64,
+) -> OpResult<()> {
     let n = x.numel() as i32;
     let val = scalar as f32;
-    let stream = x.device().config.stream;
     let p = x.data_ptr_mut();
     unsafe {
         match T::DATA_TYPE {
@@ -127,9 +133,8 @@ pub fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>, scalar: f64) -> OpR
 }
 
 /// In-place SiLU activation: `x = x * sigmoid(x)`.
-pub fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn silu_inplace<T: Dtype>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
     let n = x.numel() as i32;
-    let stream = x.device().config.stream;
     let p = x.data_ptr_mut();
     unsafe {
         match T::DATA_TYPE {
@@ -143,9 +148,8 @@ pub fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>) -> OpResult<()> {
 }
 
 /// In-place tanh activation.
-pub fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn tanh_inplace<T: Dtype>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
     let n = x.numel() as i32;
-    let stream = x.device().config.stream;
     let p = x.data_ptr_mut();
     unsafe {
         match T::DATA_TYPE {
@@ -162,11 +166,11 @@ pub fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Cuda>) -> OpResult<()> {
 /// (an `[1] f32` tensor). Reads the byte at replay time, so the host can
 /// rewrite the byte between graph launches without re-capturing.
 pub fn scalar_mul_inplace_from_dev<T: Dtype>(
+    stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     d_val: &Tensor<f32, Cuda>,
 ) -> OpResult<()> {
     let n = x.numel() as i32;
-    let stream = x.device().config.stream;
     let p = x.data_ptr_mut();
     let dv = d_val.data_ptr();
     unsafe {
@@ -194,7 +198,7 @@ mod tests {
         let cuda = Cuda::new(0).unwrap();
         let host: Vec<f32> = vec![1.0, 2.0, -3.0, 4.5];
         let mut t: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [4], &cuda).unwrap();
-        scalar_mul_inplace(&mut t, 2.5).unwrap();
+        scalar_mul_inplace(cuda.config.stream, &mut t, 2.5).unwrap();
         let got = t.to_host_vec().unwrap();
         let expected: Vec<f32> = host.iter().map(|x| x * 2.5).collect();
         for (a, b) in expected.iter().zip(got.iter()) {
@@ -210,7 +214,7 @@ mod tests {
             .map(|&x| bf16::from_f32(x))
             .collect();
         let mut t: Tensor<bf16, Cuda> = Tensor::from_host_slice(&host, [4], &cuda).unwrap();
-        scalar_mul_inplace(&mut t, 2.0).unwrap();
+        scalar_mul_inplace(cuda.config.stream, &mut t, 2.0).unwrap();
         let got: Vec<f32> = t
             .to_host_vec()
             .unwrap()
@@ -228,7 +232,7 @@ mod tests {
         let cuda = Cuda::new(0).unwrap();
         let host: Vec<f32> = vec![1.0, -1.0, 2.5, 0.0];
         let mut t: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [4], &cuda).unwrap();
-        scalar_add_inplace(&mut t, 0.5).unwrap();
+        scalar_add_inplace(cuda.config.stream, &mut t, 0.5).unwrap();
         let got = t.to_host_vec().unwrap();
         for (a, &b) in host.iter().zip(got.iter()) {
             assert!((a + 0.5 - b).abs() < 1e-5);
@@ -240,7 +244,7 @@ mod tests {
         let cuda = Cuda::new(0).unwrap();
         let host: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0, -2.0, 5.0, -5.0];
         let mut t: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [host.len()], &cuda).unwrap();
-        silu_inplace(&mut t).unwrap();
+        silu_inplace(cuda.config.stream, &mut t).unwrap();
         let got = t.to_host_vec().unwrap();
         for (i, &x) in host.iter().enumerate() {
             let expected = x / (1.0 + (-x).exp());
@@ -260,7 +264,7 @@ mod tests {
         let cuda = Cuda::new(0).unwrap();
         let host: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, -1.0, 3.0, -3.0];
         let mut t: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [host.len()], &cuda).unwrap();
-        tanh_inplace(&mut t).unwrap();
+        tanh_inplace(cuda.config.stream, &mut t).unwrap();
         let got = t.to_host_vec().unwrap();
         for (i, &x) in host.iter().enumerate() {
             let expected = x.tanh();
@@ -281,7 +285,7 @@ mod tests {
         let host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let mut t: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [4], &cuda).unwrap();
         let scalar: Tensor<f32, Cuda> = Tensor::from_host_slice(&[3.0_f32], [1], &cuda).unwrap();
-        scalar_mul_inplace_from_dev(&mut t, &scalar).unwrap();
+        scalar_mul_inplace_from_dev(cuda.config.stream, &mut t, &scalar).unwrap();
         let got = t.to_host_vec().unwrap();
         let expected: Vec<f32> = host.iter().map(|x| x * 3.0).collect();
         for (a, b) in expected.iter().zip(got.iter()) {

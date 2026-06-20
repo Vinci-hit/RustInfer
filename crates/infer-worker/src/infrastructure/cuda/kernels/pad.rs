@@ -76,6 +76,7 @@ unsafe fn d2d(
 
 /// `dst[..n] = src; dst[n..target] = pad_token broadcasted`.
 pub fn pad_with_token_into<T: Dtype>(
+    stream: cudaStream_t,
     src: &Tensor<T, Cuda>,
     pad_token: &Tensor<T, Cuda>,
     dst: &mut Tensor<T, Cuda>,
@@ -103,7 +104,6 @@ pub fn pad_with_token_into<T: Dtype>(
             d,
         )));
     }
-    let stream = src.device().config.stream;
     let bytes_per_row = d * T::SIZE_BYTES;
     let src_bytes = n * bytes_per_row;
 
@@ -146,6 +146,7 @@ pub fn pad_with_token_into<T: Dtype>(
 
 /// `dst[..n] = src; dst[n..target] = src[n-1]` — repeat last row.
 pub fn pad_last_row_into<T: Dtype>(
+    stream: cudaStream_t,
     src: &Tensor<T, Cuda>,
     dst: &mut Tensor<T, Cuda>,
 ) -> OpResult<()> {
@@ -170,7 +171,6 @@ pub fn pad_last_row_into<T: Dtype>(
             target, n
         )));
     }
-    let stream = src.device().config.stream;
     let bytes_per_row = d * T::SIZE_BYTES;
     let src_bytes = n * bytes_per_row;
     unsafe {
@@ -211,6 +211,7 @@ pub fn pad_last_row_into<T: Dtype>(
 /// `dst[keep_prefix..] = pad_token broadcasted`. Rows `[0..keep_prefix)` stay
 /// untouched.
 pub fn overwrite_pad_tokens_inplace<T: Dtype>(
+    stream: cudaStream_t,
     dst: &mut Tensor<T, Cuda>,
     pad_token: &Tensor<T, Cuda>,
     keep_prefix: usize,
@@ -237,7 +238,6 @@ pub fn overwrite_pad_tokens_inplace<T: Dtype>(
         return Ok(());
     }
     let pad_rows = target - keep_prefix;
-    let stream = dst.device().config.stream;
     let bytes_per_row = d * T::SIZE_BYTES;
     unsafe {
         let dst_base = (dst.data_ptr_mut() as *mut u8).add(keep_prefix * bytes_per_row);
@@ -282,7 +282,7 @@ mod tests {
         let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&src_host, [n, d], &cuda).unwrap();
         let pad: Tensor<f32, Cuda> = Tensor::from_host_slice(&pad_host, [d], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([target, d], &cuda).unwrap();
-        pad_with_token_into(&src, &pad, &mut dst).unwrap();
+        pad_with_token_into(cuda.config.stream, &src, &pad, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
         for i in 0..n * d {
             assert_eq!(got[i], src_host[i]);
@@ -311,7 +311,7 @@ mod tests {
         let src_host: Vec<f32> = vec![1.0, 2.0, 3.0, 9.0, 8.0, 7.0];
         let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&src_host, [n, d], &cuda).unwrap();
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([target, d], &cuda).unwrap();
-        pad_last_row_into(&src, &mut dst).unwrap();
+        pad_last_row_into(cuda.config.stream, &src, &mut dst).unwrap();
         let got = dst.to_host_vec().unwrap();
         // First two rows = src.
         for i in 0..n * d {
@@ -334,7 +334,7 @@ mod tests {
             Tensor::from_host_slice(&init, [target, d], &cuda).unwrap();
         let pad: Tensor<f32, Cuda> = Tensor::from_host_slice(&pad_host, [d], &cuda).unwrap();
         let keep = 2usize;
-        overwrite_pad_tokens_inplace(&mut dst, &pad, keep).unwrap();
+        overwrite_pad_tokens_inplace(cuda.config.stream, &mut dst, &pad, keep).unwrap();
         let got = dst.to_host_vec().unwrap();
         // [0..keep) untouched.
         for i in 0..keep * d {
@@ -366,7 +366,7 @@ mod tests {
         let src: Tensor<bf16, Cuda> = Tensor::from_host_slice(&src_host, [n, d], &cuda).unwrap();
         let pad: Tensor<bf16, Cuda> = Tensor::from_host_slice(&pad_host, [d], &cuda).unwrap();
         let mut dst: Tensor<bf16, Cuda> = Tensor::zeros([target, d], &cuda).unwrap();
-        pad_with_token_into(&src, &pad, &mut dst).unwrap();
+        pad_with_token_into(cuda.config.stream, &src, &pad, &mut dst).unwrap();
         let got: Vec<f32> = dst
             .to_host_vec()
             .unwrap()

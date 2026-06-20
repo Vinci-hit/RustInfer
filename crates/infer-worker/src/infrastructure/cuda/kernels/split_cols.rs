@@ -38,6 +38,7 @@ unsafe extern "C" {
 
 /// Split columns [col_offset..col_offset+dst_cols) from src [rows, total_cols] into dst [rows, dst_cols].
 pub fn split_cols<T: Dtype>(
+    stream: cudaStream_t,
     src: &Tensor<T, Cuda>,
     dst: &mut Tensor<T, Cuda>,
     rows: i32,
@@ -45,7 +46,6 @@ pub fn split_cols<T: Dtype>(
     col_offset: i32,
     dst_cols: i32,
 ) -> OpResult<()> {
-    let stream = src.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::BF16 => split_cols_bf16(
@@ -103,6 +103,7 @@ mod tests {
         let dst_cols = 3usize;
         let mut dst: Tensor<f32, Cuda> = Tensor::zeros([rows, dst_cols], &cuda).unwrap();
         split_cols(
+            cuda.config.stream,
             &src,
             &mut dst,
             rows as i32,
@@ -133,8 +134,18 @@ mod tests {
         let mut q: Tensor<bf16, Cuda> = Tensor::zeros([rows, dim], &cuda).unwrap();
         let mut k: Tensor<bf16, Cuda> = Tensor::zeros([rows, dim], &cuda).unwrap();
         let mut v: Tensor<bf16, Cuda> = Tensor::zeros([rows, dim], &cuda).unwrap();
-        split_cols(&src, &mut q, rows as i32, total_cols as i32, 0, dim as i32).unwrap();
         split_cols(
+            cuda.config.stream,
+            &src,
+            &mut q,
+            rows as i32,
+            total_cols as i32,
+            0,
+            dim as i32,
+        )
+        .unwrap();
+        split_cols(
+            cuda.config.stream,
             &src,
             &mut k,
             rows as i32,
@@ -144,6 +155,7 @@ mod tests {
         )
         .unwrap();
         split_cols(
+            cuda.config.stream,
             &src,
             &mut v,
             rows as i32,

@@ -183,7 +183,9 @@ pub fn alloc_with_relief<C: ReliefControl>(
                 }
                 tracing::warn!(
                     "[serve] alloc({}) failed at round={}: {} -- requesting relief",
-                    n, round, e
+                    n,
+                    round,
+                    e
                 );
                 if let Err(send_err) = control.send_alloc_failed(n, round) {
                     tracing::warn!("[serve] failed to send AllocFailed: {}", send_err);
@@ -212,7 +214,8 @@ pub fn alloc_with_relief<C: ReliefControl>(
                 if !matches!(relief, ReliefWaitOutcome::Satisfied) {
                     tracing::warn!(
                         "[serve] relief timed out at round={} (still need {} slots)",
-                        round, n
+                        round,
+                        n
                     );
                     if round == 0 {
                         round = 1;
@@ -364,7 +367,16 @@ mod tests {
         let mut active = ActiveSeqMap::new();
         let mut prefilling = PrefillSeqMap::new();
         let ctl = MockControl::new(vec![free_kv(vec![0, 1])]);
-        let out = wait_for_relief(&ctl, &mut kv, &mut active, &mut prefilling, 2, 50, false, false);
+        let out = wait_for_relief(
+            &ctl,
+            &mut kv,
+            &mut active,
+            &mut prefilling,
+            2,
+            50,
+            false,
+            false,
+        );
         assert_eq!(out, ReliefWaitOutcome::Satisfied);
         assert_eq!(kv.total_free(), 2);
     }
@@ -374,8 +386,20 @@ mod tests {
         let mut kv = GlobalKvAllocator::new(2);
         let mut active = ActiveSeqMap::new();
         let mut prefilling = PrefillSeqMap::new();
-        let ctl = MockControl::new(vec![Some((SchedulerControlMessage::Shutdown, RequestId::NONE))]);
-        let out = wait_for_relief(&ctl, &mut kv, &mut active, &mut prefilling, 2, 50, false, false);
+        let ctl = MockControl::new(vec![Some((
+            SchedulerControlMessage::Shutdown,
+            RequestId::NONE,
+        ))]);
+        let out = wait_for_relief(
+            &ctl,
+            &mut kv,
+            &mut active,
+            &mut prefilling,
+            2,
+            50,
+            false,
+            false,
+        );
         assert_eq!(out, ReliefWaitOutcome::Shutdown);
     }
 
@@ -386,7 +410,16 @@ mod tests {
         let mut active = ActiveSeqMap::new();
         let mut prefilling = PrefillSeqMap::new();
         let ctl = MockControl::new(vec![]); // always Ok(None)
-        let out = wait_for_relief(&ctl, &mut kv, &mut active, &mut prefilling, 2, 5, false, false);
+        let out = wait_for_relief(
+            &ctl,
+            &mut kv,
+            &mut active,
+            &mut prefilling,
+            2,
+            5,
+            false,
+            false,
+        );
         assert_eq!(out, ReliefWaitOutcome::TimedOut);
     }
 
@@ -398,7 +431,16 @@ mod tests {
         let mut prefilling = PrefillSeqMap::new();
         // First relief frees 1 (need 3 → partial), second frees 2 more → satisfied.
         let ctl = MockControl::new(vec![free_kv(vec![0]), free_kv(vec![1, 2])]);
-        let out = wait_for_relief(&ctl, &mut kv, &mut active, &mut prefilling, 3, 100, false, false);
+        let out = wait_for_relief(
+            &ctl,
+            &mut kv,
+            &mut active,
+            &mut prefilling,
+            3,
+            100,
+            false,
+            false,
+        );
         assert_eq!(out, ReliefWaitOutcome::Satisfied);
         assert_eq!(kv.total_free(), 3);
     }
@@ -413,7 +455,10 @@ mod tests {
         let ctl = MockControl::new(vec![]);
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 2, false, false);
         assert_eq!(out, AllocWithReliefOutcome::Allocated(vec![0, 1]));
-        assert!(ctl.alloc_failed.borrow().is_empty(), "no relief should be requested");
+        assert!(
+            ctl.alloc_failed.borrow().is_empty(),
+            "no relief should be requested"
+        );
     }
 
     #[test]
@@ -439,7 +484,11 @@ mod tests {
         ctl.fail_alloc_failed = true;
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 2, false, false);
         assert_eq!(out, AllocWithReliefOutcome::Unavailable);
-        assert_eq!(ctl.alloc_failed.borrow().len(), 1, "AllocFailed was attempted once");
+        assert_eq!(
+            ctl.alloc_failed.borrow().len(),
+            1,
+            "AllocFailed was attempted once"
+        );
     }
 
     #[test]
@@ -464,16 +513,21 @@ mod tests {
         let mut prefilling = PrefillSeqMap::new();
         // Preempt victim 7 and hand back its slots.
         let preempt = Some((
-            SchedulerControlMessage::Preempt(infer_protocol::scheduler_to_worker_control::Preempt {
-                model_instance_id: String::new(),
-                sequence_ids: vec![7],
-                free_indices: vec![0, 1],
-            }),
+            SchedulerControlMessage::Preempt(
+                infer_protocol::scheduler_to_worker_control::Preempt {
+                    model_instance_id: String::new(),
+                    sequence_ids: vec![7],
+                    free_indices: vec![0, 1],
+                },
+            ),
             RequestId::NONE,
         ));
         let ctl = MockControl::new(vec![preempt]);
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 2, false, false);
         assert_eq!(out, AllocWithReliefOutcome::Allocated(vec![0, 1]));
-        assert!(!active.contains_key(&7), "preempted victim removed from active");
+        assert!(
+            !active.contains_key(&7),
+            "preempted victim removed from active"
+        );
     }
 }

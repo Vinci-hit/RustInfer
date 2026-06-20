@@ -792,15 +792,6 @@ mod tests {
     use crate::models::diffusion::state::ZImageCapacity;
     use crate::models::layers::{LayerNorm, Linear, RMSNorm};
 
-    fn make_linear<T: Dtype>(out: usize, in_: usize, cuda: &Cuda, seed: u64) -> Linear<T, Cuda>
-    where
-        T: Dtype,
-        Tensor<T, Cuda>: Sized,
-    {
-        // For simplicity in this smoke test we always use f32 weights.
-        unreachable!("only specialized below");
-    }
-
     fn rand_linear_f32(out: usize, in_: usize, cuda: &Cuda, seed: u64) -> Linear<f32, Cuda> {
         let w: Tensor<f32, Cuda> = Tensor::randn([out, in_], cuda, Some(seed)).unwrap();
         Linear::new(w, None)

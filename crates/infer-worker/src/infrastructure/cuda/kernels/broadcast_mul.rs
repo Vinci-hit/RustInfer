@@ -57,12 +57,12 @@ unsafe extern "C" {
 
 /// In-place broadcast multiply: x[i,j] *= scale[j].
 pub fn broadcast_mul_inplace<T: Dtype>(
+    stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     scale: &Tensor<T, Cuda>,
 ) -> OpResult<()> {
     let dim = scale.numel() as i32;
     let rows = (x.numel() as i32) / dim;
-    let stream = x.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => broadcast_mul_f32_forward(
@@ -102,12 +102,12 @@ pub fn broadcast_mul_inplace<T: Dtype>(
 
 /// In-place broadcast add: x[i,j] += bias[j].
 pub fn broadcast_add_inplace<T: Dtype>(
+    stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     bias: &Tensor<T, Cuda>,
 ) -> OpResult<()> {
     let dim = bias.numel() as i32;
     let rows = (x.numel() as i32) / dim;
-    let stream = x.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => broadcast_add_inplace_f32_forward(
@@ -157,7 +157,7 @@ mod tests {
         let mut x: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&x_host, [rows, dim], &cuda).unwrap();
         let scale: Tensor<f32, Cuda> = Tensor::from_host_slice(&scale_host, [dim], &cuda).unwrap();
-        broadcast_mul_inplace(&mut x, &scale).unwrap();
+        broadcast_mul_inplace(cuda.config.stream, &mut x, &scale).unwrap();
         let got = x.to_host_vec().unwrap();
         for r in 0..rows {
             for c in 0..dim {
@@ -177,7 +177,7 @@ mod tests {
         let mut x: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&x_host, [rows, dim], &cuda).unwrap();
         let bias: Tensor<f32, Cuda> = Tensor::from_host_slice(&bias_host, [dim], &cuda).unwrap();
-        broadcast_add_inplace(&mut x, &bias).unwrap();
+        broadcast_add_inplace(cuda.config.stream, &mut x, &bias).unwrap();
         let got = x.to_host_vec().unwrap();
         for r in 0..rows {
             for c in 0..dim {
@@ -201,7 +201,7 @@ mod tests {
         let mut x: Tensor<bf16, Cuda> =
             Tensor::from_host_slice(&x_host, [rows, dim], &cuda).unwrap();
         let scale: Tensor<bf16, Cuda> = Tensor::from_host_slice(&scale_host, [dim], &cuda).unwrap();
-        broadcast_mul_inplace(&mut x, &scale).unwrap();
+        broadcast_mul_inplace(cuda.config.stream, &mut x, &scale).unwrap();
         let got: Vec<f32> = x
             .to_host_vec()
             .unwrap()

@@ -32,10 +32,13 @@ unsafe extern "C" {
 }
 
 /// Row-wise softmax over the last dimension.
-pub fn softmax<T: Dtype>(input: &Tensor<T, Cuda>, output: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn softmax<T: Dtype>(
+    stream: cudaStream_t,
+    input: &Tensor<T, Cuda>,
+    output: &mut Tensor<T, Cuda>,
+) -> OpResult<()> {
     let dim = *input.shape().as_slice().last().unwrap_or(&1);
     let rows = (input.numel() / dim) as i32;
-    let stream = input.device().config.stream;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => softmax_f32_forward(
@@ -99,7 +102,7 @@ mod tests {
         let host: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.3).sin()).collect();
         let input: Tensor<f32, Cuda> = Tensor::from_host_slice(&host, [rows, cols], &cuda).unwrap();
         let mut output: Tensor<f32, Cuda> = Tensor::zeros([rows, cols], &cuda).unwrap();
-        softmax(&input, &mut output).unwrap();
+        softmax(cuda.config.stream, &input, &mut output).unwrap();
         let got = output.to_host_vec().unwrap();
         let expected = softmax_ref(&host, rows, cols);
         for (a, b) in expected.iter().zip(got.iter()) {
@@ -122,7 +125,7 @@ mod tests {
         let input: Tensor<bf16, Cuda> =
             Tensor::from_host_slice(&host_bf16, [rows, cols], &cuda).unwrap();
         let mut output: Tensor<bf16, Cuda> = Tensor::zeros([rows, cols], &cuda).unwrap();
-        softmax(&input, &mut output).unwrap();
+        softmax(cuda.config.stream, &input, &mut output).unwrap();
         let got: Vec<f32> = output
             .to_host_vec()
             .unwrap()

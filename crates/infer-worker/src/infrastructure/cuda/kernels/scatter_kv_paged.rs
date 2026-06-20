@@ -67,6 +67,7 @@ unsafe extern "C" {
 }
 
 pub fn scatter_kv_paged<T: Dtype>(
+    stream: cudaStream_t,
     k_src: &Tensor<T, Cuda>,
     v_src: &Tensor<T, Cuda>,
     k_pool: &mut Tensor<T, Cuda>,
@@ -83,7 +84,6 @@ pub fn scatter_kv_paged<T: Dtype>(
     if batch == 0 {
         return Ok(());
     }
-    let stream = k_src.device().config.stream;
 
     // Read row stride from the tensors directly so strided views (e.g.
     // zero-copy slices of a fused QKV buffer) are handled correctly.
