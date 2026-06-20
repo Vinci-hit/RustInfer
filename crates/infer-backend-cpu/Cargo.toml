@@ -1,0 +1,10 @@
+[package]
+name = "infer-backend-cpu"
+version = "0.1.0"
+edition = "2024"
+description = "RustInfer CPU backend: the always-linked, pure-Rust reference implementation of the infer-core op-port traits. Builds with rustc only; serves as the baseline/fallback backend."
+license = "Apache-2.0"
+
+[dependencies]
+infer-core = { path = "../infer-core" }
+half = { version = "2.7.1", features = ["std", "num-traits"] }

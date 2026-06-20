@@ -23,6 +23,6 @@
 pub mod application;
 pub mod components;
 pub mod domain;
-pub mod env_flags;
+pub use infer_core::env_flags;
 pub mod infrastructure;
 pub mod models;

@@ -1,6 +1,6 @@
 //! Infrastructure layer — implements domain ports.
-pub mod cpu;
+pub use infer_backend_cpu as cpu;
 #[cfg(feature = "cuda")]
-pub mod cuda;
+pub use infer_backend_cuda as cuda;
 pub mod io;
 pub mod transport;

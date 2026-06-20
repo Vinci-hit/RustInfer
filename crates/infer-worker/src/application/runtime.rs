@@ -3,7 +3,7 @@ use std::ptr::NonNull;
 
 use crate::domain::component::{Hidden, LayerRange};
 use crate::domain::dtype::Dtype;
-use crate::domain::exec::{Device, ExecScope};
+use crate::domain::exec::{ExecDevice as Device, ExecScope};
 use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use crate::domain::model::{DecoderModel, ModelDims, SampleRows};
 use crate::domain::plan::{BatchKind, BatchPlan, SampledToken, StepOutput, StepRequest};

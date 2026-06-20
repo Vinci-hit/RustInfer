@@ -1,0 +1,17 @@
+[package]
+name = "infer-backend-cuda"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "RustInfer CUDA backend: implements the infer-core op-port traits with CUDA kernels. Statically links its compiled .cu kernels (the 29-file kernel set + CUTLASS); confines the entire CUDA toolchain (nvcc/bindgen/cuDNN) to this one leaf crate. Linked into the worker only when the `cuda` feature is on."
+license = "Apache-2.0"
+
+[dependencies]
+infer-core = { path = "../infer-core" }
+half = { version = "2.7.1", features = ["std", "num-traits"] }
+tracing = "0.1"
+
+[build-dependencies]
+cc = { version = "1.2.52", features = ["parallel"] }
+bindgen = "0.72.1"
+walkdir = "2.5.0"

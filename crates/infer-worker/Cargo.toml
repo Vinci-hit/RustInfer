@@ -15,6 +15,9 @@ required-features = ["cuda"]
 
 [dependencies]
 infer-protocol = { path = "../infer-protocol" }
+infer-core = { path = "../infer-core" }
+infer-backend-cpu = { path = "../infer-backend-cpu" }
+infer-backend-cuda = { path = "../infer-backend-cuda", optional = true }
 half = { version = "2.7.1", features = ["std", "num-traits"] }
 thiserror = "2.0.17"
 num-traits = "0.2.19"
@@ -34,11 +37,9 @@ tokenizers = "0.22.2"
 anyhow = "1"
 png = "0.17"
 
-[build-dependencies]
-cc = { version = "1.2.52", features = ["parallel"], optional = true }
-bindgen = { version = "0.72.1", optional = true }
-walkdir = { version = "2.5.0", optional = true }
-
 [features]
 default = ["cuda"]
-cuda = ["dep:cc", "dep:bindgen", "dep:walkdir"]
+# CUDA is now a statically-linked backend crate, not an in-tree kernel build.
+# The worker no longer carries cc/bindgen/walkdir or a build.rs — the CUDA
+# toolchain lives entirely in `infer-backend-cuda`.
+cuda = ["dep:infer-backend-cuda"]

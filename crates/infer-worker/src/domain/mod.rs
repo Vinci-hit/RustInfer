@@ -3,17 +3,21 @@
 //! This module defines WHAT the system IS, not HOW it does things.
 //! All trait definitions (ports) live here. Infrastructure implements them.
 
-pub mod component;
-pub mod dtype;
-pub mod exec;
+pub use infer_core::component;
+pub use infer_core::dtype;
+pub use infer_core::exec;
 pub mod global_kv_alloc;
-pub mod kv;
+pub use infer_core::kv;
+#[cfg(test)]
+mod kv_tests;
 pub mod model;
 pub mod plan;
-pub mod ports;
-pub mod storage;
-pub mod tensor;
-pub mod types;
+pub use infer_core::ports;
+pub use infer_core::storage;
+pub use infer_core::tensor;
+#[cfg(test)]
+mod tensor_tests;
+pub use infer_core::types;
 
 // ─── Re-exports ──────────────────────────────────────────────────────────────
 pub use component::{Component, Hidden, LayerRange, StageKind};

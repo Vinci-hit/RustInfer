@@ -2101,6 +2101,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-backend-cpu"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "infer-core",
+]
+
+[[package]]
+name = "infer-backend-cuda"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "half",
+ "infer-core",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "infer-core"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "infer-protocol",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "infer-frontend"
 version = "0.3.0"
 dependencies = [
@@ -2184,11 +2213,12 @@ name = "infer-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bindgen",
- "cc",
  "clap",
  "dashmap",
  "half",
+ "infer-backend-cpu",
+ "infer-backend-cuda",
+ "infer-core",
  "infer-protocol",
  "memmap2",
  "num-traits",
@@ -2203,7 +2233,6 @@ dependencies = [
  "tokenizers",
  "tracing",
  "tracing-subscriber",
- "walkdir",
  "zmq",
 ]
 
