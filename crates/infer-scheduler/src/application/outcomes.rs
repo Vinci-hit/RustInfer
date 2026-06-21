@@ -15,7 +15,6 @@
 //! event loop with `WorkerError` for `Terminate`.
 
 use crate::domain::inference_session::lifecycle::RequestId;
-use crate::domain::worker_node::{Lost, WorkerNode};
 use crate::error::SchedulerError;
 
 /// Result of processing a control-plane event.
@@ -35,15 +34,8 @@ pub enum ControlOutcome {
     /// Engine must terminate this iteration.
     ///
     /// Carries a `SchedulerError` that the orchestrator surfaces and
-    /// then bubbles out of the event loop. The `lost` snapshot is
-    /// optional: control-event paths that have a `WorkerNode<Ready>`
-    /// in scope can populate it with `worker_node.snapshot_as_lost(...)`
-    /// for downstream diagnostics; today every `Terminate` carries
-    /// `None` and the engine reconstructs the error string itself.
-    Terminate {
-        lost: Option<WorkerNode<Lost>>,
-        error: SchedulerError,
-    },
+    /// then bubbles out of the event loop.
+    Terminate { error: SchedulerError },
 }
 
 impl ControlOutcome {
@@ -54,11 +46,4 @@ impl ControlOutcome {
             fail_message: None,
         }
     }
-}
-
-/// Whether the engine event loop should keep iterating.
-#[derive(Debug)]
-pub enum ControlFlow {
-    Continue,
-    Terminate(SchedulerError),
 }

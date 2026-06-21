@@ -7,19 +7,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::application::dispatch::DispatchSystem;
-use crate::application::outcomes::ControlOutcome;
 use crate::application::output_fns;
 use crate::application::planning::PlanningSystem;
 use crate::application::scheduler_event::SchedulerEvent;
 use crate::application::workflow::{EngineWorkflow, ResourceContext};
 use crate::domain::inference_session::lifecycle::SequenceId;
-use crate::domain::inference_session::table::{Bucket, RequestTable};
+use crate::domain::inference_session::table::{Bucket, RequestTable, accounting};
 use crate::domain::policy::token_budget::TokenBudget;
 use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::error::Result;
-use crate::infrastructure::transport::control_plane::{
-    ControlEvent, ControlPlaneCmdTx, WorkerGroup, WorkerId,
-};
 
 /// LLM workflow: continuous batching, KV cache management, chunked prefill.
 ///
@@ -81,7 +77,7 @@ impl EngineWorkflow for LlmWorkflow {
         // means cancelled / preempted / failed sequences self-heal out of
         // the reservation with no leak.
         ctx.kv_budget
-            .set_pending_prefill(ctx.requests.inflight_prefill_tokens());
+            .set_pending_prefill(accounting::inflight_prefill_tokens(ctx.requests));
 
         let running = running_set(ctx.requests);
         let kv_limited_tokens = prefill_kv_budget(ctx);
@@ -150,26 +146,6 @@ impl EngineWorkflow for LlmWorkflow {
         };
         handle_llm_step(ctx, dispatch, &step).await
     }
-
-    fn handle_control_event(
-        &self,
-        event: ControlEvent,
-        ctx: &mut ResourceContext<'_>,
-        control_cmd: &ControlPlaneCmdTx,
-        worker_group: &WorkerGroup,
-        default_worker: &WorkerId,
-    ) -> ControlOutcome {
-        crate::application::control_fns::handle_control_event(
-            event,
-            ctx.requests,
-            ctx.radix,
-            ctx.kv_budget,
-            control_cmd,
-            worker_group,
-            default_worker,
-            ctx.config.enable_prefix_caching,
-        )
-    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -183,7 +159,7 @@ fn running_set(requests: &RequestTable) -> RunningSet {
 }
 
 fn prefill_kv_budget(ctx: &ResourceContext<'_>) -> usize {
-    let future_decode_reserve = ctx.requests.future_decode_reserve_tokens();
+    let future_decode_reserve = accounting::future_decode_reserve_tokens(ctx.requests);
     if ctx.config.enable_prefix_caching {
         let immediately_free = ctx.kv_budget.headroom() as usize;
         let reclaimable_cache = ctx.radix.lru_total_indices();
@@ -204,7 +180,7 @@ fn ensure_worker_kv_headroom(
         return;
     }
     let future_decode_reserve =
-        u32::try_from(ctx.requests.future_decode_reserve_tokens()).unwrap_or(u32::MAX);
+        u32::try_from(accounting::future_decode_reserve_tokens(ctx.requests)).unwrap_or(u32::MAX);
     let required = new_kv_tokens.saturating_add(future_decode_reserve);
     let headroom = ctx.kv_budget.headroom();
     if headroom >= required {

@@ -161,13 +161,12 @@ pub struct RadixTree {
 }
 
 /// Outcome of `lookup_prefix`. `matched_indices` is the flat list of global
-/// indices the new request can reuse (in order); `pinned_nodes` is the set
-/// of nodes whose owners now include the new seq, exposed for callers that
-/// want to track per-step temporary holds separately.
+/// indices the new request can reuse (in order). The matched chain is pinned
+/// to the new seq as a side effect of the lookup (its owners now include the
+/// new seq), so no separate node list needs to be returned.
 #[derive(Debug, Clone)]
 pub struct PrefixHit {
     pub matched_indices: Vec<GlobalIndex>,
-    pub pinned_nodes: Vec<NodeId>,
 }
 
 impl RadixTree {
@@ -323,7 +322,6 @@ impl RadixTree {
         let mut node = self.root;
         let mut pos = 0usize;
         let mut matched: Vec<GlobalIndex> = Vec::new();
-        let mut pinned: Vec<NodeId> = Vec::new();
         let mut tok_idx = 0usize;
 
         while tok_idx < tokens.len() {
@@ -352,14 +350,13 @@ impl RadixTree {
         }
 
         // Attach `new_seq_id` to every node we landed on (root excluded).
-        // Walk back from `node` to root.
+        // Walk back from `node` to root. This pins the matched chain for the
+        // lifetime of `new_seq_id` (keeps it out of the LRU).
         let mut cur = node;
         while cur != self.root {
             self.add_owner(cur, new_seq_id);
-            pinned.push(cur);
             cur = self.nodes[cur].parent.expect("non-root has parent");
         }
-        pinned.reverse(); // root → leaf order
 
         // Place the new seq's tip at (node, pos) so subsequent append_token
         // continues from where lookup ended.
@@ -378,7 +375,6 @@ impl RadixTree {
 
         PrefixHit {
             matched_indices: matched,
-            pinned_nodes: pinned,
         }
     }
 

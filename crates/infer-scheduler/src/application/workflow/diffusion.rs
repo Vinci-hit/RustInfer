@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
 
 use crate::application::dispatch::DispatchSystem;
-use crate::application::outcomes::ControlOutcome;
 use crate::application::output_fns;
 use crate::application::planning::PlanningSystem;
 use crate::application::scheduler_event::SchedulerEvent;
@@ -13,9 +12,6 @@ use crate::domain::inference_session::table::RequestTable;
 use crate::domain::policy::token_budget::TokenBudget;
 use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::error::Result;
-use crate::infrastructure::transport::control_plane::{
-    ControlEvent, ControlPlaneCmdTx, WorkerGroup, WorkerId,
-};
 
 /// Diffusion workflow: at most one batch in-flight at a time.
 ///
@@ -113,29 +109,6 @@ impl EngineWorkflow for DiffusionWorkflow {
         };
         self.in_flight = false;
         handle_diffusion_step(ctx, dispatch, &output).await
-    }
-
-    fn handle_control_event(
-        &self,
-        event: ControlEvent,
-        ctx: &mut ResourceContext<'_>,
-        control_cmd: &ControlPlaneCmdTx,
-        worker_group: &WorkerGroup,
-        default_worker: &WorkerId,
-    ) -> ControlOutcome {
-        // Diffusion mode doesn't use KV pressure relief (capacity=0),
-        // but we still delegate to the same handler for StepError,
-        // WorkerLost, etc.
-        crate::application::control_fns::handle_control_event(
-            event,
-            ctx.requests,
-            ctx.radix,
-            ctx.kv_budget,
-            control_cmd,
-            worker_group,
-            default_worker,
-            false,
-        )
     }
 }
 

@@ -1,17 +1,8 @@
-//! Core traits for cache management.
+//! Cache-management helper types.
+//!
+//! `PrefixMatch` is a pure domain value object; its canonical definition lives
+//! in [`crate::domain::prefix`]. It is re-exported here so existing
+//! `infrastructure::kv_cache::traits::PrefixMatch` import paths keep resolving,
+//! while the dependency arrow now points infra -> domain (not the reverse).
 
-/// Result of a prefix match operation.
-#[derive(Debug, Clone)]
-pub struct PrefixMatch {
-    /// Number of tokens that hit the cache (always block-aligned in paged mode).
-    pub num_cached_tokens: usize,
-}
-
-impl PrefixMatch {
-    /// No prefix match found.
-    pub fn none() -> Self {
-        Self {
-            num_cached_tokens: 0,
-        }
-    }
-}
+pub use crate::domain::prefix::PrefixMatch;

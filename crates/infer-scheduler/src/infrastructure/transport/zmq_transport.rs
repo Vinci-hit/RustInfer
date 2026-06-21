@@ -196,7 +196,7 @@ impl FrontendTransport for ZmqFrontendTransport {
     ) -> Result<()> {
         self.outgoing_tx
             .send(OutgoingResponse::Full {
-                client_id: ClientId::new(client.as_bytes().to_vec()),
+                client_id: client.clone(),
                 response,
             })
             .map_err(|_| SchedulerError::Shutdown)
@@ -205,7 +205,7 @@ impl FrontendTransport for ZmqFrontendTransport {
     async fn send_stream_chunk(&mut self, client: &ClientId, chunk: StreamChunk) -> Result<()> {
         self.outgoing_tx
             .send(OutgoingResponse::Chunk {
-                client_id: ClientId::new(client.as_bytes().to_vec()),
+                client_id: client.clone(),
                 chunk,
             })
             .map_err(|_| SchedulerError::Shutdown)

@@ -265,7 +265,7 @@ impl infer_core::ports::MathOps for Cuda {
         x: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::activation::silu_inplace(scope_stream(scope), x)
+        kernels::swiglu::silu_inplace(scope_stream(scope), x)
     }
 
     fn softmax<T: Dtype>(
@@ -424,7 +424,7 @@ impl infer_core::ports::FusedOps for Cuda {
         inter: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
-        kernels::activation::swiglu_packed(scope_stream(ctx.scope()), gate_up, out, rows, inter)
+        kernels::swiglu::swiglu_packed(scope_stream(ctx.scope()), gate_up, out, rows, inter)
     }
 
     fn scatter_kv_paged<T: infer_core::dtype::Dtype>(
@@ -435,7 +435,7 @@ impl infer_core::ports::FusedOps for Cuda {
         kv_dim: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
-        kernels::scatter_kv_paged::scatter_kv_paged(
+        kernels::kv_cache::scatter_kv_paged(
             scope_stream(ctx.scope()),
             k_src,
             v_src,
@@ -511,7 +511,7 @@ impl infer_core::ports::FusedOps for Cuda {
                     kv_head_num as i32,
                     head_dim as i32,
                 )?;
-                kernels::scatter_kv_paged::scatter_kv_paged(
+                kernels::kv_cache::scatter_kv_paged(
                     scope_stream(ctx.scope()),
                     k,
                     v,
@@ -546,7 +546,7 @@ impl infer_core::ports::FusedOps for Cuda {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
         let (k_pool, v_pool) = kv.layer(0);
         let workspace_elems = if ctx.plan().is_decode_only() {
-            kernels::attention_paged::flash_decode_workspace_capacity_f32(
+            kernels::flash_attn_gqa::flash_decode_workspace_capacity_f32(
                 ctx.plan().batch,
                 head_num,
                 head_dim,
@@ -556,13 +556,13 @@ impl infer_core::ports::FusedOps for Cuda {
             1
         };
         let mut workspace = Tensor::<f32, Cuda>::zeros([workspace_elems], q.device())?;
-        kernels::attention_paged::attention_paged(
+        kernels::flash_attn_gqa::attention_paged(
             scope_stream(ctx.scope()),
             q,
             k_pool,
             v_pool,
             output,
-            kernels::attention_paged::PagedAttentionPlan::from_v2(ctx.plan(), kv.index),
+            kernels::flash_attn_gqa::PagedAttentionPlan::from_v2(ctx.plan(), kv.index),
             &mut workspace,
             head_num,
             kv_head_num,
@@ -816,7 +816,7 @@ impl CoreOps for Cuda {
         )
     }
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::activation::silu_inplace(x.device().config.stream, x)
+        kernels::swiglu::silu_inplace(x.device().config.stream, x)
     }
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
         kernels::softmax::softmax(input.device().config.stream, input, output)
@@ -905,7 +905,7 @@ impl CoreOps for Cuda {
         rows: usize,
         inter: usize,
     ) -> OpResult<()> {
-        kernels::activation::swiglu_packed(
+        kernels::swiglu::swiglu_packed(
             gate_up.device().config.stream,
             gate_up,
             out,

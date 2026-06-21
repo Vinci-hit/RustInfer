@@ -47,7 +47,7 @@ use crate::domain::inference_session::lifecycle::{
 };
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::error::{Result, SchedulerError};
-use crate::infrastructure::kv_cache::traits::PrefixMatch;
+use crate::domain::prefix::PrefixMatch;
 
 new_key_type! {
     /// Generational handle into a state-bucket SlotMap.
@@ -66,22 +66,13 @@ pub enum Bucket {
     Decoding,
 }
 
-/// Minimal projection of an active session into the data the
-/// preemption policy needs to score it.
-///
-/// `kv_used` is the source of truth for "how many KV slots will be
-/// freed if we preempt this seq" — that's what the scheduler counts
-/// toward its 5%-of-total target.
-#[derive(Debug, Clone, Copy)]
-pub struct PreemptCandidate {
-    pub sequence_id: u64,
-    /// `Decoding`: emitted-token count. `Prefilling`: 0.
-    pub output_len: u32,
-    /// Prompt length (input_ids.len).
-    pub input_len: u32,
-    /// `Decoding`: `seq_position`. `Prefilling`: `num_computed_tokens`.
-    pub kv_used: u32,
-}
+// KV-accounting projections (`inflight_prefill_tokens`,
+// `future_decode_reserve_tokens`) and preemption scoring (`PreemptCandidate`,
+// `preemption_candidates`) live in the `accounting` child module — they are
+// scheduling-policy reads, not storage mechanics. Re-exported so the
+// `table::PreemptCandidate` path keeps resolving for callers.
+pub(crate) mod accounting;
+pub use accounting::PreemptCandidate;
 
 #[derive(Debug, Clone)]
 pub enum PrefillStartOutcome {
@@ -111,13 +102,22 @@ pub enum PrefillAckOutcome {
 
 #[derive(Debug, Clone)]
 pub struct TokenAppendOutcome {
-    pub request_id: RequestId,
-    pub external_id: String,
     pub sequence_id: SequenceId,
-    pub client_id: ClientId,
-    pub stream: bool,
     pub token_id: i32,
     pub worker_finished: bool,
+    /// Streaming delivery target. `Some` only for streaming requests, so
+    /// non-streaming decode tokens incur no per-token heap allocation here.
+    /// The `client_id` clone is a cheap `Arc` refcount bump; the `external_id`
+    /// String is the wire id required by `StreamChunk` and is built only for
+    /// streamed tokens.
+    pub stream: Option<StreamDelivery>,
+}
+
+/// Where to deliver a streamed token. Built only for streaming sequences.
+#[derive(Debug, Clone)]
+pub struct StreamDelivery {
+    pub client_id: ClientId,
+    pub external_id: String,
 }
 
 pub enum FailedOutcome {
@@ -182,6 +182,10 @@ impl Address {
 #[derive(Default)]
 pub struct RequestTable {
     by_request: HashMap<RequestId, SequenceId>,
+    /// Reverse of `by_request`: `SequenceId -> RequestId`. Maintained in
+    /// lockstep so `request_id_for_sequence` (output / cancel / error paths)
+    /// is O(1) instead of a linear scan of `by_request`.
+    by_sequence: HashMap<SequenceId, RequestId>,
     /// Index by client-supplied external id (used by data-plane responses
     /// e.g. diffusion batch output that carries the original string id).
     by_external_id: HashMap<String, SequenceId>,
@@ -231,26 +235,6 @@ impl RequestTable {
         self.prefilling.values().any(|seq| seq.has_inflight())
     }
 
-    /// Total prompt tokens currently in flight across all prefilling
-    /// sequences whose segment has been dispatched but not yet acked.
-    ///
-    /// This is the projected worker KV-slot footprint of unreported prefill
-    /// work. It is recomputed from live session state, so sequences that are
-    /// cancelled / preempted / failed before their ack simply stop
-    /// contributing — there is no separate counter to leak.
-    ///
-    /// Slightly conservative: it counts the full segment width and ignores
-    /// prefix-cache hits (which consume no new worker slots), so it can only
-    /// *over*-estimate pending pressure, never under-estimate. Over-estimating
-    /// is the safe direction for over-commit protection.
-    pub fn inflight_prefill_tokens(&self) -> u32 {
-        self.prefilling
-            .values()
-            .filter_map(|seq| seq.inflight_segment())
-            .map(|seg| (seg.segment_end - seg.segment_start) as u32)
-            .sum()
-    }
-
     pub fn decoding_len(&self) -> usize {
         self.decoding.len()
     }
@@ -290,6 +274,7 @@ impl RequestTable {
 
         let seq = InferenceSession::new(meta, handle);
         self.waiting.push(seq);
+        self.by_sequence.insert(sequence_id, request_id);
         self.by_request.insert(request_id, sequence_id);
         if !external_id.is_empty() {
             // Multiple inflight requests can share the same client-provided
@@ -310,11 +295,10 @@ impl RequestTable {
         self.by_external_id.get(external_id).copied()
     }
 
-    /// Reverse lookup: internal RequestId for a known SequenceId.
+    /// Reverse lookup: internal RequestId for a known SequenceId. O(1) via
+    /// the `by_sequence` index.
     pub fn request_id_for_sequence(&self, sequence_id: SequenceId) -> Option<RequestId> {
-        self.by_request
-            .iter()
-            .find_map(|(rid, sid)| (*sid == sequence_id).then(|| rid.clone()))
+        self.by_sequence.get(&sequence_id).cloned()
     }
 
     pub fn prefilling_continuations(&self) -> Vec<(RequestId, usize)> {
@@ -548,14 +532,22 @@ impl RequestTable {
             SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
         })?;
         seq.append_token(token_id);
+        // Only streaming requests need the per-token delivery target. For
+        // non-streaming requests this allocates nothing (the token is buffered
+        // and delivered once at completion via `complete_session`).
+        let stream = if seq.meta.stream {
+            Some(StreamDelivery {
+                client_id: seq.handle.client_id.clone(),
+                external_id: seq.meta.external_id.clone(),
+            })
+        } else {
+            None
+        };
         Ok(TokenAppendOutcome {
-            request_id: seq.meta.id.clone(),
-            external_id: seq.meta.external_id.clone(),
             sequence_id,
-            client_id: ClientId::new(seq.handle.client_id.as_bytes().to_vec()),
-            stream: seq.meta.stream,
             token_id,
             worker_finished,
+            stream,
         })
     }
 
@@ -567,7 +559,7 @@ impl RequestTable {
         let seq = self.decoding.remove(key).ok_or_else(|| {
             SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
         })?;
-        self.remove_active(seq.meta.id.clone(), sequence_id)?;
+        self.remove_active(seq.meta.id.clone(), sequence_id, &seq.meta.external_id)?;
         debug_assert!(self.validate_consistency().is_ok());
         Ok(seq)
     }
@@ -587,7 +579,7 @@ impl RequestTable {
         match addr.bucket {
             Bucket::Decoding => {
                 let seq = self.decoding.get(addr.key)?;
-                Some(decoding_kv_slots(seq) as u32)
+                Some(accounting::decoding_kv_slots(seq) as u32)
             }
             Bucket::Prefilling => {
                 let seq = self.prefilling.get(addr.key)?;
@@ -595,31 +587,6 @@ impl RequestTable {
             }
             _ => None,
         }
-    }
-
-    /// KV slots that must stay free for already-admitted requests to finish
-    /// decoding without relying on worker-side emergency relief.
-    ///
-    /// Prefill produces the first output token without writing that generated
-    /// token into KV, so a request with `max_tokens = N` needs at most `N - 1`
-    /// future decode allocations after prefill. For sessions already decoding,
-    /// subtract the output tokens the scheduler has observed.
-    pub fn future_decode_reserve_tokens(&self) -> usize {
-        let prefilling_reserve: usize = self
-            .prefilling
-            .values()
-            .map(|seq| seq.meta.max_tokens.saturating_sub(1))
-            .sum();
-        let decoding_reserve: usize = self
-            .decoding
-            .values()
-            .map(|seq| {
-                seq.meta
-                    .max_tokens
-                    .saturating_sub(seq.state.output_tokens.len())
-            })
-            .sum();
-        prefilling_reserve.saturating_add(decoding_reserve)
     }
 
     pub fn fail_sequence(
@@ -638,7 +605,7 @@ impl RequestTable {
                 })?;
                 let request_id = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id)?;
+                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
                 Ok(FailedOutcome::RemovedPrefilling {
                     request_id,
                     external_id,
@@ -652,7 +619,7 @@ impl RequestTable {
                 })?;
                 let request_id = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id)?;
+                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
                 Ok(FailedOutcome::RemovedDecoding {
                     request_id,
                     external_id,
@@ -679,7 +646,7 @@ impl RequestTable {
         let seq = self.prefilling.remove(addr.key).ok_or_else(|| {
             SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
         })?;
-        self.remove_active(request_id.clone(), sequence_id)?;
+        self.remove_active(request_id.clone(), sequence_id, &seq.meta.external_id)?;
         Ok(Some(seq))
     }
 
@@ -695,7 +662,7 @@ impl RequestTable {
                 let seq = self.waiting.remove(request_id).ok_or_else(|| {
                     SchedulerError::Internal(format!("waiting request not found: {}", request_id))
                 })?;
-                self.remove_active(request_id.clone(), sequence_id)?;
+                self.remove_active(request_id.clone(), sequence_id, &seq.meta.external_id)?;
                 Ok(CancelOutcome::RemovedWaiting {
                     request_id: seq.meta.id.clone(),
                     external_id: seq.meta.external_id.clone(),
@@ -708,7 +675,7 @@ impl RequestTable {
                 })?;
                 let request_id_out = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id)?;
+                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
                 Ok(CancelOutcome::RemovedPrefilling {
                     request_id: request_id_out,
                     external_id,
@@ -721,7 +688,7 @@ impl RequestTable {
                 })?;
                 let request_id_out = seq.meta.id.clone();
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id)?;
+                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
                 Ok(CancelOutcome::RemovedDecoding {
                     request_id: request_id_out,
                     external_id,
@@ -729,38 +696,6 @@ impl RequestTable {
                 })
             }
         }
-    }
-
-    /// Collect all currently-active sequences (decoding + chunked
-    /// prefilling) along with the data the scheduler needs to score
-    /// them as preemption victims.
-    ///
-    /// `Prefilling` sequences whose `num_computed_tokens == 0` are
-    /// excluded — they have no KV state on the worker yet, so
-    /// preempting them frees nothing. Any `Prefilling` with
-    /// `num_computed_tokens > 0` (chunked prefill in progress) IS
-    /// included: its KV slots are real and worth recovering.
-    pub fn preemption_candidates(&self) -> Vec<PreemptCandidate> {
-        let mut out = Vec::with_capacity(self.decoding.len() + self.prefilling.len());
-        for seq in self.decoding.values() {
-            out.push(PreemptCandidate {
-                sequence_id: seq.meta.sequence_id.0,
-                output_len: seq.state.output_tokens.len() as u32,
-                input_len: seq.meta.input_ids.len() as u32,
-                kv_used: decoding_kv_slots(seq) as u32,
-            });
-        }
-        for seq in self.prefilling.values() {
-            if seq.state.num_computed_tokens > 0 {
-                out.push(PreemptCandidate {
-                    sequence_id: seq.meta.sequence_id.0,
-                    output_len: 0,
-                    input_len: seq.meta.input_ids.len() as u32,
-                    kv_used: seq.state.num_computed_tokens as u32,
-                });
-            }
-        }
-        out
     }
 
     /// Move an active sequence (Decoding or Prefilling) back to the
@@ -850,6 +785,13 @@ impl RequestTable {
                 self.locations.len()
             )));
         }
+        if active_count != self.by_sequence.len() {
+            return Err(SchedulerError::Internal(format!(
+                "reverse index count mismatch: active={} by_sequence={}",
+                active_count,
+                self.by_sequence.len()
+            )));
+        }
 
         for seq in self.waiting.iter() {
             let addr = self.locations.get(&seq.meta.sequence_id).ok_or_else(|| {
@@ -923,6 +865,12 @@ impl RequestTable {
                 request_id
             )));
         }
+        if self.by_sequence.get(&sequence_id) != Some(request_id) {
+            return Err(SchedulerError::Internal(format!(
+                "reverse index mismatch for sequence_id={} (request {})",
+                sequence_id, request_id
+            )));
+        }
         Ok(())
     }
 
@@ -972,7 +920,12 @@ impl RequestTable {
         Ok(addr.key)
     }
 
-    fn remove_active(&mut self, request_id: RequestId, sequence_id: SequenceId) -> Result<()> {
+    fn remove_active(
+        &mut self,
+        request_id: RequestId,
+        sequence_id: SequenceId,
+        external_id: &str,
+    ) -> Result<()> {
         match self.by_request.remove(&request_id) {
             Some(id) if id == sequence_id => {}
             Some(id) => {
@@ -988,27 +941,27 @@ impl RequestTable {
                 )));
             }
         }
+        self.by_sequence.remove(&sequence_id);
         self.locations.remove(&sequence_id).ok_or_else(|| {
             SchedulerError::Internal(format!("location missing on removal: {}", sequence_id))
         })?;
         // Drop the external_id → sequence_id mapping if it still points at us.
-        // (A later request may have shadowed it; we don't disturb that.)
-        self.by_external_id.retain(|_, sid| *sid != sequence_id);
+        // (A later request may have shadowed it; we don't disturb that.) O(1):
+        // we hold the owning sequence's external_id, so no full-map scan.
+        if !external_id.is_empty()
+            && self.by_external_id.get(external_id) == Some(&sequence_id)
+        {
+            self.by_external_id.remove(external_id);
+        }
         Ok(())
     }
-}
-
-fn decoding_kv_slots(seq: &InferenceSession<Decoding>) -> usize {
-    seq.state
-        .prompt_len
-        .saturating_add(seq.state.output_tokens.len().saturating_sub(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::inference_session::lifecycle::{Priority, SamplingParams};
-    use crate::infrastructure::kv_cache::traits::PrefixMatch;
+    use crate::domain::prefix::PrefixMatch;
     use std::time::Instant;
 
     fn meta(
@@ -1196,7 +1149,7 @@ mod tests {
         // Schedule a tiny chunk → enters Prefilling with inflight set,
         // but num_computed_tokens still 0.
         table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
-        let cands = table.preemption_candidates();
+        let cands = accounting::preemption_candidates(&table);
         assert!(
             cands.iter().all(|c| c.sequence_id != 1),
             "prefilling with num_computed_tokens=0 must not be a candidate"
@@ -1213,7 +1166,7 @@ mod tests {
         table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
         // Ack first chunk → num_computed_tokens = 1, still Prefilling.
         let _ = table.ack_prefill(SequenceId(5)).unwrap();
-        let cands = table.preemption_candidates();
+        let cands = accounting::preemption_candidates(&table);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].sequence_id, 5);
         assert_eq!(cands[0].output_len, 0);
@@ -1245,7 +1198,7 @@ mod tests {
             .unwrap();
         assert_eq!(table.kv_slots_for_sequence(SequenceId(8)), Some(5));
 
-        let cands = table.preemption_candidates();
+        let cands = accounting::preemption_candidates(&table);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].kv_used, 5);
     }

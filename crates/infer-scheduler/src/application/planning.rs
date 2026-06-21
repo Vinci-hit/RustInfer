@@ -17,8 +17,8 @@
 //! - [`PlanningSystem::execute_plan`] — drive RadixTree prefix
 //!   pinning + `RequestTable` transitions for the prefill batch
 //!   entries.
-//! - [`PlanningSystem::build_llm_batch`] / `build_diffusion_batch`
-//!   — wire-format serialization, with reusable buffers.
+//! - [`PlanningSystem::build_batch`] — mode-dispatched wire-format
+//!   serialization, with reusable buffers.
 //! - [`PlanningSystem::scheduled_segments`] — read-only access to
 //!   the current chunk-size list.
 
@@ -47,7 +47,7 @@ pub struct PlanningSystem {
     current_chunk_sizes: Vec<(RequestId, usize)>,
     /// Per-iteration prefix-cache hits keyed by request id. Populated
     /// by `execute_plan` (fresh-prompt branch) from
-    /// `RadixTree::lookup_prefix`; consumed by `build_llm_batch` to
+    /// `RadixTree::lookup_prefix`; consumed by `build_batch` to
     /// fill `PrefillSegmentMeta.prefix_hint`. Cleared alongside
     /// `current_chunk_sizes`.
     current_prefix_hints: Vec<(RequestId, Vec<GlobalIndex>)>,
@@ -213,37 +213,11 @@ impl PlanningSystem {
             .sum()
     }
 
-    /// Build the LLM-mode `Prefill` batch, reusing internal buffers.
-    /// Decoding is the worker's responsibility; the scheduler only
-    /// emits prefill commands.
-    pub fn build_llm_batch(
-        &mut self,
-        prefilling: &[&InferenceSession<Prefilling>],
-        config: &SchedulerConfig,
-        codec: &MsgPackCodec,
-    ) -> Result<Vec<u8>> {
-        self.builder.build_llm_batch(
-            prefilling,
-            config,
-            codec,
-            &self.current_chunk_sizes,
-            &self.current_prefix_hints,
-        )
-    }
-
-    /// Build the Diffusion-mode batch.
-    pub fn build_diffusion_batch(
-        &mut self,
-        prefilling: &[&InferenceSession<Prefilling>],
-        codec: &MsgPackCodec,
-    ) -> Result<Vec<u8>> {
-        self.builder
-            .build_diffusion_batch(prefilling, codec, &self.current_chunk_sizes)
-    }
-
-    /// Unified batch build — dispatches to LLM or Diffusion internally.
-    /// This is the preferred entry point; the mode-specific methods are
-    /// retained for backward compat.
+    /// Build the worker batch command for the current iteration, reusing the
+    /// builder's internal staging buffers. Dispatches by mode: LLM emits
+    /// prefill segments (decoding is the worker's job); Diffusion emits the
+    /// per-request batch. The scheduled chunk sizes and prefix hints captured
+    /// by `execute_plan` ride along.
     pub fn build_batch(
         &mut self,
         prefilling: &[&InferenceSession<Prefilling>],
@@ -251,8 +225,17 @@ impl PlanningSystem {
         codec: &MsgPackCodec,
     ) -> Result<Vec<u8>> {
         match config.mode {
-            SchedulerMode::Llm => self.build_llm_batch(prefilling, config, codec),
-            SchedulerMode::Diffusion => self.build_diffusion_batch(prefilling, codec),
+            SchedulerMode::Llm => self.builder.build_llm_batch(
+                prefilling,
+                config,
+                codec,
+                &self.current_chunk_sizes,
+                &self.current_prefix_hints,
+            ),
+            SchedulerMode::Diffusion => {
+                self.builder
+                    .build_diffusion_batch(prefilling, codec, &self.current_chunk_sizes)
+            }
         }
     }
 }

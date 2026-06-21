@@ -1,5 +1,7 @@
 //! Request handle — response channel back to the HTTP server.
 
+use std::sync::Arc;
+
 /// Handle for sending responses back to the client.
 ///
 /// Holds the opaque client identity (ZMQ routing frame) and optionally
@@ -13,17 +15,19 @@ pub struct RequestHandle {
 
 /// Opaque client identity for routing responses.
 ///
-/// The inner `Vec<u8>` is the ZMQ ROUTER identity frame; treat it as opaque.
+/// The inner bytes are the ZMQ ROUTER identity frame; treat them as opaque.
+/// Backed by `Arc<[u8]>` so handing the identity to the streaming output path
+/// or the ZMQ thread is a refcount bump, not a per-token heap allocation.
 /// Construct via [`ClientId::new`] and consume via [`ClientId::as_bytes`] /
 /// [`ClientId::into_bytes`] / [`ClientId::clone`]. The field is private so
 /// external crates cannot reach in and break the routing invariant.
 #[derive(Debug, Clone)]
-pub struct ClientId(Vec<u8>);
+pub struct ClientId(Arc<[u8]>);
 
 impl ClientId {
     /// Wrap raw routing bytes (typically the ZMQ socket identity).
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(Arc::from(bytes.into_boxed_slice()))
     }
 
     /// Borrow the routing bytes.
@@ -31,14 +35,14 @@ impl ClientId {
         &self.0
     }
 
-    /// Consume self into the raw routing bytes.
+    /// Copy out the raw routing bytes.
     pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        self.0.to_vec()
     }
 
     /// Create a dummy client ID (for testing).
     pub fn dummy() -> Self {
-        Self(vec![0u8; 4])
+        Self(Arc::from(vec![0u8; 4].into_boxed_slice()))
     }
 }
 

@@ -286,26 +286,27 @@ impl SchedulerEngine {
     //  Control-plane event dispatch
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Dispatch a single control event into the workflow.
+    /// Dispatch a single control event.
+    ///
+    /// Control-plane handling is mode-independent, so the engine calls
+    /// `control_fns::handle_control_event` directly with disjoint field borrows
+    /// — no workflow indirection and no manual re-borrow dance. Prefix-cache
+    /// relief only applies in LLM mode with caching enabled.
     pub(crate) async fn on_control_event(&mut self, event: ControlEvent) -> Result<()> {
         use crate::application::ControlOutcome;
 
-        let outcome = {
-            let (workflow, _dispatch, mut ctx) = self.split_for_workflow();
-            // These are shared (`&`) refs also held inside `ctx`; copy them out
-            // as independent shared borrows before the `&mut ctx` call so the
-            // borrows don't overlap in the call expression.
-            let control_cmd = ctx.control_cmd;
-            let worker_group = ctx.worker_group;
-            let default_worker = ctx.default_worker;
-            workflow.handle_control_event(
-                event,
-                &mut ctx,
-                control_cmd,
-                worker_group,
-                default_worker,
-            )
-        };
+        let enable_prefix_caching = matches!(self.config.mode, SchedulerMode::Llm)
+            && self.config.enable_prefix_caching;
+        let outcome = crate::application::control_fns::handle_control_event(
+            event,
+            &mut self.requests,
+            &mut self.radix,
+            &mut self.kv_budget,
+            &self.control_cmd,
+            &self.worker_group,
+            &self.default_worker,
+            enable_prefix_caching,
+        );
         match outcome {
             ControlOutcome::Continue {
                 failed_request_ids,
@@ -317,7 +318,7 @@ impl SchedulerEngine {
                 }
                 Ok(())
             }
-            ControlOutcome::Terminate { lost: _, error } => {
+            ControlOutcome::Terminate { error } => {
                 let running: Vec<RequestId> = self
                     .requests
                     .running_sequence_ids()

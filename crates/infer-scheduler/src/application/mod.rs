@@ -2,7 +2,7 @@
 //!
 //! Middle ring of the hexagonal architecture. Consumes the
 //! `domain::*` aggregate roots (Session / KvBudget / RadixTree /
-//! WorkerNode / Policy) and the `infrastructure::*` IO adapters, and
+//! Policy) and the `infrastructure::*` IO adapters, and
 //! exposes the user-facing flows: ingest a request, schedule one
 //! iteration, drain outputs, drive control events.
 //!
@@ -47,6 +47,6 @@ pub mod workflow;
 pub use dispatch::DispatchSystem;
 pub use engine::SchedulerEngine;
 pub use ingestion::IngestionSystem;
-pub use outcomes::{ControlFlow, ControlOutcome};
+pub use outcomes::ControlOutcome;
 pub use planning::PlanningSystem;
 pub use workflow::{DiffusionWorkflow, EngineWorkflow, LlmWorkflow, ResourceContext};

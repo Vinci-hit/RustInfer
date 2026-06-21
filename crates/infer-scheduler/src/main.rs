@@ -77,22 +77,8 @@ async fn main() -> Result<()> {
     tracing::info!("  chunked_prefill_size: {:?}", cfg.chunked_prefill());
     tracing::info!("  enable_prefix_caching: {}", cfg.enable_prefix_caching);
 
-    // Build config.
-    let mut config = SchedulerConfig {
-        mode: scheduler_mode,
-        max_num_seqs: cfg.max_batch_seqs,
-        max_batch_tokens: cfg.max_batch_tokens,
-        max_model_len: cfg.max_model_len,
-        paged_block_size,
-        chunked_prefill_size: cfg.chunked_prefill(),
-        max_prefill_seqs_per_iter: cfg.max_prefill_seqs_per_iter,
-        prefill_sjf: cfg.prefill_sjf,
-        enable_prefix_caching: cfg.enable_prefix_caching,
-        frontend_endpoint: frontend_endpoint.clone(),
-        worker_push_endpoint: worker_push_endpoint.clone(),
-        worker_pull_endpoint: worker_pull_endpoint.clone(),
-        ..Default::default()
-    };
+    // Build config from the shared launch config (single mapping + validation).
+    let mut config = SchedulerConfig::from_launch(&cfg, scheduler_mode, paged_block_size);
 
     // Create transports.
     let frontend = ZmqFrontendTransport::new(&frontend_endpoint)?;
@@ -144,21 +130,14 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("control plane reports no workers after bootstrap"))?;
     let control_cmd = control_plane.cmd_tx();
     let control_events = control_plane.take_event_rx();
-    // Hand the ControlPlane to the engine via a leak — the engine's lifetime
-    // matches the process lifetime, and ControlPlane's Drop performs graceful
-    // shutdown. Boxing + leaking keeps it alive for the duration of run().
-    let _control_plane_handle: &'static ControlPlane = Box::leak(Box::new(control_plane));
+    // Keep the ControlPlane owned for the whole run. `cmd_tx()` / `take_event_rx()`
+    // hand the engine independent owned handles, so the plane itself does not need
+    // to be borrowed or leaked. Holding it in this binding keeps the router thread
+    // and liveness watchdog alive for the duration of `engine.run()`, and lets its
+    // `Drop` run on exit — performing graceful shutdown (Shutdown to the worker,
+    // router-thread join, pending-RPC drain) that the previous `Box::leak` skipped.
 
-    if let Some(max_total_kv_tokens) = worker_group.effective_capacity.max_total_kv_tokens {
-        let block_size = paged_block_size.as_usize();
-        config.num_gpu_blocks = max_total_kv_tokens / block_size;
-        tracing::info!(
-            "Paged KV capacity from worker profile: num_gpu_blocks={} block_size={} max_total_kv_tokens={}",
-            config.num_gpu_blocks,
-            block_size,
-            max_total_kv_tokens,
-        );
-    }
+    config.apply_worker_capacity(worker_group.effective_capacity.max_total_kv_tokens);
 
     // The worker is the sole owner of physical block allocation; the
     // scheduler only tracks slot accounting via `KvBudget` + `RadixTree`,
@@ -187,5 +166,8 @@ async fn main() -> Result<()> {
     tracing::info!("Scheduler engine running...");
     engine.run().await?;
 
+    // Engine loop has exited; tear the control plane down gracefully (Shutdown to
+    // the worker + router-thread join) before the process returns.
+    drop(control_plane);
     Ok(())
 }

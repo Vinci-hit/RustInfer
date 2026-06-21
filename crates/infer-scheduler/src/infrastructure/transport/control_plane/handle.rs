@@ -18,48 +18,11 @@ use tokio::sync::{mpsc, oneshot};
 use super::pending_calls::PendingCalls;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WorkerId
+//  WorkerId — canonical definition lives in `domain::ids`; re-exported here so
+//  the transport's own `control_plane::WorkerId` call sites keep resolving.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Stable scheduler-side identifier for a worker.
-///
-/// Wraps the ZMQ ROUTER identity bytes assigned at connect time. We never
-/// expose the raw bytes through the engine API — engine code references
-/// workers exclusively by `WorkerId`.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct WorkerId(Arc<[u8]>);
-
-impl WorkerId {
-    /// Build a `WorkerId` from raw ZMQ identity bytes (router-internal use).
-    pub(crate) fn from_identity(bytes: &[u8]) -> Self {
-        Self(Arc::from(bytes))
-    }
-
-    /// Raw identity bytes for emitting through ZMQ.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for WorkerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Most ZMQ identities are short ASCII-ish; format as hex for clarity.
-        write!(f, "WorkerId(")?;
-        for b in self.0.iter() {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, ")")
-    }
-}
-
-impl std::fmt::Display for WorkerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in self.0.iter() {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
-    }
-}
+pub use crate::domain::ids::WorkerId;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ControlEvent

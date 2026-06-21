@@ -2,7 +2,7 @@
 //!
 //! Centralized newtype dictionary for the scheduler domain:
 //! - **Identity**: `InferenceRequestId`, `SequenceId`, `ClientId`,
-//!   `WorkerNodeId`, `ModelInstanceId`
+//!   `WorkerId`, `ModelInstanceId`
 //! - **KV resources**: `BlockSize`, `BlockCount`
 //! - **Counts**: `TokenCount`, `SeqCount`, `PromptLen`, `GeneratedCount`
 //! - **Time**: `ArrivalTime`, `LastSeenAt`
@@ -16,11 +16,12 @@
 //!   arithmetic explicit; **no implicit conversion to `usize`**.
 //! - Identity types implement `Display` for log-friendly output.
 //!
-//! `RequestId`, `SequenceId`, `ClientId`, and `WorkerNodeId` are re-exported
-//! here from their canonical modules so callers can spell their imports
-//! through `domain::ids` without navigating into sub-modules.
+//! `RequestId`, `SequenceId`, and `ClientId` are re-exported here from their
+//! canonical modules so callers can spell their imports through `domain::ids`
+//! without navigating into sub-modules. `WorkerId` is defined in this module.
 
 use std::ops::{Add, Sub};
+use std::sync::Arc;
 use std::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29,7 +30,51 @@ use std::time::Instant;
 
 pub use crate::domain::inference_session::handle::ClientId;
 pub use crate::domain::inference_session::lifecycle::{RequestId, SequenceId};
-pub use crate::infrastructure::transport::control_plane::WorkerId as WorkerNodeId;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WorkerId — worker identity (defined here so the dependency arrow points
+//  infra -> domain; the transport re-exports it for its own call sites).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stable scheduler-side identifier for a worker.
+///
+/// Wraps the ZMQ ROUTER identity bytes assigned at connect time. Engine code
+/// references workers exclusively by `WorkerId`; the raw bytes are used only by
+/// the transport when emitting through ZMQ.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct WorkerId(Arc<[u8]>);
+
+impl WorkerId {
+    /// Build a `WorkerId` from raw ZMQ identity bytes (transport-internal use).
+    pub(crate) fn from_identity(bytes: &[u8]) -> Self {
+        Self(Arc::from(bytes))
+    }
+
+    /// Raw identity bytes for emitting through ZMQ.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Most ZMQ identities are short ASCII-ish; format as hex for clarity.
+        write!(f, "WorkerId(")?;
+        for b in self.0.iter() {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl std::fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0.iter() {
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Identity (defined in this module)

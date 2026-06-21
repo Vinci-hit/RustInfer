@@ -73,7 +73,7 @@ pub async fn fail_prefilling_session(
     message: &str,
 ) -> Result<()> {
     let external_id = seq.meta.external_id.clone();
-    let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
+    let client_id = seq.handle.client_id.clone();
     let stream = seq.meta.stream;
     send_request_error(
         frontend,
@@ -93,7 +93,7 @@ pub async fn fail_decoding_session(
     message: &str,
 ) -> Result<()> {
     let external_id = seq.meta.external_id.clone();
-    let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
+    let client_id = seq.handle.client_id.clone();
     let stream = seq.meta.stream;
     let num_tokens = seq.state.output_tokens.len() as u32;
     send_request_error(
@@ -117,13 +117,23 @@ pub async fn complete_session(
 
     let request_id_display = seq.meta.id.to_string();
     let external_id = seq.meta.external_id.clone();
-    let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
+    let client_id = seq.handle.client_id.clone();
     let stream = seq.meta.stream;
 
     let reason = if seq.reached_max_tokens() {
         FinishReason::MaxTokens
     } else {
         FinishReason::Eos
+    };
+    // Map the typed finish reason to the wire string rather than hardcoding
+    // "stop": a max_tokens cutoff must report "length", a natural stop (EOS or
+    // stop-sequence) reports "stop". Used for both the streaming Done chunk and
+    // the unary response below.
+    let finish_reason = match reason {
+        FinishReason::MaxTokens => "length",
+        FinishReason::Eos | FinishReason::StopSequence => "stop",
+        FinishReason::Error(_) => "error",
+        FinishReason::Cancelled => "cancel",
     };
 
     let finished = seq.finish(reason);
@@ -156,7 +166,7 @@ pub async fn complete_session(
                     request_id: external_id,
                     chunk_type: ChunkType::Done,
                     token_id: None,
-                    finish_reason: Some("stop".to_string()),
+                    finish_reason: Some(finish_reason.to_string()),
                     metrics: Some(response_metrics.clone()),
                 },
             )
@@ -167,7 +177,7 @@ pub async fn complete_session(
             status: ResponseStatus::Success,
             output_token_ids: finished.state.output_tokens,
             images: vec![],
-            finish_reason: Some("stop".to_string()),
+            finish_reason: Some(finish_reason.to_string()),
             error: None,
             metrics: response_metrics.clone(),
         };
@@ -249,11 +259,11 @@ pub async fn process_llm_step_decoded(
             token.finished,
         ) {
             Ok(outcome) => {
-                if outcome.stream {
+                if let Some(delivery) = outcome.stream {
                     token_chunks.push((
-                        outcome.client_id,
+                        delivery.client_id,
                         StreamChunk {
-                            request_id: outcome.external_id,
+                            request_id: delivery.external_id,
                             chunk_type: ChunkType::Token,
                             token_id: Some(outcome.token_id),
                             finish_reason: None,
@@ -326,7 +336,7 @@ pub async fn process_diffusion_step_decoded(
         };
         let request_id_display = seq.meta.id.to_string();
         let external_id = seq.meta.external_id.clone();
-        let client_id = ClientId::new(seq.handle.client_id.as_bytes().to_vec());
+        let client_id = seq.handle.client_id.clone();
 
         let elapsed_ms = seq.meta.arrival_time.elapsed().as_millis() as u64;
         let (status, images, error) = match item.status {

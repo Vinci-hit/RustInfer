@@ -1,14 +1,14 @@
 //! Engine workflow trait and ResourceContext.
 //!
-//! The `EngineWorkflow` trait is the deepest seam: mode-specific
-//! scheduling, output processing, and control-event handling all
-//! live behind this one interface. The engine becomes "receive event,
-//! dispatch to workflow, send result."
+//! The `EngineWorkflow` trait is the mode seam: mode-specific scheduling
+//! (`try_schedule`) and output processing (`handle_step_output`) live behind
+//! it. Control-plane handling is *not* part of this trait — it is
+//! mode-independent (both LLM and Diffusion delegated to the identical
+//! `control_fns::handle_control_event`), so the engine calls it directly.
 
 use async_trait::async_trait;
 
 use crate::application::dispatch::DispatchSystem;
-use crate::application::outcomes::ControlOutcome;
 use crate::application::scheduler_event::SchedulerEvent;
 use crate::config::SchedulerConfig;
 use crate::domain::inference_session::table::RequestTable;
@@ -17,9 +17,7 @@ use crate::error::Result;
 use crate::infrastructure::kv_cache::radix_tree::RadixTree;
 use crate::infrastructure::metrics::MetricsRecorder;
 use crate::infrastructure::transport::codec::MsgPackCodec;
-use crate::infrastructure::transport::control_plane::{
-    ControlEvent, ControlPlaneCmdTx, WorkerGroup, WorkerId,
-};
+use crate::infrastructure::transport::control_plane::{ControlPlaneCmdTx, WorkerGroup, WorkerId};
 
 /// Resources shared across all workflow implementations.
 ///
@@ -64,17 +62,6 @@ pub trait EngineWorkflow: Send + Sync {
         dispatch: &mut DispatchSystem,
         event: SchedulerEvent,
     ) -> Result<()>;
-
-    /// Handle a control-plane event. Returns a `ControlOutcome` that
-    /// the engine then dispatches (fail sessions, terminate, etc.).
-    fn handle_control_event(
-        &self,
-        event: ControlEvent,
-        ctx: &mut ResourceContext<'_>,
-        control_cmd: &ControlPlaneCmdTx,
-        worker_group: &WorkerGroup,
-        default_worker: &WorkerId,
-    ) -> ControlOutcome;
 }
 
 mod diffusion;

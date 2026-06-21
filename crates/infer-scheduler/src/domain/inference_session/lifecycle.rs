@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::domain::inference_session::handle::RequestHandle;
-use crate::infrastructure::kv_cache::traits::PrefixMatch;
+use crate::domain::prefix::PrefixMatch;
 use infer_protocol::server_to_scheduler::DiffusionRequest;
 
 // ═══════════════════════════════════════════════════════════════════════════════

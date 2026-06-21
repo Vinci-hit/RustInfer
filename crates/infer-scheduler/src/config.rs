@@ -1,5 +1,7 @@
 //! Scheduler configuration.
 
+use infer_protocol::RustInferConfig;
+
 use crate::domain::ids::BlockSize;
 
 /// Scheduler operating mode — determines scheduling behavior.
@@ -54,6 +56,58 @@ pub struct SchedulerConfig {
     // ─── Observability ───
     /// Enable metrics recording.
     pub metrics_enabled: bool,
+}
+
+impl SchedulerConfig {
+    /// Build a scheduler config from the shared launch config.
+    ///
+    /// Centralizes the launch-config → scheduler-config mapping (previously a
+    /// hand-copied field list in `main.rs`) and applies cross-field validation:
+    /// prefix caching is only meaningful in LLM mode, so it is forced off for
+    /// other modes. Worker-derived capacity (`num_gpu_blocks`) is filled in
+    /// later via [`Self::apply_worker_capacity`] once the worker profile is
+    /// known.
+    pub fn from_launch(cfg: &RustInferConfig, mode: SchedulerMode, paged_block_size: BlockSize) -> Self {
+        let enable_prefix_caching = cfg.enable_prefix_caching && matches!(mode, SchedulerMode::Llm);
+        if cfg.enable_prefix_caching && !enable_prefix_caching {
+            tracing::warn!(
+                "enable_prefix_caching is only supported in LLM mode; disabling for {:?} mode",
+                mode
+            );
+        }
+        Self {
+            mode,
+            max_num_seqs: cfg.max_batch_seqs,
+            max_batch_tokens: cfg.max_batch_tokens,
+            max_model_len: cfg.max_model_len,
+            paged_block_size,
+            chunked_prefill_size: cfg.chunked_prefill(),
+            max_prefill_seqs_per_iter: cfg.max_prefill_seqs_per_iter,
+            prefill_sjf: cfg.prefill_sjf,
+            enable_prefix_caching,
+            frontend_endpoint: cfg.frontend_endpoint(),
+            worker_push_endpoint: cfg.worker_in_endpoint(),
+            worker_pull_endpoint: cfg.worker_out_endpoint(),
+            ..Default::default()
+        }
+    }
+
+    /// Fold the worker-profiled paged-KV capacity into the config once the
+    /// control-plane handshake reports it: derive `num_gpu_blocks` from the
+    /// worker's `max_total_kv_tokens`. No-op if the worker did not report a
+    /// total (e.g. non-paged backends).
+    pub fn apply_worker_capacity(&mut self, max_total_kv_tokens: Option<usize>) {
+        if let Some(tokens) = max_total_kv_tokens {
+            let block_size = self.paged_block_size.as_usize();
+            self.num_gpu_blocks = tokens / block_size;
+            tracing::info!(
+                num_gpu_blocks = self.num_gpu_blocks,
+                block_size,
+                max_total_kv_tokens = tokens,
+                "Paged KV capacity from worker profile"
+            );
+        }
+    }
 }
 
 impl Default for SchedulerConfig {

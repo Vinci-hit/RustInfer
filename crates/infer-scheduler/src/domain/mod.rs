@@ -10,20 +10,19 @@
 //! - [`kv_budget`]            — `KvBudget` capacity gate over
 //!                              worker-reported global KV slots
 //! - [`policy`]               — scheduling policy domain service
-//! - [`worker_node`]          — typestate `WorkerNode<S>`
 
 pub mod ids;
 pub mod inference_session;
 pub mod kv_budget;
 pub mod policy;
-pub mod worker_node;
+pub mod prefix;
 
 // Re-exports for the most-used types at the domain root, so callers
 // don't need to dive into sub-modules for the canonical surface.
 pub use ids::{
     BlockCount, BlockSize, InferenceRequestId, LastSeenAt, ModelInstanceId, SeqCount, SequenceId,
-    TokenCount, WorkerNodeId,
+    TokenCount, WorkerId,
 };
 pub use inference_session::lifecycle::InferenceSession;
 pub use kv_budget::{KvBudget, KvBudgetFull};
-pub use worker_node::{Capacity, Lost, NodeState, Ready, WorkerNode};
+pub use prefix::PrefixMatch;
