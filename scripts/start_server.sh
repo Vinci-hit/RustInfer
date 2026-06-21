@@ -13,6 +13,11 @@
 
 set -e
 
+# Drop any inherited proxy so local server traffic stays off the proxy.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+export no_proxy="localhost,127.0.0.1,::1"
+export NO_PROXY="$no_proxy"
+
 CONFIG="${CONFIG:-${1:-rustinfer.toml}}"
 
 echo "═════════════════════════════════════════════════════"

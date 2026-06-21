@@ -11,6 +11,10 @@
         exit(EXIT_FAILURE); \
     } \
 }
+// Forward declaration — defined later in this TU. Lazily creates a legacy
+// cuBLAS handle used by the graph-capturable bf16 matmul path.
+static cublasHandle_t get_cublas_handle();
+
 template <int THREAD_PER_BLOCK>
 __global__ void sgemv_kernel_cu_fp32x4(
     const float* input,
@@ -185,6 +189,47 @@ static bool zimage_bf16_gemm_bench_disabled()
     return cached == 1;
 }
 
+// Returns true if `algo` can be recorded into a CUDA graph via stream capture.
+// Some cuBLASLt algorithms (notably workspace split-K reductions chosen for
+// large-K shapes) issue calls that are illegal under capture and fail with
+// status=13; such algos must NOT be cached for the graph decode path. We test
+// by capturing a single matmul (capture records, does not execute, so the
+// bench buffers are not touched here) and checking a valid graph comes back.
+static bool zimage_algo_is_capturable(
+    cublasLtHandle_t h,
+    cublasLtMatmulDesc_t op,
+    cublasLtMatrixLayout_t A,
+    cublasLtMatrixLayout_t B,
+    cublasLtMatrixLayout_t C,
+    const cublasLtMatmulAlgo_t* algo,
+    const __nv_bfloat16* bench_A,
+    const __nv_bfloat16* bench_B,
+    __nv_bfloat16* bench_C,
+    void* ws,
+    size_t wsSize)
+{
+    cudaStream_t ts = nullptr;
+    if (cudaStreamCreate(&ts) != cudaSuccess) return false;
+    float alpha = 1.0f, beta = 0.0f;
+    bool capturable = false;
+    // cudaStreamCaptureModeRelaxed (==2) matches the runtime decode capture.
+    if (cudaStreamBeginCapture(ts, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+        cublasStatus_t s = cublasLtMatmul(
+            h, op, &alpha,
+            bench_B, A, bench_A, B, &beta,
+            bench_C, C, bench_C, C,
+            algo, ws, wsSize, ts);
+        cudaGraph_t g = nullptr;
+        cudaError_t ce = cudaStreamEndCapture(ts, &g);
+        capturable = (s == CUBLAS_STATUS_SUCCESS && ce == cudaSuccess && g != nullptr);
+        if (g) cudaGraphDestroy(g);
+    }
+    // Clear any sticky error left by an invalidated capture attempt.
+    cudaGetLastError();
+    cudaStreamDestroy(ts);
+    return capturable;
+}
+
 static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     int M, int N, int K, size_t workspaceSize,
     // scratch buffers from the caller — we reuse these for the benchmark
@@ -275,6 +320,14 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
             if (s != CUBLAS_STATUS_SUCCESS) continue;
             if (cudaStreamSynchronize(bench_s) != cudaSuccess) continue;
 
+            // Only keep algos that are also CUDA-graph-capturable (the decode
+            // path replays these inside a captured graph).
+            if (!zimage_algo_is_capturable(bench_h, e.op, e.A, e.B, e.C,
+                                           &hres[i].algo, bench_A, bench_B,
+                                           bench_C, bench_ws, workspaceSize)) {
+                continue;
+            }
+
             bool ok = true;
             cudaEventRecord(t0, bench_s);
             for (int r = 0; r < 5; ++r) {
@@ -308,15 +361,33 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     }
 
     if (best < 0) {
-        // No bench — take the first viable heuristic result.
+        // No bench (or no benched algo captured) — take the first heuristic
+        // result that is graph-capturable.
+        cublasLtHandle_t test_h = nullptr;
+        cublasLtCreate(&test_h);
         for (int i = 0; i < returned; ++i) {
-            if (hres[i].state == CUBLAS_STATUS_SUCCESS
-                && hres[i].workspaceSize <= workspaceSize) {
+            if (hres[i].state != CUBLAS_STATUS_SUCCESS) continue;
+            if (hres[i].workspaceSize > workspaceSize) continue;
+            if (zimage_algo_is_capturable(test_h, e.op, e.A, e.B, e.C,
+                                          &hres[i].algo, bench_A, bench_B,
+                                          bench_C, bench_ws, workspaceSize)) {
                 best = i;
                 break;
             }
         }
-        if (best < 0) best = 0;
+        cublasLtDestroy(test_h);
+        if (best < 0) {
+            // Last resort: first viable algo even if not capturable (will error
+            // loudly at use under capture rather than silently misbehave).
+            for (int i = 0; i < returned; ++i) {
+                if (hres[i].state == CUBLAS_STATUS_SUCCESS
+                    && hres[i].workspaceSize <= workspaceSize) {
+                    best = i;
+                    break;
+                }
+            }
+            if (best < 0) best = 0;
+        }
     }
 
     e.algo = hres[best].algo;
@@ -341,44 +412,79 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     size_t workspaceSize,
     cudaStream_t stream)
 {
-    // Direct cuBLASLt call. No heuristic cache, no benchmarking, no private stream,
-    // no graph-specific algorithm branch. Let cuBLASLt choose its default algorithm.
-    // NOTE: passing nullptr for algo lets cuBLASLt's internal runtime pick the
-    // optimal kernel for the given (M,N,K) — empirically faster than any
-    // heuristic-selected or benchmarked algo for the M=1 decode case.
-    const int m_g = N, n_g = M, k_g = K;
-    cublasOperation_t opA = CUBLAS_OP_T;
-    cublasOperation_t opB = CUBLAS_OP_N;
+    // Route bf16 matmul through legacy cuBLAS `cublasGemmEx`. cuBLASLt selects
+    // non-capturable algorithms (split-K with workspace reduction) for large-K
+    // shapes; those fail under CUDA-graph stream capture with status=13 (the
+    // matmul works fine eagerly but cannot be recorded). Legacy cublasGemmEx
+    // with CUBLAS_GEMM_DEFAULT is reliably graph-capturable (it is what most
+    // graph-capture stacks rely on) and deterministic across calls.
+    //
+    // Row-major C[M,N] = A[M,K] @ B[N,K]^T  ->  column-major m=N, n=M, k=K with
+    // B^T (lda=K), A (ldb=K), C (ldc=N). `ltHandle` is unused now.
+    (void)ltHandle;
 
-    cublasLtMatmulDesc_t op = nullptr;
-    cublasLtMatrixLayout_t A = nullptr;
-    cublasLtMatrixLayout_t B = nullptr;
-    cublasLtMatrixLayout_t C = nullptr;
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) {
+        printf("cuBLAS bf16 matmul: null handle (M=%d N=%d K=%d)\n", M, N, K);
+        exit(EXIT_FAILURE);
+    }
 
-    CHECK_CUBLAS(cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
-    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g));
+    cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
+    bool capturing = (cudaStreamIsCapturing(stream, &capst) == cudaSuccess &&
+                      capst != cudaStreamCaptureStatusNone);
+
+    // cublasSetStream and cublasSetWorkspace reconfigure the handle and are NOT
+    // legal during CUDA-graph capture — they invalidate the capture (the next
+    // kernel then fails with "previous error during capture"). The eager warmup
+    // pass that runs immediately before capture already bound this handle to the
+    // same stream and workspace, so we configure it ONLY when not capturing.
+    // (The workspace also prevents cuBLAS from lazily allocating its own inside
+    // the matmul on a cold shape, which is itself illegal under capture.)
+    if (!capturing) {
+        cublasSetStream(h, stream);
+        if (workspace != nullptr && workspaceSize > 0) {
+            cublasSetWorkspace(h, workspace, workspaceSize);
+        }
+    }
+
+    // For a skinny, large-K shape (small M, large K) cuBLAS picks a split-K
+    // reduction whose kernel cannot be recorded into a CUDA graph (fails with
+    // status=13 under capture, though it runs fine eagerly). Under capture we
+    // therefore tile the K (contraction) dimension into chunks small enough
+    // that cuBLAS keeps a single-pass kernel, accumulating across chunks with
+    // beta=1. Eagerly we issue one call. Column-major mapping: m=N, n=M, the
+    // contraction runs over K with both operands' leading dim = K, so a
+    // sub-range [k0, k0+kc) is selected by offsetting both pointers by k0.
+    // Chunk ALWAYS (not just under capture) so the eager warmup pass that runs
+    // immediately before capture exercises the exact same cuBLAS call shapes the
+    // captured graph will replay. If warmup issued a single large-K call but the
+    // graph issued chunked calls, the chunk shape would be cold at capture time
+    // and cuBLAS would lazily initialize it mid-capture, invalidating the graph.
+    (void)capturing;
+    const int K_CHUNK = 2048;
+    int kc = (K > K_CHUNK) ? K_CHUNK : K;
 
     float alpha = 1.0f;
-    float beta = 0.0f;
-    cublasStatus_t status = cublasLtMatmul(
-        ltHandle, op, &alpha,
-        d_B, A, d_A, B, &beta,
-        d_C, C, d_C, C,
-        nullptr, workspace, workspaceSize, stream);
-
-    cublasLtMatrixLayoutDestroy(C);
-    cublasLtMatrixLayoutDestroy(B);
-    cublasLtMatrixLayoutDestroy(A);
-    cublasLtMatmulDescDestroy(op);
-
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("cuBLASLt BF16 direct matmul failed: status=%d M=%d N=%d K=%d workspace=%zu\n",
-               status, M, N, K, workspaceSize);
-        exit(EXIT_FAILURE);
+    for (int k0 = 0; k0 < K; k0 += kc) {
+        int this_k = (K - k0 < kc) ? (K - k0) : kc;
+        float beta = (k0 == 0) ? 0.0f : 1.0f;
+        cublasStatus_t status = cublasGemmEx(
+            h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, this_k,
+            &alpha,
+            d_B + k0, CUDA_R_16BF, K,
+            d_A + k0, CUDA_R_16BF, K,
+            &beta,
+            d_C, CUDA_R_16BF, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("cuBLAS bf16 GemmEx failed: status=%d M=%d N=%d K=%d "
+                   "(chunk k0=%d kc=%d capturing=%d)\n",
+                   status, M, N, K, k0, this_k, (int)capturing);
+            exit(EXIT_FAILURE);
+        }
     }
 }
 // ============================================================================

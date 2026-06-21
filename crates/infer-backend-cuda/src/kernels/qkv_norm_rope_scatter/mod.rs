@@ -89,6 +89,14 @@ pub fn qkv_norm_rope_scatter<T: Dtype>(
     let k_row_stride = k.strides().as_slice()[0] as i64;
     let v_row_stride = v.strides().as_slice()[0] as i64;
 
+    // Actual token-row count = rows of the q/k/v buffers. The kernel's
+    // `row < num_tokens` bounds guard MUST use this, NOT `positions.numel()`:
+    // `rope_positions` is allocated at capacity (`cap_num_tokens`) and only
+    // prefix-filled, so its numel() is the worst-case (e.g. 8192), which makes
+    // the guard ineffective and lets the kernel read past q/k/v -> OOB reads,
+    // corrupted Q, and non-deterministic garbage for batch > 1.
+    let num_tokens = q.shape().as_slice()[0] as i32;
+
     unsafe {
         qkv_norm_rope_scatter_bf16(
             q.data_ptr_mut() as _,
@@ -105,7 +113,7 @@ pub fn qkv_norm_rope_scatter<T: Dtype>(
             seq_positions.data_ptr(),
             cu_q_lens.data_ptr(),
             seq_lens_step.data_ptr(),
-            positions.numel() as i32,
+            num_tokens,
             batch as i32,
             head_num as i32,
             kv_head_num as i32,

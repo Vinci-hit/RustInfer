@@ -107,6 +107,54 @@ impl infer_core::exec::ExecScope for CudaScope {
         &self.workspace
     }
 
+    fn supports_graphs(&self) -> bool {
+        self.device.config.arena_available()
+    }
+
+    fn graph_capture_begin(&self) -> OpResult<()> {
+        // Enable the capture arena BEFORE entering stream capture so the
+        // forward's scratch allocations are alloc-free.
+        self.device.config.arena_begin();
+        if let Err(e) = self.device.config.capture_begin_relaxed() {
+            self.device.config.arena_end();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn graph_capture_end(&self, key: u64) -> OpResult<()> {
+        let slot = GraphSlot::LlmDecode {
+            batch: key as usize,
+            buffer_id: 0,
+            slot_signature: 0,
+        };
+        let r = self.device.config.capture_end(slot);
+        self.device.config.arena_end();
+        r
+    }
+
+    fn graph_launch(&self, key: u64) -> OpResult<()> {
+        let slot = GraphSlot::LlmDecode {
+            batch: key as usize,
+            buffer_id: 0,
+            slot_signature: 0,
+        };
+        self.device.config.launch(slot)
+    }
+
+    fn graph_ready(&self, key: u64) -> bool {
+        let slot = GraphSlot::LlmDecode {
+            batch: key as usize,
+            buffer_id: 0,
+            slot_signature: 0,
+        };
+        self.device.config.graph_ready(slot)
+    }
+
+    fn graph_debug_state(&self) -> &'static str {
+        self.device.config.capture_state()
+    }
+
     fn synchronize(&self) -> OpResult<()> {
         self.device.config.synchronize()
     }
@@ -427,6 +475,42 @@ impl infer_core::ports::FusedOps for Cuda {
         kernels::swiglu::swiglu_packed(scope_stream(ctx.scope()), gate_up, out, rows, inter)
     }
 
+    fn argmax<T: infer_core::dtype::Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+    ) -> OpResult<Vec<i32>> {
+        let shape = logits.shape().as_slice();
+        if shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "argmax: expected 2D logits [rows, vocab], got {:?}",
+                shape
+            )));
+        }
+        let rows = shape[0].max(1);
+        let dev = logits.device();
+        let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        // On-device two-phase argmax. Only the per-row token ids are copied back
+        // to host (`rows` i32), instead of the full [rows, vocab] logits.
+        // Workspace: the bf16 kernel uses batch*512 bf16 (= batch*256 f32) of
+        // scratch; allocate 512 f32/row for headroom.
+        let mut out = Tensor::<i32, Self>::zeros([rows], dev)?;
+        let ws = Tensor::<f32, Self>::zeros([rows * 512], dev)?;
+        kernels::sampler::argmax(scope_stream(ctx.scope()), logits, &mut out, &ws)?;
+        out.to_host_vec()
+    }
+
+    fn argmax_into<T: infer_core::dtype::Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+        out: &mut Tensor<i32, Self>,
+        workspace: &Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        // Writes per-row argmax into the caller's persistent `out`/`workspace`
+        // (no allocation) so this is safe inside CUDA-graph capture.
+        kernels::sampler::argmax(scope_stream(ctx.scope()), logits, out, workspace)
+    }
+
     fn scatter_kv_paged<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         k_src: &Tensor<T, Self>,
@@ -593,6 +677,12 @@ impl Cuda {
 
 impl MemoryPort for Cuda {
     fn alloc_bytes(&self, size: usize) -> OpResult<NonNull<u8>> {
+        // During graph capture/replay, serve scratch from the capture arena so
+        // no `cudaMalloc` is issued (illegal while a stream is capturing).
+        if let Some(arena_ptr) = self.config.arena_alloc(size) {
+            return NonNull::new(arena_ptr as *mut u8)
+                .ok_or_else(|| OpError::Kernel("graph arena returned null".into()));
+        }
         let n = size.max(1);
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: cudaMalloc/cudaMemset are safe to call with valid args.
@@ -615,6 +705,12 @@ impl MemoryPort for Cuda {
     }
 
     unsafe fn free_bytes(&self, ptr: NonNull<u8>, _size: usize) {
+        // Arena-owned scratch is not individually freed — the bump arena is
+        // reset wholesale at the next capture. A real `cudaFree` here would
+        // both corrupt the arena and (if mid-capture) be illegal.
+        if self.config.arena_contains(ptr.as_ptr() as *mut std::ffi::c_void) {
+            return;
+        }
         // SAFETY: ptr came from cudaMalloc.
         unsafe {
             ffi::cudaFree(ptr.as_ptr() as *mut std::ffi::c_void);

@@ -44,7 +44,8 @@ class RequestResult:
 RUSTINFER_MODEL = "llama3.2-1b"
 URL = "http://127.0.0.1:8000"
 DURATION = 60
-PROMPTS_FILE = "/root/RustInfer/bench/bench_prompts.json"
+import os
+PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_prompts.json")
 MAX_TOKENS = 512
 
 

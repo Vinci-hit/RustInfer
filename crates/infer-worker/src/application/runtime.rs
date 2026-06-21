@@ -13,6 +13,16 @@ use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
+#[cfg(feature = "cuda")]
+use half::bf16;
+#[cfg(feature = "cuda")]
+use crate::infrastructure::cuda::{
+    kernels::gather_merge::{
+        append_decode_admissions_into, merge_compact_decode_into, MergeCompactDecodeArgs,
+    },
+    Cuda,
+};
+
 pub struct Runtime<T, D, M>
 where
     T: Dtype,
@@ -33,6 +43,64 @@ where
     pub cap_batch: usize,
     pub capture_sizes: Vec<usize>,
     pub graph: Option<GraphRunner<D>>,
+    /// Persistent decode input-id buffer (capacity `cap_batch`). Graph replay
+    /// requires the forward to read from a fixed device address; this buffer is
+    /// rewritten in place each step instead of allocating a fresh tensor.
+    pub input_ids_buf: Tensor<i32, D>,
+    /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
+    pub abc: AbcBuffers<D>,
+}
+
+/// Address-stable buffers for the ABC GPU-resident decode pipeline.
+///
+/// A = `Runtime::input_ids_buf` (next token per row). B = `new_token_dev`
+/// (first tokens of freshly-admitted seqs). C = `argmax_out_dev` (in-graph
+/// argmax output). The compact-merge kernel consumes C, applies stop
+/// criteria, compacts surviving rows to the front of A, and emits the
+/// active/finished side-bands below. All buffers are sized to `cap_batch`
+/// so their device addresses never change (required for CUDA-graph capture).
+///
+/// Allocated in `Runtime::new`; wired into the decode step in later stages.
+#[allow(dead_code)]
+pub struct AbcBuffers<D: Device> {
+    /// B: first decode tokens of newly-admitted sequences (uploaded each step).
+    pub new_token_dev: Tensor<i32, D>,
+    /// C: in-graph argmax output, one token id per row.
+    pub argmax_out_dev: Tensor<i32, D>,
+    /// Two-phase argmax scratch (`cap_batch * 512` f32 — kernel uses 512 bf16/row).
+    pub argmax_ws: Tensor<f32, D>,
+    /// Per-row stop metadata (uploaded each step).
+    pub generated_counts_dev: Tensor<i32, D>,
+    pub max_tokens_dev: Tensor<i32, D>,
+    pub ignore_eos_dev: Tensor<i32, D>,
+    /// EOS id list (small; `eos_len` passed alongside).
+    pub eos_ids_dev: Tensor<i32, D>,
+    /// Compact-merge outputs (device).
+    pub active_src_rows_dev: Tensor<i32, D>,
+    pub finished_src_rows_dev: Tensor<i32, D>,
+    pub finished_tokens_dev: Tensor<i32, D>,
+    pub active_tokens_dev: Tensor<i32, D>,
+    /// `[active_n, finished_n, old_batch]`.
+    pub counts_dev: Tensor<i32, D>,
+    // Host mirrors for the single small D2H after each step.
+    pub argmax_out_host: Vec<i32>,
+    pub counts_host: Vec<i32>,
+    pub active_src_rows_host: Vec<i32>,
+    pub active_tokens_host: Vec<i32>,
+    pub finished_src_rows_host: Vec<i32>,
+    pub finished_tokens_host: Vec<i32>,
+    /// Persistent host staging for buffer B (admission tokens). Must outlive the
+    /// copy-in stream's DMA, so it cannot be a per-step local.
+    pub new_token_host: Vec<i32>,
+    /// Whether a copy-out has been recorded on So at least once. Gates the
+    /// `compute_wait_copy_out` guard so the first step does not wait on an
+    /// event that was never recorded.
+    pub copy_out_recorded: bool,
+    /// Whether the host map mirrors + B staging have been page-locked (pinned)
+    /// yet. Done lazily on the first decode step so the Si/So copies are truly
+    /// async (pageable host memory would make `cudaMemcpyAsync` host-synchronous
+    /// and serialize the pipeline).
+    pub pinned: bool,
 }
 
 impl<T, D, M> Runtime<T, D, M>
@@ -114,6 +182,35 @@ where
             stream: D::alloc_tensor(Shape::from_slice(&[cap_num_tokens, dims.dim]), device)?,
         };
 
+        let input_ids_buf =
+            D::alloc_tensor::<i32>(Shape::from_slice(&[cap_batch.max(1)]), device)?;
+
+        // ── ABC pipeline buffers (Stage 1: allocated, wired in later stages) ──
+        let cb = cap_batch.max(1);
+        let abc = AbcBuffers {
+            new_token_dev: alloc_i32(cb)?,
+            argmax_out_dev: alloc_i32(cb)?,
+            argmax_ws: D::alloc_tensor::<f32>(Shape::from_slice(&[cb * 512]), device)?,
+            generated_counts_dev: alloc_i32(cb)?,
+            max_tokens_dev: alloc_i32(cb)?,
+            ignore_eos_dev: alloc_i32(cb)?,
+            eos_ids_dev: alloc_i32(64)?,
+            active_src_rows_dev: alloc_i32(cb)?,
+            finished_src_rows_dev: alloc_i32(cb)?,
+            finished_tokens_dev: alloc_i32(cb)?,
+            active_tokens_dev: alloc_i32(cb)?,
+            counts_dev: alloc_i32(3)?,
+            argmax_out_host: vec![0; cb],
+            counts_host: vec![0; 3],
+            active_src_rows_host: vec![0; cb],
+            active_tokens_host: vec![0; cb],
+            finished_src_rows_host: vec![0; cb],
+            finished_tokens_host: vec![0; cb],
+            new_token_host: vec![0; cb],
+            copy_out_recorded: false,
+            pinned: false,
+        };
+
         Ok(Self {
             model,
             kv_pool,
@@ -129,6 +226,8 @@ where
             cap_batch,
             capture_sizes,
             graph: None,
+            input_ids_buf,
+            abc,
         })
     }
 
@@ -147,6 +246,20 @@ where
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
         let input_ids = self.input_ids_tensor(req, plan)?;
+        self.run_layers(plan, &input_ids)?;
+        self.sample_tail(plan, req)
+    }
+
+    /// Embed + all decoder layers into the persistent `hidden` buffer. This is
+    /// the capturable region of a decode step: every device buffer it touches
+    /// (input ids, hidden, KV pool, KV index) is a fixed allocation, so the
+    /// kernel sequence is replayable as a CUDA graph. Under graph capture the
+    /// scratch tensors allocated inside the model come from the capture arena.
+    fn run_layers(
+        &mut self,
+        plan: &crate::domain::plan::BatchPlan,
+        input_ids: &Tensor<i32, D>,
+    ) -> OpResult<()> {
         let mut hidden = Hidden {
             stream: self.hidden.stream.view_raw(
                 Shape::from_slice(&[plan.num_tokens, self.dims.dim]),
@@ -160,16 +273,34 @@ where
         let mut kv = self
             .kv_pool
             .view(LayerRange::all(self.dims.num_layers), &self.kv_index);
-
-        self.model.embed(&input_ids, &mut hidden, &ctx)?;
+        self.model.embed(input_ids, &mut hidden, &ctx)?;
         self.model.decode_layers(
             LayerRange::all(self.dims.num_layers),
             &mut hidden,
             &mut kv,
             &ctx,
         )?;
-        drop(kv);
+        Ok(())
+    }
 
+    /// Finalize (logits) + sample/verify + KV commit. Always eager: the capture
+    /// arena is disabled here, so these allocations use the normal allocator and
+    /// the (data-dependent, variable-shape) sampling never enters a graph.
+    fn sample_tail(
+        &mut self,
+        plan: &crate::domain::plan::BatchPlan,
+        req: &StepRequest,
+    ) -> OpResult<StepOutput> {
+        let hidden = Hidden {
+            stream: self.hidden.stream.view_raw(
+                Shape::from_slice(&[plan.num_tokens, self.dims.dim]),
+                Shape::from_slice(&[plan.num_tokens.max(1), self.dims.dim]).contiguous_strides(),
+                0,
+                true,
+            ),
+        };
+        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let _guard = self.scope.enter();
         let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
@@ -254,6 +385,80 @@ where
         })
     }
 
+    /// Capturable decode region for the graph path: forward (embed + decoder
+    /// layers) + finalize (lm_head → logits) + in-graph argmax into buffer C
+    /// (`abc.argmax_out_dev`). Every allocation here is served from the capture
+    /// arena, so the whole chain replays from a single graph with the argmax
+    /// result already on-device in C — no eager finalize/sample afterwards.
+    fn forward_finalize_argmax(
+        &mut self,
+        plan: &crate::domain::plan::BatchPlan,
+        input_ids: &Tensor<i32, D>,
+    ) -> OpResult<()> {
+        self.run_layers(plan, input_ids)?;
+        let hidden = Hidden {
+            stream: self.hidden.stream.view_raw(
+                Shape::from_slice(&[plan.num_tokens, self.dims.dim]),
+                Shape::from_slice(&[plan.num_tokens.max(1), self.dims.dim]).contiguous_strides(),
+                0,
+                true,
+            ),
+        };
+        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let _guard = self.scope.enter();
+        let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
+        D::argmax_into(
+            &ctx,
+            &logits.0,
+            &mut self.abc.argmax_out_dev,
+            &self.abc.argmax_ws,
+        )
+    }
+
+    /// Build the decode `StepOutput` from buffer C (the in-graph argmax result),
+    /// instead of an eager finalize+sample. Greedy, one token per decode row;
+    /// `logprob` is unused downstream. Mirrors `sample_tail`'s non-speculative
+    /// path for finished-flag + KV-length bookkeeping.
+    fn decode_output_from_c(
+        &mut self,
+        plan: &crate::domain::plan::BatchPlan,
+        req: &StepRequest,
+    ) -> OpResult<StepOutput> {
+        let batch = plan.batch;
+        let c_view = self.abc.argmax_out_dev.view_raw(
+            Shape::from_slice(&[batch]),
+            Shape::from_slice(&[batch.max(1)]).contiguous_strides(),
+            0,
+            true,
+        );
+        let ids = c_view.to_host_vec()?;
+        let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
+        let mut tokens: Vec<Vec<SampledToken>> = ids
+            .iter()
+            .map(|&token_id| {
+                vec![SampledToken {
+                    token_id,
+                    logprob: 0.0,
+                    top_logprobs: Vec::new(),
+                }]
+            })
+            .collect();
+        tokens.resize_with(batch, Vec::new);
+        let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
+        let finished = finished_flags(req, &tokens);
+        for (sid, done) in sids.iter().zip(finished.iter()) {
+            if *done {
+                self.kv_pool.seq_kv_len.remove(sid);
+            }
+        }
+        Ok(StepOutput {
+            tokens,
+            accepted,
+            finished,
+            hidden_tap: None,
+        })
+    }
+
     pub fn decide(&self, plan: &crate::domain::plan::BatchPlan) -> GraphDecision {
         self.graph
             .as_ref()
@@ -281,16 +486,70 @@ where
         let Some(graph) = self.graph.as_ref() else {
             return self.step_eager(plan, req);
         };
-        if graph.slot_size(slot).is_none() {
+        let Some(slot_batch) = graph.slot_size(slot) else {
             return Err(OpError::Shape(format!(
                 "Runtime::step: graph slot {} is out of range",
                 slot.0
             )));
+        };
+        // A captured graph hard-codes the batch it was traced with. Only replay
+        // when the live decode batch matches the slot exactly (decode ⇒
+        // num_tokens == batch); otherwise fall back to eager rather than feed a
+        // mismatched batch through the wrong graph. (Padding to the capture size
+        // is a future optimization.)
+        if slot_batch != plan.batch || plan.num_tokens != plan.batch {
+            return self.step_eager(plan, req);
         }
+        let key = plan.batch as u64;
 
-        // V2 graph capture/replay is gated by `ExecScope::supports_graphs`.
-        // Until a scope installs real replay, the safe behavior is eager.
-        self.step_eager(plan, req)
+        // Refresh the persistent input-id buffer in place (decode: one new token
+        // per sequence). The graph's `embed` reads from this fixed address.
+        let mut ids = Vec::with_capacity(plan.num_tokens);
+        for seq in &req.seqs {
+            ids.extend_from_slice(&seq.input_ids);
+        }
+        unsafe {
+            upload_i32_prefix(self.scope.device(), &self.input_ids_buf, &ids)?;
+        }
+        let input_ids = self.input_ids_buf.view_raw(
+            Shape::from_slice(&[plan.num_tokens]),
+            Shape::from_slice(&[plan.num_tokens]).contiguous_strides(),
+            0,
+            true,
+        );
+
+        if self.scope.graph_ready(key) {
+            // Hot path: pure replay. `upload_index` (in `step`) and the id
+            // refresh above already rewrote every input buffer this graph reads.
+            self.scope.graph_launch(key)?;
+        } else {
+            // Cold path. First run one EAGER forward at this exact shape so the
+            // libraries that lazily plan/benchmark on a cold shape (cuDNN SDPA
+            // plan cache, cuBLASLt algo selection) populate their shape-keyed
+            // caches — those code paths do mallocs/private-stream launches that
+            // are illegal under stream capture. This eager pass also produces a
+            // correct result; the KV scatter it performs writes the same values
+            // at the same paged positions the replay will, so the immediately
+            // following capture+launch is idempotent on KV state.
+            self.forward_finalize_argmax(plan, &input_ids)?;
+            self.scope.synchronize()?;
+
+            // Now trace the (warm) forward+finalize+argmax into a graph and run once.
+            self.scope.graph_capture_begin()?;
+            if let Err(e) = self.forward_finalize_argmax(plan, &input_ids) {
+                // Close the capture so the stream is left in a usable state.
+                let _ = self.scope.graph_capture_end(key);
+                return Err(e);
+            }
+            self.scope.graph_capture_end(key)?;
+            tracing::info!("[graph] captured decode graph (forward+argmax) for batch={}", plan.batch);
+            self.scope.graph_launch(key)?;
+        }
+        // The graph already produced the per-row argmax in buffer C; just read
+        // it back (no eager finalize/sample). The decode graph path is always
+        // greedy q_len=1 (speculative q_len>1 fell back to eager above).
+        self.scope.synchronize()?;
+        self.decode_output_from_c(plan, req)
     }
 
     fn build_plan(&self, req: &StepRequest) -> OpResult<BatchPlan> {
@@ -452,6 +711,350 @@ where
             upload_i32_prefix(device, &self.kv_index.block2tile, &block2tile)?;
         }
         Ok(())
+    }
+}
+
+/// One row of an ABC compact-merge result: the original (pre-compaction)
+/// device row it came from, plus the token the step produced for it.
+#[derive(Debug, Clone)]
+pub struct DecodeRowToken {
+    pub src_row: usize,
+    pub token_id: i32,
+}
+
+/// Outcome of one ABC decode step, with surviving and finished rows kept
+/// SEPARATE (the merge marks them apart on-device). The caller advances the
+/// `active` rows and reclaims each `finished` row's KV — including the slot
+/// allocated for it this step — on return.
+#[derive(Debug, Clone)]
+pub struct DecodeCompactOutput {
+    pub active: Vec<DecodeRowToken>,
+    pub finished: Vec<DecodeRowToken>,
+}
+
+#[cfg(feature = "cuda")]
+impl<M> Runtime<bf16, Cuda, M>
+where
+    M: DecoderModel<bf16, Cuda>,
+{
+    /// ABC GPU-resident decode step (buffer A = `input_ids_buf`).
+    ///
+    /// Precondition: rows `0..a_valid_prefix` of A already hold the correct
+    /// input token — they are the longest prefix of this step's row order that
+    /// is unchanged from the prior step, so the previous step's compact merge
+    /// already wrote their tokens on-device. The divergent suffix (fresh
+    /// admissions, or rows shifted by an out-of-band eviction) is uploaded
+    /// through buffer B and appended into A.
+    ///
+    /// Make the compute stream wait on the in-flight decode step's copy-out
+    /// (ev_out) before any further compute-stream write to buffer A. The serve
+    /// loop calls this before running a prefill while a decode step is pending:
+    /// a graph-eligible (all q=1) prefill uploads into `input_ids_buf` on the
+    /// compute stream and would otherwise race the pending step's async
+    /// copy-out read of A. Enqueue-only — no host sync.
+    pub fn guard_buffer_a_against_pending_copyout(&self) -> OpResult<()> {
+        if self.abc.copy_out_recorded {
+            let cfg = self.scope.device().config.clone();
+            cfg.compute_wait_copy_out()?;
+        }
+        Ok(())
+    }
+
+    /// ISSUE half of the 1-deep decode pipeline: enqueues forward + finalize +
+    /// in-graph argmax (graph replay when primed) into buffer C, then the
+    /// compact-merge kernel (stop criteria on-device, compacts survivors to the
+    /// front of A so the next step reuses them without a host upload, emits
+    /// active/finished source-row maps), then an ASYNC copy-out (So) of the
+    /// maps into the host mirrors. Does NOT synchronize — the caller runs
+    /// `finalize_decode_abc` one step later so the NEXT step's compute overlaps
+    /// this step's host commit/send. Only one step may be in flight at a time
+    /// (the host map mirrors and buffer C are single-buffered).
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_decode_abc(
+        &mut self,
+        req: &StepRequest,
+        a_valid_prefix: usize,
+        generated_counts: &[u32],
+        max_tokens: &[u32],
+        ignore_eos: &[bool],
+        eos_ids: &[i32],
+    ) -> OpResult<()> {
+        let plan = self.build_plan(req)?;
+        let batch = plan.batch;
+        if plan.num_tokens != batch || plan.q_lens.iter().any(|&q| q != 1) {
+            return Err(OpError::Shape(
+                "step_decode_abc: requires pure decode (q_len=1 per row)".into(),
+            ));
+        }
+        if generated_counts.len() != batch
+            || max_tokens.len() != batch
+            || ignore_eos.len() != batch
+        {
+            return Err(OpError::Shape(format!(
+                "step_decode_abc: metadata lens gen={} max={} ignore={} batch={}",
+                generated_counts.len(),
+                max_tokens.len(),
+                ignore_eos.len(),
+                batch
+            )));
+        }
+        if eos_ids.len() > self.abc.eos_ids_dev.numel() {
+            return Err(OpError::Shape(format!(
+                "step_decode_abc: eos_ids {} > capacity {}",
+                eos_ids.len(),
+                self.abc.eos_ids_dev.numel()
+            )));
+        }
+
+        // Lazily page-lock the host staging on the first step so the Si/So
+        // copies are truly async (pageable memory makes them host-synchronous).
+        if !self.abc.pinned {
+            let cfg = self.scope.device().config.clone();
+            let _guard = self.scope.enter();
+            cfg.pin_host_i32(&self.abc.new_token_host)?;
+            cfg.pin_host_i32(&self.abc.counts_host)?;
+            cfg.pin_host_i32(&self.abc.active_src_rows_host)?;
+            cfg.pin_host_i32(&self.abc.active_tokens_host)?;
+            cfg.pin_host_i32(&self.abc.finished_src_rows_host)?;
+            cfg.pin_host_i32(&self.abc.finished_tokens_host)?;
+            self.abc.pinned = true;
+        }
+
+        self.upload_index(&plan, req)?;
+
+        let cfg = self.scope.device().config.clone();
+
+        // Guard A against this step's append/merge overwriting it before the
+        // prior step's copy-out (So) finished reading A_{n-1}. (ev_out)
+        if self.abc.copy_out_recorded {
+            cfg.compute_wait_copy_out()?;
+        }
+
+        // ── Refresh A: only the divergent suffix (rows >= a_valid_prefix). ──
+        // Rows 0..vp already hold the right token from the prior step's merge.
+        // B is uploaded on the copy-in stream (Si) so it can overlap compute;
+        // the append (compute) waits on ev_in before reading B.
+        let vp = a_valid_prefix.min(batch);
+        if vp < batch {
+            let n = batch - vp;
+            // WAR guard: the prior step's copy-in DMA may still be reading
+            // `new_token_host`. Drain Si before the CPU overwrites it. Cheap
+            // (Si is a tiny copy, usually long idle by now) and only on
+            // admission steps. Mandatory for correctness once this staging
+            // buffer is page-locked (pinned), where the H2D is truly async.
+            cfg.synchronize_copy_in()?;
+            for (dst, seq) in self.abc.new_token_host[..n]
+                .iter_mut()
+                .zip(req.seqs[vp..].iter())
+            {
+                *dst = seq.input_ids[0];
+            }
+            let _guard = self.scope.enter();
+            unsafe {
+                cfg.upload_h2d_copy_in(
+                    self.abc.new_token_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                    self.abc.new_token_host.as_ptr() as *const std::ffi::c_void,
+                    n * std::mem::size_of::<i32>(),
+                )?;
+            }
+            cfg.record_copy_in()?; // ev_in on Si
+            cfg.compute_wait_copy_in()?; // compute waits ev_in before reading B
+            let stream = ExecScope::stream(&self.scope).0;
+            append_decode_admissions_into(
+                &mut self.input_ids_buf,
+                &self.abc.new_token_dev,
+                vp,
+                n,
+                stream,
+            )?;
+        }
+
+        // ── forward + finalize + in-graph argmax → buffer C ──
+        let input_ids = self.input_ids_buf.view_raw(
+            Shape::from_slice(&[batch]),
+            Shape::from_slice(&[batch]).contiguous_strides(),
+            0,
+            true,
+        );
+        let graph_key = batch as u64;
+        let use_graph = match self.decide(&plan) {
+            GraphDecision::Graph(slot) => {
+                self.graph.as_ref().and_then(|g| g.slot_size(slot)) == Some(batch)
+            }
+            GraphDecision::Eager => false,
+        };
+        if use_graph {
+            if self.scope.graph_ready(graph_key) {
+                self.scope.graph_launch(graph_key)?;
+            } else {
+                // Cold path: warm the lazy library caches with one eager pass,
+                // then capture + replay (mirrors `step_graph`).
+                self.forward_finalize_argmax(&plan, &input_ids)?;
+                self.scope.synchronize()?;
+                self.scope.graph_capture_begin()?;
+                if let Err(e) = self.forward_finalize_argmax(&plan, &input_ids) {
+                    let _ = self.scope.graph_capture_end(graph_key);
+                    return Err(e);
+                }
+                self.scope.graph_capture_end(graph_key)?;
+                tracing::info!(
+                    "[graph] captured decode graph (forward+argmax) for batch={}",
+                    batch
+                );
+                self.scope.graph_launch(graph_key)?;
+            }
+        } else {
+            self.forward_finalize_argmax(&plan, &input_ids)?;
+        }
+
+        // ── upload stop metadata + run the compact merge (C → A) ──
+        let gen_i32: Vec<i32> = generated_counts.iter().map(|&x| x as i32).collect();
+        let max_i32: Vec<i32> = max_tokens.iter().map(|&x| x as i32).collect();
+        let ign_i32: Vec<i32> = ignore_eos.iter().map(|&b| i32::from(b)).collect();
+        let device = self.scope.device();
+        unsafe {
+            upload_i32_prefix(device, &self.abc.generated_counts_dev, &gen_i32)?;
+            upload_i32_prefix(device, &self.abc.max_tokens_dev, &max_i32)?;
+            upload_i32_prefix(device, &self.abc.ignore_eos_dev, &ign_i32)?;
+            if !eos_ids.is_empty() {
+                upload_i32_prefix(device, &self.abc.eos_ids_dev, eos_ids)?;
+            }
+        }
+        let stream = ExecScope::stream(&self.scope).0;
+        {
+            let _guard = self.scope.enter();
+            let mut a = self.input_ids_buf.view_raw(
+                Shape::from_slice(&[batch]),
+                Shape::from_slice(&[batch]).contiguous_strides(),
+                0,
+                true,
+            );
+            merge_compact_decode_into(MergeCompactDecodeArgs {
+                a_out: &mut a,
+                c_prev: &self.abc.argmax_out_dev,
+                generated_counts: &self.abc.generated_counts_dev,
+                max_tokens: &self.abc.max_tokens_dev,
+                ignore_eos: &self.abc.ignore_eos_dev,
+                eos_ids: &self.abc.eos_ids_dev,
+                eos_len: eos_ids.len(),
+                old_batch: batch,
+                active_src_rows: &self.abc.active_src_rows_dev,
+                finished_src_rows: &self.abc.finished_src_rows_dev,
+                finished_tokens: &self.abc.finished_tokens_dev,
+                counts: &self.abc.counts_dev,
+                stream,
+            })?;
+        }
+        // A now holds the committed/compacted tokens (compute). Mark it so the
+        // copy-out stream may begin downloading once compute reaches here. (ev_a)
+        cfg.record_compute_a()?;
+
+        // ── download the compaction maps on the copy-out stream (So) ──
+        // So waits ev_a, then the D2H runs (and may overlap the next step's
+        // forward). Fixed `batch`-sized chunks avoid a dependency on the (still
+        // on-device) counts. ev_out gates the next step's A overwrite.
+        cfg.copy_out_wait_compute_a()?;
+        let bytes = batch * std::mem::size_of::<i32>();
+        let elem = std::mem::size_of::<i32>();
+        unsafe {
+            cfg.download_d2h_copy_out(
+                self.abc.counts_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.counts_dev.data_ptr() as *const std::ffi::c_void,
+                3 * elem,
+            )?;
+            cfg.download_d2h_copy_out(
+                self.abc.active_src_rows_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.active_src_rows_dev.data_ptr() as *const std::ffi::c_void,
+                bytes,
+            )?;
+            // Active tokens live in A[0..active] after the compaction.
+            cfg.download_d2h_copy_out(
+                self.abc.active_tokens_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.input_ids_buf.data_ptr() as *const std::ffi::c_void,
+                bytes,
+            )?;
+            cfg.download_d2h_copy_out(
+                self.abc.finished_src_rows_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.finished_src_rows_dev.data_ptr() as *const std::ffi::c_void,
+                bytes,
+            )?;
+            cfg.download_d2h_copy_out(
+                self.abc.finished_tokens_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.finished_tokens_dev.data_ptr() as *const std::ffi::c_void,
+                bytes,
+            )?;
+        }
+        cfg.record_copy_out()?; // ev_out on So
+        self.abc.copy_out_recorded = true;
+        // NOTE: no synchronize here — the So download runs asynchronously and is
+        // collected by `finalize_decode_abc`, which the caller invokes one step
+        // later so the next step's compute overlaps this step's host commit.
+        Ok(())
+    }
+
+    /// Collect the result of the in-flight `issue_decode_abc` step: drain the
+    /// copy-out stream, read the now-valid host map mirrors, and surface the
+    /// surviving vs finished rows SEPARATELY (the merge split them on-device:
+    /// compacted survivors in A[0..active] + active_src_rows; finished rows in
+    /// finished_src_rows / finished_tokens). The caller advances the actives
+    /// and reclaims each finished row's previous-step KV. A coverage check
+    /// (each row returned exactly once, all covered) catches merge-kernel
+    /// desync before it can corrupt host row bookkeeping. `batch` must be the
+    /// `order.len()` the matching `issue_decode_abc` ran with.
+    pub fn finalize_decode_abc(&mut self, batch: usize) -> OpResult<DecodeCompactOutput> {
+        let cfg = self.scope.device().config.clone();
+        cfg.synchronize_copy_out()?; // host mirrors valid before we read them
+
+        let active_n = self.abc.counts_host[0].max(0) as usize;
+        let finished_n = self.abc.counts_host[1].max(0) as usize;
+        let old_n = self.abc.counts_host[2].max(0) as usize;
+        if old_n != batch || active_n + finished_n != batch {
+            return Err(OpError::Kernel(format!(
+                "step_decode_abc: compact counts invalid active={} finished={} old={} batch={}",
+                active_n, finished_n, old_n, batch
+            )));
+        }
+        let mut seen = vec![false; batch];
+        let mut mark = |src: i32| -> OpResult<usize> {
+            let row = src as usize;
+            if row >= batch {
+                return Err(OpError::Kernel(format!(
+                    "step_decode_abc: src_row {} >= batch {}",
+                    row, batch
+                )));
+            }
+            if seen[row] {
+                return Err(OpError::Kernel(format!(
+                    "step_decode_abc: src_row {} returned twice",
+                    row
+                )));
+            }
+            seen[row] = true;
+            Ok(row)
+        };
+        let mut active = Vec::with_capacity(active_n);
+        for k in 0..active_n {
+            let row = mark(self.abc.active_src_rows_host[k])?;
+            active.push(DecodeRowToken {
+                src_row: row,
+                token_id: self.abc.active_tokens_host[k],
+            });
+        }
+        let mut finished = Vec::with_capacity(finished_n);
+        for j in 0..finished_n {
+            let row = mark(self.abc.finished_src_rows_host[j])?;
+            finished.push(DecodeRowToken {
+                src_row: row,
+                token_id: self.abc.finished_tokens_host[j],
+            });
+        }
+        if seen.iter().any(|covered| !*covered) {
+            return Err(OpError::Kernel(
+                "step_decode_abc: compaction did not cover every row".into(),
+            ));
+        }
+
+        Ok(DecodeCompactOutput { active, finished })
     }
 }
 

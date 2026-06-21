@@ -65,10 +65,14 @@ impl<D: MemoryPort> Storage<D> {
 
 impl<D: MemoryPort> Drop for Storage<D> {
     fn drop(&mut self) {
-        // Synchronize before free so any async kernel still touching this
-        // memory completes. Cheap on CPU (no-op); on CUDA waits on the
-        // device's stream.
-        let _ = self.device.synchronize();
+        // NOTE: we deliberately do NOT call `self.device.synchronize()` here.
+        // A device/stream synchronize is ILLEGAL during CUDA-graph capture and
+        // would invalidate the capture — every transient scratch tensor freed
+        // inside a captured decode step would otherwise break the graph. It is
+        // also unnecessary: the CUDA `free_bytes` path frees via `cudaFree`,
+        // which is itself device-synchronizing, so any async kernel still
+        // touching the memory has completed before the free returns. Arena-owned
+        // scratch (graph capture) is not freed at all, so it needs no sync.
         // SAFETY: ptr came from `device.alloc_bytes(self.size)` and is
         // freed exactly once (Drop runs once per Storage instance).
         unsafe { self.device.free_bytes(self.ptr, self.size.max(1)) };

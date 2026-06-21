@@ -7,8 +7,21 @@ use crate::Cuda;
 use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
-    // Signature: (logits, vocab_size, result_gpu, workspace, stream)
-    fn argmax_cu_bf16_ffi(input: *const half::bf16, batch_size: i32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    // BF16 C signature: (logits, selected_rows_device, batch_size, vocab_size,
+    // result_gpu, workspace, stream). `selected_rows_device` is nullable — null
+    // means "argmax every row 0..batch". The previous binding OMITTED this
+    // pointer, shifting every subsequent argument by one (batch→selected_rows,
+    // vocab→batch, output→vocab, ...) so the kernel never wrote `output` and
+    // decode emitted token 0 ("!") for every position.
+    fn argmax_cu_bf16_ffi(
+        input: *const half::bf16,
+        selected_rows: *const i32,
+        batch_size: i32,
+        vocab_size: i32,
+        output: *mut i32,
+        workspace: *mut f32,
+        stream: cudaStream_t,
+    );
     fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
     fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
 }
@@ -25,7 +38,7 @@ pub fn argmax<T: Dtype>(
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => argmax_cu_f32_ffi(logits.data_ptr() as _, vocab_size, output.data_ptr_mut(), workspace.data_ptr_mut(), stream),
-            DataType::BF16 => argmax_cu_bf16_ffi(logits.data_ptr() as _, batch_size, vocab_size, output.data_ptr_mut(), workspace.data_ptr_mut(), stream),
+            DataType::BF16 => argmax_cu_bf16_ffi(logits.data_ptr() as _, std::ptr::null(), batch_size, vocab_size, output.data_ptr_mut(), workspace.data_ptr_mut(), stream),
             DataType::F16 => argmax_cu_fp16_ffi(logits.data_ptr() as _, vocab_size, output.data_ptr_mut(), workspace.data_ptr_mut(), stream),
             _ => return Err(OpError::Kernel(format!("argmax: {:?}", T::DATA_TYPE))),
         }

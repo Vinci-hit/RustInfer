@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # === Model Config ===
-MODEL_PATH="/mnt/geminicephfs/vinciililu/model/ft_local/checkpoint-650"
+MODEL_PATH="/mnt/md2/liuwenqi/vllm_bench/dir"
 
 # === Runtime Config (from bootstrap log) ===
 MAX_NUM_SEQS=256

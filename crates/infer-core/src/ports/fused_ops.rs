@@ -214,6 +214,61 @@ pub trait FusedOps: MathOps {
         }
         output.upload_from_host(&output_host)
     }
+
+    /// Greedy argmax over the last (vocab) dimension. `logits` is `[rows, vocab]`;
+    /// returns the winning column index for every row as a host `Vec<i32>` of
+    /// length `rows`.
+    ///
+    /// Default is a host reference implementation (copies the full logits to
+    /// host). The CUDA backend overrides this with an on-device two-phase argmax
+    /// that copies back ONLY the per-row ids — avoiding the multi-MB
+    /// logits download that otherwise stalls the decode loop at batch > 1.
+    fn argmax<T: Dtype>(
+        ctx: &StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+    ) -> OpResult<Vec<i32>> {
+        let _ = ctx;
+        let shape = logits.shape().as_slice();
+        if shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "argmax: expected 2D logits [rows, vocab], got {:?}",
+                shape
+            )));
+        }
+        let rows = shape[0];
+        let vocab = shape[1];
+        let host = logits.to_host_vec()?;
+        let mut ids = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let start = row * vocab;
+            let slice = &host[start..start + vocab];
+            let (idx, _) = slice
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as i32, T::read_f64(v)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .ok_or_else(|| OpError::Shape("argmax: empty vocab".into()))?;
+            ids.push(idx);
+        }
+        Ok(ids)
+    }
+
+    /// Capturable greedy argmax: writes the per-row winning index into the
+    /// caller-provided device buffer `out` (numel == rows) using the
+    /// caller-provided `workspace` scratch. Allocates nothing, so it is safe to
+    /// invoke INSIDE CUDA-graph capture (unlike [`Self::argmax`], which the CUDA
+    /// backend implements with a fresh per-call output/workspace). Default is a
+    /// host reference: CPU argmax, then upload the ids into `out`.
+    fn argmax_into<T: Dtype>(
+        ctx: &StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+        out: &mut Tensor<i32, Self>,
+        workspace: &Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        let _ = workspace;
+        let ids = Self::argmax(ctx, logits)?;
+        out.upload_from_host(&ids)
+    }
 }
 
 fn scatter_kv_paged_reference<T, D>(

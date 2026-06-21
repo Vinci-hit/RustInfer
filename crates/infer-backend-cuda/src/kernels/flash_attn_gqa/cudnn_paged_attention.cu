@@ -299,6 +299,15 @@ static int launch_decode(cudnnHandle_t handle,
         return static_cast<int>(CUDNN_STATUS_BAD_PARAM);
     }
 
+    // cuDNN's execute() path is NOT CUDA-graph-capturable: both cudnnSetStream
+    // and the frontend's internal cuStreamGetCtx call are illegal during capture
+    // and invalidate it (CUDNN_STATUS_INTERNAL_ERROR / driver error 901). Decline
+    // immediately while capturing — without touching the stream — so the caller
+    // falls back to the capturable custom flash-decode kernel.
+    if (stream_is_capturing(stream)) {
+        return static_cast<int>(CUDNN_STATUS_NOT_SUPPORTED);
+    }
+
     cudnnStatus_t status = cudnnSetStream(handle, stream);
     if (status != CUDNN_STATUS_SUCCESS) {
         check(status, "set stream");

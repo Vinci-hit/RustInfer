@@ -352,6 +352,14 @@ pub fn attention_paged<T: Dtype>(
 
     match plan.kind {
         PagedAttentionKind::DecodeOnly => {
+            // Decode attention uses the custom flash kernel by default so that the
+            // eager warmup pass and the captured graph run the SAME kernel (cuDNN
+            // is not CUDA-graph-capturable and is declined under capture anyway;
+            // if warmup used cuDNN but the graph used flash, flash would be cold
+            // at capture time and its lazy module load would invalidate the
+            // graph). cuDNN can be re-enabled for pure-eager runs via env var.
+            let use_cudnn = std::env::var_os("RUSTINFER_DECODE_CUDNN").is_some();
+            if use_cudnn {
             if let Some(cudnn_status) = unsafe {
                 try_cudnn_paged_decode(
                     device,
@@ -382,6 +390,7 @@ pub fn attention_paged<T: Dtype>(
                     )));
                 }
             }
+            } // end if use_cudnn
 
             // The caller pre-allocated `workspace` with at least
             // `flash_attn_batched_decode_workspace_bytes(cap_batch, head_num, head_dim)`

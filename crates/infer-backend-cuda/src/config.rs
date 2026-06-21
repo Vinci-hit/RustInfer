@@ -8,6 +8,11 @@ use std::os::raw::c_void;
 
 const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 4usize * 1024 * 1024 * 1024;
 
+/// Size of the graph-capture scratch arena (1 GiB). Bounds the peak per-step
+/// decode scratch; for a 1B–8B dense model at batch ≤ 256 the real peak is a
+/// few hundred MiB, so this leaves comfortable headroom.
+const GRAPH_ARENA_SIZE: usize = 1usize * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
     LlmDecode {
@@ -71,6 +76,19 @@ pub struct CudaConfig {
     pub ev_in: ffi::cudaEvent_t,
     pub ev_a: ffi::cudaEvent_t,
     pub ev_out: ffi::cudaEvent_t,
+
+    // ─── Graph-capture scratch arena ─────────────────────────────────
+    //
+    // CUDA stream capture forbids `cudaMalloc`. The decode forward allocates
+    // ~190 transient scratch tensors per step, so during capture (and replay)
+    // those allocations are served from this pre-reserved bump arena instead.
+    // Sizes/order are deterministic for a fixed decode batch, so the arena
+    // hands out identical addresses every step — exactly what graph replay
+    // requires. `free` of an arena pointer is a no-op; the arena is reset to
+    // offset 0 at the start of each capture.
+    pub arena_base: std::sync::atomic::AtomicPtr<c_void>,
+    pub arena_off: std::sync::atomic::AtomicUsize,
+    pub arena_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl CudaConfig {
@@ -123,6 +141,15 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaEventCreate(&mut ev_out));
         }
+        // Graph-capture scratch arena (best-effort: if the reservation fails,
+        // `arena_base` stays null and `supports_graphs()` reports false, so the
+        // worker transparently falls back to eager decode).
+        let mut arena_ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            if ffi::cudaMalloc(&mut arena_ptr, GRAPH_ARENA_SIZE) != ffi::cudaError_cudaSuccess {
+                arena_ptr = std::ptr::null_mut();
+            }
+        }
         Ok(Self {
             stream,
             cublaslt_handle,
@@ -136,16 +163,103 @@ impl CudaConfig {
             ev_in,
             ev_a,
             ev_out,
+            arena_base: std::sync::atomic::AtomicPtr::new(arena_ptr),
+            arena_off: std::sync::atomic::AtomicUsize::new(0),
+            arena_enabled: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    // ─── Graph-capture scratch arena ─────────────────────────────────
+
+    /// True if the arena reservation succeeded (graphs are usable).
+    pub fn arena_available(&self) -> bool {
+        !self
+            .arena_base
+            .load(std::sync::atomic::Ordering::Acquire)
+            .is_null()
+    }
+
+    /// Reset the bump offset and route subsequent `alloc_bytes` through the
+    /// arena. Called just before `cudaStreamBeginCapture`.
+    pub fn arena_begin(&self) {
+        self.arena_off.store(0, std::sync::atomic::Ordering::Release);
+        self.arena_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Stop routing allocations through the arena (eager `cudaMalloc` resumes).
+    pub fn arena_end(&self) {
+        self.arena_enabled
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Serve `size` bytes from the arena, or `None` if the arena is disabled,
+    /// unavailable, or exhausted (caller then falls back to `cudaMalloc`).
+    /// Zero-initializes asynchronously on the compute stream (capture-safe).
+    pub fn arena_alloc(&self, size: usize) -> Option<*mut c_void> {
+        use std::sync::atomic::Ordering;
+        if !self.arena_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let base = self.arena_base.load(Ordering::Acquire);
+        if base.is_null() {
+            return None;
+        }
+        let n = (size.max(1) + 255) & !255usize;
+        let off = self.arena_off.fetch_add(n, Ordering::AcqRel);
+        if off + n > GRAPH_ARENA_SIZE {
+            self.arena_off.fetch_sub(n, Ordering::AcqRel);
+            return None;
+        }
+        let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
+        // Zero-initialize on the compute stream (capture-safe: cudaMemsetAsync
+        // is a recordable stream op).
+        unsafe {
+            ffi::cudaMemsetAsync(ptr, 0, n, self.stream);
+        }
+        Some(ptr)
+    }
+
+    /// Whether `ptr` lies inside the arena (its `free` must be a no-op).
+    pub fn arena_contains(&self, ptr: *mut c_void) -> bool {
+        let base = self
+            .arena_base
+            .load(std::sync::atomic::Ordering::Acquire);
+        if base.is_null() {
+            return false;
+        }
+        let p = ptr as usize;
+        let b = base as usize;
+        p >= b && p < b + GRAPH_ARENA_SIZE
     }
 
     pub fn graph_ready(&self, slot: GraphSlot) -> bool {
         self.graphs.lock().unwrap().contains_key(&slot)
     }
 
-    pub fn capture_begin_relaxed(&self) -> OpResult<()> {
+    /// Diagnostic: returns "active", "invalidated", "none", keyed by the
+    /// current capture state of the compute stream.
+    pub fn capture_state(&self) -> &'static str {
+        let mut st: ffi::cudaStreamCaptureStatus =
+            ffi::cudaStreamCaptureStatus_cudaStreamCaptureStatusNone;
         unsafe {
-            cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 1));
+            ffi::cudaStreamIsCapturing(self.stream, &mut st);
+        }
+        match st {
+            ffi::cudaStreamCaptureStatus_cudaStreamCaptureStatusActive => "active",
+            ffi::cudaStreamCaptureStatus_cudaStreamCaptureStatusInvalidated => "invalidated",
+            _ => "none",
+        }
+    }
+
+    pub fn capture_begin_relaxed(&self) -> OpResult<()> {
+        // Mode 2 = cudaStreamCaptureModeRelaxed. Relaxed (not ThreadLocal=1)
+        // is required so the potentially-unsafe API calls that cuBLASLt / cuDNN
+        // make internally while enqueuing a matmul/attention are tolerated
+        // during capture instead of returning an error (e.g. cuBLASLt
+        // EXECUTION_FAILED / status=13 under ThreadLocal capture).
+        unsafe {
+            cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 2));
         }
         Ok(())
     }
@@ -324,6 +438,24 @@ impl CudaConfig {
         }
         Ok(())
     }
+
+    /// Page-lock (pin) a host `i32` buffer in place so `cudaMemcpyAsync` on the
+    /// copy-in/copy-out streams runs truly asynchronously (pageable host memory
+    /// makes those copies host-synchronous, which serializes the decode
+    /// pipeline). Call once per buffer — re-registering an already-pinned
+    /// region errors. Not unregistered: the ABC staging lives for the process
+    /// lifetime, so the OS reclaims it at exit.
+    pub fn pin_host_i32(&self, buf: &[i32]) -> OpResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::size_of_val(buf);
+        // flags = cudaHostRegisterDefault (0): page-lock in place.
+        unsafe {
+            cuda_check!(ffi::cudaHostRegister(buf.as_ptr() as *mut c_void, bytes, 0));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CudaConfig {
@@ -358,6 +490,12 @@ impl Drop for CudaConfig {
             }
             if !self.cudnn_handle.is_null() {
                 ffi::cudnnDestroy(self.cudnn_handle);
+            }
+            let arena = self
+                .arena_base
+                .load(std::sync::atomic::Ordering::Acquire);
+            if !arena.is_null() {
+                ffi::cudaFree(arena);
             }
         }
     }

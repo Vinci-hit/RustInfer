@@ -12,9 +12,15 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import time
 from collections import Counter
 from typing import Any
+
+# Drop any inherited proxy so local requests stay off the proxy.
+for _v in ("http_proxy", "https_proxy", "all_proxy",
+           "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+    os.environ.pop(_v, None)
 
 import aiohttp
 

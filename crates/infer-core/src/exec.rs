@@ -52,6 +52,35 @@ pub trait ExecScope: Send + Sync + Sized + 'static {
     fn supports_graphs(&self) -> bool {
         false
     }
+    /// Begin CUDA-graph capture of the decode forward. Implementations that
+    /// support graphs also enable a capture-safe scratch arena here so the
+    /// per-step forward allocations issue no `cudaMalloc` while capturing.
+    fn graph_capture_begin(&self) -> OpResult<()> {
+        Err(crate::error::OpError::Kernel(
+            "graph_capture_begin: unsupported on this scope".into(),
+        ))
+    }
+    /// End capture and instantiate the executable graph keyed by `key`
+    /// (the decode batch size).
+    fn graph_capture_end(&self, _key: u64) -> OpResult<()> {
+        Err(crate::error::OpError::Kernel(
+            "graph_capture_end: unsupported on this scope".into(),
+        ))
+    }
+    /// Replay the captured graph keyed by `key`.
+    fn graph_launch(&self, _key: u64) -> OpResult<()> {
+        Err(crate::error::OpError::Kernel(
+            "graph_launch: unsupported on this scope".into(),
+        ))
+    }
+    /// Whether a graph for `key` has been captured and can be replayed.
+    fn graph_ready(&self, _key: u64) -> bool {
+        false
+    }
+    /// Diagnostic: current stream capture state ("active"/"invalidated"/"none").
+    fn graph_debug_state(&self) -> &'static str {
+        "n/a"
+    }
     fn synchronize(&self) -> OpResult<()>;
 }
 

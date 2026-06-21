@@ -21,24 +21,26 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
                 shape
             )));
         }
-        let vocab = shape[1];
-        let host = logits.to_host_vec()?;
+        // On-device argmax: returns one token id per logits row (host Vec, len
+        // = rows). This avoids the per-step full `[rows, vocab]` logits download
+        // + CPU argmax/log_softmax that bottlenecked decode at batch > 1
+        // (GPU sat at ~2% util). `logprob` is left 0.0: it is discarded
+        // downstream (GeneratedToken carries no logprob), and the host
+        // log_softmax over the whole vocab was the dominant cost.
+        let ids = D::argmax(ctx, logits)?;
         let rows = sampled_rows(ctx.plan());
         let mut tokens = Vec::with_capacity(rows.len());
         for row in rows {
-            let start = row * vocab;
-            let slice = &host[start..start + vocab];
-            let (token_id, max_logit) = slice
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as i32, T::read_f64(v)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .ok_or_else(|| OpError::Shape("GreedySampler::sample: empty vocab".into()))?;
-            let logprob = log_softmax_at(slice, token_id as usize) as f32;
-            let _ = max_logit;
+            let token_id = *ids.get(row).ok_or_else(|| {
+                OpError::Shape(format!(
+                    "GreedySampler::sample: sampled row {} out of argmax range {}",
+                    row,
+                    ids.len()
+                ))
+            })?;
             tokens.push(crate::domain::plan::SampledToken {
                 token_id,
-                logprob,
+                logprob: 0.0,
                 top_logprobs: Vec::new(),
             });
         }

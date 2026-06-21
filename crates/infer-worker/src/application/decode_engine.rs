@@ -4,7 +4,7 @@ use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, 
 
 use crate::application::decode_common::fail_decode_seqs;
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
-use crate::application::runtime::Runtime;
+use crate::application::runtime::{DecodeCompactOutput, Runtime};
 use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
@@ -19,31 +19,77 @@ use crate::infrastructure::transport::data_pump::DataPump;
 /// `ActiveSeqMap` owns per-sequence facts; `DecodeRows` owns the stable
 /// admission order so a burst of identical requests decodes as one cohort and
 /// greedy output stays reproducible regardless of HashMap iteration order.
+/// One decode step issued on the GPU but not yet finalized. Held across one
+/// `run_step` call so the next step's compute overlaps this step's host commit.
+struct PendingDecode {
+    order: Vec<u64>,
+    new_indices: Vec<u32>,
+    assigned: Vec<AssignedIndices>,
+    batch: usize,
+}
+
 pub struct DecodeEngine {
     rows: DecodeRows,
+    /// Sequence ids whose decode token currently sits in buffer A, in row
+    /// order, as left by the last successful ABC step's compact merge. The
+    /// longest common prefix of this and the next step's row order is the
+    /// portion of A that can be reused without a host token upload.
+    prev_a_rows: Vec<u64>,
+    /// The in-flight ABC step (issued, awaiting `finalize_decode_abc`). The
+    /// 1-deep pipeline: at most one step is in flight at a time.
+    pending: Option<PendingDecode>,
 }
 
 impl DecodeEngine {
     pub fn new() -> Self {
         Self {
             rows: DecodeRows::new(),
+            prev_a_rows: Vec::new(),
+            pending: None,
         }
     }
 
+    /// Hard reset. Drops any in-flight step WITHOUT finalizing it (its tokens
+    /// are lost) — only call on drain/shutdown, never mid-stream.
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.prev_a_rows.clear();
+        self.pending = None;
+    }
+
+    /// True while a step is issued but not yet finalized. The serve loop must
+    /// keep calling `run_step` until this is false so the last step's tokens
+    /// are collected and sent even after `active` drains to empty.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Free the in-flight step's freshly-allocated KV slots and drop it. Those
+    /// slots are NOT yet in any seq's block table (`commit_results` appends
+    /// them), so an `Immediate` drain that evicts every seq would otherwise
+    /// leak them. Call this BEFORE `clear()` on drain.
+    pub fn reclaim_pending(&mut self, kv_allocator: &mut GlobalKvAllocator) {
+        if let Some(p) = self.pending.take() {
+            if !p.new_indices.is_empty() {
+                kv_allocator.free(&p.new_indices);
+            }
+        }
     }
 
     pub fn retain_active(&mut self, active: &ActiveSeqMap) {
         self.rows.retain_active(active);
     }
 
-    /// Drive every active sequence one token forward through `Runtime::step`.
+    /// Drive the GPU-resident decode loop one step, pipelined 1-deep.
     ///
-    /// One eager forward over a `DecodeOnly` batch: each row contributes a
-    /// single token and one freshly allocated KV slot. The pool commits each
-    /// seq's KV length internally; the worker mirrors it in `ActiveSeq` and
-    /// owns the physical block release on finish.
+    /// Order matters: (1) finalize the step issued on the *previous* call —
+    /// drain its copy-out, commit its tokens, reclaim finished KV; (2) issue a
+    /// new step (append B, forward, merge, async copy-out) if there is work;
+    /// (3) send the finalized output *after* issuing, so the new step's GPU
+    /// compute overlaps the previous step's host commit + the ZMQ send + the
+    /// serve loop's inter-step work. The serve loop must keep calling this while
+    /// `has_pending()` so the last step is collected after `active` empties.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_step<M>(
         &mut self,
         runner: &mut Runtime<bf16, Cuda, M>,
@@ -58,68 +104,128 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
+        // 1. Finalize the in-flight step (issued last call) and commit it.
+        let to_send = self.finalize_pending(runner, active, kv_allocator, control, enable_prefix_caching)?;
+
+        // 2. Issue a new step if there is work; otherwise idle.
         if active.is_empty() {
             self.rows.clear();
-            return Ok(());
+        } else {
+            self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
         }
 
+        // 3. Send the previous step's output AFTER issuing the new step so the
+        //    send (and the serve loop's following work) overlaps GPU compute.
+        if let Some(output) = to_send {
+            data.send_step_output(&output)
+                .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Collect + commit the in-flight step. Returns its `StepOutput` to send.
+    fn finalize_pending<M>(
+        &mut self,
+        runner: &mut Runtime<bf16, Cuda, M>,
+        active: &mut ActiveSeqMap,
+        kv_allocator: &mut GlobalKvAllocator,
+        control: &ControlPump,
+        enable_prefix_caching: bool,
+    ) -> OpResult<Option<StepOutput>>
+    where
+        M: DecoderModel<bf16, Cuda>,
+    {
+        let Some(p) = self.pending.take() else {
+            return Ok(None);
+        };
+        match runner.finalize_decode_abc(p.batch) {
+            Ok(compact) => {
+                let output = self.commit_results(
+                    active,
+                    kv_allocator,
+                    &p.order,
+                    &p.new_indices,
+                    p.assigned,
+                    &compact,
+                    enable_prefix_caching,
+                )?;
+                // A now holds the surviving tokens compacted to the front in
+                // `rows` order (commit_results just set `rows` to the survivors).
+                self.prev_a_rows = self.rows.as_slice().to_vec();
+                Ok(Some(output))
+            }
+            Err(e) => {
+                if !p.new_indices.is_empty() {
+                    kv_allocator.free(&p.new_indices);
+                }
+                fail_decode_seqs(
+                    control,
+                    active,
+                    kv_allocator,
+                    &p.order,
+                    format!("decode finalize failed: {:?}", e),
+                    enable_prefix_caching,
+                );
+                self.rows.clear();
+                self.prev_a_rows.clear();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Prepare and asynchronously issue a new decode step, stashing it as the
+    /// pending in-flight step.
+    #[allow(clippy::too_many_arguments)]
+    fn issue_new<M>(
+        &mut self,
+        runner: &mut Runtime<bf16, Cuda, M>,
+        active: &mut ActiveSeqMap,
+        prefilling: &mut PrefillSeqMap,
+        kv_allocator: &mut GlobalKvAllocator,
+        control: &ControlPump,
+        eos_ids: &[i32],
+        enable_prefix_caching: bool,
+    ) -> OpResult<()>
+    where
+        M: DecoderModel<bf16, Cuda>,
+    {
         let (order, new_indices) =
             match self.prepare_step(active, prefilling, kv_allocator, control, enable_prefix_caching)? {
                 Some(ready) => ready,
                 None => return Ok(()),
             };
 
-        // Build the decode StepRequest: one new token + one new KV slot per row.
-        let mut seqs = Vec::with_capacity(order.len());
-        let mut assigned = Vec::with_capacity(order.len());
-        let mut generated_counts = Vec::with_capacity(order.len());
-        let mut max_tokens = Vec::with_capacity(order.len());
-        let mut ignore_eos = Vec::with_capacity(order.len());
-        for (i, &sid) in order.iter().enumerate() {
-            let new_idx = new_indices[i];
-            let seq = active
-                .get(&sid)
-                .expect("decode order row must be active after prepare_step");
-            let mut block_table = Vec::with_capacity(seq.block_table.len() + 1);
-            block_table.extend_from_slice(&seq.block_table);
-            block_table.push(new_idx);
-            seqs.push(SeqStep {
-                sequence_id: sid,
-                input_ids: vec![seq.last_token],
-                positions: vec![seq.kv_len as i32],
-                kv_write_start: seq.kv_len as i32,
-                kv_len_after: (seq.kv_len + 1) as i32,
-                block_table,
-            });
-            assigned.push(AssignedIndices {
-                sequence_id: sid,
-                base: new_idx,
-                len: 1,
-                token_ids: if enable_prefix_caching {
-                    vec![seq.last_token]
-                } else {
-                    Vec::new()
-                },
-            });
-            generated_counts.push(seq.generated_count as u32);
-            max_tokens.push(seq.max_tokens as u32);
-            ignore_eos.push(seq.ignore_eos);
-        }
+        let req = build_decode_request(
+            &order,
+            &new_indices,
+            active,
+            eos_ids,
+            enable_prefix_caching,
+        );
 
-        let req = StepRequest {
-            sampling: Vec::new(),
-            stop: StopCriteria {
-                eos_ids: eos_ids.to_vec(),
-                generated_counts,
-                max_tokens,
-                ignore_eos,
-            },
-            draft_tokens: Vec::new(),
-            seqs,
-        };
+        // ABC A-reuse: the leading rows of `order` that match the prior step's
+        // device-row order already hold the right token in buffer A (written by
+        // last step's compact merge), so only the divergent suffix re-uploads.
+        let a_valid_prefix = common_prefix_len(&order, &self.prev_a_rows);
 
-        let out = match runner.step(&req) {
-            Ok(out) => out,
+        match runner.issue_decode_abc(
+            &req.req,
+            a_valid_prefix,
+            &req.generated_counts,
+            &req.max_tokens,
+            &req.ignore_eos,
+            eos_ids,
+        ) {
+            Ok(()) => {
+                let batch = order.len();
+                self.pending = Some(PendingDecode {
+                    order,
+                    new_indices,
+                    assigned: req.assigned,
+                    batch,
+                });
+                Ok(())
+            }
             Err(e) => {
                 if !new_indices.is_empty() {
                     kv_allocator.free(&new_indices);
@@ -129,27 +235,16 @@ impl DecodeEngine {
                     active,
                     kv_allocator,
                     &order,
-                    format!("decode step failed: {:?}", e),
+                    format!("decode issue failed: {:?}", e),
                     enable_prefix_caching,
                 );
                 self.rows.clear();
-                return Ok(());
+                // A's contents are unknown after a failed issue; force a full
+                // re-upload on the next step.
+                self.prev_a_rows.clear();
+                Ok(())
             }
-        };
-
-        let output = self.commit_results(
-            active,
-            kv_allocator,
-            &order,
-            &new_indices,
-            assigned,
-            &out,
-            enable_prefix_caching,
-        )?;
-
-        data.send_step_output(&output)
-            .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
-        Ok(())
+        }
     }
 
     /// Materialize the row order, admit pending sequences, and allocate exactly
@@ -249,6 +344,12 @@ impl DecodeEngine {
         Ok(Some((order, new_indices)))
     }
 
+    /// Commit one ABC compact step. The merge already split surviving vs
+    /// finished rows; here we (1) advance every row that produced a token —
+    /// appending this step's `new_index` to its block table, INCLUDING finished
+    /// rows, so that (2) removing a finished row reclaims its full KV (all prior
+    /// blocks plus the slot allocated this step). Surviving rows become the next
+    /// device-row order, in compaction (active_src_rows) order, matching A.
     fn commit_results(
         &mut self,
         active: &mut ActiveSeqMap,
@@ -256,7 +357,7 @@ impl DecodeEngine {
         order: &[u64],
         new_indices: &[u32],
         assigned: Vec<AssignedIndices>,
-        out: &crate::domain::plan::StepOutput,
+        compact: &DecodeCompactOutput,
         enable_prefix_caching: bool,
     ) -> OpResult<StepOutput> {
         let mut output = StepOutput {
@@ -265,37 +366,53 @@ impl DecodeEngine {
             assigned_indices: assigned,
         };
 
-        let mut next_rows: Vec<u64> = Vec::with_capacity(order.len());
-        let mut to_remove: Vec<u64> = Vec::new();
+        // (token, finished) per original row, plus the next-step row order.
+        let mut row_results: Vec<Option<(i32, bool)>> = vec![None; order.len()];
+        let mut next_rows: Vec<u64> = Vec::with_capacity(compact.active.len());
+        for row in &compact.active {
+            if row.src_row >= order.len() {
+                continue;
+            }
+            row_results[row.src_row] = Some((row.token_id, false));
+            next_rows.push(order[row.src_row]);
+        }
+        let mut to_remove: Vec<u64> = Vec::with_capacity(compact.finished.len());
+        for row in &compact.finished {
+            if row.src_row >= order.len() {
+                continue;
+            }
+            row_results[row.src_row] = Some((row.token_id, true));
+            to_remove.push(order[row.src_row]);
+        }
+
         for (i, &sid) in order.iter().enumerate() {
-            let token = out
-                .tokens
-                .get(i)
-                .and_then(|row| row.first())
-                .map(|t| t.token_id)
-                .unwrap_or(0);
-            let finished = out.finished.get(i).copied().unwrap_or(true);
+            let Some((token, finished)) = row_results[i] else {
+                continue;
+            };
             let Some(&new_index) = new_indices.get(i) else {
                 return Err(OpError::Shape(format!(
                     "decode commit missing allocated KV index for row {} seq {}",
                     i, sid
                 )));
             };
+            // Append the slot allocated this step to EVERY row that ran —
+            // finished rows too — so the release below reclaims it. If the seq
+            // was cancelled/preempted out-of-band while this step was in flight
+            // (pipelined: control is drained between issue and finalize), it is
+            // gone from `active` and its other blocks were already released —
+            // so free this step's orphaned slot directly to avoid a leak.
             if let Some(seq) = active.get_mut(&sid) {
                 seq.commit_accepted(token, 1, &[new_index]).map_err(|e| {
                     OpError::Shape(format!("decode commit failed for seq {}: {}", sid, e))
                 })?;
+            } else {
+                kv_allocator.free(&[new_index]);
             }
             output.tokens.push(GeneratedToken {
                 sequence_id: sid,
                 token_id: token,
                 finished,
             });
-            if finished {
-                to_remove.push(sid);
-            } else {
-                next_rows.push(sid);
-            }
         }
         for sid in &to_remove {
             if let Some(removed) = active.remove(sid) {
@@ -304,6 +421,87 @@ impl DecodeEngine {
         }
         self.rows.replace_rows(next_rows);
         Ok(output)
+    }
+}
+
+/// Length of the longest common prefix of two row orders.
+fn common_prefix_len(a: &[u64], b: &[u64]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// The per-step decode request plus the stop metadata vectors the merge needs.
+struct DecodeRequestBuild {
+    req: StepRequest,
+    generated_counts: Vec<u32>,
+    max_tokens: Vec<u32>,
+    ignore_eos: Vec<bool>,
+    assigned: Vec<AssignedIndices>,
+}
+
+/// Build the decode `StepRequest`: one new token + one new KV slot per row,
+/// in `order` row order. Each row's block table is its committed table plus
+/// the slot freshly allocated for this step.
+fn build_decode_request(
+    order: &[u64],
+    new_indices: &[u32],
+    active: &ActiveSeqMap,
+    eos_ids: &[i32],
+    enable_prefix_caching: bool,
+) -> DecodeRequestBuild {
+    let mut seqs = Vec::with_capacity(order.len());
+    let mut assigned = Vec::with_capacity(order.len());
+    let mut generated_counts = Vec::with_capacity(order.len());
+    let mut max_tokens = Vec::with_capacity(order.len());
+    let mut ignore_eos = Vec::with_capacity(order.len());
+    for (i, &sid) in order.iter().enumerate() {
+        let new_idx = new_indices[i];
+        let seq = active
+            .get(&sid)
+            .expect("decode order row must be active after prepare_step");
+        let mut block_table = Vec::with_capacity(seq.block_table.len() + 1);
+        block_table.extend_from_slice(&seq.block_table);
+        block_table.push(new_idx);
+        seqs.push(SeqStep {
+            sequence_id: sid,
+            input_ids: vec![seq.last_token],
+            positions: vec![seq.kv_len as i32],
+            kv_write_start: seq.kv_len as i32,
+            kv_len_after: (seq.kv_len + 1) as i32,
+            block_table,
+        });
+        assigned.push(AssignedIndices {
+            sequence_id: sid,
+            base: new_idx,
+            len: 1,
+            token_ids: if enable_prefix_caching {
+                vec![seq.last_token]
+            } else {
+                Vec::new()
+            },
+        });
+        generated_counts.push(seq.generated_count as u32);
+        max_tokens.push(seq.max_tokens as u32);
+        ignore_eos.push(seq.ignore_eos);
+    }
+
+    let req = StepRequest {
+        sampling: Vec::new(),
+        stop: StopCriteria {
+            eos_ids: eos_ids.to_vec(),
+            generated_counts: generated_counts.clone(),
+            max_tokens: max_tokens.clone(),
+            ignore_eos: ignore_eos.clone(),
+        },
+        draft_tokens: Vec::new(),
+        seqs,
+    };
+
+    DecodeRequestBuild {
+        req,
+        generated_counts,
+        max_tokens,
+        ignore_eos,
+        assigned,
     }
 }
 

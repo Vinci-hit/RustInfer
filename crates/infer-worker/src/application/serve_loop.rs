@@ -149,8 +149,10 @@ where
     )
     .map_err(|e| format!("Runtime::new: {:?}", e))?;
 
-    // Graph replay is a reserved seam in v2 (decode runs eager today); this is a
-    // no-op until a scope installs real capture/replay.
+    // Install the decode CUDA-graph runner. On CUDA (arena reserved) this
+    // enables real capture-on-first-hit / replay for decode-only batches whose
+    // size matches a capture slot; on backends without graph support it is a
+    // no-op and decode stays eager.
     if let Err(e) = runner.prime_graphs() {
         tracing::info!(
             "[bootstrap] graph priming skipped, eager decode: {:?}",
@@ -235,7 +237,7 @@ where
         // This removes the old `idle_wait_ms = heartbeat/2` polling window
         // that dominated TTFT at low QPS.
         let mut pending_prefills = drain_data(data);
-        if pending_prefills.is_empty() && active.is_empty() {
+        if pending_prefills.is_empty() && active.is_empty() && !decode_engine.has_pending() {
             maybe_heartbeat(
                 control,
                 active.len() + prefilling.len(),
@@ -290,7 +292,7 @@ where
                 }
             }
 
-            if pending_prefills.is_empty() && active.is_empty() {
+            if pending_prefills.is_empty() && active.is_empty() && !decode_engine.has_pending() {
                 continue;
             }
         }
@@ -309,6 +311,14 @@ where
         // expose shape-dependent kernel/numeric differences and permanently
         // diverge greedy outputs. Drain the currently available prefills first
         // so a short burst starts decode as one cohort.
+        // A graph-eligible prefill writes buffer A on the compute stream; if a
+        // decode step is still in flight, order that write after the pending
+        // step's copy-out read of A (enqueue-only ev_out wait).
+        if !pending_prefills.is_empty() && decode_engine.has_pending() {
+            if let Err(e) = runner.guard_buffer_a_against_pending_copyout() {
+                tracing::warn!("[serve] guard_buffer_a failed: {}", e);
+            }
+        }
         let mut prefill_rounds = 0usize;
         while !pending_prefills.is_empty() {
             prefill_rounds += 1;
@@ -359,9 +369,10 @@ where
 
         // ── Decode step ──
         //
-        // Drives every active sequence one token forward. With no active
-        // sequences this is skipped and the loop parks on the poll above.
-        if !active.is_empty() {
+        // Drives every active sequence one token forward (pipelined 1-deep).
+        // Also runs when `active` is empty but a step is still in flight, so the
+        // last issued step is finalized and its tokens are sent.
+        if !active.is_empty() || decode_engine.has_pending() {
             if let Some(max_steps) = profile_cuda_steps {
                 if !profile_started {
                     // SAFETY: extern profiler API; returns a cudaError code.
@@ -541,6 +552,9 @@ fn apply_drain(control: &ControlPump, ctx: &mut WorkerCtx<'_>, mode: DrainMode, 
             ctx.kv_allocator
                 .release_owned(&seq.block_table, ctx.enable_prefix_caching);
         }
+        // Free the in-flight decode step's slots (not yet in any block table)
+        // before clearing, else they leak from the pool for the process life.
+        ctx.decode_engine.reclaim_pending(ctx.kv_allocator);
         ctx.decode_engine.clear();
     }
     if req_id.is_correlated() {
