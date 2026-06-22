@@ -304,12 +304,57 @@ where
         let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
-            let sampled = self.sampler.sample(&logits.0, &req.sampling, &ctx)?;
-            let mut tokens: Vec<Vec<SampledToken>> = sampled
-                .tokens
-                .into_iter()
-                .map(|token| vec![token])
-                .collect();
+            // Greedy fast path: reuse the ABC argmax workspace instead of having
+            // `Sampler::sample` allocate a fresh `[rows]` output + `[rows*512]`
+            // scratch every call. The CUDA backend's `argmax` (used by
+            // `GreedySampler::sample`) otherwise pays two `Tensor::zeros`
+            // (cudaMallocAsync + memset) per prefill, which directly inflated
+            // TTFT at low QPS after the buffer-pipeline refactor.
+            //
+            // For prefill (q_len > 1 per row) `argmax_into` writes one id per
+            // logits row into `abc.argmax_out_dev`; we then take the last token
+            // of every sequence (`sampled_rows = offset + q_len - 1`) via a
+            // single small D2H, mirroring `GreedySampler::sample`'s row pick.
+            let logits_rows = logits.0.shape().as_slice()[0];
+            if logits_rows > self.abc.argmax_out_dev.numel() {
+                return Err(OpError::Shape(format!(
+                    "sample_tail: logits rows {} exceeds argmax_out capacity {}",
+                    logits_rows,
+                    self.abc.argmax_out_dev.numel()
+                )));
+            }
+            D::argmax_into(
+                &ctx,
+                &logits.0,
+                &mut self.abc.argmax_out_dev,
+                &self.abc.argmax_ws,
+            )?;
+            let argmax_view = self.abc.argmax_out_dev.view_raw(
+                Shape::from_slice(&[logits_rows]),
+                Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
+                0,
+                true,
+            );
+            let ids = argmax_view.to_host_vec()?;
+            let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
+            let mut offset = 0usize;
+            for &q_len in &plan.q_lens {
+                let q = q_len.max(1) as usize;
+                let row = offset + q - 1;
+                let token_id = *ids.get(row).ok_or_else(|| {
+                    OpError::Shape(format!(
+                        "sample_tail: sampled row {} out of argmax range {}",
+                        row,
+                        ids.len()
+                    ))
+                })?;
+                tokens.push(vec![SampledToken {
+                    token_id,
+                    logprob: 0.0,
+                    top_logprobs: Vec::new(),
+                }]);
+                offset += q;
+            }
             tokens.resize_with(plan.batch, Vec::new);
             let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
             let speculative_len = vec![0; plan.batch];
@@ -548,7 +593,12 @@ where
         // The graph already produced the per-row argmax in buffer C; just read
         // it back (no eager finalize/sample). The decode graph path is always
         // greedy q_len=1 (speculative q_len>1 fell back to eager above).
-        self.scope.synchronize()?;
+        // `decode_output_from_c` does a `to_host_vec()` on C, which itself
+        // syncs the compute stream — so the extra `scope.synchronize()` that
+        // used to live here was redundant on the warm path and added ~1
+        // round-trip of latency per decode step. On the cold path the
+        // synchronize before capture is still required (and already issued
+        // above before `graph_capture_begin`).
         self.decode_output_from_c(plan, req)
     }
 
