@@ -7,6 +7,11 @@ use infer_core::tensor::Tensor;
 
 pub struct Hidden<T: Dtype, D: LlmBackend> {
     pub stream: Tensor<T, D>,
+    /// Deferred residual delta: a sublayer's projection output that has NOT yet
+    /// been added into `stream`. The next sublayer's pre-norm fuses the add via
+    /// `fused_add_rmsnorm` (one kernel instead of add_inplace + rmsnorm). `None`
+    /// at forward start; `decode_layers` flushes any leftover before `finalize`.
+    pub pending: Option<Tensor<T, D>>,
 }
 
 impl<T: Dtype, D: LlmBackend> Hidden<T, D> {

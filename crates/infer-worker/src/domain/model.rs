@@ -86,6 +86,15 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
     fn dims(&self) -> ModelDims;
     fn stages(&self) -> &[StageKind];
 
+    /// Install the shared, address-stable per-layer forward scratch into the
+    /// model's sublayers. Called once by `Runtime::new`. Default: no-op (for
+    /// models that don't carry component scratch, e.g. speculative wrappers).
+    fn install_scratch(
+        &mut self,
+        _scratch: std::rc::Rc<crate::domain::forward_scratch::ForwardScratch<T, D>>,
+    ) {
+    }
+
     fn embed(
         &self,
         input_ids: &Tensor<i32, D>,

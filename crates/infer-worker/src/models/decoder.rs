@@ -9,9 +9,12 @@ use crate::components::embed::Embed;
 use crate::components::ffn_dense::DenseFfn;
 use crate::components::lm_head::LmHead;
 use crate::components::norm::RmsNorm;
+use std::rc::Rc;
+
 use crate::domain::component::{Component, Hidden, LayerRange, StageKind};
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
+use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::kv::KvView;
 use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
 use crate::domain::ports::OpResult;
@@ -30,6 +33,9 @@ pub struct Decoder<T: Dtype, D: LlmBackend> {
     pub norm: RmsNorm<T, D>,
     pub lm_head: LmHead<T, D>,
     pub dims: ModelDims,
+    /// Shared per-forward scratch (installed by `Runtime::new`); used by
+    /// `finalize` for the norm + lm_head output. `None` → allocate (pooled).
+    pub scratch: Option<Rc<ForwardScratch<T, D>>>,
 }
 
 impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
@@ -39,6 +45,17 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
 
     fn stages(&self) -> &[StageKind] {
         &STAGES
+    }
+
+    fn install_scratch(
+        &mut self,
+        scratch: std::rc::Rc<crate::domain::forward_scratch::ForwardScratch<T, D>>,
+    ) {
+        for block in &mut self.blocks {
+            block.attention.scratch = Some(scratch.clone());
+            block.ffn.scratch = Some(scratch.clone());
+        }
+        self.scratch = Some(scratch);
     }
 
     fn embed(
@@ -62,6 +79,12 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
             let mut layer_view = kv.single_layer(local);
             self.blocks[layer_idx].run(hidden, Some(&mut layer_view), ctx)?;
         }
+        // Flush the last sublayer's deferred residual delta so `stream` holds the
+        // true residual for `finalize`. This is the one residual boundary not
+        // fused with a following pre-norm (all inter-sublayer boundaries are).
+        if let Some(delta) = hidden.pending.take() {
+            D::add_inplace(ctx.scope(), &mut hidden.stream, &delta)?;
+        }
         Ok(())
     }
 
@@ -77,9 +100,19 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
         let _ = rows;
         let num_tokens = hidden.num_tokens();
         let dev = hidden.stream.device().clone();
-        let mut normed = D::alloc_tensor(Shape::from_slice(&[num_tokens, self.dims.dim]), &dev)?;
-        let mut logits =
-            D::alloc_tensor(Shape::from_slice(&[num_tokens, self.dims.vocab_size]), &dev)?;
+        // Reuse the address-stable scratch (norm buffer + preallocated logits)
+        // when installed; otherwise allocate (pooled). Keeps `finalize`
+        // allocation-free and keeps the large [tokens, vocab] logits off the
+        // recycling pool (where ragged lengths would grow it unbounded).
+        let scratch = self.scratch.as_deref().filter(|s| s.fits(num_tokens));
+        let mut normed = match scratch {
+            Some(s) => s.normed(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, self.dims.dim]), &dev)?,
+        };
+        let mut logits = match scratch {
+            Some(s) => s.logits(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, self.dims.vocab_size]), &dev)?,
+        };
         self.norm.forward(&hidden.stream, &mut normed, ctx)?;
         self.lm_head.forward(&normed, &mut logits, ctx)?;
         Ok(Logits(logits))
@@ -155,11 +188,13 @@ mod tests {
                 kv_head_num: HEAD_NUM,
                 head_dim: HEAD_DIM,
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                scratch: None,
             },
             ffn: DenseFfn {
                 post_attention_layernorm: rms(ones(DIM)),
                 gate_up_proj: lin(2 * INTER, DIM),
                 down_proj: lin(DIM, INTER),
+                scratch: None,
             },
         };
         Decoder {
@@ -187,6 +222,7 @@ mod tests {
                 moe_intermediate_size: 0,
                 num_shared_experts: 0,
             },
+            scratch: None,
         }
     }
 

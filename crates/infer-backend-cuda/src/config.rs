@@ -13,6 +13,14 @@ const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 4usize * 1024 * 1024 * 1024;
 /// few hundred MiB, so this leaves comfortable headroom.
 const GRAPH_ARENA_SIZE: usize = 1usize * 1024 * 1024 * 1024;
 
+/// Upper bound on bytes the recycling pool retains across the free lists. The
+/// hot per-forward scratch is served from `ForwardScratch` (not the pool), so
+/// the pool only recycles residual/transient allocations; this cap stops a
+/// pathological mix of distinct size classes (e.g. ragged prompt lengths) from
+/// growing the free list without bound. Over budget, freed blocks are
+/// `cudaFree`d instead of retained (off the hot path, never mid-capture).
+const POOL_RETAIN_BUDGET: usize = 512usize * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
     LlmDecode {
@@ -42,6 +50,23 @@ impl Drop for CudaGraph {
             ffi::cudaGraphDestroy(self.graph);
         }
     }
+}
+
+/// Size-keyed free-list of recycled device blocks. Eliminates the per-forward
+/// `cudaMalloc`/`cudaFree` storm: every transient scratch `Tensor` returns its
+/// block here on drop (keyed by 256B-rounded size) and the next same-size alloc
+/// pops it, so an eager forward issues ~0 `cudaMalloc`/`cudaFree` in steady
+/// state. Disjoint from the graph-capture arena — arena pointers are filtered
+/// out (via `arena_contains`) before they can reach the pool, so a pooled block
+/// can never alias a captured graph's baked-in scratch addresses.
+#[derive(Debug, Default)]
+struct PoolState {
+    /// key = `round_up_256(size)` → stack of reusable device pointers.
+    free: HashMap<usize, Vec<*mut c_void>>,
+    /// Bytes currently handed out (popped or cold-malloc'd) and not yet returned.
+    live_bytes: usize,
+    /// Bytes retained across the free lists, available for reuse.
+    pooled_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -89,6 +114,13 @@ pub struct CudaConfig {
     pub arena_base: std::sync::atomic::AtomicPtr<c_void>,
     pub arena_off: std::sync::atomic::AtomicUsize,
     pub arena_enabled: std::sync::atomic::AtomicBool,
+
+    // ─── Recycling scratch allocator (eager forward path) ────────────
+    //
+    // Outside graph capture, transient scratch tensors are recycled through
+    // this size-keyed free list instead of round-tripping `cudaMalloc`/
+    // `cudaFree` (the latter device-synchronizes). See `PoolState`.
+    pool: std::sync::Mutex<PoolState>,
 }
 
 impl CudaConfig {
@@ -166,6 +198,7 @@ impl CudaConfig {
             arena_base: std::sync::atomic::AtomicPtr::new(arena_ptr),
             arena_off: std::sync::atomic::AtomicUsize::new(0),
             arena_enabled: std::sync::atomic::AtomicBool::new(false),
+            pool: std::sync::Mutex::new(PoolState::default()),
         })
     }
 
@@ -205,7 +238,7 @@ impl CudaConfig {
         if base.is_null() {
             return None;
         }
-        let n = (size.max(1) + 255) & !255usize;
+        let n = self.round_up_256(size);
         let off = self.arena_off.fetch_add(n, Ordering::AcqRel);
         if off + n > GRAPH_ARENA_SIZE {
             self.arena_off.fetch_sub(n, Ordering::AcqRel);
@@ -231,6 +264,77 @@ impl CudaConfig {
         let p = ptr as usize;
         let b = base as usize;
         p >= b && p < b + GRAPH_ARENA_SIZE
+    }
+
+    // ─── Recycling scratch allocator ─────────────────────────────────
+
+    /// Size class for the free list: round up to 256 B so an alloc and its
+    /// later free hash to the same bucket. Shared with the arena so both
+    /// allocators agree on block sizes.
+    #[inline]
+    pub fn round_up_256(&self, n: usize) -> usize {
+        (n.max(1) + 255) & !255usize
+    }
+
+    /// Pop a previously-freed block of the given rounded size, if any.
+    /// No CUDA calls under the lock — the caller zeros the block afterward.
+    pub fn pool_pop(&self, n: usize) -> Option<*mut c_void> {
+        let mut g = self.pool.lock().unwrap();
+        let p = g.free.get_mut(&n).and_then(|v| v.pop());
+        if p.is_some() {
+            g.pooled_bytes = g.pooled_bytes.saturating_sub(n);
+            g.live_bytes += n;
+        }
+        p
+    }
+
+    /// Record a cold `cudaMalloc` so `live_bytes` stays consistent (diagnostic).
+    pub fn pool_note_cold_alloc(&self, n: usize) {
+        self.pool.lock().unwrap().live_bytes += n;
+    }
+
+    /// Return a block to the free list for later reuse (no `cudaFree`), unless
+    /// retaining it would push the pool over `POOL_RETAIN_BUDGET` — then the
+    /// block is `cudaFree`d (outside the lock; legal here since arena/capture
+    /// pointers were already filtered out by `free_bytes`).
+    pub fn pool_push(&self, n: usize, ptr: *mut c_void) {
+        let retained = {
+            let mut g = self.pool.lock().unwrap();
+            g.live_bytes = g.live_bytes.saturating_sub(n);
+            if g.pooled_bytes + n > POOL_RETAIN_BUDGET {
+                false
+            } else {
+                debug_assert!(
+                    g.free.get(&n).map_or(true, |v| !v.contains(&ptr)),
+                    "double-free into cuda pool: ptr={:?} size-class={}",
+                    ptr,
+                    n
+                );
+                g.free.entry(n).or_default().push(ptr);
+                g.pooled_bytes += n;
+                true
+            }
+        };
+        if !retained {
+            // SAFETY: ptr came from cudaMalloc and is not arena/capture-owned.
+            unsafe {
+                ffi::cudaFree(ptr);
+            }
+        }
+    }
+
+    /// `cudaFree` every retained block and clear the free lists. Called on
+    /// device teardown (Drop). Must run while the CUDA context is still valid.
+    pub fn pool_drain(&self) {
+        let mut g = self.pool.lock().unwrap();
+        for (_n, v) in g.free.drain() {
+            for ptr in v {
+                unsafe {
+                    ffi::cudaFree(ptr);
+                }
+            }
+        }
+        g.pooled_bytes = 0;
     }
 
     pub fn graph_ready(&self, slot: GraphSlot) -> bool {
@@ -293,6 +397,9 @@ impl CudaConfig {
     }
 
     pub fn invalidate_all_graphs(&self) {
+        // The scratch pool is intentionally left intact: pooled blocks are a
+        // disjoint cudaMalloc region, never baked into any captured graph, so
+        // dropping graphs requires no pool drain.
         self.graphs.lock().unwrap().clear();
     }
 
@@ -498,6 +605,8 @@ impl Drop for CudaConfig {
                 ffi::cudaFree(arena);
             }
         }
+        // Release every recycled scratch block (disjoint from the arena).
+        self.pool_drain();
     }
 }
 unsafe impl Send for CudaConfig {}

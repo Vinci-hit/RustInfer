@@ -1,6 +1,9 @@
+use std::rc::Rc;
+
 use crate::components::linear::Linear;
 use crate::components::norm::RmsNorm;
 use crate::domain::component::{Component, Hidden, StageKind};
+use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
 use crate::domain::kv::KvView;
@@ -19,6 +22,9 @@ pub struct DenseFfn<T: Dtype, D: LlmBackend> {
     pub post_attention_layernorm: RmsNorm<T, D>,
     pub gate_up_proj: Linear<T, D>,
     pub down_proj: Linear<T, D>,
+    /// Shared, address-stable per-layer forward scratch (installed by
+    /// `Runtime::new`). `None` → fall back to per-call device allocation.
+    pub scratch: Option<Rc<ForwardScratch<T, D>>>,
 }
 
 impl<T: Dtype, D: LlmBackend> DenseFfn<T, D> {
@@ -35,8 +41,22 @@ impl<T: Dtype, D: LlmBackend> DenseFfn<T, D> {
         let gate_cols = self.gate_up_proj.weight.shape().as_slice()[0];
         let inter = gate_cols / 2;
         let dev = input.device().clone();
-        let mut gate_up = D::alloc_tensor(Shape::from_slice(&[num_tokens, gate_cols]), &dev)?;
-        let mut swiglu = D::alloc_tensor(Shape::from_slice(&[num_tokens, inter]), &dev)?;
+        // Reuse address-stable scratch when its geometry matches this FFN's
+        // fused gate/up width; otherwise allocate (pooled). The `fits_ffn`
+        // guard lets an MoE shared expert with a different intermediate size
+        // safely fall back instead of aliasing the wrong-width buffer.
+        let scratch = self
+            .scratch
+            .as_deref()
+            .filter(|s| s.fits_ffn(num_tokens, gate_cols));
+        let mut gate_up = match scratch {
+            Some(s) => s.gate_up(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, gate_cols]), &dev)?,
+        };
+        let mut swiglu = match scratch {
+            Some(s) => s.swiglu(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, inter]), &dev)?,
+        };
         self.gate_up_proj.forward(input, &mut gate_up, ctx)?;
         D::swiglu_packed(ctx, &gate_up, &mut swiglu, num_tokens, inter)?;
         self.down_proj.forward(&swiglu, out, ctx)
@@ -58,13 +78,34 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for DenseFfn<T, D> {
         let num_tokens = hidden.num_tokens();
         let dim = hidden.stream.shape().as_slice()[1];
         let dev = hidden.stream.device().clone();
-        let mut normed = D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?;
-        let mut ffn_out = D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?;
-        // Pre-FFN norm — residual stays intact in `hidden.stream`.
-        self.post_attention_layernorm
-            .forward(&hidden.stream, &mut normed, ctx)?;
+        let scratch = self.scratch.as_deref().filter(|s| s.fits(num_tokens));
+        let mut normed = match scratch {
+            Some(s) => s.normed(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?,
+        };
+        let mut ffn_out = match scratch {
+            Some(s) => s.ffn_out(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?,
+        };
+        // Pre-FFN norm, fusing the attention sublayer's deferred residual add
+        // when present (stream += delta; normed = rmsnorm(stream)); else plain.
+        match hidden.pending.take() {
+            Some(delta) => D::fused_add_rmsnorm(
+                ctx,
+                &mut normed,
+                &mut hidden.stream,
+                &delta,
+                &self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )?,
+            None => self
+                .post_attention_layernorm
+                .forward(&hidden.stream, &mut normed, ctx)?,
+        }
         self.project(&normed, &mut ffn_out, ctx)?;
-        // Residual update: hidden.stream += FFN output.
-        D::add_inplace(ctx.scope(), &mut hidden.stream, &ffn_out)
+        // Defer the residual add: stash `ffn_out` for the next sublayer's
+        // pre-norm to fuse. `decode_layers` flushes the final leftover.
+        hidden.pending = Some(ffn_out);
+        Ok(())
     }
 }

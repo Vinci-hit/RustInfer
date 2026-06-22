@@ -535,6 +535,23 @@ impl infer_core::ports::FusedOps for Cuda {
         )
     }
 
+    fn qkv_split<T: infer_core::dtype::Dtype>(
+        _ctx: &infer_core::exec::StepCtx<'_, Self>,
+        qkv: &Tensor<T, Self>,
+        _num_tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> OpResult<(Tensor<T, Self>, Tensor<T, Self>, Tensor<T, Self>)> {
+        // Zero-copy: Q/K/V are column narrows of the fused `qkv` buffer (row
+        // stride = qkv_dim). Every CUDA attention kernel (qkv_norm_rope_scatter,
+        // rope_inplace, scatter_kv_paged, attention_paged) reads row/col strides
+        // directly, so no split copy and no per-layer q/k/v allocation.
+        let q = qkv.narrow(1, 0, q_dim)?;
+        let k = qkv.narrow(1, q_dim, kv_dim)?;
+        let v = qkv.narrow(1, q_dim + kv_dim, kv_dim)?;
+        Ok((q, k, v))
+    }
+
     fn qkv_norm_rope_scatter<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         q: &mut Tensor<T, Self>,
@@ -683,9 +700,21 @@ impl MemoryPort for Cuda {
             return NonNull::new(arena_ptr as *mut u8)
                 .ok_or_else(|| OpError::Kernel("graph arena returned null".into()));
         }
-        let n = size.max(1);
+        // Recycle a previously-freed block of the same size class if one is
+        // available — avoids cudaMalloc entirely once the pool warms up.
+        let n = self.config.round_up_256(size);
+        if let Some(ptr) = self.config.pool_pop(n) {
+            // The reused block holds a prior tenant's bytes; zero it stream-
+            // ordered (async, no host stall) to preserve `Tensor::zeros`
+            // semantics for every caller.
+            unsafe {
+                ffi::cudaMemsetAsync(ptr, 0, n, self.config.stream);
+            }
+            return NonNull::new(ptr as *mut u8)
+                .ok_or_else(|| OpError::Kernel("cuda pool returned null".into()));
+        }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: cudaMalloc/cudaMemset are safe to call with valid args.
+        // SAFETY: cudaMalloc/cudaMemsetAsync are safe to call with valid args.
         unsafe {
             let code = ffi::cudaMalloc(&mut ptr, n);
             if code != ffi::cudaError_cudaSuccess {
@@ -694,27 +723,28 @@ impl MemoryPort for Cuda {
                     n, code
                 )));
             }
-            let code = ffi::cudaMemset(ptr, 0, n);
-            if code != ffi::cudaError_cudaSuccess {
-                ffi::cudaFree(ptr);
-                return Err(OpError::Kernel(format!("cudaMemset failed: {:?}", code)));
-            }
+            // Async, stream-ordered zero — replaces the host-blocking
+            // synchronous cudaMemset that dominated eager-forward TTFT.
+            ffi::cudaMemsetAsync(ptr, 0, n, self.config.stream);
         }
+        self.config.pool_note_cold_alloc(n);
         NonNull::new(ptr as *mut u8)
             .ok_or_else(|| OpError::Kernel("cudaMalloc returned null".into()))
     }
 
-    unsafe fn free_bytes(&self, ptr: NonNull<u8>, _size: usize) {
+    unsafe fn free_bytes(&self, ptr: NonNull<u8>, size: usize) {
         // Arena-owned scratch is not individually freed — the bump arena is
         // reset wholesale at the next capture. A real `cudaFree` here would
         // both corrupt the arena and (if mid-capture) be illegal.
         if self.config.arena_contains(ptr.as_ptr() as *mut std::ffi::c_void) {
             return;
         }
-        // SAFETY: ptr came from cudaMalloc.
-        unsafe {
-            ffi::cudaFree(ptr.as_ptr() as *mut std::ffi::c_void);
-        }
+        // Recycle into the size-keyed pool instead of `cudaFree` (which would
+        // device-synchronize). The block is reused by the next same-size alloc;
+        // all retained blocks are released in `CudaConfig::Drop` via `pool_drain`.
+        let n = self.config.round_up_256(size);
+        self.config
+            .pool_push(n, ptr.as_ptr() as *mut std::ffi::c_void);
     }
 
     unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {

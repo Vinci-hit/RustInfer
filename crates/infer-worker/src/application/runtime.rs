@@ -47,6 +47,12 @@ where
     /// requires the forward to read from a fixed device address; this buffer is
     /// rewritten in place each step instead of allocating a fresh tensor.
     pub input_ids_buf: Tensor<i32, D>,
+    /// Persistent prefill input-id staging (capacity `cap_num_tokens`) + its
+    /// host mirror. Eager forwards upload into this fixed buffer with an async
+    /// H2D (no per-step `cudaStreamSynchronize`), instead of allocating a fresh
+    /// `from_host_slice` tensor whose throwaway host Vec forced a full sync.
+    pub prefill_ids_buf: Tensor<i32, D>,
+    prefill_ids_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
 }
@@ -111,7 +117,7 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        model: M,
+        mut model: M,
         scope: <D as Device>::Scope,
         sampler: Box<dyn Sampler<T, D>>,
         num_blocks: usize,
@@ -180,17 +186,25 @@ where
 
         let hidden = Hidden {
             stream: D::alloc_tensor(Shape::from_slice(&[cap_num_tokens, dims.dim]), device)?,
+            pending: None,
         };
 
         let input_ids_buf =
             D::alloc_tensor::<i32>(Shape::from_slice(&[cap_batch.max(1)]), device)?;
+        let prefill_ids_buf =
+            D::alloc_tensor::<i32>(Shape::from_slice(&[cap_num_tokens.max(1)]), device)?;
+        let prefill_ids_host = vec![0i32; cap_num_tokens.max(1)];
 
         // ── ABC pipeline buffers (Stage 1: allocated, wired in later stages) ──
         let cb = cap_batch.max(1);
+        // Greedy prefill argmax processes every token row of the forward, so the
+        // argmax output/scratch must hold up to `cap_num_tokens` rows, not just
+        // the decode batch. Decode only ever uses the first `batch` slots.
+        let argmax_cap = cb.max(cap_num_tokens.max(1));
         let abc = AbcBuffers {
             new_token_dev: alloc_i32(cb)?,
-            argmax_out_dev: alloc_i32(cb)?,
-            argmax_ws: D::alloc_tensor::<f32>(Shape::from_slice(&[cb * 512]), device)?,
+            argmax_out_dev: alloc_i32(argmax_cap)?,
+            argmax_ws: D::alloc_tensor::<f32>(Shape::from_slice(&[argmax_cap * 512]), device)?,
             generated_counts_dev: alloc_i32(cb)?,
             max_tokens_dev: alloc_i32(cb)?,
             ignore_eos_dev: alloc_i32(cb)?,
@@ -211,6 +225,14 @@ where
             pinned: false,
         };
 
+        // Preallocate the address-stable per-layer forward scratch and install
+        // it into the model's sublayers. Eliminates the ~11 device allocations
+        // per layer (cudaMalloc/cudaFree/memset storm) on the eager forward and
+        // bakes fixed scratch addresses into captured decode graphs.
+        let scratch =
+            crate::domain::forward_scratch::ForwardScratch::<T, D>::new(device, dims, cap_num_tokens)?;
+        model.install_scratch(scratch);
+
         Ok(Self {
             model,
             kv_pool,
@@ -227,6 +249,8 @@ where
             capture_sizes,
             graph: None,
             input_ids_buf,
+            prefill_ids_buf,
+            prefill_ids_host,
             abc,
         })
     }
@@ -267,6 +291,7 @@ where
                 0,
                 true,
             ),
+            pending: None,
         };
         let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
@@ -298,6 +323,7 @@ where
                 0,
                 true,
             ),
+            pending: None,
         };
         let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
@@ -323,19 +349,17 @@ where
                     self.abc.argmax_out_dev.numel()
                 )));
             }
-            D::argmax_into(
-                &ctx,
-                &logits.0,
-                &mut self.abc.argmax_out_dev,
-                &self.abc.argmax_ws,
-            )?;
-            let argmax_view = self.abc.argmax_out_dev.view_raw(
+            // Pass a `[logits_rows]`-sized view of the (capacity `argmax_cap`)
+            // output buffer: `argmax_into` writes exactly one id per logits row,
+            // and the reference path requires the output numel to match.
+            let mut argmax_out = self.abc.argmax_out_dev.view_raw(
                 Shape::from_slice(&[logits_rows]),
                 Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
                 0,
                 true,
             );
-            let ids = argmax_view.to_host_vec()?;
+            D::argmax_into(&ctx, &logits.0, &mut argmax_out, &self.abc.argmax_ws)?;
+            let ids = argmax_out.to_host_vec()?;
             let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
             let mut offset = 0usize;
             for &q_len in &plan.q_lens {
@@ -448,6 +472,7 @@ where
                 0,
                 true,
             ),
+            pending: None,
         };
         let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
@@ -726,16 +751,38 @@ where
         })
     }
 
-    fn input_ids_tensor(&self, req: &StepRequest, plan: &BatchPlan) -> OpResult<Tensor<i32, D>> {
-        let mut input_ids = Vec::with_capacity(plan.num_tokens);
-        for seq in &req.seqs {
-            input_ids.extend_from_slice(&seq.input_ids);
+    fn input_ids_tensor(&mut self, req: &StepRequest, plan: &BatchPlan) -> OpResult<Tensor<i32, D>> {
+        let n = plan.num_tokens;
+        if n > self.prefill_ids_host.len() {
+            return Err(OpError::Shape(format!(
+                "input_ids_tensor: num_tokens {} > cap {}",
+                n,
+                self.prefill_ids_host.len()
+            )));
         }
-        Tensor::from_host_slice(
-            &input_ids,
-            Shape::from_slice(&[plan.num_tokens]),
-            self.scope.device(),
-        )
+        // Fill the persistent host staging prefix, then async-upload into the
+        // fixed device buffer (NO cudaStreamSynchronize). Same compute stream as
+        // the forward, so the H2D is ordered before the kernels that read it;
+        // the host buffer is reused (not freed), so no flush-sync is needed.
+        let mut off = 0usize;
+        for seq in &req.seqs {
+            let len = seq.input_ids.len();
+            self.prefill_ids_host[off..off + len].copy_from_slice(&seq.input_ids);
+            off += len;
+        }
+        unsafe {
+            upload_i32_prefix(
+                self.scope.device(),
+                &self.prefill_ids_buf,
+                &self.prefill_ids_host[..n],
+            )?;
+        }
+        Ok(self.prefill_ids_buf.view_raw(
+            Shape::from_slice(&[n]),
+            Shape::from_slice(&[n.max(1)]).contiguous_strides(),
+            0,
+            true,
+        ))
     }
 
     fn upload_index(&mut self, plan: &BatchPlan, req: &StepRequest) -> OpResult<()> {
@@ -1330,6 +1377,7 @@ where
             0,
             true,
         ),
+        pending: None,
     };
     let ctx = crate::domain::exec::StepCtx::new(&runtime.scope, &plan);
     let _guard = runtime.scope.enter();

@@ -59,6 +59,28 @@ pub trait FusedOps: MathOps {
         )
     }
 
+    /// Produce Q/K/V from a fused `[num_tokens, q_dim + 2*kv_dim]` buffer.
+    ///
+    /// Default: materialize CONTIGUOUS q/k/v (one copy each) — required by
+    /// backends whose attention kernels assume a contiguous row stride (the CPU
+    /// reference indexes `t*q_dim + ...`). CUDA overrides this to return
+    /// zero-copy column narrows of `qkv` (its kernels read row/col strides
+    /// directly), so the GPU path allocates and copies nothing here.
+    fn qkv_split<T: Dtype>(
+        ctx: &StepCtx<'_, Self>,
+        qkv: &Tensor<T, Self>,
+        num_tokens: usize,
+        q_dim: usize,
+        kv_dim: usize,
+    ) -> OpResult<(Tensor<T, Self>, Tensor<T, Self>, Tensor<T, Self>)> {
+        let dev = qkv.device();
+        let mut q = Self::alloc_tensor(Shape::from_slice(&[num_tokens, q_dim]), dev)?;
+        let mut k = Self::alloc_tensor(Shape::from_slice(&[num_tokens, kv_dim]), dev)?;
+        let mut v = Self::alloc_tensor(Shape::from_slice(&[num_tokens, kv_dim]), dev)?;
+        Self::split_qkv(ctx, qkv, &mut q, &mut k, &mut v, num_tokens, q_dim, kv_dim)?;
+        Ok((q, k, v))
+    }
+
     fn attention_paged<T: Dtype>(
         ctx: &StepCtx<'_, Self>,
         q: &Tensor<T, Self>,

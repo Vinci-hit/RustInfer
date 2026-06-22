@@ -1,6 +1,9 @@
+use std::rc::Rc;
+
 use crate::components::linear::Linear;
 use crate::components::norm::RmsNorm;
 use crate::domain::component::{Component, Hidden, StageKind};
+use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
 use crate::domain::kv::KvView;
@@ -28,6 +31,9 @@ pub struct Attention<T: Dtype, D: LlmBackend> {
     pub kv_head_num: usize,
     pub head_dim: usize,
     pub scale: f32,
+    /// Shared, address-stable per-layer forward scratch (installed by
+    /// `Runtime::new`). `None` → fall back to per-call device allocation.
+    pub scratch: Option<Rc<ForwardScratch<T, D>>>,
 }
 
 impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
@@ -49,18 +55,47 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
         let dim = hidden.stream.shape().as_slice()[1];
         let dev = hidden.stream.device().clone();
 
-        let mut normed = D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?;
-        let mut qkv = D::alloc_tensor(Shape::from_slice(&[num_tokens, qkv_dim]), &dev)?;
-        let mut q = D::alloc_tensor(Shape::from_slice(&[num_tokens, q_dim]), &dev)?;
-        let mut k = D::alloc_tensor(Shape::from_slice(&[num_tokens, kv_dim]), &dev)?;
-        let mut v = D::alloc_tensor(Shape::from_slice(&[num_tokens, kv_dim]), &dev)?;
-        let mut attn_out = D::alloc_tensor(Shape::from_slice(&[num_tokens, q_dim]), &dev)?;
-        let mut o_out = D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?;
+        // Per-layer scratch: reuse the address-stable workspace when installed
+        // (zero alloc, zero memset, CUDA-graph friendly); otherwise fall back
+        // to the device allocator (pooled). See `ForwardScratch`.
+        let scratch = self.scratch.as_deref().filter(|s| s.fits(num_tokens));
+        let mut normed = match scratch {
+            Some(s) => s.normed(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?,
+        };
+        let mut qkv = match scratch {
+            Some(s) => s.qkv(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, qkv_dim]), &dev)?,
+        };
+        let mut attn_out = match scratch {
+            Some(s) => s.attn_out(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, q_dim]), &dev)?,
+        };
+        let mut o_out = match scratch {
+            Some(s) => s.o_out(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?,
+        };
 
-        // Pre-attention norm — residual stays intact in `hidden.stream`.
-        self.input_layernorm.forward(&hidden.stream, &mut normed, ctx)?;
+        // Pre-attention norm. If the previous sublayer left a deferred residual
+        // delta, fuse its add into this norm (one kernel: stream += delta;
+        // normed = rmsnorm(stream)); else plain norm. Residual stays in
+        // `hidden.stream` for the post-attention add.
+        match hidden.pending.take() {
+            Some(delta) => D::fused_add_rmsnorm(
+                ctx,
+                &mut normed,
+                &mut hidden.stream,
+                &delta,
+                &self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )?,
+            None => self.input_layernorm.forward(&hidden.stream, &mut normed, ctx)?,
+        }
         self.qkv_proj.forward(&normed, &mut qkv, ctx)?;
-        D::split_qkv(ctx, &qkv, &mut q, &mut k, &mut v, num_tokens, q_dim, kv_dim)?;
+        // Q/K/V: zero-copy column views of `qkv` on CUDA (its kernels honor row
+        // strides → no copy, no per-layer alloc); contiguous copies on backends
+        // that require them (CPU reference). See `D::qkv_split`.
+        let (mut q, mut k, v) = D::qkv_split(ctx, &qkv, num_tokens, q_dim, kv_dim)?;
 
         match (&self.q_norm, &self.k_norm) {
             (Some(qn), Some(kn)) => {
@@ -119,7 +154,10 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
             self.scale,
         )?;
         self.o_proj.forward(&attn_out, &mut o_out, ctx)?;
-        // Residual update: hidden.stream += attention output.
-        D::add_inplace(ctx.scope(), &mut hidden.stream, &o_out)
+        // Defer the residual add: stash `o_out`; the next sublayer's pre-norm
+        // fuses it (add + norm in one kernel). `decode_layers` flushes any
+        // leftover delta before finalize.
+        hidden.pending = Some(o_out);
+        Ok(())
     }
 }

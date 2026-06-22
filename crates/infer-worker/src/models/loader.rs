@@ -363,11 +363,13 @@ impl<'a> WeightLoader<'a> {
                     kv_head_num: cfg.kv_head_num,
                     head_dim: cfg.head_dim,
                     scale,
+                    scratch: None,
                 },
                 ffn: DenseFfn {
                     post_attention_layernorm: comp_rms(post_attention_layernorm),
                     gate_up_proj: comp_linear(gate_up_proj),
                     down_proj: comp_linear(down_proj),
+                    scratch: None,
                 },
             });
         }
@@ -395,6 +397,7 @@ impl<'a> WeightLoader<'a> {
                 moe_intermediate_size: 0,
                 num_shared_experts: 0,
             },
+            scratch: None,
         })
     }
 
