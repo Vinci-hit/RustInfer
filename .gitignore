@@ -21,3 +21,4 @@ crates/infer-worker/.codex
 !/docs/**/
 !/docs/*.md
 !/docs/**/*.md
+CLAUDE_FABLE_5.md

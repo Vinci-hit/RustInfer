@@ -6,7 +6,9 @@ use crate::domain::dtype::Dtype;
 use crate::domain::exec::{ExecDevice as Device, ExecScope};
 use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use crate::domain::model::{DecoderModel, ModelDims, SampleRows};
-use crate::domain::plan::{BatchKind, BatchPlan, SampledToken, StepOutput, StepRequest};
+use crate::domain::plan::{
+    BatchKind, BatchPlan, SampledToken, StepOutput, StepRequest, SeqStep, StopCriteria,
+};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::sampler::Sampler;
 use crate::domain::ports::{OpError, OpResult};
@@ -55,6 +57,14 @@ where
     prefill_ids_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
+}
+
+/// Ragged tiling vectors computed once in `build_plan_with_tiles` and reused
+/// by `upload_index`, avoiding a duplicate `plan_ragged_tiles` call (P3).
+struct RaggedTiles {
+    cu_q_lens: Vec<i32>,
+    block2req: Vec<i32>,
+    block2tile: Vec<i32>,
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -106,6 +116,13 @@ pub struct AbcBuffers<D: Device> {
     pub new_token_host: Vec<i32>,
     /// Persistent host staging for `sampled_rows_dev`; filled per step.
     pub sampled_rows_host: Vec<i32>,
+    /// Pinned host mirrors for stop-metadata, uploaded on the copy-in stream
+    /// (Si) so the DMA overlaps compute. Eliminates the per-step `Vec<i32>`
+    /// allocations + `collect()` that the old path did on the compute stream.
+    pub generated_counts_host: Vec<i32>,
+    pub max_tokens_host: Vec<i32>,
+    pub ignore_eos_host: Vec<i32>,
+    pub eos_ids_host: Vec<i32>,
     /// Whether a copy-out has been recorded on So at least once. Gates the
     /// `compute_wait_copy_out` guard so the first step does not wait on an
     /// event that was never recorded.
@@ -234,6 +251,10 @@ where
             finished_tokens_host: vec![0; cb],
             new_token_host: vec![0; cb],
             sampled_rows_host: vec![0; cb],
+            generated_counts_host: vec![0; cb],
+            max_tokens_host: vec![0; cb],
+            ignore_eos_host: vec![0; cb],
+            eos_ids_host: vec![0; 64],
             copy_out_recorded: false,
             pinned: false,
         };
@@ -278,8 +299,8 @@ where
     }
 
     pub fn step(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
-        let plan = self.build_plan(req)?;
-        self.upload_index(&plan, req)?;
+        let (plan, tiles) = self.build_plan_with_tiles(req)?;
+        self.upload_index(&plan, req, &tiles)?;
         match self.decide(&plan) {
             GraphDecision::Eager => self.step_eager(&plan, req),
             GraphDecision::Graph(slot) => self.step_graph(slot, &plan, req),
@@ -596,6 +617,26 @@ where
             .map_or(GraphDecision::Eager, |graph| graph.decide(plan))
     }
 
+    /// Pre-capture CUDA decode graphs for every `capture_sizes` slot at startup
+    /// so the first decode step at each batch size is a hot graph replay, not a
+    /// cold capture (eager warmup + host sync + capture + instantiate, all on
+    /// the serving hot path). This is the warmup-and-capture-all pattern from
+    /// the pre-refactor worker.
+    ///
+    /// For each capture size `B`:
+    /// 1. Build a dummy decode plan (`batch = B`, every `q_len = 1`).
+    /// 2. Run one EAGER `forward_finalize_argmax` so lazy library caches
+    ///    (cuDNN plan cache, cuBLASLt algo selection) populate — those paths
+    ///    do mallocs/private-stream launches illegal under stream capture.
+    /// 3. Synchronize, then capture `forward_finalize_argmax` into a graph.
+    /// 4. Instantiate and launch once to validate.
+    ///
+    /// The dummy KV index upload + input ids are all written to the persistent
+    /// fixed-address buffers, so the captured graph's baked-in addresses match
+    /// what the real decode step will use. The eager warmup writes the same KV
+    /// values the capture will, so this is idempotent on KV state (the scratch
+    /// arena is reset between captures, and the real first decode will overwrite
+    /// all these buffers anyway).
     pub fn prime_graphs(&mut self) -> OpResult<()> {
         self.graph = None;
         if self.capture_sizes.is_empty() || !self.scope.supports_graphs() {
@@ -605,6 +646,73 @@ where
             self.capture_sizes.clone(),
             self.cap_batch,
         )?);
+
+        for &batch in &self.capture_sizes.clone() {
+            if batch == 0 || batch > self.cap_batch {
+                continue;
+            }
+            // Build a dummy decode request: `batch` rows, each q_len=1, token 0.
+            let dummy_req = StepRequest {
+                seqs: (0..batch)
+                    .map(|i| SeqStep {
+                        sequence_id: i as u64,
+                        input_ids: vec![0],
+                        positions: vec![0],
+                        kv_write_start: 0,
+                        kv_len_after: 1,
+                        block_table: vec![0],
+                    })
+                    .collect(),
+                sampling: Vec::new(),
+                stop: StopCriteria {
+                    eos_ids: Vec::new(),
+                    generated_counts: vec![0; batch],
+                    max_tokens: vec![u32::MAX; batch],
+                    ignore_eos: vec![false; batch],
+                },
+                draft_tokens: Vec::new(),
+            };
+
+            let (plan, tiles) = self.build_plan_with_tiles(&dummy_req)?;
+            self.upload_index(&plan, &dummy_req, &tiles)?;
+
+            // Fill the persistent input-id buffer with dummy tokens.
+            unsafe {
+                upload_i32_prefix(
+                    self.scope.device(),
+                    &self.input_ids_buf,
+                    &vec![0i32; batch],
+                )?;
+            }
+            let input_ids = self.input_ids_buf.view_raw(
+                Shape::from_slice(&[batch]),
+                Shape::from_slice(&[batch]).contiguous_strides(),
+                0,
+                true,
+            );
+
+            // 1. Eager warmup so lazy library caches populate.
+            self.forward_finalize_argmax(&plan, &input_ids)?;
+            self.scope.synchronize()?;
+
+            // 2. Capture the warm forward+finalize+argmax.
+            let key = batch as u64;
+            self.scope.graph_capture_begin()?;
+            if let Err(e) = self.forward_finalize_argmax(&plan, &input_ids) {
+                let _ = self.scope.graph_capture_end(key);
+                return Err(e);
+            }
+            self.scope.graph_capture_end(key)?;
+            tracing::info!(
+                "[graph] pre-captured decode graph for batch={} (warmup+capture at startup)",
+                batch
+            );
+
+            // 3. Launch once to validate the instantiated graph.
+            self.scope.graph_launch(key)?;
+            self.scope.synchronize()?;
+        }
+
         Ok(())
     }
 
@@ -689,6 +797,17 @@ where
     }
 
     fn build_plan(&self, req: &StepRequest) -> OpResult<BatchPlan> {
+        let (plan, _tiles) = self.build_plan_with_tiles(req)?;
+        Ok(plan)
+    }
+
+    /// Build the `BatchPlan` and compute ragged tiles once, returning both.
+    /// `upload_index` consumes the tiles, avoiding a second `plan_ragged_tiles`
+    /// call (P3: was computed twice — once here, once in `upload_index`).
+    fn build_plan_with_tiles(
+        &self,
+        req: &StepRequest,
+    ) -> OpResult<(BatchPlan, RaggedTiles)> {
         let batch = req.seqs.len();
         if batch == 0 {
             return Err(OpError::Shape("Runtime::step: empty request".into()));
@@ -787,7 +906,7 @@ where
             }
         }
 
-        let (_cu_q_lens, block2req, _block2tile) = BatchPlan::plan_ragged_tiles(&q_lens);
+        let (cu_q_lens, block2req, block2tile) = BatchPlan::plan_ragged_tiles(&q_lens);
         let kind = if !req.draft_tokens.is_empty() {
             BatchKind::Spec {
                 mask: crate::domain::plan::MaskMode::Causal,
@@ -798,7 +917,7 @@ where
         } else {
             BatchKind::Ragged
         };
-        Ok(BatchPlan {
+        let plan = BatchPlan {
             kind,
             num_tokens: total_tokens,
             batch,
@@ -809,7 +928,13 @@ where
             max_blocks_per_seq: self.max_blocks_per_seq,
             block_size: self.block_size,
             total_q_tiles: block2req.len() as i32,
-        })
+        };
+        let tiles = RaggedTiles {
+            cu_q_lens,
+            block2req,
+            block2tile,
+        };
+        Ok((plan, tiles))
     }
 
     fn input_ids_tensor(&mut self, req: &StepRequest, plan: &BatchPlan) -> OpResult<Tensor<i32, D>> {
@@ -846,8 +971,15 @@ where
         ))
     }
 
-    fn upload_index(&mut self, plan: &BatchPlan, req: &StepRequest) -> OpResult<()> {
-        let (cu_q_lens, block2req, block2tile) = BatchPlan::plan_ragged_tiles(&plan.q_lens);
+    fn upload_index(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        tiles: &RaggedTiles,
+    ) -> OpResult<()> {
+        let cu_q_lens = &tiles.cu_q_lens;
+        let block2req = &tiles.block2req;
+        let block2tile = &tiles.block2tile;
         let mut block_tables = vec![0i32; plan.batch * self.max_blocks_per_seq];
         for (i, seq) in req.seqs.iter().enumerate() {
             let row = i * self.max_blocks_per_seq;
@@ -860,13 +992,13 @@ where
         let device = self.scope.device();
         unsafe {
             upload_i32_prefix(device, &self.kv_index.block_tables, &block_tables)?;
-            upload_i32_prefix(device, &self.kv_index.cu_q_lens, &cu_q_lens)?;
+            upload_i32_prefix(device, &self.kv_index.cu_q_lens, cu_q_lens)?;
             upload_i32_prefix(device, &self.kv_index.kv_lens, &plan.kv_lens)?;
             upload_i32_prefix(device, &self.kv_index.seq_positions, &plan.seq_positions)?;
             upload_i32_prefix(device, &self.kv_index.seq_lens_step, &seq_lens_step)?;
             upload_i32_prefix(device, &self.kv_index.rope_positions, &plan.rope_positions)?;
-            upload_i32_prefix(device, &self.kv_index.block2req, &block2req)?;
-            upload_i32_prefix(device, &self.kv_index.block2tile, &block2tile)?;
+            upload_i32_prefix(device, &self.kv_index.block2req, block2req)?;
+            upload_i32_prefix(device, &self.kv_index.block2tile, block2tile)?;
         }
         Ok(())
     }
@@ -937,7 +1069,7 @@ where
         ignore_eos: &[bool],
         eos_ids: &[i32],
     ) -> OpResult<()> {
-        let plan = self.build_plan(req)?;
+        let (plan, tiles) = self.build_plan_with_tiles(req)?;
         let batch = plan.batch;
         if plan.num_tokens != batch || plan.q_lens.iter().any(|&q| q != 1) {
             return Err(OpError::Shape(
@@ -975,10 +1107,14 @@ where
             cfg.pin_host_i32(&self.abc.active_tokens_host)?;
             cfg.pin_host_i32(&self.abc.finished_src_rows_host)?;
             cfg.pin_host_i32(&self.abc.finished_tokens_host)?;
+            cfg.pin_host_i32(&self.abc.generated_counts_host)?;
+            cfg.pin_host_i32(&self.abc.max_tokens_host)?;
+            cfg.pin_host_i32(&self.abc.ignore_eos_host)?;
+            cfg.pin_host_i32(&self.abc.eos_ids_host)?;
             self.abc.pinned = true;
         }
 
-        self.upload_index(&plan, req)?;
+        self.upload_index(&plan, req, &tiles)?;
 
         let cfg = self.scope.device().config.clone();
 
@@ -1065,19 +1201,63 @@ where
             self.forward_finalize_argmax(&plan, &input_ids)?;
         }
 
-        // ── upload stop metadata + run the compact merge (C → A) ──
-        let gen_i32: Vec<i32> = generated_counts.iter().map(|&x| x as i32).collect();
-        let max_i32: Vec<i32> = max_tokens.iter().map(|&x| x as i32).collect();
-        let ign_i32: Vec<i32> = ignore_eos.iter().map(|&b| i32::from(b)).collect();
-        let device = self.scope.device();
+        // ── upload stop metadata on the copy-in stream (Si) + run the compact merge (C → A) ──
+        // P1+P2: Upload stop metadata on the copy-in stream (Si) instead of the
+        // compute stream, so the DMA overlaps compute. Also reuse pinned host
+        // mirrors instead of allocating 3 fresh Vec<i32> per step. The merge
+        // kernel on the compute stream waits on ev_in before reading these.
+        {
+            let n = batch;
+            for (dst, &src) in self.abc.generated_counts_host[..n]
+                .iter_mut()
+                .zip(generated_counts.iter())
+            {
+                *dst = src as i32;
+            }
+            for (dst, &src) in self.abc.max_tokens_host[..n]
+                .iter_mut()
+                .zip(max_tokens.iter())
+            {
+                *dst = src as i32;
+            }
+            for (dst, &src) in self.abc.ignore_eos_host[..n]
+                .iter_mut()
+                .zip(ignore_eos.iter())
+            {
+                *dst = i32::from(src);
+            }
+            let eos_len = eos_ids.len().min(self.abc.eos_ids_host.len());
+            self.abc.eos_ids_host[..eos_len].copy_from_slice(&eos_ids[..eos_len]);
+        }
+        let meta_bytes = batch * std::mem::size_of::<i32>();
+        let eos_bytes = eos_ids.len() * std::mem::size_of::<i32>();
+        let _guard = self.scope.enter();
         unsafe {
-            upload_i32_prefix(device, &self.abc.generated_counts_dev, &gen_i32)?;
-            upload_i32_prefix(device, &self.abc.max_tokens_dev, &max_i32)?;
-            upload_i32_prefix(device, &self.abc.ignore_eos_dev, &ign_i32)?;
-            if !eos_ids.is_empty() {
-                upload_i32_prefix(device, &self.abc.eos_ids_dev, eos_ids)?;
+            cfg.upload_h2d_copy_in(
+                self.abc.generated_counts_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                self.abc.generated_counts_host.as_ptr() as *const std::ffi::c_void,
+                meta_bytes,
+            )?;
+            cfg.upload_h2d_copy_in(
+                self.abc.max_tokens_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                self.abc.max_tokens_host.as_ptr() as *const std::ffi::c_void,
+                meta_bytes,
+            )?;
+            cfg.upload_h2d_copy_in(
+                self.abc.ignore_eos_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                self.abc.ignore_eos_host.as_ptr() as *const std::ffi::c_void,
+                meta_bytes,
+            )?;
+            if eos_bytes > 0 {
+                cfg.upload_h2d_copy_in(
+                    self.abc.eos_ids_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                    self.abc.eos_ids_host.as_ptr() as *const std::ffi::c_void,
+                    eos_bytes,
+                )?;
             }
         }
+        cfg.record_copy_in()?;
+        cfg.compute_wait_copy_in()?;
         let stream = ExecScope::stream(&self.scope).0;
         {
             let _guard = self.scope.enter();
@@ -1428,8 +1608,8 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
-    let plan = runtime.build_plan(req)?;
-    runtime.upload_index(&plan, req)?;
+    let (plan, tiles) = runtime.build_plan_with_tiles(req)?;
+    runtime.upload_index(&plan, req, &tiles)?;
     let input_ids = runtime.input_ids_tensor(req, &plan)?;
     let mut hidden = Hidden {
         stream: runtime.hidden.stream.view_raw(
