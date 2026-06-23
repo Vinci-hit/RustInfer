@@ -55,6 +55,10 @@ where
     /// `from_host_slice` tensor whose throwaway host Vec forced a full sync.
     pub prefill_ids_buf: Tensor<i32, D>,
     prefill_ids_host: Vec<i32>,
+    /// Reusable host staging for `upload_index` — avoids two `Vec` allocations
+    /// per decode step (`block_tables` + `seq_lens_step`).
+    upload_block_tables_host: Vec<i32>,
+    upload_seq_lens_step_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
 }
@@ -294,6 +298,8 @@ where
             input_ids_buf,
             prefill_ids_buf,
             prefill_ids_host,
+            upload_block_tables_host: vec![0i32; cap_batch * max_blocks_per_seq],
+            upload_seq_lens_step_host: vec![0i32; cap_batch],
             abc,
         })
     }
@@ -980,22 +986,28 @@ where
         let cu_q_lens = &tiles.cu_q_lens;
         let block2req = &tiles.block2req;
         let block2tile = &tiles.block2tile;
-        let mut block_tables = vec![0i32; plan.batch * self.max_blocks_per_seq];
+        let batch = plan.batch;
+        let bts = batch * self.max_blocks_per_seq;
+        // Reuse persistent host staging instead of allocating two Vecs per step.
+        self.upload_block_tables_host[..bts].fill(0);
         for (i, seq) in req.seqs.iter().enumerate() {
             let row = i * self.max_blocks_per_seq;
             for (j, &block) in seq.block_table.iter().enumerate() {
-                block_tables[row + j] = block as i32;
+                self.upload_block_tables_host[row + j] = block as i32;
             }
         }
-        let seq_lens_step = plan.q_lens.clone();
+        let block_tables = &self.upload_block_tables_host[..bts];
+        self.upload_seq_lens_step_host[..batch]
+            .copy_from_slice(&plan.q_lens[..batch]);
+        let seq_lens_step = &self.upload_seq_lens_step_host[..batch];
 
         let device = self.scope.device();
         unsafe {
-            upload_i32_prefix(device, &self.kv_index.block_tables, &block_tables)?;
+            upload_i32_prefix(device, &self.kv_index.block_tables, block_tables)?;
             upload_i32_prefix(device, &self.kv_index.cu_q_lens, cu_q_lens)?;
             upload_i32_prefix(device, &self.kv_index.kv_lens, &plan.kv_lens)?;
             upload_i32_prefix(device, &self.kv_index.seq_positions, &plan.seq_positions)?;
-            upload_i32_prefix(device, &self.kv_index.seq_lens_step, &seq_lens_step)?;
+            upload_i32_prefix(device, &self.kv_index.seq_lens_step, seq_lens_step)?;
             upload_i32_prefix(device, &self.kv_index.rope_positions, &plan.rope_positions)?;
             upload_i32_prefix(device, &self.kv_index.block2req, block2req)?;
             upload_i32_prefix(device, &self.kv_index.block2tile, block2tile)?;
