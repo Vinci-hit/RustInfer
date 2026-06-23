@@ -11,24 +11,13 @@
 - prefill `input_ids` 每步阻塞 `cudaStreamSynchronize` → 持久 `Runtime::prefill_ids_buf` + host 镜像 + `upload_i32_prefix`（async）
 - 丢失 `fused_add_rmsnorm` → deferred-delta：`Hidden.pending` 携带上一 sublayer 的残差 delta，下一 sublayer 的 pre-norm 用 `fused_add_rmsnorm` 融合 add+norm；`decode_layers` 末尾 flush。CUDA 真融合，CPU 走 default(add+rmsnorm) 行为不变
 - **argmax 容量 latent bug**（`total_tokens > cap_batch` 的 prefill 必报错）→ `argmax_out_dev`/`argmax_ws` 按 `cap_num_tokens` 分配；`sample_tail` 传 `[logits_rows]` view 给 `argmax_into`
+- **#5 prefill argmax 跑全部行**（TTFT 3× 主因）→ `FusedOps::argmax_into` 加 `selected_rows: Option<&Tensor<i32, Self>>`；`AbcBuffers` 新增 `sampled_rows_dev`，`sample_tail` 每步上传 `cu_q_lens[i+1]-1`，kernel 只算 `batch` 行 argmax + 仅 D2H `batch` 个 id。`argmax_out_dev`/`argmax_ws` 容量回退到 `cap_batch`（不再需要 `cap_num_tokens`）
+- **#3 flash decode workspace 每层 alloc + memset** → `ForwardScratch` 新增 `flash_ws`，容量经 `FusedOps::flash_decode_workspace_capacity_f32(cap_batch, head_num, head_dim)` 探测；`Attention::run` 每层零分配地传给 `D::attention_paged(..., Some(&mut ws))`。`UnsafeCell<Tensor<f32,D>>` 包装允许 `&self` 路径上让每层各自拿一个 owned view（layers 串行 on one stream，无别名）。`D::attention_paged` 同时保留 `workspace: None` legacy 路径
+- **#4 `D::attention_paged` 签名升级**（同上）：trait 增 9 个参数（+ workspace）、新增 `flash_decode_workspace_capacity_f32` 默认 0；CUDA override 实现 + CPU reference 走默认（忽略 workspace）
 
 ---
 
-## 未完成（均为 CUDA 专属微优化，单项 ~µs 级；GPU 占满时无法验证，建议先 benchmark 再做）
-
-### #3 flash-attention workspace 每层 alloc + memset（进 decode graph）
-- **现状**：`crates/infer-backend-cuda/src/lib.rs:~642` `attention_paged` 内 `Tensor::<f32>::zeros([workspace_elems], q.device())` 每次调用分配 + 清零。decode 走 graph 捕获时该 memset 被录进图，每 token 每层（~36 次）重放。
-- **旧版**：`forward_workspace.rs` 预分配 `flash_decode_workspace_f32` 一次（仅构造时清零），`attention_paged` 收 `workspace: &mut Tensor<f32>` 参数复用。
-- **影响**：TTOT，~18µs/token（量级估计），kernel 写前不读所以 memset 本就多余。
-- **修法**：(A) 给 `attention_paged` 重加 `workspace` 参数（trait `fused_ops.rs` + CUDA impl + reference + 调用方 `attention.rs`），`ForwardScratch` 增一个 f32 flash buffer 传入。难点：flash 容量公式 `flash_decode_workspace_capacity_f32` 是 CUDA 专属，而 `ForwardScratch`/`Runtime` 是 generic-over-`D`，需把容量作为参数传入（旧版 `ForwardWorkspace::new` 正是这么做）。(B) 走 uninit alloc（跳过 memset）——需动 `infer-core` 分配 API。
-- **难度**：中-高（签名改动 + generic-D 容量传递）。
-
-### #5(perf) prefill argmax 跑全部行而非每序列末行
-- **现状**：`crates/infer-worker/src/application/runtime.rs` `sample_tail` 对全部 `num_tokens` 行做 argmax，host 端再挑 `offset+q_len-1`。（容量正确性已修，仅性能未优。）
-- **旧版**：`argmax_batched` 用 `selected_rows = cu_q_lens[seq+1]-1`，只算 `batch` 个 argmax。
-- **影响**：TTFT，长 prompt ~150µs（P 行 vs 1 行的 argmax + 更大 D2H）。注意 lm_head 仍投影全部行（新旧一致，是 `SampleRows` 预留 seam，非回归）。
-- **修法**：给 `argmax_into` 重加 `selected_rows` 参数（kernel 本就支持），或先 gather 末行 logits 再 argmax。
-- **难度**：中（签名改动）。
+## 未完成（均为 TTOT 微优化，单项 ~µs 级；GPU 占满时无法验证，建议先 benchmark 再做）
 
 ### #4 CUDA graph 不在 bootstrap 预捕获
 - **现状**：`runtime.rs:~521` `prime_graphs` 只 `GraphRunner::new`，不 warmup/capture。首次命中某 batch size 的 decode 步在服务热路径上付冷捕获（一次 eager forward + host sync + capture，见 `issue_decode_abc` cold path ~944-963）。

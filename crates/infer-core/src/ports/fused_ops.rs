@@ -90,8 +90,25 @@ pub trait FusedOps: MathOps {
         kv_head_num: usize,
         head_dim: usize,
         scale: f32,
+        // `Some(ws)` → backend reuses the caller-provided `[f32; >=
+        // flash_decode_workspace_capacity_f32(batch, head_num, head_dim)]`
+        // scratch (zero alloc, capturable). `None` → backend self-allocates
+        // (legacy path). The CPU reference ignores this parameter.
+        workspace: Option<&mut Tensor<f32, Self>>,
     ) -> OpResult<()> {
+        let _ = workspace;
         attention_paged_reference(ctx, q, kv, output, head_num, kv_head_num, head_dim, scale)
+    }
+
+    /// f32 element count required by `attention_paged`'s decode workspace for
+    /// the given dims. Backends that do not need a workspace (CPU reference)
+    /// return 0. CUDA returns the flash-decode kernel's batched scratch size.
+    fn flash_decode_workspace_capacity_f32(
+        _batch: usize,
+        _num_q_heads: usize,
+        _head_dim: usize,
+    ) -> usize {
+        0
     }
 
     fn scatter_kv_paged<T: Dtype>(
@@ -276,20 +293,49 @@ pub trait FusedOps: MathOps {
     }
 
     /// Capturable greedy argmax: writes the per-row winning index into the
-    /// caller-provided device buffer `out` (numel == rows) using the
-    /// caller-provided `workspace` scratch. Allocates nothing, so it is safe to
-    /// invoke INSIDE CUDA-graph capture (unlike [`Self::argmax`], which the CUDA
-    /// backend implements with a fresh per-call output/workspace). Default is a
-    /// host reference: CPU argmax, then upload the ids into `out`.
+    /// caller-provided device buffer `out` using the caller-provided
+    /// `workspace` scratch. Allocates nothing, so it is safe to invoke INSIDE
+    /// CUDA-graph capture (unlike [`Self::argmax`], which the CUDA backend
+    /// implements with a fresh per-call output/workspace).
+    ///
+    /// `selected_rows`:
+    /// - `None` → argmax every row of `logits`; `out` must have `numel == rows`.
+    /// - `Some(idx)` → argmax ONLY the rows listed in `idx` (device i32 tensor
+    ///   of length `K`); `out` must have `numel == K` and receives one id per
+    ///   selected row, in order. Used by prefill to skip the `num_tokens - K`
+    ///   rows that the sampler discards anyway (the per-sequence last row is
+    ///   the only one whose token id matters).
+    ///
+    /// Default is a host reference: CPU argmax + host-side row pick, then
+    /// upload only the selected ids into `out`.
     fn argmax_into<T: Dtype>(
         ctx: &StepCtx<'_, Self>,
         logits: &Tensor<T, Self>,
         out: &mut Tensor<i32, Self>,
         workspace: &Tensor<f32, Self>,
+        selected_rows: Option<&Tensor<i32, Self>>,
     ) -> OpResult<()> {
         let _ = workspace;
-        let ids = Self::argmax(ctx, logits)?;
-        out.upload_from_host(&ids)
+        let all_ids = Self::argmax(ctx, logits)?;
+        match selected_rows {
+            None => out.upload_from_host(&all_ids),
+            Some(idx) => {
+                let idx_host = idx.to_host_vec()?;
+                let mut picked = Vec::with_capacity(idx_host.len());
+                for &row in &idx_host {
+                    let row = row as usize;
+                    let id = all_ids.get(row).copied().ok_or_else(|| {
+                        OpError::Shape(format!(
+                            "argmax_into: selected row {} >= rows {}",
+                            row,
+                            all_ids.len()
+                        ))
+                    })?;
+                    picked.push(id);
+                }
+                out.upload_from_host(&picked)
+            }
+        }
     }
 }
 

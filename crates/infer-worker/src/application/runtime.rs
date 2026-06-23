@@ -88,6 +88,12 @@ pub struct AbcBuffers<D: Device> {
     pub active_tokens_dev: Tensor<i32, D>,
     /// `[active_n, finished_n, old_batch]`.
     pub counts_dev: Tensor<i32, D>,
+    /// Device row-pick list for `sample_tail`'s prefill argmax: per-sequence
+    /// last-row indices (`cu_q_lens[i+1]-1`). Sized to `cap_batch`; only the
+    /// first `batch` entries are read each step. Lets the argmax kernel skip
+    /// the `num_tokens - batch` rows the sampler would discard, collapsing
+    /// the dominant TTFT cost on long prompts.
+    pub sampled_rows_dev: Tensor<i32, D>,
     // Host mirrors for the single small D2H after each step.
     pub argmax_out_host: Vec<i32>,
     pub counts_host: Vec<i32>,
@@ -98,6 +104,8 @@ pub struct AbcBuffers<D: Device> {
     /// Persistent host staging for buffer B (admission tokens). Must outlive the
     /// copy-in stream's DMA, so it cannot be a per-step local.
     pub new_token_host: Vec<i32>,
+    /// Persistent host staging for `sampled_rows_dev`; filled per step.
+    pub sampled_rows_host: Vec<i32>,
     /// Whether a copy-out has been recorded on So at least once. Gates the
     /// `compute_wait_copy_out` guard so the first step does not wait on an
     /// event that was never recorded.
@@ -197,10 +205,13 @@ where
 
         // ── ABC pipeline buffers (Stage 1: allocated, wired in later stages) ──
         let cb = cap_batch.max(1);
-        // Greedy prefill argmax processes every token row of the forward, so the
-        // argmax output/scratch must hold up to `cap_num_tokens` rows, not just
-        // the decode batch. Decode only ever uses the first `batch` slots.
-        let argmax_cap = cb.max(cap_num_tokens.max(1));
+        // Decode argmax writes one id per row (one row per seq); sized to
+        // `cap_batch`. Prefill argmax used to walk every token row, sized this
+        // to `cap_num_tokens`, and paid an O(num_tokens) argmax + D2H. The
+        // selected-rows path now feeds only `batch` rows in, so `cap_batch` is
+        // sufficient for both decode (in-graph) and prefill (eager). Kernel
+        // workspace is bf16, `512` halfs/row covers it with headroom.
+        let argmax_cap = cb;
         let abc = AbcBuffers {
             new_token_dev: alloc_i32(cb)?,
             argmax_out_dev: alloc_i32(argmax_cap)?,
@@ -214,6 +225,7 @@ where
             finished_tokens_dev: alloc_i32(cb)?,
             active_tokens_dev: alloc_i32(cb)?,
             counts_dev: alloc_i32(3)?,
+            sampled_rows_dev: alloc_i32(cb)?,
             argmax_out_host: vec![0; cb],
             counts_host: vec![0; 3],
             active_src_rows_host: vec![0; cb],
@@ -221,6 +233,7 @@ where
             finished_src_rows_host: vec![0; cb],
             finished_tokens_host: vec![0; cb],
             new_token_host: vec![0; cb],
+            sampled_rows_host: vec![0; cb],
             copy_out_recorded: false,
             pinned: false,
         };
@@ -228,9 +241,18 @@ where
         // Preallocate the address-stable per-layer forward scratch and install
         // it into the model's sublayers. Eliminates the ~11 device allocations
         // per layer (cudaMalloc/cudaFree/memset storm) on the eager forward and
-        // bakes fixed scratch addresses into captured decode graphs.
-        let scratch =
-            crate::domain::forward_scratch::ForwardScratch::<T, D>::new(device, dims, cap_num_tokens)?;
+        // bakes fixed scratch addresses into captured decode graphs. Also
+        // owns the flash-attention decode workspace — sized once to
+        // worst-case `(cap_batch, head_num, head_dim)` (see
+        // `D::flash_decode_workspace_capacity_f32`) instead of allocated +
+        // memset per layer per step (~18µs × num_layers per token in the old
+        // path).
+        let scratch = crate::domain::forward_scratch::ForwardScratch::<T, D>::new(
+            device,
+            dims,
+            cap_num_tokens,
+            cap_batch,
+        )?;
         model.install_scratch(scratch);
 
         Ok(Self {
@@ -330,45 +352,81 @@ where
         let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
-            // Greedy fast path: reuse the ABC argmax workspace instead of having
-            // `Sampler::sample` allocate a fresh `[rows]` output + `[rows*512]`
-            // scratch every call. The CUDA backend's `argmax` (used by
-            // `GreedySampler::sample`) otherwise pays two `Tensor::zeros`
-            // (cudaMallocAsync + memset) per prefill, which directly inflated
-            // TTFT at low QPS after the buffer-pipeline refactor.
+            // Greedy fast path.
             //
-            // For prefill (q_len > 1 per row) `argmax_into` writes one id per
-            // logits row into `abc.argmax_out_dev`; we then take the last token
-            // of every sequence (`sampled_rows = offset + q_len - 1`) via a
-            // single small D2H, mirroring `GreedySampler::sample`'s row pick.
-            let logits_rows = logits.0.shape().as_slice()[0];
-            if logits_rows > self.abc.argmax_out_dev.numel() {
-                return Err(OpError::Shape(format!(
-                    "sample_tail: logits rows {} exceeds argmax_out capacity {}",
-                    logits_rows,
-                    self.abc.argmax_out_dev.numel()
-                )));
+            // Two compounding TTFT regressions used to live here, both gone:
+            //
+            //  1. `Sampler::sample` allocated a fresh `[rows] i32` + `[rows*512] f32`
+            //     per prefill step (cudaMallocAsync + memset, twice). Fixed by
+            //     using `argmax_into` against the persistent `abc` workspace.
+            //
+            //  2. Even after (1), argmax was kernel-evaluated over EVERY logits
+            //     row (`num_tokens` = sum of prompt q_lens, up to thousands),
+            //     and the D2H downloaded all of them — only to discard all but
+            //     `batch` last-rows on host. That's `num_tokens / batch`× wasted
+            //     argmax work plus the full D2H stalling the rest of the
+            //     decode pipeline. Fixed by uploading the per-sequence last-row
+            //     indices and letting the kernel argmax exactly `batch` rows.
+            //
+            // Speculative verify still goes through `self.sampler.verify` below.
+            let batch = plan.batch;
+            // Build sampled_rows = cu_q_lens[i+1] - 1 from the host-side q_lens,
+            // then async-upload into the persistent `abc.sampled_rows_dev`.
+            let mut offset = 0i32;
+            for (i, &q_len) in plan.q_lens.iter().enumerate() {
+                let q = q_len.max(1);
+                offset += q;
+                self.abc.sampled_rows_host[i] = offset - 1;
             }
-            // Pass a `[logits_rows]`-sized view of the (capacity `argmax_cap`)
-            // output buffer: `argmax_into` writes exactly one id per logits row,
-            // and the reference path requires the output numel to match.
-            let mut argmax_out = self.abc.argmax_out_dev.view_raw(
-                Shape::from_slice(&[logits_rows]),
-                Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
+            let logits_rows = logits.0.shape().as_slice()[0];
+            // Validate every selected row lies inside the produced logits.
+            // (Equivalent to `offset == logits_rows`; we check the strict
+            // bound used by the kernel.)
+            if let Some(&last) = self.abc.sampled_rows_host[..batch].iter().max() {
+                if (last as usize) >= logits_rows {
+                    return Err(OpError::Shape(format!(
+                        "sample_tail: selected row {} >= logits rows {}",
+                        last, logits_rows
+                    )));
+                }
+            }
+            let device = self.scope.device();
+            unsafe {
+                upload_i32_prefix(
+                    device,
+                    &self.abc.sampled_rows_dev,
+                    &self.abc.sampled_rows_host[..batch],
+                )?;
+            }
+            let sel_rows = self.abc.sampled_rows_dev.view_raw(
+                Shape::from_slice(&[batch]),
+                Shape::from_slice(&[batch.max(1)]).contiguous_strides(),
                 0,
                 true,
             );
-            D::argmax_into(&ctx, &logits.0, &mut argmax_out, &self.abc.argmax_ws)?;
+            // `argmax_out_dev` capacity is `cap_batch` ≥ `batch` ✓. Take a
+            // `[batch]` view so the kernel writes exactly one id per selected
+            // row (and the reference path's numel check passes).
+            let mut argmax_out = self.abc.argmax_out_dev.view_raw(
+                Shape::from_slice(&[batch]),
+                Shape::from_slice(&[batch.max(1)]).contiguous_strides(),
+                0,
+                true,
+            );
+            D::argmax_into(
+                &ctx,
+                &logits.0,
+                &mut argmax_out,
+                &self.abc.argmax_ws,
+                Some(&sel_rows),
+            )?;
             let ids = argmax_out.to_host_vec()?;
-            let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
-            let mut offset = 0usize;
-            for &q_len in &plan.q_lens {
-                let q = q_len.max(1) as usize;
-                let row = offset + q - 1;
-                let token_id = *ids.get(row).ok_or_else(|| {
+            let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(batch);
+            for (i, _) in plan.q_lens.iter().enumerate() {
+                let token_id = *ids.get(i).ok_or_else(|| {
                     OpError::Shape(format!(
-                        "sample_tail: sampled row {} out of argmax range {}",
-                        row,
+                        "sample_tail: argmax id {} out of range {}",
+                        i,
                         ids.len()
                     ))
                 })?;
@@ -377,11 +435,10 @@ where
                     logprob: 0.0,
                     top_logprobs: Vec::new(),
                 }]);
-                offset += q;
             }
-            tokens.resize_with(plan.batch, Vec::new);
+            tokens.resize_with(batch, Vec::new);
             let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
-            let speculative_len = vec![0; plan.batch];
+            let speculative_len = vec![0; batch];
             (tokens, accepted, speculative_len)
         } else {
             let draft_tokens = flatten_draft_tokens(req, plan)?;
@@ -482,6 +539,10 @@ where
             &logits.0,
             &mut self.abc.argmax_out_dev,
             &self.abc.argmax_ws,
+            // Decode graph: every row of `[batch, vocab]` logits is the last
+            // (and only) row for one sequence — argmax all of them. Selector
+            // would be the trivial `0..batch`, so skip the upload.
+            None,
         )
     }
 

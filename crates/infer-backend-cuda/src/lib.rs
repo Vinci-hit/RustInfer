@@ -495,7 +495,7 @@ impl infer_core::ports::FusedOps for Cuda {
         // scratch; allocate 512 f32/row for headroom.
         let mut out = Tensor::<i32, Self>::zeros([rows], dev)?;
         let ws = Tensor::<f32, Self>::zeros([rows * 512], dev)?;
-        kernels::sampler::argmax(scope_stream(ctx.scope()), logits, &mut out, &ws)?;
+        kernels::sampler::argmax(scope_stream(ctx.scope()), logits, &mut out, &ws, None)?;
         out.to_host_vec()
     }
 
@@ -504,11 +504,21 @@ impl infer_core::ports::FusedOps for Cuda {
         logits: &Tensor<T, Self>,
         out: &mut Tensor<i32, Self>,
         workspace: &Tensor<f32, Self>,
+        selected_rows: Option<&Tensor<i32, Self>>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
         // Writes per-row argmax into the caller's persistent `out`/`workspace`
-        // (no allocation) so this is safe inside CUDA-graph capture.
-        kernels::sampler::argmax(scope_stream(ctx.scope()), logits, out, workspace)
+        // (no allocation) so this is safe inside CUDA-graph capture. When
+        // `selected_rows` is `Some`, the kernel argmaxes ONLY those rows and
+        // writes K = selected_rows.numel() ids into `out` (in order) — used by
+        // prefill to skip num_tokens-K rows the sampler would discard.
+        kernels::sampler::argmax(
+            scope_stream(ctx.scope()),
+            logits,
+            out,
+            workspace,
+            selected_rows,
+        )
     }
 
     fn scatter_kv_paged<T: infer_core::dtype::Dtype>(
@@ -643,33 +653,69 @@ impl infer_core::ports::FusedOps for Cuda {
         kv_head_num: usize,
         head_dim: usize,
         scale: f32,
+        workspace: Option<&mut Tensor<f32, Self>>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
         let (k_pool, v_pool) = kv.layer(0);
-        let workspace_elems = if ctx.plan().is_decode_only() {
-            kernels::flash_attn_gqa::flash_decode_workspace_capacity_f32(
-                ctx.plan().batch,
+        // The flash kernel only reads `workspace` on the DecodeOnly path; on
+        // Ragged/prefill it touches nothing, so a 1-elem placeholder is safe.
+        // Caller-owned scratch is the hot path here — every layer of every
+        // step used to allocate + memset a fresh `[B*H*HD*… f32]` buffer here
+        // (≈18µs × num_layers / token of TTOT, plus prefill TTFT bloat). The
+        // address-stable buffer also bakes cleanly into captured decode
+        // graphs; the previous per-call alloc made graph capture see a
+        // different scratch address every replay (illegal).
+        match workspace {
+            Some(ws) => kernels::flash_attn_gqa::attention_paged(
+                scope_stream(ctx.scope()),
+                q,
+                k_pool,
+                v_pool,
+                output,
+                kernels::flash_attn_gqa::PagedAttentionPlan::from_v2(ctx.plan(), kv.index),
+                ws,
                 head_num,
+                kv_head_num,
                 head_dim,
-            )
-            .max(1)
-        } else {
-            1
-        };
-        let mut workspace = Tensor::<f32, Cuda>::zeros([workspace_elems], q.device())?;
-        kernels::flash_attn_gqa::attention_paged(
-            scope_stream(ctx.scope()),
-            q,
-            k_pool,
-            v_pool,
-            output,
-            kernels::flash_attn_gqa::PagedAttentionPlan::from_v2(ctx.plan(), kv.index),
-            &mut workspace,
-            head_num,
-            kv_head_num,
-            head_dim,
-            scale,
-        )
+                scale,
+            ),
+            None => {
+                // Legacy fallback: still works (and graph-captures correctly
+                // through the capture arena), but pays the per-call alloc.
+                let workspace_elems = if ctx.plan().is_decode_only() {
+                    kernels::flash_attn_gqa::flash_decode_workspace_capacity_f32(
+                        ctx.plan().batch,
+                        head_num,
+                        head_dim,
+                    )
+                    .max(1)
+                } else {
+                    1
+                };
+                let mut owned = Tensor::<f32, Cuda>::zeros([workspace_elems], q.device())?;
+                kernels::flash_attn_gqa::attention_paged(
+                    scope_stream(ctx.scope()),
+                    q,
+                    k_pool,
+                    v_pool,
+                    output,
+                    kernels::flash_attn_gqa::PagedAttentionPlan::from_v2(ctx.plan(), kv.index),
+                    &mut owned,
+                    head_num,
+                    kv_head_num,
+                    head_dim,
+                    scale,
+                )
+            }
+        }
+    }
+
+    fn flash_decode_workspace_capacity_f32(
+        batch: usize,
+        num_q_heads: usize,
+        head_dim: usize,
+    ) -> usize {
+        kernels::flash_attn_gqa::flash_decode_workspace_capacity_f32(batch, num_q_heads, head_dim)
     }
 }
 

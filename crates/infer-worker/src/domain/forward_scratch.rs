@@ -22,18 +22,22 @@
 //! whole forward (prefill or decode) ALLOCATES nothing per step on CUDA.
 //! `logits [cap_num_tokens, vocab]` is the one large buffer; it is preallocated
 //! rather than pooled so ragged prompt lengths cannot grow the allocator's free
-//! list without bound.
+//! list without bound. `flash_ws [flash_ws_elems]` is the attention kernel's
+//! batched-decode scratch, sized once per `Runtime` to the worst-case
+//! `(cap_batch, head_num, head_dim)`; backends that don't need it (CPU
+//! reference) get a 0-elem placeholder via `D::flash_decode_workspace_capacity_f32`.
 
+use std::cell::UnsafeCell;
 use std::rc::Rc;
 
 use super::model::ModelDims;
-use super::ports::{MemoryPort, OpResult};
+use super::ports::{FusedOps, OpResult};
 use super::tensor::Tensor;
 use super::types::{Dtype, Shape};
 
 /// Fixed-capacity scratch for the dense decoder forward (attention + dense FFN).
 /// Sized for the worst-case `cap_num_tokens` rows; sublayers view a row-prefix.
-pub struct ForwardScratch<T: Dtype, D: MemoryPort> {
+pub struct ForwardScratch<T: Dtype, D: FusedOps> {
     cap_num_tokens: usize,
     dims: ModelDims,
 
@@ -45,16 +49,41 @@ pub struct ForwardScratch<T: Dtype, D: MemoryPort> {
     swiglu: Tensor<T, D>,   // [cap, intermediate_size]
     ffn_out: Tensor<T, D>,  // [cap, dim]
     logits: Tensor<T, D>,   // [cap, vocab_size]  (finalize lm_head output)
+    /// Flash-attention decode workspace, `[flash_ws_elems] f32`. Held in
+    /// `UnsafeCell` so per-call `Attention::run` can hand the kernel a `&mut`
+    /// view via `flash_workspace_mut`. Concurrent layers are NOT possible (the
+    /// decoder runs layers serially on a single stream), and inside one layer
+    /// the kernel reads/writes are stream-ordered — so the only thing the
+    /// shared-mutability guard needs to protect is the (single-threaded)
+    /// borrow discipline, which `&self` enforces by giving out fresh views
+    /// each call. Tensor handles are reference-counted views into immutable
+    /// storage; this `UnsafeCell` exists purely so we can hand out a `&mut`
+    /// handle (NOT mutate the cell itself).
+    flash_ws: UnsafeCell<Tensor<f32, D>>,
+    flash_ws_elems: usize,
 }
 
-impl<T: Dtype, D: MemoryPort> ForwardScratch<T, D> {
+impl<T: Dtype, D: FusedOps + MemoryPort> ForwardScratch<T, D> {
     /// Allocate every buffer once at worst-case capacity. Returned behind an
     /// `Rc` so it can be cloned into each decoder block's sublayers.
-    pub fn new(device: &D, dims: ModelDims, cap_num_tokens: usize) -> OpResult<Rc<Self>> {
+    ///
+    /// `cap_batch` sizes the flash-attention decode workspace (the kernel's
+    /// scratch grows with batch, not token count); CPU returns 0 and the
+    /// placeholder is unused.
+    pub fn new(
+        device: &D,
+        dims: ModelDims,
+        cap_num_tokens: usize,
+        cap_batch: usize,
+    ) -> OpResult<Rc<Self>> {
         let cap = cap_num_tokens.max(1);
         let alloc = |cols: usize| -> OpResult<Tensor<T, D>> {
             Tensor::<T, D>::zeros(Shape::from_slice(&[cap, cols.max(1)]), device)
         };
+        let flash_ws_elems =
+            D::flash_decode_workspace_capacity_f32(cap_batch, dims.head_num, dims.head_dim).max(1);
+        let flash_ws =
+            Tensor::<f32, D>::zeros(Shape::from_slice(&[flash_ws_elems]), device)?;
         Ok(Rc::new(Self {
             cap_num_tokens: cap,
             dims,
@@ -66,6 +95,8 @@ impl<T: Dtype, D: MemoryPort> ForwardScratch<T, D> {
             swiglu: alloc(dims.intermediate_size)?,
             ffn_out: alloc(dims.dim)?,
             logits: alloc(dims.vocab_size)?,
+            flash_ws: UnsafeCell::new(flash_ws),
+            flash_ws_elems,
         }))
     }
 
@@ -114,5 +145,34 @@ impl<T: Dtype, D: MemoryPort> ForwardScratch<T, D> {
     /// `finalize` lm_head output, `[n, vocab_size]`.
     pub fn logits(&self, n: usize) -> Tensor<T, D> {
         Self::view(&self.logits, n, self.dims.vocab_size)
+    }
+
+    /// Borrow the flash-attention decode workspace mutably for one
+    /// kernel call. Single-threaded, layers run serially on the same stream,
+    /// so handing the same buffer to each layer in turn is safe (the kernel's
+    /// reads-and-writes are stream-ordered).
+    ///
+    /// Returns a fresh full-buffer view rather than `&mut Tensor` so the
+    /// `Rc<Self>` borrow rules stay clean (the returned view owns its
+    /// storage handle through the underlying tensor's `Arc`).
+    pub fn flash_workspace_mut(&self) -> Tensor<f32, D> {
+        // SAFETY: `&self` precludes aliasing across threads (`ForwardScratch`
+        // is `!Sync` via `UnsafeCell`). Within one thread, layers run
+        // serially: each call obtains a fresh view, hands it to one
+        // `attention_paged` invocation, and drops it before the next layer
+        // runs. We never hold two live views simultaneously.
+        let cell = unsafe { &*self.flash_ws.get() };
+        let shape = Shape::from_slice(&[self.flash_ws_elems]);
+        let strides = shape.contiguous_strides();
+        cell.view_raw(shape, strides, 0, true)
+    }
+
+    /// f32 element count of the flash workspace. Mostly useful for tests /
+    /// debug assertions.
+    pub fn flash_workspace_elems(&self) -> usize {
+        self.flash_ws_elems
+    }
+}
+ems
     }
 }
