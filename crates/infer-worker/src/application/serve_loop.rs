@@ -362,9 +362,10 @@ where
             }
 
             pending_prefills = drain_data(data);
-            if pending_prefills.is_empty() {
-                pending_prefills = wait_for_prefill_quiet(data, Duration::from_millis(1));
-            }
+            // Drop the 1ms wait — if nothing is queued, proceed to decode
+            // immediately. This removes up to 16ms of stall per serve loop
+            // iteration when the prefill queue drains mid-burst.
+            // pending_prefills = wait_for_prefill_quiet(data, Duration::from_millis(1));
         }
 
         // ── Decode step ──
