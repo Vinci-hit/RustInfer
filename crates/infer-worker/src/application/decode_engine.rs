@@ -80,15 +80,20 @@ impl DecodeEngine {
         self.rows.retain_active(active);
     }
 
-    /// Drive the GPU-resident decode loop one step, pipelined 1-deep.
+    /// Drive the GPU-resident decode loop one step (synchronous).
     ///
-    /// Order matters: (1) finalize the step issued on the *previous* call —
-    /// drain its copy-out, commit its tokens, reclaim finished KV; (2) issue a
-    /// new step (append B, forward, merge, async copy-out) if there is work;
-    /// (3) send the finalized output *after* issuing, so the new step's GPU
-    /// compute overlaps the previous step's host commit + the ZMQ send + the
-    /// serve loop's inter-step work. The serve loop must keep calling this while
-    /// `has_pending()` so the last step is collected after `active` empties.
+    /// Issue + finalize a single step in one call. All GPU compute work
+    /// (forward + finalize + argmax + compact merge) is enqueued BEFORE
+    /// `synchronize_copy_out` blocks the CPU, so the GPU stays busy the
+    /// entire time — no idle bubble. This mirrors the baseline's
+    /// `step_decode_abc_compact` which was also fully synchronous.
+    ///
+    /// The 1-deep pipeline approach (issue step N, finalize step N-1) is
+    /// fundamentally broken here because `prepare_step` reads `active` seq
+    /// state (last_token, kv_len, block_table) that is only updated by
+    /// `commit_results` from the PRIOR step's finalize. Issuing before
+    /// finalizing would read stale seq state and the pending overwrite would
+    /// silently drop every other step's tokens.
     #[allow(clippy::too_many_arguments)]
     pub fn run_step<M>(
         &mut self,
@@ -104,46 +109,23 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
-        // ── Issue-then-finalize ordering ───────────────────────────────
-        //
-        // The order is critical for throughput: we issue the NEW step's compute
-        // work FIRST, then finalize (sync + read host mirrors of) the PREVIOUS
-        // step. This way the GPU starts on the new forward immediately while
-        // the CPU blocks on `synchronize_copy_out` for the prior step's D2H —
-        // the two overlap. If we finalized first (the natural reading of a
-        // 1-deep pipeline), the CPU would stall on the sync while the GPU sits
-        // idle, adding a full GPU-idle bubble every step.
-        //
-        // Cold-start (no pending step on entry): issue, immediately finalize
-        // (degenerating to 0-deep for this one iteration), and re-issue so the
-        // next call enters steady state with `pending = Some`.
-        let cold_start = self.pending.is_none() && !active.is_empty();
-
-        // 1. Issue the new step FIRST so its compute enqueues on the GPU
-        //    before we block on the prior step's sync.
         if active.is_empty() && !self.has_pending() {
             self.rows.clear();
-        } else {
-            self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
+            return Ok(());
         }
 
-        // 2. Finalize the in-flight step (issued last call, or just above in
-        //    the cold-start case). The `synchronize_copy_out` inside
-        //    `finalize_decode_abc` now overlaps the new step's GPU compute
-        //    instead of stalling an idle GPU.
+        // 1. Issue a new step (enqueues ALL compute: forward + argmax + merge
+        //    + async copy-out on So).
+        self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
+
+        // 2. Finalize immediately — sync So, read host mirrors, commit results.
+        //    GPU compute is already enqueued so the sync overlaps it.
         let to_send = self.finalize_pending(runner, active, kv_allocator, control, enable_prefix_caching)?;
 
-        // 3. Send the previous step's output.
+        // 3. Send the step's output.
         if let Some(output) = to_send {
             data.send_step_output(&output)
                 .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
-        }
-
-        // 4. Cold-start re-issue: if we entered with no pending step, we just
-        //    issued + finalized in one call. Re-issue so the next `run_step`
-        //    re-enters steady state with `pending = Some`.
-        if cold_start && !active.is_empty() {
-            self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
         }
         Ok(())
     }
