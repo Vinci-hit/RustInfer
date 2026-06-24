@@ -42,6 +42,7 @@ class RequestResult:
 
 
 RUSTINFER_MODEL = "llama3.2-1b"
+VLLM_MODEL = "dir"
 URL = "http://127.0.0.1:8000"
 DURATION = 60
 import os
@@ -141,6 +142,7 @@ async def send_rustinfer(session, url, prompt):
 
 async def send_vllm(session, url, prompt):
     payload = {
+        "model": VLLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
         "ignore_eos": True,

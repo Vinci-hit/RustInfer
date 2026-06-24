@@ -31,7 +31,7 @@ use std::cell::UnsafeCell;
 use std::rc::Rc;
 
 use super::model::ModelDims;
-use super::ports::{FusedOps, OpResult};
+use super::ports::{FusedOps, MemoryPort, OpResult};
 use super::tensor::Tensor;
 use super::types::{Dtype, Shape};
 
@@ -171,8 +171,5 @@ impl<T: Dtype, D: FusedOps + MemoryPort> ForwardScratch<T, D> {
     /// debug assertions.
     pub fn flash_workspace_elems(&self) -> usize {
         self.flash_ws_elems
-    }
-}
-ems
     }
 }
