@@ -988,12 +988,18 @@ where
         let block2tile = &tiles.block2tile;
         let batch = plan.batch;
         let bts = batch * self.max_blocks_per_seq;
-        // Reuse persistent host staging instead of allocating two Vecs per step.
-        self.upload_block_tables_host[..bts].fill(0);
+        // Only zero-fill the portion of each seq's row that has no valid block
+        // entry, so we don't wastefully zero then overwrite. (Baseline only
+        // zero-fills the tail.)
         for (i, seq) in req.seqs.iter().enumerate() {
             let row = i * self.max_blocks_per_seq;
+            let valid = seq.block_table.len();
             for (j, &block) in seq.block_table.iter().enumerate() {
                 self.upload_block_tables_host[row + j] = block as i32;
+            }
+            // Zero the unused tail of this row.
+            for j in valid..self.max_blocks_per_seq {
+                self.upload_block_tables_host[row + j] = 0;
             }
         }
         let block_tables = &self.upload_block_tables_host[..bts];
@@ -1110,10 +1116,14 @@ where
 
         // Lazily page-lock the host staging on the first step so the Si/So
         // copies are truly async (pageable memory makes them host-synchronous).
+        // NOTE: `new_token_host` is intentionally LEFT pageable — its H2D is
+        // tiny (batch × 4 B) and keeping it pageable makes the upload
+        // synchronous, eliminating the need for an explicit `synchronize_copy_in`
+        // before the CPU overwrites it on the next admission step (matching the
+        // baseline's behaviour).
         if !self.abc.pinned {
             let cfg = self.scope.device().config.clone();
             let _guard = self.scope.enter();
-            cfg.pin_host_i32(&self.abc.new_token_host)?;
             cfg.pin_host_i32(&self.abc.counts_host)?;
             cfg.pin_host_i32(&self.abc.active_src_rows_host)?;
             cfg.pin_host_i32(&self.abc.active_tokens_host)?;
@@ -1143,12 +1153,9 @@ where
         let vp = a_valid_prefix.min(batch);
         if vp < batch {
             let n = batch - vp;
-            // WAR guard: the prior step's copy-in DMA may still be reading
-            // `new_token_host`. Drain Si before the CPU overwrites it. Cheap
-            // (Si is a tiny copy, usually long idle by now) and only on
-            // admission steps. Mandatory for correctness once this staging
-            // buffer is page-locked (pinned), where the H2D is truly async.
-            cfg.synchronize_copy_in()?;
+            // `new_token_host` is pageable, so `upload_h2d_copy_in` is
+            // synchronous — the CPU write-back below is safe without an
+            // explicit Si sync. (Baseline behaviour: no synchronize_copy_in.)
             for (dst, seq) in self.abc.new_token_host[..n]
                 .iter_mut()
                 .zip(req.seqs[vp..].iter())
@@ -1173,6 +1180,69 @@ where
                 n,
                 stream,
             )?;
+        }
+
+        // ── Upload B (new tokens) AND stop-criteria metadata on the copy-in
+        //    stream (Si) BEFORE forward, so the DMA overlaps compute. We record
+        //    ev_in now but defer `compute_wait_copy_in` to AFTER forward (right
+        //    before merge), matching the baseline pattern: the Si DMA completes
+        //    during forward, making the wait a no-op.
+        {
+            let n = batch;
+            for (dst, &src) in self.abc.generated_counts_host[..n]
+                .iter_mut()
+                .zip(generated_counts.iter())
+            {
+                *dst = src as i32;
+            }
+            for (dst, &src) in self.abc.max_tokens_host[..n]
+                .iter_mut()
+                .zip(max_tokens.iter())
+            {
+                *dst = src as i32;
+            }
+            for (dst, &src) in self.abc.ignore_eos_host[..n]
+                .iter_mut()
+                .zip(ignore_eos.iter())
+            {
+                *dst = i32::from(src);
+            }
+            let eos_len = eos_ids.len().min(self.abc.eos_ids_host.len());
+            self.abc.eos_ids_host[..eos_len].copy_from_slice(&eos_ids[..eos_len]);
+        }
+        let meta_bytes = batch * std::mem::size_of::<i32>();
+        let eos_bytes = eos_ids.len() * std::mem::size_of::<i32>();
+        {
+            let _guard = self.scope.enter();
+            unsafe {
+                cfg.upload_h2d_copy_in(
+                    self.abc.generated_counts_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                    self.abc.generated_counts_host.as_ptr() as *const std::ffi::c_void,
+                    meta_bytes,
+                )?;
+                cfg.upload_h2d_copy_in(
+                    self.abc.max_tokens_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                    self.abc.max_tokens_host.as_ptr() as *const std::ffi::c_void,
+                    meta_bytes,
+                )?;
+                cfg.upload_h2d_copy_in(
+                    self.abc.ignore_eos_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                    self.abc.ignore_eos_host.as_ptr() as *const std::ffi::c_void,
+                    meta_bytes,
+                )?;
+                if eos_bytes > 0 {
+                    cfg.upload_h2d_copy_in(
+                        self.abc.eos_ids_dev.data_ptr_mut() as *mut std::ffi::c_void,
+                        self.abc.eos_ids_host.as_ptr() as *const std::ffi::c_void,
+                        eos_bytes,
+                    )?;
+                }
+            }
+            cfg.record_copy_in()?; // ev_in on Si (after B + metadata)
+            // NOTE: compute_wait_copy_in is deferred to after forward so the Si
+            // DMA overlaps compute. If B was uploaded above (admission step),
+            // its compute_wait_copy_in already ensures the append sees B; the
+            // metadata wait is folded into the single post-forward wait.
         }
 
         // ── forward + finalize + in-graph argmax → buffer C ──
@@ -1213,62 +1283,10 @@ where
             self.forward_finalize_argmax(&plan, &input_ids)?;
         }
 
-        // ── upload stop metadata on the copy-in stream (Si) + run the compact merge (C → A) ──
-        // P1+P2: Upload stop metadata on the copy-in stream (Si) instead of the
-        // compute stream, so the DMA overlaps compute. Also reuse pinned host
-        // mirrors instead of allocating 3 fresh Vec<i32> per step. The merge
-        // kernel on the compute stream waits on ev_in before reading these.
-        {
-            let n = batch;
-            for (dst, &src) in self.abc.generated_counts_host[..n]
-                .iter_mut()
-                .zip(generated_counts.iter())
-            {
-                *dst = src as i32;
-            }
-            for (dst, &src) in self.abc.max_tokens_host[..n]
-                .iter_mut()
-                .zip(max_tokens.iter())
-            {
-                *dst = src as i32;
-            }
-            for (dst, &src) in self.abc.ignore_eos_host[..n]
-                .iter_mut()
-                .zip(ignore_eos.iter())
-            {
-                *dst = i32::from(src);
-            }
-            let eos_len = eos_ids.len().min(self.abc.eos_ids_host.len());
-            self.abc.eos_ids_host[..eos_len].copy_from_slice(&eos_ids[..eos_len]);
-        }
-        let meta_bytes = batch * std::mem::size_of::<i32>();
-        let eos_bytes = eos_ids.len() * std::mem::size_of::<i32>();
-        let _guard = self.scope.enter();
-        unsafe {
-            cfg.upload_h2d_copy_in(
-                self.abc.generated_counts_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                self.abc.generated_counts_host.as_ptr() as *const std::ffi::c_void,
-                meta_bytes,
-            )?;
-            cfg.upload_h2d_copy_in(
-                self.abc.max_tokens_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                self.abc.max_tokens_host.as_ptr() as *const std::ffi::c_void,
-                meta_bytes,
-            )?;
-            cfg.upload_h2d_copy_in(
-                self.abc.ignore_eos_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                self.abc.ignore_eos_host.as_ptr() as *const std::ffi::c_void,
-                meta_bytes,
-            )?;
-            if eos_bytes > 0 {
-                cfg.upload_h2d_copy_in(
-                    self.abc.eos_ids_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                    self.abc.eos_ids_host.as_ptr() as *const std::ffi::c_void,
-                    eos_bytes,
-                )?;
-            }
-        }
-        cfg.record_copy_in()?;
+        // ── run the compact merge (C → A) ──
+        // Stop metadata was uploaded on Si before forward (above). Now make
+        // compute wait for ev_in — the Si DMA has been overlapping forward and
+        // is usually complete, making this a no-op. (Matches baseline pattern.)
         cfg.compute_wait_copy_in()?;
         let stream = ExecScope::stream(&self.scope).0;
         {
