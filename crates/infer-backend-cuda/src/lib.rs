@@ -585,6 +585,23 @@ impl infer_core::ports::FusedOps for Cuda {
         kv_dim: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        // Grid-size the scatter by the ACTUAL active batch, not the
+        // capacity-allocated control-buffer shape. The KV-index buffers
+        // (`seq_positions` etc.) are allocated at `cap_batch` and zero-padded, and
+        // the kernel derives its sequence-grid from `seq_positions.shape()[0]`. So
+        // without this narrow a single-request prefill (batch=1) launches
+        // `cap_batch` (e.g. 256) sequence-blocks per layer — 255 of them empty —
+        // which made `qkv_norm_rope_scatter` ~3x slower than the pre-refactor path
+        // and was the dominant prefill-forward (TTFT) regression. The data at
+        // [0, batch) is identical; only the launched grid shrinks. Decode-only
+        // steps are CUDA-graph-captured at fixed shapes, so leave their grid
+        // exactly as-is and shrink only the eager prefill/ragged path.
+        let active_batch = if ctx.plan().is_decode_only() {
+            layer.index.seq_positions.shape().as_slice()[0]
+        } else {
+            ctx.plan().batch.max(1)
+        };
+        let seq_positions_active = layer.index.seq_positions.narrow(0, 0, active_batch)?;
         match (q_weight, k_weight) {
             (Some(q_weight), Some(k_weight)) => {
                 kernels::qkv_norm_rope_scatter::qkv_norm_rope_scatter(
@@ -602,7 +619,7 @@ impl infer_core::ports::FusedOps for Cuda {
                     layer.k,
                     layer.v,
                     &layer.index.block_tables,
-                    &layer.index.seq_positions,
+                    &seq_positions_active,
                     &layer.index.cu_q_lens,
                     &layer.index.seq_lens_step,
                     ctx.plan().max_blocks_per_seq,
