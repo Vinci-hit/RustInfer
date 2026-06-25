@@ -242,10 +242,49 @@ static void gemm_bf16_chunked_legacy(
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream);
 
+// Direct cuBLASLt call with algo=nullptr: cuBLASLt's internal runtime picks the
+// kernel for this exact (M,N,K). This is the pre-refactor (532f5c) path and is
+// empirically faster than the heuristic-top-1 / benchmarked / capturable-cached
+// algos for small-M prefill GEMMs (~2.7ms/forward on Qwen3-4B). NOT graph-
+// capturable (runtime selection does private-stream probing under capture), so
+// it is used ONLY on the non-capturing eager-prefill path; decode graphs keep
+// the capturable cached algo. Recreates the (cheap, ~µs) descriptors per call.
+static void gemm_bf16_nullptr_runtime(
+    cublasLtHandle_t ltHandle, int M, int N, int K,
+    const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
+    void* workspace, size_t workspaceSize, cudaStream_t stream)
+{
+    // Row-major C[M,N]=A[M,K]·B[N,K]^T → col-major [N,M]=[N,K]·[K,M] with
+    // transA=T, transB=N and swapped operands (mirrors the cached paths).
+    const int m_g = N, n_g = M, k_g = K;
+    cublasOperation_t opA = CUBLAS_OP_T, opB = CUBLAS_OP_N;
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+    cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
+    cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
+    cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
+    cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t status = cublasLtMatmul(
+        ltHandle, op, &alpha,
+        d_B, A, d_A, B, &beta,
+        d_C, C, d_C, C,
+        nullptr, workspace, workspaceSize, stream);
+    cublasLtMatrixLayoutDestroy(C);
+    cublasLtMatrixLayoutDestroy(B);
+    cublasLtMatrixLayoutDestroy(A);
+    cublasLtMatmulDescDestroy(op);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+    }
+}
+
 // Eager bf16 GEMM via the (N,K)-cached single-pass cuBLASLt algo. Falls back to
 // the chunked cublasGemmEx path on any cuBLASLt error (cold-build failure or an
 // algo the cached pick can't service at this M).
-static void gemm_bf16_eager_nk_cached(
+[[maybe_unused]] static void gemm_bf16_eager_nk_cached(
     cublasLtHandle_t ltHandle, int M, int N, int K,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream)
@@ -656,7 +695,9 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     // (~9-18ms of cold build off TTFT) while keeping the large-tile single-pass
     // kernel (no chunked K-tile launch storm).
     if (!capturing && g_zimage_eager_prefill_gemm.load(std::memory_order_relaxed) != 0) {
-        gemm_bf16_eager_nk_cached(ltHandle, M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+        // algo=nullptr runtime selection — faster than the heuristic/benchmarked
+        // cached algos for small-M prefill (restores 532f5c forward speed).
+        gemm_bf16_nullptr_runtime(ltHandle, M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
         return;
     }
 

@@ -49,6 +49,30 @@ landed (60ms→12.6ms). Worker eager-forward is the target here.
   if last chunk: eager `finalize(LastPerSeq)` + sample → first token.
 
 ## Status (2026-06-25)
+- **STAGE A DONE — single-seq prefill graph (exact `num_tokens` key), no
+  padding. Landed in `runtime.rs`.** `GraphDecision::PrefillGraph(num_tokens)`;
+  `GraphRunner::decide` routes single-seq (`batch==1`) plain-`Ragged` prefill of
+  `2..=PREFILL_GRAPH_MAX_TOKENS` (256) tokens to a prefill graph keyed by exact
+  `num_tokens` (tagged `1<<40` so it can't collide with decode batch keys).
+  `step_prefill_graph` captures `run_layers` ONLY (warmup eager pass → sync →
+  capture → replay), `sample_tail` stays eager. Budget `PREFILL_GRAPH_BUDGET=16`
+  distinct lengths, then eager. Crucially it does NOT set `prefill_gemm_mode`, so
+  the warmup builds the capturable per-`(M,N,K)` cuBLASLt cache (the eager `(N,K)`
+  path is capture-illegal). Validated: Paris/Tokyo/2+2 correct; captures fire
+  (num_tokens=13/20/21/23/27); replay confirmed.
+  - **RESULT (H200 cuda:7, seq2.py keep-alive, NW=3, 3×150, back-to-back):**
+    HEAD median **15.3ms** vs `1cd848` baseline **16.5ms** — 1.2ms (7.3%) faster,
+    no median overlap, p90 15.8 vs 16.7. Worker `handle_prefill` 8.18→**7.48ms**
+    (the −0.7ms is the whole win; prefill is GPU-bound — a serial 36-layer chain
+    of ~144 latency-bound small-M GEMMs + 36 attn, so graph replay only removes
+    the non-overlapped launch slice, NOT kernel-execution latency). Worker
+    prep/send is negligible (~0.06ms); qkv+gate_up already fused (4 GEMM/layer).
+  - **STAGE B (still TODO) = bucketing + dummy-tail padding** (below) to (a) make
+    ANY prompt length capturable with a bounded graph set instead of per-exact,
+    and (b) cover burst (batch>1) prefill. Stage A already wins the short-prompt
+    TTFT target; Stage B generalizes + bounds graph memory. Going materially
+    below 7.48ms needs kernel-level work (fused MLP/attention, larger GEMM tiles)
+    — out of scope for the graph capture.
 - STEP 1 DONE — chunked-prefill foundation enabled + VALIDATED. Set
   `chunked_prefill_size = 256` in rustinfer.toml. 997-tok prompt → 4 chunks
   (worker logged 4 handle_prefill calls, 23/33/43/51ms as KV prefix grows),

@@ -55,6 +55,11 @@ where
     prefill_ids_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
+    /// Count of distinct single-seq prefill graphs captured so far (Stage A
+    /// keys each prefill graph by exact `num_tokens`). Bounds graph memory:
+    /// once it reaches `PREFILL_GRAPH_BUDGET`, further uncaptured prefill
+    /// lengths run eager instead of capturing a new graph.
+    prefill_graphs_captured: usize,
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -264,6 +269,7 @@ where
             prefill_ids_buf,
             prefill_ids_host,
             abc,
+            prefill_graphs_captured: 0,
         })
     }
 
@@ -273,6 +279,9 @@ where
         match self.decide(&plan) {
             GraphDecision::Eager => self.step_eager(&plan, req),
             GraphDecision::Graph(slot) => self.step_graph(slot, &plan, req),
+            GraphDecision::PrefillGraph(num_tokens) => {
+                self.step_prefill_graph(num_tokens, &plan, req)
+            }
         }
     }
 
@@ -291,8 +300,25 @@ where
         }
         let _gemm_guard = PrefillGemmGuard::<D>(prefill_gemm, std::marker::PhantomData);
         let input_ids = self.input_ids_tensor(req, plan)?;
+        let _trace = std::env::var_os("RUSTINFER_TTFT_TRACE").is_some();
+        let _t0 = std::time::Instant::now();
         self.run_layers(plan, &input_ids)?;
-        self.sample_tail(plan, req)
+        if _trace {
+            let _ = self.scope.synchronize();
+            tracing::info!(
+                "[ttft-trace] run_layers (36L fwd, synced) = {:.2}ms",
+                _t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let _t1 = std::time::Instant::now();
+        let out = self.sample_tail(plan, req);
+        if _trace {
+            tracing::info!(
+                "[ttft-trace] sample_tail (finalize+argmax+D2H) = {:.2}ms",
+                _t1.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        out
     }
 
     /// Embed + all decoder layers into the persistent `hidden` buffer. This is
@@ -571,6 +597,7 @@ where
         self.graph = Some(GraphRunner::new(
             self.capture_sizes.clone(),
             self.cap_batch,
+            PREFILL_GRAPH_MAX_TOKENS,
         )?);
         Ok(())
     }
@@ -653,6 +680,74 @@ where
         // synchronize before capture is still required (and already issued
         // above before `graph_capture_begin`).
         self.decode_output_from_c(plan, req)
+    }
+
+    /// Single-sequence prefill via CUDA graph (Stage A). The captured region is
+    /// `run_layers` (embed + decoder layers → the persistent `hidden` buffer) —
+    /// the launch-heavy ~Nlayers×Nkernels chain whose per-launch CPU dispatch
+    /// dominates a short-prompt prefill (~8ms for a 6-token prompt is almost
+    /// entirely launch/setup, not compute). `sample_tail` stays EAGER: the
+    /// finalize (`LastPerSeq`) + argmax + the small data-dependent D2H run
+    /// outside the graph, exactly as for an eager prefill.
+    ///
+    /// Keyed by exact `num_tokens` (tagged so it can't collide with a decode
+    /// graph keyed by `batch`). Replay reuses the address-stable control buffers
+    /// (`upload_index`, already run in `step`) and the fixed `prefill_ids_buf`,
+    /// so a later same-length prefill with different blocks/positions replays
+    /// correctly — the kernels read block tables / kv lens at runtime.
+    ///
+    /// IMPORTANT: this path does NOT enable `prefill_gemm_mode`. The eager
+    /// `(N,K)` GEMM cache is capture-illegal (it builds/probes lazily). With the
+    /// flag off, the cold warmup pass below builds the capturable per-`(M,N,K)`
+    /// cuBLASLt cache for `M == num_tokens`, which the capture then replays.
+    fn step_prefill_graph(
+        &mut self,
+        num_tokens: usize,
+        plan: &crate::domain::plan::BatchPlan,
+        req: &StepRequest,
+    ) -> OpResult<StepOutput> {
+        // Fall back to eager if graphs are unavailable on this scope.
+        if self.graph.is_none() || !self.scope.supports_graphs() {
+            return self.step_eager(plan, req);
+        }
+        let key = PREFILL_GRAPH_KEY_TAG | num_tokens as u64;
+        // Fixed-address input ids (uploaded into the persistent prefill buffer).
+        let input_ids = self.input_ids_tensor(req, plan)?;
+
+        if self.scope.graph_ready(key) {
+            // Hot path: pure replay. `upload_index` + the id upload above already
+            // rewrote every input buffer the graph reads.
+            self.scope.graph_launch(key)?;
+        } else if self.prefill_graphs_captured >= PREFILL_GRAPH_BUDGET {
+            // Graph budget spent: run eager (still correct, just not captured).
+            self.run_layers(plan, &input_ids)?;
+            return self.sample_tail(plan, req);
+        } else {
+            // Cold path (mirrors the decode cold path). One eager `run_layers`
+            // first warms the lazily-built, capture-illegal library caches
+            // (cuBLASLt per-`(M,N,K)` algo selection / capturability probe) and
+            // writes the seq's KV at its paged positions. Then capture the
+            // (now warm) `run_layers` and replay it — the replay re-scatters the
+            // same KV at the same positions, so it is idempotent on KV state.
+            self.run_layers(plan, &input_ids)?;
+            self.scope.synchronize()?;
+            self.scope.graph_capture_begin()?;
+            if let Err(e) = self.run_layers(plan, &input_ids) {
+                let _ = self.scope.graph_capture_end(key);
+                return Err(e);
+            }
+            self.scope.graph_capture_end(key)?;
+            self.prefill_graphs_captured += 1;
+            tracing::info!(
+                "[graph] captured prefill graph (run_layers) for num_tokens={} ({}/{} budget)",
+                num_tokens,
+                self.prefill_graphs_captured,
+                PREFILL_GRAPH_BUDGET
+            );
+            self.scope.graph_launch(key)?;
+        }
+        // `hidden` now holds the replayed forward output; finalize + sample eager.
+        self.sample_tail(plan, req)
     }
 
     fn build_plan(&self, req: &StepRequest) -> OpResult<BatchPlan> {
@@ -1014,6 +1109,9 @@ where
             GraphDecision::Graph(slot) => {
                 self.graph.as_ref().and_then(|g| g.slot_size(slot)) == Some(batch)
             }
+            // This ABC path only runs for decode-only steps, so a prefill-graph
+            // decision never reaches here; treat it as eager for exhaustiveness.
+            GraphDecision::PrefillGraph(_) => false,
             GraphDecision::Eager => false,
         };
         if use_graph {
@@ -1338,9 +1436,28 @@ unsafe fn upload_i32_full_zeropad<D: Device>(
     unsafe { device.upload_async(ptr, padded.as_ptr() as *const u8, bytes) }
 }
 
+/// Tag bit OR'd into prefill-graph keys (keyed by `num_tokens`) so they never
+/// collide with decode-graph keys (keyed by `batch` ≤ `cap_batch`) in the
+/// scope's graph map. `1 << 40` is far above any realistic token count.
+const PREFILL_GRAPH_KEY_TAG: u64 = 1 << 40;
+/// Max distinct single-seq prefill lengths to capture graphs for (Stage A keys
+/// each prefill graph by exact `num_tokens`). Bounds graph memory; beyond this,
+/// uncaptured prefill lengths run eager.
+const PREFILL_GRAPH_BUDGET: usize = 16;
+/// Default max prompt length (tokens) eligible for a single-seq prefill graph.
+/// Set to 0 (disabled): the eager prefill path now routes its bf16 GEMMs to the
+/// `algo=nullptr` cuBLASLt runtime-selected kernel (532f5c's path), which is
+/// ~2ms/forward FASTER than a captured graph replaying a capturable-but-slower
+/// cached algo. The graph machinery is retained (Stage B) but off by default;
+/// raise this to re-enable single-seq prefill graphs.
+const PREFILL_GRAPH_MAX_TOKENS: usize = 0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphDecision {
     Graph(GraphSlotId),
+    /// Single-seq prefill graph, keyed by exact `num_tokens` (the captured
+    /// region is `run_layers`; `sample_tail` stays eager).
+    PrefillGraph(usize),
     Eager,
 }
 
@@ -1349,6 +1466,9 @@ pub struct GraphSlotId(pub usize);
 
 pub struct GraphRunner<D: LlmBackend> {
     capture_sizes: Vec<usize>,
+    /// Max prompt length (tokens) eligible for a single-seq prefill graph.
+    /// `0` disables prefill graphs (decode graphs only).
+    prefill_graph_max: usize,
     _d: PhantomData<D>,
 }
 
@@ -1356,13 +1476,18 @@ impl<D: LlmBackend> Default for GraphRunner<D> {
     fn default() -> Self {
         Self {
             capture_sizes: Vec::new(),
+            prefill_graph_max: 0,
             _d: PhantomData,
         }
     }
 }
 
 impl<D: LlmBackend> GraphRunner<D> {
-    pub fn new(mut capture_sizes: Vec<usize>, cap_batch: usize) -> OpResult<Self> {
+    pub fn new(
+        mut capture_sizes: Vec<usize>,
+        cap_batch: usize,
+        prefill_graph_max: usize,
+    ) -> OpResult<Self> {
         capture_sizes.sort_unstable();
         capture_sizes.dedup();
         if capture_sizes.is_empty() {
@@ -1385,6 +1510,7 @@ impl<D: LlmBackend> GraphRunner<D> {
         }
         Ok(Self {
             capture_sizes,
+            prefill_graph_max,
             _d: PhantomData,
         })
     }
@@ -1394,11 +1520,24 @@ impl<D: LlmBackend> GraphRunner<D> {
     }
 
     pub fn decide(&self, plan: &crate::domain::plan::BatchPlan) -> GraphDecision {
-        if !plan.is_decode_only() {
-            return GraphDecision::Eager;
+        if plan.is_decode_only() {
+            return self
+                .slot_for_batch(plan.batch)
+                .map_or(GraphDecision::Eager, GraphDecision::Graph);
         }
-        self.slot_for_batch(plan.batch)
-            .map_or(GraphDecision::Eager, GraphDecision::Graph)
+        // Single-seq prefill graph (Stage A): exact-`num_tokens` key. Only plain
+        // ragged prefill of one sequence is eligible — bursts (batch > 1) and
+        // speculative/spec masks still run eager (Stage B generalizes via
+        // bucketing + dummy-tail padding).
+        if self.prefill_graph_max > 0
+            && plan.batch == 1
+            && plan.num_tokens >= 2
+            && plan.num_tokens <= self.prefill_graph_max
+            && matches!(plan.kind, BatchKind::Ragged)
+        {
+            return GraphDecision::PrefillGraph(plan.num_tokens);
+        }
+        GraphDecision::Eager
     }
 
     pub fn slot_size(&self, slot: GraphSlotId) -> Option<usize> {
@@ -1606,7 +1745,7 @@ mod tests {
 
     #[test]
     fn graph_runner_picks_smallest_decode_slot() {
-        let runner = GraphRunner::<Cpu>::new(vec![4, 1, 2, 2], 4).unwrap();
+        let runner = GraphRunner::<Cpu>::new(vec![4, 1, 2, 2], 4, 0).unwrap();
         assert_eq!(runner.capture_sizes(), &[1, 2, 4]);
 
         let mut plan = BatchPlan {

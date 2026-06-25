@@ -265,6 +265,11 @@ where
         draft_tokens: Vec::new(),
         seqs: steps,
     };
+    let _step_t0 = if std::env::var_os("RUSTINFER_TTFT_TRACE").is_some() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let out = match ctx.runner.step(&req) {
         Ok(out) => out,
         Err(e) => {
@@ -286,6 +291,12 @@ where
             return Ok(());
         }
     };
+    if let Some(t0) = _step_t0 {
+        tracing::info!(
+            "[ttft-trace] runner.step (forward+sample) = {:.2}ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // #6 zero-copy: the forward only borrowed the request, so move the input
     // tokens and block tables back out of the owned `seqs` into their plans
     // (reclaimed by `assigned_runs` and the commit loop below) rather than
