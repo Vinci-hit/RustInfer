@@ -53,6 +53,17 @@ where
     /// `from_host_slice` tensor whose throwaway host Vec forced a full sync.
     pub prefill_ids_buf: Tensor<i32, D>,
     prefill_ids_host: Vec<i32>,
+    /// Persistent host staging for the paged block tables (capacity
+    /// `cap_batch * max_blocks_per_seq`). Rewritten in place every step and
+    /// async-uploaded into `kv_index.block_tables`. Lives for the runtime's
+    /// lifetime so the `upload_async` (cudaMemcpyAsync) contract holds — the
+    /// previous code allocated+zeroed a fresh `Vec` per step and uploaded from
+    /// it, which (a) churned 1–4 MiB/step in the decode hot loop, (b) was
+    /// pageable so the "async" copy silently degraded to a synchronous one, and
+    /// (c) freed the host buffer before the stream consumed it. Pinned lazily
+    /// alongside the ABC buffers so the copy is genuinely async on the decode
+    /// path.
+    block_tables_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
     /// Count of distinct single-seq prefill graphs captured so far (Stage A
@@ -211,6 +222,7 @@ where
         let prefill_ids_buf =
             D::alloc_tensor::<i32>(Shape::from_slice(&[cap_num_tokens.max(1)]), device)?;
         let prefill_ids_host = vec![0i32; cap_num_tokens.max(1)];
+        let block_tables_host = vec![0i32; (cap_batch * max_blocks_per_seq).max(1)];
 
         // ── ABC pipeline buffers (Stage 1: allocated, wired in later stages) ──
         let cb = cap_batch.max(1);
@@ -268,6 +280,7 @@ where
             input_ids_buf,
             prefill_ids_buf,
             prefill_ids_host,
+            block_tables_host,
             abc,
             prefill_graphs_captured: 0,
         })
@@ -849,7 +862,12 @@ where
             }
         }
 
-        let (_cu_q_lens, block2req, _block2tile) = BatchPlan::plan_ragged_tiles(&q_lens);
+        // `total_q_tiles` is the only thing the plan needs from the ragged-tile
+        // layout; compute it arithmetically instead of building (and discarding)
+        // the three `plan_ragged_tiles` Vecs here. `upload_index` builds them
+        // once, when it actually uploads them.
+        let tile = crate::domain::plan::RAGGED_Q_TILE;
+        let total_q_tiles: i32 = q_lens.iter().map(|&q| (q + tile - 1) / tile).sum();
         let kind = if !req.draft_tokens.is_empty() {
             BatchKind::Spec {
                 mask: crate::domain::plan::MaskMode::Causal,
@@ -870,7 +888,7 @@ where
             rope_positions,
             max_blocks_per_seq: self.max_blocks_per_seq,
             block_size: self.block_size,
-            total_q_tiles: block2req.len() as i32,
+            total_q_tiles,
         })
     }
 
@@ -910,18 +928,38 @@ where
 
     fn upload_index(&mut self, plan: &BatchPlan, req: &StepRequest) -> OpResult<()> {
         let (cu_q_lens, block2req, block2tile) = BatchPlan::plan_ragged_tiles(&plan.q_lens);
-        let mut block_tables = vec![0i32; plan.batch * self.max_blocks_per_seq];
-        for (i, seq) in req.seqs.iter().enumerate() {
-            let row = i * self.max_blocks_per_seq;
-            for (j, &block) in seq.block_table.iter().enumerate() {
-                block_tables[row + j] = block as i32;
+
+        // Refresh the persistent block-table staging IN PLACE — no per-step
+        // heap alloc/zero of a `batch * max_blocks_per_seq` Vec (1–4 MiB in the
+        // decode hot loop), and the buffer outlives the async H2D below so the
+        // `upload_async` (cudaMemcpyAsync) host-pointer contract holds.
+        //
+        // Each row writes only its own `block_table` entries; the kernels bound
+        // every block-table read by the sequence's live length —
+        // `qkv_norm_rope_scatter` walks `logical_pos/block_size` for
+        // `t < seq_lens[seq]`, paged attention walks `logical_block < kv_len` —
+        // so entries past a row's live length are never read and need not be
+        // cleared. (Unlike the per-seq control buffers below, which the kernels
+        // iterate to capacity and therefore must be zero-padded.)
+        let mbps = self.max_blocks_per_seq;
+        let upload_len = plan.batch * mbps;
+        {
+            let block_tables_host = &mut self.block_tables_host;
+            for (i, seq) in req.seqs.iter().enumerate() {
+                let row = i * mbps;
+                for (j, &block) in seq.block_table.iter().enumerate() {
+                    block_tables_host[row + j] = block as i32;
+                }
             }
         }
-        let seq_lens_step = plan.q_lens.clone();
 
         let device = self.scope.device();
         unsafe {
-            upload_i32_prefix(device, &self.kv_index.block_tables, &block_tables)?;
+            upload_i32_prefix(
+                device,
+                &self.kv_index.block_tables,
+                &self.block_tables_host[..upload_len],
+            )?;
             // The per-sequence control buffers are sized to `cap_batch` but the
             // attention/scatter kernels iterate over `seq_positions.shape()[0]`
             // (== capacity). A prefix-only upload leaves the tail holding STALE
@@ -933,7 +971,9 @@ where
             upload_i32_full_zeropad(device, &self.kv_index.cu_q_lens, &cu_q_lens)?;
             upload_i32_full_zeropad(device, &self.kv_index.kv_lens, &plan.kv_lens)?;
             upload_i32_full_zeropad(device, &self.kv_index.seq_positions, &plan.seq_positions)?;
-            upload_i32_full_zeropad(device, &self.kv_index.seq_lens_step, &seq_lens_step)?;
+            // `seq_lens_step` is the per-row q_len; upload `plan.q_lens`
+            // directly instead of cloning it each step.
+            upload_i32_full_zeropad(device, &self.kv_index.seq_lens_step, &plan.q_lens)?;
             upload_i32_prefix(device, &self.kv_index.rope_positions, &plan.rope_positions)?;
             upload_i32_prefix(device, &self.kv_index.block2req, &block2req)?;
             upload_i32_prefix(device, &self.kv_index.block2tile, &block2tile)?;
@@ -1045,6 +1085,10 @@ where
             cfg.pin_host_i32(&self.abc.active_tokens_host)?;
             cfg.pin_host_i32(&self.abc.finished_src_rows_host)?;
             cfg.pin_host_i32(&self.abc.finished_tokens_host)?;
+            // Pin the persistent block-table staging too — it is the largest
+            // per-step H2D on the decode path and was previously a pageable
+            // (host-synchronous) copy.
+            cfg.pin_host_i32(&self.block_tables_host)?;
             self.abc.pinned = true;
         }
 

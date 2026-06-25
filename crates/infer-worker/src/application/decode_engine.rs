@@ -422,6 +422,13 @@ impl DecodeEngine {
             to_remove.push(order[row.src_row]);
         }
 
+        // Accumulate every slot this step returns to the pool — orphaned
+        // per-step slots and finished sequences' block tables — and free them
+        // in ONE call below. `GlobalKvAllocator::free` is O(pool) per call
+        // (compact + merge), so a single merged free per step replaces one pass
+        // per sequence (previously K full-pool passes when K rows finished, and
+        // a full-pool pass to return a single orphaned slot).
+        let mut to_free: Vec<u32> = Vec::new();
         for (i, &sid) in order.iter().enumerate() {
             let Some((token, finished)) = row_results[i] else {
                 continue;
@@ -443,7 +450,7 @@ impl DecodeEngine {
                     OpError::Shape(format!("decode commit failed for seq {}: {}", sid, e))
                 })?;
             } else {
-                kv_allocator.free(&[new_index]);
+                to_free.push(new_index);
             }
             output.tokens.push(GeneratedToken {
                 sequence_id: sid,
@@ -453,8 +460,20 @@ impl DecodeEngine {
         }
         for sid in &to_remove {
             if let Some(removed) = active.remove(sid) {
-                kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+                // `release_owned` with prefix caching ON is a no-op (slots stay
+                // pinned by the scheduler RadixTree); with it OFF the blocks
+                // return to the pool. Accumulate the OFF case into the shared
+                // batch instead of one `free()` per finished sequence.
+                if !enable_prefix_caching {
+                    to_free.extend_from_slice(&removed.block_table);
+                }
             }
+        }
+        // One merged free for the whole step. `free()` sorts + dedups its input
+        // internally, so combining orphaned slots with finished block tables is
+        // correct and costs a single compact+merge pass.
+        if !to_free.is_empty() {
+            kv_allocator.free(&to_free);
         }
         self.rows.replace_rows(next_rows);
         Ok(output)
