@@ -179,12 +179,26 @@ static std::mutex g_zimage_bf16_gemm_cache_mu;
 static std::unordered_map<ZimageBf16GemmKey, ZimageBf16GemmEntry, ZimageBf16GemmKeyHash>
     g_zimage_bf16_gemm_cache;
 
+// Per-shape cuBLASLt algo benchmarking is OFF by default. The cuBLASLt
+// heuristic's top capturable algo matches the benchmarked pick for the decode
+// shapes (measured: identical TPOT, e.g. b32 4.00ms vs 4.10ms, b64 4.87ms vs
+// 4.87ms on Qwen3-4B) — both select the same large-tile single-pass kernel, so
+// the benchmark added no decode speedup. But the benchmark's per-shape
+// cudaDeviceSynchronize + timed sweep over ~32 algos cost ~30ms PER cold shape,
+// and prefill M = num_tokens varies per request, so almost every prefill paid
+// it on the TTFT critical path (TTFT 128tok 80ms -> 48.8ms with bench off).
+// Opt back in with RUSTINFER_ENABLE_CUBLASLT_BF16_BENCH=1 for workloads where
+// the heuristic's top algo is suboptimal (e.g. z-image DiT GEMM shapes). The
+// legacy RUSTINFER_DISABLE_CUBLASLT_BF16_BENCH still force-disables.
 static bool zimage_bf16_gemm_bench_disabled()
 {
     static int cached = -1;
     if (cached == -1) {
-        const char* s = getenv("RUSTINFER_DISABLE_CUBLASLT_BF16_BENCH");
-        cached = (s != nullptr && s[0] != '\0' && s[0] != '0') ? 1 : 0;
+        const char* en = getenv("RUSTINFER_ENABLE_CUBLASLT_BF16_BENCH");
+        const char* dis = getenv("RUSTINFER_DISABLE_CUBLASLT_BF16_BENCH");
+        bool force_dis = (dis != nullptr && dis[0] != '\0' && dis[0] != '0');
+        bool opt_in = (en != nullptr && en[0] != '\0' && en[0] != '0');
+        cached = (opt_in && !force_dis) ? 0 : 1; // disabled unless explicitly enabled
     }
     return cached == 1;
 }
