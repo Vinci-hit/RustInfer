@@ -6,9 +6,7 @@ use crate::domain::dtype::Dtype;
 use crate::domain::exec::{ExecDevice as Device, ExecScope};
 use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use crate::domain::model::{DecoderModel, ModelDims, SampleRows};
-use crate::domain::plan::{
-    BatchKind, BatchPlan, SampledToken, StepOutput, StepRequest, SeqStep, StopCriteria,
-};
+use crate::domain::plan::{BatchKind, BatchPlan, SampledToken, StepOutput, StepRequest};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::sampler::Sampler;
 use crate::domain::ports::{OpError, OpResult};
@@ -55,20 +53,8 @@ where
     /// `from_host_slice` tensor whose throwaway host Vec forced a full sync.
     pub prefill_ids_buf: Tensor<i32, D>,
     prefill_ids_host: Vec<i32>,
-    /// Reusable host staging for `upload_index` — avoids two `Vec` allocations
-    /// per decode step (`block_tables` + `seq_lens_step`).
-    upload_block_tables_host: Vec<i32>,
-    upload_seq_lens_step_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
-}
-
-/// Ragged tiling vectors computed once in `build_plan_with_tiles` and reused
-/// by `upload_index`, avoiding a duplicate `plan_ragged_tiles` call (P3).
-struct RaggedTiles {
-    cu_q_lens: Vec<i32>,
-    block2req: Vec<i32>,
-    block2tile: Vec<i32>,
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -102,12 +88,6 @@ pub struct AbcBuffers<D: Device> {
     pub active_tokens_dev: Tensor<i32, D>,
     /// `[active_n, finished_n, old_batch]`.
     pub counts_dev: Tensor<i32, D>,
-    /// Device row-pick list for `sample_tail`'s prefill argmax: per-sequence
-    /// last-row indices (`cu_q_lens[i+1]-1`). Sized to `cap_batch`; only the
-    /// first `batch` entries are read each step. Lets the argmax kernel skip
-    /// the `num_tokens - batch` rows the sampler would discard, collapsing
-    /// the dominant TTFT cost on long prompts.
-    pub sampled_rows_dev: Tensor<i32, D>,
     // Host mirrors for the single small D2H after each step.
     pub argmax_out_host: Vec<i32>,
     pub counts_host: Vec<i32>,
@@ -118,15 +98,6 @@ pub struct AbcBuffers<D: Device> {
     /// Persistent host staging for buffer B (admission tokens). Must outlive the
     /// copy-in stream's DMA, so it cannot be a per-step local.
     pub new_token_host: Vec<i32>,
-    /// Persistent host staging for `sampled_rows_dev`; filled per step.
-    pub sampled_rows_host: Vec<i32>,
-    /// Pinned host mirrors for stop-metadata, uploaded on the copy-in stream
-    /// (Si) so the DMA overlaps compute. Eliminates the per-step `Vec<i32>`
-    /// allocations + `collect()` that the old path did on the compute stream.
-    pub generated_counts_host: Vec<i32>,
-    pub max_tokens_host: Vec<i32>,
-    pub ignore_eos_host: Vec<i32>,
-    pub eos_ids_host: Vec<i32>,
     /// Whether a copy-out has been recorded on So at least once. Gates the
     /// `compute_wait_copy_out` guard so the first step does not wait on an
     /// event that was never recorded.
@@ -226,13 +197,10 @@ where
 
         // ── ABC pipeline buffers (Stage 1: allocated, wired in later stages) ──
         let cb = cap_batch.max(1);
-        // Decode argmax writes one id per row (one row per seq); sized to
-        // `cap_batch`. Prefill argmax used to walk every token row, sized this
-        // to `cap_num_tokens`, and paid an O(num_tokens) argmax + D2H. The
-        // selected-rows path now feeds only `batch` rows in, so `cap_batch` is
-        // sufficient for both decode (in-graph) and prefill (eager). Kernel
-        // workspace is bf16, `512` halfs/row covers it with headroom.
-        let argmax_cap = cb;
+        // Greedy prefill argmax processes every token row of the forward, so the
+        // argmax output/scratch must hold up to `cap_num_tokens` rows, not just
+        // the decode batch. Decode only ever uses the first `batch` slots.
+        let argmax_cap = cb.max(cap_num_tokens.max(1));
         let abc = AbcBuffers {
             new_token_dev: alloc_i32(cb)?,
             argmax_out_dev: alloc_i32(argmax_cap)?,
@@ -246,7 +214,6 @@ where
             finished_tokens_dev: alloc_i32(cb)?,
             active_tokens_dev: alloc_i32(cb)?,
             counts_dev: alloc_i32(3)?,
-            sampled_rows_dev: alloc_i32(cb)?,
             argmax_out_host: vec![0; cb],
             counts_host: vec![0; 3],
             active_src_rows_host: vec![0; cb],
@@ -254,11 +221,6 @@ where
             finished_src_rows_host: vec![0; cb],
             finished_tokens_host: vec![0; cb],
             new_token_host: vec![0; cb],
-            sampled_rows_host: vec![0; cb],
-            generated_counts_host: vec![0; cb],
-            max_tokens_host: vec![0; cb],
-            ignore_eos_host: vec![0; cb],
-            eos_ids_host: vec![0; 64],
             copy_out_recorded: false,
             pinned: false,
         };
@@ -266,18 +228,9 @@ where
         // Preallocate the address-stable per-layer forward scratch and install
         // it into the model's sublayers. Eliminates the ~11 device allocations
         // per layer (cudaMalloc/cudaFree/memset storm) on the eager forward and
-        // bakes fixed scratch addresses into captured decode graphs. Also
-        // owns the flash-attention decode workspace — sized once to
-        // worst-case `(cap_batch, head_num, head_dim)` (see
-        // `D::flash_decode_workspace_capacity_f32`) instead of allocated +
-        // memset per layer per step (~18µs × num_layers per token in the old
-        // path).
-        let scratch = crate::domain::forward_scratch::ForwardScratch::<T, D>::new(
-            device,
-            dims,
-            cap_num_tokens,
-            cap_batch,
-        )?;
+        // bakes fixed scratch addresses into captured decode graphs.
+        let scratch =
+            crate::domain::forward_scratch::ForwardScratch::<T, D>::new(device, dims, cap_num_tokens, cb)?;
         model.install_scratch(scratch);
 
         Ok(Self {
@@ -298,15 +251,13 @@ where
             input_ids_buf,
             prefill_ids_buf,
             prefill_ids_host,
-            upload_block_tables_host: vec![0i32; cap_batch * max_blocks_per_seq],
-            upload_seq_lens_step_host: vec![0i32; cap_batch],
             abc,
         })
     }
 
     pub fn step(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
-        let (plan, tiles) = self.build_plan_with_tiles(req)?;
-        self.upload_index(&plan, req, &tiles)?;
+        let plan = self.build_plan(req)?;
+        self.upload_index(&plan, req)?;
         match self.decide(&plan) {
             GraphDecision::Eager => self.step_eager(&plan, req),
             GraphDecision::Graph(slot) => self.step_graph(slot, &plan, req),
@@ -379,81 +330,45 @@ where
         let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
-            // Greedy fast path.
+            // Greedy fast path: reuse the ABC argmax workspace instead of having
+            // `Sampler::sample` allocate a fresh `[rows]` output + `[rows*512]`
+            // scratch every call. The CUDA backend's `argmax` (used by
+            // `GreedySampler::sample`) otherwise pays two `Tensor::zeros`
+            // (cudaMallocAsync + memset) per prefill, which directly inflated
+            // TTFT at low QPS after the buffer-pipeline refactor.
             //
-            // Two compounding TTFT regressions used to live here, both gone:
-            //
-            //  1. `Sampler::sample` allocated a fresh `[rows] i32` + `[rows*512] f32`
-            //     per prefill step (cudaMallocAsync + memset, twice). Fixed by
-            //     using `argmax_into` against the persistent `abc` workspace.
-            //
-            //  2. Even after (1), argmax was kernel-evaluated over EVERY logits
-            //     row (`num_tokens` = sum of prompt q_lens, up to thousands),
-            //     and the D2H downloaded all of them — only to discard all but
-            //     `batch` last-rows on host. That's `num_tokens / batch`× wasted
-            //     argmax work plus the full D2H stalling the rest of the
-            //     decode pipeline. Fixed by uploading the per-sequence last-row
-            //     indices and letting the kernel argmax exactly `batch` rows.
-            //
-            // Speculative verify still goes through `self.sampler.verify` below.
-            let batch = plan.batch;
-            // Build sampled_rows = cu_q_lens[i+1] - 1 from the host-side q_lens,
-            // then async-upload into the persistent `abc.sampled_rows_dev`.
-            let mut offset = 0i32;
-            for (i, &q_len) in plan.q_lens.iter().enumerate() {
-                let q = q_len.max(1);
-                offset += q;
-                self.abc.sampled_rows_host[i] = offset - 1;
-            }
+            // For prefill (q_len > 1 per row) `argmax_into` writes one id per
+            // logits row into `abc.argmax_out_dev`; we then take the last token
+            // of every sequence (`sampled_rows = offset + q_len - 1`) via a
+            // single small D2H, mirroring `GreedySampler::sample`'s row pick.
             let logits_rows = logits.0.shape().as_slice()[0];
-            // Validate every selected row lies inside the produced logits.
-            // (Equivalent to `offset == logits_rows`; we check the strict
-            // bound used by the kernel.)
-            if let Some(&last) = self.abc.sampled_rows_host[..batch].iter().max() {
-                if (last as usize) >= logits_rows {
-                    return Err(OpError::Shape(format!(
-                        "sample_tail: selected row {} >= logits rows {}",
-                        last, logits_rows
-                    )));
-                }
+            if logits_rows > self.abc.argmax_out_dev.numel() {
+                return Err(OpError::Shape(format!(
+                    "sample_tail: logits rows {} exceeds argmax_out capacity {}",
+                    logits_rows,
+                    self.abc.argmax_out_dev.numel()
+                )));
             }
-            let device = self.scope.device();
-            unsafe {
-                upload_i32_prefix(
-                    device,
-                    &self.abc.sampled_rows_dev,
-                    &self.abc.sampled_rows_host[..batch],
-                )?;
-            }
-            let sel_rows = self.abc.sampled_rows_dev.view_raw(
-                Shape::from_slice(&[batch]),
-                Shape::from_slice(&[batch.max(1)]).contiguous_strides(),
-                0,
-                true,
-            );
-            // `argmax_out_dev` capacity is `cap_batch` ≥ `batch` ✓. Take a
-            // `[batch]` view so the kernel writes exactly one id per selected
-            // row (and the reference path's numel check passes).
+            // Pass a `[logits_rows]`-sized view of the (capacity `argmax_cap`)
+            // output buffer: `argmax_into` writes exactly one id per logits row,
+            // and the reference path requires the output numel to match.
             let mut argmax_out = self.abc.argmax_out_dev.view_raw(
-                Shape::from_slice(&[batch]),
-                Shape::from_slice(&[batch.max(1)]).contiguous_strides(),
+                Shape::from_slice(&[logits_rows]),
+                Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
                 0,
                 true,
             );
-            D::argmax_into(
-                &ctx,
-                &logits.0,
-                &mut argmax_out,
-                &self.abc.argmax_ws,
-                Some(&sel_rows),
-            )?;
+            D::argmax_into(&ctx, &logits.0, &mut argmax_out, &self.abc.argmax_ws, None)?;
             let ids = argmax_out.to_host_vec()?;
-            let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(batch);
-            for (i, _) in plan.q_lens.iter().enumerate() {
-                let token_id = *ids.get(i).ok_or_else(|| {
+            let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
+            let mut offset = 0usize;
+            for &q_len in &plan.q_lens {
+                let q = q_len.max(1) as usize;
+                let row = offset + q - 1;
+                let token_id = *ids.get(row).ok_or_else(|| {
                     OpError::Shape(format!(
-                        "sample_tail: argmax id {} out of range {}",
-                        i,
+                        "sample_tail: sampled row {} out of argmax range {}",
+                        row,
                         ids.len()
                     ))
                 })?;
@@ -462,10 +377,11 @@ where
                     logprob: 0.0,
                     top_logprobs: Vec::new(),
                 }]);
+                offset += q;
             }
-            tokens.resize_with(batch, Vec::new);
+            tokens.resize_with(plan.batch, Vec::new);
             let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
-            let speculative_len = vec![0; batch];
+            let speculative_len = vec![0; plan.batch];
             (tokens, accepted, speculative_len)
         } else {
             let draft_tokens = flatten_draft_tokens(req, plan)?;
@@ -566,9 +482,6 @@ where
             &logits.0,
             &mut self.abc.argmax_out_dev,
             &self.abc.argmax_ws,
-            // Decode graph: every row of `[batch, vocab]` logits is the last
-            // (and only) row for one sequence — argmax all of them. Selector
-            // would be the trivial `0..batch`, so skip the upload.
             None,
         )
     }
@@ -623,26 +536,6 @@ where
             .map_or(GraphDecision::Eager, |graph| graph.decide(plan))
     }
 
-    /// Pre-capture CUDA decode graphs for every `capture_sizes` slot at startup
-    /// so the first decode step at each batch size is a hot graph replay, not a
-    /// cold capture (eager warmup + host sync + capture + instantiate, all on
-    /// the serving hot path). This is the warmup-and-capture-all pattern from
-    /// the pre-refactor worker.
-    ///
-    /// For each capture size `B`:
-    /// 1. Build a dummy decode plan (`batch = B`, every `q_len = 1`).
-    /// 2. Run one EAGER `forward_finalize_argmax` so lazy library caches
-    ///    (cuDNN plan cache, cuBLASLt algo selection) populate — those paths
-    ///    do mallocs/private-stream launches illegal under stream capture.
-    /// 3. Synchronize, then capture `forward_finalize_argmax` into a graph.
-    /// 4. Instantiate and launch once to validate.
-    ///
-    /// The dummy KV index upload + input ids are all written to the persistent
-    /// fixed-address buffers, so the captured graph's baked-in addresses match
-    /// what the real decode step will use. The eager warmup writes the same KV
-    /// values the capture will, so this is idempotent on KV state (the scratch
-    /// arena is reset between captures, and the real first decode will overwrite
-    /// all these buffers anyway).
     pub fn prime_graphs(&mut self) -> OpResult<()> {
         self.graph = None;
         if self.capture_sizes.is_empty() || !self.scope.supports_graphs() {
@@ -652,73 +545,6 @@ where
             self.capture_sizes.clone(),
             self.cap_batch,
         )?);
-
-        for &batch in &self.capture_sizes.clone() {
-            if batch == 0 || batch > self.cap_batch {
-                continue;
-            }
-            // Build a dummy decode request: `batch` rows, each q_len=1, token 0.
-            let dummy_req = StepRequest {
-                seqs: (0..batch)
-                    .map(|i| SeqStep {
-                        sequence_id: i as u64,
-                        input_ids: vec![0],
-                        positions: vec![0],
-                        kv_write_start: 0,
-                        kv_len_after: 1,
-                        block_table: vec![0],
-                    })
-                    .collect(),
-                sampling: Vec::new(),
-                stop: StopCriteria {
-                    eos_ids: Vec::new(),
-                    generated_counts: vec![0; batch],
-                    max_tokens: vec![u32::MAX; batch],
-                    ignore_eos: vec![false; batch],
-                },
-                draft_tokens: Vec::new(),
-            };
-
-            let (plan, tiles) = self.build_plan_with_tiles(&dummy_req)?;
-            self.upload_index(&plan, &dummy_req, &tiles)?;
-
-            // Fill the persistent input-id buffer with dummy tokens.
-            unsafe {
-                upload_i32_prefix(
-                    self.scope.device(),
-                    &self.input_ids_buf,
-                    &vec![0i32; batch],
-                )?;
-            }
-            let input_ids = self.input_ids_buf.view_raw(
-                Shape::from_slice(&[batch]),
-                Shape::from_slice(&[batch]).contiguous_strides(),
-                0,
-                true,
-            );
-
-            // 1. Eager warmup so lazy library caches populate.
-            self.forward_finalize_argmax(&plan, &input_ids)?;
-            self.scope.synchronize()?;
-
-            // 2. Capture the warm forward+finalize+argmax.
-            let key = batch as u64;
-            self.scope.graph_capture_begin()?;
-            if let Err(e) = self.forward_finalize_argmax(&plan, &input_ids) {
-                let _ = self.scope.graph_capture_end(key);
-                return Err(e);
-            }
-            self.scope.graph_capture_end(key)?;
-            tracing::info!(
-                "[graph] pre-captured decode graph for batch={} (warmup+capture at startup)",
-                batch
-            );
-
-            // 3. Launch once to validate the instantiated graph.
-            self.scope.graph_launch(key)?;
-            self.scope.synchronize()?;
-        }
-
         Ok(())
     }
 
@@ -803,17 +629,6 @@ where
     }
 
     fn build_plan(&self, req: &StepRequest) -> OpResult<BatchPlan> {
-        let (plan, _tiles) = self.build_plan_with_tiles(req)?;
-        Ok(plan)
-    }
-
-    /// Build the `BatchPlan` and compute ragged tiles once, returning both.
-    /// `upload_index` consumes the tiles, avoiding a second `plan_ragged_tiles`
-    /// call (P3: was computed twice — once here, once in `upload_index`).
-    fn build_plan_with_tiles(
-        &self,
-        req: &StepRequest,
-    ) -> OpResult<(BatchPlan, RaggedTiles)> {
         let batch = req.seqs.len();
         if batch == 0 {
             return Err(OpError::Shape("Runtime::step: empty request".into()));
@@ -912,7 +727,7 @@ where
             }
         }
 
-        let (cu_q_lens, block2req, block2tile) = BatchPlan::plan_ragged_tiles(&q_lens);
+        let (_cu_q_lens, block2req, _block2tile) = BatchPlan::plan_ragged_tiles(&q_lens);
         let kind = if !req.draft_tokens.is_empty() {
             BatchKind::Spec {
                 mask: crate::domain::plan::MaskMode::Causal,
@@ -923,7 +738,7 @@ where
         } else {
             BatchKind::Ragged
         };
-        let plan = BatchPlan {
+        Ok(BatchPlan {
             kind,
             num_tokens: total_tokens,
             batch,
@@ -934,13 +749,7 @@ where
             max_blocks_per_seq: self.max_blocks_per_seq,
             block_size: self.block_size,
             total_q_tiles: block2req.len() as i32,
-        };
-        let tiles = RaggedTiles {
-            cu_q_lens,
-            block2req,
-            block2tile,
-        };
-        Ok((plan, tiles))
+        })
     }
 
     fn input_ids_tensor(&mut self, req: &StepRequest, plan: &BatchPlan) -> OpResult<Tensor<i32, D>> {
@@ -977,40 +786,27 @@ where
         ))
     }
 
-    fn upload_index(
-        &mut self,
-        plan: &BatchPlan,
-        req: &StepRequest,
-        tiles: &RaggedTiles,
-    ) -> OpResult<()> {
-        let cu_q_lens = &tiles.cu_q_lens;
-        let block2req = &tiles.block2req;
-        let block2tile = &tiles.block2tile;
-        let batch = plan.batch;
-        let bts = batch * self.max_blocks_per_seq;
-        // Reuse persistent host staging instead of allocating two Vecs per step.
-        self.upload_block_tables_host[..bts].fill(0);
+    fn upload_index(&mut self, plan: &BatchPlan, req: &StepRequest) -> OpResult<()> {
+        let (cu_q_lens, block2req, block2tile) = BatchPlan::plan_ragged_tiles(&plan.q_lens);
+        let mut block_tables = vec![0i32; plan.batch * self.max_blocks_per_seq];
         for (i, seq) in req.seqs.iter().enumerate() {
             let row = i * self.max_blocks_per_seq;
             for (j, &block) in seq.block_table.iter().enumerate() {
-                self.upload_block_tables_host[row + j] = block as i32;
+                block_tables[row + j] = block as i32;
             }
         }
-        let block_tables = &self.upload_block_tables_host[..bts];
-        self.upload_seq_lens_step_host[..batch]
-            .copy_from_slice(&plan.q_lens[..batch]);
-        let seq_lens_step = &self.upload_seq_lens_step_host[..batch];
+        let seq_lens_step = plan.q_lens.clone();
 
         let device = self.scope.device();
         unsafe {
-            upload_i32_prefix(device, &self.kv_index.block_tables, block_tables)?;
-            upload_i32_prefix(device, &self.kv_index.cu_q_lens, cu_q_lens)?;
+            upload_i32_prefix(device, &self.kv_index.block_tables, &block_tables)?;
+            upload_i32_prefix(device, &self.kv_index.cu_q_lens, &cu_q_lens)?;
             upload_i32_prefix(device, &self.kv_index.kv_lens, &plan.kv_lens)?;
             upload_i32_prefix(device, &self.kv_index.seq_positions, &plan.seq_positions)?;
-            upload_i32_prefix(device, &self.kv_index.seq_lens_step, seq_lens_step)?;
+            upload_i32_prefix(device, &self.kv_index.seq_lens_step, &seq_lens_step)?;
             upload_i32_prefix(device, &self.kv_index.rope_positions, &plan.rope_positions)?;
-            upload_i32_prefix(device, &self.kv_index.block2req, block2req)?;
-            upload_i32_prefix(device, &self.kv_index.block2tile, block2tile)?;
+            upload_i32_prefix(device, &self.kv_index.block2req, &block2req)?;
+            upload_i32_prefix(device, &self.kv_index.block2tile, &block2tile)?;
         }
         Ok(())
     }
@@ -1081,7 +877,7 @@ where
         ignore_eos: &[bool],
         eos_ids: &[i32],
     ) -> OpResult<()> {
-        let (plan, tiles) = self.build_plan_with_tiles(req)?;
+        let plan = self.build_plan(req)?;
         let batch = plan.batch;
         if plan.num_tokens != batch || plan.q_lens.iter().any(|&q| q != 1) {
             return Err(OpError::Shape(
@@ -1119,14 +915,10 @@ where
             cfg.pin_host_i32(&self.abc.active_tokens_host)?;
             cfg.pin_host_i32(&self.abc.finished_src_rows_host)?;
             cfg.pin_host_i32(&self.abc.finished_tokens_host)?;
-            cfg.pin_host_i32(&self.abc.generated_counts_host)?;
-            cfg.pin_host_i32(&self.abc.max_tokens_host)?;
-            cfg.pin_host_i32(&self.abc.ignore_eos_host)?;
-            cfg.pin_host_i32(&self.abc.eos_ids_host)?;
             self.abc.pinned = true;
         }
 
-        self.upload_index(&plan, req, &tiles)?;
+        self.upload_index(&plan, req)?;
 
         let cfg = self.scope.device().config.clone();
 
@@ -1213,63 +1005,19 @@ where
             self.forward_finalize_argmax(&plan, &input_ids)?;
         }
 
-        // ── upload stop metadata on the copy-in stream (Si) + run the compact merge (C → A) ──
-        // P1+P2: Upload stop metadata on the copy-in stream (Si) instead of the
-        // compute stream, so the DMA overlaps compute. Also reuse pinned host
-        // mirrors instead of allocating 3 fresh Vec<i32> per step. The merge
-        // kernel on the compute stream waits on ev_in before reading these.
-        {
-            let n = batch;
-            for (dst, &src) in self.abc.generated_counts_host[..n]
-                .iter_mut()
-                .zip(generated_counts.iter())
-            {
-                *dst = src as i32;
-            }
-            for (dst, &src) in self.abc.max_tokens_host[..n]
-                .iter_mut()
-                .zip(max_tokens.iter())
-            {
-                *dst = src as i32;
-            }
-            for (dst, &src) in self.abc.ignore_eos_host[..n]
-                .iter_mut()
-                .zip(ignore_eos.iter())
-            {
-                *dst = i32::from(src);
-            }
-            let eos_len = eos_ids.len().min(self.abc.eos_ids_host.len());
-            self.abc.eos_ids_host[..eos_len].copy_from_slice(&eos_ids[..eos_len]);
-        }
-        let meta_bytes = batch * std::mem::size_of::<i32>();
-        let eos_bytes = eos_ids.len() * std::mem::size_of::<i32>();
-        let _guard = self.scope.enter();
+        // ── upload stop metadata + run the compact merge (C → A) ──
+        let gen_i32: Vec<i32> = generated_counts.iter().map(|&x| x as i32).collect();
+        let max_i32: Vec<i32> = max_tokens.iter().map(|&x| x as i32).collect();
+        let ign_i32: Vec<i32> = ignore_eos.iter().map(|&b| i32::from(b)).collect();
+        let device = self.scope.device();
         unsafe {
-            cfg.upload_h2d_copy_in(
-                self.abc.generated_counts_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                self.abc.generated_counts_host.as_ptr() as *const std::ffi::c_void,
-                meta_bytes,
-            )?;
-            cfg.upload_h2d_copy_in(
-                self.abc.max_tokens_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                self.abc.max_tokens_host.as_ptr() as *const std::ffi::c_void,
-                meta_bytes,
-            )?;
-            cfg.upload_h2d_copy_in(
-                self.abc.ignore_eos_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                self.abc.ignore_eos_host.as_ptr() as *const std::ffi::c_void,
-                meta_bytes,
-            )?;
-            if eos_bytes > 0 {
-                cfg.upload_h2d_copy_in(
-                    self.abc.eos_ids_dev.data_ptr_mut() as *mut std::ffi::c_void,
-                    self.abc.eos_ids_host.as_ptr() as *const std::ffi::c_void,
-                    eos_bytes,
-                )?;
+            upload_i32_prefix(device, &self.abc.generated_counts_dev, &gen_i32)?;
+            upload_i32_prefix(device, &self.abc.max_tokens_dev, &max_i32)?;
+            upload_i32_prefix(device, &self.abc.ignore_eos_dev, &ign_i32)?;
+            if !eos_ids.is_empty() {
+                upload_i32_prefix(device, &self.abc.eos_ids_dev, eos_ids)?;
             }
         }
-        cfg.record_copy_in()?;
-        cfg.compute_wait_copy_in()?;
         let stream = ExecScope::stream(&self.scope).0;
         {
             let _guard = self.scope.enter();
@@ -1620,8 +1368,8 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
-    let (plan, tiles) = runtime.build_plan_with_tiles(req)?;
-    runtime.upload_index(&plan, req, &tiles)?;
+    let plan = runtime.build_plan(req)?;
+    runtime.upload_index(&plan, req)?;
     let input_ids = runtime.input_ids_tensor(req, &plan)?;
     let mut hidden = Hidden {
         stream: runtime.hidden.stream.view_raw(

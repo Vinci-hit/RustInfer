@@ -402,6 +402,65 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     return e;
 }
 
+// Fallback: legacy cuBLAS `cublasGemmEx` with K-chunked single-pass kernels.
+// Used only when the benchmarked-capturable cuBLASLt algo cache has no entry
+// for this shape AND we are mid graph-capture (so we cannot build one). With
+// the eager warmup pass that runs before every capture this path should never
+// fire in steady state; it exists purely so a cold shape seen first under
+// capture still produces a correct (if slower) result instead of crashing.
+//
+// Row-major C[M,N] = A[M,K] @ B[N,K]^T -> column-major m=N, n=M, k=K with
+// B^T (lda=K), A (ldb=K), C (ldc=N). K is tiled at K_CHUNK so cuBLAS keeps a
+// single-pass (graph-capturable) kernel and accumulates chunks with beta=1.
+static void gemm_bf16_chunked_legacy(
+    int M, int N, int K,
+    const __nv_bfloat16 *d_A,
+    const __nv_bfloat16 *d_B,
+    __nv_bfloat16 *d_C,
+    void *workspace, size_t workspaceSize,
+    cudaStream_t stream)
+{
+    cublasHandle_t h = get_cublas_handle();
+    if (!h) {
+        printf("cuBLAS bf16 matmul: null handle (M=%d N=%d K=%d)\n", M, N, K);
+        exit(EXIT_FAILURE);
+    }
+
+    cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
+    bool capturing = (cudaStreamIsCapturing(stream, &capst) == cudaSuccess &&
+                      capst != cudaStreamCaptureStatusNone);
+    // cublasSetStream / cublasSetWorkspace are illegal under capture; only
+    // (re)bind the handle when not capturing.
+    if (!capturing) {
+        cublasSetStream(h, stream);
+        if (workspace != nullptr && workspaceSize > 0) {
+            cublasSetWorkspace(h, workspace, workspaceSize);
+        }
+    }
+
+    const int K_CHUNK = 2048;
+    int kc = (K > K_CHUNK) ? K_CHUNK : K;
+    float alpha = 1.0f;
+    for (int k0 = 0; k0 < K; k0 += kc) {
+        int this_k = (K - k0 < kc) ? (K - k0) : kc;
+        float beta = (k0 == 0) ? 0.0f : 1.0f;
+        cublasStatus_t status = cublasGemmEx(
+            h, CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, this_k, &alpha,
+            d_B + k0, CUDA_R_16BF, K,
+            d_A + k0, CUDA_R_16BF, K,
+            &beta,
+            d_C, CUDA_R_16BF, N,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("cuBLAS bf16 GemmEx fallback failed: status=%d M=%d N=%d K=%d "
+                   "(chunk k0=%d kc=%d capturing=%d)\n",
+                   status, M, N, K, k0, this_k, (int)capturing);
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
 void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtHandle_t ltHandle,
     int M, int N, int K,
@@ -412,80 +471,58 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     size_t workspaceSize,
     cudaStream_t stream)
 {
-    // Route bf16 matmul through legacy cuBLAS `cublasGemmEx`. cuBLASLt selects
-    // non-capturable algorithms (split-K with workspace reduction) for large-K
-    // shapes; those fail under CUDA-graph stream capture with status=13 (the
-    // matmul works fine eagerly but cannot be recorded). Legacy cublasGemmEx
-    // with CUBLAS_GEMM_DEFAULT is reliably graph-capturable (it is what most
-    // graph-capture stacks rely on) and deterministic across calls.
-    //
-    // Row-major C[M,N] = A[M,K] @ B[N,K]^T  ->  column-major m=N, n=M, k=K with
-    // B^T (lda=K), A (ldb=K), C (ldc=N). `ltHandle` is unused now.
-    (void)ltHandle;
-
-    cublasHandle_t h = get_cublas_handle();
-    if (!h) {
-        printf("cuBLAS bf16 matmul: null handle (M=%d N=%d K=%d)\n", M, N, K);
-        exit(EXIT_FAILURE);
-    }
-
+    // Fast path: a per-shape cuBLASLt algo that was (a) benchmarked as fastest
+    // and (b) verified graph-capturable at warmup. This restores the large-tile,
+    // single-pass cuBLASLt kernels used pre-refactor (commit 96f7b4e), which the
+    // K-chunked legacy `cublasGemmEx` fallback replaced and ran ~1.6x more
+    // launches / 20% slower at decode. cuBLASLt's matmul takes stream+workspace
+    // as call args (no cublasSetStream/Workspace), so it is capture-safe with a
+    // pre-selected algo — no handle reconfiguration inside the capture region.
     cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
     bool capturing = (cudaStreamIsCapturing(stream, &capst) == cudaSuccess &&
                       capst != cudaStreamCaptureStatusNone);
 
-    // cublasSetStream and cublasSetWorkspace reconfigure the handle and are NOT
-    // legal during CUDA-graph capture — they invalidate the capture (the next
-    // kernel then fails with "previous error during capture"). The eager warmup
-    // pass that runs immediately before capture already bound this handle to the
-    // same stream and workspace, so we configure it ONLY when not capturing.
-    // (The workspace also prevents cuBLAS from lazily allocating its own inside
-    // the matmul on a cold shape, which is itself illegal under capture.)
-    if (!capturing) {
-        cublasSetStream(h, stream);
-        if (workspace != nullptr && workspaceSize > 0) {
-            cublasSetWorkspace(h, workspace, workspaceSize);
+    const ZimageBf16GemmEntry* entry = nullptr;
+    ZimageBf16GemmKey key{M, N, K};
+    {
+        std::lock_guard<std::mutex> lk(g_zimage_bf16_gemm_cache_mu);
+        auto it = g_zimage_bf16_gemm_cache.find(key);
+        if (it != g_zimage_bf16_gemm_cache.end()) {
+            if (it->second.valid) entry = &it->second;
+        } else if (!capturing) {
+            // Build (heuristic + benchmark + capturability probe) eagerly. This
+            // only runs while NOT capturing — the warmup pass before each graph
+            // capture exercises every decode shape, so capture always hits a
+            // populated cache. Reuse the caller's d_A/d_B/d_C/workspace as bench
+            // scratch (the real matmul below overwrites d_C with the answer).
+            ZimageBf16GemmEntry built = zimage_build_bf16_gemm_entry(
+                M, N, K, workspaceSize, d_A, d_B, d_C, workspace);
+            auto ins = g_zimage_bf16_gemm_cache.emplace(key, built);
+            if (ins.first->second.valid) entry = &ins.first->second;
         }
     }
 
-    // For a skinny, large-K shape (small M, large K) cuBLAS picks a split-K
-    // reduction whose kernel cannot be recorded into a CUDA graph (fails with
-    // status=13 under capture, though it runs fine eagerly). Under capture we
-    // therefore tile the K (contraction) dimension into chunks small enough
-    // that cuBLAS keeps a single-pass kernel, accumulating across chunks with
-    // beta=1. Eagerly we issue one call. Column-major mapping: m=N, n=M, the
-    // contraction runs over K with both operands' leading dim = K, so a
-    // sub-range [k0, k0+kc) is selected by offsetting both pointers by k0.
-    // Chunk ALWAYS (not just under capture) so the eager warmup pass that runs
-    // immediately before capture exercises the exact same cuBLAS call shapes the
-    // captured graph will replay. If warmup issued a single large-K call but the
-    // graph issued chunked calls, the chunk shape would be cold at capture time
-    // and cuBLAS would lazily initialize it mid-capture, invalidating the graph.
-    (void)capturing;
-    const int K_CHUNK = 2048;
-    int kc = (K > K_CHUNK) ? K_CHUNK : K;
-
-    float alpha = 1.0f;
-    for (int k0 = 0; k0 < K; k0 += kc) {
-        int this_k = (K - k0 < kc) ? (K - k0) : kc;
-        float beta = (k0 == 0) ? 0.0f : 1.0f;
-        cublasStatus_t status = cublasGemmEx(
-            h,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, this_k,
-            &alpha,
-            d_B + k0, CUDA_R_16BF, K,
-            d_A + k0, CUDA_R_16BF, K,
-            &beta,
-            d_C, CUDA_R_16BF, N,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT);
+    if (entry) {
+        // Replay the cached capturable algo. Descriptors are handle-independent;
+        // `ltHandle` is the process-wide persistent cuBLASLt handle.
+        float alpha = 1.0f, beta = 0.0f;
+        cublasStatus_t status = cublasLtMatmul(
+            ltHandle, entry->op, &alpha,
+            d_B, entry->A, d_A, entry->B, &beta,
+            d_C, entry->C, d_C, entry->C,
+            &entry->algo, workspace, workspaceSize, stream);
         if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("cuBLAS bf16 GemmEx failed: status=%d M=%d N=%d K=%d "
-                   "(chunk k0=%d kc=%d capturing=%d)\n",
-                   status, M, N, K, k0, this_k, (int)capturing);
-            exit(EXIT_FAILURE);
+            printf("cuBLASLt bf16 cached matmul failed: status=%d M=%d N=%d K=%d "
+                   "(capturing=%d) — falling back to chunked legacy\n",
+                   status, M, N, K, (int)capturing);
+            gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
         }
+        return;
     }
+
+    // Cache miss with no chance to build (cold shape first seen under capture):
+    // use the capture-safe chunked legacy path so we stay correct.
+    gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
 }
 // ============================================================================
 // BF16 GEMV kernel v3 for decode phase (M=1)

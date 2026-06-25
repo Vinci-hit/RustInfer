@@ -80,20 +80,15 @@ impl DecodeEngine {
         self.rows.retain_active(active);
     }
 
-    /// Drive the GPU-resident decode loop one step (synchronous).
+    /// Drive the GPU-resident decode loop one step, pipelined 1-deep.
     ///
-    /// Issue + finalize a single step in one call. All GPU compute work
-    /// (forward + finalize + argmax + compact merge) is enqueued BEFORE
-    /// `synchronize_copy_out` blocks the CPU, so the GPU stays busy the
-    /// entire time — no idle bubble. This mirrors the baseline's
-    /// `step_decode_abc_compact` which was also fully synchronous.
-    ///
-    /// The 1-deep pipeline approach (issue step N, finalize step N-1) is
-    /// fundamentally broken here because `prepare_step` reads `active` seq
-    /// state (last_token, kv_len, block_table) that is only updated by
-    /// `commit_results` from the PRIOR step's finalize. Issuing before
-    /// finalizing would read stale seq state and the pending overwrite would
-    /// silently drop every other step's tokens.
+    /// Order matters: (1) finalize the step issued on the *previous* call —
+    /// drain its copy-out, commit its tokens, reclaim finished KV; (2) issue a
+    /// new step (append B, forward, merge, async copy-out) if there is work;
+    /// (3) send the finalized output *after* issuing, so the new step's GPU
+    /// compute overlaps the previous step's host commit + the ZMQ send + the
+    /// serve loop's inter-step work. The serve loop must keep calling this while
+    /// `has_pending()` so the last step is collected after `active` empties.
     #[allow(clippy::too_many_arguments)]
     pub fn run_step<M>(
         &mut self,
@@ -109,23 +104,58 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
-        if active.is_empty() && !self.has_pending() {
-            self.rows.clear();
-            return Ok(());
-        }
+        // Track whether this call starts with nothing in flight. If so, the
+        // 1-deep pipeline would otherwise emit *no* token this iteration
+        // (finalize sees `pending=None` → `to_send=None`) and the first decode
+        // token of a fresh stream would not reach the scheduler until the NEXT
+        // serve-loop turn — doubling the inter-token latency between the
+        // prefill's first token and the first pure-decode token.
+        //
+        // Detection of "cold start": no in-flight step AND we're about to
+        // issue work this round. In that case, after issuing, immediately
+        // finalize + send the freshly-issued step (degenerating to 0-deep for
+        // this one iteration). Steady-state decode keeps the 1-deep pipeline
+        // because `pending` will be non-empty on entry.
+        let cold_start = self.pending.is_none() && !active.is_empty();
 
-        // 1. Issue a new step (enqueues ALL compute: forward + argmax + merge
-        //    + async copy-out on So).
-        self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
-
-        // 2. Finalize immediately — sync So, read host mirrors, commit results.
-        //    GPU compute is already enqueued so the sync overlaps it.
+        // 1. Finalize the in-flight step (issued last call) and commit it.
         let to_send = self.finalize_pending(runner, active, kv_allocator, control, enable_prefix_caching)?;
 
-        // 3. Send the step's output.
+        // 2. Issue a new step if there is work; otherwise idle.
+        if active.is_empty() {
+            self.rows.clear();
+        } else {
+            self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
+        }
+
+        // 3. Send the previous step's output AFTER issuing the new step so the
+        //    send (and the serve loop's following work) overlaps GPU compute.
         if let Some(output) = to_send {
             data.send_step_output(&output)
                 .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
+        }
+
+        // 4. Cold-start drain: if this call started the pipeline from empty
+        //    AND `issue_new` actually queued a step, immediately finalize +
+        //    send it so the FIRST decode token after prefill is not delayed
+        //    by a full extra round-trip. We then re-issue so the next call
+        //    re-enters steady-state with a non-empty `pending` — otherwise
+        //    every subsequent call would also see `pending=None` and the
+        //    pipeline would never start.
+        if cold_start && self.pending.is_some() {
+            let drained = self.finalize_pending(runner, active, kv_allocator, control, enable_prefix_caching)?;
+            if let Some(output) = drained {
+                data.send_step_output(&output)
+                    .map_err(|e| OpError::Kernel(format!("data plane send_step_output (cold) failed: {}", e)))?;
+            }
+            // Re-issue so steady-state pipelining resumes on the next call.
+            // `commit_results` (inside `finalize_pending`) may have emptied
+            // `active` (every row finished its single token); guard for that.
+            if !active.is_empty() {
+                self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
+            } else {
+                self.rows.clear();
+            }
         }
         Ok(())
     }

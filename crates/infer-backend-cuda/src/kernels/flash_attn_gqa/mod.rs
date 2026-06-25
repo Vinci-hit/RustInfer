@@ -352,13 +352,13 @@ pub fn attention_paged<T: Dtype>(
 
     match plan.kind {
         PagedAttentionKind::DecodeOnly => {
-            // Decode attention uses the custom flash kernel by default so that the
-            // eager warmup pass and the captured graph run the SAME kernel (cuDNN
-            // is not CUDA-graph-capturable and is declined under capture anyway;
-            // if warmup used cuDNN but the graph used flash, flash would be cold
-            // at capture time and its lazy module load would invalidate the
-            // graph). cuDNN can be re-enabled for pure-eager runs via env var.
-            let use_cudnn = std::env::var_os("RUSTINFER_DECODE_CUDNN").is_some();
+            // Decode attention uses cuDNN SDPA by default (matches commit
+            // 96f7b4e: correct + ~3.3x faster than the custom flash-decode
+            // kernel). cuDNN IS CUDA-graph-capturable here — warmup builds &
+            // caches the SDPA plan and capture reuses the cached plan (see
+            // cudnn_paged_attention.cu), so warmup and the captured graph run the
+            // SAME cuDNN kernel. Opt out (custom kernel) via env.
+            let use_cudnn = std::env::var_os(DISABLE_CUDNN_ATTENTION_ENV).is_none();
             if use_cudnn {
             if let Some(cudnn_status) = unsafe {
                 try_cudnn_paged_decode(

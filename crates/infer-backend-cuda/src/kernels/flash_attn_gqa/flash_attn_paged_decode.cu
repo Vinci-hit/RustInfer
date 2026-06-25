@@ -89,7 +89,8 @@ __global__ void paged_decode_pass1_kernel(
     int32_t* __restrict__ workspace_num_splits,
     int num_q_heads,
     int num_kv_heads,
-    float softmax_scale)
+    float softmax_scale,
+    int splits_cap)
 {
     static_assert(HeadDim % kElemPerLane == 0, "HeadDim must be a multiple of 8");
     constexpr int kThreadsPerKey = HeadDim / kElemPerLane;
@@ -110,7 +111,15 @@ __global__ void paged_decode_pass1_kernel(
         return;
     }
 
-    int chunk_size = (kv_len + kMaxSplits - 1) / kMaxSplits;
+    // Adaptive split count: the host caps the number of KV splits by GPU
+    // occupancy (batch*q_heads*splits ~ a few waves). At high batch the grid is
+    // already full with splits_cap==1, so we take the single-split fast path and
+    // avoid the FP32 partial-O global round-trip entirely. kMaxSplits still bounds
+    // the workspace layout, so splits_cap is clamped into [1, kMaxSplits].
+    int eff_splits = splits_cap;
+    if (eff_splits < 1) eff_splits = 1;
+    if (eff_splits > kMaxSplits) eff_splits = kMaxSplits;
+    int chunk_size = (kv_len + eff_splits - 1) / eff_splits;
     if (chunk_size < kMinChunkSize) chunk_size = kMinChunkSize;
     chunk_size = (chunk_size + kBN - 1) & ~(kBN - 1);
     const int num_splits = (kv_len + chunk_size - 1) / chunk_size;
@@ -327,6 +336,35 @@ __global__ void paged_decode_combine_kernel(
     }
 }
 
+// Number of SMs on the active device, queried once. Used to pick the KV-split
+// count by occupancy so we only split far enough to fill the GPU.
+static int device_sm_count() {
+    static int sm = 0;
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { sm = 132; return; }
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) { sm = 132; return; }
+        sm = prop.multiProcessorCount > 0 ? prop.multiProcessorCount : 132;
+    });
+    return sm;
+}
+
+// Pick the KV-split cap: the minimum number of splits whose grid
+// (batch*q_heads*splits) still covers ~2 waves of the GPU, clamped to
+// [1, kMaxSplits]. At high batch this returns 1 (grid already full → no
+// FP32 partial-O round-trip); at batch 1 it returns kMaxSplits.
+static int compute_splits_cap(int batch, int num_q_heads) {
+    const long target = 2L * device_sm_count();
+    const long base = static_cast<long>(batch) * num_q_heads;
+    if (base <= 0) return 1;
+    long cap = (target + base - 1) / base;  // ceil(target / base)
+    if (cap < 1) cap = 1;
+    if (cap > kMaxSplits) cap = kMaxSplits;
+    return static_cast<int>(cap);
+}
+
 template <class Elem, int HeadDim>
 static cudaError_t launch_impl(
     const Elem* q, int64_t qsb, int64_t qsh,
@@ -351,7 +389,8 @@ static cudaError_t launch_impl(
 
     constexpr int kThreadsPerKey = HeadDim / kElemPerLane;
     constexpr int kBlockThreads = kNumGroups * kThreadsPerKey;
-    dim3 grid1(num_q_heads, kMaxSplits, batch);
+    const int splits_cap = compute_splits_cap(batch, num_q_heads);
+    dim3 grid1(num_q_heads, splits_cap, batch);
     dim3 block1(kBlockThreads);
 
     const size_t smem_size =
@@ -372,12 +411,16 @@ static cudaError_t launch_impl(
         q, qsb, qsh, k_pool, v_pool, o, osb, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens,
         partial_o, partial_lse, num_splits,
-        num_q_heads, num_kv_heads, softmax_scale);
+        num_q_heads, num_kv_heads, softmax_scale, splits_cap);
 
-    dim3 grid2(num_q_heads, 1, batch);
-    dim3 block2(HeadDim);
-    paged_decode_combine_kernel<Elem, HeadDim><<<grid2, block2, 0, stream>>>(
-        o, osb, osh, partial_o, partial_lse, num_splits, num_q_heads);
+    // splits_cap==1 forces num_splits==1 for every sequence, so pass1 writes the
+    // final O directly and the combine pass is a no-op — skip its launch.
+    if (splits_cap > 1) {
+        dim3 grid2(num_q_heads, 1, batch);
+        dim3 block2(HeadDim);
+        paged_decode_combine_kernel<Elem, HeadDim><<<grid2, block2, 0, stream>>>(
+            o, osb, osh, partial_o, partial_lse, num_splits, num_q_heads);
+    }
 
     return cudaGetLastError();
 }
