@@ -273,3 +273,141 @@ The §5 synced phase timing is a good enough proxy without ncu.
 - Forward path: `components/{attention,ffn_dense,decoder_block}.rs`, `application/runtime.rs` (`run_layers`, `step_eager`), `models/decoder.rs`.
 - 532f5c equivalent: monolithic `models/qwen3.rs` (forward loop).
 - Related: docs/HANDOFF_cudnn_orchestration_fix.md, docs/HANDOFF_graph_prefill.md.
+
+---
+
+## 10. UPDATE — slow machine says: forward CLEAN, gap is IPC + "something" (~7.2ms)
+
+New data from the slow machine (532f5c TTFT≈8ms, HEAD≈13ms): the **GPU forward has
+no regression** there (kernels are byte-identical; Fix#1 §6 only mattered on cuda:7).
+The 7.2ms gap is **CPU-side: IPC wake/park latency + orchestration**, not compute.
+
+### 10a. CONFIRMED IPC regression — server ZMQ-client lost its wake (FIXED)
+`crates/infer-server/src/client/zmq_client.rs`. Commit **`cac326a` "use cudnn for fa"**
+incidentally removed the inproc-PAIR **wake socket** and made `Waker::wake()` a
+**no-op**, then capped `POLL_MAX_TIMEOUT` 1s→1ms as a band-aid.
+
+Mechanism: axum pushes a request onto the mpsc command channel, then the ZMQ thread
+must *notice* it. With the wake gone, it only notices when its `zmq::poll(DEALER, T)`
+**times out** — up to `POLL_MAX_TIMEOUT`. So every request submit ate **up to ~1ms**
+(avg ~0.5ms) on the TTFT path. On 532f5c the wake byte interrupted the poll
+**instantly** (even with the 1s timeout). Responses were never affected (they wake
+via DEALER POLLIN).
+
+**Fix (in tree):** restored an instant wake using a **plain OS pipe** (`std::io::pipe`,
+Rust ≥1.87) instead of a ZMQ inproc PAIR — a pipe fd cannot trip libzmq's cross-thread
+signaler assertion (the reason the original was removed). The ZMQ thread polls the
+pipe's fd via `zmq::PollItem::from_fd` alongside the DEALER; `wake()` writes 1 byte;
+the reader drains. `POLL_MAX_TIMEOUT` restored to 1s. All 4 existing `waker.wake()`
+call sites now actually fire. Builds clean (`cargo build -p infer-server`).
+Magnitude: ~0.5–1ms on a tuned host; **more on a power-managed CPU** (see 10c).
+
+### 10b. The remaining "something" — decompose with the THREE built-in trace hooks
+All three already exist in HEAD (no code to paste back this time):
+- **server** `crates/infer-server/src/api/openai/streaming.rs` → log line
+  `TTFT_TRACE: chat first content chunk` with `server_ttft_ms` (request→first SSE chunk).
+  Always on (info).
+- **scheduler** `crates/infer-scheduler/src/application/event_loop.rs` → set env
+  `RUSTINFER_SCHED_TRACE=1`: logs `SCHED_TRACE: NewRequest->dispatch` (us) and
+  `SCHED_TRACE: StepOutput->forward` (us).
+- **worker** `serve_loop.rs` + `worker_scheduler.rs` → set env `RUSTINFER_TTFT_TRACE=1`:
+  logs `[ttft-trace] handle_prefill wall` and `[ttft-trace] runner.step (forward+sample)`.
+  (Env reaches the worker only if NOT stripped by the launch wrapper — if missing, gate
+  on a sentinel file like §1; see [[scatter-grid-capacity-regression]].)
+
+Decomposition (run on the slow machine, 532f5c vs HEAD, low QPS, single stream):
+```
+server_ttft  =  [submit IPC]  +  sched(NewRequest->dispatch)  +  [dispatch IPC hop]
+             +  handle_prefill_wall  +  sched(StepOutput->forward)  +  [reply IPC]  +  SSE encode
+where runner.step ⊆ handle_prefill_wall   (forward+sample, confirmed CLEAN)
+```
+Read off which term grew HEAD vs 532f5c:
+- `handle_prefill_wall − runner.step` large → prefill **orchestration** (KV alloc
+  `alloc_with_relief`, block-table concat, `send_step_output`). That is the non-forward
+  worker "something".
+- `sched(*)` large → scheduler engine/planning.
+- `server_ttft − (sum of the above)` large → **IPC hops** = submit wake (10a, fixed) +
+  the dispatch/reply park-wakes (10c).
+
+### 10c. Prime amplifier hypothesis: CPU power management (fits "fast host hides it")
+The refactor leans on **OS wakeups** at several hops (zmq-client submit poll, worker
+data-plane `zmq::poll` PARK between requests, scheduler channel handoffs). A POLLIN
+wake is kernel-delivered, but the **core still has to exit its idle C-state**, and a
+`poll(timeout)` wake waits on a timer. On a tuned server (perf governor, shallow
+C-states) that is ~µs and invisible; on a default/powersave/loaded machine each
+park→wake can cost **several ms** — which would turn the same code into the 7.2ms gap
+while leaving the GPU forward untouched. Check on the slow machine FIRST (cheap):
+```bash
+cpupower frequency-info | grep -i governor        # want: performance
+cat /sys/devices/system/cpu/cpu*/cpuidle/state*/disable   # deep C-states
+turbostat --quiet sleep 1   # watch C-state residency + wake latency under load
+```
+Mitigate to test the hypothesis: `cpupower frequency-set -g performance`, disable deep
+C-states (`cpupower idle-set -D 0` or kernel `intel_idle.max_cstate=1`), and pin the
+worker/scheduler/server threads. If the gap collapses, it was wake latency, and 10a's
+wake-pipe fix (instant submit wake, no timer) is the code-side half of the cure.
+
+### 10d. What was checked and ruled OUT (so you don't re-chase)
+- forward GPU phases: identical (this doc §5) — and the slow machine confirms.
+- sampling: `GreedySampler` uses on-device `D::argmax`, downloads only `rows` ints
+  (`application/sampler_stack.rs`) — NOT a full-logits copy. Not a regression.
+- worker serve-loop poll: event-driven, POLLIN wakes immediately; the old
+  `idle_wait_ms=heartbeat/2` window was REMOVED (improvement), and `wait_for_prefill_quiet(1ms)`
+  is commented out. Not a regression.
+- scheduler transports + control plane: no poll/timeout/wake change (only a WorkerId
+  type move and a ClientId clone tidy). Engine/planning/main are refactors, no added sync.
+- decode 1-deep pipelining: affects TTOT, not TTFT (first token is sent inside
+  `handle_prefill` before any decode step).
+
+---
+
+## 11. ROOT CAUSE of the bulk "something" — KV allocator O(num_blocks) per completion (PROVEN)
+
+Resolves the logic gap in §10: the user tests **both versions on the same machine**, so
+env (C-states/governor) is constant and cannot explain a delta — **the delta is code**, and
+a slower CPU only *amplifies* host-side per-request work HEAD added (invisible to kernel-time
+"forward").
+
+**File:** `crates/infer-worker/src/domain/global_kv_alloc.rs`.
+HEAD's "Eager merge (A1)": `release_owned()` — called on **every sequence completion**
+(default real-time recycling, prefix-caching off) — calls `free()` → `merge_sorted_returned`,
+an **O(num_blocks) in-place merge** over the entire free pool. 532f5c's `release()` parked
+freed slots in a lazy `released` holding list (O(returned)≈0), draining only on alloc failure.
+`paged_block_size=1` ⇒ num_blocks = token slots; the pool auto-sizes to ~780k (max working set
+256×1024 = 262k → ~3× over).
+
+**Empirical proof** — micro-bench of the *real* impl on cuda:7's host CPU (`rustc -O`,
+`-C debug-assertions=no`; source: `scratchpad/kv_bench2.rs`, mirrors the file via a tracing shim):
+
+| num_blocks | `release_owned`→`free()` per completion |
+|---|---|
+| 16384  | 0.039 ms |
+| 65536  | 0.159 ms |
+| 262144 | 0.648 ms |
+| 786432 | **2.005 ms** |
+
+Linear in num_blocks. ~2ms/completion at the ~780k auto pool on cuda:7's *fast* CPU →
+multi-ms on the slow machine's CPU. Under continuous batching (the bench is concurrent),
+completions interleave with prefills in the serve loop, so each merge delays a prefill →
+**inflates TTFT**. Pure host CPU ⇒ "forward clean" holds. This is the bulk of the 5–7ms gap.
+
+### 11a. FIX DONE (in tree, builds) — clamp the auto-sized pool to the working set
+`serve_loop.rs` bootstrap: when prefix-caching is OFF, the VRAM-probe `num_blocks` is now
+clamped to `max_batch_seqs × max_blocks_per_seq` — the most slots the worker can ever hold
+in use (the scheduler admits ≤ max_batch_seqs seqs, each ≤ max_seq_len). Lossless; blocks
+beyond that were unreachable, only wasting VRAM and inflating every O(num_blocks) op.
+Default 256×1024 ⇒ cap 262144 (vs ~780k) ⇒ free() 2.0ms→0.65ms (cuda:7). Bootstrap log now
+prints `probed=X -> num_blocks=Y` so you can see the reduction. **For full elimination set
+`max_batch_seqs` to real concurrency** (e.g. 32 ⇒ 32768 ⇒ ~0.08ms/completion) — clamp
+follows automatically. (Or set toml `num_blocks` explicitly to override the probe entirely.)
+This is the confirmation test too: rebuild worker, re-measure HEAD TTFT → should drop.
+
+### 11b. Proper fix (NOT applied — allocator is corruption/starvation-prone; validate on full stack)
+Make `release_owned`/`free` **O(returned)** while keeping freed slots immediately
+allocatable. Block-slot order is "architecturally irrelevant" for `block_size=1` (module
+doc), so the full-pool sorted merge is unnecessary for correctness. Sketch: `release_owned`
+→ `release()` (park in `released`, O(returned)); `alloc_indices` drains `released` first
+(O(returned)) before bumping; keep `recycle()`'s full sort as a rare cleanup. Verify the
+A1 starvation does not return — `alloc_with_relief` already gates admission on `total_free()`
+(which counts `released`), so the accounting should hold; confirm decode batch fills to
+capacity and there is no KV leak (run the worker unit tests + a burst bench).

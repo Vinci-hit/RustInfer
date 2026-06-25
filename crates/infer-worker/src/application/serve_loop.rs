@@ -111,13 +111,36 @@ where
         // OOM on this path is otherwise swallowed by the kernel error layer,
         // so we err conservative here.
         let reserve = 1 + (raw / 200).max(1);
-        let derived = raw.saturating_sub(reserve).max(1);
+        let probed = raw.saturating_sub(reserve).max(1);
+        // Cap the auto-sized pool at the working set the worker can ever hold
+        // in use: at most `max_batch_seqs` sequences, each at most
+        // `max_seq_len` tokens. The scheduler never admits more than
+        // `max_batch_seqs` running sequences, so any block beyond this is
+        // unreachable — it only wastes VRAM AND inflates every O(num_blocks)
+        // op in `GlobalKvAllocator`. `release_owned`→`free()` does a full-pool
+        // compact+merge on EVERY sequence completion; at a VRAM-filling ~780k
+        // pool that is ~2ms/completion (measured), which lands in serve-loop
+        // ticks alongside prefills and directly inflates TTFT on slower CPUs.
+        // With prefix caching ON, extra blocks cache evicted prefixes, so keep
+        // the full probe; with it OFF (real-time recycling) the live working
+        // set is the only thing that can be allocated, so clamp to it.
+        let derived = if bs.load.enable_prefix_caching {
+            probed
+        } else {
+            let working_set = bs
+                .load
+                .max_batch_seqs
+                .saturating_mul(max_blocks_per_seq)
+                .max(1);
+            probed.min(working_set)
+        };
         tracing::info!(
-            "[bootstrap] KV mem probe: free={:.2}GiB total={:.2}GiB fraction={} bytes/block={} -> num_blocks={} (~{:.2}GiB KV pool)",
+            "[bootstrap] KV mem probe: free={:.2}GiB total={:.2}GiB fraction={} bytes/block={} probed={} -> num_blocks={} (~{:.2}GiB KV pool)",
             free as f64 / (1u64 << 30) as f64,
             total as f64 / (1u64 << 30) as f64,
             fraction,
             bytes_per_block,
+            probed,
             derived,
             (derived * bytes_per_block) as f64 / (1u64 << 30) as f64,
         );

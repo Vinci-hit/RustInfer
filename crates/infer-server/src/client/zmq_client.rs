@@ -8,6 +8,9 @@ use infer_protocol::server_to_scheduler::{
     CancelReason, CancelRequest as ServerCancelRequest, InferenceRequest, ServerCommand,
 };
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,8 +21,13 @@ use super::InferClient;
 
 const CLIENT_COMMAND_BUFFER: usize = 1024;
 const STREAM_CHUNK_BUFFER: usize = 64;
-/// 上限保护：即使没有 stream 也最多阻塞这么久（防御性，正常情况下应靠 wakeup/POLLIN 唤醒）。
-const POLL_MAX_TIMEOUT: Duration = Duration::from_millis(1);
+/// Idle ceiling on a single `zmq::poll`: with the wake pipe restored, new
+/// commands interrupt the poll instantly and responses arrive via POLLIN, so
+/// this only bounds how often `cancel_timed_out_requests` runs while fully
+/// idle. Kept generous (was briefly dropped to 1ms as a band-aid after the
+/// wake socket was removed in `cac326a`, which cost up to ~1ms per request
+/// submit on the TTFT path).
+const POLL_MAX_TIMEOUT: Duration = Duration::from_secs(1);
 
 enum RequestEnvelope {
     Oneshot {
@@ -83,12 +91,28 @@ impl Drop for StreamHandle {
     }
 }
 
-/// No-op wake handle. The ZMQ thread uses a short finite poll timeout to avoid
-/// cross-thread ZMQ wake sockets, which can trip libzmq's signaler assertions.
-struct Waker;
+/// Wakes the ZMQ thread the instant a new command is queued, so request
+/// submission does not wait for the poll timeout to elapse.
+///
+/// Uses a plain OS pipe (not a ZMQ inproc PAIR socket) so it cannot trip
+/// libzmq's cross-thread signaler assertions — which is why the previous
+/// inproc-PAIR waker was removed in `cac326a`. The write end is shared across
+/// the axum worker threads; the read end is polled by the ZMQ thread. The
+/// `Mutex` is held only for a single best-effort 1-byte write, never across an
+/// `.await`.
+struct Waker {
+    writer: Mutex<std::io::PipeWriter>,
+}
 
 impl Waker {
-    fn wake(&self) {}
+    fn wake(&self) {
+        if let Ok(mut w) = self.writer.lock() {
+            // One byte is enough to mark the pipe readable; the reader coalesces
+            // by draining. A full pipe (reader stalled) just means a wake is
+            // already in flight, so dropping this one is harmless.
+            let _ = w.write(&[1u8]);
+        }
+    }
 }
 
 pub struct ZmqClient {
@@ -104,12 +128,17 @@ impl ZmqClient {
         let (command_tx, command_rx) =
             std::sync::mpsc::sync_channel::<RequestEnvelope>(CLIENT_COMMAND_BUFFER);
 
-        let waker = std::sync::Arc::new(Waker);
+        // Self-pipe wake: producers (axum threads) write 1 byte to `wake_tx`;
+        // the ZMQ thread polls `wake_rx`'s fd alongside the DEALER socket.
+        let (wake_rx, wake_tx) = std::io::pipe()?;
+        let waker = std::sync::Arc::new(Waker {
+            writer: Mutex::new(wake_tx),
+        });
 
         thread::Builder::new()
             .name("zmq-client".to_string())
             .spawn(move || {
-                if let Err(e) = Self::zmq_thread(endpoint, command_rx, timeout) {
+                if let Err(e) = Self::zmq_thread(endpoint, command_rx, wake_rx, timeout) {
                     tracing::error!("ZMQ thread exited with error: {:?}", e);
                 }
             })?;
@@ -124,11 +153,13 @@ impl ZmqClient {
     fn zmq_thread(
         endpoint: String,
         command_rx: Receiver<RequestEnvelope>,
+        mut wake_rx: std::io::PipeReader,
         timeout: Duration,
     ) -> Result<()> {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::DEALER)?;
         socket.connect(&endpoint)?;
+        let wake_fd = wake_rx.as_raw_fd();
 
         tracing::info!("ZMQ client connected to {}", endpoint);
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
@@ -144,8 +175,12 @@ impl ZmqClient {
             // 2) 计算下一次 poll 的超时：取 stream deadline 的最近值，无则 POLL_MAX_TIMEOUT。
             let poll_timeout_ms = Self::next_poll_timeout_ms(&pending);
 
-            // 3) 监听 DEALER；命令通道靠短 timeout 轮询，避免跨线程 ZMQ wake socket。
-            let mut items = [socket.as_poll_item(zmq::POLLIN)];
+            // 3) 同时监听 DEALER 与 wake 管道：新命令写 wake 管道即可立刻打断 poll，
+            //    无需等到 timeout（wake 管道是普通 OS pipe，不会触发 libzmq signaler 断言）。
+            let mut items = [
+                socket.as_poll_item(zmq::POLLIN),
+                zmq::PollItem::from_fd(wake_fd, zmq::POLLIN),
+            ];
             match zmq::poll(&mut items, poll_timeout_ms) {
                 Ok(_) => {}
                 Err(zmq::Error::EINTR) => continue,
@@ -160,7 +195,15 @@ impl ZmqClient {
                 Self::drain_dealer(&socket, &mut pending, timeout);
             }
 
-            // 5) 兜底：处理 stream 超时
+            // 5) wake 管道有信号：排空一次（POLLIN 保证至少 1 字节，不会阻塞；
+            //    残留字节会让下一轮 poll 立刻返回，无害）。下一轮顶部 drain_commands
+            //    会消费新命令。
+            if items[1].is_readable() {
+                let mut sink = [0u8; 64];
+                let _ = wake_rx.read(&mut sink);
+            }
+
+            // 6) 兜底：处理 stream 超时
             Self::cancel_timed_out_requests(&socket, &mut pending);
         }
     }
