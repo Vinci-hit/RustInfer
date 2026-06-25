@@ -800,10 +800,18 @@ where
         let device = self.scope.device();
         unsafe {
             upload_i32_prefix(device, &self.kv_index.block_tables, &block_tables)?;
-            upload_i32_prefix(device, &self.kv_index.cu_q_lens, &cu_q_lens)?;
-            upload_i32_prefix(device, &self.kv_index.kv_lens, &plan.kv_lens)?;
-            upload_i32_prefix(device, &self.kv_index.seq_positions, &plan.seq_positions)?;
-            upload_i32_prefix(device, &self.kv_index.seq_lens_step, &seq_lens_step)?;
+            // The per-sequence control buffers are sized to `cap_batch` but the
+            // attention/scatter kernels iterate over `seq_positions.shape()[0]`
+            // (== capacity). A prefix-only upload leaves the tail holding STALE
+            // values from a prior, larger batch — phantom sequences then claim
+            // real tokens via stale `cu_q_lens`, re-applying RoPE in-place at the
+            // wrong position and corrupting Q/K (manifests as persistent garbage
+            // for every later request after one high-batch step). Upload these
+            // zero-padded to full capacity so phantom rows are inert (0 length).
+            upload_i32_full_zeropad(device, &self.kv_index.cu_q_lens, &cu_q_lens)?;
+            upload_i32_full_zeropad(device, &self.kv_index.kv_lens, &plan.kv_lens)?;
+            upload_i32_full_zeropad(device, &self.kv_index.seq_positions, &plan.seq_positions)?;
+            upload_i32_full_zeropad(device, &self.kv_index.seq_lens_step, &seq_lens_step)?;
             upload_i32_prefix(device, &self.kv_index.rope_positions, &plan.rope_positions)?;
             upload_i32_prefix(device, &self.kv_index.block2req, &block2req)?;
             upload_i32_prefix(device, &self.kv_index.block2tile, &block2tile)?;
@@ -1276,6 +1284,31 @@ unsafe fn upload_i32_prefix<D: Device>(
     let bytes = std::mem::size_of_val(host);
     let ptr = unsafe { NonNull::new_unchecked(dst.data_ptr_mut() as *mut u8) };
     unsafe { device.upload_async(ptr, host.as_ptr() as *const u8, bytes) }
+}
+
+/// Upload `host` into the front of `dst` and zero the remaining tail, so the
+/// full buffer holds only this step's data. Required for per-sequence control
+/// buffers (`cu_q_lens`/`seq_lens`/`seq_positions`/`kv_lens`) that the attention
+/// kernels iterate over at capacity: a stale tail from a prior larger batch
+/// would otherwise be read as phantom sequences. The pad is tiny (≤ cap_batch).
+unsafe fn upload_i32_full_zeropad<D: Device>(
+    device: &D,
+    dst: &Tensor<i32, D>,
+    host: &[i32],
+) -> OpResult<()> {
+    let cap = dst.numel();
+    if host.len() > cap {
+        return Err(OpError::Shape(format!(
+            "upload_i32_full_zeropad: host {} > dst {}",
+            host.len(),
+            cap
+        )));
+    }
+    let mut padded = vec![0i32; cap];
+    padded[..host.len()].copy_from_slice(host);
+    let bytes = std::mem::size_of_val(padded.as_slice());
+    let ptr = unsafe { NonNull::new_unchecked(dst.data_ptr_mut() as *mut u8) };
+    unsafe { device.upload_async(ptr, padded.as_ptr() as *const u8, bytes) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

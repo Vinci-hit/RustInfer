@@ -130,12 +130,27 @@ rather than relying on cuBLASLt's `nullptr` default heuristic.
 1. ~~GEMM tiling alignment~~ **DONE** (see above). b32/b64 now exceed 96f7b4e; b128/b256 within noise.
    Any further large-batch gain is attention-dominated (longer KV at maxtok=300 widens it for BOTH
    builds equally) — diminishing returns; would need fresh nsys vs a rebuilt 96f7b4e on this host.
-2. **KV-recycle contamination (correctness under load).** After many requests, recycled KV
-   blocks corrupt later prompts (verify2 later-prompt degradation; "high qps some seq repeat").
-   Possibly pre-existing (check 96f7b4e too). See memory `batched-decode-corruption-bug`.
-3. **Commit the fix.** cuDNN restore + orchestration revert + **GEMM cache wiring**. `decoder.rs`
-   DBG-FWD already removed (reverted). Dormant adaptive-split in `flash_attn_paged_decode.cu` is
-   harmless — keep or drop.
+2. ~~KV-recycle contamination~~ **FIXED (2026-06-25, session 2).** Was NOT KV-block recycling —
+   root cause = **stale per-sequence control-buffer tails**. The persistent device buffers
+   `cu_q_lens` / `seq_lens_step` / `seq_positions` / `kv_lens` (runtime.rs `KvIndexTensors`) are
+   sized to `cap_batch` (256) but `upload_index` only prefix-filled them (`upload_i32_prefix`).
+   The attention/scatter kernels iterate over `seq_positions.shape()[0]` (== capacity), so after
+   one large batch the tail keeps stale values; a later smaller batch leaves phantom rows whose
+   stale `cu_q_lens` make them **claim real tokens and re-apply RoPE in-place at the wrong
+   position**, corrupting Q/K. Symptom: one high-batch step permanently poisons every later
+   request (fluent but input-incoherent: "capital of France"→"a 1984 American science fiction
+   film", 2+2→"10000000"); model weights/RoPE/embeddings all verified byte-intact (it's the
+   per-step inputs, not the params). FIX: `upload_i32_full_zeropad` zero-pads those four control
+   buffers to full capacity each step so phantom rows are inert (matches the known-good clean
+   state). Same *class* as the old `qkv_norm_rope_scatter` capacity-vs-actual OOB, different
+   buffers + consumer. Verified: 40-wave × 48-concurrent churn → 0/40 corrupt (was 40/40 by wave
+   ~13); verify2 b1==b32 now true for all prompts; perf unchanged. Full root-cause method:
+   checksum-probe bisection (params intact → hidden identical at embed, diverges at L0 → dumped
+   L0 kernel inputs → saw stale tail). See memory `kv-stale-control-buffer-tail`.
+3. **Commit the fix.** cuDNN restore + orchestration revert + **GEMM cache wiring** +
+   **stale-tail zero-pad** (runtime.rs). All debug probes removed (decoder.rs / qkv mod.rs
+   reverted clean; only runtime.rs + matmul.cu + flash_attn_gqa changes remain). Dormant
+   adaptive-split in `flash_attn_paged_decode.cu` is harmless — keep or drop.
 
 ## Key artifacts (scratchpad: /tmp/claude-1011/.../7181ccd7-.../scratchpad/)
 
