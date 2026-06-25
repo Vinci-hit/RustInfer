@@ -116,6 +116,7 @@ pub async fn chat_completions(
             rx,
             state.tokenizer.clone(),
             include_usage,
+            request_start,
         );
 
         Ok(sse.into_response())

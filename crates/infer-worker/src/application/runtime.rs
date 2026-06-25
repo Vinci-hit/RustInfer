@@ -109,6 +109,18 @@ pub struct AbcBuffers<D: Device> {
     pub pinned: bool,
 }
 
+/// RAII guard that restores the default (decode) GEMM mode when an eager prefill
+/// forward returns — including early `?` returns. The `bool` records whether the
+/// mode was actually flipped on, so the no-prefill case is a cheap no-op.
+struct PrefillGemmGuard<D: LlmBackend>(bool, std::marker::PhantomData<D>);
+impl<D: LlmBackend> Drop for PrefillGemmGuard<D> {
+    fn drop(&mut self) {
+        if self.0 {
+            D::set_prefill_gemm_mode(false);
+        }
+    }
+}
+
 impl<T, D, M> Runtime<T, D, M>
 where
     T: Dtype,
@@ -269,6 +281,15 @@ where
         plan: &crate::domain::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
+        // Eager prefill (num_tokens > batch) routes bf16 GEMMs to the build-free
+        // chunked path so each distinct prompt length skips the cuBLASLt cache
+        // build (~9-18ms off TTFT). A guard restores the default on any return so
+        // the decode graph cold-path warmup still builds the cuBLASLt cache.
+        let prefill_gemm = plan.num_tokens > plan.batch;
+        if prefill_gemm {
+            D::set_prefill_gemm_mode(true);
+        }
+        let _gemm_guard = PrefillGemmGuard::<D>(prefill_gemm, std::marker::PhantomData);
         let input_ids = self.input_ids_tensor(req, plan)?;
         self.run_layers(plan, &input_ids)?;
         self.sample_tail(plan, req)
@@ -327,7 +348,17 @@ where
         };
         let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
-        let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
+        // Greedy first-token sampling only needs the last row of each sequence,
+        // so project just those (`LastPerSeq`) — this keeps the lm_head GEMM at
+        // M=batch (a warm decode shape) and off the cold per-prompt-length path
+        // that paid a ~37ms cuBLASLt heuristic on prefill. Speculative verify
+        // scores every draft position, so it still needs all rows.
+        let sample_rows = if req.draft_tokens.is_empty() {
+            SampleRows::LastPerSeq
+        } else {
+            SampleRows::All
+        };
+        let logits = self.model.finalize(&hidden, sample_rows, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
             // Greedy fast path: reuse the ABC argmax workspace instead of having
@@ -337,10 +368,10 @@ where
             // (cudaMallocAsync + memset) per prefill, which directly inflated
             // TTFT at low QPS after the buffer-pipeline refactor.
             //
-            // For prefill (q_len > 1 per row) `argmax_into` writes one id per
-            // logits row into `abc.argmax_out_dev`; we then take the last token
-            // of every sequence (`sampled_rows = offset + q_len - 1`) via a
-            // single small D2H, mirroring `GreedySampler::sample`'s row pick.
+            // `finalize(LastPerSeq)` already projected exactly one logits row per
+            // sequence (the last token of each), in `q_lens` order. So
+            // `argmax_into` yields one id per sequence and seq `i` maps directly
+            // to row `i` — no per-sequence `offset + q_len - 1` indexing.
             let logits_rows = logits.0.shape().as_slice()[0];
             if logits_rows > self.abc.argmax_out_dev.numel() {
                 return Err(OpError::Shape(format!(
@@ -361,14 +392,11 @@ where
             D::argmax_into(&ctx, &logits.0, &mut argmax_out, &self.abc.argmax_ws, None)?;
             let ids = argmax_out.to_host_vec()?;
             let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
-            let mut offset = 0usize;
-            for &q_len in &plan.q_lens {
-                let q = q_len.max(1) as usize;
-                let row = offset + q - 1;
-                let token_id = *ids.get(row).ok_or_else(|| {
+            for i in 0..plan.q_lens.len() {
+                let token_id = *ids.get(i).ok_or_else(|| {
                     OpError::Shape(format!(
                         "sample_tail: sampled row {} out of argmax range {}",
-                        row,
+                        i,
                         ids.len()
                     ))
                 })?;
@@ -377,7 +405,6 @@ where
                     logprob: 0.0,
                     top_logprobs: Vec::new(),
                 }]);
-                offset += q;
             }
             tokens.resize_with(plan.batch, Vec::new);
             let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();

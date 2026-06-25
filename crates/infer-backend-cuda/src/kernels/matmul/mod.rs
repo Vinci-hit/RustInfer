@@ -69,6 +69,17 @@ unsafe extern "C" {
         group_size: i32,
         stream: cudaStream_t,
     );
+    fn zimage_set_eager_prefill_gemm(on: i32);
+}
+
+/// Toggle the eager-prefill bf16 GEMM mode. When `on`, eager (non-capturing)
+/// bf16 GEMMs use the build-free chunked `cublasGemmEx` path instead of the
+/// per-shape cuBLASLt heuristic+probe cache build — eliminating ~9-18ms of
+/// cold-shape build from every distinct-length prefill's TTFT. Decode (graph
+/// capture + its warmup) must leave this off so the cuBLASLt cache is built.
+pub fn set_eager_prefill_gemm(on: bool) {
+    // SAFETY: stores an int into a process-global atomic; no aliasing.
+    unsafe { zimage_set_eager_prefill_gemm(on as i32) };
 }
 
 /// Standard matmul: output = input @ weight^T (same dtype)

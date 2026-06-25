@@ -57,9 +57,13 @@ pub async fn run_event_loop(
 
         match event {
             SchedulerEvent::NewRequest { client_id, request } => {
+                let _t = std::time::Instant::now();
                 engine.handle_new_request(client_id, request);
                 if engine.can_schedule() {
                     engine.run_iteration().await?;
+                }
+                if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
+                    tracing::info!(us = _t.elapsed().as_micros() as u64, "SCHED_TRACE: NewRequest->dispatch");
                 }
             }
             SchedulerEvent::Cancel {
@@ -72,8 +76,12 @@ pub async fn run_event_loop(
                 }
             }
             SchedulerEvent::WorkerLlmStep(_) | SchedulerEvent::WorkerDiffusionStep(_) => {
+                let _t = std::time::Instant::now();
                 engine.handle_step_output(event).await?;
                 engine.run_iteration().await?;
+                if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
+                    tracing::info!(us = _t.elapsed().as_micros() as u64, "SCHED_TRACE: StepOutput->forward");
+                }
             }
             SchedulerEvent::ControlSignal(ev) => {
                 engine.on_control_event(ev).await?;

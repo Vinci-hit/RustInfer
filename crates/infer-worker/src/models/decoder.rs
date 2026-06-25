@@ -94,26 +94,78 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
         rows: SampleRows<'_>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<Logits<T, D>> {
-        // `rows` selection (project only sampled rows) is a reserved perf seam;
-        // today the LM head projects every token and the sampler picks the last
-        // row per sequence — byte-identical results.
-        let _ = rows;
         let num_tokens = hidden.num_tokens();
         let dev = hidden.stream.device().clone();
+        let dim = self.dims.dim;
+
+        // Row selection. The greedy first-token path passes `LastPerSeq`: only
+        // the last token of each sequence needs logits. Projecting just those
+        // `batch` rows instead of all `num_tokens` (a) shrinks the lm_head GEMM
+        // from [num_tokens, vocab] to [batch, vocab], and (b) — the bigger win —
+        // keeps that GEMM at M=batch (a warm decode shape) instead of
+        // M=num_tokens, which is cold for every distinct prompt length and
+        // otherwise paid a ~37ms cuBLASLt heuristic for the 151936-wide vocab
+        // projection on the TTFT critical path. Decode (every q_len==1 →
+        // num_tokens==batch) gathers the identity, so we skip the gather there.
+        let gather_idx: Option<Vec<i32>> = match rows {
+            SampleRows::All => None,
+            SampleRows::LastPerSeq => {
+                let plan = ctx.plan();
+                let mut idx: Vec<i32> = Vec::with_capacity(plan.q_lens.len());
+                let mut off = 0i32;
+                for &q in &plan.q_lens {
+                    off += q.max(1);
+                    idx.push(off - 1);
+                }
+                // All-singleton (decode) → identity gather; project directly.
+                if idx.len() >= num_tokens { None } else { Some(idx) }
+            }
+            SampleRows::Explicit(sel) => {
+                if sel.len() >= num_tokens {
+                    None
+                } else {
+                    Some(sel.to_vec())
+                }
+            }
+        };
+
+        // Materialize the selected rows (if any) into a contiguous buffer.
+        let selected: Option<Tensor<T, D>> = match &gather_idx {
+            None => None,
+            Some(idx) if idx.len() == 1 => {
+                // Single-sequence prefill: the last row is contiguous, so a
+                // narrow avoids both the gather kernel and the index upload.
+                Some(hidden.stream.narrow(0, idx[0] as usize, 1)?)
+            }
+            Some(idx) => {
+                // Scattered last rows (burst prefill): gather via the embedding
+                // row-select kernel (table = residual stream, ids = last rows).
+                let idx_dev =
+                    Tensor::from_host_slice(idx, Shape::from_slice(&[idx.len()]), &dev)?;
+                let mut gathered =
+                    D::alloc_tensor::<T>(Shape::from_slice(&[idx.len(), dim]), &dev)?;
+                D::embedding(ctx.scope(), &hidden.stream, &idx_dev, &mut gathered)?;
+                Some(gathered)
+            }
+        };
+
+        let src: &Tensor<T, D> = selected.as_ref().unwrap_or(&hidden.stream);
+        let n_rows = src.shape().as_slice()[0];
+
         // Reuse the address-stable scratch (norm buffer + preallocated logits)
         // when installed; otherwise allocate (pooled). Keeps `finalize`
-        // allocation-free and keeps the large [tokens, vocab] logits off the
+        // allocation-free and keeps the large [rows, vocab] logits off the
         // recycling pool (where ragged lengths would grow it unbounded).
-        let scratch = self.scratch.as_deref().filter(|s| s.fits(num_tokens));
+        let scratch = self.scratch.as_deref().filter(|s| s.fits(n_rows));
         let mut normed = match scratch {
-            Some(s) => s.normed(num_tokens),
-            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, self.dims.dim]), &dev)?,
+            Some(s) => s.normed(n_rows),
+            None => D::alloc_tensor(Shape::from_slice(&[n_rows, dim]), &dev)?,
         };
         let mut logits = match scratch {
-            Some(s) => s.logits(num_tokens),
-            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, self.dims.vocab_size]), &dev)?,
+            Some(s) => s.logits(n_rows),
+            None => D::alloc_tensor(Shape::from_slice(&[n_rows, self.dims.vocab_size]), &dev)?,
         };
-        self.norm.forward(&hidden.stream, &mut normed, ctx)?;
+        self.norm.forward(src, &mut normed, ctx)?;
         self.lm_head.forward(&normed, &mut logits, ctx)?;
         Ok(Logits(logits))
     }

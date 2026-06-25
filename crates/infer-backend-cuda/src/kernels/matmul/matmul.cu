@@ -3,6 +3,8 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <chrono>
+#include <atomic>
 #define CHECK_CUBLAS(func) { \
     cublasStatus_t status = (func); \
     if (status != CUBLAS_STATUS_SUCCESS) { \
@@ -179,6 +181,142 @@ static std::mutex g_zimage_bf16_gemm_cache_mu;
 static std::unordered_map<ZimageBf16GemmKey, ZimageBf16GemmEntry, ZimageBf16GemmKeyHash>
     g_zimage_bf16_gemm_cache;
 
+// When set (by the Rust prefill path via `zimage_set_eager_prefill_gemm`), eager
+// bf16 GEMMs take the build-free `gemm_bf16_chunked_legacy` (cublasGemmEx) path
+// instead of the per-shape cuBLASLt heuristic+capturability-probe cache build.
+// Prefill M = num_tokens varies per request, so every distinct prompt length is
+// a cold shape that otherwise pays ~9-18ms of build (heuristic + graph-capture
+// probe) on the TTFT critical path — pure overhead, since eager prefill is never
+// captured into a graph and so needs neither a benchmarked nor a capturable algo.
+// Decode (graph capture + its eager warmup) leaves this 0 and keeps the cuBLASLt
+// cached path, where the per-(capture_size) build amortizes across many replays.
+static std::atomic<int> g_zimage_eager_prefill_gemm{0};
+extern "C" void zimage_set_eager_prefill_gemm(int on)
+{
+    g_zimage_eager_prefill_gemm.store(on, std::memory_order_relaxed);
+}
+
+// Eager-prefill algo cache keyed by (N,K) only — NOT M. The cuBLASLt heuristic's
+// algo pick is robust across M for a fixed (N,K), so we run the heuristic once
+// per (N,K) and reuse the (M-independent) op descriptor + algo for every prompt
+// length. The cheap M-dependent matrix layouts are recreated per call. This
+// gives prefill the single-pass cuBLASLt kernel (no chunked K-tile launch storm)
+// with zero per-length build cost — unlike the (M,N,K)-keyed decode cache, which
+// rebuilds (heuristic + capture probe) for every distinct M.
+// The cuBLASLt heuristic's best algo depends on the M *regime* (small-M memory-
+// bound tilings differ from large-M compute-bound ones), so a single algo cached
+// per (N,K) and reused across all M mis-tiles long prefills (~2x slower). Bucket
+// M into coarse regimes and cache one algo per (N,K,bucket): a new prompt length
+// lands in an existing bucket → cache hit with a regime-appropriate algo, and the
+// total build count stays tiny (~5 (N,K) × ~6 buckets).
+static inline int zimage_m_bucket(int M)
+{
+    if (M <= 16) return 16;
+    if (M <= 64) return 64;
+    if (M <= 256) return 256;
+    if (M <= 1024) return 1024;
+    return ((M + 1023) / 1024) * 1024;
+}
+struct ZimageNkKey {
+    int N, K, Mb;
+    bool operator==(const ZimageNkKey& o) const { return N == o.N && K == o.K && Mb == o.Mb; }
+};
+struct ZimageNkKeyHash {
+    size_t operator()(const ZimageNkKey& k) const {
+        size_t h = std::hash<long long>()(((long long)k.N << 32) ^ (unsigned)k.K);
+        return h * 1000003u ^ std::hash<int>()(k.Mb);
+    }
+};
+struct ZimageNkEntry {
+    cublasLtMatmulDesc_t op = nullptr; // M-independent (transA/B + compute type)
+    cublasLtMatmulAlgo_t algo;
+    size_t algo_ws = 0;
+    bool valid = false;
+};
+static std::mutex g_zimage_nk_mu;
+static std::unordered_map<ZimageNkKey, ZimageNkEntry, ZimageNkKeyHash> g_zimage_nk_cache;
+
+// Forward decl — defined later in this TU (the build-free chunked fallback).
+static void gemm_bf16_chunked_legacy(
+    int M, int N, int K,
+    const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
+    void* workspace, size_t workspaceSize, cudaStream_t stream);
+
+// Eager bf16 GEMM via the (N,K)-cached single-pass cuBLASLt algo. Falls back to
+// the chunked cublasGemmEx path on any cuBLASLt error (cold-build failure or an
+// algo the cached pick can't service at this M).
+static void gemm_bf16_eager_nk_cached(
+    cublasLtHandle_t ltHandle, int M, int N, int K,
+    const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
+    void* workspace, size_t workspaceSize, cudaStream_t stream)
+{
+    // Row-major C[M,N]=A[M,K]·B[N,K]^T  ->  col-major [N,M]=[N,K]·[K,M] with
+    // transA=T, transB=N and swapped operands (mirrors the decode-cache build).
+    const int m_g = N, n_g = M, k_g = K;
+    const ZimageNkKey nk_key{N, K, zimage_m_bucket(M)};
+
+    ZimageNkEntry entry;
+    {
+        std::lock_guard<std::mutex> lk(g_zimage_nk_mu);
+        auto it = g_zimage_nk_cache.find(nk_key);
+        if (it != g_zimage_nk_cache.end() && it->second.valid) {
+            entry = it->second;
+        } else {
+            cublasOperation_t opA = CUBLAS_OP_T, opB = CUBLAS_OP_N;
+            cublasLtMatmulDesc_t op = nullptr;
+            cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+            cublasLtMatmulPreference_t pref = nullptr;
+            cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
+            cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
+            cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
+            cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g);
+            cublasLtMatmulPreferenceCreate(&pref);
+            cublasLtMatmulPreferenceSetAttribute(
+                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize));
+            cublasLtMatmulHeuristicResult_t res{};
+            int ret = 0;
+            cublasLtHandle_t tmp_h = nullptr;
+            cublasLtCreate(&tmp_h);
+            cublasLtMatmulAlgoGetHeuristic(tmp_h, op, A, B, C, C, pref, 1, &res, &ret);
+            cublasLtDestroy(tmp_h);
+            cublasLtMatmulPreferenceDestroy(pref);
+            cublasLtMatrixLayoutDestroy(A);
+            cublasLtMatrixLayoutDestroy(B);
+            cublasLtMatrixLayoutDestroy(C);
+            if (ret == 0) {
+                cublasLtMatmulDescDestroy(op);
+                gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+                return;
+            }
+            entry.op = op;
+            entry.algo = res.algo;
+            entry.algo_ws = res.workspaceSize;
+            entry.valid = true;
+            g_zimage_nk_cache.emplace(nk_key, entry);
+        }
+    }
+
+    // M-dependent layouts are cheap (~µs); recreate per call and run single-pass.
+    cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+    cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
+    cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
+    cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st = cublasLtMatmul(
+        ltHandle, entry.op, &alpha,
+        d_B, A, d_A, B, &beta,
+        d_C, C, d_C, C,
+        &entry.algo, workspace, workspaceSize, stream);
+    cublasLtMatrixLayoutDestroy(A);
+    cublasLtMatrixLayoutDestroy(B);
+    cublasLtMatrixLayoutDestroy(C);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+    }
+}
+
 // Per-shape cuBLASLt algo benchmarking is OFF by default. The cuBLASLt
 // heuristic's top capturable algo matches the benchmarked pick for the decode
 // shapes (measured: identical TPOT, e.g. b32 4.00ms vs 4.10ms, b64 4.87ms vs
@@ -281,6 +419,14 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     std::vector<cublasLtMatmulHeuristicResult_t> hres(kRequested);
     int returned = 0;
 
+    const bool _gbt = (getenv("RUSTINFER_GEMM_BUILD_TRACE") != nullptr);
+    auto _gbt_now = []() { return std::chrono::steady_clock::now(); };
+    auto _gbt_ms = [](std::chrono::steady_clock::time_point a,
+                      std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto _t_start = _gbt_now();
+
     // Use a private temporary cuBLASLt handle to run the heuristic. This
     // avoids touching the caller's handle (which may be mid-graph-capture).
     {
@@ -291,6 +437,7 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
             pref, kRequested, hres.data(), &returned);
         cublasLtDestroy(tmp_h);
     }
+    auto _t_heur = _gbt_now();
 
     cublasLtMatmulPreferenceDestroy(pref);
 
@@ -374,6 +521,7 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
         cublasLtDestroy(bench_h);
     }
 
+    auto _t_probe0 = _gbt_now();
     if (best < 0) {
         // No bench (or no benched algo captured) — take the first heuristic
         // result that is graph-capturable.
@@ -402,6 +550,13 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
             }
             if (best < 0) best = 0;
         }
+    }
+
+    auto _t_probe1 = _gbt_now();
+    if (_gbt) {
+        fprintf(stderr, "[gemm-build] M=%d N=%d K=%d  heuristic=%.2fms  probe=%.2fms  total=%.2fms (returned=%d)\n",
+               M, N, K, _gbt_ms(_t_start, _t_heur), _gbt_ms(_t_probe0, _t_probe1),
+               _gbt_ms(_t_start, _t_probe1), returned);
     }
 
     e.algo = hres[best].algo;
@@ -495,6 +650,15 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     cudaStreamCaptureStatus capst = cudaStreamCaptureStatusNone;
     bool capturing = (cudaStreamIsCapturing(stream, &capst) == cudaSuccess &&
                       capst != cudaStreamCaptureStatusNone);
+
+    // Eager prefill: single-pass cuBLASLt with an algo cached by (N,K), so each
+    // distinct prompt length skips the per-(M,N,K) heuristic + capture probe
+    // (~9-18ms of cold build off TTFT) while keeping the large-tile single-pass
+    // kernel (no chunked K-tile launch storm).
+    if (!capturing && g_zimage_eager_prefill_gemm.load(std::memory_order_relaxed) != 0) {
+        gemm_bf16_eager_nk_cached(ltHandle, M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+        return;
+    }
 
     const ZimageBf16GemmEntry* entry = nullptr;
     ZimageBf16GemmKey key{M, N, K};

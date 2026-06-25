@@ -38,6 +38,7 @@ pub fn stream_chat_completion(
     mut stream_handle: StreamHandle,
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
+    request_start: Instant,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         let stream_started = Instant::now();
@@ -91,8 +92,9 @@ pub fn stream_chat_completion(
                                 first_content_sent = true;
                                 tracing::debug!(
                                     request_id = %request_id,
-                                    elapsed_ms = stream_started.elapsed().as_millis(),
-                                    "chat stream first content chunk"
+                                    server_ttft_ms = request_start.elapsed().as_secs_f64() * 1000.0,
+                                    since_stream_ms = stream_started.elapsed().as_secs_f64() * 1000.0,
+                                    "TTFT_TRACE: chat first content chunk"
                                 );
                             }
                             let payload = make_content_chunk(&chunk_id, &model, delta);

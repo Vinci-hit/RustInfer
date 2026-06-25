@@ -32,7 +32,7 @@ max_model_len = 1024
 
 # Paged KV.
 paged_block_size = 1
-chunked_prefill_size = 0      # 0 => disabled (prefill the whole prompt in one step)
+chunked_prefill_size = 0      # 0 => disabled (whole prompt in one step). Set 256 to re-enable the graph-prefill foundation (see docs/HANDOFF_graph_prefill.md)
 enable_prefix_caching = false
 mem_fraction_static = 0.3
 num_blocks = 0                # 0 => auto-size

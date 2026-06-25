@@ -335,6 +335,11 @@ where
                         return Ok(());
                     }
                 }
+                let _ttft_t0 = if std::env::var_os("RUSTINFER_TTFT_TRACE").is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if let Err(e) = handle_prefill(
                     &mut PrefillCtx {
                         runner: &mut runner,
@@ -354,6 +359,9 @@ where
                         return Ok(());
                     }
                     tracing::info!("[serve] prefill error: {}", e);
+                }
+                if let Some(t0) = _ttft_t0 {
+                    tracing::info!("[ttft-trace] handle_prefill wall = {:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
                 }
             }
 

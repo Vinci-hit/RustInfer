@@ -8,6 +8,14 @@ use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
 pub trait FusedOps: MathOps {
+    /// Toggle build-free eager-prefill GEMM mode. When `on`, eager (non-graph)
+    /// bf16 GEMMs skip the per-shape cuBLASLt heuristic+probe cache build and use
+    /// the build-free chunked path, removing ~9-18ms of cold-shape build from
+    /// every distinct-length prefill's TTFT. Must be left off for decode (graph
+    /// capture + its warmup) so the amortized cuBLASLt cache is populated.
+    /// Default: no-op (only the CUDA backend implements it).
+    fn set_prefill_gemm_mode(_on: bool) {}
+
     fn fused_add_rmsnorm<T: Dtype>(
         ctx: &StepCtx<'_, Self>,
         output: &mut Tensor<T, Self>,

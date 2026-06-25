@@ -445,6 +445,10 @@ impl infer_core::ports::MathOps for Cuda {
 }
 
 impl infer_core::ports::FusedOps for Cuda {
+    fn set_prefill_gemm_mode(on: bool) {
+        kernels::matmul::set_eager_prefill_gemm(on);
+    }
+
     fn fused_add_rmsnorm<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         output: &mut Tensor<T, Self>,
