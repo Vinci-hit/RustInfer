@@ -28,6 +28,9 @@ pub struct AppState {
     pub model_type: String,
     /// 加载的模型信息
     pub model_info: ModelInfo,
+    /// 准入信号量：限制并发 in-flight 请求数，过载时在入口返回 429
+    /// （而不是把请求压入无界内部队列直到 OOM）。
+    pub admission: Arc<tokio::sync::Semaphore>,
 }
 
 /// 方便类型别名

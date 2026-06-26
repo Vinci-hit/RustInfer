@@ -43,3 +43,23 @@ pub(crate) fn send_step_error(control: &ControlPump, sequence_ids: Vec<u64>, mes
         tracing::error!(error = %e, "failed to send StepError to scheduler (control plane may be down)");
     }
 }
+
+/// Send a **fatal** StepError for `sequence_ids` (poisoned device/context).
+/// Unlike [`send_step_error`], this tells the scheduler to terminate rather
+/// than retry the sequences; the worker is expected to exit immediately after.
+pub(crate) fn send_fatal_step_error(
+    control: &ControlPump,
+    sequence_ids: Vec<u64>,
+    message: String,
+) {
+    if let Err(e) = control.send(
+        WorkerControlMessage::StepError(WorkerStepError {
+            sequence_ids,
+            message,
+            fatal: true,
+        }),
+        infer_protocol::control_envelope::RequestId::NONE,
+    ) {
+        tracing::error!(error = %e, "failed to send FATAL StepError to scheduler (control plane may be down)");
+    }
+}

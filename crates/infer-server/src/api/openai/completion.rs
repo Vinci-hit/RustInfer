@@ -21,6 +21,14 @@ pub async fn completions(
     State(state): State<SharedState>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, AppError> {
+    // 0. 准入控制：过载时在入口返回 429（详见 chat_completions）。permit move 进
+    //    流式 SSE 或随非流式响应构建结束而释放。
+    let permit = state
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::too_many("server overloaded, please retry later"))?;
+
     // 1. 校验
     validate_request(&req)?;
     let response_model = state.model_info.model_id.clone();
@@ -82,7 +90,7 @@ pub async fn completions(
             .client
             .infer_stream(engine_req)
             .await
-            .map_err(AppError::internal)?;
+            .map_err(AppError::from_submit)?;
 
         let include_usage = req
             .stream_options
@@ -97,6 +105,7 @@ pub async fn completions(
             rx,
             state.tokenizer.clone(),
             include_usage,
+            permit,
         );
 
         Ok(sse.into_response())
@@ -105,7 +114,7 @@ pub async fn completions(
             .client
             .infer(engine_req)
             .await
-            .map_err(AppError::internal)?;
+            .map_err(AppError::from_submit)?;
 
         if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
             return Err(AppError::internal(anyhow::anyhow!(

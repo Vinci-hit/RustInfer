@@ -121,6 +121,20 @@ pub struct ZmqClient {
     timeout: Duration,
 }
 
+/// Classify a failed submit into the bounded command channel: a full channel
+/// means the server is overloaded (→ HTTP 429 via [`crate::error::AppError::from_submit`]);
+/// a disconnected channel means the scheduler link is gone (→ 500).
+fn map_submit_err(err: std::sync::mpsc::TrySendError<RequestEnvelope>) -> anyhow::Error {
+    match err {
+        std::sync::mpsc::TrySendError::Full(_) => {
+            anyhow::Error::new(crate::error::ServerOverloaded)
+        }
+        std::sync::mpsc::TrySendError::Disconnected(_) => {
+            anyhow::anyhow!("scheduler command channel disconnected")
+        }
+    }
+}
+
 impl ZmqClient {
     pub async fn new(endpoint: &str, timeout_secs: u64) -> Result<Self> {
         let endpoint = endpoint.to_string();
@@ -491,7 +505,7 @@ impl InferClient for ZmqClient {
                 request: req,
                 reply_tx: tx,
             })
-            .map_err(|_| anyhow::anyhow!("ZMQ command channel full or disconnected"))?;
+            .map_err(map_submit_err)?;
         self.waker.wake();
 
         match tokio::time::timeout(self.timeout, rx).await {
@@ -526,7 +540,7 @@ impl InferClient for ZmqClient {
                 request: req,
                 chunk_tx: tx,
             })
-            .map_err(|_| anyhow::anyhow!("ZMQ command channel full or disconnected"))?;
+            .map_err(map_submit_err)?;
         self.waker.wake();
 
         Ok(StreamHandle {

@@ -31,6 +31,7 @@ fn json_event<T: serde::Serialize>(request_id: &str, payload: &T) -> Event {
 }
 
 /// 构建 Chat Completion SSE 流
+#[allow(clippy::too_many_arguments)]
 pub fn stream_chat_completion(
     request_id: String,
     model: String,
@@ -39,8 +40,14 @@ pub fn stream_chat_completion(
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
     request_start: Instant,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
+        // Hold the admission permit for the lifetime of the stream. Binding it
+        // INSIDE the generator is what ties its release to stream completion or
+        // client disconnect (generator drop); binding it outside would drop it
+        // when this fn returns, making the gate a no-op for streaming.
+        let _permit = permit;
         let stream_started = Instant::now();
         let created = chrono::Utc::now().timestamp();
         let chunk_id = format!("chatcmpl-{}", request_id);
@@ -198,8 +205,12 @@ pub fn stream_completion(
     mut stream_handle: StreamHandle,
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
+        // Hold the admission permit for the stream's lifetime (see
+        // stream_chat_completion for why this must be bound inside the block).
+        let _permit = permit;
         let created = chrono::Utc::now().timestamp();
         let chunk_id = format!("cmpl-{}", request_id);
         let mut completion_tokens: u32 = 0;

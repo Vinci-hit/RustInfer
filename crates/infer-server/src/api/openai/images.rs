@@ -26,6 +26,14 @@ pub async fn image_generations(
     State(state): State<SharedState>,
     Json(req): Json<ImageGenerationRequest>,
 ) -> Result<Response, AppError> {
+    // 准入控制：过载时在入口返回 429。一个 HTTP 请求占用一个名额（与 n 无关），
+    // 持有到所有子请求完成、图片编码结束。
+    let _permit = state
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::too_many("server overloaded, please retry later"))?;
+
     validate_image_request(&req)?;
 
     let n = req.n.unwrap_or(1);
@@ -94,7 +102,7 @@ pub async fn image_generations(
                 .client
                 .infer(engine_req)
                 .await
-                .map_err(AppError::internal)?;
+                .map_err(AppError::from_submit)?;
 
             if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
                 return Err(AppError::internal(anyhow::anyhow!(

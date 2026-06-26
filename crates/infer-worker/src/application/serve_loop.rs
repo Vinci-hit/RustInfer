@@ -455,6 +455,9 @@ where
                         tracing::info!("[serve] prefill interrupted by shutdown.");
                         return Ok(());
                     }
+                    if e.is_fatal() {
+                        escalate_fatal_and_exit(control, &active, &prefilling, &e);
+                    }
                     tracing::info!("[serve] prefill error: {}", e);
                 }
                 if let Some(t0) = _ttft_t0 {
@@ -517,6 +520,9 @@ where
                     tracing::info!("[serve] decode interrupted by shutdown.");
                     return Ok(());
                 }
+                if e.is_fatal() {
+                    escalate_fatal_and_exit(control, &active, &prefilling, &e);
+                }
                 tracing::info!("[serve] decode error: {}", e);
             }
             if let Some(t) = dec_t0 {
@@ -570,6 +576,34 @@ where
             &kv_allocator,
         );
     }
+}
+
+/// A poisoned device/context surfaced a fatal error. Notify the scheduler so it
+/// fails every in-flight sequence, then exit the process. We deliberately call
+/// `std::process::exit` rather than returning `Err` and unwinding: CUDA `Drop`
+/// impls (cudaFree / device-sync) can hang or double-fault on a poisoned
+/// context, and the OS reclaims device memory on process exit anyway.
+fn escalate_fatal_and_exit(
+    control: &ControlPump,
+    active: &ActiveSeqMap,
+    prefilling: &PrefillSeqMap,
+    err: &OpError,
+) -> ! {
+    let mut sids: Vec<u64> = active.keys().copied().collect();
+    sids.extend(prefilling.keys().copied());
+    sids.sort_unstable();
+    sids.dedup();
+    tracing::error!(
+        error = %err,
+        num_seqs = sids.len(),
+        "[serve] FATAL device error — notifying scheduler, exiting worker"
+    );
+    crate::application::decode_common::send_fatal_step_error(
+        control,
+        sids,
+        format!("worker fatal device error: {}", err),
+    );
+    std::process::exit(1);
 }
 
 fn drain_control(control: &ControlPump, ctx: &mut WorkerCtx<'_>) -> bool {

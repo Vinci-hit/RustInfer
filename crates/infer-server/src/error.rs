@@ -40,6 +40,19 @@ pub enum AppError {
     Internal(anyhow::Error),
 }
 
+/// Marker error: the client's bounded submit channel to the scheduler was full
+/// (server overloaded). The ZMQ client wraps it in `anyhow`; [`AppError::from_submit`]
+/// downcasts it to a 429 instead of a 500.
+#[derive(Debug)]
+pub struct ServerOverloaded;
+
+impl std::fmt::Display for ServerOverloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server overloaded: request submit queue full")
+    }
+}
+impl std::error::Error for ServerOverloaded {}
+
 impl AppError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::BadRequest(msg.into())
@@ -51,6 +64,20 @@ impl AppError {
 
     pub fn timeout(msg: impl Into<String>) -> Self {
         Self::Timeout(msg.into())
+    }
+
+    pub fn too_many(msg: impl Into<String>) -> Self {
+        Self::TooManyRequests(msg.into())
+    }
+
+    /// Map an error returned by a client submit (`infer`/`infer_stream`): an
+    /// overload marker becomes 429 (rate_limit_error); anything else is 500.
+    pub fn from_submit(err: anyhow::Error) -> Self {
+        if err.downcast_ref::<ServerOverloaded>().is_some() {
+            Self::TooManyRequests("server overloaded, please retry later".to_string())
+        } else {
+            Self::Internal(err)
+        }
     }
 }
 

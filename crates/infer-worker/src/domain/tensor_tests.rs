@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod helper_tests {
     use crate::domain::tensor::Tensor;
-    use crate::domain::ports::*;
+    use crate::domain::ports::OpError;
     use crate::infrastructure::cpu::Cpu;
     use half::bf16;
 
@@ -108,7 +108,6 @@ mod opbackend_dispatch_tests {
     //! Catches issues where the trait wiring forgets a method.
 
     use crate::domain::tensor::Tensor;
-    use crate::domain::ports::*;
     use crate::domain::ports::{CoreOps, DiffusionOps};
     use crate::infrastructure::cuda::Cuda;
     use half::bf16;

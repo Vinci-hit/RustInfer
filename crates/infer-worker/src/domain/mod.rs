@@ -16,11 +16,7 @@ pub mod plan;
 pub use infer_core::ports;
 pub use infer_core::storage;
 pub use infer_core::tensor;
-// NOTE: temporarily disabled — `tensor_tests` has a PRE-EXISTING MathOps/CoreOps
-// trait-ambiguity build break (unrelated to this work). Re-enable after that is
-// fixed separately.
 #[cfg(test)]
-#[cfg(any())]
 mod tensor_tests;
 pub use infer_core::types;
 
@@ -33,7 +29,6 @@ pub use global_kv_alloc::{AllocFull, GlobalKvAllocator};
 pub use model::{DecoderModel, Logits, ModelDims, SampleRows};
 pub use ports::{
     Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpBackend, OpError, OpResult,
-    V2Backend, V2DiffusionOps,
 };
 pub use storage::Storage;
 pub use tensor::Tensor;

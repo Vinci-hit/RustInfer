@@ -25,6 +25,16 @@ pub async fn chat_completions(
 ) -> Result<Response, AppError> {
     let request_start = Instant::now();
 
+    // 0. 准入控制：在 tokenize 和任何内部排队之前抢占一个并发名额。过载时立即
+    //    返回 429，而不是把请求压入无界队列。permit 的生命周期 == 请求生命周期：
+    //    非流式分支持有到响应构建完毕；流式分支把 permit move 进 SSE 流，随流结束
+    //    或客户端断开而释放。
+    let permit = state
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::too_many("server overloaded, please retry later"))?;
+
     // 1. 校验请求
     validate_request(&req)?;
     let response_model = state.model_info.model_id.clone();
@@ -96,7 +106,7 @@ pub async fn chat_completions(
             .client
             .infer_stream(engine_req)
             .await
-            .map_err(AppError::internal)?;
+            .map_err(AppError::from_submit)?;
         tracing::debug!(
             request_id = %request_id,
             submit_ms = request_start.elapsed().as_secs_f64() * 1000.0,
@@ -117,6 +127,7 @@ pub async fn chat_completions(
             state.tokenizer.clone(),
             include_usage,
             request_start,
+            permit,
         );
 
         Ok(sse.into_response())
@@ -126,7 +137,7 @@ pub async fn chat_completions(
             .client
             .infer(engine_req)
             .await
-            .map_err(AppError::internal)?;
+            .map_err(AppError::from_submit)?;
         tracing::debug!(
             request_id = %request_id,
             elapsed_ms = request_start.elapsed().as_millis(),

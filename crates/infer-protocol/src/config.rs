@@ -45,6 +45,24 @@ pub struct RustInferConfig {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
+    /// Worker-liveness timeout (seconds). The scheduler declares a worker lost
+    /// if no heartbeat arrives within this window. Decoupled from
+    /// `request_timeout_secs` so a crashed/hung worker is detected in seconds
+    /// rather than after a full request timeout. Must be safely above the
+    /// worst-case single decode/prefill step (heartbeats are emitted inline on
+    /// the worker serve loop), so the default is conservative.
+    #[serde(default = "default_worker_heartbeat_timeout_secs")]
+    pub worker_heartbeat_timeout_secs: u64,
+
+    /// Max concurrent in-flight HTTP requests admitted by the server. Excess
+    /// requests are shed at ingress with HTTP 429 instead of being queued into
+    /// unbounded internal channels (which would grow scheduler memory until
+    /// OOM). Because the server is the sole frontend, bounding in-flight here
+    /// also bounds the scheduler's waiting queue. `0` => unlimited (no
+    /// admission gate).
+    #[serde(default = "default_max_inflight_requests")]
+    pub max_inflight_requests: usize,
+
     /// Max batch tokens per iteration.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
@@ -135,6 +153,12 @@ fn default_port() -> u16 {
 }
 fn default_request_timeout_secs() -> u64 {
     120
+}
+fn default_worker_heartbeat_timeout_secs() -> u64 {
+    15
+}
+fn default_max_inflight_requests() -> usize {
+    1024
 }
 fn default_max_batch_tokens() -> usize {
     8192

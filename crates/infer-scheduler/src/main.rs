@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
     // runtime control once the handshake completes.
     let mut cp_cfg = ControlPlaneConfig::default();
     cp_cfg.heartbeat_interval = Duration::from_secs(1);
-    cp_cfg.heartbeat_timeout = Duration::from_secs(cfg.request_timeout_secs.saturating_add(30));
+    cp_cfg.heartbeat_timeout = Duration::from_secs(cfg.worker_heartbeat_timeout_secs.max(1));
     tracing::info!(
         "  worker heartbeat_interval: {:?}",
         cp_cfg.heartbeat_interval
@@ -168,10 +168,49 @@ async fn main() -> Result<()> {
     );
 
     tracing::info!("Scheduler engine running...");
-    engine.run().await?;
+    // Run the engine until it exits on its own OR a shutdown signal arrives.
+    // Catching SIGTERM/SIGINT here is what prevents an orphaned worker holding
+    // the GPU: on a signal we fall through to `drop(control_plane)`, which sends
+    // `Shutdown` to the worker and joins the router thread. Without this, a
+    // `systemctl stop` / `docker stop` (SIGTERM) would kill the scheduler
+    // without ever telling the worker to exit.
+    tokio::select! {
+        res = engine.run() => { res?; }
+        sig = wait_for_shutdown_signal() => {
+            tracing::info!("Received {}; shutting down scheduler and notifying worker.", sig);
+        }
+    }
 
-    // Engine loop has exited; tear the control plane down gracefully (Shutdown to
-    // the worker + router-thread join) before the process returns.
+    // Engine loop has exited (or a signal arrived); tear the control plane down
+    // gracefully (Shutdown to the worker + router-thread join) before returning.
     drop(control_plane);
     Ok(())
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (the signal
+/// `systemctl stop` / `docker stop` send by default). Returns the signal name
+/// for logging. On non-unix targets only Ctrl-C is observed.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = term.recv() => "SIGTERM",
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler ({}); Ctrl-C only", e);
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
 }

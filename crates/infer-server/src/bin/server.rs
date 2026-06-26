@@ -73,12 +73,24 @@ async fn main() -> Result<()> {
     let port = config.port;
     let host = config.host.clone();
 
+    // Admission gate: bound concurrent in-flight requests so overload sheds at
+    // ingress (429) instead of growing internal queues. Read before `config` is
+    // moved into AppState. `0` => unlimited.
+    let permits = if config.max_inflight_requests == 0 {
+        tokio::sync::Semaphore::MAX_PERMITS
+    } else {
+        config.max_inflight_requests
+    };
+    let admission = Arc::new(tokio::sync::Semaphore::new(permits));
+    tracing::info!("  Max in-flight requests: {}", config.max_inflight_requests);
+
     let state = Arc::new(AppState {
         client,
         tokenizer: Arc::new(tokenizer),
         config,
         model_type,
         model_info,
+        admission,
     });
 
     let app = build_router(state);
@@ -104,12 +116,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for Ctrl+C
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received Ctrl+C, initiating shutdown...");
-        }
-    }
+    // Wait for SIGINT (Ctrl+C) or SIGTERM (systemctl/docker stop). Handling
+    // SIGTERM here lets Axum drain gracefully under a supervisor stop instead of
+    // being killed by the default disposition.
+    wait_for_shutdown_signal().await;
+    tracing::info!("Shutdown signal received, initiating shutdown...");
 
     let _ = shutdown_tx.send(()); // Signal Axum to shut down
     tracing::info!("Waiting for Axum server to exit...");
@@ -117,4 +128,29 @@ async fn main() -> Result<()> {
 
     tracing::info!("API Server stopped. Goodbye!");
     Ok(())
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM. On non-unix
+/// targets only Ctrl-C is observed.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler ({}); Ctrl-C only", e);
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

@@ -19,14 +19,25 @@ impl std::fmt::Display for CudaError {
 }
 impl std::error::Error for CudaError {}
 
+/// Classify a CUDA error observed at a **synchronization point** (i.e. a prior
+/// async kernel faulted). For every code except a bare allocation failure this
+/// poisons the context — all subsequent CUDA calls re-observe the same sticky
+/// error — so it is reported as [`OpError::Fatal`] to drive a clean worker exit
+/// instead of a per-sequence retry that can never succeed. A plain
+/// out-of-memory is recoverable (the context survives) and stays non-fatal.
+fn classify_sync_error(code: ffi::cudaError_t, context: &str) -> infer_core::ports::OpError {
+    let msg = format!("{}: {}", context, CudaError(code));
+    if code == ffi::cudaError_cudaErrorMemoryAllocation {
+        infer_core::ports::OpError::Kernel(msg)
+    } else {
+        infer_core::ports::OpError::Fatal(msg)
+    }
+}
+
 pub fn check_last_error(context: &str) -> infer_core::ports::OpResult<()> {
     let code = unsafe { ffi::cudaGetLastError() };
     if code != ffi::cudaError_cudaSuccess {
-        return Err(infer_core::ports::OpError::Kernel(format!(
-            "{}: {}",
-            context,
-            CudaError(code)
-        )));
+        return Err(classify_sync_error(code, context));
     }
     Ok(())
 }
