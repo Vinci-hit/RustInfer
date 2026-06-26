@@ -181,6 +181,45 @@ where
             "[bootstrap] graph priming skipped, eager decode: {:?}",
             e
         );
+    } else {
+        // Capture every decode graph now, before serving, so no live decode
+        // step ever pays an inline capture stall (the dominant TTFT/TPOT tail
+        // spike under load — see `Runtime::prewarm_decode_graphs`).
+        let t_warm = Instant::now();
+        match runner.prewarm_decode_graphs() {
+            Ok(()) => tracing::info!(
+                "[bootstrap] decode graphs prewarmed ({} sizes) in {:.2}s",
+                bs.capture_sizes.len(),
+                t_warm.elapsed().as_secs_f64(),
+            ),
+            Err(e) => tracing::info!(
+                "[bootstrap] decode graph prewarm skipped: {:?}",
+                e
+            ),
+        }
+        // Warm the prefill path across a length grid so the first live prefill
+        // of each shape pays no inline allocator/library cost (the residual
+        // TTFT p99 tail after decode-graph prewarm). Grid is coarse — the CUDA
+        // allocator bins sizes, so nearby lengths reuse warmed pools.
+        let prefill_grid: Vec<usize> = [
+            8usize, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 768,
+            1024,
+        ]
+        .into_iter()
+        .filter(|&l| l <= bs.max_seq_len)
+        .collect();
+        let t_pf = Instant::now();
+        match runner.prewarm_prefill_shapes(&prefill_grid) {
+            Ok(()) => tracing::info!(
+                "[bootstrap] prefill shapes prewarmed ({} lengths) in {:.2}s",
+                prefill_grid.len(),
+                t_pf.elapsed().as_secs_f64(),
+            ),
+            Err(e) => tracing::info!(
+                "[bootstrap] prefill prewarm skipped: {:?}",
+                e
+            ),
+        }
     }
 
     let max_total_kv_tokens = num_blocks * bs.block_size;
@@ -229,6 +268,23 @@ where
     let mut profile_step_count: u32 = 0;
     let mut profile_started = false;
     let mut decode_engine = DecodeEngine::new();
+
+    // Per-step stall tracer (off unless RUSTINFER_STEP_TRACE set). Logs any
+    // serve-loop *work* iteration (prefill+decode, excluding idle poll wait)
+    // whose wall time >= RUSTINFER_STEP_TRACE_MS (default 20ms), with the
+    // batch shape + KV pool state that produced it. One run → fingerprint of
+    // the wandering once-per-run stall.
+    let trace_steps = std::env::var_os("RUSTINFER_STEP_TRACE").is_some();
+    let step_trace_ms: f64 = std::env::var("RUSTINFER_STEP_TRACE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20.0);
+    if trace_steps {
+        tracing::info!(
+            "[step-trace] enabled, threshold={:.1}ms",
+            step_trace_ms
+        );
+    }
 
     loop {
         let mut ctx = WorkerCtx {
@@ -320,6 +376,15 @@ where
             }
         }
 
+        // Stall tracer: start timing the *work* section (idle poll wait above
+        // is intentionally excluded — it is not a stall).
+        let work_t0 = if trace_steps { Some(Instant::now()) } else { None };
+        let mut tr_pf_seqs = 0usize;
+        let mut tr_pf_tokens = 0usize;
+        let mut tr_pf_ms = 0f64;
+        let mut tr_dec_ms = 0f64;
+        let mut tr_dec_batch = 0usize;
+
         // ── Prefill first, then decode ──
         //
         // New prefills are admitted *before* the decode step so the first
@@ -337,6 +402,11 @@ where
         // A graph-eligible prefill writes buffer A on the compute stream; if a
         // decode step is still in flight, order that write after the pending
         // step's copy-out read of A (enqueue-only ev_out wait).
+        let pf_t0 = if trace_steps && !pending_prefills.is_empty() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         if !pending_prefills.is_empty() && decode_engine.has_pending() {
             if let Err(e) = runner.guard_buffer_a_against_pending_copyout() {
                 tracing::warn!("[serve] guard_buffer_a failed: {}", e);
@@ -346,6 +416,10 @@ where
         while !pending_prefills.is_empty() {
             prefill_rounds += 1;
             for cmd in std::mem::take(&mut pending_prefills) {
+                if trace_steps {
+                    tr_pf_seqs += cmd.segments.len();
+                    tr_pf_tokens += cmd.input_ids.len();
+                }
                 {
                     let mut ctx = WorkerCtx {
                         active: &mut active,
@@ -398,6 +472,9 @@ where
             // iteration when the prefill queue drains mid-burst.
             // pending_prefills = wait_for_prefill_quiet(data, Duration::from_millis(1));
         }
+        if let Some(t) = pf_t0 {
+            tr_pf_ms = t.elapsed().as_secs_f64() * 1e3;
+        }
 
         // ── Decode step ──
         //
@@ -420,6 +497,12 @@ where
                 }
             }
 
+            let dec_t0 = if trace_steps {
+                tr_dec_batch = active.len();
+                Some(Instant::now())
+            } else {
+                None
+            };
             if let Err(e) = decode_engine.run_step(
                 &mut runner,
                 &mut active,
@@ -435,6 +518,9 @@ where
                     return Ok(());
                 }
                 tracing::info!("[serve] decode error: {}", e);
+            }
+            if let Some(t) = dec_t0 {
+                tr_dec_ms = t.elapsed().as_secs_f64() * 1e3;
             }
 
             if let Some(max_steps) = profile_cuda_steps {
@@ -453,6 +539,26 @@ where
                         return Ok(());
                     }
                 }
+            }
+        }
+
+        if let Some(t0) = work_t0 {
+            let iter_ms = t0.elapsed().as_secs_f64() * 1e3;
+            if iter_ms >= step_trace_ms {
+                tracing::info!(
+                    "[step-trace] work={:.1}ms pf={:.1}ms(seqs={} tok={} rounds={}) dec={:.1}ms(batch={}) active={} kv[out={} free={} rel={}]",
+                    iter_ms,
+                    tr_pf_ms,
+                    tr_pf_seqs,
+                    tr_pf_tokens,
+                    prefill_rounds,
+                    tr_dec_ms,
+                    tr_dec_batch,
+                    active.len(),
+                    kv_allocator.outstanding(),
+                    kv_allocator.total_free(),
+                    kv_allocator.released_len(),
+                );
             }
         }
 

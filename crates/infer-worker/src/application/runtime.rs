@@ -6,7 +6,9 @@ use crate::domain::dtype::Dtype;
 use crate::domain::exec::{ExecDevice as Device, ExecScope};
 use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use crate::domain::model::{DecoderModel, ModelDims, SampleRows};
-use crate::domain::plan::{BatchKind, BatchPlan, SampledToken, StepOutput, StepRequest};
+use crate::domain::plan::{
+    BatchKind, BatchPlan, SampledToken, SeqStep, StepOutput, StepRequest, StopCriteria,
+};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::sampler::Sampler;
 use crate::domain::ports::{OpError, OpResult};
@@ -615,6 +617,109 @@ where
         Ok(())
     }
 
+    /// Eagerly capture a decode CUDA graph for every configured capture size,
+    /// so the first *live* decode at each batch size replays a ready graph
+    /// instead of paying an inline `forward + capture` on the serve thread.
+    ///
+    /// Without this, each size is traced lazily on its first hit during
+    /// serving (`step_graph` cold path): that step runs a full eager forward,
+    /// a `synchronize`, then a capture pass — blocking the serve loop, and with
+    /// it every prefill queued behind it. A cold-vs-warm QPS sweep pins this as
+    /// the dominant source of TTFT/TPOT tail spikes (p99 TTFT ~235–471ms cold
+    /// vs ~25–45ms once all graphs are cached). Running every capture here, at
+    /// bootstrap before `Ready`, moves that one-time cost off the hot path.
+    ///
+    /// Each warmup step is a synthetic 1-token decode against scratch KV blocks
+    /// `0..batch`. The graph bakes only the batch dimension; KV positions /
+    /// lengths are read from address-stable control buffers at replay, so a
+    /// capture traced at `kv_len = 1` replays correctly at any real length.
+    /// The scratch blocks hold throwaway state: this runs before any request is
+    /// admitted, and real sequences allocate from the free list and overwrite
+    /// whatever lands there. The decode kernels address the KV pool by raw
+    /// block id, so no allocator interaction or ownership check is needed.
+    pub fn prewarm_decode_graphs(&mut self) -> OpResult<()> {
+        if self.graph.is_none() {
+            return Ok(());
+        }
+        for batch in self.capture_sizes.clone() {
+            if batch == 0 || batch > self.cap_batch {
+                continue;
+            }
+            let seqs: Vec<SeqStep> = (0..batch)
+                .map(|i| SeqStep {
+                    sequence_id: i as u64,
+                    input_ids: vec![1],
+                    positions: vec![0],
+                    kv_write_start: 0,
+                    kv_len_after: 1,
+                    block_table: vec![i as u32],
+                })
+                .collect();
+            let req = StepRequest {
+                seqs,
+                sampling: vec![Default::default(); batch],
+                stop: StopCriteria {
+                    eos_ids: Vec::new(),
+                    generated_counts: vec![0; batch],
+                    max_tokens: vec![u32::MAX; batch],
+                    ignore_eos: vec![true; batch],
+                },
+                draft_tokens: Vec::new(),
+            };
+            // Drives the `step_graph` cold path for this exact size → capture.
+            self.step(&req)?;
+        }
+        self.scope.synchronize()?;
+        Ok(())
+    }
+
+    /// Warm the prefill path at a grid of prompt lengths, so the first *live*
+    /// prefill of a given length does not pay one-time per-shape costs inline on
+    /// the serve thread (and stall any decode it is interleaved with).
+    ///
+    /// Decode-graph prewarm (`prewarm_decode_graphs`) fixes the decode side, but
+    /// a cold-vs-warm sweep shows a residual TTFT p99 tail (~235-365ms cold,
+    /// ~40ms once warm) that tracks first-encounter prefill shapes: CUDA
+    /// caching-allocator growth as new token counts allocate new workspace
+    /// sizes (inline `cudaMalloc`), `lm_head` first-touch, and any shape-keyed
+    /// library state the eager prefill path builds. Running a synthetic prefill
+    /// per grid length here pays all of that at bootstrap instead.
+    ///
+    /// Each warmup is a single synthetic sequence of `len` tokens routed through
+    /// the real `step()` prefill path (`num_tokens > batch`), so it exercises the
+    /// exact GEMM mode, ragged attention, and sampling the live path uses. The
+    /// allocator rounds sizes to bins, so a coarse grid covers nearby lengths;
+    /// scratch KV blocks `0..len` are throwaway (overwritten by real requests).
+    pub fn prewarm_prefill_shapes(&mut self, lengths: &[usize]) -> OpResult<()> {
+        let max_len = self.max_seq_len.min(self.cap_num_tokens).min(self.max_blocks_per_seq);
+        for &len in lengths {
+            if len == 0 || len > max_len {
+                continue;
+            }
+            let req = StepRequest {
+                seqs: vec![SeqStep {
+                    sequence_id: 0,
+                    input_ids: vec![1; len],
+                    positions: (0..len as i32).collect(),
+                    kv_write_start: 0,
+                    kv_len_after: len as i32,
+                    block_table: (0..len as u32).collect(),
+                }],
+                sampling: vec![Default::default(); 1],
+                stop: StopCriteria {
+                    eos_ids: Vec::new(),
+                    generated_counts: vec![0; 1],
+                    max_tokens: vec![u32::MAX; 1],
+                    ignore_eos: vec![true; 1],
+                },
+                draft_tokens: Vec::new(),
+            };
+            self.step(&req)?;
+        }
+        self.scope.synchronize()?;
+        Ok(())
+    }
+
     fn step_graph(
         &mut self,
         slot: GraphSlotId,
@@ -630,15 +735,19 @@ where
                 slot.0
             )));
         };
-        // A captured graph hard-codes the batch it was traced with. Only replay
-        // when the live decode batch matches the slot exactly (decode ⇒
-        // num_tokens == batch); otherwise fall back to eager rather than feed a
-        // mismatched batch through the wrong graph. (Padding to the capture size
-        // is a future optimization.)
-        if slot_batch != plan.batch || plan.num_tokens != plan.batch {
+        // Pad the live decode batch UP to the captured slot: `slot_for_batch`
+        // rounds `plan.batch` up to the smallest capture size >= batch, and
+        // replaying that (>= batch) graph is correct — the zero-padded control
+        // tail rows [batch, slot) are inert (q_len=0/kv_len=0 ⇒ no KV scatter,
+        // no attention read) and their forward output in C[batch..slot] is never
+        // read (`decode_output_from_c` reads only the real `plan.batch` rows).
+        // Requires a pure decode step (num_tokens == batch); ragged/spec steps
+        // (num_tokens > batch) still run eager. See `issue_decode_abc` for the
+        // same fix on the hot ABC decode path.
+        if plan.num_tokens != plan.batch || slot_batch < plan.batch {
             return self.step_eager(plan, req);
         }
-        let key = plan.batch as u64;
+        let key = slot_batch as u64;
 
         // Refresh the persistent input-id buffer in place (decode: one new token
         // per sequence). The graph's `embed` reads from this fixed address.
@@ -660,15 +769,15 @@ where
             // Hot path: pure replay. `upload_index` (in `step`) and the id
             // refresh above already rewrote every input buffer this graph reads.
             self.scope.graph_launch(key)?;
-        } else {
-            // Cold path. First run one EAGER forward at this exact shape so the
-            // libraries that lazily plan/benchmark on a cold shape (cuDNN SDPA
-            // plan cache, cuBLASLt algo selection) populate their shape-keyed
-            // caches — those code paths do mallocs/private-stream launches that
-            // are illegal under stream capture. This eager pass also produces a
-            // correct result; the KV scatter it performs writes the same values
-            // at the same paged positions the replay will, so the immediately
-            // following capture+launch is idempotent on KV state.
+        } else if slot_batch == plan.batch {
+            // Cold path, exact shape. First run one EAGER forward at this exact
+            // shape so the libraries that lazily plan/benchmark on a cold shape
+            // (cuDNN SDPA plan cache, cuBLASLt algo selection) populate their
+            // shape-keyed caches — those code paths do mallocs/private-stream
+            // launches that are illegal under stream capture. This eager pass
+            // also produces a correct result; the KV scatter it performs writes
+            // the same values at the same paged positions the replay will, so
+            // the immediately following capture+launch is idempotent on KV state.
             self.forward_finalize_argmax(plan, &input_ids)?;
             self.scope.synchronize()?;
 
@@ -682,6 +791,11 @@ where
             self.scope.graph_capture_end(key)?;
             tracing::info!("[graph] captured decode graph (forward+argmax) for batch={}", plan.batch);
             self.scope.graph_launch(key)?;
+        } else {
+            // Padded slot whose graph is not yet captured (boot prewarm off):
+            // can't capture a `slot_batch` graph from a `batch`-sized plan, so
+            // fall back to a correct eager step at the real batch.
+            return self.step_eager(plan, req);
         }
         // The graph already produced the per-row argmax in buffer C; just read
         // it back (no eager finalize/sample). The decode graph path is always
@@ -1148,38 +1262,42 @@ where
             0,
             true,
         );
-        let graph_key = batch as u64;
-        let use_graph = match self.decide(&plan) {
-            GraphDecision::Graph(slot) => {
-                self.graph.as_ref().and_then(|g| g.slot_size(slot)) == Some(batch)
-            }
+        // Pad the live decode batch UP to the next captured graph size and
+        // replay that (possibly larger) graph. `slot_for_batch` rounds `batch`
+        // up to the smallest capture size >= batch; replaying it is correct
+        // because the per-seq control buffers are zero-padded to capacity, so
+        // the tail rows [batch, slot) carry q_len=0 / kv_len=0: the KV scatter
+        // writes nothing and paged attention reads nothing for them, and the
+        // forward is per-row independent (no cross-row reduction), so their
+        // garbage output lands only in C[batch..slot], which the merge — run at
+        // the real `batch` (old_batch=batch) — never reads. This eliminates the
+        // eager fallback that every NON-capture batch size used to take: an
+        // eager `forward_finalize_argmax` on a cold (batch × kv_len) shape pays
+        // the full lazy cuDNN-SDPA-plan + cuBLASLt-algo build (~400ms measured),
+        // inline on the serve thread — the dominant wandering TTFT/TPOT tail
+        // spike under load ("抖动"). With boot prewarm every slot is ready, so
+        // this is a pure replay.
+        let slot_batch = match self.decide(&plan) {
+            GraphDecision::Graph(slot) => self.graph.as_ref().and_then(|g| g.slot_size(slot)),
             // This ABC path only runs for decode-only steps, so a prefill-graph
             // decision never reaches here; treat it as eager for exhaustiveness.
-            GraphDecision::PrefillGraph(_) => false,
-            GraphDecision::Eager => false,
+            GraphDecision::PrefillGraph(_) | GraphDecision::Eager => None,
         };
-        if use_graph {
-            if self.scope.graph_ready(graph_key) {
-                self.scope.graph_launch(graph_key)?;
-            } else {
-                // Cold path: warm the lazy library caches with one eager pass,
-                // then capture + replay (mirrors `step_graph`).
-                self.forward_finalize_argmax(&plan, &input_ids)?;
-                self.scope.synchronize()?;
-                self.scope.graph_capture_begin()?;
-                if let Err(e) = self.forward_finalize_argmax(&plan, &input_ids) {
-                    let _ = self.scope.graph_capture_end(graph_key);
-                    return Err(e);
-                }
-                self.scope.graph_capture_end(graph_key)?;
-                tracing::info!(
-                    "[graph] captured decode graph (forward+argmax) for batch={}",
-                    batch
-                );
-                self.scope.graph_launch(graph_key)?;
+        match slot_batch {
+            Some(sb) if self.scope.graph_ready(sb as u64) => {
+                // Hot path: pure replay of the (>= batch) captured graph.
+                self.scope.graph_launch(sb as u64)?;
             }
-        } else {
-            self.forward_finalize_argmax(&plan, &input_ids)?;
+            // No ready graph for this shape (boot prewarm off/failed, or
+            // batch > max capture size): run EAGER at the real batch. We never
+            // capture inline at serve time — an inline capture is a full eager
+            // forward + `synchronize` + trace pass that blocks the serve loop
+            // (and every prefill queued behind it); that lazy capture WAS the
+            // original TTFT/TPOT stall. Every decode graph is captured once at
+            // boot by `prewarm_decode_graphs`; serving only replays or runs eager.
+            _ => {
+                self.forward_finalize_argmax(&plan, &input_ids)?;
+            }
         }
 
         // ── upload stop metadata + run the compact merge (C → A) ──
