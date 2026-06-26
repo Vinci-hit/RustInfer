@@ -77,6 +77,14 @@ pub struct SchedulerEngine {
     /// New-request ingestion stage. Owns the monotonic SequenceId counter.
     ingestion: crate::application::IngestionSystem,
 
+    // ─── Batch-accumulation (throughput knob) ───
+    /// Max time to hold freshly arrived requests while accumulating a larger
+    /// prefill batch. `None` => low-latency mode (dispatch immediately).
+    batch_wait: Option<std::time::Duration>,
+    /// Absolute instant at which the currently-open accumulation window must
+    /// flush. `Some` only while requests are being deliberately held.
+    schedule_deadline: Option<tokio::time::Instant>,
+
     // ─── Background decode ───
     /// Raw worker output receiver — extracted from the `WorkerTransport`
     /// at construction time and consumed by `run()` to spawn the
@@ -150,9 +158,11 @@ impl SchedulerEngine {
             default_worker,
             codec: MsgPackCodec,
             metrics: std::sync::Arc::new(MetricsRecorder::new(config.metrics_enabled)),
+            batch_wait: config.batch_wait,
             config,
             iteration_id: 0,
             ingestion: crate::application::IngestionSystem::new(),
+            schedule_deadline: None,
             worker_output_rx,
         }
     }
@@ -267,6 +277,66 @@ impl SchedulerEngine {
 
         let (workflow, dispatch, mut ctx) = self.split_for_workflow();
         workflow.try_schedule(&mut ctx, dispatch).await
+    }
+
+    /// Schedule prefills, honoring the batch-accumulation window.
+    ///
+    /// Low-latency mode (`batch_wait == None`) dispatches immediately, exactly
+    /// as the eager path always did. Throughput mode holds freshly arrived
+    /// requests until the accumulation window closes (deadline elapsed, batch
+    /// full, or continuation work present), arming a timer so the held batch
+    /// flushes even if no further events arrive.
+    pub(crate) async fn maybe_schedule(&mut self) -> Result<()> {
+        if !self.can_schedule() {
+            return Ok(());
+        }
+        if self.should_defer_new_prefills() {
+            // Open the accumulation window on the first held request; keep the
+            // existing deadline otherwise so the window is measured from the
+            // oldest waiter (bounded TTFT), not reset by later arrivals.
+            if self.schedule_deadline.is_none() {
+                if let Some(wait) = self.batch_wait {
+                    self.schedule_deadline = Some(tokio::time::Instant::now() + wait);
+                }
+            }
+            return Ok(());
+        }
+        self.schedule_deadline = None;
+        self.run_iteration().await
+    }
+
+    /// Whether to hold freshly arrived prefills to accumulate a larger batch.
+    ///
+    /// Returns false (schedule now) in low-latency mode, when there is nothing
+    /// fresh to batch, when the batch is already seq-saturated, when there is
+    /// continuation work that must not be stalled, or once the accumulation
+    /// window has elapsed.
+    fn should_defer_new_prefills(&self) -> bool {
+        if self.batch_wait.is_none() {
+            return false;
+        }
+        let waiting = self.requests.waiting();
+        if waiting.is_empty() || waiting.len() >= self.config.max_num_seqs {
+            return false;
+        }
+        if self.requests.has_prefilling_continuations() {
+            return false;
+        }
+        match self.schedule_deadline {
+            // Window still open: keep holding.
+            Some(deadline) => tokio::time::Instant::now() < deadline,
+            // No window yet: open one and hold.
+            None => true,
+        }
+    }
+
+    /// Flush the accumulated prefill batch when the wait window elapses.
+    pub(crate) async fn on_batch_timer(&mut self) -> Result<()> {
+        self.schedule_deadline = None;
+        if self.can_schedule() {
+            self.run_iteration().await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn metrics_handle(&self) -> MetricsHandle {
@@ -409,6 +479,7 @@ impl SchedulerEngine {
         decoded_rx: &mut mpsc::UnboundedReceiver<SchedulerEvent>,
     ) -> SchedulerEvent {
         let has_work = self.has_pending_work() || self.has_in_flight_batch();
+        let deadline = self.schedule_deadline;
         let frontend = self.dispatch.frontend_mut();
         let control_events = &mut self.control_events;
 
@@ -416,6 +487,10 @@ impl SchedulerEngine {
             biased;
             Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
             result = frontend.recv_event() => frontend_result_to_event(result),
+            // Batch-accumulation deadline (throughput mode only). The deadline
+            // is absolute, so re-arming this branch each poll fires at the same
+            // wall-clock instant regardless of intervening events.
+            _ = sleep_until_opt(deadline), if deadline.is_some() => SchedulerEvent::BatchTimer,
             Some(event) = decoded_rx.recv(), if has_work => event,
         }
     }
@@ -463,6 +538,18 @@ async fn decode_worker_output(
     }
     // Raw channel closed — worker transport shut down.
     let _ = decoded_tx.send(SchedulerEvent::WorkerShutdown);
+}
+
+/// Sleep until an optional absolute deadline.
+///
+/// `None` yields a future that never completes — safe because the
+/// `select!` branch using it is disabled (`if deadline.is_some()`) in that
+/// case, so it is constructed but never polled.
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(dl) => tokio::time::sleep_until(dl).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Translate a `Result<FrontendEvent>` from the frontend transport

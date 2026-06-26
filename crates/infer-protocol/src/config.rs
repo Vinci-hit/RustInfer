@@ -78,6 +78,15 @@ pub struct RustInferConfig {
     #[serde(default)]
     pub prefill_sjf: bool,
 
+    /// Max time (milliseconds) the scheduler waits accumulating freshly
+    /// arrived requests into a single, larger prefill batch before
+    /// dispatching. `0` => low-latency mode: every request is dispatched as
+    /// soon as it arrives (no waiting). A non-zero value raises throughput
+    /// under bursty / high-QPS load by amortizing per-step overhead across a
+    /// bigger prefill, at the cost of up to this much added TTFT.
+    #[serde(default)]
+    pub batch_wait_ms: u64,
+
     /// Enable RadixTree prefix caching (paged mode only).
     #[serde(default)]
     pub enable_prefix_caching: bool,
@@ -220,6 +229,16 @@ impl RustInferConfig {
             None
         } else {
             Some(self.chunked_prefill_size)
+        }
+    }
+
+    /// Batch-accumulation wait as `Option<Duration>` (0 => None /
+    /// low-latency mode). See [`Self::batch_wait_ms`].
+    pub fn batch_wait(&self) -> Option<std::time::Duration> {
+        if self.batch_wait_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(self.batch_wait_ms))
         }
     }
 

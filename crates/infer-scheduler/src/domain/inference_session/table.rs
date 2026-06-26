@@ -301,6 +301,15 @@ impl RequestTable {
         self.by_sequence.get(&sequence_id).cloned()
     }
 
+    /// Whether any prefilling session has an unscheduled continuation chunk
+    /// (a partial prefill awaiting more work). Cheaper than
+    /// [`Self::prefilling_continuations`] — short-circuits with no allocation.
+    pub fn has_prefilling_continuations(&self) -> bool {
+        self.prefilling
+            .values()
+            .any(|seq| !seq.has_inflight() && seq.remaining_tokens() > 0)
+    }
+
     pub fn prefilling_continuations(&self) -> Vec<(RequestId, usize)> {
         self.prefilling
             .values()

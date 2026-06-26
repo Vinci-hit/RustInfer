@@ -30,6 +30,12 @@ max_batch_tokens = 8192
 max_batch_seqs = 256
 max_model_len = 1024
 
+# Throughput knob: max time (ms) the scheduler waits accumulating freshly
+# arrived requests into one larger prefill batch before dispatching.
+# 0 => low-latency mode (dispatch each request immediately, no waiting).
+# Non-zero trades up to this much TTFT for higher throughput under high QPS.
+batch_wait_ms = 10
+
 # Paged KV.
 paged_block_size = 1
 chunked_prefill_size = 0      # 0 => disabled (whole prompt in one step). Set 256 to re-enable the graph-prefill foundation (see docs/HANDOFF_graph_prefill.md)

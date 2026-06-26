@@ -76,6 +76,10 @@ async fn main() -> Result<()> {
     tracing::info!("  paged_block_size: {}", paged_block_size);
     tracing::info!("  chunked_prefill_size: {:?}", cfg.chunked_prefill());
     tracing::info!("  enable_prefix_caching: {}", cfg.enable_prefix_caching);
+    match cfg.batch_wait() {
+        Some(d) => tracing::info!("  batch_wait: {:?} (throughput mode)", d),
+        None => tracing::info!("  batch_wait: off (low-latency mode)"),
+    }
 
     // Build config from the shared launch config (single mapping + validation).
     let mut config = SchedulerConfig::from_launch(&cfg, scheduler_mode, paged_block_size);

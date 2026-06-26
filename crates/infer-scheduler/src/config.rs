@@ -42,6 +42,11 @@ pub struct SchedulerConfig {
     pub max_prefill_seqs_per_iter: usize,
     /// Shortest-job-first prefill ordering within an iteration (B2).
     pub prefill_sjf: bool,
+    /// Max time to wait accumulating freshly arrived requests into a larger
+    /// prefill batch before dispatching. `None` => low-latency mode (dispatch
+    /// each request immediately). Throughput knob — see
+    /// [`infer_protocol::RustInferConfig::batch_wait_ms`].
+    pub batch_wait: Option<std::time::Duration>,
     /// Whether prefix caching is enabled (requires Paged mode).
     pub enable_prefix_caching: bool,
 
@@ -84,6 +89,7 @@ impl SchedulerConfig {
             chunked_prefill_size: cfg.chunked_prefill(),
             max_prefill_seqs_per_iter: cfg.max_prefill_seqs_per_iter,
             prefill_sjf: cfg.prefill_sjf,
+            batch_wait: cfg.batch_wait(),
             enable_prefix_caching,
             frontend_endpoint: cfg.frontend_endpoint(),
             worker_push_endpoint: cfg.worker_in_endpoint(),
@@ -122,6 +128,7 @@ impl Default for SchedulerConfig {
             chunked_prefill_size: None,
             max_prefill_seqs_per_iter: 0,
             prefill_sjf: false,
+            batch_wait: None,
             enable_prefix_caching: false,
             frontend_endpoint: "ipc:///tmp/rustinfer.ipc".to_string(),
             worker_push_endpoint: "ipc:///tmp/rustinfer-worker-in.ipc".to_string(),

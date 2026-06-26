@@ -59,9 +59,7 @@ pub async fn run_event_loop(
             SchedulerEvent::NewRequest { client_id, request } => {
                 let _t = std::time::Instant::now();
                 engine.handle_new_request(client_id, request);
-                if engine.can_schedule() {
-                    engine.run_iteration().await?;
-                }
+                engine.maybe_schedule().await?;
                 if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
                     tracing::info!(us = _t.elapsed().as_micros() as u64, "SCHED_TRACE: NewRequest->dispatch");
                 }
@@ -71,23 +69,22 @@ pub async fn run_event_loop(
                 reason: _,
             } => {
                 engine.cancel_request_by_external_id(&external_id).await?;
-                if engine.can_schedule() {
-                    engine.run_iteration().await?;
-                }
+                engine.maybe_schedule().await?;
             }
             SchedulerEvent::WorkerLlmStep(_) | SchedulerEvent::WorkerDiffusionStep(_) => {
                 let _t = std::time::Instant::now();
                 engine.handle_step_output(event).await?;
-                engine.run_iteration().await?;
+                engine.maybe_schedule().await?;
                 if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
                     tracing::info!(us = _t.elapsed().as_micros() as u64, "SCHED_TRACE: StepOutput->forward");
                 }
             }
             SchedulerEvent::ControlSignal(ev) => {
                 engine.on_control_event(ev).await?;
-                if engine.can_schedule() {
-                    engine.run_iteration().await?;
-                }
+                engine.maybe_schedule().await?;
+            }
+            SchedulerEvent::BatchTimer => {
+                engine.on_batch_timer().await?;
             }
             SchedulerEvent::FrontendShutdown => {
                 tracing::info!("Frontend transport closed, shutting down");

@@ -34,6 +34,9 @@ pub enum SchedulerEvent {
     WorkerDiffusionStep(DiffusionBatchOutput),
     /// Control-plane event (heartbeat, AllocFailed, etc.).
     ControlSignal(ControlEvent),
+    /// Batch-accumulation deadline elapsed — flush deferred prefills.
+    /// Only emitted when `batch_wait` is enabled (throughput mode).
+    BatchTimer,
     /// Frontend transport closed.
     FrontendShutdown,
     /// Worker transport closed.
