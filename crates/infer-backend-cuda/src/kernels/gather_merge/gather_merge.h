@@ -41,6 +41,32 @@ void merge_compact_decode(
     cudaStream_t stream
 );
 
+// Build the NEXT decode step's control plane on-device from this step's
+// survivors (after merge_compact_decode). Gathers block tables/kv_lens to the
+// compacted front, appends each row's next-step KV slot, advances
+// position/length, rebuilds the decode tile layout, and zeroes the phantom
+// tail. block_tables_out / kv_lens_out are scratch (gather cannot be in-place);
+// the caller copies them back into the live buffers. Replaces the per-step host
+// block-table rebuild + upload with O(batch) device work.
+void compact_extend_control(
+    int* block_tables,
+    int* block_tables_scratch,
+    int* kv_lens,
+    int* kv_lens_scratch,
+    int* seq_positions_out,
+    int* seq_lens_step_out,
+    int* rope_positions_out,
+    int* cu_q_lens_out,
+    int* block2req_out,
+    int* block2tile_out,
+    const int* active_src_rows,
+    const int* counts,
+    const int* new_slots,
+    int mbps,
+    int cap_batch,
+    cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

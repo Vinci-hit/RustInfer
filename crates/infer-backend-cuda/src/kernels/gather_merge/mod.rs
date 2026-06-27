@@ -36,6 +36,25 @@ unsafe extern "C" {
         counts: *mut i32,
         stream: cudaStream_t,
     );
+    #[allow(clippy::too_many_arguments)]
+    fn compact_extend_control(
+        block_tables: *mut i32,
+        block_tables_scratch: *mut i32,
+        kv_lens: *mut i32,
+        kv_lens_scratch: *mut i32,
+        seq_positions_out: *mut i32,
+        seq_lens_step_out: *mut i32,
+        rope_positions_out: *mut i32,
+        cu_q_lens_out: *mut i32,
+        block2req_out: *mut i32,
+        block2tile_out: *mut i32,
+        active_src_rows: *const i32,
+        counts: *const i32,
+        new_slots: *const i32,
+        mbps: i32,
+        cap_batch: i32,
+        stream: cudaStream_t,
+    );
 }
 
 /// Copy new-admission seed tokens from B into A at `start..start+count`.
@@ -75,6 +94,60 @@ pub struct MergeCompactDecodeArgs<'a> {
     pub finished_tokens: &'a Tensor<i32, Cuda>,
     pub counts: &'a Tensor<i32, Cuda>,
     pub stream: cudaStream_t,
+}
+
+/// Arguments for the device-resident decode control-plane builder.
+pub struct CompactExtendControlArgs<'a> {
+    /// Live block tables (this step's order). The gather reads it, then the
+    /// launcher copies the scratch result back over it.
+    pub block_tables: &'a mut Tensor<i32, Cuda>,
+    /// Scratch gather target for block tables ([cap_batch * mbps]).
+    pub block_tables_scratch: &'a mut Tensor<i32, Cuda>,
+    /// Live kv_lens (read by the gather, then overwritten by the copy-back).
+    pub kv_lens: &'a mut Tensor<i32, Cuda>,
+    /// Scratch gather target for kv_lens ([cap_batch]).
+    pub kv_lens_scratch: &'a mut Tensor<i32, Cuda>,
+    pub seq_positions_out: &'a mut Tensor<i32, Cuda>,
+    pub seq_lens_step_out: &'a mut Tensor<i32, Cuda>,
+    pub rope_positions_out: &'a mut Tensor<i32, Cuda>,
+    pub cu_q_lens_out: &'a mut Tensor<i32, Cuda>,
+    pub block2req_out: &'a mut Tensor<i32, Cuda>,
+    pub block2tile_out: &'a mut Tensor<i32, Cuda>,
+    pub active_src_rows: &'a Tensor<i32, Cuda>,
+    pub counts: &'a Tensor<i32, Cuda>,
+    pub new_slots: &'a Tensor<i32, Cuda>,
+    pub mbps: usize,
+    pub cap_batch: usize,
+    pub stream: cudaStream_t,
+}
+
+/// Build the next decode step's control plane on-device from this step's
+/// survivors. See the `compact_extend_control` C declaration for semantics.
+pub fn compact_extend_control_into(args: CompactExtendControlArgs<'_>) -> OpResult<()> {
+    if args.cap_batch == 0 {
+        return Ok(());
+    }
+    unsafe {
+        compact_extend_control(
+            args.block_tables.data_ptr_mut(),
+            args.block_tables_scratch.data_ptr_mut(),
+            args.kv_lens.data_ptr_mut(),
+            args.kv_lens_scratch.data_ptr_mut(),
+            args.seq_positions_out.data_ptr_mut(),
+            args.seq_lens_step_out.data_ptr_mut(),
+            args.rope_positions_out.data_ptr_mut(),
+            args.cu_q_lens_out.data_ptr_mut(),
+            args.block2req_out.data_ptr_mut(),
+            args.block2tile_out.data_ptr_mut(),
+            args.active_src_rows.data_ptr(),
+            args.counts.data_ptr(),
+            args.new_slots.data_ptr(),
+            args.mbps as i32,
+            args.cap_batch as i32,
+            args.stream,
+        );
+    }
+    Ok(())
 }
 
 /// Commit decode output C into stable A, compacting non-finished rows.

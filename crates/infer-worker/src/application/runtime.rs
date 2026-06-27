@@ -20,7 +20,8 @@ use half::bf16;
 #[cfg(feature = "cuda")]
 use crate::infrastructure::cuda::{
     kernels::gather_merge::{
-        append_decode_admissions_into, merge_compact_decode_into, MergeCompactDecodeArgs,
+        append_decode_admissions_into, compact_extend_control_into, merge_compact_decode_into,
+        CompactExtendControlArgs, MergeCompactDecodeArgs,
     },
     Cuda,
 };
@@ -68,6 +69,13 @@ where
     block_tables_host: Vec<i32>,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
+    /// Async-decode device control plane scratch (built lazily on first async
+    /// step). `compact_extend_control` gathers the compacted block tables /
+    /// kv_lens into these (an in-place gather would race), and the caller copies
+    /// them back into `kv_index`. `new_slots_dev` holds the next step's KV slot
+    /// per output row, uploaded O(batch) each async step (vs the O(batch*seqlen)
+    /// host block-table rebuild the async path eliminates).
+    async_ctrl: Option<AsyncControlBuffers<D>>,
     /// Count of distinct single-seq prefill graphs captured so far (Stage A
     /// keys each prefill graph by exact `num_tokens`). Bounds graph memory:
     /// once it reaches `PREFILL_GRAPH_BUDGET`, further uncaptured prefill
@@ -125,6 +133,21 @@ pub struct AbcBuffers<D: Device> {
     /// async (pageable host memory would make `cudaMemcpyAsync` host-synchronous
     /// and serialize the pipeline).
     pub pinned: bool,
+}
+
+/// Scratch buffers for the device-resident decode control plane. Allocated
+/// lazily on the first decode step that builds it (they cost
+/// `cap_batch * (max_blocks_per_seq + 1)` i32s).
+#[cfg(feature = "cuda")]
+struct AsyncControlBuffers<D: Device> {
+    /// Gather target for the compacted block tables ([cap_batch * mbps]).
+    block_tables_scratch: Tensor<i32, D>,
+    /// Gather target for the compacted kv_lens ([cap_batch]).
+    kv_lens_scratch: Tensor<i32, D>,
+    /// Next-step KV slot per output row, device side ([cap_batch]). Uploaded
+    /// O(batch) each step from a small pageable Vec (the copy is host-sync for
+    /// pageable memory, so no pinned staging is needed for this tiny transfer).
+    new_slots_dev: Tensor<i32, D>,
 }
 
 /// RAII guard that restores the default (decode) GEMM mode when an eager prefill
@@ -279,6 +302,7 @@ where
             cap_batch,
             capture_sizes,
             graph: None,
+            async_ctrl: None,
             input_ids_buf,
             prefill_ids_buf,
             prefill_ids_host,
@@ -1152,6 +1176,28 @@ where
     /// this step's host commit/send. Only one step may be in flight at a time
     /// (the host map mirrors and buffer C are single-buffered).
     #[allow(clippy::too_many_arguments)]
+    /// Lazily allocate the async-decode control-plane scratch (only when the
+    /// async path is first used). Sized to capacity so addresses are stable.
+    fn ensure_async_ctrl(&mut self) -> OpResult<()> {
+        if self.async_ctrl.is_some() {
+            return Ok(());
+        }
+        let device = self.scope.device();
+        let cb = self.cap_batch.max(1);
+        let mbps = self.max_blocks_per_seq.max(1);
+        let block_tables_scratch =
+            Tensor::<i32, Cuda>::zeros(Shape::from_slice(&[cb * mbps]), device)?;
+        let kv_lens_scratch = Tensor::<i32, Cuda>::zeros(Shape::from_slice(&[cb]), device)?;
+        let new_slots_dev = Tensor::<i32, Cuda>::zeros(Shape::from_slice(&[cb]), device)?;
+        self.async_ctrl = Some(AsyncControlBuffers {
+            block_tables_scratch,
+            kv_lens_scratch,
+            new_slots_dev,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_decode_abc(
         &mut self,
         req: &StepRequest,
@@ -1160,6 +1206,16 @@ where
         max_tokens: &[u32],
         ignore_eos: &[bool],
         eos_ids: &[i32],
+        // Async device control plane (high-QPS path). `Some(next_slots)` enables
+        // it: after the forward+merge, build the NEXT step's per-row control on
+        // device (`compact_extend_control`) instead of a host rebuild+upload.
+        // `next_slots[r]` is the next-step KV slot for output row r (the Stage-1
+        // speculative reservation). `reuse_device_control` skips this step's
+        // `upload_index` because the previous step's `compact_extend` already
+        // left this step's control on device; false on the first async step or
+        // after any admission/eviction re-seeds it from the host request.
+        async_next_slots: Option<&[u32]>,
+        reuse_device_control: bool,
     ) -> OpResult<()> {
         let plan = self.build_plan(req)?;
         let batch = plan.batch;
@@ -1206,7 +1262,16 @@ where
             self.abc.pinned = true;
         }
 
-        self.upload_index(&plan, req)?;
+        // Async path: when reusing the device-resident control plane, this
+        // step's block tables / kv_lens / positions were left on device by the
+        // previous step's `compact_extend_control`; skip the host rebuild +
+        // upload entirely. Otherwise (proven path, or first/post-change async
+        // step) seed the device control from the host request as usual.
+        if async_next_slots.is_some() && reuse_device_control {
+            // Control already on device. Nothing to upload.
+        } else {
+            self.upload_index(&plan, req)?;
+        }
 
         let cfg = self.scope.device().config.clone();
 
@@ -1338,6 +1403,52 @@ where
                 stream,
             })?;
         }
+
+        // ── Async path: build NEXT step's device control plane on-device ──
+        // After the merge has produced `active_src_rows` + `counts`, gather the
+        // surviving rows' block tables / kv_lens to the compacted front, append
+        // each row's next-step KV slot, advance position/length, and rebuild the
+        // decode tile layout — replacing the host O(batch*seq_len) rebuild +
+        // upload with O(batch) device work. Runs on the compute stream after the
+        // merge; the next step's forward (after the finalize sync) reads the
+        // result. `new_slots` are the Stage-1 speculative reservations.
+        if let Some(next_slots) = async_next_slots {
+            self.ensure_async_ctrl()?;
+            let device = self.scope.device();
+            // Upload the next-step slots (O(batch)); the kernel uses the first
+            // `active` of them (active is device-resident).
+            let slots_i32: Vec<i32> = next_slots.iter().map(|&s| s as i32).collect();
+            {
+                let ctrl = self.async_ctrl.as_ref().expect("async_ctrl ensured");
+                unsafe {
+                    upload_i32_prefix(device, &ctrl.new_slots_dev, &slots_i32)?;
+                }
+            }
+            let mbps = self.max_blocks_per_seq;
+            let cap_batch = self.cap_batch;
+            let stream = ExecScope::stream(&self.scope).0;
+            let _guard = self.scope.enter();
+            let ctrl = self.async_ctrl.as_mut().expect("async_ctrl ensured");
+            compact_extend_control_into(CompactExtendControlArgs {
+                block_tables: &mut self.kv_index.block_tables,
+                block_tables_scratch: &mut ctrl.block_tables_scratch,
+                kv_lens: &mut self.kv_index.kv_lens,
+                kv_lens_scratch: &mut ctrl.kv_lens_scratch,
+                seq_positions_out: &mut self.kv_index.seq_positions,
+                seq_lens_step_out: &mut self.kv_index.seq_lens_step,
+                rope_positions_out: &mut self.kv_index.rope_positions,
+                cu_q_lens_out: &mut self.kv_index.cu_q_lens,
+                block2req_out: &mut self.kv_index.block2req,
+                block2tile_out: &mut self.kv_index.block2tile,
+                active_src_rows: &self.abc.active_src_rows_dev,
+                counts: &self.abc.counts_dev,
+                new_slots: &ctrl.new_slots_dev,
+                mbps,
+                cap_batch,
+                stream,
+            })?;
+        }
+
         // A now holds the committed/compacted tokens (compute). Mark it so the
         // copy-out stream may begin downloading once compute reaches here. (ev_a)
         cfg.record_compute_a()?;

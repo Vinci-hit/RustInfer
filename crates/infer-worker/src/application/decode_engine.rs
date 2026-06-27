@@ -26,6 +26,9 @@ struct PendingDecode {
     new_indices: Vec<u32>,
     assigned: Vec<AssignedIndices>,
     batch: usize,
+    /// True when this step ran the async `compact_extend` (device control for
+    /// the next step is ready). Drives whether commit records `device_rows`.
+    device_prepared: bool,
 }
 
 pub struct DecodeEngine {
@@ -38,6 +41,31 @@ pub struct DecodeEngine {
     /// The in-flight ABC step (issued, awaiting `finalize_decode_abc`). The
     /// 1-deep pipeline: at most one step is in flight at a time.
     pending: Option<PendingDecode>,
+    /// KV slots speculatively reserved during the PREVIOUS step's in-flight
+    /// forward, for the NEXT step's rows. Reserving here moves the bulk KV
+    /// allocation off the decode critical path (it overlaps GPU compute instead
+    /// of running after the copy-out sync). Sized to the issuing step's batch on
+    /// the optimistic assumption every row survives; `prepare_step` consumes
+    /// these, frees any surplus when rows finished, and tops up for fresh
+    /// admissions. Best-effort: under a tight pool nothing is reserved and
+    /// `prepare_step` falls back to the on-path relief alloc. These slots are
+    /// outstanding-but-unowned (in no block table), so they must be freed on
+    /// drain/idle to avoid a pool leak.
+    prealloc: Vec<u32>,
+    /// Device-resident decode control plane: each step maintains the per-row
+    /// control (block tables, kv_lens, positions) ON DEVICE via
+    /// `compact_extend_control` instead of rebuilding + uploading it from the
+    /// host, cutting the per-step host cost from O(batch * seq_len) to O(batch).
+    /// Used whenever the next-step KV slots were speculatively reserved (the
+    /// common case); the host-upload path is the fallback on the first step,
+    /// under pool pressure, or any step whose row set changed via an admission
+    /// or out-of-band eviction.
+    ///
+    /// `device_rows` is the row order whose control plane the previous step's
+    /// `compact_extend` left ready on device (= last step's survivors). When it
+    /// matches the current step's order exactly the device control is valid and
+    /// the host rebuild+upload is skipped; otherwise the step re-seeds it.
+    device_rows: Vec<u64>,
 }
 
 impl DecodeEngine {
@@ -46,15 +74,19 @@ impl DecodeEngine {
             rows: DecodeRows::new(),
             prev_a_rows: Vec::new(),
             pending: None,
+            prealloc: Vec::new(),
+            device_rows: Vec::new(),
         }
     }
 
     /// Hard reset. Drops any in-flight step WITHOUT finalizing it (its tokens
-    /// are lost) — only call on drain/shutdown, never mid-stream.
+    /// are lost) — only call on drain/shutdown, never mid-stream. `prealloc` is
+    /// reclaimed separately by `reclaim_pending` (it needs the allocator).
     pub fn clear(&mut self) {
         self.rows.clear();
         self.prev_a_rows.clear();
         self.pending = None;
+        self.device_rows.clear();
     }
 
     /// True while a step is issued but not yet finalized. The serve loop must
@@ -64,15 +96,40 @@ impl DecodeEngine {
         self.pending.is_some()
     }
 
-    /// Free the in-flight step's freshly-allocated KV slots and drop it. Those
-    /// slots are NOT yet in any seq's block table (`commit_results` appends
-    /// them), so an `Immediate` drain that evicts every seq would otherwise
-    /// leak them. Call this BEFORE `clear()` on drain.
+    /// Free the in-flight step's freshly-allocated KV slots and drop it, plus
+    /// any speculatively-reserved next-step slots. Neither set is yet in a seq's
+    /// block table (`commit_results` appends the in-flight ones; `prepare_step`
+    /// consumes the speculative ones), so an `Immediate` drain that evicts every
+    /// seq would otherwise leak them. Call this BEFORE `clear()` on drain.
     pub fn reclaim_pending(&mut self, kv_allocator: &mut GlobalKvAllocator) {
         if let Some(p) = self.pending.take() {
             if !p.new_indices.is_empty() {
                 kv_allocator.free(&p.new_indices);
             }
+        }
+        self.release_prealloc(kv_allocator);
+    }
+
+    /// Return any speculatively-reserved next-step slots to the pool. Called
+    /// when no next step will consume them (active drained to empty, or drain).
+    fn release_prealloc(&mut self, kv_allocator: &mut GlobalKvAllocator) {
+        if !self.prealloc.is_empty() {
+            let slots = std::mem::take(&mut self.prealloc);
+            kv_allocator.free(&slots);
+        }
+    }
+
+    /// Best-effort reservation of `n` KV slots for the NEXT decode step, issued
+    /// while THIS step's forward runs on the GPU. Plain alloc (no relief): on a
+    /// tight pool it reserves nothing and the next `prepare_step` allocs on-path
+    /// as before. Speculation must never preempt live rows.
+    fn reserve_next_step_slots(&mut self, kv_allocator: &mut GlobalKvAllocator, n: usize) {
+        debug_assert!(self.prealloc.is_empty(), "prealloc must be drained before reserving");
+        if n == 0 {
+            return;
+        }
+        if let Ok(slots) = kv_allocator.alloc_indices(n as u32) {
+            self.prealloc = slots;
         }
     }
 
@@ -121,9 +178,11 @@ impl DecodeEngine {
         // 1. Finalize the in-flight step (issued last call) and commit it.
         let to_send = self.finalize_pending(runner, active, kv_allocator, control, enable_prefix_caching)?;
 
-        // 2. Issue a new step if there is work; otherwise idle.
+        // 2. Issue a new step if there is work; otherwise idle (and return any
+        //    speculatively-reserved slots — no next step will consume them).
         if active.is_empty() {
             self.rows.clear();
+            self.release_prealloc(kv_allocator);
         } else {
             self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
         }
@@ -155,6 +214,7 @@ impl DecodeEngine {
                 self.issue_new(runner, active, prefilling, kv_allocator, control, eos_ids, enable_prefix_caching)?;
             } else {
                 self.rows.clear();
+                self.release_prealloc(kv_allocator);
             }
         }
         Ok(())
@@ -185,6 +245,7 @@ impl DecodeEngine {
                     p.assigned,
                     &compact,
                     enable_prefix_caching,
+                    p.device_prepared,
                 )?;
                 // A now holds the surviving tokens compacted to the front in
                 // `rows` order (commit_results just set `rows` to the survivors).
@@ -205,6 +266,10 @@ impl DecodeEngine {
                 );
                 self.rows.clear();
                 self.prev_a_rows.clear();
+                // Device control state is unknown after a finalize failure;
+                // force a host re-seed next step and drop stale reservations.
+                self.device_rows.clear();
+                self.release_prealloc(kv_allocator);
                 Ok(None)
             }
         }
@@ -232,6 +297,26 @@ impl DecodeEngine {
                 None => return Ok(()),
             };
 
+        // Reserve the NEXT step's KV slots before issuing. In the async path the
+        // device control builder (`compact_extend`) appends these to each
+        // survivor on-device; in the proven path they become the next step's
+        // `prepare_step` reservation (drawn off the critical path either way).
+        self.reserve_next_step_slots(kv_allocator, order.len());
+
+        // The device control plane is usable this step only if the pool gave a
+        // full next-step reservation (compact_extend appends one slot per
+        // survivor; a short reservation would leave survivors without a slot).
+        let device_ctrl_ok = self.prealloc.len() == order.len();
+        // Reuse the device-resident control plane when the row set is exactly
+        // what the previous step's compact_extend prepared — no admission, no
+        // out-of-band eviction. Otherwise re-seed it from the host request.
+        let reuse_device_control = device_ctrl_ok && self.device_rows == order;
+        let next_slots: Option<Vec<u32>> = if device_ctrl_ok {
+            Some(self.prealloc.clone())
+        } else {
+            None
+        };
+
         let req = build_decode_request(
             &order,
             &new_indices,
@@ -252,6 +337,8 @@ impl DecodeEngine {
             &req.max_tokens,
             &req.ignore_eos,
             eos_ids,
+            next_slots.as_deref(),
+            reuse_device_control,
         ) {
             Ok(()) => {
                 let batch = order.len();
@@ -260,6 +347,7 @@ impl DecodeEngine {
                     new_indices,
                     assigned: req.assigned,
                     batch,
+                    device_prepared: device_ctrl_ok,
                 });
                 Ok(())
             }
@@ -279,6 +367,11 @@ impl DecodeEngine {
                 // A's contents are unknown after a failed issue; force a full
                 // re-upload on the next step.
                 self.prev_a_rows.clear();
+                // The device control plane was not advanced (compact_extend did
+                // not run / is unreliable) and the reserved next-step slots are
+                // orphaned; force a host re-seed next step and reclaim them.
+                self.device_rows.clear();
+                self.release_prealloc(kv_allocator);
                 Ok(())
             }
         }
@@ -306,35 +399,52 @@ impl DecodeEngine {
             return Ok(None);
         }
 
-        let initial_n = order.len() as u32;
-        let new_indices = match alloc_with_relief(
-            kv_allocator,
-            control,
-            active,
-            prefilling,
-            initial_n,
-            enable_prefix_caching,
-            true,
-        ) {
-            AllocWithReliefOutcome::Allocated(v) => v,
-            AllocWithReliefOutcome::Unavailable => {
-                let order: Vec<u64> = self.rows.as_slice().to_vec();
-                tracing::warn!(
-                    seqs = order.len(),
-                    "decode alloc still failing after relief -- failing seqs"
-                );
-                fail_decode_seqs(
-                    control,
-                    active,
-                    kv_allocator,
-                    &order,
-                    "worker KV pool exhausted at decode".to_string(),
-                    enable_prefix_caching,
-                );
-                self.rows.clear();
-                return Ok(None);
+        let initial_n = order.len();
+        let new_indices = if self.prealloc.len() >= initial_n {
+            // Fast path: slots reserved during the previous step's forward cover
+            // this step. Take exactly `initial_n`; return any surplus (rows that
+            // finished since the speculative reservation) to the pool.
+            let mut slots = std::mem::take(&mut self.prealloc);
+            if slots.len() > initial_n {
+                let surplus = slots.split_off(initial_n);
+                kv_allocator.free(&surplus);
             }
-            AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
+            slots
+        } else {
+            // Speculation fell short (batch grew via admissions, or the pool was
+            // too tight to reserve last step). Return the partial reservation
+            // and allocate the full set on the critical path, with relief —
+            // identical to the pre-speculation behaviour.
+            self.release_prealloc(kv_allocator);
+            match alloc_with_relief(
+                kv_allocator,
+                control,
+                active,
+                prefilling,
+                initial_n as u32,
+                enable_prefix_caching,
+                true,
+            ) {
+                AllocWithReliefOutcome::Allocated(v) => v,
+                AllocWithReliefOutcome::Unavailable => {
+                    let order: Vec<u64> = self.rows.as_slice().to_vec();
+                    tracing::warn!(
+                        seqs = order.len(),
+                        "decode alloc still failing after relief -- failing seqs"
+                    );
+                    fail_decode_seqs(
+                        control,
+                        active,
+                        kv_allocator,
+                        &order,
+                        "worker KV pool exhausted at decode".to_string(),
+                        enable_prefix_caching,
+                    );
+                    self.rows.clear();
+                    return Ok(None);
+                }
+                AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
+            }
         };
 
         // Relief may have preempted active rows; resync against the survivors.
@@ -396,6 +506,7 @@ impl DecodeEngine {
         assigned: Vec<AssignedIndices>,
         compact: &DecodeCompactOutput,
         enable_prefix_caching: bool,
+        device_prepared: bool,
     ) -> OpResult<StepOutput> {
         let mut output = StepOutput {
             prefill_done: Vec::new(),
@@ -474,6 +585,15 @@ impl DecodeEngine {
         // correct and costs a single compact+merge pass.
         if !to_free.is_empty() {
             kv_allocator.free(&to_free);
+        }
+        // If the async control builder ran this step, the device control plane
+        // now holds exactly these survivors — record them so the next step can
+        // detect an unchanged row set and skip the host rebuild+upload. If it
+        // did not run (proven path / pool too tight), the device is not prepared.
+        if device_prepared {
+            self.device_rows = next_rows.clone();
+        } else {
+            self.device_rows.clear();
         }
         self.rows.replace_rows(next_rows);
         Ok(output)
@@ -564,5 +684,67 @@ fn build_decode_request(
 impl Default for DecodeEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod prealloc_tests {
+    use super::*;
+
+    // Slot conservation for the speculative next-step reservation. These guard
+    // the two leak-critical seams (`reserve_next_step_slots`, `release_prealloc`
+    // + the surplus split in `prepare_step`) without needing a GPU `Runtime`.
+
+    #[test]
+    fn reserve_then_release_conserves_pool() {
+        let mut kv = GlobalKvAllocator::new(16);
+        let mut eng = DecodeEngine::new();
+        eng.reserve_next_step_slots(&mut kv, 4);
+        assert_eq!(eng.prealloc.len(), 4);
+        assert_eq!(kv.outstanding(), 4, "reserved slots are outstanding");
+        eng.release_prealloc(&mut kv);
+        assert!(eng.prealloc.is_empty());
+        assert_eq!(kv.outstanding(), 0, "release returns every reserved slot");
+    }
+
+    #[test]
+    fn reserve_is_best_effort_on_tight_pool() {
+        let mut kv = GlobalKvAllocator::new(4);
+        let _held = kv.alloc_indices(3).unwrap(); // total_free = 1
+        let mut eng = DecodeEngine::new();
+        // Cannot fit 2 → reserve nothing rather than partially; the on-path
+        // relief alloc handles the step instead.
+        eng.reserve_next_step_slots(&mut kv, 2);
+        assert!(eng.prealloc.is_empty());
+        assert_eq!(kv.outstanding(), 3, "no speculative slots taken under pressure");
+    }
+
+    #[test]
+    fn surplus_split_returns_only_unused_slots() {
+        // Mirrors the prepare_step fast path: reserved 4, this step needs 2 →
+        // take 2, free the 2-slot surplus; the kept slots stay outstanding until
+        // committed into a block table.
+        let mut kv = GlobalKvAllocator::new(16);
+        let mut eng = DecodeEngine::new();
+        eng.reserve_next_step_slots(&mut kv, 4);
+        let needed = 2;
+        let mut slots = std::mem::take(&mut eng.prealloc);
+        let surplus = slots.split_off(needed);
+        kv.free(&surplus);
+        assert_eq!(slots.len(), 2, "kept exactly the needed slots");
+        assert_eq!(kv.outstanding(), 2, "only the 2 kept slots remain outstanding");
+        kv.free(&slots); // emulate later commit/free of the kept slots
+        assert_eq!(kv.outstanding(), 0);
+    }
+
+    #[test]
+    fn reclaim_pending_frees_prealloc() {
+        let mut kv = GlobalKvAllocator::new(16);
+        let mut eng = DecodeEngine::new();
+        eng.reserve_next_step_slots(&mut kv, 5);
+        assert_eq!(kv.outstanding(), 5);
+        eng.reclaim_pending(&mut kv); // drain path: no pending step, just prealloc
+        assert!(eng.prealloc.is_empty());
+        assert_eq!(kv.outstanding(), 0, "drain reclaims speculative slots");
     }
 }

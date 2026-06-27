@@ -34,13 +34,13 @@ max_model_len = 1024
 # arrived requests into one larger prefill batch before dispatching.
 # 0 => low-latency mode (dispatch each request immediately, no waiting).
 # Non-zero trades up to this much TTFT for higher throughput under high QPS.
-batch_wait_ms = 10
+batch_wait_ms = 0
 
 # Paged KV.
 paged_block_size = 1
 chunked_prefill_size = 0      # 0 => disabled (whole prompt in one step). Set 256 to re-enable the graph-prefill foundation (see docs/HANDOFF_graph_prefill.md)
 enable_prefix_caching = false
-mem_fraction_static = 0.3
+mem_fraction_static = 0.9
 num_blocks = 0                # 0 => auto-size
 
 # Generation.

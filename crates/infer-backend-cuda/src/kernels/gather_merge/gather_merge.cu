@@ -104,3 +104,129 @@ extern "C" void merge_compact_decode(
         finished_tokens,
         counts);
 }
+
+// ── Device-resident decode control plane (async path) ────────────────────────
+//
+// After `merge_compact_decode` writes `active_src_rows` + `counts`, build the
+// NEXT decode step's per-row control buffers entirely on-device: gather each
+// surviving row's block table to the compacted front, append its next-step KV
+// slot, advance length/position, and rebuild the (trivial) decode tile layout.
+// Phantom tail rows are zeroed so they stay inert (cf. zero-pad invariant).
+//
+// This replaces the per-step host rebuild (`build_decode_request`) + H2D upload
+// (`upload_index`) — O(batch * seq_len) host work — with O(batch) device work,
+// the dominant high-QPS decode-step tail cost. Output block tables / kv_lens are
+// written to scratch buffers (gather reads the live buffers; an in-place gather
+// would race), then copied back to the live buffers by the caller.
+//
+// One block per output row; threads in a block stripe the block-table gather.
+__global__ void compact_extend_control_kernel(
+    const int* __restrict__ block_tables_in,   // [cap_batch, mbps] this step's order
+    int*       __restrict__ block_tables_out,   // [cap_batch, mbps] scratch -> next step
+    const int* __restrict__ kv_lens_in,         // [cap_batch] this step: length AFTER write
+    int*       __restrict__ kv_lens_out,        // [cap_batch] scratch -> next step
+    int*       __restrict__ seq_positions_out,  // [cap_batch] next step
+    int*       __restrict__ seq_lens_step_out,  // [cap_batch] next step (q_len = 1)
+    int*       __restrict__ rope_positions_out, // [cap_batch] next step (1 pos/row)
+    int*       __restrict__ cu_q_lens_out,      // [cap_batch + 1]
+    int*       __restrict__ block2req_out,      // [cap_batch]
+    int*       __restrict__ block2tile_out,     // [cap_batch]
+    const int* __restrict__ active_src_rows,    // [active]
+    const int* __restrict__ counts,             // [active, finished, old]
+    const int* __restrict__ new_slots,          // [cap_batch] next-step KV slot per output row
+    int mbps,
+    int cap_batch)
+{
+    const int active = counts[0];
+    const int r = blockIdx.x;          // output row
+    if (r >= cap_batch) return;
+    const int t = threadIdx.x;
+
+    if (r == 0 && t == 0) {
+        cu_q_lens_out[0] = 0;          // prefix-sum base
+    }
+
+    if (r >= active) {
+        // Phantom tail: inert (length 0, empty q range).
+        if (t == 0) {
+            kv_lens_out[r]        = 0;
+            seq_positions_out[r]  = 0;
+            seq_lens_step_out[r]  = 0;
+            rope_positions_out[r] = 0;
+            block2req_out[r]      = 0;
+            block2tile_out[r]     = 0;
+            cu_q_lens_out[r + 1]  = 0;
+        }
+        return;
+    }
+
+    const int src = active_src_rows[r];
+    const int M   = kv_lens_in[src];   // entries already present: indices 0..M-1
+    // Gather block_table[src][0..M] -> out[r][0..M].
+    for (int j = t; j < M; j += blockDim.x) {
+        block_tables_out[r * mbps + j] = block_tables_in[src * mbps + j];
+    }
+    if (t == 0) {
+        block_tables_out[r * mbps + M] = new_slots[r]; // next-step write slot at index M
+        kv_lens_out[r]        = M + 1;
+        seq_positions_out[r]  = M;
+        rope_positions_out[r] = M;
+        seq_lens_step_out[r]  = 1;
+        cu_q_lens_out[r + 1]  = r + 1;  // prefix sum of all-ones q_lens
+        block2req_out[r]      = r;
+        block2tile_out[r]     = 0;
+    }
+}
+
+// `block_tables` / `kv_lens` are the LIVE buffers (read by the gather, then
+// overwritten by the copy-back below). `*_scratch` are the gather targets — an
+// in-place gather races because output row r may read source row r' > r whose
+// data another block is concurrently overwriting. All other outputs are pure
+// (computed from `kv_lens[src]`), so they write the live buffers directly.
+extern "C" void compact_extend_control(
+    int* block_tables,
+    int* block_tables_scratch,
+    int* kv_lens,
+    int* kv_lens_scratch,
+    int* seq_positions_out,
+    int* seq_lens_step_out,
+    int* rope_positions_out,
+    int* cu_q_lens_out,
+    int* block2req_out,
+    int* block2tile_out,
+    const int* active_src_rows,
+    const int* counts,
+    const int* new_slots,
+    int mbps,
+    int cap_batch,
+    cudaStream_t stream)
+{
+    if (cap_batch <= 0) {
+        return;
+    }
+    const int threads = 256;
+    compact_extend_control_kernel<<<cap_batch, threads, 0, stream>>>(
+        block_tables,          // in (live)
+        block_tables_scratch,  // out (scratch)
+        kv_lens,               // in (live)
+        kv_lens_scratch,       // out (scratch)
+        seq_positions_out,
+        seq_lens_step_out,
+        rope_positions_out,
+        cu_q_lens_out,
+        block2req_out,
+        block2tile_out,
+        active_src_rows,
+        counts,
+        new_slots,
+        mbps,
+        cap_batch);
+    // Copy the gathered scratch back into the live buffers (same stream → ordered
+    // after the kernel). Full-capacity copy; phantom-tail rows are never read.
+    cudaMemcpyAsync(block_tables, block_tables_scratch,
+                    (size_t)cap_batch * (size_t)mbps * sizeof(int),
+                    cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(kv_lens, kv_lens_scratch,
+                    (size_t)cap_batch * sizeof(int),
+                    cudaMemcpyDeviceToDevice, stream);
+}
