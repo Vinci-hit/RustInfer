@@ -2,9 +2,11 @@
 // -----------------------------------------------------------------------------
 // cuDNN frontend SDPA path for paged decode attention.
 //
-// This intentionally covers decode-only first (S_q = 1). Ragged prefill needs a
-// token-level causal mask; the frontend graph below only uses paged K/V
-// plus KV sequence lengths, so the ragged Flash kernel remains the fallback path.
+// Decode-only (S_q = 1). The fused mixed-batch forward routes its q==1 decode
+// rows here (one cuDNN call over the decode prefix) so they skip the CuTe ragged
+// kernel's 128-wide q tiling; the q>1 prefill rows stay on the CuTe ragged
+// kernel (efficient at q>1, and its bottom-right causal mask is unconditionally
+// supported, unlike cuDNN paged SDPA causal which needs a backend >= 9.21).
 // -----------------------------------------------------------------------------
 
 #include "flash_attn_gqa.h"

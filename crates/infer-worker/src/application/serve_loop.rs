@@ -13,7 +13,7 @@ use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
 use crate::application::decode_engine::DecodeEngine;
 use crate::application::runtime::Runtime;
 use crate::application::sampler_stack::GreedySampler;
-use crate::application::worker_scheduler::{PrefillCtx, handle_prefill};
+use crate::application::worker_scheduler::handle_fused_step;
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
@@ -22,11 +22,6 @@ use crate::infrastructure::cuda::{Cuda, CudaScope, device_utils};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
 use crate::models::loader::LoadConfig;
-
-/// Upper bound on how many consecutive prefill rounds the serve loop drains
-/// before forcing a decode step. Caps prefill starvation of decode under a
-/// sustained prefill backlog (extracted magic number, refactor #16).
-const MAX_CONSECUTIVE_PREFILL_ROUNDS: usize = 16;
 
 // cudaProfiler API for precise nsys capture.
 unsafe extern "C" {
@@ -381,110 +376,60 @@ where
         let work_t0 = if trace_steps { Some(Instant::now()) } else { None };
         let mut tr_pf_seqs = 0usize;
         let mut tr_pf_tokens = 0usize;
-        let mut tr_pf_ms = 0f64;
+        let tr_pf_ms = 0f64;
         let mut tr_dec_ms = 0f64;
         let mut tr_dec_batch = 0usize;
 
-        // ── Prefill first, then decode ──
+        // ── Fused step: prefill chunks + decode in ONE ragged forward ──
         //
-        // New prefills are admitted *before* the decode step so the first
-        // token is produced on this very iteration instead of waiting for a
-        // full decode round-trip. `handle_prefill` emits the first token
-        // directly (FinishPrefillAndStartDecode), so TTFT no longer eats an
-        // extra decode-step latency.
-        //
-        // Decode is intentionally not interleaved between prefills in the
-        // same drained backlog. Interleaving makes identical burst requests
-        // enter decode at different batch shapes (1, 2, 3, ...), which can
-        // expose shape-dependent kernel/numeric differences and permanently
-        // diverge greedy outputs. Drain the currently available prefills first
-        // so a short burst starts decode as one cohort.
-        // A graph-eligible prefill writes buffer A on the compute stream; if a
-        // decode step is still in flight, order that write after the pending
-        // step's copy-out read of A (enqueue-only ev_out wait).
-        let pf_t0 = if trace_steps && !pending_prefills.is_empty() {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        if !pending_prefills.is_empty() && decode_engine.has_pending() {
-            if let Err(e) = runner.guard_buffer_a_against_pending_copyout() {
-                tracing::warn!("[serve] guard_buffer_a failed: {}", e);
-            }
-        }
-        let mut prefill_rounds = 0usize;
-        while !pending_prefills.is_empty() {
-            prefill_rounds += 1;
-            for cmd in std::mem::take(&mut pending_prefills) {
-                if trace_steps {
+        // Every pending prefill chunk and every active decode row go through a
+        // single eager ragged forward (`handle_fused_step`). This pays the fixed
+        // per-forward host overhead once per step instead of once per prefill,
+        // and in-flight decode rows advance a token in that same forward rather
+        // than stalling behind the prefills. When nothing is prefilling, steady-
+        // state decode keeps the fast graphed ABC pipeline (`run_step`).
+        let prefill_rounds = if pending_prefills.is_empty() { 0usize } else { 1usize };
+        if !pending_prefills.is_empty() {
+            if trace_steps {
+                for cmd in &pending_prefills {
                     tr_pf_seqs += cmd.segments.len();
                     tr_pf_tokens += cmd.input_ids.len();
                 }
-                {
-                    let mut ctx = WorkerCtx {
-                        active: &mut active,
-                        prefilling: &mut prefilling,
-                        decode_engine: &mut decode_engine,
-                        kv_allocator: &mut kv_allocator,
-                        enable_prefix_caching,
-                    };
-                    if drain_control(control, &mut ctx) {
-                        return Ok(());
-                    }
-                }
-                let _ttft_t0 = if std::env::var_os("RUSTINFER_TTFT_TRACE").is_some() {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                if let Err(e) = handle_prefill(
-                    &mut PrefillCtx {
-                        runner: &mut runner,
-                        active: &mut active,
-                        prefilling: &mut prefilling,
-                        kv_allocator: &mut kv_allocator,
-                        control,
-                        data,
-                        eos_ids,
-                        enable_prefix_caching,
-                        cap_batch,
-                    },
-                    &cmd,
-                ) {
-                    if matches!(e, OpError::Shutdown) {
-                        tracing::info!("[serve] prefill interrupted by shutdown.");
-                        return Ok(());
-                    }
-                    if e.is_fatal() {
-                        escalate_fatal_and_exit(control, &active, &prefilling, &e);
-                    }
-                    tracing::info!("[serve] prefill error: {}", e);
-                }
-                if let Some(t0) = _ttft_t0 {
-                    tracing::info!("[ttft-trace] handle_prefill wall = {:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
-                }
+                tr_dec_batch = active.len();
             }
-
-            if prefill_rounds >= MAX_CONSECUTIVE_PREFILL_ROUNDS {
-                break;
+            let fused_t0 = if trace_steps { Some(Instant::now()) } else { None };
+            if let Err(e) = handle_fused_step(
+                &mut runner,
+                &mut decode_engine,
+                &mut active,
+                &mut prefilling,
+                &mut kv_allocator,
+                control,
+                data,
+                eos_ids,
+                enable_prefix_caching,
+                cap_batch,
+                cap_num_tokens,
+                std::mem::take(&mut pending_prefills),
+            ) {
+                if matches!(e, OpError::Shutdown) {
+                    tracing::info!("[serve] fused step interrupted by shutdown.");
+                    return Ok(());
+                }
+                if e.is_fatal() {
+                    escalate_fatal_and_exit(control, &active, &prefilling, &e);
+                }
+                tracing::info!("[serve] fused step error: {}", e);
             }
-
-            pending_prefills = drain_data(data);
-            // Drop the 1ms wait — if nothing is queued, proceed to decode
-            // immediately. This removes up to 16ms of stall per serve loop
-            // iteration when the prefill queue drains mid-burst.
-            // pending_prefills = wait_for_prefill_quiet(data, Duration::from_millis(1));
-        }
-        if let Some(t) = pf_t0 {
-            tr_pf_ms = t.elapsed().as_secs_f64() * 1e3;
-        }
-
-        // ── Decode step ──
-        //
-        // Drives every active sequence one token forward (pipelined 1-deep).
-        // Also runs when `active` is empty but a step is still in flight, so the
-        // last issued step is finalized and its tokens are sent.
-        if !active.is_empty() || decode_engine.has_pending() {
+            if let Some(t) = fused_t0 {
+                tr_dec_ms = t.elapsed().as_secs_f64() * 1e3;
+            }
+        } else if !active.is_empty() || decode_engine.has_pending() {
+            // ── Pure decode step (graphed ABC pipeline, 1-deep) ──
+            //
+            // Runs when nothing is prefilling. Also runs when `active` is empty
+            // but a step is still in flight, so the last issued step is
+            // finalized and its tokens are sent.
             if let Some(max_steps) = profile_cuda_steps {
                 if !profile_started {
                     // SAFETY: extern profiler API; returns a cudaError code.
@@ -757,26 +702,6 @@ fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {
         }
     }
     pending_prefills
-}
-
-fn wait_for_prefill_quiet(data: &DataPump, quiet: Duration) -> Vec<PrefillBatchCmd> {
-    let timeout_ms = quiet.as_millis().max(1) as i64;
-    let mut items = [data.recv_socket().as_poll_item(zmq::POLLIN)];
-    match zmq::poll(&mut items, timeout_ms) {
-        Ok(_) => {}
-        Err(zmq::Error::EINTR) => return Vec::new(),
-        Err(e) => {
-            tracing::info!("[serve] prefill quiet poll error: {:?}", e);
-            return Vec::new();
-        }
-    }
-    let data_ready = items[0].is_readable();
-    drop(items);
-    if data_ready {
-        drain_data(data)
-    } else {
-        Vec::new()
-    }
 }
 
 fn maybe_heartbeat(

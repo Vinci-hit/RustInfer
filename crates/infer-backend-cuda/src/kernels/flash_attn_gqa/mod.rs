@@ -183,6 +183,12 @@ pub struct PagedAttentionPlan<'a> {
     pub kind: PagedAttentionKind,
     pub num_tokens: usize,
     pub batch: usize,
+    /// Per-request query lengths (host), in row order. The fused mixed batch is
+    /// laid out decode-first, so the leading run of `1`s is the decode prefix and
+    /// the remainder are prefill chunks. Used to split a `Ragged` batch's
+    /// attention by row type (decode → cuDNN decode SDPA; prefill → cuDNN
+    /// bottom-right-causal SDPA), keeping q=1 rows off the CuTe ragged kernel.
+    pub q_lens: &'a [i32],
     pub block_tables: &'a Tensor<i32, Cuda>,
     pub cu_q_lens: &'a Tensor<i32, Cuda>,
     pub kv_lens: &'a Tensor<i32, Cuda>,
@@ -204,6 +210,7 @@ impl<'a> PagedAttentionPlan<'a> {
             kind,
             num_tokens: plan.num_tokens,
             batch: plan.batch,
+            q_lens: &plan.q_lens,
             block_tables: &index.block_tables,
             cu_q_lens: &index.cu_q_lens,
             kv_lens: &index.kv_lens,
@@ -229,6 +236,104 @@ pub fn flash_decode_workspace_capacity_f32(
         flash_attn_batched_decode_workspace_bytes(batch as i32, num_q_heads as i32, head_dim as i32)
     } as usize;
     (bytes + 3) / 4
+}
+
+/// Launch the CuTe paged ragged Flash kernel over a (sub)set of q tiles. The
+/// kernel indexes q / kv_lens / block_tables by the *absolute* request id held
+/// in `block2req[tile]` (and `cu_q_lens[req]`), so a fused batch's prefill
+/// suffix runs by passing the full base pointers but with `block2req` /
+/// `block2tile` shifted past the leading decode tiles and `total_q_tiles`
+/// reduced to match. Always causal (chunked-prefill bottom-right via the
+/// kernel's `kv_len - q_len` mask shift).
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_cute_ragged<T: Dtype>(
+    q_ptr: *const T,
+    q_stride_seq: i64,
+    q_stride_head: i64,
+    k_pool: &Tensor<T, Cuda>,
+    v_pool: &Tensor<T, Cuda>,
+    o_ptr: *mut T,
+    o_stride_seq: i64,
+    o_stride_head: i64,
+    block_tables_ptr: *const u32,
+    max_blocks_per_seq: i32,
+    block_size: i32,
+    kv_lens_ptr: *const i32,
+    cu_q_lens_ptr: *const i32,
+    block2req_ptr: *const i32,
+    block2tile_ptr: *const i32,
+    total_q_tiles: i32,
+    batch: i32,
+    num_tokens: i32,
+    head_num: usize,
+    kv_head_num: usize,
+    head_dim: usize,
+    scale: f32,
+    stream: cudaStream_t,
+) -> OpResult<()> {
+    unsafe {
+        match T::DATA_TYPE {
+            DataType::BF16 => launch_flash_attn_paged_ragged_cute_bf16(
+                q_ptr as _,
+                q_stride_seq,
+                q_stride_head,
+                k_pool.data_ptr() as _,
+                v_pool.data_ptr() as _,
+                o_ptr as _,
+                o_stride_seq,
+                o_stride_head,
+                block_tables_ptr,
+                max_blocks_per_seq,
+                block_size,
+                kv_lens_ptr,
+                cu_q_lens_ptr,
+                block2req_ptr,
+                block2tile_ptr,
+                total_q_tiles,
+                batch,
+                num_tokens,
+                head_num as i32,
+                kv_head_num as i32,
+                head_dim as i32,
+                scale,
+                1,
+                stream,
+            ),
+            DataType::F16 => launch_flash_attn_paged_ragged_cute_fp16(
+                q_ptr as _,
+                q_stride_seq,
+                q_stride_head,
+                k_pool.data_ptr() as _,
+                v_pool.data_ptr() as _,
+                o_ptr as _,
+                o_stride_seq,
+                o_stride_head,
+                block_tables_ptr,
+                max_blocks_per_seq,
+                block_size,
+                kv_lens_ptr,
+                cu_q_lens_ptr,
+                block2req_ptr,
+                block2tile_ptr,
+                total_q_tiles,
+                batch,
+                num_tokens,
+                head_num as i32,
+                kv_head_num as i32,
+                head_dim as i32,
+                scale,
+                1,
+                stream,
+            ),
+            _ => {
+                return Err(OpError::Kernel(format!(
+                    "attention_paged Ragged: dtype {:?}",
+                    T::DATA_TYPE
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -466,68 +571,116 @@ pub fn attention_paged<T: Dtype>(
                 }
             }
         }
-        PagedAttentionKind::Ragged => unsafe {
-            match T::DATA_TYPE {
-                DataType::BF16 => launch_flash_attn_paged_ragged_cute_bf16(
-                    q.data_ptr() as _,
-                    q_stride_seq,
-                    q_stride_head,
-                    k_pool.data_ptr() as _,
-                    v_pool.data_ptr() as _,
-                    output.data_ptr_mut() as _,
-                    o_stride_seq,
-                    o_stride_head,
-                    plan.block_tables.data_ptr() as *const u32,
-                    plan.max_blocks_per_seq as i32,
-                    plan.block_size as i32,
-                    plan.kv_lens.data_ptr(),
-                    plan.cu_q_lens.data_ptr(),
-                    plan.block2req.data_ptr(),
-                    plan.block2tile.data_ptr(),
-                    plan.total_q_tiles,
-                    batch,
-                    plan.num_tokens as i32,
-                    head_num as i32,
-                    kv_head_num as i32,
-                    head_dim as i32,
-                    scale,
-                    1,
-                    stream,
-                ),
-                DataType::F16 => launch_flash_attn_paged_ragged_cute_fp16(
-                    q.data_ptr() as _,
-                    q_stride_seq,
-                    q_stride_head,
-                    k_pool.data_ptr() as _,
-                    v_pool.data_ptr() as _,
-                    output.data_ptr_mut() as _,
-                    o_stride_seq,
-                    o_stride_head,
-                    plan.block_tables.data_ptr() as *const u32,
-                    plan.max_blocks_per_seq as i32,
-                    plan.block_size as i32,
-                    plan.kv_lens.data_ptr(),
-                    plan.cu_q_lens.data_ptr(),
-                    plan.block2req.data_ptr(),
-                    plan.block2tile.data_ptr(),
-                    plan.total_q_tiles,
-                    batch,
-                    plan.num_tokens as i32,
-                    head_num as i32,
-                    kv_head_num as i32,
-                    head_dim as i32,
-                    scale,
-                    1,
-                    stream,
-                ),
-                _ => {
-                    return Err(OpError::Kernel(format!(
-                        "attention_paged Ragged: dtype {:?}",
-                        T::DATA_TYPE
-                    )));
+        PagedAttentionKind::Ragged => {
+            // Fused mixed batch is laid out decode-first, so the leading run of
+            // q==1 rows is the decode prefix. Rescue it onto cuDNN's fast decode
+            // SDPA and run the q>1 prefill suffix on the CuTe ragged kernel
+            // (efficient at q>1; its bottom-right causal mask works on any cuDNN
+            // backend, unlike paged-SDPA causal which needs backend >= 9.21).
+            //
+            // The split is pure pointer arithmetic: each decode row is one tile,
+            // so the first `decode_count` tiles are the decode rows. Shifting
+            // block2req/block2tile past them and reducing total_q_tiles selects
+            // exactly the prefill tiles, and the CuTe kernel's absolute
+            // block2req[tile] / cu_q_lens[req] indexing keeps every lookup
+            // correct against the full base pointers. Decode output rows are
+            // never touched by the suffix launch.
+            let cudnn_enabled = std::env::var_os(DISABLE_CUDNN_ATTENTION_ENV).is_none();
+            let decode_count = plan.q_lens.iter().take_while(|&&q| q == 1).count();
+
+            if cudnn_enabled && decode_count > 0 && decode_count < plan.batch {
+                let dec = unsafe {
+                    try_cudnn_paged_decode(
+                        device,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        plan,
+                        q_stride_seq,
+                        q_stride_head,
+                        o_stride_seq,
+                        o_stride_head,
+                        head_num,
+                        kv_head_num,
+                        head_dim,
+                        scale,
+                        decode_count as i32,
+                        stream,
+                    )
+                };
+                if dec == Some(0) {
+                    // decode prefix done on cuDNN → prefill suffix on CuTe.
+                    let suffix_tiles = plan.total_q_tiles - decode_count as i32;
+                    if suffix_tiles > 0 {
+                        unsafe {
+                            launch_cute_ragged(
+                                q.data_ptr(),
+                                q_stride_seq,
+                                q_stride_head,
+                                k_pool,
+                                v_pool,
+                                output.data_ptr_mut(),
+                                o_stride_seq,
+                                o_stride_head,
+                                plan.block_tables.data_ptr() as *const u32,
+                                plan.max_blocks_per_seq as i32,
+                                plan.block_size as i32,
+                                plan.kv_lens.data_ptr(),
+                                plan.cu_q_lens.data_ptr(),
+                                plan.block2req.data_ptr().add(decode_count),
+                                plan.block2tile.data_ptr().add(decode_count),
+                                suffix_tiles,
+                                batch,
+                                plan.num_tokens as i32,
+                                head_num,
+                                kv_head_num,
+                                head_dim,
+                                scale,
+                                stream,
+                            )?;
+                        }
+                    }
+                    return Ok(());
                 }
+                if dec.is_some() && std::env::var_os(STRICT_CUDNN_ATTENTION_ENV).is_some() {
+                    return Err(OpError::Kernel(
+                        "cuDNN fused decode-prefix attention failed".into(),
+                    ));
+                }
+                // else: decode rescue unavailable → full-batch CuTe ragged below.
             }
-        },
+
+            // Full-batch CuTe ragged: no decode prefix, cuDNN disabled, or the
+            // decode rescue failed (non-strict). Correct for any composition.
+            unsafe {
+                launch_cute_ragged(
+                    q.data_ptr(),
+                    q_stride_seq,
+                    q_stride_head,
+                    k_pool,
+                    v_pool,
+                    output.data_ptr_mut(),
+                    o_stride_seq,
+                    o_stride_head,
+                    plan.block_tables.data_ptr() as *const u32,
+                    plan.max_blocks_per_seq as i32,
+                    plan.block_size as i32,
+                    plan.kv_lens.data_ptr(),
+                    plan.cu_q_lens.data_ptr(),
+                    plan.block2req.data_ptr(),
+                    plan.block2tile.data_ptr(),
+                    plan.total_q_tiles,
+                    batch,
+                    plan.num_tokens as i32,
+                    head_num,
+                    kv_head_num,
+                    head_dim,
+                    scale,
+                    stream,
+                )?;
+            }
+        }
     }
     Ok(())
 }

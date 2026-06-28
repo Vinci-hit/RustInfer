@@ -4,33 +4,17 @@ use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, PrefillSegmentCo
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
 use crate::application::decode_common::send_step_error;
+use crate::application::decode_engine::{DecodeEngine, build_decode_request};
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
 use crate::application::runtime::Runtime;
 use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
-use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
+use crate::domain::plan::{SampledToken, SeqStep, StepRequest, StopCriteria};
 use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
-
-/// P2: Context struct bundling the mutable state that `handle_prefill` passes
-/// around, replacing 10 separate parameters with a single reference.
-pub struct PrefillCtx<'a, M>
-where
-    M: DecoderModel<bf16, Cuda>,
-{
-    pub runner: &'a mut Runtime<bf16, Cuda, M>,
-    pub active: &'a mut ActiveSeqMap,
-    pub prefilling: &'a mut PrefillSeqMap,
-    pub kv_allocator: &'a mut GlobalKvAllocator,
-    pub control: &'a ControlPump,
-    pub data: &'a DataPump,
-    pub eos_ids: &'a [i32],
-    pub enable_prefix_caching: bool,
-    pub cap_batch: usize,
-}
 
 /// Per-segment prefill plan. Replaces the parallel `per_seg_*` arrays that
 /// were index-correlated across three loops: each segment now carries its own
@@ -71,17 +55,11 @@ fn concat_block_table(base: &[u32], appended: &[u32]) -> Vec<u32> {
     bt
 }
 
-/// Run one prefill batch (one PrefillBatchCmd = potentially many segments).
-///
-/// Each segment's KV slots come from the worker-owned
-/// `GlobalKvAllocator`, not from `seg.block_table`. Optional
-/// `seg.prefix_hint` is prepended verbatim; those slots already hold valid
-/// KV from a previous request and are pinned by scheduler-side RadixTree
-/// policy while this step runs.
-pub fn handle_prefill<M>(ctx: &mut PrefillCtx<'_, M>, cmd: &PrefillBatchCmd) -> OpResult<()>
-where
-    M: DecoderModel<bf16, Cuda>,
-{
+/// Plan every segment of one prefill cmd: compute the new (non-prefix) token
+/// count, resolve each segment's base block table, and mark stale segments
+/// skipped. Returns the per-segment plans (1:1 with `cmd.segments`) and the
+/// total new tokens to allocate KV for.
+fn plan_prefill_segments(cmd: &PrefillBatchCmd, prefilling: &PrefillSeqMap) -> (Vec<SegmentPlan>, u32) {
     let mut plans: Vec<SegmentPlan> = Vec::with_capacity(cmd.segments.len());
     let mut total_new: u32 = 0;
     for seg in &cmd.segments {
@@ -93,8 +71,7 @@ where
         } else {
             seg_len
         };
-        let base_table = ctx
-            .prefilling
+        let base_table = prefilling
             .get(&seg.sequence_id)
             .map(|state| state.block_table.clone())
             .unwrap_or_else(|| prefix.clone());
@@ -125,9 +102,13 @@ where
             step_idx: None,
         });
     }
+    (plans, total_new)
+}
 
-    let new_decode_segments = cmd
-        .segments
+/// Count a cmd's non-skipped segments that finish prefill this step (each
+/// becomes a new decode row).
+fn count_new_decode(cmd: &PrefillBatchCmd, plans: &[SegmentPlan]) -> usize {
+    cmd.segments
         .iter()
         .enumerate()
         .filter(|(i, s)| {
@@ -137,64 +118,27 @@ where
                     PrefillSegmentCompletion::FinishPrefillAndStartDecode
                 )
         })
-        .count();
-    if ctx.active.len() + new_decode_segments > ctx.cap_batch {
-        let overflow_ids: Vec<u64> = cmd
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !plans[*i].skipped)
-            .map(|(_, s)| s.sequence_id)
-            .collect();
-        tracing::warn!(
-            active = ctx.active.len(),
-            new = new_decode_segments,
-            cap = ctx.cap_batch,
-            failing = overflow_ids.len(),
-            "prefill rejected: active + new > cap"
-        );
-        send_step_error(
-            ctx.control,
-            overflow_ids,
-            format!(
-                "worker batch slot exhausted: active={} + new={} > cap={}",
-                ctx.active.len(),
-                new_decode_segments,
-                ctx.cap_batch,
-            ),
-        );
-        return Ok(());
-    }
+        .count()
+}
 
-    let base_indices = match alloc_with_relief(
-        ctx.kv_allocator,
-        ctx.control,
-        ctx.active,
-        ctx.prefilling,
-        total_new,
-        ctx.enable_prefix_caching,
-        false,
-    ) {
-        AllocWithReliefOutcome::Allocated(v) => v,
-        AllocWithReliefOutcome::Unavailable => {
-            tracing::warn!(
-                n = total_new,
-                "prefill alloc still failing after relief -- failing batch"
-            );
-            let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
-            send_step_error(
-                ctx.control,
-                failed_ids,
-                format!("worker KV pool exhausted (n={})", total_new),
-            );
-            return Ok(());
-        }
-        AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
-    };
+/// Number of forward rows a cmd contributes (its non-skipped segments).
+fn prefill_row_count(plans: &[SegmentPlan]) -> usize {
+    plans.iter().filter(|p| !p.skipped).count()
+}
 
-    let mut steps: Vec<SeqStep> = Vec::with_capacity(cmd.segments.len());
-    let mut step_max_tokens: Vec<u32> = Vec::with_capacity(cmd.segments.len());
-    let mut step_ignore_eos: Vec<bool> = Vec::with_capacity(cmd.segments.len());
+/// Build `SeqStep`s for one cmd's non-skipped segments, appending them (and
+/// their per-row stop vectors) onto the shared accumulators that form the fused
+/// forward. `base_indices` are this cmd's freshly-allocated KV slots
+/// (`len == total_new`). Each plan's `step_idx` records its row index in the
+/// merged `seqs` so `reclaim_prefill_step_data` can move its buffers back.
+fn build_prefill_steps_into(
+    cmd: &PrefillBatchCmd,
+    plans: &mut [SegmentPlan],
+    base_indices: &[u32],
+    seqs: &mut Vec<SeqStep>,
+    max_tokens: &mut Vec<u32>,
+    ignore_eos: &mut Vec<bool>,
+) {
     let mut idx_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
         if plans[i].skipped {
@@ -202,8 +146,6 @@ where
         }
         let new_tokens = plans[i].new_tokens as usize;
         let range = cmd.segment_token_range(i);
-        // P0: Avoid intermediate Vec allocations for trimmed/positions.
-        // Use direct slice operations instead of iterator collect.
         let (input_ids, positions): (Vec<i32>, Vec<i32>) = if seg.segment_start == 0
             && !plans[i].prefix.is_empty()
         {
@@ -225,11 +167,8 @@ where
         let block_table = concat_block_table(&plans[i].base_table, &new_indices);
         let kv_write_start = block_table.len() as i32 - new_tokens as i32;
         let kv_len_after = block_table.len() as i32;
-        // #6 zero-copy: hand `input_ids`/`block_table` to the step by move. The
-        // forward only borrows them; they are reclaimed below (post-forward)
-        // into `token_ids`/`full_block_table` rather than cloned here.
-        plans[i].step_idx = Some(steps.len());
-        steps.push(SeqStep {
+        plans[i].step_idx = Some(seqs.len());
+        seqs.push(SeqStep {
             sequence_id: seg.sequence_id,
             input_ids,
             positions,
@@ -237,100 +176,59 @@ where
             kv_len_after,
             block_table,
         });
-        step_max_tokens.push(seg.max_tokens as u32);
-        step_ignore_eos.push(seg.ignore_eos);
+        max_tokens.push(seg.max_tokens as u32);
+        ignore_eos.push(seg.ignore_eos);
         plans[i].indices = new_indices;
     }
-    debug_assert_eq!(idx_cursor, total_new as usize);
+    debug_assert_eq!(idx_cursor, base_indices.len());
+}
 
-    if steps.is_empty() {
-        if !base_indices.is_empty() {
-            ctx.kv_allocator.free(&base_indices);
-        }
-        return Ok(());
-    }
-
-    // One ragged forward over every non-skipped segment. Greedy sampling
-    // (empty `sampling` → GreedySampler) keeps the first-token result
-    // byte-identical to the old argmax path. The pool commits each seq's KV
-    // length from `kv_len_after` internally.
-    let req = StepRequest {
-        sampling: Vec::new(),
-        stop: StopCriteria {
-            eos_ids: ctx.eos_ids.to_vec(),
-            generated_counts: vec![0u32; steps.len()],
-            max_tokens: step_max_tokens,
-            ignore_eos: step_ignore_eos,
-        },
-        draft_tokens: Vec::new(),
-        seqs: steps,
-    };
-    let _step_t0 = if std::env::var_os("RUSTINFER_TTFT_TRACE").is_some() {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let out = match ctx.runner.step(&req) {
-        Ok(out) => out,
-        Err(e) => {
-            if !base_indices.is_empty() {
-                ctx.kv_allocator.free(&base_indices);
-            }
-            for seg in &cmd.segments {
-                if let Some(removed) = ctx.prefilling.remove(&seg.sequence_id) {
-                    ctx.kv_allocator
-                        .release_owned(&removed.block_table, ctx.enable_prefix_caching);
-                }
-            }
-            let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
-            send_step_error(
-                ctx.control,
-                failed_ids,
-                format!("prefill step failed: {:?}", e),
-            );
-            return Ok(());
-        }
-    };
-    if let Some(t0) = _step_t0 {
-        tracing::info!(
-            "[ttft-trace] runner.step (forward+sample) = {:.2}ms",
-            t0.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    // #6 zero-copy: the forward only borrowed the request, so move the input
-    // tokens and block tables back out of the owned `seqs` into their plans
-    // (reclaimed by `assigned_runs` and the commit loop below) rather than
-    // having cloned them during step building.
-    let StepRequest { seqs: mut steps, .. } = req;
+/// #6 zero-copy: the forward only borrowed the request, so move the input
+/// tokens and block tables back out of the (now-owned) merged `seqs` into each
+/// plan, where `assigned_runs` + `commit_prefill_outputs` reclaim them.
+fn reclaim_prefill_step_data(seqs: &mut [SeqStep], plans: &mut [SegmentPlan]) {
     for plan in plans.iter_mut() {
         if let Some(k) = plan.step_idx {
-            plan.token_ids = std::mem::take(&mut steps[k].input_ids);
-            plan.full_block_table = std::mem::take(&mut steps[k].block_table);
+            plan.token_ids = std::mem::take(&mut seqs[k].input_ids);
+            plan.full_block_table = std::mem::take(&mut seqs[k].block_table);
         }
     }
+}
 
-    let assigned = assigned_runs(cmd, &plans, ctx.enable_prefix_caching);
-
-    let mut output = StepOutput {
-        prefill_done: Vec::new(),
-        tokens: Vec::new(),
-        assigned_indices: assigned,
-    };
-    let mut token_cursor = 0usize;
+/// Route one cmd's prefill outputs into the shared `output`. This cmd's rows
+/// occupy `out_tokens[token_offset .. token_offset + non_skipped]`.
+/// Continuation chunks store their KV in `prefilling` and emit no token; final
+/// chunks emit the first decode token and admit the sequence into `active`.
+#[allow(clippy::too_many_arguments)]
+fn commit_prefill_outputs(
+    cmd: &PrefillBatchCmd,
+    plans: &mut [SegmentPlan],
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    kv_allocator: &mut GlobalKvAllocator,
+    enable_prefix_caching: bool,
+    out_tokens: &[Vec<SampledToken>],
+    out_finished: &[bool],
+    token_offset: usize,
+    output: &mut StepOutput,
+) {
+    let mut local = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
         if plans[i].skipped {
             continue;
         }
-        let row = out.tokens.get(token_cursor);
-        let token = row.and_then(|r| r.first()).map(|t| t.token_id).unwrap_or(0);
-        let finished = out.finished.get(token_cursor).copied().unwrap_or(false);
-        token_cursor += 1;
-        // P0: Reuse the full block table built during step construction
-        // instead of rebuilding it with a second concat_block_table call.
+        let row = token_offset + local;
+        local += 1;
+        let token = out_tokens
+            .get(row)
+            .and_then(|r| r.first())
+            .map(|t| t.token_id)
+            .unwrap_or(0);
+        let finished = out_finished.get(row).copied().unwrap_or(false);
         let full_block_table = std::mem::take(&mut plans[i].full_block_table);
         match seg.completion {
             PrefillSegmentCompletion::ContinuePrefill => {
-                ctx.prefilling.insert(
+                prefilling.insert(
                     seg.sequence_id,
                     PrefillSeq {
                         kv_len: full_block_table.len(),
@@ -340,7 +238,7 @@ where
                 output.prefill_done.push(seg.sequence_id);
             }
             PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
-                ctx.prefilling.remove(&seg.sequence_id);
+                prefilling.remove(&seg.sequence_id);
                 output.prefill_done.push(seg.sequence_id);
                 output.tokens.push(GeneratedToken {
                     sequence_id: seg.sequence_id,
@@ -348,21 +246,383 @@ where
                     finished,
                 });
                 if !finished {
-                    ctx.active.insert(
+                    active.insert(
                         seg.sequence_id,
                         ActiveSeq::new(token, full_block_table, seg.max_tokens, seg.ignore_eos),
                     );
                 } else {
-                    ctx.kv_allocator
-                        .release_owned(&full_block_table, ctx.enable_prefix_caching);
+                    kv_allocator.release_owned(&full_block_table, enable_prefix_caching);
                 }
             }
         }
     }
-    ctx.data
-        .send_step_output(&output)
-        .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
+}
+
+/// Planned + KV-allocated prefill cmd, awaiting its forward.
+struct CmdPrep<'a> {
+    cmd: &'a PrefillBatchCmd,
+    plans: Vec<SegmentPlan>,
+    base_indices: Vec<u32>,
+    /// Non-skipped segment count = rows this cmd adds to the forward.
+    rows: usize,
+    /// New tokens this cmd adds to the forward.
+    tokens: usize,
+}
+
+/// A single fused forward: the decode rows (group 0 only) plus a set of prefill
+/// cmds, packed so `rows <= cap_batch` and `tokens <= cap_num_tokens`.
+struct ForwardGroup {
+    /// True for the first group, which carries the decode rows.
+    decode: bool,
+    /// Indices into the `preps` vec.
+    preps: Vec<usize>,
+    rows: usize,
+    tokens: usize,
+}
+
+/// Run ONE fused step: finalize the in-flight decode, then drive all active
+/// decode rows + every pending prefill chunk through a single ragged forward.
+///
+/// Replaces the old "prefill-first, then decode" serialization. Prefill chunks
+/// and decode rows share one eager ragged forward, so the fixed per-forward
+/// host overhead (per-layer alloc/build) is paid ONCE per step instead of once
+/// per prefill, and in-flight decode rows are never stalled behind prefills —
+/// they advance a token in the same forward. Overflowing prefill cmds (past the
+/// batch/token cap) spill into extra pure-prefill forwards; the decode rows
+/// always ride the first forward.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_fused_step<M>(
+    runner: &mut Runtime<bf16, Cuda, M>,
+    decode_engine: &mut DecodeEngine,
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
+    data: &DataPump,
+    eos_ids: &[i32],
+    enable_prefix_caching: bool,
+    cap_batch: usize,
+    cap_num_tokens: usize,
+    pending_prefills: Vec<PrefillBatchCmd>,
+) -> OpResult<()>
+where
+    M: DecoderModel<bf16, Cuda>,
+{
+    // 1. Drain the in-flight ABC decode step and send its tokens. This commits
+    //    the prior step and syncs the copy-out so the fused eager forward (which
+    //    uses the prefill input buffer, not buffer A) cannot race it.
+    decode_engine.finalize_and_send(runner, active, kv_allocator, control, data, enable_prefix_caching)?;
+
+    // 2. Decode rows for this step: one new KV slot each.
+    let decode = decode_engine.prepare_fused_decode(active, prefilling, kv_allocator, control, enable_prefix_caching)?;
+    let (decode_order, decode_new_indices, decode_build) = match decode {
+        Some((order, idx)) => {
+            let build = build_decode_request(&order, &idx, active, eos_ids, enable_prefix_caching);
+            (order, idx, Some(build))
+        }
+        None => (Vec::new(), Vec::new(), None),
+    };
+    let decode_count = decode_order.len();
+
+    // 3. Plan + allocate KV for every pending prefill cmd. Reject cmds that
+    //    would push the concurrent decode-row count past the batch cap.
+    let mut admitted_decode = active.len();
+    let mut preps: Vec<CmdPrep> = Vec::new();
+    for cmd in &pending_prefills {
+        let (plans, total_new) = plan_prefill_segments(cmd, prefilling);
+        let new_decode = count_new_decode(cmd, &plans);
+        if admitted_decode + new_decode > cap_batch {
+            let overflow_ids: Vec<u64> = cmd
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !plans[*i].skipped)
+                .map(|(_, s)| s.sequence_id)
+                .collect();
+            tracing::warn!(
+                active = admitted_decode,
+                new = new_decode,
+                cap = cap_batch,
+                "fused prefill rejected: active + new > cap"
+            );
+            send_step_error(
+                control,
+                overflow_ids,
+                format!(
+                    "worker batch slot exhausted: active={} + new={} > cap={}",
+                    admitted_decode, new_decode, cap_batch
+                ),
+            );
+            continue;
+        }
+        let rows = prefill_row_count(&plans);
+        if rows == 0 {
+            continue;
+        }
+        let base_indices = match alloc_with_relief(
+            kv_allocator,
+            control,
+            active,
+            prefilling,
+            total_new,
+            enable_prefix_caching,
+            false,
+        ) {
+            AllocWithReliefOutcome::Allocated(v) => v,
+            AllocWithReliefOutcome::Unavailable => {
+                tracing::warn!(n = total_new, "fused prefill alloc failing after relief");
+                let failed_ids: Vec<u64> = cmd.segments.iter().map(|s| s.sequence_id).collect();
+                send_step_error(
+                    control,
+                    failed_ids,
+                    format!("worker KV pool exhausted (n={})", total_new),
+                );
+                continue;
+            }
+            AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
+        };
+        admitted_decode += new_decode;
+        preps.push(CmdPrep {
+            cmd,
+            plans,
+            base_indices,
+            rows,
+            tokens: total_new as usize,
+        });
+    }
+
+    // 4. Pack cmds into forward groups. Group 0 carries the decode rows; cmds
+    //    that exceed the batch/token cap spill into extra pure-prefill forwards
+    //    (rare — the scheduler chunks within cap_num_tokens).
+    let mut groups: Vec<ForwardGroup> = vec![ForwardGroup {
+        decode: true,
+        preps: Vec::new(),
+        rows: decode_count,
+        tokens: decode_count,
+    }];
+    for (i, prep) in preps.iter().enumerate() {
+        let last = groups.last_mut().unwrap();
+        let fits = last.rows + prep.rows <= cap_batch && last.tokens + prep.tokens <= cap_num_tokens;
+        if fits {
+            last.rows += prep.rows;
+            last.tokens += prep.tokens;
+            last.preps.push(i);
+        } else {
+            groups.push(ForwardGroup {
+                decode: false,
+                preps: vec![i],
+                rows: prep.rows,
+                tokens: prep.tokens,
+            });
+        }
+    }
+
+    // 5. Issue each group as one ragged forward and route its outputs.
+    for group in &groups {
+        let has_decode = group.decode && decode_count > 0;
+        if !has_decode && group.preps.is_empty() {
+            continue;
+        }
+
+        let mut seqs: Vec<SeqStep> = Vec::with_capacity(group.rows);
+        let mut max_tokens: Vec<u32> = Vec::with_capacity(group.rows);
+        let mut ignore_eos: Vec<bool> = Vec::with_capacity(group.rows);
+        let mut generated_counts: Vec<u32> = Vec::with_capacity(group.rows);
+        if has_decode {
+            let b = decode_build.as_ref().unwrap();
+            seqs.extend(b.req.seqs.iter().cloned());
+            max_tokens.extend_from_slice(&b.max_tokens);
+            ignore_eos.extend_from_slice(&b.ignore_eos);
+            generated_counts.extend_from_slice(&b.generated_counts);
+        }
+        // Pad the decode prefix up to a decode capture slot so the split
+        // attention's cuDNN decode-prefix call (the leading run of q=1 rows)
+        // reuses a PREWARMED cuDNN SDPA plan instead of paying a ~370ms
+        // HEURISTICS_CHOICE build for every novel decode-row count (the measured
+        // fused tail spike — see [[eager-fused-mixed-tail-regression]]). The pad
+        // rows are inert q=1 decode steps over throwaway KV (freed after the
+        // step); their forward output lands in rows [decode_count, slot) which
+        // the commit below never reads. Only padded when the group carries
+        // prefill (so the Ragged split path actually runs). Best-effort: if the
+        // tiny KV alloc fails, skip and accept the cold build for this one step.
+        let mut decode_prefix_len = if has_decode { decode_count } else { 0 };
+        let mut pad_indices: Vec<u32> = Vec::new();
+        if has_decode && !group.preps.is_empty() {
+            if let Some(slot) = runner.next_capture_slot(decode_count) {
+                let pad = slot - decode_count;
+                if pad > 0 {
+                    if let Ok(idx) = kv_allocator.alloc_indices(pad as u32) {
+                        for &blk in &idx {
+                            seqs.push(SeqStep {
+                                sequence_id: u64::MAX, // sentinel: inert pad row
+                                input_ids: vec![1],
+                                positions: vec![0],
+                                kv_write_start: 0,
+                                kv_len_after: 1,
+                                block_table: vec![blk],
+                            });
+                            max_tokens.push(u32::MAX);
+                            ignore_eos.push(true);
+                            generated_counts.push(0);
+                        }
+                        decode_prefix_len = slot;
+                        pad_indices = idx;
+                    }
+                }
+            }
+        }
+        for &pi in &group.preps {
+            let prep = &mut preps[pi];
+            build_prefill_steps_into(
+                prep.cmd,
+                &mut prep.plans,
+                &prep.base_indices,
+                &mut seqs,
+                &mut max_tokens,
+                &mut ignore_eos,
+            );
+        }
+        // Prefill rows have generated 0 tokens so far.
+        generated_counts.resize(seqs.len(), 0);
+        if seqs.is_empty() {
+            continue;
+        }
+
+        let req = StepRequest {
+            sampling: Vec::new(),
+            stop: StopCriteria {
+                eos_ids: eos_ids.to_vec(),
+                generated_counts,
+                max_tokens,
+                ignore_eos,
+            },
+            draft_tokens: Vec::new(),
+            seqs,
+        };
+
+        let out = match runner.step_fused_eager(&req) {
+            Ok(out) => out,
+            Err(e) => {
+                fail_fused_group(
+                    e,
+                    has_decode,
+                    &decode_order,
+                    &decode_new_indices,
+                    decode_engine,
+                    group,
+                    &mut preps,
+                    active,
+                    prefilling,
+                    kv_allocator,
+                    control,
+                    enable_prefix_caching,
+                );
+                if !pad_indices.is_empty() {
+                    kv_allocator.free(&pad_indices);
+                }
+                continue;
+            }
+        };
+
+        let StepRequest { seqs: mut merged_seqs, .. } = req;
+        let mut output = StepOutput {
+            prefill_done: Vec::new(),
+            tokens: Vec::new(),
+            assigned_indices: Vec::new(),
+        };
+        let mut cursor = 0usize;
+        if has_decode {
+            let b = decode_build.as_ref().unwrap();
+            output.assigned_indices.extend(b.assigned.iter().cloned());
+            decode_engine.commit_fused_decode(
+                active,
+                kv_allocator,
+                &decode_order,
+                &decode_new_indices,
+                &out.tokens,
+                &out.finished,
+                enable_prefix_caching,
+                &mut output,
+            )?;
+            cursor = decode_prefix_len;
+        }
+        for &pi in &group.preps {
+            let prep = &mut preps[pi];
+            reclaim_prefill_step_data(&mut merged_seqs, &mut prep.plans);
+            let assigned = assigned_runs(prep.cmd, &prep.plans, enable_prefix_caching);
+            output.assigned_indices.extend(assigned);
+            commit_prefill_outputs(
+                prep.cmd,
+                &mut prep.plans,
+                active,
+                prefilling,
+                kv_allocator,
+                enable_prefix_caching,
+                &out.tokens,
+                &out.finished,
+                cursor,
+                &mut output,
+            );
+            cursor += prep.rows;
+        }
+        data.send_step_output(&output)
+            .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
+        // Reclaim the inert decode-prefix pad KV (transient; never owned by any
+        // sequence). Done after the forward + commits so the cuDNN call (which
+        // read these rows' KV) has been issued.
+        if !pad_indices.is_empty() {
+            kv_allocator.free(&pad_indices);
+        }
+    }
     Ok(())
+}
+
+/// Clean up a fused forward that failed: free the group's freshly-allocated KV,
+/// drop its decode rows + prefilling state, and report the error for every
+/// affected sequence.
+#[allow(clippy::too_many_arguments)]
+fn fail_fused_group(
+    e: OpError,
+    has_decode: bool,
+    decode_order: &[u64],
+    decode_new_indices: &[u32],
+    decode_engine: &mut DecodeEngine,
+    group: &ForwardGroup,
+    preps: &mut [CmdPrep],
+    active: &mut ActiveSeqMap,
+    prefilling: &mut PrefillSeqMap,
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
+    enable_prefix_caching: bool,
+) {
+    let mut failed: Vec<u64> = Vec::new();
+    if has_decode {
+        if !decode_new_indices.is_empty() {
+            kv_allocator.free(decode_new_indices);
+        }
+        for &sid in decode_order {
+            if let Some(removed) = active.remove(&sid) {
+                if !enable_prefix_caching {
+                    kv_allocator.free(&removed.block_table);
+                }
+            }
+            failed.push(sid);
+        }
+        decode_engine.reset_after_fused();
+    }
+    for &pi in &group.preps {
+        let prep = &mut preps[pi];
+        if !prep.base_indices.is_empty() {
+            kv_allocator.free(&prep.base_indices);
+        }
+        for seg in &prep.cmd.segments {
+            if let Some(removed) = prefilling.remove(&seg.sequence_id) {
+                kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);
+            }
+            failed.push(seg.sequence_id);
+        }
+    }
+    send_step_error(control, failed, format!("fused step failed: {:?}", e));
 }
 
 fn assigned_runs(

@@ -220,11 +220,15 @@ where
             seq_kv_len: std::collections::HashMap::new(),
         };
 
-        let cap_total_q_tiles = ((cap_num_tokens + crate::domain::plan::RAGGED_Q_TILE as usize
-            - 1)
-            / crate::domain::plan::RAGGED_Q_TILE as usize)
-            .max(1)
-            .max(cap_batch);
+        // Worst-case ragged tiles for ANY valid batch: every req contributes ≥1
+        // tile (≤ cap_batch) PLUS the extra tiles a long prefill adds
+        // (≤ ⌈cap_num_tokens / TILE⌉). A mixed batch (many q=1 decode rows + a
+        // long prefill chunk) hits both at once, so the cap is their SUM — not
+        // their max (the old `.max()` under-sized block2req/block2tile for mixed
+        // batches and for the bucketed mixed graph's padded `cap_batch + ⌈B/TILE⌉`
+        // tile grid).
+        let tile = crate::domain::plan::RAGGED_Q_TILE as usize;
+        let cap_total_q_tiles = (cap_batch + (cap_num_tokens + tile - 1) / tile).max(1);
         let alloc_i32 = |n: usize| D::alloc_tensor::<i32>(Shape::from_slice(&[n.max(1)]), device);
         let kv_index = KvIndexTensors {
             block_tables: alloc_i32(cap_batch * max_blocks_per_seq)?,
@@ -661,6 +665,22 @@ where
     /// admitted, and real sequences allocate from the free list and overwrite
     /// whatever lands there. The decode kernels address the KV pool by raw
     /// block id, so no allocator interaction or ownership check is needed.
+    /// Smallest decode capture size `>= batch` (and `<= cap_batch`), or `None` if
+    /// `batch` is 0 or exceeds the largest capture size. The fused path pads its
+    /// cuDNN decode-prefix up to this slot so the prewarmed (per-capture-size)
+    /// cuDNN SDPA plan is reused instead of paying a ~370ms HEURISTICS_CHOICE
+    /// build on every novel decode-row count. See [[eager-fused-mixed-tail-regression]].
+    pub fn next_capture_slot(&self, batch: usize) -> Option<usize> {
+        if batch == 0 {
+            return None;
+        }
+        self.capture_sizes
+            .iter()
+            .copied()
+            .filter(|&s| s >= batch && s <= self.cap_batch)
+            .min()
+    }
+
     pub fn prewarm_decode_graphs(&mut self) -> OpResult<()> {
         if self.graph.is_none() {
             return Ok(());
@@ -1152,18 +1172,38 @@ where
     /// admissions, or rows shifted by an out-of-band eviction) is uploaded
     /// through buffer B and appended into A.
     ///
-    /// Make the compute stream wait on the in-flight decode step's copy-out
-    /// (ev_out) before any further compute-stream write to buffer A. The serve
-    /// loop calls this before running a prefill while a decode step is pending:
-    /// a graph-eligible (all q=1) prefill uploads into `input_ids_buf` on the
-    /// compute stream and would otherwise race the pending step's async
-    /// copy-out read of A. Enqueue-only — no host sync.
-    pub fn guard_buffer_a_against_pending_copyout(&self) -> OpResult<()> {
-        if self.abc.copy_out_recorded {
-            let cfg = self.scope.device().config.clone();
-            cfg.compute_wait_copy_out()?;
-        }
-        Ok(())
+    /// Forward + sample a fused (mixed prefill + decode) batch, always eager.
+    /// A fused step mixes q>1 prefill-chunk rows with q=1 decode rows in one
+    /// ragged forward. It must NOT take the captured decode-graph path (that path
+    /// is driven by the ABC pipeline with fixed buffers, not this request-driven
+    /// forward), so even an all-q=1 fused batch is routed through `step_eager`.
+    /// The ragged/varlen attention handles any per-row q distribution; the eager
+    /// finalize samples one token per row in `req.seqs` order.
+    pub fn step_fused_eager(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
+        // Eager fused forward. Route ALL transient scratch through the bump arena
+        // (zero cudaMalloc/cudaFree) instead of the recycling pool, which churns
+        // cudaMalloc on every new ragged shape and cudaFree (device-sync) once
+        // over its retain budget. Arena pointers are no-op on free
+        // (arena_contains filter); on exhaustion allocs fall back to the pool.
+        //
+        // NOTE: this path is currently ~2.4x slower than the decode baseline at
+        // high QPS. Root cause (measured): the fused batch routes the q=1 DECODE
+        // rows through the CuTe ragged PREFILL attention kernel (1/128 tile
+        // utilization). The CUDA-graph attempt was a dead end (graphs the slow
+        // attention). The real fix is to SPLIT the fused attention by row type —
+        // q=1 decode rows → fast cuDNN decode SDPA, q>1 prefill rows → cuDNN
+        // varlen+causal SDPA (needs a varlen-q cuDNN graph; current graph
+        // hardcodes q-seqlen=1) or the CuTe ragged kernel. See memory
+        // fused-mixed-batch-and-graph.
+        let cfg = self.scope.device().config.clone();
+        cfg.arena_begin();
+        let result = (|| {
+            let plan = self.build_plan(req)?;
+            self.upload_index(&plan, req)?;
+            self.step_eager(&plan, req)
+        })();
+        cfg.arena_end();
+        result
     }
 
     /// ISSUE half of the 1-deep decode pipeline: enqueues forward + finalize +
