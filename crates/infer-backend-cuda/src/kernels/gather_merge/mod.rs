@@ -250,6 +250,57 @@ mod tests {
     use infer_core::types::Shape;
 
     #[test]
+    fn merge_compact_decode_preserves_order() {
+        let cuda = Cuda::new(0).expect("cuda init");
+        let mut a = Tensor::<i32, Cuda>::from_host_slice(&[99; 5], Shape::from_slice(&[5]), &cuda)
+            .expect("A");
+        let c = Tensor::<i32, Cuda>::from_host_slice(&[10, 20, 30, 40, 50], [5], &cuda).expect("C");
+        let generated_counts =
+            Tensor::<i32, Cuda>::from_host_slice(&[0, 1, 4, 0, 2], [5], &cuda).expect("gen");
+        let max_tokens =
+            Tensor::<i32, Cuda>::from_host_slice(&[10, 10, 5, 99, 3], [5], &cuda).expect("max");
+        let ignore_eos =
+            Tensor::<i32, Cuda>::from_host_slice(&[1, 1, 1, 0, 1], [5], &cuda).expect("ignore");
+        let eos_ids = Tensor::<i32, Cuda>::from_host_slice(&[40], [1], &cuda).expect("eos");
+        let active_src_rows = Tensor::<i32, Cuda>::zeros([5], &cuda).expect("active_src");
+        let finished_src_rows = Tensor::<i32, Cuda>::zeros([5], &cuda).expect("finished_src");
+        let finished_tokens = Tensor::<i32, Cuda>::zeros([5], &cuda).expect("finished_tokens");
+        let counts = Tensor::<i32, Cuda>::zeros([3], &cuda).expect("counts");
+
+        merge_compact_decode_into(MergeCompactDecodeArgs {
+            a_out: &mut a,
+            c_prev: &c,
+            generated_counts: &generated_counts,
+            max_tokens: &max_tokens,
+            ignore_eos: &ignore_eos,
+            eos_ids: &eos_ids,
+            eos_len: 1,
+            old_batch: 5,
+            active_src_rows: &active_src_rows,
+            finished_src_rows: &finished_src_rows,
+            finished_tokens: &finished_tokens,
+            counts: &counts,
+            stream: cuda.config.stream,
+        })
+        .expect("merge");
+
+        assert_eq!(&counts.to_host_vec().expect("counts")[..3], &[2, 3, 5]);
+        assert_eq!(&a.to_host_vec().expect("A")[..2], &[10, 20]);
+        assert_eq!(
+            &active_src_rows.to_host_vec().expect("active src")[..2],
+            &[0, 1]
+        );
+        assert_eq!(
+            &finished_src_rows.to_host_vec().expect("finished src")[..3],
+            &[2, 3, 4]
+        );
+        assert_eq!(
+            &finished_tokens.to_host_vec().expect("finished tokens")[..3],
+            &[30, 40, 50]
+        );
+    }
+
+    #[test]
     fn merge_compact_mixed_respects_row_kind() {
         let cuda = Cuda::new(0).expect("cuda init");
         let mut a = Tensor::<i32, Cuda>::from_host_slice(&[99; 5], Shape::from_slice(&[5]), &cuda)

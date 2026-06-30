@@ -85,6 +85,10 @@ where
     /// Exact-shape mixed ABC graphs captured so far. Bounded because mixed
     /// q_len layouts can be much more diverse than decode batch sizes.
     mixed_graphs_captured: usize,
+    /// Mixed graph capture is a bootstrap-only activity. Serving may replay a
+    /// ready bucket, but an unseen bucket falls back to eager instead of doing
+    /// eager warmup + synchronize + stream capture on the request path.
+    mixed_graph_capture_enabled: bool,
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -365,6 +369,7 @@ where
             abc,
             prefill_graphs_captured: 0,
             mixed_graphs_captured: 0,
+            mixed_graph_capture_enabled: false,
         })
     }
 
@@ -1308,6 +1313,150 @@ impl<M> Runtime<bf16, Cuda, M>
 where
     M: DecoderModel<bf16, Cuda>,
 {
+    /// Capture the common mixed (decode-prefix + one prefill admission) ABC
+    /// graph buckets before the worker reports Ready. Live mixed batches used to
+    /// discover these buckets inline on the serve thread, so the first request
+    /// at each `(decode_prefix, token_bucket)` paid eager warmup + synchronize +
+    /// stream capture in the timed path.
+    ///
+    /// The synthetic request mirrors the scheduler's common online shape: a
+    /// decode prefix already rounded to a capture slot, followed by one prefill
+    /// final row. It uses real `step_fused_abc_eager`, with `next_slots`, so the
+    /// captured region and graph key match the high-QPS ABC path.
+    pub fn prewarm_mixed_graphs(&mut self, eos_ids: &[i32]) -> OpResult<usize> {
+        if self.graph.is_none() || !self.scope.supports_graphs() {
+            return Ok(0);
+        }
+        let prev_capture_enabled = self.mixed_graph_capture_enabled;
+        self.mixed_graph_capture_enabled = true;
+        let result = self.prewarm_mixed_graphs_inner(eos_ids);
+        self.mixed_graph_capture_enabled = prev_capture_enabled;
+        result
+    }
+
+    fn prewarm_mixed_graphs_inner(&mut self, eos_ids: &[i32]) -> OpResult<usize> {
+        let max_prefill_len = self
+            .max_seq_len
+            .min(self.cap_num_tokens)
+            .min(self.max_blocks_per_seq.saturating_mul(self.block_size));
+        let cases = mixed_graph_warmup_cases(
+            &self.capture_sizes,
+            self.cap_batch,
+            self.cap_num_tokens,
+            max_prefill_len,
+            MIXED_GRAPH_PREWARM_MAX,
+        );
+        let mut warmed = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for case in cases {
+            let Some((req, row_kind, next_slots, key)) =
+                self.mixed_graph_warmup_request(case, eos_ids)?
+            else {
+                continue;
+            };
+            if !seen.insert(key) || self.scope.graph_ready(key) {
+                continue;
+            }
+            self.step_fused_abc_eager(&req, &row_kind, Some(&next_slots))?;
+            warmed += 1;
+            if self.mixed_graphs_captured >= MIXED_GRAPH_BUDGET {
+                break;
+            }
+        }
+        self.scope.synchronize()?;
+        Ok(warmed)
+    }
+
+    fn mixed_graph_warmup_request(
+        &self,
+        case: MixedGraphWarmupCase,
+        eos_ids: &[i32],
+    ) -> OpResult<Option<(StepRequest, Vec<RaggedRowKind>, Vec<u32>, u64)>> {
+        if case.prefill_len < 2 {
+            return Ok(None);
+        }
+        let batch = case.decode_prefix + 1;
+        if batch > self.cap_batch || case.decode_prefix + case.prefill_len > self.cap_num_tokens {
+            return Ok(None);
+        }
+
+        let prefill_blocks = case.prefill_len.div_ceil(self.block_size);
+        if prefill_blocks > self.max_blocks_per_seq {
+            return Ok(None);
+        }
+        let needed_blocks = case
+            .decode_prefix
+            .saturating_add(prefill_blocks)
+            .saturating_add(batch);
+        if needed_blocks > self.kv_pool.num_blocks || needed_blocks > u32::MAX as usize {
+            return Ok(None);
+        }
+
+        let mut next_block = 0u32;
+        let mut seqs = Vec::with_capacity(batch);
+        let mut row_kind = Vec::with_capacity(batch);
+        for i in 0..case.decode_prefix {
+            let block = next_block;
+            next_block += 1;
+            seqs.push(SeqStep {
+                sequence_id: 10_000_000 + i as u64,
+                input_ids: vec![1],
+                positions: vec![0],
+                kv_write_start: 0,
+                kv_len_after: 1,
+                block_table: vec![block],
+            });
+            row_kind.push(RaggedRowKind::Decode);
+        }
+
+        let prefill_start = next_block;
+        next_block += prefill_blocks as u32;
+        seqs.push(SeqStep {
+            sequence_id: 20_000_000 + case.token_bucket as u64,
+            input_ids: vec![1; case.prefill_len],
+            positions: (0..case.prefill_len as i32).collect(),
+            kv_write_start: 0,
+            kv_len_after: case.prefill_len as i32,
+            block_table: (prefill_start..next_block).collect(),
+        });
+        row_kind.push(RaggedRowKind::PrefillFinal);
+
+        let next_slots: Vec<u32> = (0..batch)
+            .map(|_| {
+                let block = next_block;
+                next_block += 1;
+                block
+            })
+            .collect();
+
+        let req = StepRequest {
+            sampling: vec![Default::default(); batch],
+            stop: StopCriteria {
+                eos_ids: eos_ids.to_vec(),
+                generated_counts: vec![0; batch],
+                max_tokens: vec![u32::MAX; batch],
+                ignore_eos: vec![true; batch],
+            },
+            draft_tokens: Vec::new(),
+            seqs,
+        };
+        let plan = self.build_plan(&req)?;
+        let Some(shape) = self.graph.as_ref().and_then(|graph| {
+            mixed_graph_shape(
+                &plan,
+                &row_kind,
+                self.cap_batch,
+                self.cap_num_tokens,
+                self.mixed_graph_tile_capacity(),
+                graph.capture_sizes(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        let key = mixed_graph_key(shape, eos_ids.len(), true);
+        Ok(Some((req, row_kind, next_slots, key)))
+    }
+
     /// ABC GPU-resident decode step (buffer A = `input_ids_buf`).
     ///
     /// Precondition: rows `0..a_valid_prefix` of A already hold the correct
@@ -1454,6 +1603,9 @@ where
             self.scope.graph_launch(key)?;
             return Ok(true);
         }
+        if !self.mixed_graph_capture_enabled {
+            return Ok(false);
+        }
         if self.mixed_graphs_captured >= MIXED_GRAPH_BUDGET {
             return Ok(false);
         }
@@ -1514,7 +1666,13 @@ where
         let _gemm_guard = PrefillGemmGuard::<Cuda>(prefill_gemm, std::marker::PhantomData);
         self.run_layers(plan, input_ids)?;
         self.forward_argmax_last_per_seq(plan)?;
-        self.run_mixed_merge_and_next_control(plan, req.stop.eos_ids.len(), next_control)
+        let control_rows = self.mixed_next_control_rows(plan.batch);
+        self.run_mixed_merge_and_next_control(
+            plan,
+            req.stop.eos_ids.len(),
+            next_control,
+            control_rows,
+        )
     }
 
     fn run_mixed_abc_graph_region(
@@ -1530,7 +1688,7 @@ where
             true,
         );
         self.forward_finalize_argmax_all_selected(plan, &input_ids)?;
-        self.run_mixed_merge_and_next_control(plan, eos_len, next_control)
+        self.run_mixed_merge_and_next_control(plan, eos_len, next_control, plan.batch)
     }
 
     fn mixed_graph_tile_capacity(&self) -> i32 {
@@ -1643,6 +1801,7 @@ where
         plan: &BatchPlan,
         eos_len: usize,
         next_control: bool,
+        control_rows: usize,
     ) -> OpResult<()> {
         let stream = ExecScope::stream(&self.scope).0;
         let mut a_view = self.input_ids_buf.view_raw(
@@ -1671,9 +1830,16 @@ where
             stream,
         })?;
         if next_control {
-            self.run_compact_extend_control(stream)?;
+            self.run_compact_extend_control(stream, control_rows)?;
         }
         Ok(())
+    }
+
+    fn mixed_next_control_rows(&self, batch: usize) -> usize {
+        self.next_capture_slot(batch)
+            .unwrap_or(batch)
+            .min(self.cap_batch)
+            .max(batch)
     }
 
     fn ensure_abc_pinned(&mut self) -> OpResult<()> {
@@ -1820,10 +1986,11 @@ where
     fn run_compact_extend_control(
         &mut self,
         stream: crate::infrastructure::cuda::ffi::cudaStream_t,
+        control_rows: usize,
     ) -> OpResult<()> {
         self.ensure_async_ctrl()?;
         let mbps = self.max_blocks_per_seq;
-        let cap_batch = self.cap_batch;
+        let cap_batch = control_rows.clamp(1, self.cap_batch);
         let _guard = self.scope.enter();
         let ctrl = self.async_ctrl.as_mut().expect("async_ctrl ensured");
         compact_extend_control_into(CompactExtendControlArgs {
@@ -1967,7 +2134,8 @@ where
         }
         self.upload_mixed_next_slots(next_slots)?;
         let stream = ExecScope::stream(&self.scope).0;
-        self.run_compact_extend_control(stream)
+        let control_rows = self.mixed_next_control_rows(active_n);
+        self.run_compact_extend_control(stream, control_rows)
     }
 
     /// ISSUE half of the 1-deep decode pipeline: enqueues forward + finalize +
@@ -2219,7 +2387,7 @@ where
                 }
             }
             let mbps = self.max_blocks_per_seq;
-            let cap_batch = self.cap_batch;
+            let cap_batch = slot_batch.unwrap_or(batch).clamp(1, self.cap_batch);
             let stream = ExecScope::stream(&self.scope).0;
             let _guard = self.scope.enter();
             let ctrl = self.async_ctrl.as_mut().expect("async_ctrl ensured");
@@ -2512,14 +2680,23 @@ const MIXED_GRAPH_KEY_TAG: u64 = 1 << 41;
 /// each prefill graph by exact `num_tokens`). Bounds graph memory; beyond this,
 /// uncaptured prefill lengths run eager.
 const PREFILL_GRAPH_BUDGET: usize = 16;
-/// Bucketed mixed graphs are keyed by decode-prefix bucket and token bucket,
-/// not exact q_len layout. Keep the budget high enough for a few token buckets
-/// across the configured decode-prefix capture sizes.
-const MIXED_GRAPH_BUDGET: usize = 64;
+/// Bucketed mixed graphs are keyed by row/decode-prefix/token/tile buckets, not
+/// exact q_len layout. Keep the budget high enough for the common online QPS
+/// buckets without falling back to eager during a timed run.
+const MIXED_GRAPH_BUDGET: usize = 128;
 /// Round mixed graph token shapes to this multiple. 64 keeps LM-head/FFN GEMM
 /// shapes stable without padding every mixed step all the way to
 /// `max_batch_tokens`.
 const MIXED_GRAPH_TOKEN_BUCKET: usize = 64;
+/// Round mixed graph ragged tile grids to this multiple. This keeps capture
+/// cardinality bounded while avoiding the previous `tile_capacity` grid, which
+/// launched hundreds of no-op tiles for small mixed batches.
+const MIXED_GRAPH_TILE_BUCKET: usize = 32;
+/// Number of common mixed graph buckets to capture at bootstrap. Keep this
+/// below the total mixed graph budget so rare live buckets can still be learned.
+const MIXED_GRAPH_PREWARM_MAX: usize = 48;
+const MIXED_GRAPH_PREWARM_MAX_DECODE_PREFIX: usize = 128;
+const MIXED_GRAPH_PREWARM_TOKEN_BUCKETS: &[usize] = &[64, 128, 192, 256, 320, 384];
 /// Default max prompt length (tokens) eligible for a single-seq prefill graph.
 /// Set to 0 (disabled): the eager prefill path now routes its bf16 GEMMs to the
 /// `algo=nullptr` cuBLASLt runtime-selected kernel (532f5c's path), which is
@@ -2534,6 +2711,62 @@ struct MixedGraphShape {
     tokens: usize,
     tiles: i32,
     decode_prefix: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixedGraphWarmupCase {
+    decode_prefix: usize,
+    token_bucket: usize,
+    prefill_len: usize,
+}
+
+fn mixed_graph_warmup_cases(
+    capture_sizes: &[usize],
+    cap_batch: usize,
+    cap_num_tokens: usize,
+    max_prefill_len: usize,
+    limit: usize,
+) -> Vec<MixedGraphWarmupCase> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut prefixes: Vec<usize> = capture_sizes
+        .iter()
+        .copied()
+        .filter(|&p| {
+            p > 0
+                && p <= MIXED_GRAPH_PREWARM_MAX_DECODE_PREFIX
+                && p < cap_batch
+                && ceil_capture_slot(capture_sizes, p + 1).is_some()
+        })
+        .collect();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+
+    let mut out = Vec::with_capacity(limit.min(64));
+    for &token_bucket in MIXED_GRAPH_PREWARM_TOKEN_BUCKETS {
+        if token_bucket > cap_num_tokens {
+            continue;
+        }
+        for &decode_prefix in &prefixes {
+            if out.len() >= limit {
+                return out;
+            }
+            if decode_prefix + 2 > token_bucket {
+                continue;
+            }
+            let prefill_len = token_bucket - decode_prefix;
+            if prefill_len > max_prefill_len {
+                continue;
+            }
+            out.push(MixedGraphWarmupCase {
+                decode_prefix,
+                token_bucket,
+                prefill_len,
+            });
+        }
+    }
+    out
 }
 
 fn mixed_graph_shape(
@@ -2559,17 +2792,21 @@ fn mixed_graph_shape(
     }
     let actual_decode_prefix = plan.q_lens.iter().take_while(|&&q| q == 1).count();
     let decode_prefix = floor_capture_slot(capture_sizes, actual_decode_prefix)?;
-    if decode_prefix == 0 || decode_prefix >= cap_batch {
+    let rows = ceil_capture_slot(capture_sizes, plan.batch)?;
+    if decode_prefix == 0 || decode_prefix >= rows || rows > cap_batch {
         return None;
     }
     let tokens = round_up_to_bucket(plan.num_tokens, MIXED_GRAPH_TOKEN_BUCKET)?;
-    if tokens > cap_num_tokens || plan.total_q_tiles > tile_capacity {
+    let actual_tiles = usize::try_from(plan.total_q_tiles).ok()?;
+    let tile_capacity = usize::try_from(tile_capacity).ok()?;
+    let tiles = round_up_to_bucket(actual_tiles.max(1), MIXED_GRAPH_TILE_BUCKET)?;
+    if tokens > cap_num_tokens || tiles > tile_capacity {
         return None;
     }
     Some(MixedGraphShape {
-        rows: cap_batch,
+        rows,
         tokens,
-        tiles: tile_capacity,
+        tiles: tiles as i32,
         decode_prefix,
     })
 }
@@ -2579,6 +2816,13 @@ fn floor_capture_slot(capture_sizes: &[usize], n: usize) -> Option<usize> {
         return None;
     }
     capture_sizes.iter().copied().filter(|&s| s <= n).max()
+}
+
+fn ceil_capture_slot(capture_sizes: &[usize], n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    capture_sizes.iter().copied().filter(|&s| s >= n).min()
 }
 
 fn round_up_to_bucket(n: usize, bucket: usize) -> Option<usize> {
@@ -2948,9 +3192,9 @@ mod tests {
         assert_eq!(
             shape,
             MixedGraphShape {
-                rows: 32,
+                rows: 24,
                 tokens: 384,
-                tiles: 36,
+                tiles: 32,
                 decode_prefix: 16,
             }
         );
@@ -2981,7 +3225,7 @@ mod tests {
             MixedGraphShape {
                 rows: 32,
                 tokens: 64,
-                tiles: 36,
+                tiles: 32,
                 decode_prefix: 24,
             }
         );
@@ -3010,6 +3254,68 @@ mod tests {
 
         assert_eq!(mixed_graph_key(a, 2, true), mixed_graph_key(b, 2, true));
         assert_ne!(mixed_graph_key(a, 2, true), mixed_graph_key(c, 2, true));
+    }
+
+    #[test]
+    fn mixed_graph_warmup_cases_cover_common_buckets() {
+        let cases = mixed_graph_warmup_cases(&[1, 2, 4, 8, 16, 24, 32], 32, 512, 512, 10);
+
+        assert_eq!(
+            cases,
+            vec![
+                MixedGraphWarmupCase {
+                    decode_prefix: 1,
+                    token_bucket: 64,
+                    prefill_len: 63,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 2,
+                    token_bucket: 64,
+                    prefill_len: 62,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 4,
+                    token_bucket: 64,
+                    prefill_len: 60,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 8,
+                    token_bucket: 64,
+                    prefill_len: 56,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 16,
+                    token_bucket: 64,
+                    prefill_len: 48,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 24,
+                    token_bucket: 64,
+                    prefill_len: 40,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 1,
+                    token_bucket: 128,
+                    prefill_len: 127,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 2,
+                    token_bucket: 128,
+                    prefill_len: 126,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 4,
+                    token_bucket: 128,
+                    prefill_len: 124,
+                },
+                MixedGraphWarmupCase {
+                    decode_prefix: 8,
+                    token_bucket: 128,
+                    prefill_len: 120,
+                },
+            ]
+        );
+        assert!(cases.iter().all(|case| case.decode_prefix < 32));
     }
 
     #[test]

@@ -206,6 +206,15 @@ where
             ),
             Err(e) => tracing::info!("[bootstrap] prefill prewarm skipped: {:?}", e),
         }
+        let t_mixed = Instant::now();
+        match runner.prewarm_mixed_graphs(eos_ids) {
+            Ok(n) => tracing::info!(
+                "[bootstrap] mixed ABC graphs prewarmed ({} buckets) in {:.2}s",
+                n,
+                t_mixed.elapsed().as_secs_f64(),
+            ),
+            Err(e) => tracing::info!("[bootstrap] mixed graph prewarm skipped: {:?}", e),
+        }
     }
 
     let max_total_kv_tokens = num_blocks * bs.block_size;

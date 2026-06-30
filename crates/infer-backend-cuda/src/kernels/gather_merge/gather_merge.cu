@@ -32,10 +32,20 @@ __device__ __forceinline__ bool token_is_eos(int token, const int* eos_ids, int 
     return false;
 }
 
-// Small-batch control kernel. The serving batch is capped by max_batch_seqs,
-// and this launch sits behind the transformer forward, so a sequential scan
-// keeps the in-place A compact unambiguous and cheap.
-__global__ void merge_compact_decode_kernel(
+constexpr int MERGE_MAX_ROWS = 1024;
+
+static int merge_threads_for_rows(int rows)
+{
+    int threads = 32;
+    while (threads < rows && threads < MERGE_MAX_ROWS) {
+        threads <<= 1;
+    }
+    return threads;
+}
+
+// Fallback for unusually large batches. Normal serving batches use the
+// single-block prefix-scan kernels below.
+__global__ void merge_compact_decode_serial_kernel(
     int* __restrict__ A,
     const int* __restrict__ C,
     const int* __restrict__ generated_counts,
@@ -72,6 +82,71 @@ __global__ void merge_compact_decode_kernel(
     counts[2] = old_batch;
 }
 
+__global__ void merge_compact_decode_kernel(
+    int* __restrict__ A,
+    const int* __restrict__ C,
+    const int* __restrict__ generated_counts,
+    const int* __restrict__ max_tokens,
+    const int* __restrict__ ignore_eos,
+    const int* __restrict__ eos_ids,
+    int eos_len,
+    int old_batch,
+    int* __restrict__ active_src_rows,
+    int* __restrict__ finished_src_rows,
+    int* __restrict__ finished_tokens,
+    int* __restrict__ counts)
+{
+    __shared__ int active_scan[MERGE_MAX_ROWS];
+    __shared__ int finished_scan[MERGE_MAX_ROWS];
+
+    const int i = threadIdx.x;
+    int active_flag = 0;
+    int finished_flag = 0;
+    int token = 0;
+    if (i < old_batch) {
+        token = C[i];
+        const bool hit_eos = (ignore_eos[i] == 0) && token_is_eos(token, eos_ids, eos_len);
+        const bool hit_max = generated_counts[i] + 1 >= max_tokens[i];
+        finished_flag = (hit_eos || hit_max) ? 1 : 0;
+        active_flag = finished_flag ? 0 : 1;
+    }
+    active_scan[i] = active_flag;
+    finished_scan[i] = finished_flag;
+    __syncthreads();
+
+    for (int offset = 1; offset < old_batch; offset <<= 1) {
+        int active_add = 0;
+        int finished_add = 0;
+        if (i < old_batch && i >= offset) {
+            active_add = active_scan[i - offset];
+            finished_add = finished_scan[i - offset];
+        }
+        __syncthreads();
+        if (i < old_batch) {
+            active_scan[i] += active_add;
+            finished_scan[i] += finished_add;
+        }
+        __syncthreads();
+    }
+
+    if (i < old_batch) {
+        if (active_flag) {
+            const int dst = active_scan[i] - 1;
+            A[dst] = token;
+            active_src_rows[dst] = i;
+        } else {
+            const int dst = finished_scan[i] - 1;
+            finished_src_rows[dst] = i;
+            finished_tokens[dst] = token;
+        }
+    }
+    if (i == 0) {
+        counts[0] = active_scan[old_batch - 1];
+        counts[1] = finished_scan[old_batch - 1];
+        counts[2] = old_batch;
+    }
+}
+
 extern "C" void merge_compact_decode(
     int* A,
     const int* C,
@@ -90,7 +165,24 @@ extern "C" void merge_compact_decode(
     if (old_batch <= 0) {
         return;
     }
-    merge_compact_decode_kernel<<<1, 1, 0, stream>>>(
+    if (old_batch > MERGE_MAX_ROWS) {
+        merge_compact_decode_serial_kernel<<<1, 1, 0, stream>>>(
+            A,
+            C,
+            generated_counts,
+            max_tokens,
+            ignore_eos,
+            eos_ids,
+            eos_len,
+            old_batch,
+            active_src_rows,
+            finished_src_rows,
+            finished_tokens,
+            counts);
+        return;
+    }
+    const int threads = merge_threads_for_rows(old_batch);
+    merge_compact_decode_kernel<<<1, threads, 0, stream>>>(
         A,
         C,
         generated_counts,
@@ -112,7 +204,7 @@ enum MixedRowKind {
     ROW_PAD = 3,
 };
 
-__global__ void merge_compact_mixed_kernel(
+__global__ void merge_compact_mixed_serial_kernel(
     int* __restrict__ A,
     const int* __restrict__ C,
     const int* __restrict__ row_kind,
@@ -168,6 +260,93 @@ __global__ void merge_compact_mixed_kernel(
     counts[3] = old_rows;
 }
 
+__global__ void merge_compact_mixed_kernel(
+    int* __restrict__ A,
+    const int* __restrict__ C,
+    const int* __restrict__ row_kind,
+    const int* __restrict__ generated_counts,
+    const int* __restrict__ max_tokens,
+    const int* __restrict__ ignore_eos,
+    const int* __restrict__ eos_ids,
+    int eos_len,
+    int old_rows,
+    int* __restrict__ active_src_rows,
+    int* __restrict__ active_tokens,
+    int* __restrict__ finished_src_rows,
+    int* __restrict__ finished_tokens,
+    int* __restrict__ prefill_final_src_rows,
+    int* __restrict__ prefill_final_tokens,
+    int* __restrict__ counts)
+{
+    __shared__ int active_scan[MERGE_MAX_ROWS];
+    __shared__ int finished_scan[MERGE_MAX_ROWS];
+    __shared__ int prefill_final_scan[MERGE_MAX_ROWS];
+
+    const int i = threadIdx.x;
+    int active_flag = 0;
+    int finished_flag = 0;
+    int prefill_final_flag = 0;
+    int token = 0;
+    if (i < old_rows) {
+        const int kind = row_kind[i];
+        const bool emits = kind != ROW_PAD && kind != ROW_PREFILL_CONT;
+        prefill_final_flag = kind == ROW_PREFILL_FINAL ? 1 : 0;
+        if (emits) {
+            token = C[i];
+            const bool hit_eos = (ignore_eos[i] == 0) && token_is_eos(token, eos_ids, eos_len);
+            const bool hit_max = generated_counts[i] + 1 >= max_tokens[i];
+            finished_flag = (hit_eos || hit_max) ? 1 : 0;
+            active_flag = finished_flag ? 0 : 1;
+        }
+    }
+    active_scan[i] = active_flag;
+    finished_scan[i] = finished_flag;
+    prefill_final_scan[i] = prefill_final_flag;
+    __syncthreads();
+
+    for (int offset = 1; offset < old_rows; offset <<= 1) {
+        int active_add = 0;
+        int finished_add = 0;
+        int prefill_final_add = 0;
+        if (i < old_rows && i >= offset) {
+            active_add = active_scan[i - offset];
+            finished_add = finished_scan[i - offset];
+            prefill_final_add = prefill_final_scan[i - offset];
+        }
+        __syncthreads();
+        if (i < old_rows) {
+            active_scan[i] += active_add;
+            finished_scan[i] += finished_add;
+            prefill_final_scan[i] += prefill_final_add;
+        }
+        __syncthreads();
+    }
+
+    if (i < old_rows) {
+        if (prefill_final_flag) {
+            const int dst = prefill_final_scan[i] - 1;
+            prefill_final_src_rows[dst] = i;
+            prefill_final_tokens[dst] = token;
+        }
+        if (active_flag) {
+            const int dst = active_scan[i] - 1;
+            A[dst] = token;
+            active_src_rows[dst] = i;
+            active_tokens[dst] = token;
+        } else if (finished_flag) {
+            const int dst = finished_scan[i] - 1;
+            finished_src_rows[dst] = i;
+            finished_tokens[dst] = token;
+        }
+    }
+    if (i == 0) {
+        counts[0] = active_scan[old_rows - 1];
+        counts[1] = finished_scan[old_rows - 1];
+        counts[2] = prefill_final_scan[old_rows - 1];
+        counts[3] = old_rows;
+    }
+}
+
 extern "C" void merge_compact_mixed(
     int* A,
     const int* C,
@@ -190,7 +369,28 @@ extern "C" void merge_compact_mixed(
     if (old_rows <= 0) {
         return;
     }
-    merge_compact_mixed_kernel<<<1, 1, 0, stream>>>(
+    if (old_rows > MERGE_MAX_ROWS) {
+        merge_compact_mixed_serial_kernel<<<1, 1, 0, stream>>>(
+            A,
+            C,
+            row_kind,
+            generated_counts,
+            max_tokens,
+            ignore_eos,
+            eos_ids,
+            eos_len,
+            old_rows,
+            active_src_rows,
+            active_tokens,
+            finished_src_rows,
+            finished_tokens,
+            prefill_final_src_rows,
+            prefill_final_tokens,
+            counts);
+        return;
+    }
+    const int threads = merge_threads_for_rows(old_rows);
+    merge_compact_mixed_kernel<<<1, threads, 0, stream>>>(
         A,
         C,
         row_kind,
