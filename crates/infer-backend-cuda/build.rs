@@ -33,9 +33,7 @@ fn main() {
         let kernel_paths = find_files("src/kernels", "cu");
 
         if kernel_paths.is_empty() {
-            println!(
-                "cargo:warning=No CUDA kernel files (.cu) found in src/kernels/"
-            );
+            println!("cargo:warning=No CUDA kernel files (.cu) found in src/kernels/");
         }
 
         // 配置 Rust 链接搜索路径 (加入动态识别的 Conda lib 路径)

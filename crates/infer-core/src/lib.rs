@@ -20,14 +20,14 @@
 extern crate self as infer_core;
 
 pub mod device;
-pub mod storage;
-pub mod tensor;
+pub mod dtype;
+pub mod env_flags;
+pub mod error;
 pub mod exec;
 pub mod plan;
-pub mod dtype;
-pub mod error;
+pub mod storage;
+pub mod tensor;
 pub mod types;
-pub mod env_flags;
 
 // ── backend interface (folded in from infer-backend-abi) ──
 pub mod component;

@@ -118,7 +118,9 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 
                 let mut new_admitted = 0usize;
                 for (seqs_used, seq) in candidates.into_iter().enumerate() {
-                    if seqs_used >= seq_budget || kv_budget_remaining == 0 || tile_budget_remaining == 0
+                    if seqs_used >= seq_budget
+                        || kv_budget_remaining == 0
+                        || tile_budget_remaining == 0
                     {
                         break;
                     }
@@ -131,9 +133,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                     let prompt_len = seq.meta.input_ids.len();
                     let requested_tokens = match self.chunked_prefill_size {
                         Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
-                        None => {
-                            prompt_len.min(kv_budget_remaining)
-                        }
+                        None => prompt_len.min(kv_budget_remaining),
                     };
                     let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
                     let tokens_to_prefill = fit_new_prefill_tokens(
@@ -164,7 +164,9 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 let mut new_admitted = 0usize;
                 let mut seqs_used = 0usize;
                 for seq in waiting.iter() {
-                    if seqs_used >= seq_budget || kv_budget_remaining == 0 || tile_budget_remaining == 0
+                    if seqs_used >= seq_budget
+                        || kv_budget_remaining == 0
+                        || tile_budget_remaining == 0
                     {
                         break;
                     }
@@ -177,9 +179,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                     let prompt_len = seq.meta.input_ids.len();
                     let requested_tokens = match self.chunked_prefill_size {
                         Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
-                        None => {
-                            prompt_len.min(kv_budget_remaining)
-                        }
+                        None => prompt_len.min(kv_budget_remaining),
                     };
                     let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
                     let tokens_to_prefill = fit_new_prefill_tokens(

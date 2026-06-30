@@ -7,11 +7,11 @@
 //! RoPE tables: sin [max_seq_len, head_dim/2], cos [max_seq_len, head_dim/2]
 //! positions: device pointer [num_tokens] i32
 
-use infer_core::ports::{OpResult, OpError};
-use infer_core::types::{DataType, Dtype};
-use infer_core::tensor::Tensor;
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{DataType, Dtype};
 
 // ─── C kernel declarations ─────────────────────────────────────────────────────
 
@@ -173,7 +173,7 @@ pub fn fused_qk_norm_rope<T: Dtype>(
                 return Err(OpError::Kernel(format!(
                     "fused_qk_norm_rope: unsupported dtype {:?}",
                     T::DATA_TYPE
-                )))
+                )));
             }
         }
     }

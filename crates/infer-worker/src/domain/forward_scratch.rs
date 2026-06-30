@@ -41,14 +41,14 @@ pub struct ForwardScratch<T: Dtype, D: FusedOps> {
     cap_num_tokens: usize,
     dims: ModelDims,
 
-    normed: Tensor<T, D>,   // [cap, dim]   (attn pre-norm + ffn pre-norm + finalize norm)
-    qkv: Tensor<T, D>,      // [cap, qkv_dim]  (Q/K/V come from D::qkv_split: CUDA narrows this)
+    normed: Tensor<T, D>, // [cap, dim]   (attn pre-norm + ffn pre-norm + finalize norm)
+    qkv: Tensor<T, D>,    // [cap, qkv_dim]  (Q/K/V come from D::qkv_split: CUDA narrows this)
     attn_out: Tensor<T, D>, // [cap, q_dim]
-    o_out: Tensor<T, D>,    // [cap, dim]
-    gate_up: Tensor<T, D>,  // [cap, 2*intermediate_size]
-    swiglu: Tensor<T, D>,   // [cap, intermediate_size]
-    ffn_out: Tensor<T, D>,  // [cap, dim]
-    logits: Tensor<T, D>,   // [cap, vocab_size]  (finalize lm_head output)
+    o_out: Tensor<T, D>,  // [cap, dim]
+    gate_up: Tensor<T, D>, // [cap, 2*intermediate_size]
+    swiglu: Tensor<T, D>, // [cap, intermediate_size]
+    ffn_out: Tensor<T, D>, // [cap, dim]
+    logits: Tensor<T, D>, // [cap, vocab_size]  (finalize lm_head output)
     /// Flash-attention decode workspace, `[flash_ws_elems] f32`. Held in
     /// `UnsafeCell` so per-call `Attention::run` can hand the kernel a `&mut`
     /// view via `flash_workspace_mut`. Concurrent layers are NOT possible (the
@@ -82,8 +82,7 @@ impl<T: Dtype, D: FusedOps + MemoryPort> ForwardScratch<T, D> {
         };
         let flash_ws_elems =
             D::flash_decode_workspace_capacity_f32(cap_batch, dims.head_num, dims.head_dim).max(1);
-        let flash_ws =
-            Tensor::<f32, D>::zeros(Shape::from_slice(&[flash_ws_elems]), device)?;
+        let flash_ws = Tensor::<f32, D>::zeros(Shape::from_slice(&[flash_ws_elems]), device)?;
         Ok(Rc::new(Self {
             cap_num_tokens: cap,
             dims,

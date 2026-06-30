@@ -120,9 +120,8 @@ impl LruList {
     /// (e.g. after every N evictions) to prevent unbounded queue growth
     /// from lazy-removed entries.
     fn compact(&mut self) {
-        self.queue.retain(|&(node, g)| {
-            self.generations.get(&node).map_or(false, |&cur| cur == g)
-        });
+        self.queue
+            .retain(|&(node, g)| self.generations.get(&node).map_or(false, |&cur| cur == g));
         // Also prune the generations map for nodes no longer in the queue.
         // After retain, any node not in the queue can have its gen removed.
         // However, re-scanning is O(generations.len()); to keep this cheap,

@@ -9,8 +9,7 @@ use std::ptr::NonNull;
 use half::{bf16, f16};
 
 use infer_core::ports::{
-    AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpError,
-    OpResult,
+    AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpError, OpResult,
 };
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype, Shape};

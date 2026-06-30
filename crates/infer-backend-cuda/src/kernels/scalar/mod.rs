@@ -1,11 +1,11 @@
 //! Scalar ops CUDA kernel wrappers (scalar mul/add, silu/tanh, device-scalar variants).
 
-use infer_core::ports::{OpError, OpResult};
-use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype};
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
 use half::{bf16, f16};
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
     // dst = src * val

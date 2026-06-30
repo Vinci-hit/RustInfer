@@ -1,10 +1,7 @@
 use dioxus::prelude::*;
 
 #[component]
-pub fn MessageInput(
-    on_send: EventHandler<String>,
-    is_disabled: bool,
-) -> Element {
+pub fn MessageInput(on_send: EventHandler<String>, is_disabled: bool) -> Element {
     let mut input_text = use_signal(String::new);
 
     let mut do_send = move || {

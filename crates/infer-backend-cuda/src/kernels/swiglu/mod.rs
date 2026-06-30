@@ -1,10 +1,10 @@
 //! SiLU + SwiGLU CUDA kernel wrappers.
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     // SwiGLU: input_output_x = silu(input_output_x) * input_y, in place.

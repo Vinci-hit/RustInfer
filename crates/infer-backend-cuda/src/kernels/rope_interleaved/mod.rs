@@ -7,11 +7,11 @@
 //!
 //! `cos` / `sin` are F32 caches of shape `[seq, head_dim/2]`.
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn rope_interleaved_f32_forward(
@@ -106,8 +106,8 @@ pub fn apply_rope_interleaved<T: Dtype>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infer_core::types::Shape;
     use half::bf16;
+    use infer_core::types::Shape;
 
     /// CPU reference: interleaved RoPE.
     fn rope_interleaved_cpu_f32(

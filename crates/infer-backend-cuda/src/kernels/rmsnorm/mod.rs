@@ -1,10 +1,10 @@
 //! RMSNorm CUDA kernel wrapper — generic over T: Float.
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 // ─── C kernel declarations ───────────────────────────────────────────────────
 

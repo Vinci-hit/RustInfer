@@ -70,6 +70,12 @@ pub struct WorkerHeartbeat {
     /// Enables scheduler-side drift detection against its own `KvBudget`.
     #[serde(default)]
     pub kv_outstanding: Option<u32>,
+    /// Worker-side KV slots that are allocated but not yet visible through a
+    /// `StepOutput.assigned_indices` report: in-flight decode slots and
+    /// next-step speculative reservations. Drift detection subtracts these
+    /// before comparing with scheduler-confirmed outstanding.
+    #[serde(default)]
+    pub kv_transient_reserved: Option<u32>,
     /// Worker-side total free KV slots (`allocator.total_free()`).
     #[serde(default)]
     pub kv_total_free: Option<u32>,

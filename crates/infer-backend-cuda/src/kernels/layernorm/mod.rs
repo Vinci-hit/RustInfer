@@ -2,11 +2,11 @@
 //! The .cu kernel computes (x - mean) / std. We apply weight*x + bias via
 //! broadcast_mul + a simple bias-add loop on top.
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn layernorm_f32_forward(

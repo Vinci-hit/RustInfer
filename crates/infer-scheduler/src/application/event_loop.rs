@@ -61,7 +61,10 @@ pub async fn run_event_loop(
                 engine.handle_new_request(client_id, request);
                 engine.maybe_schedule().await?;
                 if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
-                    tracing::info!(us = _t.elapsed().as_micros() as u64, "SCHED_TRACE: NewRequest->dispatch");
+                    tracing::info!(
+                        us = _t.elapsed().as_micros() as u64,
+                        "SCHED_TRACE: NewRequest->dispatch"
+                    );
                 }
             }
             SchedulerEvent::Cancel {
@@ -76,7 +79,10 @@ pub async fn run_event_loop(
                 engine.handle_step_output(event).await?;
                 engine.maybe_schedule().await?;
                 if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
-                    tracing::info!(us = _t.elapsed().as_micros() as u64, "SCHED_TRACE: StepOutput->forward");
+                    tracing::info!(
+                        us = _t.elapsed().as_micros() as u64,
+                        "SCHED_TRACE: StepOutput->forward"
+                    );
                 }
             }
             SchedulerEvent::ControlSignal(ev) => {

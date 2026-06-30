@@ -1,6 +1,6 @@
-use dioxus::prelude::*;
 use crate::state::conversation::Message;
 use crate::utils::markdown::render_markdown;
+use dioxus::prelude::*;
 
 #[component]
 pub fn MessageBubble(message: Message) -> Element {

@@ -1,8 +1,8 @@
-use infer_core::dtype::Dtype;
-use infer_core::exec::StepCtx;
 use crate::kv::KvView;
 use crate::ports::OpResult;
 use crate::ports::backend::LlmBackend;
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
 use infer_core::tensor::Tensor;
 
 pub struct Hidden<T: Dtype, D: LlmBackend> {

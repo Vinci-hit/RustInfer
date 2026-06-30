@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::ports::{OpError, OpResult};
 use infer_core::dtype::Dtype;
 use infer_core::dtype::quant::QuantScheme;
 use infer_core::exec::ExecDevice as Device;
-use crate::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{Shape, Strides};
 

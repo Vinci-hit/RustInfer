@@ -1,6 +1,6 @@
-use anyhow::Result;
-use crate::state::metrics::SystemMetrics;
 use super::types::*;
+use crate::state::metrics::SystemMetrics;
+use anyhow::Result;
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -23,7 +23,8 @@ impl ApiClient {
     /// 非流式 chat completion
     pub async fn chat_completion(&self, request: ChatRequest) -> Result<ChatResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&request)
             .send()
@@ -37,7 +38,8 @@ impl ApiClient {
     /// 流式 chat completion — 返回 Response 供逐行读取 SSE
     pub async fn chat_completion_stream(&self, request: ChatRequest) -> Result<reqwest::Response> {
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&request)
             .send()
@@ -62,7 +64,8 @@ impl ApiClient {
     /// 获取可用模型列表
     pub async fn list_models(&self) -> Result<Vec<ModelObject>> {
         let url = format!("{}/v1/models", self.base_url);
-        let resp: ModelListResponse = self.client
+        let resp: ModelListResponse = self
+            .client
             .get(&url)
             .send()
             .await?
@@ -75,12 +78,7 @@ impl ApiClient {
     /// 获取系统 metrics
     pub async fn get_metrics(&self) -> Result<SystemMetrics> {
         let url = format!("{}/metrics", self.base_url);
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let response = self.client.get(&url).send().await?.json().await?;
         Ok(response)
     }
 

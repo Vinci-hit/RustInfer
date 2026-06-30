@@ -172,10 +172,7 @@ where
     // size matches a capture slot; on backends without graph support it is a
     // no-op and decode stays eager.
     if let Err(e) = runner.prime_graphs() {
-        tracing::info!(
-            "[bootstrap] graph priming skipped, eager decode: {:?}",
-            e
-        );
+        tracing::info!("[bootstrap] graph priming skipped, eager decode: {:?}", e);
     } else {
         // Capture every decode graph now, before serving, so no live decode
         // step ever pays an inline capture stall (the dominant TTFT/TPOT tail
@@ -187,10 +184,7 @@ where
                 bs.capture_sizes.len(),
                 t_warm.elapsed().as_secs_f64(),
             ),
-            Err(e) => tracing::info!(
-                "[bootstrap] decode graph prewarm skipped: {:?}",
-                e
-            ),
+            Err(e) => tracing::info!("[bootstrap] decode graph prewarm skipped: {:?}", e),
         }
         // Warm the prefill path across a length grid so the first live prefill
         // of each shape pays no inline allocator/library cost (the residual
@@ -210,10 +204,7 @@ where
                 prefill_grid.len(),
                 t_pf.elapsed().as_secs_f64(),
             ),
-            Err(e) => tracing::info!(
-                "[bootstrap] prefill prewarm skipped: {:?}",
-                e
-            ),
+            Err(e) => tracing::info!("[bootstrap] prefill prewarm skipped: {:?}", e),
         }
     }
 
@@ -275,10 +266,7 @@ where
         .and_then(|s| s.parse().ok())
         .unwrap_or(20.0);
     if trace_steps {
-        tracing::info!(
-            "[step-trace] enabled, threshold={:.1}ms",
-            step_trace_ms
-        );
+        tracing::info!("[step-trace] enabled, threshold={:.1}ms", step_trace_ms);
     }
 
     loop {
@@ -318,6 +306,7 @@ where
                 &mut last_heartbeat,
                 heartbeat_interval,
                 &kv_allocator,
+                decode_engine.transient_reserved_slots(),
             );
 
             // Block until a socket is readable or the next heartbeat is due.
@@ -373,7 +362,11 @@ where
 
         // Stall tracer: start timing the *work* section (idle poll wait above
         // is intentionally excluded — it is not a stall).
-        let work_t0 = if trace_steps { Some(Instant::now()) } else { None };
+        let work_t0 = if trace_steps {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut tr_pf_seqs = 0usize;
         let mut tr_pf_tokens = 0usize;
         let tr_pf_ms = 0f64;
@@ -388,7 +381,11 @@ where
         // and in-flight decode rows advance a token in that same forward rather
         // than stalling behind the prefills. When nothing is prefilling, steady-
         // state decode keeps the fast graphed ABC pipeline (`run_step`).
-        let prefill_rounds = if pending_prefills.is_empty() { 0usize } else { 1usize };
+        let prefill_rounds = if pending_prefills.is_empty() {
+            0usize
+        } else {
+            1usize
+        };
         if !pending_prefills.is_empty() {
             if trace_steps {
                 for cmd in &pending_prefills {
@@ -397,7 +394,11 @@ where
                 }
                 tr_dec_batch = active.len();
             }
-            let fused_t0 = if trace_steps { Some(Instant::now()) } else { None };
+            let fused_t0 = if trace_steps {
+                Some(Instant::now())
+            } else {
+                None
+            };
             if let Err(e) = handle_fused_step(
                 &mut runner,
                 &mut decode_engine,
@@ -519,6 +520,7 @@ where
             &mut last_heartbeat,
             heartbeat_interval,
             &kv_allocator,
+            decode_engine.transient_reserved_slots(),
         );
     }
 }
@@ -710,11 +712,13 @@ fn maybe_heartbeat(
     last: &mut Instant,
     interval: Duration,
     kv_allocator: &GlobalKvAllocator,
+    transient_reserved: usize,
 ) {
     if last.elapsed() >= interval {
         if let Err(e) = control.send_heartbeat(
             active_n,
             Some(kv_allocator.outstanding()),
+            Some(transient_reserved.min(u32::MAX as usize) as u32),
             Some(kv_allocator.total_free()),
             Some(kv_allocator.released_len() as u32),
         ) {

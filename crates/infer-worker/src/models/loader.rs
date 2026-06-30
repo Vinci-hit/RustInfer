@@ -322,7 +322,8 @@ impl<'a> WeightLoader<'a> {
                 None,
                 device,
             )?;
-            let gate_up_proj = self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?;
+            let gate_up_proj =
+                self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?;
             let down_proj = self.load_linear(
                 &format!("model.layers.{}.mlp.down_proj.weight", i),
                 None,
@@ -332,12 +333,20 @@ impl<'a> WeightLoader<'a> {
             let q_norm_name = format!("model.layers.{}.self_attn.q_norm.weight", i);
             let k_norm_name = format!("model.layers.{}.self_attn.k_norm.weight", i);
             let q_norm = if self.reader.contains(&q_norm_name) {
-                Some(comp_rms(self.load_rmsnorm(&q_norm_name, device, cfg.rms_norm_eps)?))
+                Some(comp_rms(self.load_rmsnorm(
+                    &q_norm_name,
+                    device,
+                    cfg.rms_norm_eps,
+                )?))
             } else {
                 None
             };
             let k_norm = if self.reader.contains(&k_norm_name) {
-                Some(comp_rms(self.load_rmsnorm(&k_norm_name, device, cfg.rms_norm_eps)?))
+                Some(comp_rms(self.load_rmsnorm(
+                    &k_norm_name,
+                    device,
+                    cfg.rms_norm_eps,
+                )?))
             } else {
                 None
             };
@@ -421,14 +430,18 @@ impl<'a> WeightLoader<'a> {
     }
 }
 
-fn comp_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(l: Linear<T, D>) -> CompLinear<T, D> {
+fn comp_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+    l: Linear<T, D>,
+) -> CompLinear<T, D> {
     CompLinear {
         weight: l.weight,
         bias: l.bias,
     }
 }
 
-fn comp_rms<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(r: RMSNorm<T, D>) -> CompRmsNorm<T, D> {
+fn comp_rms<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+    r: RMSNorm<T, D>,
+) -> CompRmsNorm<T, D> {
     CompRmsNorm {
         weight: r.weight,
         eps: r.eps,

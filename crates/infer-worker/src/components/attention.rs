@@ -3,9 +3,9 @@ use std::rc::Rc;
 use crate::components::linear::Linear;
 use crate::components::norm::RmsNorm;
 use crate::domain::component::{Component, Hidden, StageKind};
-use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
+use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::kv::KvView;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpError, OpResult};
@@ -89,7 +89,9 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
                 &self.input_layernorm.weight,
                 self.input_layernorm.eps,
             )?,
-            None => self.input_layernorm.forward(&hidden.stream, &mut normed, ctx)?,
+            None => self
+                .input_layernorm
+                .forward(&hidden.stream, &mut normed, ctx)?,
         }
         self.qkv_proj.forward(&normed, &mut qkv, ctx)?;
         // Q/K/V: zero-copy column views of `qkv` on CUDA (its kernels honor row

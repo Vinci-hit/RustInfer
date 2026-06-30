@@ -129,8 +129,11 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for MoeFfn<T, D> {
             offsets.push(routes.len() as i32);
         }
 
-        let grouped_input =
-            Tensor::from_host_slice(&grouped_input, Shape::from_slice(&[grouped_rows, dim]), &dev)?;
+        let grouped_input = Tensor::from_host_slice(
+            &grouped_input,
+            Shape::from_slice(&[grouped_rows, dim]),
+            &dev,
+        )?;
         let expert_offsets =
             Tensor::from_host_slice(&offsets, Shape::from_slice(&[num_experts + 1]), &dev)?;
         let mut gate_up: Tensor<T, D> =
@@ -172,7 +175,8 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for MoeFfn<T, D> {
                 combined[dst] = T::write_f64(value);
             }
         }
-        let moe_out = Tensor::from_host_slice(&combined, Shape::from_slice(&[num_tokens, dim]), &dev)?;
+        let moe_out =
+            Tensor::from_host_slice(&combined, Shape::from_slice(&[num_tokens, dim]), &dev)?;
         D::add_inplace(ctx.scope(), &mut hidden.stream, &moe_out)?;
 
         // Shared expert reuses the already-normalized input (no second norm).

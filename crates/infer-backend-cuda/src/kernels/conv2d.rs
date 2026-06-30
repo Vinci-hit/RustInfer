@@ -3,11 +3,11 @@
 //! Uses cudnnConvolutionForward with pre-allocated workspace from CudaConfig.
 //! Descriptor creation is done per-call (caching can be added later for perf).
 
+use crate::Cuda;
+use crate::ffi::{self, cudaStream_t};
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::{self, cudaStream_t};
 
 /// Conv2D forward using cuDNN.
 /// input: [N, Cin, H, W], weight: [Cout, Cin, Kh, Kw], output: [N, Cout, Hout, Wout]

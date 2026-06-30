@@ -1,9 +1,9 @@
-use infer_core::dtype::Dtype;
-use infer_core::dtype::quant::QuantScheme;
-use infer_core::exec::StepCtx;
 use crate::kv::{KvView, LayerKv};
 use crate::ports::math_ops::MathOps;
 use crate::ports::{OpError, OpResult};
+use infer_core::dtype::Dtype;
+use infer_core::dtype::quant::QuantScheme;
+use infer_core::exec::StepCtx;
 use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
@@ -270,10 +270,7 @@ pub trait FusedOps: MathOps {
     /// host). The CUDA backend overrides this with an on-device two-phase argmax
     /// that copies back ONLY the per-row ids — avoiding the multi-MB
     /// logits download that otherwise stalls the decode loop at batch > 1.
-    fn argmax<T: Dtype>(
-        ctx: &StepCtx<'_, Self>,
-        logits: &Tensor<T, Self>,
-    ) -> OpResult<Vec<i32>> {
+    fn argmax<T: Dtype>(ctx: &StepCtx<'_, Self>, logits: &Tensor<T, Self>) -> OpResult<Vec<i32>> {
         let _ = ctx;
         let shape = logits.shape().as_slice();
         if shape.len() != 2 {

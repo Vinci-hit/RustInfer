@@ -4,9 +4,9 @@
 //! AppError 自动转换为 OpenAI 风格的 JSON 错误响应。
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 
@@ -84,18 +84,20 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_type, message) = match &self {
-            AppError::BadRequest(msg) => {
-                (StatusCode::BAD_REQUEST, "invalid_request_error", msg.clone())
-            }
+            AppError::BadRequest(msg) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                msg.clone(),
+            ),
             AppError::ModelNotFound(msg) => {
                 (StatusCode::NOT_FOUND, "invalid_request_error", msg.clone())
             }
-            AppError::TooManyRequests(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg.clone())
-            }
-            AppError::Timeout(msg) => {
-                (StatusCode::GATEWAY_TIMEOUT, "timeout_error", msg.clone())
-            }
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                msg.clone(),
+            ),
+            AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "timeout_error", msg.clone()),
             AppError::Internal(err) => {
                 tracing::error!("Internal error: {:?}", err);
                 (

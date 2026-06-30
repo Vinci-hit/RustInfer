@@ -215,7 +215,8 @@ impl CudaConfig {
     /// Reset the bump offset and route subsequent `alloc_bytes` through the
     /// arena. Called just before `cudaStreamBeginCapture`.
     pub fn arena_begin(&self) {
-        self.arena_off.store(0, std::sync::atomic::Ordering::Release);
+        self.arena_off
+            .store(0, std::sync::atomic::Ordering::Release);
         self.arena_enabled
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -255,9 +256,7 @@ impl CudaConfig {
 
     /// Whether `ptr` lies inside the arena (its `free` must be a no-op).
     pub fn arena_contains(&self, ptr: *mut c_void) -> bool {
-        let base = self
-            .arena_base
-            .load(std::sync::atomic::Ordering::Acquire);
+        let base = self.arena_base.load(std::sync::atomic::Ordering::Acquire);
         if base.is_null() {
             return false;
         }
@@ -598,9 +597,7 @@ impl Drop for CudaConfig {
             if !self.cudnn_handle.is_null() {
                 ffi::cudnnDestroy(self.cudnn_handle);
             }
-            let arena = self
-                .arena_base
-                .load(std::sync::atomic::Ordering::Acquire);
+            let arena = self.arena_base.load(std::sync::atomic::Ordering::Acquire);
             if !arena.is_null() {
                 ffi::cudaFree(arena);
             }

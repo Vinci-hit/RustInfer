@@ -1,6 +1,6 @@
-use dioxus::prelude::*;
 use crate::api::client::ApiClient;
 use crate::state::metrics::SystemMetrics;
+use dioxus::prelude::*;
 
 /// SVG 圆形进度环组件
 fn progress_ring(percent: f32, color: &str, size: u32) -> String {

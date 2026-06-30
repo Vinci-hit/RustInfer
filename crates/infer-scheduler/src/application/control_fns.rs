@@ -6,7 +6,9 @@
 //! borrow, keeping the `&mut requests` borrow here disjoint from the follow-up
 //! `&mut output`.
 
-use infer_protocol::scheduler_to_worker_control::{FreeKvIndices, Preempt, SchedulerControlMessage};
+use infer_protocol::scheduler_to_worker_control::{
+    FreeKvIndices, Preempt, SchedulerControlMessage,
+};
 use infer_protocol::worker_to_scheduler_control::{AllocFailed, WorkerStepError};
 
 use crate::domain::inference_session::lifecycle::SequenceId;
@@ -57,11 +59,7 @@ pub fn handle_control_event(
         enable_prefix_caching,
     };
     match event {
-        ControlEvent::StepError { worker, err } => handle_worker_step_error(
-            err,
-            &mut ctx,
-            &worker,
-        ),
+        ControlEvent::StepError { worker, err } => handle_worker_step_error(err, &mut ctx, &worker),
         ControlEvent::WorkerLost {
             worker,
             last_seen_ms,
@@ -98,31 +96,47 @@ pub fn handle_control_event(
             // beyond the threshold indicates lost messages / decode errors
             // that caused the two counters to permanently diverge.
             if let Some(worker_outstanding) = hb.kv_outstanding {
+                let worker_transient = hb.kv_transient_reserved.unwrap_or(0);
+                let worker_confirmed = worker_outstanding.saturating_sub(worker_transient);
                 let sched_outstanding = ctx.kv_budget.outstanding();
-                let drift = (sched_outstanding as i64) - (worker_outstanding as i64);
+                let sched_pending = ctx.kv_budget.pending_prefill();
+                let sched_pressure = sched_outstanding.saturating_add(sched_pending);
+                let drift = (sched_pressure as i64) - (worker_confirmed as i64);
                 // Threshold: max(8, capacity / 1000) — covers normal in-flight
                 // jitter while catching systematic drift.
                 let cap = ctx.kv_budget.capacity();
                 let threshold = 8i64.max(cap as i64 / 1000);
-                if drift.unsigned_abs() > threshold as u64 {
+                // A worker can finish and report zero active/confirmed KV
+                // before the scheduler has consumed the final StepOutput and
+                // released its outstanding reservation. Recalibrating in that
+                // narrow window drops the scheduler budget to zero, then the
+                // normal release path later clamps and loses accounting signal.
+                let scheduler_release_in_flight = worker_confirmed == 0 && sched_outstanding > 0;
+                let stable_for_drift_check = hb.active_requests == 0
+                    && sched_pending == 0
+                    && worker_transient == 0
+                    && !scheduler_release_in_flight;
+                if stable_for_drift_check && drift.unsigned_abs() > threshold as u64 {
                     tracing::warn!(
                         scheduler = sched_outstanding,
-                        worker = worker_outstanding,
+                        scheduler_pending = sched_pending,
+                        scheduler_pressure = sched_pressure,
+                        worker = worker_confirmed,
+                        worker_raw = worker_outstanding,
+                        worker_transient,
                         drift,
                         threshold,
                         "KV budget drift detected; recalibrating to worker value"
                     );
-                    ctx.kv_budget.force_set_outstanding(worker_outstanding);
+                    ctx.kv_budget
+                        .force_set_outstanding(worker_confirmed.saturating_sub(sched_pending));
                 }
             }
             ControlOutcome::noop()
         }
-        ControlEvent::AllocFailed { worker, req } => handle_alloc_failed(
-            req,
-            &mut ctx,
-            &worker,
-            default_worker,
-        ),
+        ControlEvent::AllocFailed { worker, req } => {
+            handle_alloc_failed(req, &mut ctx, &worker, default_worker)
+        }
     }
 }
 
@@ -237,8 +251,12 @@ fn handle_worker_step_error(
         .iter()
         .filter_map(|raw| ctx.sessions.kv_slots_for_sequence(SequenceId(*raw)))
         .sum();
-    let free_indices =
-        release_kv_for_sequences(ctx, &failed_sequence_ids, failed_kv_slots, "worker_step_error");
+    let free_indices = release_kv_for_sequences(
+        ctx,
+        &failed_sequence_ids,
+        failed_kv_slots,
+        "worker_step_error",
+    );
     if !free_indices.is_empty() {
         let msg = free_kv_indices_msg(ctx, free_indices);
         send_to_worker(ctx, target_worker, msg, "worker StepError FreeKvIndices");
@@ -271,7 +289,12 @@ fn free_kv_indices_msg(ctx: &ControlCtx<'_>, indices: Vec<GlobalIndex>) -> Sched
 }
 
 /// Unicast a control message to a worker, logging on failure.
-fn send_to_worker(ctx: &ControlCtx<'_>, worker: &WorkerId, msg: SchedulerControlMessage, what: &str) {
+fn send_to_worker(
+    ctx: &ControlCtx<'_>,
+    worker: &WorkerId,
+    msg: SchedulerControlMessage,
+    what: &str,
+) {
     if let Err(e) = ctx.control_cmd.send_to(worker, msg) {
         tracing::error!(worker = %worker, error = %e, "failed to send {}", what);
     }
@@ -639,6 +662,7 @@ mod tests {
                     state: WorkerState::Running,
                     active_requests: 0,
                     kv_outstanding: None,
+                    kv_transient_reserved: None,
                     kv_total_free: None,
                     kv_released_pending: None,
                 },
@@ -651,5 +675,37 @@ mod tests {
         );
         assert!(matches!(outcome, ControlOutcome::Continue { .. }));
         assert!(cmd_rx.try_recv().is_err(), "no FreeKvIndices expected");
+    }
+
+    #[test]
+    fn heartbeat_zero_worker_kv_does_not_clear_unreleased_scheduler_budget() {
+        let mut sessions = empty_table();
+        let mut radix = fresh_radix();
+        let mut budget = fresh_budget(100);
+        budget.try_reserve(32).unwrap();
+        let (cmd, _cmd_rx) = dummy_cmd_tx_with_rx();
+        let wg = worker_group_for_test();
+        let outcome = invoke(
+            ControlEvent::Heartbeat {
+                worker: WorkerId::from_identity(b"w"),
+                hb: WorkerHeartbeat {
+                    worker_id: "w".into(),
+                    state: WorkerState::Running,
+                    active_requests: 0,
+                    kv_outstanding: Some(0),
+                    kv_transient_reserved: Some(0),
+                    kv_total_free: None,
+                    kv_released_pending: None,
+                },
+            },
+            &mut sessions,
+            &mut radix,
+            &mut budget,
+            &cmd,
+            &wg,
+        );
+
+        assert!(matches!(outcome, ControlOutcome::Continue { .. }));
+        assert_eq!(budget.outstanding(), 32);
     }
 }

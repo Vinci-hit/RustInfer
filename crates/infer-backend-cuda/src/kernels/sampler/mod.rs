@@ -1,10 +1,10 @@
 //! Argmax sampler CUDA kernel.
 
-use infer_core::tensor::Tensor;
-use infer_core::ports::{OpError, OpResult};
-use infer_core::types::{DataType, Dtype};
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
     // BF16 C signature: (logits, selected_rows_device, batch_size, vocab_size,
@@ -22,10 +22,21 @@ unsafe extern "C" {
         workspace: *mut f32,
         stream: cudaStream_t,
     );
-    fn argmax_cu_fp16_ffi(input: *const half::f16, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
-    fn argmax_cu_f32_ffi(input: *const f32, vocab_size: i32, output: *mut i32, workspace: *mut f32, stream: cudaStream_t);
+    fn argmax_cu_fp16_ffi(
+        input: *const half::f16,
+        vocab_size: i32,
+        output: *mut i32,
+        workspace: *mut f32,
+        stream: cudaStream_t,
+    );
+    fn argmax_cu_f32_ffi(
+        input: *const f32,
+        vocab_size: i32,
+        output: *mut i32,
+        workspace: *mut f32,
+        stream: cudaStream_t,
+    );
 }
-
 
 pub fn argmax<T: Dtype>(
     stream: cudaStream_t,

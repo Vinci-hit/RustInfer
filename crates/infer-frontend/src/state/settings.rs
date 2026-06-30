@@ -1,13 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum Theme {
     #[default]
     Dark,
     Light,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {

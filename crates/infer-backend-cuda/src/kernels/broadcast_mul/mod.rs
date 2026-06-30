@@ -1,11 +1,11 @@
 //! Broadcast multiply CUDA kernel wrapper.
 //! broadcast_mul: dst[i] = a[i] * b[i % D]  (b is [D], a is [rows, D])
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn broadcast_mul_f32_forward(

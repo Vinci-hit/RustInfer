@@ -320,6 +320,7 @@ __global__ void flash_attn_paged_ragged_kernel(
     const int32_t* __restrict__ cu_q_lens,
     const int32_t* __restrict__ block2req,
     const int32_t* __restrict__ block2tile,
+    const int32_t* __restrict__ valid_q_tiles,
     int num_q_heads,
     int num_kv_heads,
     float softmax_scale,
@@ -330,6 +331,7 @@ __global__ void flash_attn_paged_ragged_kernel(
 
     const int flat_tile  = blockIdx.x;
     const int q_head_idx = blockIdx.y;
+    if (valid_q_tiles != nullptr && flat_tile >= valid_q_tiles[0]) return;
     const int req     = block2req[flat_tile];
     const int block_m = block2tile[flat_tile];
 
@@ -541,6 +543,7 @@ static cudaError_t launch_impl(
     const int32_t* cu_q_lens,
     const int32_t* block2req,
     const int32_t* block2tile,
+    const int32_t* valid_q_tiles,
     int total_q_tiles,
     int num_q_heads, int num_kv_heads,
     float softmax_scale, int is_causal,
@@ -566,7 +569,7 @@ static cudaError_t launch_impl(
     kernel<<<grid, block, smem_size, stream>>>(
         q, qss, qsh, k_pool, v_pool, o, oss, osh,
         block_tables, max_blocks_per_seq, block_size,
-        kv_lens, cu_q_lens, block2req, block2tile,
+        kv_lens, cu_q_lens, block2req, block2tile, valid_q_tiles,
         num_q_heads, num_kv_heads, softmax_scale, is_causal);
     return cudaGetLastError();
 }
@@ -584,6 +587,7 @@ static cudaError_t launch_dispatch(
     const int32_t* cu_q_lens,
     const int32_t* block2req,
     const int32_t* block2tile,
+    const int32_t* valid_q_tiles,
     int total_q_tiles,
     int batch,
     int total_q_tokens,
@@ -596,22 +600,22 @@ static cudaError_t launch_dispatch(
     case 64:
         return launch_impl<Elem, 64>(q,qss,qsh,k_pool,v_pool,o,oss,osh,
                                      block_tables,max_blocks_per_seq,block_size,
-                                     kv_lens,cu_q_lens,block2req,block2tile,total_q_tiles,
+                                     kv_lens,cu_q_lens,block2req,block2tile,valid_q_tiles,total_q_tiles,
                                      num_q_heads,num_kv_heads,softmax_scale,is_causal,stream);
     case 128:
         return launch_impl<Elem,128>(q,qss,qsh,k_pool,v_pool,o,oss,osh,
                                      block_tables,max_blocks_per_seq,block_size,
-                                     kv_lens,cu_q_lens,block2req,block2tile,total_q_tiles,
+                                     kv_lens,cu_q_lens,block2req,block2tile,valid_q_tiles,total_q_tiles,
                                      num_q_heads,num_kv_heads,softmax_scale,is_causal,stream);
     case 192:
         return launch_impl<Elem,192>(q,qss,qsh,k_pool,v_pool,o,oss,osh,
                                      block_tables,max_blocks_per_seq,block_size,
-                                     kv_lens,cu_q_lens,block2req,block2tile,total_q_tiles,
+                                     kv_lens,cu_q_lens,block2req,block2tile,valid_q_tiles,total_q_tiles,
                                      num_q_heads,num_kv_heads,softmax_scale,is_causal,stream);
     case 256:
         return launch_impl<Elem,256>(q,qss,qsh,k_pool,v_pool,o,oss,osh,
                                      block_tables,max_blocks_per_seq,block_size,
-                                     kv_lens,cu_q_lens,block2req,block2tile,total_q_tiles,
+                                     kv_lens,cu_q_lens,block2req,block2tile,valid_q_tiles,total_q_tiles,
                                      num_q_heads,num_kv_heads,softmax_scale,is_causal,stream);
     default:
         fprintf(stderr, "[flash_attn_paged_ragged_cute] unsupported head_dim=%d (supported: 64, 128, 192, 256)\n", head_dim);
@@ -677,6 +681,7 @@ extern "C" void launch_flash_attn_paged_ragged_cute_bf16(
     const int32_t* cu_q_lens,
     const int32_t* block2req,
     const int32_t* block2tile,
+    const int32_t* valid_q_tiles,
     int total_q_tiles,
     int batch, int total_q_tokens,
     int num_q_heads, int num_kv_heads, int head_dim,
@@ -686,7 +691,7 @@ extern "C" void launch_flash_attn_paged_ragged_cute_bf16(
     cudaError_t err = flash_attn_paged_prefill::launch_dispatch<__nv_bfloat16>(
         q, qss, qsh, k_pool, v_pool, o, oss, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,
-        block2req, block2tile, total_q_tiles,
+        block2req, block2tile, valid_q_tiles, total_q_tiles,
         batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
         softmax_scale, is_causal, stream);
     if (err != cudaSuccess) {
@@ -706,6 +711,7 @@ extern "C" void launch_flash_attn_paged_ragged_cute_fp16(
     const int32_t* cu_q_lens,
     const int32_t* block2req,
     const int32_t* block2tile,
+    const int32_t* valid_q_tiles,
     int total_q_tiles,
     int batch, int total_q_tokens,
     int num_q_heads, int num_kv_heads, int head_dim,
@@ -715,7 +721,7 @@ extern "C" void launch_flash_attn_paged_ragged_cute_fp16(
     cudaError_t err = flash_attn_paged_prefill::launch_dispatch<__half>(
         q, qss, qsh, k_pool, v_pool, o, oss, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,
-        block2req, block2tile, total_q_tiles,
+        block2req, block2tile, valid_q_tiles, total_q_tiles,
         batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
         softmax_scale, is_causal, stream);
     if (err != cudaSuccess) {

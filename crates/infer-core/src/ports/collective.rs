@@ -1,6 +1,6 @@
+use crate::ports::{OpError, OpResult};
 use infer_core::dtype::Dtype;
 use infer_core::exec::ExecDevice as Device;
-use crate::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 
 // CommAxis now lives in infer-core's exec vocabulary (next to TopologyShape);

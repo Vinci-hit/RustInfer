@@ -46,8 +46,8 @@ use crate::domain::inference_session::lifecycle::{
     SequenceId,
 };
 use crate::domain::inference_session::queue::WaitingQueue;
-use crate::error::{Result, SchedulerError};
 use crate::domain::prefix::PrefixMatch;
+use crate::error::{Result, SchedulerError};
 
 new_key_type! {
     /// Generational handle into a state-bucket SlotMap.
@@ -957,9 +957,7 @@ impl RequestTable {
         // Drop the external_id → sequence_id mapping if it still points at us.
         // (A later request may have shadowed it; we don't disturb that.) O(1):
         // we hold the owning sequence's external_id, so no full-map scan.
-        if !external_id.is_empty()
-            && self.by_external_id.get(external_id) == Some(&sequence_id)
-        {
+        if !external_id.is_empty() && self.by_external_id.get(external_id) == Some(&sequence_id) {
             self.by_external_id.remove(external_id);
         }
         Ok(())

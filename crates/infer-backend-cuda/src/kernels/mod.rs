@@ -25,12 +25,12 @@ pub mod swiglu; // was activation
 pub mod upsample;
 
 // --- extra wrappers sharing a dir (distinct module names) ---
-#[path = "matmul/sdpa.rs"]
-pub mod sdpa;
 #[path = "cast_fill/cast_dtype.rs"]
 pub mod cast_dtype;
 #[path = "cast_fill/pad.rs"]
 pub mod pad;
+#[path = "matmul/sdpa.rs"]
+pub mod sdpa;
 
 // --- no-cu (pure Rust / cudnn) modules, kept flat ---
 pub mod concat_seq;

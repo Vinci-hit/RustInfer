@@ -10,14 +10,12 @@
 //! `fill_repeat_last_row_*_forward` kernels in `cast_fill.cu`, plus D2D
 //! memcpy for the prefix.
 
+use crate::Cuda;
+use crate::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t};
+use half::bf16;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::{
-    cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t,
-};
-use half::bf16;
 
 unsafe extern "C" {
     fn broadcast_row_bf16_forward(

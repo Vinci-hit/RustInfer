@@ -118,7 +118,11 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
                     idx.push(off - 1);
                 }
                 // All-singleton (decode) → identity gather; project directly.
-                if idx.len() >= num_tokens { None } else { Some(idx) }
+                if idx.len() >= num_tokens {
+                    None
+                } else {
+                    Some(idx)
+                }
             }
             SampleRows::Explicit(sel) => {
                 if sel.len() >= num_tokens {
@@ -140,8 +144,7 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
             Some(idx) => {
                 // Scattered last rows (burst prefill): gather via the embedding
                 // row-select kernel (table = residual stream, ids = last rows).
-                let idx_dev =
-                    Tensor::from_host_slice(idx, Shape::from_slice(&[idx.len()]), &dev)?;
+                let idx_dev = Tensor::from_host_slice(idx, Shape::from_slice(&[idx.len()]), &dev)?;
                 let mut gathered =
                     D::alloc_tensor::<T>(Shape::from_slice(&[idx.len(), dim]), &dev)?;
                 D::embedding(ctx.scope(), &hidden.stream, &idx_dev, &mut gathered)?;
@@ -336,10 +339,7 @@ mod tests {
         let bt0: Vec<u32> = vec![0, 1, 2, 3, 4];
         let bt1: Vec<u32> = vec![8, 9, 10];
         let req = StepRequest {
-            seqs: vec![
-                prefill_seq(0, &p0, &bt0),
-                prefill_seq(1, &p1, &bt1),
-            ],
+            seqs: vec![prefill_seq(0, &p0, &bt0), prefill_seq(1, &p1, &bt1)],
             sampling: Vec::new(),
             stop: StopCriteria {
                 eos_ids: Vec::new(),

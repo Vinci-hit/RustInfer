@@ -105,6 +105,110 @@ extern "C" void merge_compact_decode(
         counts);
 }
 
+enum MixedRowKind {
+    ROW_DECODE = 0,
+    ROW_PREFILL_FINAL = 1,
+    ROW_PREFILL_CONT = 2,
+    ROW_PAD = 3,
+};
+
+__global__ void merge_compact_mixed_kernel(
+    int* __restrict__ A,
+    const int* __restrict__ C,
+    const int* __restrict__ row_kind,
+    const int* __restrict__ generated_counts,
+    const int* __restrict__ max_tokens,
+    const int* __restrict__ ignore_eos,
+    const int* __restrict__ eos_ids,
+    int eos_len,
+    int old_rows,
+    int* __restrict__ active_src_rows,
+    int* __restrict__ active_tokens,
+    int* __restrict__ finished_src_rows,
+    int* __restrict__ finished_tokens,
+    int* __restrict__ prefill_final_src_rows,
+    int* __restrict__ prefill_final_tokens,
+    int* __restrict__ counts)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    int active = 0;
+    int finished = 0;
+    int prefill_final = 0;
+    for (int i = 0; i < old_rows; ++i) {
+        const int kind = row_kind[i];
+        if (kind == ROW_PAD || kind == ROW_PREFILL_CONT) {
+            continue;
+        }
+        const int token = C[i];
+        const bool hit_eos = (ignore_eos[i] == 0) && token_is_eos(token, eos_ids, eos_len);
+        const bool hit_max = generated_counts[i] + 1 >= max_tokens[i];
+        const bool done = hit_eos || hit_max;
+
+        if (kind == ROW_PREFILL_FINAL) {
+            prefill_final_src_rows[prefill_final] = i;
+            prefill_final_tokens[prefill_final] = token;
+            ++prefill_final;
+        }
+
+        if (done) {
+            finished_src_rows[finished] = i;
+            finished_tokens[finished] = token;
+            ++finished;
+        } else {
+            A[active] = token;
+            active_src_rows[active] = i;
+            active_tokens[active] = token;
+            ++active;
+        }
+    }
+    counts[0] = active;
+    counts[1] = finished;
+    counts[2] = prefill_final;
+    counts[3] = old_rows;
+}
+
+extern "C" void merge_compact_mixed(
+    int* A,
+    const int* C,
+    const int* row_kind,
+    const int* generated_counts,
+    const int* max_tokens,
+    const int* ignore_eos,
+    const int* eos_ids,
+    int eos_len,
+    int old_rows,
+    int* active_src_rows,
+    int* active_tokens,
+    int* finished_src_rows,
+    int* finished_tokens,
+    int* prefill_final_src_rows,
+    int* prefill_final_tokens,
+    int* counts,
+    cudaStream_t stream)
+{
+    if (old_rows <= 0) {
+        return;
+    }
+    merge_compact_mixed_kernel<<<1, 1, 0, stream>>>(
+        A,
+        C,
+        row_kind,
+        generated_counts,
+        max_tokens,
+        ignore_eos,
+        eos_ids,
+        eos_len,
+        old_rows,
+        active_src_rows,
+        active_tokens,
+        finished_src_rows,
+        finished_tokens,
+        prefill_final_src_rows,
+        prefill_final_tokens,
+        counts);
+}
+
 // ── Device-resident decode control plane (async path) ────────────────────────
 //
 // After `merge_compact_decode` writes `active_src_rows` + `counts`, build the

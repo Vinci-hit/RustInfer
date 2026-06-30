@@ -72,7 +72,11 @@ impl SchedulerConfig {
     /// other modes. Worker-derived capacity (`num_gpu_blocks`) is filled in
     /// later via [`Self::apply_worker_capacity`] once the worker profile is
     /// known.
-    pub fn from_launch(cfg: &RustInferConfig, mode: SchedulerMode, paged_block_size: BlockSize) -> Self {
+    pub fn from_launch(
+        cfg: &RustInferConfig,
+        mode: SchedulerMode,
+        paged_block_size: BlockSize,
+    ) -> Self {
         let enable_prefix_caching = cfg.enable_prefix_caching && matches!(mode, SchedulerMode::Llm);
         if cfg.enable_prefix_caching && !enable_prefix_caching {
             tracing::warn!(

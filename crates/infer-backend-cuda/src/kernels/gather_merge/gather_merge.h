@@ -41,6 +41,35 @@ void merge_compact_decode(
     cudaStream_t stream
 );
 
+// Row-kind aware variant for ragged mixed batches.
+//
+// row_kind values:
+//   0 = Decode       (emit token; survivor becomes next decode row)
+//   1 = PrefillFinal (emit first decode token; survivor becomes next decode row)
+//   2 = PrefillCont  (KV-only continuation; no emitted token)
+//   3 = Pad          (inert shape pad)
+//
+// counts = [active, finished, prefill_final, old_rows].
+void merge_compact_mixed(
+    int* A,
+    const int* C,
+    const int* row_kind,
+    const int* generated_counts,
+    const int* max_tokens,
+    const int* ignore_eos,
+    const int* eos_ids,
+    int eos_len,
+    int old_rows,
+    int* active_src_rows,
+    int* active_tokens,
+    int* finished_src_rows,
+    int* finished_tokens,
+    int* prefill_final_src_rows,
+    int* prefill_final_tokens,
+    int* counts,
+    cudaStream_t stream
+);
+
 // Build the NEXT decode step's control plane on-device from this step's
 // survivors (after merge_compact_decode). Gathers block tables/kv_lens to the
 // compacted front, appends each row's next-step KV slot, advances

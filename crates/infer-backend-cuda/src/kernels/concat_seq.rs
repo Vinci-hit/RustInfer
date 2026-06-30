@@ -2,13 +2,11 @@
 //!
 //! Implemented as two stream-ordered D2D memcpy.
 
+use crate::Cuda;
+use crate::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t};
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::Dtype;
-use crate::Cuda;
-use crate::ffi::{
-    cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t,
-};
 
 /// In-place concat: `dst = [a; b]` along dim 0.
 ///

@@ -1,10 +1,10 @@
 //! Split columns CUDA kernel — extracts a sub-range of columns from a matrix.
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn split_cols_bf16(
@@ -84,8 +84,8 @@ pub fn split_cols<T: Dtype>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infer_core::types::Shape;
     use half::bf16;
+    use infer_core::types::Shape;
 
     #[test]
     fn split_cols_f32_extracts_middle_block() {

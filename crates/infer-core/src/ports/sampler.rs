@@ -1,7 +1,7 @@
-use infer_core::dtype::Dtype;
-use infer_core::exec::StepCtx;
 use crate::ports::backend::LlmBackend;
 use crate::ports::{OpError, OpResult};
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
 use infer_core::tensor::Tensor;
 
 /// A single sampled token plus its log-probabilities. The sampling *result*

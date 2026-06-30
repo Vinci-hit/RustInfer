@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use crate::component::LayerRange;
+use crate::ports::{OpError, OpResult};
 use infer_core::dtype::Dtype;
 use infer_core::dtype::quant::QuantScheme;
 use infer_core::exec::ExecDevice as Device;
-use crate::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,14 @@ pub struct KvIndexTensors<D: Device> {
     pub rope_positions: Tensor<i32, D>,
     pub block2req: Tensor<i32, D>,
     pub block2tile: Tensor<i32, D>,
+    /// Device scalar: number of valid ragged Q tiles in `block2req/block2tile`.
+    /// Graph-captured mixed batches may launch a bucket-sized grid and let the
+    /// kernel skip `tile >= valid_q_tiles`.
+    pub valid_q_tiles: Tensor<i32, D>,
+    /// Device scalar: valid ragged suffix tiles after a decode prefix split.
+    /// The suffix kernel receives `block2req/block2tile` shifted past the
+    /// decode prefix, so it needs a suffix-relative valid count.
+    pub valid_suffix_q_tiles: Tensor<i32, D>,
 }
 
 pub struct PagedKvPool<T: Dtype, D: Device> {

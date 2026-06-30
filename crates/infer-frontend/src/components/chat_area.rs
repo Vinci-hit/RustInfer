@@ -1,17 +1,18 @@
-use dioxus::prelude::*;
-use crate::state::conversation::{Message, Conversation, MessageMetrics};
 use crate::api::client::ApiClient;
-use crate::api::types::{ChatRequest, ChatMessage};
+use crate::api::types::{ChatMessage, ChatRequest};
+use crate::state::conversation::{Conversation, Message, MessageMetrics};
+use dioxus::prelude::*;
 
 #[component]
-pub fn ChatArea(
-    conversations: Signal<Vec<Conversation>>,
-    active_id: Signal<String>,
-) -> Element {
+pub fn ChatArea(conversations: Signal<Vec<Conversation>>, active_id: Signal<String>) -> Element {
     let mut is_generating = use_signal(|| false);
 
     // 获取当前活跃对话
-    let active_conv = conversations.read().iter().find(|c| c.id == active_id()).cloned();
+    let active_conv = conversations
+        .read()
+        .iter()
+        .find(|c| c.id == active_id())
+        .cloned();
 
     let messages: Vec<Message> = active_conv
         .as_ref()
@@ -56,15 +57,19 @@ pub fn ChatArea(
         // 构建 API 请求
         let api_messages: Vec<ChatMessage> = {
             let convs = conversations.read();
-            convs.iter()
+            convs
+                .iter()
                 .find(|c| c.id == active_id())
-                .map(|c| c.messages.iter()
-                    .filter(|m| !m.is_streaming)
-                    .map(|m| ChatMessage {
-                        role: m.role.clone(),
-                        content: m.content.clone(),
-                    })
-                    .collect())
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .filter(|m| !m.is_streaming)
+                        .map(|m| ChatMessage {
+                            role: m.role.clone(),
+                            content: m.content.clone(),
+                        })
+                        .collect()
+                })
                 .unwrap_or_default()
         };
 
@@ -95,8 +100,12 @@ pub fn ChatArea(
                                     full_content.push_str(content);
                                     // 更新 streaming 消息
                                     let mut convs = conversations.write();
-                                    if let Some(conv) = convs.iter_mut().find(|c| c.id == active_id_val) {
-                                        if let Some(msg) = conv.messages.iter_mut().find(|m| m.id == assistant_id) {
+                                    if let Some(conv) =
+                                        convs.iter_mut().find(|c| c.id == active_id_val)
+                                    {
+                                        if let Some(msg) =
+                                            conv.messages.iter_mut().find(|m| m.id == assistant_id)
+                                        {
                                             msg.content = full_content.clone();
                                         }
                                     }
@@ -112,7 +121,11 @@ pub fn ChatArea(
                     let metrics = final_usage.map(|u| MessageMetrics {
                         prefill_ms: u.performance.as_ref().map(|p| p.prefill_ms).unwrap_or(0),
                         decode_ms: u.performance.as_ref().map(|p| p.decode_ms).unwrap_or(0),
-                        tokens_per_second: u.performance.as_ref().map(|p| p.tokens_per_second).unwrap_or(0.0),
+                        tokens_per_second: u
+                            .performance
+                            .as_ref()
+                            .map(|p| p.tokens_per_second)
+                            .unwrap_or(0.0),
                         total_tokens: u.completion_tokens,
                     });
 

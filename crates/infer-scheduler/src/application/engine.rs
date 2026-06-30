@@ -365,8 +365,8 @@ impl SchedulerEngine {
     pub(crate) async fn on_control_event(&mut self, event: ControlEvent) -> Result<()> {
         use crate::application::ControlOutcome;
 
-        let enable_prefix_caching = matches!(self.config.mode, SchedulerMode::Llm)
-            && self.config.enable_prefix_caching;
+        let enable_prefix_caching =
+            matches!(self.config.mode, SchedulerMode::Llm) && self.config.enable_prefix_caching;
         let outcome = crate::application::control_fns::handle_control_event(
             event,
             &mut self.requests,

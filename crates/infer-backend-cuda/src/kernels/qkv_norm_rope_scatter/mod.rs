@@ -1,10 +1,10 @@
 //! Fused Qwen3 Q/K RMSNorm + RoPE + paged K/V scatter CUDA wrapper.
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn qkv_norm_rope_scatter_bf16(

@@ -66,6 +66,7 @@ impl ControlPump {
         &self,
         active_requests: usize,
         kv_outstanding: Option<u32>,
+        kv_transient_reserved: Option<u32>,
         kv_total_free: Option<u32>,
         kv_released_pending: Option<u32>,
     ) -> Result<(), String> {
@@ -75,6 +76,7 @@ impl ControlPump {
                 state: WorkerState::Running,
                 active_requests,
                 kv_outstanding,
+                kv_transient_reserved,
                 kv_total_free,
                 kv_released_pending,
             }),

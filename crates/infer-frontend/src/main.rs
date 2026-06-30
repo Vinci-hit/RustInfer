@@ -25,7 +25,11 @@ fn App() -> Element {
 
     // 当前活跃对话 ID
     let mut active_id = use_signal(|| {
-        conversations.read().first().map(|c| c.id.clone()).unwrap_or_default()
+        conversations
+            .read()
+            .first()
+            .map(|c| c.id.clone())
+            .unwrap_or_default()
     });
 
     // Sidebar 折叠状态

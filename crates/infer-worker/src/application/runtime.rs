@@ -11,20 +11,21 @@ use crate::domain::plan::{
 };
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::sampler::Sampler;
-use crate::domain::ports::{OpError, OpResult};
+use crate::domain::ports::{FusedOps, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
 #[cfg(feature = "cuda")]
-use half::bf16;
-#[cfg(feature = "cuda")]
 use crate::infrastructure::cuda::{
-    kernels::gather_merge::{
-        append_decode_admissions_into, compact_extend_control_into, merge_compact_decode_into,
-        CompactExtendControlArgs, MergeCompactDecodeArgs,
-    },
     Cuda,
+    kernels::gather_merge::{
+        CompactExtendControlArgs, MergeCompactDecodeArgs, MergeCompactMixedArgs,
+        append_decode_admissions_into, compact_extend_control_into, merge_compact_decode_into,
+        merge_compact_mixed_into,
+    },
 };
+#[cfg(feature = "cuda")]
+use half::bf16;
 
 pub struct Runtime<T, D, M>
 where
@@ -81,6 +82,9 @@ where
     /// once it reaches `PREFILL_GRAPH_BUDGET`, further uncaptured prefill
     /// lengths run eager instead of capturing a new graph.
     prefill_graphs_captured: usize,
+    /// Exact-shape mixed ABC graphs captured so far. Bounded because mixed
+    /// q_len layouts can be much more diverse than decode batch sizes.
+    mixed_graphs_captured: usize,
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -107,12 +111,19 @@ pub struct AbcBuffers<D: Device> {
     pub ignore_eos_dev: Tensor<i32, D>,
     /// EOS id list (small; `eos_len` passed alongside).
     pub eos_ids_dev: Tensor<i32, D>,
+    /// Mixed/ragged row kind, one value per logical row.
+    pub row_kind_dev: Tensor<i32, D>,
+    /// Mixed graph: last token row in the flat token tape for every logical row.
+    pub last_token_rows_dev: Tensor<i32, D>,
     /// Compact-merge outputs (device).
     pub active_src_rows_dev: Tensor<i32, D>,
     pub finished_src_rows_dev: Tensor<i32, D>,
     pub finished_tokens_dev: Tensor<i32, D>,
     pub active_tokens_dev: Tensor<i32, D>,
-    /// `[active_n, finished_n, old_batch]`.
+    pub prefill_final_src_rows_dev: Tensor<i32, D>,
+    pub prefill_final_tokens_dev: Tensor<i32, D>,
+    /// Decode: `[active_n, finished_n, old_batch]`.
+    /// Mixed: `[active_n, finished_n, prefill_final_n, old_rows]`.
     pub counts_dev: Tensor<i32, D>,
     // Host mirrors for the single small D2H after each step.
     pub argmax_out_host: Vec<i32>,
@@ -121,6 +132,10 @@ pub struct AbcBuffers<D: Device> {
     pub active_tokens_host: Vec<i32>,
     pub finished_src_rows_host: Vec<i32>,
     pub finished_tokens_host: Vec<i32>,
+    pub prefill_final_src_rows_host: Vec<i32>,
+    pub prefill_final_tokens_host: Vec<i32>,
+    pub row_kind_host: Vec<i32>,
+    pub last_token_rows_host: Vec<i32>,
     /// Persistent host staging for buffer B (admission tokens). Must outlive the
     /// copy-in stream's DMA, so it cannot be a per-step local.
     pub new_token_host: Vec<i32>,
@@ -159,6 +174,29 @@ impl<D: LlmBackend> Drop for PrefillGemmGuard<D> {
         if self.0 {
             D::set_prefill_gemm_mode(false);
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaggedRowKind {
+    Decode,
+    PrefillFinal,
+    PrefillCont,
+    Pad,
+}
+
+impl RaggedRowKind {
+    pub fn as_i32(self) -> i32 {
+        match self {
+            Self::Decode => 0,
+            Self::PrefillFinal => 1,
+            Self::PrefillCont => 2,
+            Self::Pad => 3,
+        }
+    }
+
+    fn emits_token(self) -> bool {
+        matches!(self, Self::Decode | Self::PrefillFinal)
     }
 }
 
@@ -239,6 +277,8 @@ where
             rope_positions: alloc_i32(cap_num_tokens)?,
             block2req: alloc_i32(cap_total_q_tiles)?,
             block2tile: alloc_i32(cap_total_q_tiles)?,
+            valid_q_tiles: alloc_i32(1)?,
+            valid_suffix_q_tiles: alloc_i32(1)?,
         };
 
         let hidden = Hidden {
@@ -246,8 +286,7 @@ where
             pending: None,
         };
 
-        let input_ids_buf =
-            D::alloc_tensor::<i32>(Shape::from_slice(&[cap_batch.max(1)]), device)?;
+        let input_ids_buf = D::alloc_tensor::<i32>(Shape::from_slice(&[cap_batch.max(1)]), device)?;
         let prefill_ids_buf =
             D::alloc_tensor::<i32>(Shape::from_slice(&[cap_num_tokens.max(1)]), device)?;
         let prefill_ids_host = vec![0i32; cap_num_tokens.max(1)];
@@ -267,17 +306,25 @@ where
             max_tokens_dev: alloc_i32(cb)?,
             ignore_eos_dev: alloc_i32(cb)?,
             eos_ids_dev: alloc_i32(64)?,
+            row_kind_dev: alloc_i32(cb)?,
+            last_token_rows_dev: alloc_i32(cb)?,
             active_src_rows_dev: alloc_i32(cb)?,
             finished_src_rows_dev: alloc_i32(cb)?,
             finished_tokens_dev: alloc_i32(cb)?,
             active_tokens_dev: alloc_i32(cb)?,
-            counts_dev: alloc_i32(3)?,
+            prefill_final_src_rows_dev: alloc_i32(cb)?,
+            prefill_final_tokens_dev: alloc_i32(cb)?,
+            counts_dev: alloc_i32(5)?,
             argmax_out_host: vec![0; cb],
-            counts_host: vec![0; 3],
+            counts_host: vec![0; 5],
             active_src_rows_host: vec![0; cb],
             active_tokens_host: vec![0; cb],
             finished_src_rows_host: vec![0; cb],
             finished_tokens_host: vec![0; cb],
+            prefill_final_src_rows_host: vec![0; cb],
+            prefill_final_tokens_host: vec![0; cb],
+            row_kind_host: vec![0; cb],
+            last_token_rows_host: vec![0; cb],
             new_token_host: vec![0; cb],
             copy_out_recorded: false,
             pinned: false,
@@ -287,8 +334,12 @@ where
         // it into the model's sublayers. Eliminates the ~11 device allocations
         // per layer (cudaMalloc/cudaFree/memset storm) on the eager forward and
         // bakes fixed scratch addresses into captured decode graphs.
-        let scratch =
-            crate::domain::forward_scratch::ForwardScratch::<T, D>::new(device, dims, cap_num_tokens, cb)?;
+        let scratch = crate::domain::forward_scratch::ForwardScratch::<T, D>::new(
+            device,
+            dims,
+            cap_num_tokens,
+            cb,
+        )?;
         model.install_scratch(scratch);
 
         Ok(Self {
@@ -313,6 +364,7 @@ where
             block_tables_host,
             abc,
             prefill_graphs_captured: 0,
+            mixed_graphs_captured: 0,
         })
     }
 
@@ -735,7 +787,10 @@ where
     /// allocator rounds sizes to bins, so a coarse grid covers nearby lengths;
     /// scratch KV blocks `0..len` are throwaway (overwritten by real requests).
     pub fn prewarm_prefill_shapes(&mut self, lengths: &[usize]) -> OpResult<()> {
-        let max_len = self.max_seq_len.min(self.cap_num_tokens).min(self.max_blocks_per_seq);
+        let max_len = self
+            .max_seq_len
+            .min(self.cap_num_tokens)
+            .min(self.max_blocks_per_seq);
         for &len in lengths {
             if len == 0 || len > max_len {
                 continue;
@@ -833,7 +888,10 @@ where
                 return Err(e);
             }
             self.scope.graph_capture_end(key)?;
-            tracing::info!("[graph] captured decode graph (forward+argmax) for batch={}", plan.batch);
+            tracing::info!(
+                "[graph] captured decode graph (forward+argmax) for batch={}",
+                plan.batch
+            );
             self.scope.graph_launch(key)?;
         } else {
             // Padded slot whose graph is not yet captured (boot prewarm off):
@@ -973,14 +1031,17 @@ where
             // which would spuriously reject a reused sequence id whose pool entry
             // was left behind by an out-of-band eviction (cancel/preempt/drain).
             let start = seq.kv_write_start as u32;
-            let expected_after = start.checked_add(seq.input_ids.len() as u32).ok_or_else(|| {
-                OpError::Shape(format!(
-                    "Runtime::step: seq[{}] kv_len overflow start={} q={}",
-                    i,
-                    start,
-                    seq.input_ids.len()
-                ))
-            })?;
+            let expected_after =
+                start
+                    .checked_add(seq.input_ids.len() as u32)
+                    .ok_or_else(|| {
+                        OpError::Shape(format!(
+                            "Runtime::step: seq[{}] kv_len overflow start={} q={}",
+                            i,
+                            start,
+                            seq.input_ids.len()
+                        ))
+                    })?;
             if seq.kv_len_after as u32 != expected_after {
                 return Err(OpError::Shape(format!(
                     "Runtime::step: seq[{}] kv_len_after {} != start {} + q_len {}",
@@ -1050,7 +1111,11 @@ where
         })
     }
 
-    fn input_ids_tensor(&mut self, req: &StepRequest, plan: &BatchPlan) -> OpResult<Tensor<i32, D>> {
+    fn input_ids_tensor(
+        &mut self,
+        req: &StepRequest,
+        plan: &BatchPlan,
+    ) -> OpResult<Tensor<i32, D>> {
         let n = plan.num_tokens;
         if n > self.prefill_ids_host.len() {
             return Err(OpError::Shape(format!(
@@ -1084,7 +1149,60 @@ where
         ))
     }
 
+    fn upload_input_ids_bucket(
+        &mut self,
+        req: &StepRequest,
+        actual_tokens: usize,
+        token_bucket: usize,
+    ) -> OpResult<Tensor<i32, D>> {
+        if actual_tokens > token_bucket {
+            return Err(OpError::Shape(format!(
+                "upload_input_ids_bucket: actual_tokens {} > bucket {}",
+                actual_tokens, token_bucket
+            )));
+        }
+        if token_bucket > self.prefill_ids_host.len() {
+            return Err(OpError::Shape(format!(
+                "upload_input_ids_bucket: bucket {} > cap {}",
+                token_bucket,
+                self.prefill_ids_host.len()
+            )));
+        }
+        let mut off = 0usize;
+        for seq in &req.seqs {
+            let len = seq.input_ids.len();
+            self.prefill_ids_host[off..off + len].copy_from_slice(&seq.input_ids);
+            off += len;
+        }
+        debug_assert_eq!(off, actual_tokens);
+        if token_bucket > off {
+            self.prefill_ids_host[off..token_bucket].fill(0);
+        }
+        unsafe {
+            upload_i32_prefix(
+                self.scope.device(),
+                &self.prefill_ids_buf,
+                &self.prefill_ids_host[..token_bucket],
+            )?;
+        }
+        Ok(self.prefill_ids_buf.view_raw(
+            Shape::from_slice(&[token_bucket]),
+            Shape::from_slice(&[token_bucket.max(1)]).contiguous_strides(),
+            0,
+            true,
+        ))
+    }
+
     fn upload_index(&mut self, plan: &BatchPlan, req: &StepRequest) -> OpResult<()> {
+        self.upload_index_with_suffix_prefix(plan, req, None)
+    }
+
+    fn upload_index_with_suffix_prefix(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        suffix_prefix_tiles: Option<usize>,
+    ) -> OpResult<()> {
         let (cu_q_lens, block2req, block2tile) = BatchPlan::plan_ragged_tiles(&plan.q_lens);
 
         // Refresh the persistent block-table staging IN PLACE — no per-step
@@ -1135,6 +1253,18 @@ where
             upload_i32_prefix(device, &self.kv_index.rope_positions, &plan.rope_positions)?;
             upload_i32_prefix(device, &self.kv_index.block2req, &block2req)?;
             upload_i32_prefix(device, &self.kv_index.block2tile, &block2tile)?;
+            let valid_q_tiles = [block2req.len() as i32];
+            let actual_decode_prefix_tiles = plan.q_lens.iter().take_while(|&&q| q == 1).count();
+            let decode_prefix_tiles = suffix_prefix_tiles
+                .unwrap_or(actual_decode_prefix_tiles)
+                .min(block2req.len()) as i32;
+            let valid_suffix_q_tiles = [(valid_q_tiles[0] - decode_prefix_tiles).max(0)];
+            upload_i32_prefix(device, &self.kv_index.valid_q_tiles, &valid_q_tiles)?;
+            upload_i32_prefix(
+                device,
+                &self.kv_index.valid_suffix_q_tiles,
+                &valid_suffix_q_tiles,
+            )?;
         }
         Ok(())
     }
@@ -1156,6 +1286,21 @@ pub struct DecodeRowToken {
 pub struct DecodeCompactOutput {
     pub active: Vec<DecodeRowToken>,
     pub finished: Vec<DecodeRowToken>,
+}
+
+fn validate_mixed_src_row(src: i32, batch: usize, label: &str) -> OpResult<usize> {
+    let row = src as usize;
+    if row >= batch {
+        return Err(OpError::Kernel(format!(
+            "step_fused_abc_eager: {} src_row {} >= batch {}",
+            label, row, batch
+        )));
+    }
+    Ok(row)
+}
+
+fn u32_to_i32_saturating(x: u32) -> i32 {
+    x.min(i32::MAX as u32) as i32
 }
 
 #[cfg(feature = "cuda")]
@@ -1204,6 +1349,625 @@ where
         })();
         cfg.arena_end();
         result
+    }
+
+    /// Mixed/ragged forward through the ABC data model.
+    ///
+    /// Hot path: an exact-shape mixed CUDA graph captures forward + finalize +
+    /// selected-row argmax + mixed merge + optional next-control compact. Eager
+    /// remains the fallback and keeps the same flat-token ABC contract.
+    pub fn step_fused_abc_eager(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_slots: Option<&[u32]>,
+    ) -> OpResult<StepOutput> {
+        let plan = self.validate_mixed_abc_request(req, row_kind)?;
+        if let Some(slots) = next_slots {
+            self.upload_mixed_next_slots(slots)?;
+        }
+
+        let trace = std::env::var_os("RUSTINFER_MIXED_TRACE").is_some();
+        let t0 = std::time::Instant::now();
+        let ran_graph = self.try_run_mixed_abc_graph(&plan, req, row_kind, next_slots.is_some())?;
+        if !ran_graph {
+            self.upload_index(&plan, req)?;
+            let input_ids = self.input_ids_tensor(req, &plan)?;
+            self.upload_mixed_abc_metadata(req, row_kind, plan.batch)?;
+            let cfg = self.scope.device().config.clone();
+            cfg.arena_begin();
+            let result =
+                self.run_mixed_abc_eager_region(&plan, req, &input_ids, next_slots.is_some());
+            cfg.arena_end();
+            result?;
+        }
+        if trace {
+            let _ = self.scope.synchronize();
+            tracing::info!(
+                "[mixed-trace] mode={} rows={} tokens={} tiles={} elapsed={:.2}ms",
+                if ran_graph { "graph" } else { "eager" },
+                plan.batch,
+                plan.num_tokens,
+                plan.total_q_tiles,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        self.copy_out_mixed_abc(plan.batch)?;
+        self.finalize_mixed_abc(&plan, req, row_kind)
+    }
+
+    fn validate_mixed_abc_request(
+        &self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+    ) -> OpResult<BatchPlan> {
+        let plan = self.build_plan(req)?;
+        if !req.draft_tokens.is_empty() {
+            return Err(OpError::Shape(
+                "step_fused_abc_eager: speculative mixed batches are not supported".into(),
+            ));
+        }
+        if row_kind.len() != plan.batch {
+            return Err(OpError::Shape(format!(
+                "step_fused_abc_eager: row_kind {} != batch {}",
+                row_kind.len(),
+                plan.batch
+            )));
+        }
+        if req.stop.eos_ids.len() > self.abc.eos_ids_dev.numel() {
+            return Err(OpError::Shape(format!(
+                "step_fused_abc_eager: eos_ids {} > capacity {}",
+                req.stop.eos_ids.len(),
+                self.abc.eos_ids_dev.numel()
+            )));
+        }
+        Ok(plan)
+    }
+
+    fn try_run_mixed_abc_graph(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_control: bool,
+    ) -> OpResult<bool> {
+        if self.graph.is_none() || !self.scope.supports_graphs() {
+            return Ok(false);
+        }
+        let Some(shape) = self.graph.as_ref().and_then(|graph| {
+            mixed_graph_shape(
+                plan,
+                row_kind,
+                self.cap_batch,
+                self.cap_num_tokens,
+                self.mixed_graph_tile_capacity(),
+                graph.capture_sizes(),
+            )
+        }) else {
+            return Ok(false);
+        };
+        let key = mixed_graph_key(shape, req.stop.eos_ids.len(), next_control);
+        if self.scope.graph_ready(key) {
+            self.upload_index_with_suffix_prefix(plan, req, Some(shape.decode_prefix))?;
+            self.upload_input_ids_bucket(req, plan.num_tokens, shape.tokens)?;
+            self.upload_mixed_abc_metadata(req, row_kind, shape.rows)?;
+            self.scope.graph_launch(key)?;
+            return Ok(true);
+        }
+        if self.mixed_graphs_captured >= MIXED_GRAPH_BUDGET {
+            return Ok(false);
+        }
+
+        let graph_plan = self.mixed_graph_bucket_plan(plan, shape);
+        let input_ids = self.upload_input_ids_bucket(req, plan.num_tokens, shape.tokens)?;
+        self.upload_index_with_suffix_prefix(plan, req, Some(shape.decode_prefix))?;
+        self.upload_mixed_abc_metadata(req, row_kind, shape.rows)?;
+
+        // Warm only the capturable forward/finalize kernels. Do not run merge or
+        // compact-extend here, because compact-extend mutates this step's control
+        // plane into the next step's control plane.
+        self.forward_finalize_argmax_all_selected(&graph_plan, &input_ids)?;
+        self.scope.synchronize()?;
+
+        // Re-seed every device input the graph reads. Warmup should be
+        // idempotent, but keeping this explicit makes future mutation safer.
+        self.upload_index_with_suffix_prefix(plan, req, Some(shape.decode_prefix))?;
+        self.upload_input_ids_bucket(req, plan.num_tokens, shape.tokens)?;
+        self.upload_mixed_abc_metadata(req, row_kind, shape.rows)?;
+        self.scope.graph_capture_begin()?;
+        if let Err(e) =
+            self.run_mixed_abc_graph_region(&graph_plan, req.stop.eos_ids.len(), next_control)
+        {
+            let _ = self.scope.graph_capture_end(key);
+            return Err(e);
+        }
+        self.scope.graph_capture_end(key)?;
+        self.mixed_graphs_captured += 1;
+        tracing::info!(
+            "[graph] captured mixed ABC graph bucket rows={} tokens={} tiles={} decode_prefix={} actual_rows={} actual_tokens={} actual_tiles={} next_control={} ({}/{})",
+            shape.rows,
+            shape.tokens,
+            shape.tiles,
+            shape.decode_prefix,
+            plan.batch,
+            plan.num_tokens,
+            plan.total_q_tiles,
+            next_control,
+            self.mixed_graphs_captured,
+            MIXED_GRAPH_BUDGET
+        );
+        self.scope.graph_launch(key)?;
+        Ok(true)
+    }
+
+    fn run_mixed_abc_eager_region(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        input_ids: &Tensor<i32, Cuda>,
+        next_control: bool,
+    ) -> OpResult<()> {
+        let prefill_gemm = plan.num_tokens > plan.batch;
+        if prefill_gemm {
+            Cuda::set_prefill_gemm_mode(true);
+        }
+        let _gemm_guard = PrefillGemmGuard::<Cuda>(prefill_gemm, std::marker::PhantomData);
+        self.run_layers(plan, input_ids)?;
+        self.forward_argmax_last_per_seq(plan)?;
+        self.run_mixed_merge_and_next_control(plan, req.stop.eos_ids.len(), next_control)
+    }
+
+    fn run_mixed_abc_graph_region(
+        &mut self,
+        plan: &BatchPlan,
+        eos_len: usize,
+        next_control: bool,
+    ) -> OpResult<()> {
+        let input_ids = self.prefill_ids_buf.view_raw(
+            Shape::from_slice(&[plan.num_tokens]),
+            Shape::from_slice(&[plan.num_tokens.max(1)]).contiguous_strides(),
+            0,
+            true,
+        );
+        self.forward_finalize_argmax_all_selected(plan, &input_ids)?;
+        self.run_mixed_merge_and_next_control(plan, eos_len, next_control)
+    }
+
+    fn mixed_graph_tile_capacity(&self) -> i32 {
+        let tile = crate::domain::plan::RAGGED_Q_TILE as usize;
+        (self.cap_batch + self.cap_num_tokens.div_ceil(tile)).max(1) as i32
+    }
+
+    fn mixed_graph_bucket_plan(&self, actual: &BatchPlan, shape: MixedGraphShape) -> BatchPlan {
+        let mut q_lens = vec![0i32; shape.rows];
+        for q in q_lens.iter_mut().take(shape.decode_prefix) {
+            *q = 1;
+        }
+        if shape.decode_prefix < shape.rows {
+            // Keep the host-side attention branch stable: the leading q==1 run
+            // is the decode prefix, and a non-1 row after it forces the ragged
+            // suffix path. Real q lengths live in the device control tensors.
+            q_lens[shape.decode_prefix] = 2;
+        }
+        BatchPlan {
+            kind: BatchKind::Ragged,
+            num_tokens: shape.tokens,
+            batch: shape.rows,
+            q_lens,
+            kv_lens: vec![0; shape.rows],
+            seq_positions: vec![0; shape.rows],
+            rope_positions: vec![0; shape.tokens],
+            max_blocks_per_seq: actual.max_blocks_per_seq,
+            block_size: actual.block_size,
+            total_q_tiles: shape.tiles,
+        }
+    }
+
+    fn forward_argmax_last_per_seq(&mut self, plan: &BatchPlan) -> OpResult<()> {
+        let hidden = Hidden {
+            stream: self.hidden.stream.view_raw(
+                Shape::from_slice(&[plan.num_tokens, self.dims.dim]),
+                Shape::from_slice(&[plan.num_tokens.max(1), self.dims.dim]).contiguous_strides(),
+                0,
+                true,
+            ),
+            pending: None,
+        };
+        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let _guard = self.scope.enter();
+        let logits = self.model.finalize(&hidden, SampleRows::LastPerSeq, &ctx)?;
+        let logits_rows = logits.0.shape().as_slice()[0];
+        if logits_rows != plan.batch {
+            return Err(OpError::Shape(format!(
+                "step_fused_abc_eager: logits rows {} != batch {}",
+                logits_rows, plan.batch
+            )));
+        }
+        if logits_rows > self.abc.argmax_out_dev.numel() {
+            return Err(OpError::Shape(format!(
+                "step_fused_abc_eager: logits rows {} exceeds C capacity {}",
+                logits_rows,
+                self.abc.argmax_out_dev.numel()
+            )));
+        }
+        let mut c_view = self.abc.argmax_out_dev.view_raw(
+            Shape::from_slice(&[logits_rows]),
+            Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
+            0,
+            true,
+        );
+        Cuda::argmax_into(&ctx, &logits.0, &mut c_view, &self.abc.argmax_ws, None)
+    }
+
+    fn forward_finalize_argmax_all_selected(
+        &mut self,
+        plan: &BatchPlan,
+        input_ids: &Tensor<i32, Cuda>,
+    ) -> OpResult<()> {
+        self.run_layers(plan, input_ids)?;
+        let hidden = Hidden {
+            stream: self.hidden.stream.view_raw(
+                Shape::from_slice(&[plan.num_tokens, self.dims.dim]),
+                Shape::from_slice(&[plan.num_tokens.max(1), self.dims.dim]).contiguous_strides(),
+                0,
+                true,
+            ),
+            pending: None,
+        };
+        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let _guard = self.scope.enter();
+        let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
+        let mut c_view = self.abc.argmax_out_dev.view_raw(
+            Shape::from_slice(&[plan.batch]),
+            Shape::from_slice(&[plan.batch.max(1)]).contiguous_strides(),
+            0,
+            true,
+        );
+        let selected = self.abc.last_token_rows_dev.view_raw(
+            Shape::from_slice(&[plan.batch]),
+            Shape::from_slice(&[plan.batch.max(1)]).contiguous_strides(),
+            0,
+            true,
+        );
+        Cuda::argmax_into(
+            &ctx,
+            &logits.0,
+            &mut c_view,
+            &self.abc.argmax_ws,
+            Some(&selected),
+        )
+    }
+
+    fn run_mixed_merge_and_next_control(
+        &mut self,
+        plan: &BatchPlan,
+        eos_len: usize,
+        next_control: bool,
+    ) -> OpResult<()> {
+        let stream = ExecScope::stream(&self.scope).0;
+        let mut a_view = self.input_ids_buf.view_raw(
+            Shape::from_slice(&[plan.batch]),
+            Shape::from_slice(&[plan.batch.max(1)]).contiguous_strides(),
+            0,
+            true,
+        );
+        merge_compact_mixed_into(MergeCompactMixedArgs {
+            a_out: &mut a_view,
+            c_prev: &self.abc.argmax_out_dev,
+            row_kind: &self.abc.row_kind_dev,
+            generated_counts: &self.abc.generated_counts_dev,
+            max_tokens: &self.abc.max_tokens_dev,
+            ignore_eos: &self.abc.ignore_eos_dev,
+            eos_ids: &self.abc.eos_ids_dev,
+            eos_len,
+            old_rows: plan.batch,
+            active_src_rows: &self.abc.active_src_rows_dev,
+            active_tokens: &self.abc.active_tokens_dev,
+            finished_src_rows: &self.abc.finished_src_rows_dev,
+            finished_tokens: &self.abc.finished_tokens_dev,
+            prefill_final_src_rows: &self.abc.prefill_final_src_rows_dev,
+            prefill_final_tokens: &self.abc.prefill_final_tokens_dev,
+            counts: &self.abc.counts_dev,
+            stream,
+        })?;
+        if next_control {
+            self.run_compact_extend_control(stream)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_abc_pinned(&mut self) -> OpResult<()> {
+        if self.abc.pinned {
+            return Ok(());
+        }
+        let cfg = self.scope.device().config.clone();
+        let _guard = self.scope.enter();
+        cfg.pin_host_i32(&self.abc.new_token_host)?;
+        cfg.pin_host_i32(&self.abc.argmax_out_host)?;
+        cfg.pin_host_i32(&self.abc.counts_host)?;
+        cfg.pin_host_i32(&self.abc.active_src_rows_host)?;
+        cfg.pin_host_i32(&self.abc.active_tokens_host)?;
+        cfg.pin_host_i32(&self.abc.finished_src_rows_host)?;
+        cfg.pin_host_i32(&self.abc.finished_tokens_host)?;
+        cfg.pin_host_i32(&self.abc.prefill_final_src_rows_host)?;
+        cfg.pin_host_i32(&self.abc.prefill_final_tokens_host)?;
+        cfg.pin_host_i32(&self.abc.row_kind_host)?;
+        cfg.pin_host_i32(&self.abc.last_token_rows_host)?;
+        // Pin the persistent block-table staging too — it is the largest
+        // per-step H2D on the decode path and was previously a pageable
+        // (host-synchronous) copy.
+        cfg.pin_host_i32(&self.block_tables_host)?;
+        self.abc.pinned = true;
+        Ok(())
+    }
+
+    fn copy_out_mixed_abc(&mut self, batch: usize) -> OpResult<()> {
+        self.ensure_abc_pinned()?;
+        let cfg = self.scope.device().config.clone();
+        cfg.record_compute_a()?;
+        cfg.copy_out_wait_compute_a()?;
+        let elem = std::mem::size_of::<i32>();
+        let row_bytes = batch * elem;
+        unsafe {
+            cfg.download_d2h_copy_out(
+                self.abc.counts_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.counts_dev.data_ptr() as *const std::ffi::c_void,
+                4 * elem,
+            )?;
+            cfg.download_d2h_copy_out(
+                self.abc.argmax_out_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.argmax_out_dev.data_ptr() as *const std::ffi::c_void,
+                row_bytes,
+            )?;
+            cfg.download_d2h_copy_out(
+                self.abc.active_src_rows_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.active_src_rows_dev.data_ptr() as *const std::ffi::c_void,
+                row_bytes,
+            )?;
+            cfg.download_d2h_copy_out(
+                self.abc.finished_src_rows_host.as_mut_ptr() as *mut std::ffi::c_void,
+                self.abc.finished_src_rows_dev.data_ptr() as *const std::ffi::c_void,
+                row_bytes,
+            )?;
+        }
+        cfg.record_copy_out()?;
+        cfg.synchronize_copy_out()?;
+        self.abc.copy_out_recorded = true;
+        Ok(())
+    }
+
+    fn upload_mixed_abc_metadata(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        rows_to_upload: usize,
+    ) -> OpResult<()> {
+        let batch = req.seqs.len();
+        if rows_to_upload < batch || rows_to_upload > self.cap_batch {
+            return Err(OpError::Shape(format!(
+                "upload_mixed_abc_metadata: rows_to_upload {} not in [{}..={}]",
+                rows_to_upload, batch, self.cap_batch
+            )));
+        }
+        let mut gen_i32 = Vec::with_capacity(rows_to_upload);
+        let mut max_i32 = Vec::with_capacity(rows_to_upload);
+        let mut ign_i32 = Vec::with_capacity(rows_to_upload);
+        let mut token_offset = 0i32;
+        for i in 0..batch {
+            gen_i32.push(u32_to_i32_saturating(
+                req.stop.generated_counts.get(i).copied().unwrap_or(0),
+            ));
+            max_i32.push(u32_to_i32_saturating(
+                req.stop.max_tokens.get(i).copied().unwrap_or(u32::MAX),
+            ));
+            ign_i32.push(i32::from(
+                req.stop.ignore_eos.get(i).copied().unwrap_or(false),
+            ));
+            self.abc.row_kind_host[i] = row_kind[i].as_i32();
+            let q = req.seqs[i].input_ids.len().max(1) as i32;
+            token_offset += q;
+            self.abc.last_token_rows_host[i] = token_offset - 1;
+        }
+        for i in batch..rows_to_upload {
+            gen_i32.push(0);
+            max_i32.push(i32::MAX);
+            ign_i32.push(1);
+            self.abc.row_kind_host[i] = RaggedRowKind::Pad.as_i32();
+            self.abc.last_token_rows_host[i] = 0;
+        }
+        let device = self.scope.device();
+        unsafe {
+            upload_i32_prefix(device, &self.abc.generated_counts_dev, &gen_i32)?;
+            upload_i32_prefix(device, &self.abc.max_tokens_dev, &max_i32)?;
+            upload_i32_prefix(device, &self.abc.ignore_eos_dev, &ign_i32)?;
+            upload_i32_prefix(
+                device,
+                &self.abc.row_kind_dev,
+                &self.abc.row_kind_host[..rows_to_upload],
+            )?;
+            upload_i32_prefix(
+                device,
+                &self.abc.last_token_rows_dev,
+                &self.abc.last_token_rows_host[..rows_to_upload],
+            )?;
+            if !req.stop.eos_ids.is_empty() {
+                upload_i32_prefix(device, &self.abc.eos_ids_dev, &req.stop.eos_ids)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn upload_mixed_next_slots(&mut self, next_slots: &[u32]) -> OpResult<()> {
+        if next_slots.is_empty() {
+            return Ok(());
+        }
+        if next_slots.len() > self.cap_batch {
+            return Err(OpError::Shape(format!(
+                "upload_mixed_next_slots: next_slots {} > cap_batch {}",
+                next_slots.len(),
+                self.cap_batch
+            )));
+        }
+        self.ensure_async_ctrl()?;
+        let slots_i32: Vec<i32> = next_slots.iter().map(|&s| s as i32).collect();
+        let ctrl = self.async_ctrl.as_ref().expect("async_ctrl ensured");
+        unsafe {
+            upload_i32_prefix(self.scope.device(), &ctrl.new_slots_dev, &slots_i32)?;
+        }
+        Ok(())
+    }
+
+    fn run_compact_extend_control(
+        &mut self,
+        stream: crate::infrastructure::cuda::ffi::cudaStream_t,
+    ) -> OpResult<()> {
+        self.ensure_async_ctrl()?;
+        let mbps = self.max_blocks_per_seq;
+        let cap_batch = self.cap_batch;
+        let _guard = self.scope.enter();
+        let ctrl = self.async_ctrl.as_mut().expect("async_ctrl ensured");
+        compact_extend_control_into(CompactExtendControlArgs {
+            block_tables: &mut self.kv_index.block_tables,
+            block_tables_scratch: &mut ctrl.block_tables_scratch,
+            kv_lens: &mut self.kv_index.kv_lens,
+            kv_lens_scratch: &mut ctrl.kv_lens_scratch,
+            seq_positions_out: &mut self.kv_index.seq_positions,
+            seq_lens_step_out: &mut self.kv_index.seq_lens_step,
+            rope_positions_out: &mut self.kv_index.rope_positions,
+            cu_q_lens_out: &mut self.kv_index.cu_q_lens,
+            block2req_out: &mut self.kv_index.block2req,
+            block2tile_out: &mut self.kv_index.block2tile,
+            active_src_rows: &self.abc.active_src_rows_dev,
+            counts: &self.abc.counts_dev,
+            new_slots: &ctrl.new_slots_dev,
+            mbps,
+            cap_batch,
+            stream,
+        })
+    }
+
+    fn finalize_mixed_abc(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+    ) -> OpResult<StepOutput> {
+        let batch = plan.batch;
+        let counts = &self.abc.counts_host[..4];
+        let active_n = counts[0].max(0) as usize;
+        let finished_n = counts[1].max(0) as usize;
+        let prefill_final_n = counts[2].max(0) as usize;
+        let old_n = counts[3].max(0) as usize;
+        if old_n < batch
+            || old_n > self.cap_batch
+            || active_n + finished_n > batch
+            || prefill_final_n > batch
+        {
+            return Err(OpError::Kernel(format!(
+                "step_fused_abc_eager: mixed counts invalid active={} finished={} prefill_final={} old={} batch={} cap={}",
+                active_n, finished_n, prefill_final_n, old_n, batch, self.cap_batch
+            )));
+        }
+
+        let active_src = &self.abc.active_src_rows_host[..batch];
+        let finished_src = &self.abc.finished_src_rows_host[..batch];
+        let row_tokens = &self.abc.argmax_out_host[..batch];
+
+        let mut row_results: Vec<Option<(i32, bool)>> = vec![None; batch];
+        let mut seen = vec![false; batch];
+        for k in 0..active_n {
+            let row = validate_mixed_src_row(active_src[k], batch, "active")?;
+            if !row_kind[row].emits_token() {
+                return Err(OpError::Kernel(format!(
+                    "step_fused_abc_eager: active row {} has non-emitting kind {:?}",
+                    row, row_kind[row]
+                )));
+            }
+            if seen[row] {
+                return Err(OpError::Kernel(format!(
+                    "step_fused_abc_eager: row {} returned twice",
+                    row
+                )));
+            }
+            seen[row] = true;
+            row_results[row] = Some((row_tokens[row], false));
+        }
+        for k in 0..finished_n {
+            let row = validate_mixed_src_row(finished_src[k], batch, "finished")?;
+            if !row_kind[row].emits_token() {
+                return Err(OpError::Kernel(format!(
+                    "step_fused_abc_eager: finished row {} has non-emitting kind {:?}",
+                    row, row_kind[row]
+                )));
+            }
+            if seen[row] {
+                return Err(OpError::Kernel(format!(
+                    "step_fused_abc_eager: row {} returned twice",
+                    row
+                )));
+            }
+            seen[row] = true;
+            row_results[row] = Some((row_tokens[row], true));
+        }
+        for (row, kind) in row_kind.iter().copied().enumerate() {
+            if kind.emits_token() && row_results[row].is_none() {
+                return Err(OpError::Kernel(format!(
+                    "step_fused_abc_eager: emitting row {} missing from mixed merge",
+                    row
+                )));
+            }
+        }
+
+        let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(batch);
+        let mut finished = Vec::with_capacity(batch);
+        for result in row_results {
+            if let Some((token_id, done)) = result {
+                tokens.push(vec![SampledToken {
+                    token_id,
+                    logprob: 0.0,
+                    top_logprobs: Vec::new(),
+                }]);
+                finished.push(done);
+            } else {
+                tokens.push(Vec::new());
+                finished.push(false);
+            }
+        }
+        for (seq, done) in req.seqs.iter().zip(finished.iter()) {
+            if *done {
+                self.kv_pool.seq_kv_len.remove(&seq.sequence_id);
+            }
+        }
+        Ok(StepOutput {
+            tokens,
+            accepted: plan.q_lens.iter().map(|&q| q.max(0) as u32).collect(),
+            finished,
+            hidden_tap: None,
+        })
+    }
+
+    /// Build the next pure-decode control plane after a mixed ABC step.
+    ///
+    /// `step_fused_abc_eager` leaves this step's block tables / kv_lens in
+    /// `kv_index` and mixed survivors in `abc.active_src_rows_dev`. Given one
+    /// fresh KV slot per survivor, the same compact-extend kernel used by the
+    /// decode ABC path can gather survivors into the compacted front and append
+    /// those slots, so the next pure decode step can skip host control upload.
+    pub fn prepare_mixed_next_decode_control(&mut self, next_slots: &[u32]) -> OpResult<()> {
+        let active_n = self.abc.counts_host[0].max(0) as usize;
+        if next_slots.len() != active_n {
+            return Err(OpError::Shape(format!(
+                "prepare_mixed_next_decode_control: next_slots {} != active {}",
+                next_slots.len(),
+                active_n
+            )));
+        }
+        if active_n == 0 {
+            return Ok(());
+        }
+        self.upload_mixed_next_slots(next_slots)?;
+        let stream = ExecScope::stream(&self.scope).0;
+        self.run_compact_extend_control(stream)
     }
 
     /// ISSUE half of the 1-deep decode pipeline: enqueues forward + finalize +
@@ -1264,9 +2028,7 @@ where
                 "step_decode_abc: requires pure decode (q_len=1 per row)".into(),
             ));
         }
-        if generated_counts.len() != batch
-            || max_tokens.len() != batch
-            || ignore_eos.len() != batch
+        if generated_counts.len() != batch || max_tokens.len() != batch || ignore_eos.len() != batch
         {
             return Err(OpError::Shape(format!(
                 "step_decode_abc: metadata lens gen={} max={} ignore={} batch={}",
@@ -1286,21 +2048,7 @@ where
 
         // Lazily page-lock the host staging on the first step so the Si/So
         // copies are truly async (pageable memory makes them host-synchronous).
-        if !self.abc.pinned {
-            let cfg = self.scope.device().config.clone();
-            let _guard = self.scope.enter();
-            cfg.pin_host_i32(&self.abc.new_token_host)?;
-            cfg.pin_host_i32(&self.abc.counts_host)?;
-            cfg.pin_host_i32(&self.abc.active_src_rows_host)?;
-            cfg.pin_host_i32(&self.abc.active_tokens_host)?;
-            cfg.pin_host_i32(&self.abc.finished_src_rows_host)?;
-            cfg.pin_host_i32(&self.abc.finished_tokens_host)?;
-            // Pin the persistent block-table staging too — it is the largest
-            // per-step H2D on the decode path and was previously a pageable
-            // (host-synchronous) copy.
-            cfg.pin_host_i32(&self.block_tables_host)?;
-            self.abc.pinned = true;
-        }
+        self.ensure_abc_pinned()?;
 
         // Async path: when reusing the device-resident control plane, this
         // step's block tables / kv_lens / positions were left on device by the
@@ -1406,8 +2154,14 @@ where
         }
 
         // ── upload stop metadata + run the compact merge (C → A) ──
-        let gen_i32: Vec<i32> = generated_counts.iter().map(|&x| x as i32).collect();
-        let max_i32: Vec<i32> = max_tokens.iter().map(|&x| x as i32).collect();
+        let gen_i32: Vec<i32> = generated_counts
+            .iter()
+            .map(|&x| u32_to_i32_saturating(x))
+            .collect();
+        let max_i32: Vec<i32> = max_tokens
+            .iter()
+            .map(|&x| u32_to_i32_saturating(x))
+            .collect();
         let ign_i32: Vec<i32> = ignore_eos.iter().map(|&b| i32::from(b)).collect();
         let device = self.scope.device();
         unsafe {
@@ -1753,10 +2507,19 @@ unsafe fn upload_i32_full_zeropad<D: Device>(
 /// collide with decode-graph keys (keyed by `batch` ≤ `cap_batch`) in the
 /// scope's graph map. `1 << 40` is far above any realistic token count.
 const PREFILL_GRAPH_KEY_TAG: u64 = 1 << 40;
+const MIXED_GRAPH_KEY_TAG: u64 = 1 << 41;
 /// Max distinct single-seq prefill lengths to capture graphs for (Stage A keys
 /// each prefill graph by exact `num_tokens`). Bounds graph memory; beyond this,
 /// uncaptured prefill lengths run eager.
 const PREFILL_GRAPH_BUDGET: usize = 16;
+/// Bucketed mixed graphs are keyed by decode-prefix bucket and token bucket,
+/// not exact q_len layout. Keep the budget high enough for a few token buckets
+/// across the configured decode-prefix capture sizes.
+const MIXED_GRAPH_BUDGET: usize = 64;
+/// Round mixed graph token shapes to this multiple. 64 keeps LM-head/FFN GEMM
+/// shapes stable without padding every mixed step all the way to
+/// `max_batch_tokens`.
+const MIXED_GRAPH_TOKEN_BUCKET: usize = 64;
 /// Default max prompt length (tokens) eligible for a single-seq prefill graph.
 /// Set to 0 (disabled): the eager prefill path now routes its bf16 GEMMs to the
 /// `algo=nullptr` cuBLASLt runtime-selected kernel (532f5c's path), which is
@@ -1764,6 +2527,81 @@ const PREFILL_GRAPH_BUDGET: usize = 16;
 /// cached algo. The graph machinery is retained (Stage B) but off by default;
 /// raise this to re-enable single-seq prefill graphs.
 const PREFILL_GRAPH_MAX_TOKENS: usize = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixedGraphShape {
+    rows: usize,
+    tokens: usize,
+    tiles: i32,
+    decode_prefix: usize,
+}
+
+fn mixed_graph_shape(
+    plan: &BatchPlan,
+    row_kind: &[RaggedRowKind],
+    cap_batch: usize,
+    cap_num_tokens: usize,
+    tile_capacity: i32,
+    capture_sizes: &[usize],
+) -> Option<MixedGraphShape> {
+    if !matches!(plan.kind, BatchKind::Ragged) {
+        return None;
+    }
+    if plan.batch == 0 || plan.batch > cap_batch || plan.num_tokens > cap_num_tokens {
+        return None;
+    }
+    let has_decode = row_kind.iter().any(|&k| k == RaggedRowKind::Decode);
+    let has_prefill = row_kind
+        .iter()
+        .any(|&k| matches!(k, RaggedRowKind::PrefillFinal | RaggedRowKind::PrefillCont));
+    if !has_decode || !has_prefill {
+        return None;
+    }
+    let actual_decode_prefix = plan.q_lens.iter().take_while(|&&q| q == 1).count();
+    let decode_prefix = floor_capture_slot(capture_sizes, actual_decode_prefix)?;
+    if decode_prefix == 0 || decode_prefix >= cap_batch {
+        return None;
+    }
+    let tokens = round_up_to_bucket(plan.num_tokens, MIXED_GRAPH_TOKEN_BUCKET)?;
+    if tokens > cap_num_tokens || plan.total_q_tiles > tile_capacity {
+        return None;
+    }
+    Some(MixedGraphShape {
+        rows: cap_batch,
+        tokens,
+        tiles: tile_capacity,
+        decode_prefix,
+    })
+}
+
+fn floor_capture_slot(capture_sizes: &[usize], n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    capture_sizes.iter().copied().filter(|&s| s <= n).max()
+}
+
+fn round_up_to_bucket(n: usize, bucket: usize) -> Option<usize> {
+    if bucket == 0 {
+        return None;
+    }
+    Some(n.div_ceil(bucket) * bucket)
+}
+
+fn mixed_graph_key(shape: MixedGraphShape, eos_len: usize, next_control: bool) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    mix(shape.rows as u64);
+    mix(shape.tokens as u64);
+    mix(shape.tiles as u64);
+    mix(shape.decode_prefix as u64);
+    mix(eos_len as u64);
+    mix(next_control as u64);
+    MIXED_GRAPH_KEY_TAG | (h & ((1u64 << 40) - 1))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphDecision {
@@ -2081,6 +2919,97 @@ mod tests {
         plan.batch = 1;
         plan.kind = BatchKind::Ragged;
         assert_eq!(runner.decide(&plan), GraphDecision::Eager);
+    }
+
+    #[test]
+    fn mixed_graph_shape_buckets_tokens_and_rows() {
+        let plan = BatchPlan {
+            kind: BatchKind::Ragged,
+            num_tokens: 321,
+            batch: 21,
+            q_lens: vec![1; 16]
+                .into_iter()
+                .chain([65, 64, 64, 64, 63])
+                .collect(),
+            kv_lens: vec![1; 21],
+            seq_positions: vec![0; 21],
+            rope_positions: vec![0; 321],
+            max_blocks_per_seq: 96,
+            block_size: 1,
+            total_q_tiles: 21,
+        };
+        let mut kinds = vec![RaggedRowKind::Decode; 16];
+        kinds.extend([RaggedRowKind::PrefillCont; 4]);
+        kinds.push(RaggedRowKind::PrefillFinal);
+
+        let shape =
+            mixed_graph_shape(&plan, &kinds, 32, 512, 36, &[1, 2, 4, 8, 16, 24, 32]).unwrap();
+
+        assert_eq!(
+            shape,
+            MixedGraphShape {
+                rows: 32,
+                tokens: 384,
+                tiles: 36,
+                decode_prefix: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_graph_shape_buckets_decode_prefix_down() {
+        let plan = BatchPlan {
+            kind: BatchKind::Ragged,
+            num_tokens: 62,
+            batch: 31,
+            q_lens: vec![1; 30].into_iter().chain([32]).collect(),
+            kv_lens: vec![1; 31],
+            seq_positions: vec![0; 31],
+            rope_positions: vec![0; 62],
+            max_blocks_per_seq: 96,
+            block_size: 1,
+            total_q_tiles: 31,
+        };
+        let mut kinds = vec![RaggedRowKind::Decode; 30];
+        kinds.push(RaggedRowKind::PrefillFinal);
+
+        let shape =
+            mixed_graph_shape(&plan, &kinds, 32, 512, 36, &[1, 2, 4, 8, 16, 24, 32]).unwrap();
+
+        assert_eq!(
+            shape,
+            MixedGraphShape {
+                rows: 32,
+                tokens: 64,
+                tiles: 36,
+                decode_prefix: 24,
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_graph_key_ignores_exact_q_lens_with_same_bucket() {
+        let a = MixedGraphShape {
+            rows: 32,
+            tokens: 384,
+            tiles: 36,
+            decode_prefix: 16,
+        };
+        let b = MixedGraphShape {
+            rows: 32,
+            tokens: 384,
+            tiles: 36,
+            decode_prefix: 16,
+        };
+        let c = MixedGraphShape {
+            rows: 32,
+            tokens: 448,
+            tiles: 36,
+            decode_prefix: 16,
+        };
+
+        assert_eq!(mixed_graph_key(a, 2, true), mixed_graph_key(b, 2, true));
+        assert_ne!(mixed_graph_key(a, 2, true), mixed_graph_key(c, 2, true));
     }
 
     #[test]

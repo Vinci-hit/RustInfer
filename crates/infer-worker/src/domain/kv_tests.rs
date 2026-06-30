@@ -3,8 +3,8 @@
 //! API.
 #[cfg(test)]
 mod tests {
-    use infer_core::kv::*;
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::kv::*;
     use std::collections::HashMap;
 
     fn empty_pool() -> PagedKvPool<f32, Cpu> {

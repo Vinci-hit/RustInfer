@@ -1,9 +1,9 @@
 //! GET /v1/models handler
 
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 
-use crate::state::SharedState;
 use super::types::*;
+use crate::state::SharedState;
 
 /// GET /v1/models
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelListResponse> {

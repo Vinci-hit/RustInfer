@@ -2,8 +2,8 @@
 //!
 //! 将 OpenAI 格式的 messages 转换为模型特定的 prompt 格式。
 
-use anyhow::Result;
 use crate::api::openai::types::ChatMessage;
+use anyhow::Result;
 
 /// Chat Template trait
 pub trait ChatTemplate: Send + Sync {

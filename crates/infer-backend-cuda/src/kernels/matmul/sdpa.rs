@@ -12,13 +12,11 @@
 //! `gemm_strided_batched_{bf16,f32}_{axbt,axb}` in `matmul.cu`). No host
 //! round-trips, no per-row D2D launches.
 
+use crate::Cuda;
+use crate::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t};
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype, Shape};
-use crate::Cuda;
-use crate::ffi::{
-    cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t,
-};
 
 unsafe extern "C" {
     fn gemm_strided_batched_bf16_axbt(

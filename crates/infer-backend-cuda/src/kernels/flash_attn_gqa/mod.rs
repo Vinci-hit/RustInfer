@@ -7,13 +7,13 @@
 //! pool per layer; per-seq routing comes from the device `block_tables`
 //! tensor (`[batch, max_blocks_per_seq]` u32).
 
+use crate::Cuda;
+use crate::ffi::{cudaStream_t, cudnnHandle_t};
 use infer_core::kv::KvIndexTensors;
 use infer_core::plan;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::{cudaStream_t, cudnnHandle_t};
 use std::ffi::c_void;
 
 unsafe extern "C" {
@@ -131,6 +131,7 @@ unsafe extern "C" {
         cu_q_lens: *const i32,
         block2req: *const i32,
         block2tile: *const i32,
+        valid_q_tiles: *const i32,
         total_q_tiles: i32,
         batch: i32,
         total_q_tokens: i32,
@@ -157,6 +158,7 @@ unsafe extern "C" {
         cu_q_lens: *const i32,
         block2req: *const i32,
         block2tile: *const i32,
+        valid_q_tiles: *const i32,
         total_q_tiles: i32,
         batch: i32,
         total_q_tokens: i32,
@@ -197,6 +199,8 @@ pub struct PagedAttentionPlan<'a> {
     pub block_size: usize,
     pub block2req: &'a Tensor<i32, Cuda>,
     pub block2tile: &'a Tensor<i32, Cuda>,
+    pub valid_q_tiles: &'a Tensor<i32, Cuda>,
+    pub valid_suffix_q_tiles: &'a Tensor<i32, Cuda>,
     pub total_q_tiles: i32,
 }
 
@@ -219,6 +223,8 @@ impl<'a> PagedAttentionPlan<'a> {
             block_size: plan.block_size,
             block2req: &index.block2req,
             block2tile: &index.block2tile,
+            valid_q_tiles: &index.valid_q_tiles,
+            valid_suffix_q_tiles: &index.valid_suffix_q_tiles,
             total_q_tiles: plan.total_q_tiles,
         }
     }
@@ -262,6 +268,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
     cu_q_lens_ptr: *const i32,
     block2req_ptr: *const i32,
     block2tile_ptr: *const i32,
+    valid_q_tiles_ptr: *const i32,
     total_q_tiles: i32,
     batch: i32,
     num_tokens: i32,
@@ -289,6 +296,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
                 cu_q_lens_ptr,
                 block2req_ptr,
                 block2tile_ptr,
+                valid_q_tiles_ptr,
                 total_q_tiles,
                 batch,
                 num_tokens,
@@ -315,6 +323,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
                 cu_q_lens_ptr,
                 block2req_ptr,
                 block2tile_ptr,
+                valid_q_tiles_ptr,
                 total_q_tiles,
                 batch,
                 num_tokens,
@@ -465,36 +474,36 @@ pub fn attention_paged<T: Dtype>(
             // SAME cuDNN kernel. Opt out (custom kernel) via env.
             let use_cudnn = std::env::var_os(DISABLE_CUDNN_ATTENTION_ENV).is_none();
             if use_cudnn {
-            if let Some(cudnn_status) = unsafe {
-                try_cudnn_paged_decode(
-                    device,
-                    q,
-                    k_pool,
-                    v_pool,
-                    output,
-                    plan,
-                    q_stride_seq,
-                    q_stride_head,
-                    o_stride_seq,
-                    o_stride_head,
-                    head_num,
-                    kv_head_num,
-                    head_dim,
-                    scale,
-                    batch,
-                    stream,
-                )
-            } {
-                if cudnn_status == 0 {
-                    return Ok(());
+                if let Some(cudnn_status) = unsafe {
+                    try_cudnn_paged_decode(
+                        device,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        plan,
+                        q_stride_seq,
+                        q_stride_head,
+                        o_stride_seq,
+                        o_stride_head,
+                        head_num,
+                        kv_head_num,
+                        head_dim,
+                        scale,
+                        batch,
+                        stream,
+                    )
+                } {
+                    if cudnn_status == 0 {
+                        return Ok(());
+                    }
+                    if std::env::var_os(STRICT_CUDNN_ATTENTION_ENV).is_some() {
+                        return Err(OpError::Kernel(format!(
+                            "cuDNN paged decode attention failed with status {}",
+                            cudnn_status
+                        )));
+                    }
                 }
-                if std::env::var_os(STRICT_CUDNN_ATTENTION_ENV).is_some() {
-                    return Err(OpError::Kernel(format!(
-                        "cuDNN paged decode attention failed with status {}",
-                        cudnn_status
-                    )));
-                }
-            }
             } // end if use_cudnn
 
             // The caller pre-allocated `workspace` with at least
@@ -630,6 +639,7 @@ pub fn attention_paged<T: Dtype>(
                                 plan.cu_q_lens.data_ptr(),
                                 plan.block2req.data_ptr().add(decode_count),
                                 plan.block2tile.data_ptr().add(decode_count),
+                                plan.valid_suffix_q_tiles.data_ptr(),
                                 suffix_tiles,
                                 batch,
                                 plan.num_tokens as i32,
@@ -670,6 +680,7 @@ pub fn attention_paged<T: Dtype>(
                     plan.cu_q_lens.data_ptr(),
                     plan.block2req.data_ptr(),
                     plan.block2tile.data_ptr(),
+                    plan.valid_q_tiles.data_ptr(),
                     plan.total_q_tiles,
                     batch,
                     plan.num_tokens as i32,

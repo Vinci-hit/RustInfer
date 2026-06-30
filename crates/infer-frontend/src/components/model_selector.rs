@@ -1,6 +1,6 @@
-use dioxus::prelude::*;
 use crate::api::client::ApiClient;
 use crate::api::types::ModelObject;
+use dioxus::prelude::*;
 
 #[component]
 pub fn ModelSelector() -> Element {

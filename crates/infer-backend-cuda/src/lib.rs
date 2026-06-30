@@ -803,7 +803,10 @@ impl MemoryPort for Cuda {
         // Arena-owned scratch is not individually freed — the bump arena is
         // reset wholesale at the next capture. A real `cudaFree` here would
         // both corrupt the arena and (if mid-capture) be illegal.
-        if self.config.arena_contains(ptr.as_ptr() as *mut std::ffi::c_void) {
+        if self
+            .config
+            .arena_contains(ptr.as_ptr() as *mut std::ffi::c_void)
+        {
             return;
         }
         // Recycle into the size-keyed pool instead of `cudaFree` (which would
@@ -1098,13 +1101,7 @@ impl CoreOps for Cuda {
         rows: usize,
         inter: usize,
     ) -> OpResult<()> {
-        kernels::swiglu::swiglu_packed(
-            gate_up.device().config.stream,
-            gate_up,
-            out,
-            rows,
-            inter,
-        )
+        kernels::swiglu::swiglu_packed(gate_up.device().config.stream, gate_up, out, rows, inter)
     }
     fn rope_inplace<T: Dtype>(
         q: &mut Tensor<T, Self>,

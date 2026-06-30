@@ -6,7 +6,7 @@ use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, 
 use crate::application::decode_common::send_step_error;
 use crate::application::decode_engine::{DecodeEngine, build_decode_request};
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
-use crate::application::runtime::Runtime;
+use crate::application::runtime::{RaggedRowKind, Runtime};
 use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
@@ -59,7 +59,10 @@ fn concat_block_table(base: &[u32], appended: &[u32]) -> Vec<u32> {
 /// count, resolve each segment's base block table, and mark stale segments
 /// skipped. Returns the per-segment plans (1:1 with `cmd.segments`) and the
 /// total new tokens to allocate KV for.
-fn plan_prefill_segments(cmd: &PrefillBatchCmd, prefilling: &PrefillSeqMap) -> (Vec<SegmentPlan>, u32) {
+fn plan_prefill_segments(
+    cmd: &PrefillBatchCmd,
+    prefilling: &PrefillSeqMap,
+) -> (Vec<SegmentPlan>, u32) {
     let mut plans: Vec<SegmentPlan> = Vec::with_capacity(cmd.segments.len());
     let mut total_new: u32 = 0;
     for seg in &cmd.segments {
@@ -138,6 +141,7 @@ fn build_prefill_steps_into(
     seqs: &mut Vec<SeqStep>,
     max_tokens: &mut Vec<u32>,
     ignore_eos: &mut Vec<bool>,
+    row_kinds: &mut Vec<RaggedRowKind>,
 ) {
     let mut idx_cursor = 0usize;
     for (i, seg) in cmd.segments.iter().enumerate() {
@@ -178,9 +182,37 @@ fn build_prefill_steps_into(
         });
         max_tokens.push(seg.max_tokens as u32);
         ignore_eos.push(seg.ignore_eos);
+        row_kinds.push(match seg.completion {
+            PrefillSegmentCompletion::ContinuePrefill => RaggedRowKind::PrefillCont,
+            PrefillSegmentCompletion::FinishPrefillAndStartDecode => RaggedRowKind::PrefillFinal,
+        });
         plans[i].indices = new_indices;
     }
     debug_assert_eq!(idx_cursor, base_indices.len());
+}
+
+fn append_prefill_abc_next_rows(
+    cmd: &PrefillBatchCmd,
+    plans: &[SegmentPlan],
+    out_finished: &[bool],
+    token_offset: usize,
+    next_rows: &mut Vec<u64>,
+) {
+    let mut local = 0usize;
+    for (i, seg) in cmd.segments.iter().enumerate() {
+        if plans[i].skipped {
+            continue;
+        }
+        let row = token_offset + local;
+        local += 1;
+        if matches!(
+            seg.completion,
+            PrefillSegmentCompletion::FinishPrefillAndStartDecode
+        ) && !out_finished.get(row).copied().unwrap_or(false)
+        {
+            next_rows.push(seg.sequence_id);
+        }
+    }
 }
 
 /// #6 zero-copy: the forward only borrowed the request, so move the input
@@ -311,10 +343,23 @@ where
     // 1. Drain the in-flight ABC decode step and send its tokens. This commits
     //    the prior step and syncs the copy-out so the fused eager forward (which
     //    uses the prefill input buffer, not buffer A) cannot race it.
-    decode_engine.finalize_and_send(runner, active, kv_allocator, control, data, enable_prefix_caching)?;
+    decode_engine.finalize_and_send(
+        runner,
+        active,
+        kv_allocator,
+        control,
+        data,
+        enable_prefix_caching,
+    )?;
 
     // 2. Decode rows for this step: one new KV slot each.
-    let decode = decode_engine.prepare_fused_decode(active, prefilling, kv_allocator, control, enable_prefix_caching)?;
+    let decode = decode_engine.prepare_fused_decode(
+        active,
+        prefilling,
+        kv_allocator,
+        control,
+        enable_prefix_caching,
+    )?;
     let (decode_order, decode_new_indices, decode_build) = match decode {
         Some((order, idx)) => {
             let build = build_decode_request(&order, &idx, active, eos_ids, enable_prefix_caching);
@@ -402,7 +447,8 @@ where
     }];
     for (i, prep) in preps.iter().enumerate() {
         let last = groups.last_mut().unwrap();
-        let fits = last.rows + prep.rows <= cap_batch && last.tokens + prep.tokens <= cap_num_tokens;
+        let fits =
+            last.rows + prep.rows <= cap_batch && last.tokens + prep.tokens <= cap_num_tokens;
         if fits {
             last.rows += prep.rows;
             last.tokens += prep.tokens;
@@ -418,6 +464,8 @@ where
     }
 
     // 5. Issue each group as one ragged forward and route its outputs.
+    let can_record_abc_rows = groups.len() == 1;
+    let mut recorded_abc_rows = false;
     for group in &groups {
         let has_decode = group.decode && decode_count > 0;
         if !has_decode && group.preps.is_empty() {
@@ -428,12 +476,14 @@ where
         let mut max_tokens: Vec<u32> = Vec::with_capacity(group.rows);
         let mut ignore_eos: Vec<bool> = Vec::with_capacity(group.rows);
         let mut generated_counts: Vec<u32> = Vec::with_capacity(group.rows);
+        let mut row_kinds: Vec<RaggedRowKind> = Vec::with_capacity(group.rows);
         if has_decode {
             let b = decode_build.as_ref().unwrap();
             seqs.extend(b.req.seqs.iter().cloned());
             max_tokens.extend_from_slice(&b.max_tokens);
             ignore_eos.extend_from_slice(&b.ignore_eos);
             generated_counts.extend_from_slice(&b.generated_counts);
+            row_kinds.extend(std::iter::repeat(RaggedRowKind::Decode).take(decode_count));
         }
         // Pad the decode prefix up to a decode capture slot so the split
         // attention's cuDNN decode-prefix call (the leading run of q=1 rows)
@@ -450,7 +500,10 @@ where
         if has_decode && !group.preps.is_empty() {
             if let Some(slot) = runner.next_capture_slot(decode_count) {
                 let pad = slot - decode_count;
-                if pad > 0 {
+                let prefill_rows = group.rows.saturating_sub(decode_count);
+                let padded_rows_fit = slot.saturating_add(prefill_rows) <= cap_batch;
+                let padded_tokens_fit = group.tokens.saturating_add(pad) <= cap_num_tokens;
+                if pad > 0 && padded_rows_fit && padded_tokens_fit {
                     if let Ok(idx) = kv_allocator.alloc_indices(pad as u32) {
                         for &blk in &idx {
                             seqs.push(SeqStep {
@@ -464,6 +517,7 @@ where
                             max_tokens.push(u32::MAX);
                             ignore_eos.push(true);
                             generated_counts.push(0);
+                            row_kinds.push(RaggedRowKind::Pad);
                         }
                         decode_prefix_len = slot;
                         pad_indices = idx;
@@ -480,6 +534,7 @@ where
                 &mut seqs,
                 &mut max_tokens,
                 &mut ignore_eos,
+                &mut row_kinds,
             );
         }
         // Prefill rows have generated 0 tokens so far.
@@ -500,9 +555,42 @@ where
             seqs,
         };
 
-        let out = match runner.step_fused_eager(&req) {
+        let mut mixed_next_slots: Vec<u32> = Vec::new();
+        let mut mixed_device_prepared = false;
+        if can_record_abc_rows {
+            let potential_next = row_kinds
+                .iter()
+                .filter(|&&k| matches!(k, RaggedRowKind::Decode | RaggedRowKind::PrefillFinal))
+                .count();
+            if potential_next > 0 {
+                match kv_allocator.alloc_indices(potential_next as u32) {
+                    Ok(slots) => {
+                        mixed_next_slots = slots;
+                        mixed_device_prepared = true;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "mixed ABC next-slot reservation failed; falling back to host alloc: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        let out = match runner.step_fused_abc_eager(
+            &req,
+            &row_kinds,
+            if mixed_next_slots.is_empty() {
+                None
+            } else {
+                Some(mixed_next_slots.as_slice())
+            },
+        ) {
             Ok(out) => out,
             Err(e) => {
+                if !mixed_next_slots.is_empty() {
+                    kv_allocator.free(&mixed_next_slots);
+                }
                 fail_fused_group(
                     e,
                     has_decode,
@@ -520,20 +608,30 @@ where
                 if !pad_indices.is_empty() {
                     kv_allocator.free(&pad_indices);
                 }
+                decode_engine.invalidate_abc_reuse();
                 continue;
             }
         };
 
-        let StepRequest { seqs: mut merged_seqs, .. } = req;
+        let StepRequest {
+            seqs: mut merged_seqs,
+            ..
+        } = req;
         let mut output = StepOutput {
             prefill_done: Vec::new(),
             tokens: Vec::new(),
             assigned_indices: Vec::new(),
         };
+        let mut abc_next_rows: Vec<u64> = Vec::new();
         let mut cursor = 0usize;
         if has_decode {
             let b = decode_build.as_ref().unwrap();
             output.assigned_indices.extend(b.assigned.iter().cloned());
+            for (i, &sid) in decode_order.iter().enumerate() {
+                if !out.finished.get(i).copied().unwrap_or(false) {
+                    abc_next_rows.push(sid);
+                }
+            }
             decode_engine.commit_fused_decode(
                 active,
                 kv_allocator,
@@ -551,6 +649,13 @@ where
             reclaim_prefill_step_data(&mut merged_seqs, &mut prep.plans);
             let assigned = assigned_runs(prep.cmd, &prep.plans, enable_prefix_caching);
             output.assigned_indices.extend(assigned);
+            append_prefill_abc_next_rows(
+                prep.cmd,
+                &prep.plans,
+                &out.finished,
+                cursor,
+                &mut abc_next_rows,
+            );
             commit_prefill_outputs(
                 prep.cmd,
                 &mut prep.plans,
@@ -565,6 +670,15 @@ where
             );
             cursor += prep.rows;
         }
+        if can_record_abc_rows {
+            decode_engine.record_mixed_abc_rows(
+                abc_next_rows,
+                mixed_next_slots,
+                mixed_device_prepared,
+                kv_allocator,
+            );
+            recorded_abc_rows = true;
+        }
         data.send_step_output(&output)
             .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
         // Reclaim the inert decode-prefix pad KV (transient; never owned by any
@@ -573,6 +687,9 @@ where
         if !pad_indices.is_empty() {
             kv_allocator.free(&pad_indices);
         }
+    }
+    if !recorded_abc_rows {
+        decode_engine.invalidate_abc_reuse();
     }
     Ok(())
 }
@@ -622,6 +739,13 @@ fn fail_fused_group(
             failed.push(seg.sequence_id);
         }
     }
+    tracing::warn!(
+        failed = failed.len(),
+        has_decode,
+        prefill_groups = group.preps.len(),
+        error = ?e,
+        "fused step failed; failing affected sequences"
+    );
     send_step_error(control, failed, format!("fused step failed: {:?}", e));
 }
 

@@ -1,5 +1,5 @@
-use dioxus::prelude::*;
 use crate::state::conversation::Conversation;
+use dioxus::prelude::*;
 
 #[component]
 pub fn Sidebar(

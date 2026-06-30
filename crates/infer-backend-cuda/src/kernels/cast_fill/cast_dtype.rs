@@ -1,11 +1,11 @@
 //! Dtype casting CUDA wrappers — F32 ↔ BF16, F32 ↔ F16.
 
-use infer_core::ports::{OpError, OpResult};
-use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype};
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
 use half::{bf16, f16};
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
     fn cast_f32_to_bf16_forward(dst: *mut bf16, src: *const f32, n: i32, stream: cudaStream_t);

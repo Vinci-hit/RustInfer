@@ -1,11 +1,11 @@
 //! Matmul CUDA kernel wrapper — dispatches to GEMV/GEMM by dtype and shape.
 //! Also provides AWQ int4 quantized matmul (kpack_gemv/kpack_gemm).
 
+use crate::Cuda;
+use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
-use crate::Cuda;
-use crate::ffi::cudaStream_t;
 
 unsafe extern "C" {
     fn sgemv_cu_fp32x4(
