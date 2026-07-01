@@ -306,6 +306,24 @@ pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
     let resolved = if hint.contains("qwen") {
         "qwen3"
     } else {
+        // Unknown or missing architecture hint. We still default to the llama3
+        // dispatch (the most common weights layout), but this is a frequent
+        // source of "wrong template / wrong attention" confusion, so make the
+        // fallback visible rather than silent.
+        if hint.is_empty() {
+            eprintln!(
+                "warning: resolve_model_type: no `model_type`/`architectures` in {}; \
+                 defaulting to \"llama3\"",
+                cfg_path.display()
+            );
+        } else if !hint.contains("llama") {
+            eprintln!(
+                "warning: resolve_model_type: unrecognized model hint {:?} in {}; \
+                 defaulting to \"llama3\" (supported: llama*, qwen*)",
+                hint,
+                cfg_path.display()
+            );
+        }
         "llama3"
     };
     Ok(resolved.to_string())

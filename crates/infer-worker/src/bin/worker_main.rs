@@ -212,7 +212,12 @@ fn main() -> Result<(), String> {
 
     // ── 1. ZMQ ──
     let zmq_ctx = zmq::Context::new();
-    let control = ControlPump::new(&zmq_ctx, cfg.worker_id.clone(), &control_endpoint)?;
+    let control = ControlPump::new(
+        &zmq_ctx,
+        cfg.worker_id.clone(),
+        cfg.device.clone(),
+        &control_endpoint,
+    )?;
     let data = DataPump::new(&zmq_ctx, &data_recv_endpoint, &data_send_endpoint)?;
 
     // ── 2. Hello ──

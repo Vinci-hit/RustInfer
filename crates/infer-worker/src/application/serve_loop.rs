@@ -75,50 +75,103 @@ where
     let max_blocks_per_seq = bs.max_seq_len.div_ceil(bs.block_size);
     let model_dims = model.dims();
 
-    let num_blocks = if bs.num_blocks_override != 0 {
+    let bytes_per_block =
+        model_dims.num_layers * 2 * bs.block_size * model_dims.kv_dim * std::mem::size_of::<bf16>();
+
+    let cap_num_tokens = bs.load.max_batch_tokens;
+    let cap_batch = bs.load.max_batch_seqs;
+
+    // KV-pool sizing (auto path) is profile-driven: build the Runtime with a
+    // small throwaway KV pool, run one worst-case eager forward so the fixed
+    // activation workspace + lazy library allocations are all resident, THEN
+    // probe free memory and size the real pool from what is actually left.
+    //
+    // The old design probed `cudaMemGetInfo` immediately after weight load —
+    // before `Runtime::new` allocated the (GiB-scale, `max_batch_tokens × vocab`)
+    // logits/activation workspace — so `mem_fraction_static` had to leave that
+    // fixed cost as a *percentage* of free memory. A large batch/vocab then blew
+    // the fractional headroom and OOM'd *after* the KV pool was already sized.
+    // Profiling first makes the probe see the true footprint, so the fraction
+    // means "fraction of usable memory for KV", as users expect.
+    let bootstrap_pool_blocks = if bs.num_blocks_override != 0 {
+        // Explicit override: skip probing entirely and build at the final size.
         tracing::info!(
             "[bootstrap] num_blocks override from CLI: {} (skipping GPU mem probe)",
             bs.num_blocks_override,
         );
+        bs.num_blocks_override + 1
+    } else {
+        crate::application::tuning::PROFILE_KV_BLOCKS.min(
+            // Never allocate a profiling pool larger than the final pool could
+            // ever be (a tiny device / huge model): cap at the working set.
+            bs.load
+                .max_batch_seqs
+                .saturating_mul(max_blocks_per_seq)
+                .saturating_add(1)
+                .max(2),
+        )
+    };
+
+    let mut runner: Runtime<bf16, Cuda, M> = Runtime::new(
+        model,
+        CudaScope::new(bs.cuda.clone()),
+        Box::new(GreedySampler),
+        bootstrap_pool_blocks,
+        bs.block_size,
+        max_blocks_per_seq,
+        bs.max_seq_len,
+        cap_num_tokens,
+        cap_batch,
+        bs.capture_sizes.clone(),
+    )
+    .map_err(|e| format!("Runtime::new: {:?}", e))?;
+
+    let num_blocks = if bs.num_blocks_override != 0 {
         bs.num_blocks_override
     } else {
-        let bytes_per_block = model_dims.num_layers
-            * 2
-            * bs.block_size
-            * model_dims.kv_dim
-            * std::mem::size_of::<bf16>();
         let fraction = bs.load.kv_cache_memory_fraction.unwrap_or(0.9).clamp(
             crate::application::tuning::KV_MEM_FRACTION_MIN,
             crate::application::tuning::KV_MEM_FRACTION_MAX,
         );
-        let (free, total) =
+        // Probe now — AFTER `Runtime::new` allocated the fixed activation
+        // workspace (the GiB-scale logits buffer that used to OOM), but before
+        // the dummy forward. The delta against the post-dummy probe below is the
+        // lazy library footprint (diagnostic only).
+        let (free_before, total) =
             device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
-        let budget = (free as f64 * fraction as f64) as usize;
+        // Worst-case eager forward: exercises the activation workspace and forces
+        // the lazy cuBLASLt/cuDNN/recycling-pool allocations the first live
+        // forward would otherwise make. `graph` is still None ⇒ eager ⇒ no graph
+        // captured, no KV-base pointer baked (so the resize below is safe).
+        runner
+            .profile_forward()
+            .map_err(|e| format!("profile_forward: {:?}", e))?;
+        // This probe reflects weights + activation workspace + committed library
+        // state — everything resident except the (throwaway) profiling KV pool.
+        let (free_after, _) =
+            device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
+        // Hold back a fixed reserve for the incremental allocations the prewarm
+        // pass makes after sizing (per-shape cuDNN plans, recycling-pool growth).
+        let usable =
+            free_after.saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
+        let budget = (usable as f64 * fraction as f64) as usize;
         let raw = budget / bytes_per_block.max(1);
-        // Safety reserve (M8): the `free` probe is taken before the forward
-        // activation workspace and the decode CUDA-graph capture pool are
-        // allocated (both happen in `Runtime::new` / `prime_graphs`
-        // *after* this point). `fraction` (default 0.9) is the primary
-        // headroom for them; on top we keep an explicit reserve so rounding +
-        // allocator fragmentation never pushes runtime peak past the probe:
-        //   - 1 block is the graph scratch block (see `pool_blocks` below),
-        //   - plus 0.5% of the raw block count (min 1) as fragmentation slack.
-        // OOM on this path is otherwise swallowed by the kernel error layer,
-        // so we err conservative here.
+        // Small fragmentation slack on top of the fixed prewarm reserve: 1 block
+        // for the graph-scratch block (see `pool_blocks` below) + 0.5% of raw.
         let reserve = 1 + (raw / 200).max(1);
         let probed = raw.saturating_sub(reserve).max(1);
-        // Cap the auto-sized pool at the working set the worker can ever hold
-        // in use: at most `max_batch_seqs` sequences, each at most
-        // `max_seq_len` tokens. The scheduler never admits more than
-        // `max_batch_seqs` running sequences, so any block beyond this is
-        // unreachable — it only wastes VRAM AND inflates every O(num_blocks)
-        // op in `GlobalKvAllocator`. `release_owned`→`free()` does a full-pool
-        // compact+merge on EVERY sequence completion; at a VRAM-filling ~780k
-        // pool that is ~2ms/completion (measured), which lands in serve-loop
-        // ticks alongside prefills and directly inflates TTFT on slower CPUs.
-        // With prefix caching ON, extra blocks cache evicted prefixes, so keep
-        // the full probe; with it OFF (real-time recycling) the live working
-        // set is the only thing that can be allocated, so clamp to it.
+        // Cap the auto-sized pool at the working set the worker can ever hold in
+        // use: at most `max_batch_seqs` sequences, each at most `max_seq_len`
+        // tokens. The scheduler never admits more than `max_batch_seqs` running
+        // sequences, so any block beyond this is unreachable — it only wastes
+        // VRAM AND inflates every O(num_blocks) op in `GlobalKvAllocator`.
+        // `release_owned`→`free()` does a full-pool compact+merge on EVERY
+        // sequence completion; at a VRAM-filling ~780k pool that is ~2ms/
+        // completion (measured), landing in serve-loop ticks alongside prefills
+        // and directly inflating TTFT on slower CPUs. With prefix caching ON,
+        // extra blocks cache evicted prefixes, so keep the full probe; with it
+        // OFF (real-time recycling) the live working set is the only thing that
+        // can be allocated, so clamp to it.
         let derived = if bs.load.enable_prefix_caching {
             probed
         } else {
@@ -129,16 +182,26 @@ where
                 .max(1);
             probed.min(working_set)
         };
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
         tracing::info!(
-            "[bootstrap] KV mem probe: free={:.2}GiB total={:.2}GiB fraction={} bytes/block={} probed={} -> num_blocks={} (~{:.2}GiB KV pool)",
-            free as f64 / (1u64 << 30) as f64,
-            total as f64 / (1u64 << 30) as f64,
+            "[bootstrap] KV mem probe (profile-driven): total={:.2}GiB free_after_workspace={:.2}GiB free_after_dummy_fwd={:.2}GiB (dummy committed {:.2}GiB lazy libs) prewarm_reserve={:.2}GiB fraction={} bytes/block={} probed={} -> num_blocks={} (~{:.2}GiB KV pool)",
+            gib(total as usize),
+            gib(free_before),
+            gib(free_after),
+            gib(free_before.saturating_sub(free_after)),
+            gib(crate::application::tuning::PREWARM_HEADROOM_BYTES),
             fraction,
             bytes_per_block,
             probed,
             derived,
-            (derived * bytes_per_block) as f64 / (1u64 << 30) as f64,
+            gib(derived * bytes_per_block),
         );
+        // Swap the throwaway profiling pool for the real one (frees the profile
+        // pool first). Runs before `prime_graphs`, so no graph references the old
+        // KV base and there is no live sequence state to migrate.
+        runner
+            .resize_kv_pool(derived + 1)
+            .map_err(|e| format!("resize_kv_pool: {:?}", e))?;
         derived
     };
 
@@ -150,22 +213,6 @@ where
         pool_blocks,
         max_blocks_per_seq,
     );
-
-    let cap_num_tokens = bs.load.max_batch_tokens;
-    let cap_batch = bs.load.max_batch_seqs;
-    let mut runner: Runtime<bf16, Cuda, M> = Runtime::new(
-        model,
-        CudaScope::new(bs.cuda.clone()),
-        Box::new(GreedySampler),
-        pool_blocks,
-        bs.block_size,
-        max_blocks_per_seq,
-        bs.max_seq_len,
-        cap_num_tokens,
-        cap_batch,
-        bs.capture_sizes.clone(),
-    )
-    .map_err(|e| format!("Runtime::new: {:?}", e))?;
 
     // Install the decode CUDA-graph runner. On CUDA (arena reserved) this
     // enables real capture-on-first-hit / replay for decode-only batches whose

@@ -13,11 +13,20 @@ use infer_protocol::worker_to_scheduler_control::{
 /// ControlPump manages the ZMQ DEALER socket for control plane.
 pub struct ControlPump {
     pub worker_id: String,
+    /// This worker's CUDA device string (e.g. `"cuda:7"`), reported to the
+    /// scheduler in Hello/Ready so multi-device deployments are not all
+    /// misreported as `cuda:0`.
+    device: String,
     socket: zmq::Socket,
 }
 
 impl ControlPump {
-    pub fn new(ctx: &zmq::Context, worker_id: String, endpoint: &str) -> Result<Self, String> {
+    pub fn new(
+        ctx: &zmq::Context,
+        worker_id: String,
+        device: String,
+        endpoint: &str,
+    ) -> Result<Self, String> {
         let socket = ctx
             .socket(zmq::DEALER)
             .map_err(|e| format!("zmq socket: {}", e))?;
@@ -30,7 +39,11 @@ impl ControlPump {
         socket
             .connect(endpoint)
             .map_err(|e| format!("connect {}: {}", endpoint, e))?;
-        Ok(Self { worker_id, socket })
+        Ok(Self {
+            worker_id,
+            device,
+            socket,
+        })
     }
 
     /// Serialize and send a control message.
@@ -52,7 +65,7 @@ impl ControlPump {
                 worker_id: self.worker_id.clone(),
                 pid: std::process::id(),
                 hostname: hostname(),
-                device: "cuda:0".into(),
+                device: self.device.clone(),
                 protocol_version: WORKER_CONTROL_PROTOCOL_VERSION,
             }),
             RequestId::NONE,
@@ -112,7 +125,7 @@ impl ControlPump {
                 model_instance_id,
                 model_path,
                 model_type,
-                device: "cuda:0".into(),
+                device: self.device.clone(),
                 capacity,
             }),
             RequestId::NONE,

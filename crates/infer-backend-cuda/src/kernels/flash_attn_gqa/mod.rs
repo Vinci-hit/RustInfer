@@ -508,8 +508,11 @@ pub fn attention_paged<T: Dtype>(
 
             // The caller pre-allocated `workspace` with at least
             // `flash_attn_batched_decode_workspace_bytes(cap_batch, head_num, head_dim)`
-            // bytes. We sanity-check at debug time, but trust the caller in release.
-            #[cfg(debug_assertions)]
+            // bytes. A too-small workspace would let the flash kernel write out
+            // of bounds (silent device memory corruption), so validate ALWAYS —
+            // computing `need` is a couple integer ops plus one cheap FFI call,
+            // negligible next to the kernel launch, and worth it to fail loudly
+            // instead of corrupting memory in release builds.
             {
                 let need = unsafe {
                     flash_attn_batched_decode_workspace_bytes(
@@ -519,12 +522,13 @@ pub fn attention_paged<T: Dtype>(
                     )
                 } as usize;
                 let have = workspace.numel() * std::mem::size_of::<f32>();
-                debug_assert!(
-                    have >= need,
-                    "attention_paged workspace too small: have {} bytes, need {}",
-                    have,
-                    need
-                );
+                if have < need {
+                    return Err(OpError::Kernel(format!(
+                        "attention_paged decode workspace too small: have {} bytes, need {} \
+                         (batch={}, head_num={}, head_dim={})",
+                        have, need, batch, head_num, head_dim
+                    )));
+                }
             }
 
             unsafe {

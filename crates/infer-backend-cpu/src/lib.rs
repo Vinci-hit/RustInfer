@@ -183,6 +183,8 @@ impl CoreOps for Cpu {
         b: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
+        check_contiguous3(a, b, dst)?;
+        check_numel3(a, b, dst)?;
         for i in 0..a.numel() {
             unsafe {
                 let va = read_f64(a.data_ptr().add(i));
@@ -228,13 +230,34 @@ impl CoreOps for Cpu {
         let m = input.shape().as_slice()[0];
         let k = input.shape().as_slice()[1];
         let n = weight.shape().as_slice()[0];
+        if !input.is_contiguous() || !weight.is_contiguous() || !output.is_contiguous() {
+            return Err(OpError::NotContiguous(*input.shape()));
+        }
+        if group_size == 0 || k % group_size != 0 {
+            return Err(OpError::Shape(format!(
+                "matmul_quant: k {} not divisible by group_size {}",
+                k, group_size
+            )));
+        }
+        let groups = k / group_size;
+        // Bound checks against the actual backing storage before any raw reads.
+        if weight.numel() < n * k
+            || input.numel() < m * k
+            || output.numel() < m * n
+            || scales.numel() < n * groups
+        {
+            return Err(OpError::Shape(format!(
+                "matmul_quant: operand smaller than declared m={} n={} k={} groups={} (input={}, weight={}, scales={}, output={})",
+                m, n, k, groups, input.numel(), weight.numel(), scales.numel(), output.numel()
+            )));
+        }
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for p in 0..k {
                     let group = p / group_size;
                     let scale =
-                        unsafe { read_f64(scales.data_ptr().add(j * (k / group_size) + group)) };
+                        unsafe { read_f64(scales.data_ptr().add(j * groups + group)) };
                     let w = unsafe { read_f64(weight.data_ptr().add(j * k + p)) };
                     let a = unsafe { read_f64(input.data_ptr().add(i * k + p)) };
                     sum += a * w * scale;
@@ -293,10 +316,18 @@ impl CoreOps for Cpu {
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let dim = table.shape().as_slice()[1];
+        let vocab = table.shape().as_slice()[0];
         let seq_len = indices.numel();
         let idx_slice = unsafe { std::slice::from_raw_parts(indices.data_ptr(), seq_len) };
         for i in 0..seq_len {
-            let idx = idx_slice[i] as usize;
+            let raw = idx_slice[i];
+            if raw < 0 || (raw as usize) >= vocab {
+                return Err(OpError::Shape(format!(
+                    "embedding: index {} at position {} out of range [0, {})",
+                    raw, i, vocab
+                )));
+            }
+            let idx = raw as usize;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (table.data_ptr() as *const u8).add(idx * dim * T::SIZE_BYTES),
@@ -366,6 +397,18 @@ impl CoreOps for Cpu {
             return Err(OpError::Shape(format!(
                 "split_cols: col_offset {} + dst_cols {} > total_cols {}",
                 col_offset, dst_cols, total_cols
+            )));
+        }
+        if !src.is_contiguous() || !dst.is_contiguous() {
+            return Err(OpError::NotContiguous(*src.shape()));
+        }
+        // The declared [rows, total_cols] / [rows, dst_cols] logical shapes must
+        // fit inside the backing tensors; otherwise the pointer arithmetic below
+        // (`r * total_cols + col_offset`, `r * dst_cols`) walks out of bounds.
+        if rows * total_cols > src.numel() || rows * dst_cols > dst.numel() {
+            return Err(OpError::Shape(format!(
+                "split_cols: declared shape exceeds storage (rows={}, total_cols={}, dst_cols={}, src_numel={}, dst_numel={})",
+                rows, total_cols, dst_cols, src.numel(), dst.numel()
             )));
         }
         let src_ptr = src.data_ptr();

@@ -188,9 +188,20 @@ impl<'a> WeightLoader<'a> {
             let dst = unsafe { host.as_mut_ptr().add(row_offset * dim * elem) };
             if src_dt == T::DATA_TYPE {
                 let n = numel * elem;
-                // SAFETY: host buffer has at least row_offset*dim*elem + n bytes by construction.
+                if src.len() != n {
+                    return Err(OpError::Shape(format!(
+                        "fused_qkv layer {}: view byte length {} != expected {} for shape {:?} \
+                         (corrupt safetensors?)",
+                        layer_idx,
+                        src.len(),
+                        n,
+                        shape,
+                    )));
+                }
+                // SAFETY: host buffer has at least row_offset*dim*elem + n bytes
+                // by construction, and src has exactly n bytes (checked above).
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len()));
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
                 }
             } else {
                 cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
@@ -257,8 +268,18 @@ impl<'a> WeightLoader<'a> {
             let dst = unsafe { host.as_mut_ptr().add(row_offset * dim * elem) };
             if src_dt == T::DATA_TYPE {
                 let n = numel * elem;
+                if src.len() != n {
+                    return Err(OpError::Shape(format!(
+                        "fused_gate_up layer {}: view byte length {} != expected {} for shape {:?} \
+                         (corrupt safetensors?)",
+                        layer_idx,
+                        src.len(),
+                        n,
+                        shape,
+                    )));
+                }
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n.min(src.len()));
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
                 }
             } else {
                 cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
@@ -477,9 +498,18 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
     // Build a host buffer in target dtype, then upload to device in one shot.
     let mut host_buf: Vec<u8> = vec![0u8; size_bytes];
     if src_dtype == T::DATA_TYPE {
-        // Direct byte copy.
-        let n = size_bytes.min(src_bytes.len());
-        host_buf[..n].copy_from_slice(&src_bytes[..n]);
+        // Direct byte copy — the view must carry exactly the bytes its shape
+        // implies, otherwise the weight would be silently zero-padded.
+        if src_bytes.len() != size_bytes {
+            return Err(OpError::Shape(format!(
+                "tensor_from_safetensor_view: view byte length {} != expected {} for shape {:?} \
+                 (corrupt safetensors?)",
+                src_bytes.len(),
+                size_bytes,
+                shape_vec,
+            )));
+        }
+        host_buf.copy_from_slice(src_bytes);
     } else {
         // Element-wise cast through f64 intermediate.
         cast_bytes(

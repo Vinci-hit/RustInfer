@@ -11,6 +11,15 @@ use crate::error::{Result, SchedulerError, TransportError};
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
+/// Bound on the scheduler → ZMQ-thread outbound queues (responses / chunks /
+/// worker commands). The ZMQ thread drains these with a tight `blocking_recv`
+/// loop and forwards to non-blocking socket sends, so the queue is normally
+/// near-empty. The bound only matters as an OOM backstop: if a peer stalls, the
+/// async producer applies backpressure (`send().await`) instead of letting an
+/// unbounded queue grow without limit. Large enough to never throttle healthy
+/// traffic.
+const OUTBOUND_QUEUE_BOUND: usize = 16_384;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ZMQ Frontend Transport
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -35,14 +44,16 @@ pub struct ZmqFrontendTransport {
     /// Receive channel: ZMQ thread sends incoming requests here.
     incoming_rx: mpsc::UnboundedReceiver<FrontendEvent>,
     /// Send channel: scheduler sends responses here, ZMQ thread drains.
-    outgoing_tx: mpsc::UnboundedSender<OutgoingResponse>,
+    /// Bounded so a stalled client cannot make the scheduler accumulate an
+    /// unbounded backlog of undelivered responses (OOM backstop).
+    outgoing_tx: mpsc::Sender<OutgoingResponse>,
 }
 
 impl ZmqFrontendTransport {
     /// Spawn the ZMQ I/O thread and return the transport handle.
     pub fn new(endpoint: &str) -> Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTBOUND_QUEUE_BOUND);
         let endpoint = endpoint.to_string();
 
         std::thread::Builder::new()
@@ -71,7 +82,7 @@ impl ZmqFrontendTransport {
     fn zmq_thread(
         endpoint: String,
         incoming_tx: mpsc::UnboundedSender<FrontendEvent>,
-        mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingResponse>,
+        mut outgoing_rx: mpsc::Receiver<OutgoingResponse>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = zmq::Context::new();
         let socket = ctx.socket(zmq::ROUTER)?;
@@ -199,6 +210,7 @@ impl FrontendTransport for ZmqFrontendTransport {
                 client_id: client.clone(),
                 response,
             })
+            .await
             .map_err(|_| SchedulerError::Shutdown)
     }
 
@@ -208,6 +220,7 @@ impl FrontendTransport for ZmqFrontendTransport {
                 client_id: client.clone(),
                 chunk,
             })
+            .await
             .map_err(|_| SchedulerError::Shutdown)
     }
 }
@@ -223,7 +236,8 @@ pub struct ZmqWorkerTransport {
     /// for the background decode task.
     output_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     /// Send channel: scheduler sends batch commands here.
-    command_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Bounded as an OOM backstop if the worker PUSH socket stalls.
+    command_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl ZmqWorkerTransport {
@@ -232,7 +246,7 @@ impl ZmqWorkerTransport {
         // ZMQ I/O thread must never block on the Tokio bridge: blocking here can
         // deadlock command sending against worker output receiving under load.
         let (output_tx, output_rx) = mpsc::unbounded_channel();
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::channel(OUTBOUND_QUEUE_BOUND);
         let push_ep = push_endpoint.to_string();
         let pull_ep = pull_endpoint.to_string();
 
@@ -261,7 +275,7 @@ impl ZmqWorkerTransport {
         push_endpoint: String,
         pull_endpoint: String,
         output_tx: mpsc::UnboundedSender<Vec<u8>>,
-        mut command_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut command_rx: mpsc::Receiver<Vec<u8>>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = zmq::Context::new();
 
@@ -343,6 +357,7 @@ impl WorkerTransport for ZmqWorkerTransport {
     async fn send_batch(&mut self, cmd: Vec<u8>) -> Result<()> {
         self.command_tx
             .send(cmd)
+            .await
             .map_err(|_| SchedulerError::Shutdown)
     }
 

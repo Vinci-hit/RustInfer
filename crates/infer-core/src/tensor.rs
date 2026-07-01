@@ -176,12 +176,32 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         offset_elems: usize,
         is_contiguous: bool,
     ) -> Self {
+        let numel = shape.numel();
+        // Validate the view stays inside the backing allocation. Debug-only so
+        // the hot path (data_ptr / data_ptr_mut) can stay unchecked: the offset
+        // is baked in here once, not re-derived per access. `offset_elems`
+        // addresses element `T`; for a max-strided (non-contiguous) view the
+        // last touched element is at `offset + Σ (dim-1)*stride`, but for the
+        // contiguous / prefix views this constructor is used for, `offset +
+        // numel` is the tight upper bound.
+        debug_assert!(
+            offset_elems
+                .checked_add(numel)
+                .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
+                .map(|bytes| bytes <= self.storage.size())
+                .unwrap_or(false),
+            "view_raw out of bounds: offset_elems={} numel={} elem_size={} storage_bytes={}",
+            offset_elems,
+            numel,
+            std::mem::size_of::<T>(),
+            self.storage.size(),
+        );
         Self {
             storage: Arc::clone(&self.storage),
             shape,
             strides,
             offset_elems,
-            numel: shape.numel(),
+            numel,
             is_contiguous,
             _marker: PhantomData,
         }
@@ -231,10 +251,13 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         let new_shape = Shape::from_slice(&new_shape_vec);
         let extra_offset = start * strides[dim] as usize;
         let new_offset = self.offset_elems + extra_offset;
-        // After narrow along dim != 0 with non-full extent, the view is
-        // non-contiguous in general. Conservatively mark non-contiguous unless
-        // the narrow is identity.
-        let is_contig = self.is_contiguous && start == 0 && length == shape[dim];
+        // Contiguity after narrow: a slice along `dim == 0` stays a single
+        // contiguous block (only the base offset shifts), so it remains
+        // contiguous for any `start`/`length`. Narrowing an inner dim to less
+        // than its full extent introduces gaps between rows and is
+        // non-contiguous (unless it is the identity slice).
+        let is_contig = self.is_contiguous
+            && (dim == 0 || (start == 0 && length == shape[dim]));
         Ok(self.view_raw(new_shape, self.strides, new_offset, is_contig))
     }
 

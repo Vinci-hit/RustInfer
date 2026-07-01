@@ -159,13 +159,21 @@ impl SafetensorsReader {
                 .name_to_shard
                 .get(name)
                 .ok_or_else(|| format!("tensor '{}' not in weight_map", name))?;
-            self.shards[idx]
+            let shard = self
+                .shards
+                .get(idx)
+                .ok_or_else(|| format!("tensor '{}' maps to shard {} but only {} shard(s) loaded", name, idx, self.shards.len()))?;
+            shard
                 .header
                 .tensor(name)
                 .map_err(|e| format!("tensor '{}' not in shard {}: {}", name, idx, e))
         } else {
             // Single-file: scan shard 0.
-            self.shards[0]
+            let shard = self
+                .shards
+                .first()
+                .ok_or_else(|| format!("tensor '{}' requested but no shards loaded", name))?;
+            shard
                 .header
                 .tensor(name)
                 .map_err(|e| format!("tensor '{}' not found: {}", name, e))
@@ -177,7 +185,9 @@ impl SafetensorsReader {
         if !self.name_to_shard.is_empty() {
             self.name_to_shard.contains_key(name)
         } else {
-            self.shards[0].header.tensor(name).is_ok()
+            self.shards
+                .first()
+                .is_some_and(|s| s.header.tensor(name).is_ok())
         }
     }
 

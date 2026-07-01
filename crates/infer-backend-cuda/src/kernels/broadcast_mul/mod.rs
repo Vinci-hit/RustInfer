@@ -61,8 +61,16 @@ pub fn broadcast_mul_inplace<T: Dtype>(
     x: &mut Tensor<T, Cuda>,
     scale: &Tensor<T, Cuda>,
 ) -> OpResult<()> {
-    let dim = scale.numel() as i32;
-    let rows = (x.numel() as i32) / dim;
+    let dim = scale.numel();
+    if dim == 0 || x.numel() % dim != 0 {
+        return Err(OpError::Shape(format!(
+            "broadcast_mul_inplace: x.numel()={} not a multiple of scale.numel()={}",
+            x.numel(),
+            dim
+        )));
+    }
+    let rows = (x.numel() / dim) as i32;
+    let dim = dim as i32;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => broadcast_mul_f32_forward(
@@ -106,8 +114,16 @@ pub fn broadcast_add_inplace<T: Dtype>(
     x: &mut Tensor<T, Cuda>,
     bias: &Tensor<T, Cuda>,
 ) -> OpResult<()> {
-    let dim = bias.numel() as i32;
-    let rows = (x.numel() as i32) / dim;
+    let dim = bias.numel();
+    if dim == 0 || x.numel() % dim != 0 {
+        return Err(OpError::Shape(format!(
+            "broadcast_add_inplace: x.numel()={} not a multiple of bias.numel()={}",
+            x.numel(),
+            dim
+        )));
+    }
+    let rows = (x.numel() / dim) as i32;
+    let dim = dim as i32;
     unsafe {
         match T::DATA_TYPE {
             DataType::F32 => broadcast_add_inplace_f32_forward(

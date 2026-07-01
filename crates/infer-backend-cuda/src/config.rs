@@ -240,11 +240,22 @@ impl CudaConfig {
             return None;
         }
         let n = self.round_up_256(size);
-        let off = self.arena_off.fetch_add(n, Ordering::AcqRel);
-        if off + n > GRAPH_ARENA_SIZE {
-            self.arena_off.fetch_sub(n, Ordering::AcqRel);
-            return None;
-        }
+        // Reserve `n` bytes atomically without ever transiently over-committing
+        // the bump offset. `fetch_add`+rollback could momentarily publish an
+        // offset past the arena end to a concurrent allocator; `fetch_update`
+        // only commits when the new offset fits, so a losing race simply retries
+        // or returns `None`. (Capture is single-threaded today, so this is
+        // belt-and-suspenders, but it makes the invariant local and robust.)
+        let off = self
+            .arena_off
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let end = cur.checked_add(n)?;
+                (end <= GRAPH_ARENA_SIZE).then_some(end)
+            });
+        let off = match off {
+            Ok(prev) => prev, // prev offset; our region is [prev, prev+n)
+            Err(_) => return None,
+        };
         let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
         // Zero-initialize on the compute stream (capture-safe: cudaMemsetAsync
         // is a recordable stream op).

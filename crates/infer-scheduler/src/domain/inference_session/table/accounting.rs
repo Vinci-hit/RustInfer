@@ -91,13 +91,17 @@ pub(crate) fn future_decode_reserve_tokens(table: &RequestTable) -> usize {
 /// `Prefilling` with `num_computed_tokens > 0` (chunked prefill in progress) IS
 /// included: its KV slots are real and worth recovering.
 pub(crate) fn preemption_candidates(table: &RequestTable) -> Vec<PreemptCandidate> {
+    // Token counts are bounded by `max_model_len` in practice, well below
+    // `u32::MAX`, but clamp explicitly so an unexpected value degrades the
+    // preemption score gracefully instead of wrapping to a tiny count.
+    let clamp = |n: usize| -> u32 { u32::try_from(n).unwrap_or(u32::MAX) };
     let mut out = Vec::with_capacity(table.decoding.len() + table.prefilling.len());
     for seq in table.decoding.values() {
         out.push(PreemptCandidate {
             sequence_id: seq.meta.sequence_id.0,
-            output_len: seq.state.output_tokens.len() as u32,
-            input_len: seq.meta.input_ids.len() as u32,
-            kv_used: decoding_kv_slots(seq) as u32,
+            output_len: clamp(seq.state.output_tokens.len()),
+            input_len: clamp(seq.meta.input_ids.len()),
+            kv_used: clamp(decoding_kv_slots(seq)),
         });
     }
     for seq in table.prefilling.values() {
@@ -105,8 +109,8 @@ pub(crate) fn preemption_candidates(table: &RequestTable) -> Vec<PreemptCandidat
             out.push(PreemptCandidate {
                 sequence_id: seq.meta.sequence_id.0,
                 output_len: 0,
-                input_len: seq.meta.input_ids.len() as u32,
-                kv_used: seq.state.num_computed_tokens as u32,
+                input_len: clamp(seq.meta.input_ids.len()),
+                kv_used: clamp(seq.state.num_computed_tokens),
             });
         }
     }

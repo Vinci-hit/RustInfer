@@ -25,7 +25,19 @@ fn json_event<T: serde::Serialize>(request_id: &str, payload: &T) -> Event {
                 error = %error,
                 "failed to serialize SSE payload"
             );
-            Event::default().data("[DONE]")
+            // Emit a distinguishable `error` event rather than `[DONE]`: `[DONE]`
+            // is the OpenAI stream *terminator* and would masquerade a failure as
+            // successful completion, leaving the client unable to tell that the
+            // response was truncated.
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to serialize streaming payload: {error}"),
+                    "type": "internal_error",
+                }
+            });
+            Event::default()
+                .event("error")
+                .data(body.to_string())
         }
     }
 }

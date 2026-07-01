@@ -42,8 +42,26 @@ pub struct AssignedIndices {
 }
 
 impl AssignedIndices {
+    /// End of the `[base, base+len)` global-index run.
+    ///
+    /// Uses `saturating_add` so a corrupt/overflowing `(base, len)` pair yields
+    /// `u32::MAX` (an empty or clamped range downstream) instead of silently
+    /// wrapping to a small value that would alias low KV indices.
     pub fn end(&self) -> u32 {
-        self.base + self.len as u32
+        self.base.saturating_add(self.len as u32)
+    }
+
+    /// True when the run is internally consistent: `base + len` does not
+    /// overflow `u32`, and — when token ids are carried for prefix caching —
+    /// there is exactly one token id per slot in the run.
+    ///
+    /// The worker is trusted, but this guards against a buggy/mismatched worker
+    /// build silently corrupting the scheduler's RadixTree bindings.
+    pub fn is_consistent(&self) -> bool {
+        if self.base.checked_add(self.len as u32).is_none() {
+            return false;
+        }
+        self.token_ids.is_empty() || self.token_ids.len() == self.len as usize
     }
 }
 

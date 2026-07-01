@@ -702,6 +702,101 @@ where
         Ok(())
     }
 
+    /// Run one worst-case synthetic forward so the bootstrap memory probe (in
+    /// `serve_loop`) measures the true resident footprint before the real KV
+    /// pool is sized. The eager forward commits the fixed activation workspace
+    /// (already allocated in `Runtime::new`) *and* forces the lazy device
+    /// allocations the first live forward would otherwise make — cuBLASLt algo
+    /// workspaces, cuDNN SDPA plans, the recycling pool's scratch. After this
+    /// returns and the caller `synchronize()`s + probes, `cudaMemGetInfo`'s
+    /// `free` reflects everything except the KV pool, so the pool can be sized
+    /// from what is genuinely left instead of a fraction-of-free guess taken
+    /// before the workspace existed.
+    ///
+    /// Must be called with `self.graph == None` (i.e. before `prime_graphs`):
+    /// `decide()` then routes every `step()` through the eager path, so this
+    /// captures no CUDA graph and bakes no KV-base pointer that the subsequent
+    /// `resize_kv_pool` would invalidate.
+    ///
+    /// The synthetic request is a single ragged prefill of `profile_len` tokens
+    /// (the largest that both the activation workspace `cap_num_tokens` and the
+    /// throwaway profiling KV pool can hold), mirroring `prewarm_prefill_shapes`.
+    /// Blocks `0..profile_len` are scratch — this runs before any admission.
+    pub fn profile_forward(&mut self) -> OpResult<()> {
+        debug_assert!(
+            self.graph.is_none(),
+            "profile_forward must run before prime_graphs (eager only)"
+        );
+        // Largest prefill the fixed workspace and the profiling pool both hold.
+        // `num_blocks - 1` leaves the graph-scratch block untouched, matching
+        // the `pool_blocks = num_blocks + 1` convention the real pool uses.
+        let profile_len = self
+            .cap_num_tokens
+            .min(self.max_seq_len)
+            .min(self.max_blocks_per_seq)
+            .min(self.kv_pool.num_blocks.saturating_sub(1))
+            .max(1);
+        let req = StepRequest {
+            seqs: vec![SeqStep {
+                sequence_id: 0,
+                input_ids: vec![1; profile_len],
+                positions: (0..profile_len as i32).collect(),
+                kv_write_start: 0,
+                kv_len_after: profile_len as i32,
+                block_table: (0..profile_len as u32).collect(),
+            }],
+            sampling: vec![Default::default(); 1],
+            stop: StopCriteria {
+                eos_ids: Vec::new(),
+                generated_counts: vec![0; 1],
+                max_tokens: vec![u32::MAX; 1],
+                ignore_eos: vec![true; 1],
+            },
+            draft_tokens: Vec::new(),
+        };
+        self.step(&req)?;
+        self.scope.synchronize()?;
+        Ok(())
+    }
+
+    /// Replace the KV pool's per-layer `k`/`v` tensors with a fresh set sized for
+    /// `num_blocks`, freeing the previous (profiling) pool first. Called once at
+    /// bootstrap between `profile_forward` and `prime_graphs`, so no captured
+    /// graph yet references the old KV base and `seq_kv_len` is empty (no live
+    /// sequence state to migrate). Dropping the old `layers` before allocating
+    /// the new ones returns the profiling pool's bytes to the device so the
+    /// (typically larger) real pool can reuse them.
+    pub fn resize_kv_pool(&mut self, num_blocks: usize) -> OpResult<()> {
+        debug_assert!(
+            self.graph.is_none(),
+            "resize_kv_pool must run before prime_graphs (no graph may reference the old KV base)"
+        );
+        let device = self.scope.device();
+        let block_size = self.kv_pool.block_size;
+        let kv_dim = self.kv_pool.kv_dim;
+        let num_layers = self.kv_pool.layers.len();
+        // Free the profiling pool first (drop its device tensors), so its bytes
+        // are available for the new allocation on a memory-tight device.
+        self.kv_pool.layers.clear();
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(PagedKvLayer {
+                k: D::alloc_tensor(
+                    Shape::from_slice(&[num_blocks, block_size, kv_dim]),
+                    device,
+                )?,
+                v: D::alloc_tensor(
+                    Shape::from_slice(&[num_blocks, block_size, kv_dim]),
+                    device,
+                )?,
+            });
+        }
+        self.kv_pool.layers = layers;
+        self.kv_pool.num_blocks = num_blocks;
+        self.kv_pool.seq_kv_len.clear();
+        Ok(())
+    }
+
     /// Eagerly capture a decode CUDA graph for every configured capture size,
     /// so the first *live* decode at each batch size replays a ready graph
     /// instead of paying an inline `forward + capture` on the serve thread.
@@ -1931,7 +2026,17 @@ where
             ));
             self.abc.row_kind_host[i] = row_kind[i].as_i32();
             let q = req.seqs[i].input_ids.len().max(1) as i32;
-            token_offset += q;
+            // `token_offset` indexes into the flat token tape, bounded by
+            // `max_batch_tokens` in practice. Use a checked add so a malformed
+            // oversized batch fails loudly instead of wrapping `i32` and pointing
+            // `last_token_rows` at the wrong tape row (which would sample and
+            // return the wrong token to the user).
+            token_offset = token_offset.checked_add(q).ok_or_else(|| {
+                OpError::Shape(format!(
+                    "upload_mixed_abc_metadata: token_offset overflow at row {} (q={})",
+                    i, q
+                ))
+            })?;
             self.abc.last_token_rows_host[i] = token_offset - 1;
         }
         for i in batch..rows_to_upload {
