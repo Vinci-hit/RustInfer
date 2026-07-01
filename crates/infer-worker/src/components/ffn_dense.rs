@@ -18,6 +18,11 @@ use crate::domain::types::Shape;
 /// gate/up → SwiGLU → down projection, and adds the result back into the
 /// residual. Owns its post-attention norm. Swapping this for `MoeFfn` (same
 /// `Component` contract) is the entire dense↔MoE model change.
+///
+/// Each projection is a [`Linear`], which transparently carries either a
+/// full-precision weight or an int4 group-quantized (`pack-quantized`) weight
+/// — so this one struct backs both bf16 and int4-MLP models with no change to
+/// the FFN dataflow.
 pub struct DenseFfn<T: Dtype, D: LlmBackend> {
     pub post_attention_layernorm: RmsNorm<T, D>,
     pub gate_up_proj: Linear<T, D>,
@@ -38,7 +43,7 @@ impl<T: Dtype, D: LlmBackend> DenseFfn<T, D> {
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
         let num_tokens = input.shape().as_slice()[0];
-        let gate_cols = self.gate_up_proj.weight.shape().as_slice()[0];
+        let gate_cols = self.gate_up_proj.out_features();
         let inter = gate_cols / 2;
         let dev = input.device().clone();
         // Reuse address-stable scratch when its geometry matches this FFN's

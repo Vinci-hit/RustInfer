@@ -6,7 +6,6 @@ pub mod ffn_moe;
 pub mod linear;
 pub mod lm_head;
 pub mod norm;
-pub mod quant_linear;
 
 pub use attention::Attention;
 pub use decoder_block::DecoderBlock;
@@ -16,4 +15,3 @@ pub use ffn_moe::MoeFfn;
 pub use linear::Linear;
 pub use lm_head::LmHead;
 pub use norm::RmsNorm;
-pub use quant_linear::QuantLinear;

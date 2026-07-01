@@ -206,10 +206,7 @@ mod tests {
     }
 
     fn lin(rows: usize, cols: usize) -> Linear<f32, Cpu> {
-        Linear {
-            weight: weight(rows, cols),
-            bias: None,
-        }
+        Linear::new(weight(rows, cols), None)
     }
 
     /// 1-layer Llama-style decoder with deterministic weights (rebuildable so

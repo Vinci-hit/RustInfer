@@ -38,7 +38,12 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for MoeFfn<T, D> {
         let hidden_shape = hidden.stream.shape().as_slice();
         let gate_shape = self.expert_gate_up.shape().as_slice();
         let down_shape = self.expert_down.shape().as_slice();
-        let router_shape = self.router.weight.shape().as_slice();
+        let router_weight = self
+            .router
+            .weight
+            .as_dense()
+            .ok_or_else(|| OpError::Shape("MoeFfn::run: router weight must be dense".into()))?;
+        let router_shape = router_weight.shape().as_slice();
         if hidden_shape.len() != 2 || gate_shape.len() != 3 || down_shape.len() != 3 {
             return Err(OpError::Shape(format!(
                 "MoeFfn::run: expected hidden [tokens,dim], gate [experts,2*inter,dim], down [experts,dim,inter], got {:?} {:?} {:?}",

@@ -15,6 +15,7 @@ use crate::components::{
     Attention, DecoderBlock, DenseFfn, Embed, Linear as CompLinear, LmHead, RmsNorm as CompRmsNorm,
 };
 use crate::domain::model::ModelDims;
+use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
@@ -49,6 +50,10 @@ pub struct LoadConfig {
     pub rope_theta: f64,
     /// Optional NTK-aware frequency rescaling (Llama-3 family).
     pub rope_scaling: Option<RopeScaling>,
+    /// When `Some`, the MLP `gate/up/down` projections are int4 group-quantized
+    /// (compressed-tensors `pack-quantized`) with this scheme; attention and
+    /// the head stay full-precision. `None` → a fully dense model.
+    pub mlp_quant: Option<QuantScheme>,
 }
 
 /// Weight loader — pulls tensors out of a `SafetensorsReader` and builds
@@ -295,6 +300,97 @@ impl<'a> WeightLoader<'a> {
         Ok(Linear::new(fused, None))
     }
 
+    // ─── AWQ / compressed-tensors `pack-quantized` MLP loading ───────────────
+    //
+    // Only the MLP `gate/up/down` projections are int4-quantized; the tensors
+    // are stored verbatim (no cast) and fed straight to the `matmul_quant`
+    // kernel. `gate` and `up` are fused by vertical (row / `N`-axis) concat,
+    // mirroring the dense `load_fused_gate_up` so downstream SwiGLU is
+    // unchanged. `N` is divisible by 8, so the zero-point rows (`[N/8, g]`,
+    // packed 8-along-`N`) concatenate on a clean word boundary.
+
+    /// Vertically concatenate two same-width row-major safetensors views of
+    /// dtype `E` into a fresh device tensor `[rows_a + rows_b, cols]`. Bytes
+    /// are copied verbatim (no cast), so the view dtype must already be `E`.
+    fn fuse_rows_verbatim<E: Dtype, D: MemoryPort>(
+        &self,
+        a: &TensorView,
+        b: &TensorView,
+        what: &str,
+        device: &D,
+    ) -> OpResult<Tensor<E, D>> {
+        let (sa, sb) = (a.shape(), b.shape());
+        if sa.len() != 2 || sb.len() != 2 || sa[1] != sb[1] {
+            return Err(OpError::Shape(format!(
+                "{}: cannot fuse views of shape {:?} and {:?}",
+                what, sa, sb
+            )));
+        }
+        if st_dtype(a)? != E::DATA_TYPE || st_dtype(b)? != E::DATA_TYPE {
+            return Err(OpError::Kernel(format!(
+                "{}: expected dtype {:?}, got {:?}/{:?}",
+                what,
+                E::DATA_TYPE,
+                a.dtype(),
+                b.dtype()
+            )));
+        }
+        let mut host = Vec::with_capacity(a.data().len() + b.data().len());
+        host.extend_from_slice(a.data());
+        host.extend_from_slice(b.data());
+        Tensor::<E, D>::from_host_bytes(&host, Shape::from_slice(&[sa[0] + sb[0], sa[1]]), device)
+    }
+
+    /// Load a single int4 (`pack-quantized`) projection — e.g. `down_proj` —
+    /// into a quantized `Linear`. `prefix` is the tensor-name stem, e.g.
+    /// `"model.layers.0.mlp.down_proj"`.
+    fn load_awq_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        prefix: &str,
+        scheme: QuantScheme,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let packed = self.load_tensor::<i32, D>(&format!("{}.weight_packed", prefix), device)?;
+        let zeros = self.load_tensor::<i32, D>(&format!("{}.weight_zero_point", prefix), device)?;
+        let scales = self.load_tensor::<T, D>(&format!("{}.weight_scale", prefix), device)?;
+        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None))
+    }
+
+    /// Load int4 `gate_proj` + `up_proj` fused along rows into one quantized
+    /// `Linear` (`[2*inter, K/8]` packed), matching the dense fused layout.
+    fn load_fused_gate_up_awq<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        layer_idx: usize,
+        scheme: QuantScheme,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let view = |proj: &str, part: &str| -> OpResult<TensorView<'_>> {
+            let name = format!("model.layers.{}.mlp.{}.{}", layer_idx, proj, part);
+            self.reader
+                .read_view(&name)
+                .map_err(|e| OpError::Kernel(format!("{}: {}", name, e)))
+        };
+        let packed = self.fuse_rows_verbatim::<i32, D>(
+            &view("gate_proj", "weight_packed")?,
+            &view("up_proj", "weight_packed")?,
+            "fused_gate_up_awq packed",
+            device,
+        )?;
+        let zeros = self.fuse_rows_verbatim::<i32, D>(
+            &view("gate_proj", "weight_zero_point")?,
+            &view("up_proj", "weight_zero_point")?,
+            "fused_gate_up_awq zeros",
+            device,
+        )?;
+        let scales = self.fuse_rows_verbatim::<T, D>(
+            &view("gate_proj", "weight_scale")?,
+            &view("up_proj", "weight_scale")?,
+            "fused_gate_up_awq scales",
+            device,
+        )?;
+        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None))
+    }
+
     /// Build the shared dense decoder. Per-block Q/K norms are populated when
     /// the weights contain them (Qwen3) and left absent otherwise (Llama3), so
     /// one builder backs both `load_llama3` and `load_qwen3`.
@@ -343,13 +439,34 @@ impl<'a> WeightLoader<'a> {
                 None,
                 device,
             )?;
-            let gate_up_proj =
-                self.load_fused_gate_up(i, cfg.intermediate_size, cfg.dim, device)?;
-            let down_proj = self.load_linear(
-                &format!("model.layers.{}.mlp.down_proj.weight", i),
-                None,
-                device,
-            )?;
+            // MLP: int4 `pack-quantized` when `mlp_quant` is set, else dense.
+            // Both arms yield a `components::Linear`; the quant arm carries the
+            // packed weight + scales/zeros and drives `matmul_quant` internally.
+            let (gate_up_proj, down_proj): (CompLinear<T, D>, CompLinear<T, D>) =
+                if let Some(scheme) = cfg.mlp_quant {
+                    (
+                        self.load_fused_gate_up_awq(i, scheme, device)?,
+                        self.load_awq_linear(
+                            &format!("model.layers.{}.mlp.down_proj", i),
+                            scheme,
+                            device,
+                        )?,
+                    )
+                } else {
+                    (
+                        comp_linear(self.load_fused_gate_up(
+                            i,
+                            cfg.intermediate_size,
+                            cfg.dim,
+                            device,
+                        )?),
+                        comp_linear(self.load_linear(
+                            &format!("model.layers.{}.mlp.down_proj.weight", i),
+                            None,
+                            device,
+                        )?),
+                    )
+                };
 
             let q_norm_name = format!("model.layers.{}.self_attn.q_norm.weight", i);
             let k_norm_name = format!("model.layers.{}.self_attn.k_norm.weight", i);
@@ -397,8 +514,8 @@ impl<'a> WeightLoader<'a> {
                 },
                 ffn: DenseFfn {
                     post_attention_layernorm: comp_rms(post_attention_layernorm),
-                    gate_up_proj: comp_linear(gate_up_proj),
-                    down_proj: comp_linear(down_proj),
+                    gate_up_proj,
+                    down_proj,
                     scratch: None,
                 },
             });
@@ -454,10 +571,7 @@ impl<'a> WeightLoader<'a> {
 fn comp_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
     l: Linear<T, D>,
 ) -> CompLinear<T, D> {
-    CompLinear {
-        weight: l.weight,
-        bias: l.bias,
-    }
+    CompLinear::new(l.weight, l.bias)
 }
 
 fn comp_rms<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
@@ -470,6 +584,23 @@ fn comp_rms<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
 }
 
 // ─── Internal: convert safetensor view to Tensor<T, D> ───────────────────────
+
+/// Map a safetensors view's dtype to our `DataType`, erroring on unsupported.
+fn st_dtype(view: &TensorView) -> OpResult<DataType> {
+    Ok(match view.dtype() {
+        safetensors::Dtype::F32 => DataType::F32,
+        safetensors::Dtype::F16 => DataType::F16,
+        safetensors::Dtype::BF16 => DataType::BF16,
+        safetensors::Dtype::I32 => DataType::I32,
+        safetensors::Dtype::I8 => DataType::I8,
+        other => {
+            return Err(OpError::Kernel(format!(
+                "unsupported safetensor dtype: {:?}",
+                other
+            )));
+        }
+    })
+}
 
 fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
     view: &TensorView,

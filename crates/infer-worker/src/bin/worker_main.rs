@@ -22,6 +22,7 @@ use serde::Deserialize;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 
 use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
+use infer_worker::domain::dtype::quant::QuantScheme;
 use infer_worker::infrastructure::cuda::Cuda;
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
@@ -64,6 +65,38 @@ struct HfConfig {
     rope_scaling: Option<HfRopeScaling>,
     #[serde(default)]
     architectures: Vec<String>,
+    /// compressed-tensors / llm-compressor quantization block. Present only for
+    /// quantized checkpoints; we support int4 `pack-quantized` on the MLP.
+    #[serde(default)]
+    quantization_config: Option<HfQuantConfig>,
+}
+
+/// Subset of the HuggingFace `quantization_config` block we act on. Only the
+/// group size and bit width matter for wiring the `matmul_quant` kernel; the
+/// per-layer `ignore` list (attention, lm_head) is honored implicitly because
+/// the loader only reads packed tensors for the MLP projections.
+#[derive(Debug, Deserialize)]
+struct HfQuantConfig {
+    #[serde(default)]
+    quant_method: Option<String>,
+    #[serde(default)]
+    config_groups: std::collections::HashMap<String, HfQuantGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfQuantGroup {
+    #[serde(default)]
+    weights: Option<HfQuantWeights>,
+    #[serde(default)]
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfQuantWeights {
+    #[serde(default)]
+    num_bits: Option<u32>,
+    #[serde(default)]
+    group_size: Option<usize>,
 }
 
 fn default_max_position() -> usize {
@@ -74,6 +107,39 @@ fn default_rms_eps() -> f32 {
 }
 fn default_rope_theta() -> f64 {
     10000.0
+}
+
+/// Derive the MLP int4 quant scheme from `quantization_config`, or `None` for a
+/// dense model. We enable int4 only when a config group is 4-bit and targets
+/// the MLP `gate/up/down` projections (the shape this build's kernel supports).
+fn derive_mlp_quant(cfg: &HfConfig) -> Option<QuantScheme> {
+    let qc = cfg.quantization_config.as_ref()?;
+    // compressed-tensors is the format llm-compressor emits for W4A16.
+    if qc.quant_method.as_deref() != Some("compressed-tensors") {
+        return None;
+    }
+    for group in qc.config_groups.values() {
+        let w = match &group.weights {
+            Some(w) => w,
+            None => continue,
+        };
+        if w.num_bits != Some(4) {
+            continue;
+        }
+        let targets_mlp = group
+            .targets
+            .iter()
+            .any(|t| t.contains("gate_proj") || t.contains("up_proj") || t.contains("down_proj"));
+        if !targets_mlp {
+            continue;
+        }
+        let mut scheme = QuantScheme::AWQ_INT4_G128;
+        if let Some(g) = w.group_size {
+            scheme.group = g;
+        }
+        return Some(scheme);
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +184,7 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
         rms_norm_eps: cfg.rms_norm_eps,
         rope_theta: cfg.rope_theta,
         rope_scaling,
+        mlp_quant: derive_mlp_quant(cfg),
     }
 }
 
@@ -259,7 +326,7 @@ fn main() -> Result<(), String> {
     let hf_cfg: HfConfig = serde_json::from_slice(&cfg_bytes)
         .map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
     let max_seq_len = load.max_model_len;
-    let load_cfg = build_load_config(&hf_cfg, max_seq_len);
+    let mut load_cfg = build_load_config(&hf_cfg, max_seq_len);
     eprintln!(
         "[bootstrap] arch={} layers={} dim={} heads={}/{} vocab={}",
         hf_cfg.architectures.first().cloned().unwrap_or_default(),
@@ -274,6 +341,26 @@ fn main() -> Result<(), String> {
     let reader = SafetensorsReader::open(st_path).map_err(|e| format!("open weights: {}", e))?;
     let loader = WeightLoader::new(&reader);
     let load_start = Instant::now();
+
+    // Reconcile the config's quant claim with the actual weights: only enable
+    // the int4 MLP path when packed tensors are really present. A mismatch
+    // (quantized config but dense weights, or vice-versa) falls back to dense
+    // rather than failing the load.
+    if let Some(scheme) = load_cfg.mlp_quant {
+        let has_packed = loader.has_tensor("model.layers.0.mlp.gate_proj.weight_packed");
+        if has_packed {
+            eprintln!(
+                "[bootstrap] MLP int4 quant enabled (pack-quantized, group_size={})",
+                scheme.group
+            );
+        } else {
+            eprintln!(
+                "[bootstrap] config declares int4 MLP quant but no weight_packed tensors found; \
+                 loading as dense"
+            );
+            load_cfg.mlp_quant = None;
+        }
+    }
 
     // Model type is derived from the model's config.json, NOT from
     // `load.model_type` (which the scheduler fills for its own logging).
