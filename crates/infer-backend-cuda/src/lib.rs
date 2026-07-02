@@ -207,7 +207,15 @@ impl infer_core::ports::MathOps for Cuda {
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::add::add(scope_stream(scope), a, b, dst)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "add", |F| {
+            kernels::add::add::<F>(
+                stream,
+                &a.reinterpret::<F>(),
+                &b.reinterpret::<F>(),
+                &mut dst.reinterpret::<F>(),
+            )
+        })
     }
 
     fn add_inplace<T: Dtype>(
@@ -216,7 +224,14 @@ impl infer_core::ports::MathOps for Cuda {
         src: &Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::add::add_inplace(scope_stream(scope), dst, src)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "add_inplace", |F| {
+            kernels::add::add_inplace::<F>(
+                stream,
+                &mut dst.reinterpret::<F>(),
+                &src.reinterpret::<F>(),
+            )
+        })
     }
 
     fn ewise_mul<T: Dtype>(
@@ -226,7 +241,15 @@ impl infer_core::ports::MathOps for Cuda {
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::ewise_mul::ewise_mul(scope_stream(scope), a, b, dst)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "ewise_mul", |F| {
+            kernels::ewise_mul::ewise_mul::<F>(
+                stream,
+                &a.reinterpret::<F>(),
+                &b.reinterpret::<F>(),
+                &mut dst.reinterpret::<F>(),
+            )
+        })
     }
 
     fn scalar_mul_inplace<T: Dtype>(
@@ -235,7 +258,10 @@ impl infer_core::ports::MathOps for Cuda {
         scalar: f64,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::scalar::scalar_mul_inplace(scope_stream(scope), x, scalar)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "scalar_mul_inplace", |F| {
+            kernels::scalar::scalar_mul_inplace::<F>(stream, &mut x.reinterpret::<F>(), scalar)
+        })
     }
 
     fn broadcast_mul_inplace<T: Dtype>(
@@ -244,7 +270,14 @@ impl infer_core::ports::MathOps for Cuda {
         scale: &Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::broadcast_mul::broadcast_mul_inplace(scope_stream(scope), x, scale)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "broadcast_mul_inplace", |F| {
+            kernels::broadcast_mul::broadcast_mul_inplace::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                &scale.reinterpret::<F>(),
+            )
+        })
     }
 
     fn broadcast_add_inplace<T: Dtype>(
@@ -253,7 +286,14 @@ impl infer_core::ports::MathOps for Cuda {
         bias: &Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::broadcast_mul::broadcast_add_inplace(scope_stream(scope), x, bias)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "broadcast_add_inplace", |F| {
+            kernels::broadcast_mul::broadcast_add_inplace::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                &bias.reinterpret::<F>(),
+            )
+        })
     }
 
     fn matmul<T: Dtype>(
@@ -295,7 +335,16 @@ impl infer_core::ports::MathOps for Cuda {
         eps: f32,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::rmsnorm::rmsnorm(scope_stream(scope), input, weight, output, eps)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "rmsnorm", |F| {
+            kernels::rmsnorm::rmsnorm::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+                eps,
+            )
+        })
     }
 
     fn rmsnorm_inplace<T: Dtype>(
@@ -305,7 +354,15 @@ impl infer_core::ports::MathOps for Cuda {
         eps: f32,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::rmsnorm::rmsnorm_inplace(scope_stream(scope), x, weight, eps)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "rmsnorm_inplace", |F| {
+            kernels::rmsnorm::rmsnorm_inplace::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                eps,
+            )
+        })
     }
 
     fn silu_inplace<T: Dtype>(
@@ -313,7 +370,10 @@ impl infer_core::ports::MathOps for Cuda {
         x: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::swiglu::silu_inplace(scope_stream(scope), x)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "silu_inplace", |F| {
+            kernels::swiglu::silu_inplace::<F>(stream, &mut x.reinterpret::<F>())
+        })
     }
 
     fn softmax<T: Dtype>(
@@ -322,7 +382,14 @@ impl infer_core::ports::MathOps for Cuda {
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::softmax::softmax(scope_stream(scope), input, output)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "softmax", |F| {
+            kernels::softmax::softmax::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+            )
+        })
     }
 
     fn rope_inplace<T: Dtype>(
@@ -338,18 +405,21 @@ impl infer_core::ports::MathOps for Cuda {
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
         let num_tokens = q.shape().as_slice()[0] as i32;
-        kernels::rope::rope_inplace(
-            scope_stream(scope),
-            q,
-            k,
-            sin,
-            cos,
-            positions.data_ptr(),
-            num_tokens,
-            head_num as i32,
-            kv_head_num as i32,
-            head_dim as i32,
-        )
+        let stream = scope_stream(scope);
+        narrow_float!(T, "rope_inplace", |F| {
+            kernels::rope::rope_inplace::<F>(
+                stream,
+                &mut q.reinterpret::<F>(),
+                &mut k.reinterpret::<F>(),
+                &sin.reinterpret::<F>(),
+                &cos.reinterpret::<F>(),
+                positions.data_ptr(),
+                num_tokens,
+                head_num as i32,
+                kv_head_num as i32,
+                head_dim as i32,
+            )
+        })
     }
 
     fn sdpa<T: Dtype>(
@@ -400,7 +470,15 @@ impl infer_core::ports::MathOps for Cuda {
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::embedding::embedding(scope_stream(scope), table, indices, output)
+        let stream = scope_stream(scope);
+        narrow_float!(T, "embedding", |F| {
+            kernels::embedding::embedding::<F>(
+                stream,
+                &table.reinterpret::<F>(),
+                indices,
+                &mut output.reinterpret::<F>(),
+            )
+        })
     }
 
     fn split_cols<T: Dtype>(
@@ -413,15 +491,18 @@ impl infer_core::ports::MathOps for Cuda {
         dst_cols: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        kernels::split_cols::split_cols(
-            scope_stream(scope),
-            src,
-            dst,
-            rows as i32,
-            total_cols as i32,
-            col_offset as i32,
-            dst_cols as i32,
-        )
+        let stream = scope_stream(scope);
+        narrow_float!(T, "split_cols", |F| {
+            kernels::split_cols::split_cols::<F>(
+                stream,
+                &src.reinterpret::<F>(),
+                &mut dst.reinterpret::<F>(),
+                rows as i32,
+                total_cols as i32,
+                col_offset as i32,
+                dst_cols as i32,
+            )
+        })
     }
 
     fn concat_seq<T: Dtype>(
@@ -458,14 +539,17 @@ impl infer_core::ports::FusedOps for Cuda {
         eps: f32,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
-        kernels::fused_add_rmsnorm::fused_add_rmsnorm(
-            scope_stream(ctx.scope()),
-            output,
-            residual,
-            input,
-            weight,
-            eps,
-        )
+        let stream = scope_stream(ctx.scope());
+        narrow_float!(T, "fused_add_rmsnorm", |F| {
+            kernels::fused_add_rmsnorm::fused_add_rmsnorm::<F>(
+                stream,
+                &mut output.reinterpret::<F>(),
+                &mut residual.reinterpret::<F>(),
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                eps,
+            )
+        })
     }
 
     fn swiglu_packed<T: infer_core::dtype::Dtype>(
@@ -476,7 +560,16 @@ impl infer_core::ports::FusedOps for Cuda {
         inter: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
-        kernels::swiglu::swiglu_packed(scope_stream(ctx.scope()), gate_up, out, rows, inter)
+        let stream = scope_stream(ctx.scope());
+        narrow_float_no_f16!(T, "swiglu_packed", |F| {
+            kernels::swiglu::swiglu_packed::<F>(
+                stream,
+                &gate_up.reinterpret::<F>(),
+                &mut out.reinterpret::<F>(),
+                rows,
+                inter,
+            )
+        })
     }
 
     fn argmax<T: infer_core::dtype::Dtype>(
@@ -631,18 +724,22 @@ impl infer_core::ports::FusedOps for Cuda {
                 )
             }
             (None, None) => {
-                kernels::rope::rope_inplace(
-                    scope_stream(ctx.scope()),
-                    q,
-                    k,
-                    sin,
-                    cos,
-                    positions.data_ptr(),
-                    q.shape().as_slice()[0] as i32,
-                    head_num as i32,
-                    kv_head_num as i32,
-                    head_dim as i32,
-                )?;
+                let num_tokens = q.shape().as_slice()[0] as i32;
+                let stream = scope_stream(ctx.scope());
+                narrow_float!(T, "rope_inplace", |F| {
+                    kernels::rope::rope_inplace::<F>(
+                        stream,
+                        &mut q.reinterpret::<F>(),
+                        &mut k.reinterpret::<F>(),
+                        &sin.reinterpret::<F>(),
+                        &cos.reinterpret::<F>(),
+                        positions.data_ptr(),
+                        num_tokens,
+                        head_num as i32,
+                        kv_head_num as i32,
+                        head_dim as i32,
+                    )
+                })?;
                 kernels::kv_cache::scatter_kv_paged(
                     scope_stream(ctx.scope()),
                     k,
@@ -974,17 +1071,40 @@ impl CoreOps for Cuda {
         b: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::add::add(a.device().config.stream, a, b, dst)
+        let stream = a.device().config.stream;
+        narrow_float!(T, "add", |F| {
+            kernels::add::add::<F>(
+                stream,
+                &a.reinterpret::<F>(),
+                &b.reinterpret::<F>(),
+                &mut dst.reinterpret::<F>(),
+            )
+        })
     }
     fn add_inplace<T: Dtype>(dst: &mut Tensor<T, Self>, src: &Tensor<T, Self>) -> OpResult<()> {
-        kernels::add::add_inplace(dst.device().config.stream, dst, src)
+        let stream = dst.device().config.stream;
+        narrow_float!(T, "add_inplace", |F| {
+            kernels::add::add_inplace::<F>(
+                stream,
+                &mut dst.reinterpret::<F>(),
+                &src.reinterpret::<F>(),
+            )
+        })
     }
     fn ewise_mul<T: Dtype>(
         a: &Tensor<T, Self>,
         b: &Tensor<T, Self>,
         dst: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::ewise_mul::ewise_mul(a.device().config.stream, a, b, dst)
+        let stream = a.device().config.stream;
+        narrow_float!(T, "ewise_mul", |F| {
+            kernels::ewise_mul::ewise_mul::<F>(
+                stream,
+                &a.reinterpret::<F>(),
+                &b.reinterpret::<F>(),
+                &mut dst.reinterpret::<F>(),
+            )
+        })
     }
     fn matmul<T: Dtype>(
         input: &Tensor<T, Self>,
@@ -1012,41 +1132,86 @@ impl CoreOps for Cuda {
         )
     }
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::swiglu::silu_inplace(x.device().config.stream, x)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "silu_inplace", |F| {
+            kernels::swiglu::silu_inplace::<F>(stream, &mut x.reinterpret::<F>())
+        })
     }
     fn softmax<T: Dtype>(input: &Tensor<T, Self>, output: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::softmax::softmax(input.device().config.stream, input, output)
+        let stream = input.device().config.stream;
+        narrow_float!(T, "softmax", |F| {
+            kernels::softmax::softmax::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+            )
+        })
     }
     fn embedding<T: Dtype>(
         table: &Tensor<T, Self>,
         indices: &Tensor<i32, Self>,
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::embedding::embedding(table.device().config.stream, table, indices, output)
+        let stream = table.device().config.stream;
+        narrow_float!(T, "embedding", |F| {
+            kernels::embedding::embedding::<F>(
+                stream,
+                &table.reinterpret::<F>(),
+                indices,
+                &mut output.reinterpret::<F>(),
+            )
+        })
     }
     fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        kernels::scalar::scalar_mul_inplace(x.device().config.stream, x, scalar)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "scalar_mul_inplace", |F| {
+            kernels::scalar::scalar_mul_inplace::<F>(stream, &mut x.reinterpret::<F>(), scalar)
+        })
     }
     fn scalar_add_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
-        kernels::scalar::scalar_add_inplace(x.device().config.stream, x, scalar)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "scalar_add_inplace", |F| {
+            kernels::scalar::scalar_add_inplace::<F>(stream, &mut x.reinterpret::<F>(), scalar)
+        })
     }
     fn scalar_mul_inplace_from_dev<T: Dtype>(
         x: &mut Tensor<T, Self>,
         d_scalar: &Tensor<f32, Self>,
     ) -> OpResult<()> {
-        kernels::scalar::scalar_mul_inplace_from_dev(x.device().config.stream, x, d_scalar)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "scalar_mul_inplace_from_dev", |F| {
+            kernels::scalar::scalar_mul_inplace_from_dev::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                d_scalar,
+            )
+        })
     }
     fn broadcast_mul_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         scale: &Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::broadcast_mul::broadcast_mul_inplace(x.device().config.stream, x, scale)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "broadcast_mul_inplace", |F| {
+            kernels::broadcast_mul::broadcast_mul_inplace::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                &scale.reinterpret::<F>(),
+            )
+        })
     }
     fn broadcast_add_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         bias: &Tensor<T, Self>,
     ) -> OpResult<()> {
-        kernels::broadcast_mul::broadcast_add_inplace(x.device().config.stream, x, bias)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "broadcast_add_inplace", |F| {
+            kernels::broadcast_mul::broadcast_add_inplace::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                &bias.reinterpret::<F>(),
+            )
+        })
     }
     fn split_cols<T: Dtype>(
         src: &Tensor<T, Self>,
@@ -1056,15 +1221,18 @@ impl CoreOps for Cuda {
         col_offset: usize,
         dst_cols: usize,
     ) -> OpResult<()> {
-        kernels::split_cols::split_cols(
-            src.device().config.stream,
-            src,
-            dst,
-            rows as i32,
-            total_cols as i32,
-            col_offset as i32,
-            dst_cols as i32,
-        )
+        let stream = src.device().config.stream;
+        narrow_float!(T, "split_cols", |F| {
+            kernels::split_cols::split_cols::<F>(
+                stream,
+                &src.reinterpret::<F>(),
+                &mut dst.reinterpret::<F>(),
+                rows as i32,
+                total_cols as i32,
+                col_offset as i32,
+                dst_cols as i32,
+            )
+        })
     }
     fn concat_seq<T: Dtype>(
         a: &Tensor<T, Self>,
@@ -1086,14 +1254,31 @@ impl CoreOps for Cuda {
         output: &mut Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::rmsnorm::rmsnorm(input.device().config.stream, input, weight, output, eps)
+        let stream = input.device().config.stream;
+        narrow_float!(T, "rmsnorm", |F| {
+            kernels::rmsnorm::rmsnorm::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+                eps,
+            )
+        })
     }
     fn rmsnorm_inplace<T: Dtype>(
         x: &mut Tensor<T, Self>,
         weight: &Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::rmsnorm::rmsnorm_inplace(x.device().config.stream, x, weight, eps)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "rmsnorm_inplace", |F| {
+            kernels::rmsnorm::rmsnorm_inplace::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                eps,
+            )
+        })
     }
     fn swiglu_packed<T: Dtype>(
         gate_up: &Tensor<T, Self>,
@@ -1101,7 +1286,16 @@ impl CoreOps for Cuda {
         rows: usize,
         inter: usize,
     ) -> OpResult<()> {
-        kernels::swiglu::swiglu_packed(gate_up.device().config.stream, gate_up, out, rows, inter)
+        let stream = gate_up.device().config.stream;
+        narrow_float_no_f16!(T, "swiglu_packed", |F| {
+            kernels::swiglu::swiglu_packed::<F>(
+                stream,
+                &gate_up.reinterpret::<F>(),
+                &mut out.reinterpret::<F>(),
+                rows,
+                inter,
+            )
+        })
     }
     fn rope_inplace<T: Dtype>(
         q: &mut Tensor<T, Self>,
@@ -1114,18 +1308,21 @@ impl CoreOps for Cuda {
         head_dim: usize,
     ) -> OpResult<()> {
         let num_tokens = q.shape().as_slice()[0] as i32;
-        kernels::rope::rope_inplace(
-            q.device().config.stream,
-            q,
-            k,
-            sin,
-            cos,
-            positions.data_ptr(),
-            num_tokens,
-            head_num as i32,
-            kv_head_num as i32,
-            head_dim as i32,
-        )
+        let stream = q.device().config.stream;
+        narrow_float!(T, "rope_inplace", |F| {
+            kernels::rope::rope_inplace::<F>(
+                stream,
+                &mut q.reinterpret::<F>(),
+                &mut k.reinterpret::<F>(),
+                &sin.reinterpret::<F>(),
+                &cos.reinterpret::<F>(),
+                positions.data_ptr(),
+                num_tokens,
+                head_num as i32,
+                kv_head_num as i32,
+                head_dim as i32,
+            )
+        })
     }
 }
 
@@ -1195,14 +1392,17 @@ impl DiffusionOps for Cuda {
         output: &mut Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
-        kernels::layernorm::layernorm(
-            input.device().config.stream,
-            input,
-            weight,
-            bias,
-            output,
-            eps,
-        )
+        let stream = input.device().config.stream;
+        narrow_float!(T, "layernorm", |F| {
+            kernels::layernorm::layernorm::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                &bias.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+                eps,
+            )
+        })
     }
 
     fn upsample_nearest_2x<T: Dtype>(
@@ -1266,13 +1466,16 @@ impl DiffusionOps for Cuda {
         sin: &Tensor<f32, Self>,
         head_dim: usize,
     ) -> OpResult<()> {
-        kernels::rope_interleaved::apply_rope_interleaved(
-            x.device().config.stream,
-            x,
-            cos,
-            sin,
-            head_dim,
-        )
+        let stream = x.device().config.stream;
+        narrow_float_no_f16!(T, "apply_rope_interleaved", |F| {
+            kernels::rope_interleaved::apply_rope_interleaved::<F>(
+                stream,
+                &mut x.reinterpret::<F>(),
+                cos,
+                sin,
+                head_dim,
+            )
+        })
     }
 
     fn pad_with_token<T: Dtype>(
@@ -1301,10 +1504,16 @@ impl DiffusionOps for Cuda {
     }
 
     fn silu_inplace_diff<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::scalar::silu_inplace(x.device().config.stream, x)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "silu_inplace", |F| {
+            kernels::scalar::silu_inplace::<F>(stream, &mut x.reinterpret::<F>())
+        })
     }
 
     fn tanh_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
-        kernels::scalar::tanh_inplace(x.device().config.stream, x)
+        let stream = x.device().config.stream;
+        narrow_float!(T, "tanh_inplace", |F| {
+            kernels::scalar::tanh_inplace::<F>(stream, &mut x.reinterpret::<F>())
+        })
     }
 }

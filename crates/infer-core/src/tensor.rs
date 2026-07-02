@@ -326,6 +326,35 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         T::DATA_TYPE
     }
 
+    /// Reinterpret this tensor's element type as `U` **without touching memory**,
+    /// for backends that must narrow a generic `T` to a concrete dtype at a
+    /// dispatch boundary (e.g. `MathOps for Cuda` selecting the `f32`/`bf16`/
+    /// `f16` kernel). `T` and `U` must have identical storage layout — enforced
+    /// here by requiring equal `DATA_TYPE` and `SIZE_BYTES`; a mismatch is a
+    /// programmer error and panics rather than silently reinterpreting bytes.
+    ///
+    /// Zero-cost: this only rewrites the `PhantomData<T>` tag; the `Arc`,
+    /// shape, strides, and offset are copied verbatim (an `Arc` refcount bump).
+    #[inline]
+    pub fn reinterpret<U: Dtype>(&self) -> Tensor<U, D> {
+        assert_eq!(
+            (T::DATA_TYPE, T::SIZE_BYTES),
+            (U::DATA_TYPE, U::SIZE_BYTES),
+            "Tensor::reinterpret: layout mismatch {:?} -> {:?}",
+            T::DATA_TYPE,
+            U::DATA_TYPE,
+        );
+        Tensor {
+            storage: Arc::clone(&self.storage),
+            shape: self.shape,
+            strides: self.strides,
+            offset_elems: self.offset_elems,
+            numel: self.numel,
+            is_contiguous: self.is_contiguous,
+            _marker: PhantomData,
+        }
+    }
+
     /// Overwrite the tensor's contents with `data` (host → device upload).
     ///
     /// `data.len()` must equal `self.numel()`. The tensor must be contiguous.

@@ -14,6 +14,7 @@
 
 use crate::Cuda;
 use crate::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t};
+use crate::narrow_float_no_f16;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype, Shape};
@@ -256,7 +257,7 @@ pub fn sdpa<T: Dtype>(
     };
 
     // ── 4. scores = Q @ K^T, shape [H, S, S].
-    let mut scores: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
+    let scores: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
     let stride_qkv = (seq * head_dim) as i64;
     let stride_scores = (seq * seq) as i64;
     unsafe {
@@ -291,10 +292,18 @@ pub fn sdpa<T: Dtype>(
         }
     }
 
-    // ── 5. Scale + softmax (over last axis).
-    super::scalar::scalar_mul_inplace(stream, &mut scores, scale as f64)?;
-    let mut attn: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
-    super::softmax::softmax(stream, &scores, &mut attn)?;
+    // ── 5. Scale + softmax (over last axis). `sdpa` supports only F32/BF16
+    // (guarded above), so narrow to the concrete float for the elementwise
+    // helpers, which are generic over their per-kernel binding traits.
+    let attn: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
+    narrow_float_no_f16!(T, "sdpa scale+softmax", |F| {
+        super::scalar::scalar_mul_inplace::<F>(
+            stream,
+            &mut scores.reinterpret::<F>(),
+            scale as f64,
+        )?;
+        super::softmax::softmax::<F>(stream, &scores.reinterpret::<F>(), &mut attn.reinterpret::<F>())
+    })?;
 
     // ── 6. out_hsd = attn[H,S,S] @ V[H,S,D].
     //   We want axb(attn, V) → [H, S, D], but axb has subtle row/col-major
@@ -505,7 +514,7 @@ pub fn sdpa_masked<T: Dtype>(
     };
 
     // scores = Q @ K^T  [H, S, S]
-    let mut scores: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
+    let scores: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
     let stride_qkv = (seq * head_dim) as i64;
     let stride_scores = (seq * seq) as i64;
     unsafe {
@@ -540,13 +549,24 @@ pub fn sdpa_masked<T: Dtype>(
         }
     }
 
-    // Scale, then add mask (broadcast across heads), then softmax.
-    super::scalar::scalar_mul_inplace(stream, &mut scores, scale as f64)?;
-    // scores is [H, S, S] viewed as [H, S*S] with bias [S*S]. Use the
-    // existing broadcast_add_inplace which adds bias[j] to x[i, j].
-    super::broadcast_mul::broadcast_add_inplace(stream, &mut scores, mask)?;
-    let mut attn: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
-    super::softmax::softmax(stream, &scores, &mut attn)?;
+    // Scale, then add mask (broadcast across heads), then softmax. F32/BF16
+    // only (guarded above); narrow to the concrete float for the helpers.
+    // scores is [H, S, S] viewed as [H, S*S] with bias [S*S]: broadcast_add
+    // adds bias[j] to x[i, j].
+    let attn: Tensor<T, Cuda> = Tensor::zeros([num_heads, seq, seq], &dev)?;
+    narrow_float_no_f16!(T, "sdpa_masked scale+mask+softmax", |F| {
+        super::scalar::scalar_mul_inplace::<F>(
+            stream,
+            &mut scores.reinterpret::<F>(),
+            scale as f64,
+        )?;
+        super::broadcast_mul::broadcast_add_inplace::<F>(
+            stream,
+            &mut scores.reinterpret::<F>(),
+            &mask.reinterpret::<F>(),
+        )?;
+        super::softmax::softmax::<F>(stream, &scores.reinterpret::<F>(), &mut attn.reinterpret::<F>())
+    })?;
 
     // out = attn @ V (via V permute to [H, D, S] + axbt)
     let v_hds: Tensor<T, Cuda> = Tensor::zeros([num_heads, head_dim, seq], &dev)?;

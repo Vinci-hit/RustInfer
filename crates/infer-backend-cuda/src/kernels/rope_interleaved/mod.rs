@@ -6,12 +6,17 @@
 //!   `x'[2k+1] = x[2k] * sin + x[2k+1] * cos`
 //!
 //! `cos` / `sin` are F32 caches of shape `[seq, head_dim/2]`.
+//!
+//! Dispatch is an attribute of the element type: [`RopeInterleavedKernel`] is
+//! implemented once per supported dtype and names that dtype's `extern "C"`
+//! entry point, so [`apply_rope_interleaved`] is generic with no runtime
+//! `match`. Adding a dtype is one `impl`; an unsupported dtype fails to compile.
 
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
+use crate::kernels::dtype_kernel::CudaFloat;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
     fn rope_interleaved_f32_forward(
@@ -34,9 +39,63 @@ unsafe extern "C" {
     );
 }
 
+/// Element types with an interleaved-RoPE CUDA kernel. The method forwards to
+/// this dtype's `extern` entry; the wrapper below is generic over this trait, so
+/// the dtype→kernel mapping lives here as a type attribute. `cos`/`sin` are
+/// always F32 caches regardless of `Self`.
+///
+/// Only `f32` and `bf16` have a device kernel (there is no f16 variant).
+///
+/// # Safety
+/// Implementors' pointers must be valid device pointers for the given
+/// seq/head layout on `stream`; this just names the FFI entry and performs no
+/// checks.
+pub trait RopeInterleavedKernel: CudaFloat {
+    /// Apply interleaved RoPE in-place to `x` of shape `[seq, n_heads, head_dim]`.
+    unsafe fn rope_interleaved(
+        x: *mut Self,
+        cos: *const f32,
+        sin: *const f32,
+        seq: i32,
+        n_heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    );
+}
+
+impl RopeInterleavedKernel for f32 {
+    #[inline]
+    unsafe fn rope_interleaved(
+        x: *mut Self,
+        cos: *const f32,
+        sin: *const f32,
+        seq: i32,
+        n_heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe { rope_interleaved_f32_forward(x, cos, sin, seq, n_heads, head_dim, stream) }
+    }
+}
+
+impl RopeInterleavedKernel for half::bf16 {
+    #[inline]
+    unsafe fn rope_interleaved(
+        x: *mut Self,
+        cos: *const f32,
+        sin: *const f32,
+        seq: i32,
+        n_heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe { rope_interleaved_bf16_forward(x, cos, sin, seq, n_heads, head_dim, stream) }
+    }
+}
+
 /// Apply interleaved RoPE in-place to `x` of shape `[seq, n_heads, head_dim]`.
 /// `cos` / `sin` are `[seq, head_dim/2]`, both F32.
-pub fn apply_rope_interleaved<T: Dtype>(
+pub fn apply_rope_interleaved<T: RopeInterleavedKernel>(
     stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     cos: &Tensor<f32, Cuda>,
@@ -73,32 +132,15 @@ pub fn apply_rope_interleaved<T: Dtype>(
         )));
     }
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => rope_interleaved_f32_forward(
-                x.data_ptr_mut() as *mut f32,
-                cos.data_ptr() as *const f32,
-                sin.data_ptr() as *const f32,
-                seq as i32,
-                n_heads as i32,
-                head_dim as i32,
-                stream,
-            ),
-            DataType::BF16 => rope_interleaved_bf16_forward(
-                x.data_ptr_mut() as *mut half::bf16,
-                cos.data_ptr() as *const f32,
-                sin.data_ptr() as *const f32,
-                seq as i32,
-                n_heads as i32,
-                head_dim as i32,
-                stream,
-            ),
-            _ => {
-                return Err(OpError::Kernel(format!(
-                    "apply_rope_interleaved: unsupported dtype {:?}",
-                    T::DATA_TYPE,
-                )));
-            }
-        }
+        T::rope_interleaved(
+            x.data_ptr_mut(),
+            cos.data_ptr(),
+            sin.data_ptr(),
+            seq as i32,
+            n_heads as i32,
+            head_dim as i32,
+            stream,
+        );
     }
     Ok(())
 }

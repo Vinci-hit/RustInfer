@@ -1,11 +1,16 @@
 //! Scalar ops CUDA kernel wrappers (scalar mul/add, silu/tanh, device-scalar variants).
+//!
+//! Dispatch is an attribute of the element type: [`ScalarKernel`] is
+//! implemented once per supported dtype and names that dtype's `extern "C"`
+//! entry points, so the wrappers below are generic with no runtime `match`.
+//! Adding a dtype is one `impl`; an unsupported dtype fails to compile.
 
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
+use crate::kernels::dtype_kernel::CudaFloat;
 use half::{bf16, f16};
-use infer_core::ports::{OpError, OpResult};
+use infer_core::ports::OpResult;
 use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
     // dst = src * val
@@ -81,9 +86,132 @@ unsafe extern "C" {
     );
 }
 
+/// Element types with the scalar-op CUDA kernels. Each method forwards to this
+/// dtype's `extern` entry; the wrappers below are generic over this trait, so
+/// the dtype→kernel mapping lives here as a type attribute.
+///
+/// # Safety
+/// Implementors' pointers must be valid device pointers for `n` elements on
+/// `stream` (and `d_val` a valid `[1] f32` device pointer for
+/// [`scalar_mul_inplace_from_dev`]); this just names the FFI entries and
+/// performs no checks.
+pub trait ScalarKernel: CudaFloat {
+    /// `dst = src * val`, elementwise over `n` elements.
+    unsafe fn scalar_mul(
+        dst: *mut Self,
+        src: *const Self,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    /// `dst = src + val`, elementwise over `n` elements.
+    unsafe fn scalar_add(
+        dst: *mut Self,
+        src: *const Self,
+        val: f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+    /// `data = silu(data)`, in place over `n` elements.
+    unsafe fn silu_inplace(data: *mut Self, n: i32, stream: cudaStream_t);
+    /// `data = tanh(data)`, in place over `n` elements.
+    unsafe fn tanh_inplace(data: *mut Self, n: i32, stream: cudaStream_t);
+    /// `x *= *d_val`, reading the scalar from device memory at replay time.
+    unsafe fn scalar_mul_inplace_from_dev(
+        x: *mut Self,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    );
+}
+
+impl ScalarKernel for f32 {
+    #[inline]
+    unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
+        unsafe { scalar_mul_f32_forward(dst, src, val, n, stream) }
+    }
+    #[inline]
+    unsafe fn scalar_add(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
+        unsafe { scalar_add_f32_forward(dst, src, val, n, stream) }
+    }
+    #[inline]
+    unsafe fn silu_inplace(data: *mut Self, n: i32, stream: cudaStream_t) {
+        unsafe { silu_inplace_f32_forward(data, n, stream) }
+    }
+    #[inline]
+    unsafe fn tanh_inplace(data: *mut Self, n: i32, stream: cudaStream_t) {
+        unsafe { tanh_inplace_f32_forward(data, n, stream) }
+    }
+    #[inline]
+    unsafe fn scalar_mul_inplace_from_dev(
+        x: *mut Self,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe { scalar_mul_inplace_from_dev_f32_forward(x, d_val, n, stream) }
+    }
+}
+
+impl ScalarKernel for bf16 {
+    #[inline]
+    unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
+        unsafe { scalar_mul_bf16_forward(dst, src, val, n, stream) }
+    }
+    #[inline]
+    unsafe fn scalar_add(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
+        unsafe { scalar_add_bf16_forward(dst, src, val, n, stream) }
+    }
+    #[inline]
+    unsafe fn silu_inplace(data: *mut Self, n: i32, stream: cudaStream_t) {
+        unsafe { silu_inplace_bf16_forward(data, n, stream) }
+    }
+    #[inline]
+    unsafe fn tanh_inplace(data: *mut Self, n: i32, stream: cudaStream_t) {
+        unsafe { tanh_inplace_bf16_forward(data, n, stream) }
+    }
+    #[inline]
+    unsafe fn scalar_mul_inplace_from_dev(
+        x: *mut Self,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe { scalar_mul_inplace_from_dev_bf16_forward(x, d_val, n, stream) }
+    }
+}
+
+impl ScalarKernel for f16 {
+    #[inline]
+    unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
+        unsafe { scalar_mul_f16_forward(dst, src, val, n, stream) }
+    }
+    #[inline]
+    unsafe fn scalar_add(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
+        unsafe { scalar_add_f16_forward(dst, src, val, n, stream) }
+    }
+    #[inline]
+    unsafe fn silu_inplace(data: *mut Self, n: i32, stream: cudaStream_t) {
+        unsafe { silu_inplace_f16_forward(data, n, stream) }
+    }
+    #[inline]
+    unsafe fn tanh_inplace(data: *mut Self, n: i32, stream: cudaStream_t) {
+        unsafe { tanh_inplace_f16_forward(data, n, stream) }
+    }
+    #[inline]
+    unsafe fn scalar_mul_inplace_from_dev(
+        x: *mut Self,
+        d_val: *const f32,
+        n: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe { scalar_mul_inplace_from_dev_f16_forward(x, d_val, n, stream) }
+    }
+}
+
 /// In-place scalar multiply: `x *= val`. Implemented as `dst=src,val` with
 /// `dst == src` aliased to the same buffer.
-pub fn scalar_mul_inplace<T: Dtype>(
+pub fn scalar_mul_inplace<T: ScalarKernel>(
     stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     scalar: f64,
@@ -92,23 +220,13 @@ pub fn scalar_mul_inplace<T: Dtype>(
     let val = scalar as f32;
     let p = x.data_ptr_mut();
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => scalar_mul_f32_forward(p as _, p as _, val, n, stream),
-            DataType::BF16 => scalar_mul_bf16_forward(p as _, p as _, val, n, stream),
-            DataType::F16 => scalar_mul_f16_forward(p as _, p as _, val, n, stream),
-            _ => {
-                return Err(OpError::Kernel(format!(
-                    "scalar_mul_inplace: {:?}",
-                    T::DATA_TYPE
-                )));
-            }
-        }
+        T::scalar_mul(p, p, val, n, stream);
     }
     Ok(())
 }
 
 /// In-place scalar add: `x += val`.
-pub fn scalar_add_inplace<T: Dtype>(
+pub fn scalar_add_inplace<T: ScalarKernel>(
     stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     scalar: f64,
@@ -117,47 +235,27 @@ pub fn scalar_add_inplace<T: Dtype>(
     let val = scalar as f32;
     let p = x.data_ptr_mut();
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => scalar_add_f32_forward(p as _, p as _, val, n, stream),
-            DataType::BF16 => scalar_add_bf16_forward(p as _, p as _, val, n, stream),
-            DataType::F16 => scalar_add_f16_forward(p as _, p as _, val, n, stream),
-            _ => {
-                return Err(OpError::Kernel(format!(
-                    "scalar_add_inplace: {:?}",
-                    T::DATA_TYPE
-                )));
-            }
-        }
+        T::scalar_add(p, p, val, n, stream);
     }
     Ok(())
 }
 
 /// In-place SiLU activation: `x = x * sigmoid(x)`.
-pub fn silu_inplace<T: Dtype>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn silu_inplace<T: ScalarKernel>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
     let n = x.numel() as i32;
     let p = x.data_ptr_mut();
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => silu_inplace_f32_forward(p as _, n, stream),
-            DataType::BF16 => silu_inplace_bf16_forward(p as _, n, stream),
-            DataType::F16 => silu_inplace_f16_forward(p as _, n, stream),
-            _ => return Err(OpError::Kernel(format!("silu_inplace: {:?}", T::DATA_TYPE))),
-        }
+        T::silu_inplace(p, n, stream);
     }
     Ok(())
 }
 
 /// In-place tanh activation.
-pub fn tanh_inplace<T: Dtype>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn tanh_inplace<T: ScalarKernel>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
     let n = x.numel() as i32;
     let p = x.data_ptr_mut();
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => tanh_inplace_f32_forward(p as _, n, stream),
-            DataType::BF16 => tanh_inplace_bf16_forward(p as _, n, stream),
-            DataType::F16 => tanh_inplace_f16_forward(p as _, n, stream),
-            _ => return Err(OpError::Kernel(format!("tanh_inplace: {:?}", T::DATA_TYPE))),
-        }
+        T::tanh_inplace(p, n, stream);
     }
     Ok(())
 }
@@ -165,7 +263,7 @@ pub fn tanh_inplace<T: Dtype>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> 
 /// CUDA-Graph-friendly scalar mul: scalar lives in device memory at `d_val`
 /// (an `[1] f32` tensor). Reads the byte at replay time, so the host can
 /// rewrite the byte between graph launches without re-capturing.
-pub fn scalar_mul_inplace_from_dev<T: Dtype>(
+pub fn scalar_mul_inplace_from_dev<T: ScalarKernel>(
     stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     d_val: &Tensor<f32, Cuda>,
@@ -174,17 +272,7 @@ pub fn scalar_mul_inplace_from_dev<T: Dtype>(
     let p = x.data_ptr_mut();
     let dv = d_val.data_ptr();
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => scalar_mul_inplace_from_dev_f32_forward(p as _, dv, n, stream),
-            DataType::BF16 => scalar_mul_inplace_from_dev_bf16_forward(p as _, dv, n, stream),
-            DataType::F16 => scalar_mul_inplace_from_dev_f16_forward(p as _, dv, n, stream),
-            _ => {
-                return Err(OpError::Kernel(format!(
-                    "scalar_mul_inplace_from_dev: {:?}",
-                    T::DATA_TYPE
-                )));
-            }
-        }
+        T::scalar_mul_inplace_from_dev(p, dv, n, stream);
     }
     Ok(())
 }

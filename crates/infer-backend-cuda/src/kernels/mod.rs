@@ -1,6 +1,11 @@
 //! CUDA kernel wrappers — paged KV path only.
 //! Each kernel co-located with its `.cu`/`.h` source in its own dir.
 
+// Zero-cost dtype dispatch: per-kernel binding traits (`CudaFloat` supertrait)
+// plus the single `narrow_float!` narrowing point used at the `MathOps for
+// Cuda` boundary. See `dtype_kernel.rs`.
+pub mod dtype_kernel;
+
 // --- kernels with a co-located mod.rs in their dir ---
 pub mod add;
 pub mod broadcast_mul;

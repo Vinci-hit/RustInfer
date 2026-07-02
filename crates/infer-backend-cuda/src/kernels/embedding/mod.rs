@@ -1,10 +1,15 @@
 //! Embedding CUDA kernel wrapper.
+//!
+//! Dispatch is an attribute of the element type: [`EmbeddingKernel`] is
+//! implemented once per supported dtype and names that dtype's `extern "C"`
+//! entry point, so [`embedding`] is generic with no runtime `match`. Adding a
+//! dtype is one `impl`; an unsupported dtype fails to compile.
 
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
-use infer_core::ports::{OpError, OpResult};
+use crate::kernels::dtype_kernel::CudaFloat;
+use infer_core::ports::OpResult;
 use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
     fn embedding_kernel_cu_bf16x8(
@@ -36,7 +41,80 @@ unsafe extern "C" {
     );
 }
 
-pub fn embedding<T: Dtype>(
+/// Element types with an embedding-gather CUDA kernel. The method forwards to
+/// this dtype's `extern` entry; the wrapper below is generic over this trait, so
+/// the dtype→kernel mapping lives here as a type attribute. Indices are always
+/// `i32` regardless of `Self`.
+///
+/// # Safety
+/// Implementors' pointers must be valid device pointers for the given
+/// vocab/dim/token layout on `stream`; this just names the FFI entry and
+/// performs no checks.
+pub trait EmbeddingKernel: CudaFloat {
+    /// Gather rows of `table` selected by `indices` into `output`.
+    unsafe fn embedding(
+        output: *mut Self,
+        indices: *const i32,
+        table: *const Self,
+        token_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: cudaStream_t,
+    );
+}
+
+impl EmbeddingKernel for f32 {
+    #[inline]
+    unsafe fn embedding(
+        output: *mut Self,
+        indices: *const i32,
+        table: *const Self,
+        token_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            embedding_kernel_cu_fp32x4(output, indices, table, token_len, dim, vocab_size, stream)
+        }
+    }
+}
+
+impl EmbeddingKernel for half::bf16 {
+    #[inline]
+    unsafe fn embedding(
+        output: *mut Self,
+        indices: *const i32,
+        table: *const Self,
+        token_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            embedding_kernel_cu_bf16x8(output, indices, table, token_len, dim, vocab_size, stream)
+        }
+    }
+}
+
+impl EmbeddingKernel for half::f16 {
+    #[inline]
+    unsafe fn embedding(
+        output: *mut Self,
+        indices: *const i32,
+        table: *const Self,
+        token_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            embedding_kernel_cu_fp16x8(output, indices, table, token_len, dim, vocab_size, stream)
+        }
+    }
+}
+
+pub fn embedding<T: EmbeddingKernel>(
     stream: cudaStream_t,
     table: &Tensor<T, Cuda>,
     indices: &Tensor<i32, Cuda>,
@@ -47,36 +125,15 @@ pub fn embedding<T: Dtype>(
     let dim = table_shape[1] as i32;
     let seq_len = indices.numel() as i32;
     unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => embedding_kernel_cu_fp32x4(
-                output.data_ptr_mut() as _,
-                indices.data_ptr(),
-                table.data_ptr() as _,
-                seq_len,
-                dim,
-                vocab,
-                stream,
-            ),
-            DataType::BF16 => embedding_kernel_cu_bf16x8(
-                output.data_ptr_mut() as _,
-                indices.data_ptr(),
-                table.data_ptr() as _,
-                seq_len,
-                dim,
-                vocab,
-                stream,
-            ),
-            DataType::F16 => embedding_kernel_cu_fp16x8(
-                output.data_ptr_mut() as _,
-                indices.data_ptr(),
-                table.data_ptr() as _,
-                seq_len,
-                dim,
-                vocab,
-                stream,
-            ),
-            _ => return Err(OpError::Kernel(format!("embedding: {:?}", T::DATA_TYPE))),
-        }
+        T::embedding(
+            output.data_ptr_mut(),
+            indices.data_ptr(),
+            table.data_ptr(),
+            seq_len,
+            dim,
+            vocab,
+            stream,
+        );
     }
     Ok(())
 }

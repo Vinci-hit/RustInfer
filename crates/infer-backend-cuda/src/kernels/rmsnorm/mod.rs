@@ -1,10 +1,16 @@
-//! RMSNorm CUDA kernel wrapper — generic over T: Float.
+//! RMSNorm CUDA kernel wrapper.
+//!
+//! Dispatch is an attribute of the element type: [`RmsNormKernel`] is
+//! implemented once per supported dtype and names that dtype's `extern "C"`
+//! entry point, so [`rmsnorm`]/[`rmsnorm_inplace`] are generic with no runtime
+//! `match`. Adding a dtype is one `impl`; an unsupported dtype fails to compile.
 
 use crate::Cuda;
 use crate::ffi::cudaStream_t;
+use crate::kernels::dtype_kernel::CudaFloat;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype};
+use infer_core::types::Dtype;
 
 // ─── C kernel declarations ───────────────────────────────────────────────────
 
@@ -53,10 +59,92 @@ unsafe extern "C" {
     );
 }
 
+// ─── Binding trait ───────────────────────────────────────────────────────────
+
+/// Element types with an RMSNorm CUDA kernel. The method forwards to this
+/// dtype's `extern` entry; the wrappers below are generic over this trait, so
+/// the dtype→kernel mapping lives here as a type attribute.
+///
+/// # Safety
+/// Implementors' pointers must be valid device pointers matching the layouts on
+/// `stream`; this just names the FFI entry and performs no checks.
+pub trait RmsNormKernel: CudaFloat {
+    /// `out = rmsnorm(inp, w, eps)` over the given input/output layouts.
+    unsafe fn rmsnorm(
+        out: *mut Self,
+        inp: *const Self,
+        w: *const Self,
+        il: Layout,
+        ol: Layout,
+        eps: f32,
+        stream: cudaStream_t,
+    );
+}
+
+impl RmsNormKernel for f32 {
+    #[inline]
+    unsafe fn rmsnorm(
+        out: *mut Self,
+        inp: *const Self,
+        w: *const Self,
+        il: Layout,
+        ol: Layout,
+        eps: f32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            rmsnorm_kernel_cu_dim(
+                out, inp, w, il.outer0, il.outer1, il.dim, il.stride0, il.stride1, ol.stride0,
+                ol.stride1, eps, stream,
+            )
+        }
+    }
+}
+
+impl RmsNormKernel for half::bf16 {
+    #[inline]
+    unsafe fn rmsnorm(
+        out: *mut Self,
+        inp: *const Self,
+        w: *const Self,
+        il: Layout,
+        ol: Layout,
+        eps: f32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            rmsnorm_kernel_cu_bf16x8(
+                out, inp, w, il.outer0, il.outer1, il.dim, il.stride0, il.stride1, ol.stride0,
+                ol.stride1, eps, stream,
+            )
+        }
+    }
+}
+
+impl RmsNormKernel for half::f16 {
+    #[inline]
+    unsafe fn rmsnorm(
+        out: *mut Self,
+        inp: *const Self,
+        w: *const Self,
+        il: Layout,
+        ol: Layout,
+        eps: f32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            rmsnorm_kernel_cu_fp16x8(
+                out, inp, w, il.outer0, il.outer1, il.dim, il.stride0, il.stride1, ol.stride0,
+                ol.stride1, eps, stream,
+            )
+        }
+    }
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// `output = rmsnorm(input, weight, eps)` on CUDA.
-pub fn rmsnorm<T: Dtype>(
+pub fn rmsnorm<T: RmsNormKernel>(
     stream: cudaStream_t,
     input: &Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
@@ -68,20 +156,21 @@ pub fn rmsnorm<T: Dtype>(
     let out_layout = derive_layout(output, dim)?;
 
     unsafe {
-        dispatch::<T>(
-            output.data_ptr_mut() as *mut _,
-            input.data_ptr() as *const _,
-            weight.data_ptr() as *const _,
+        T::rmsnorm(
+            output.data_ptr_mut(),
+            input.data_ptr(),
+            weight.data_ptr(),
             in_layout,
             out_layout,
             eps,
             stream,
         )
     }
+    Ok(())
 }
 
 /// In-place: `x = rmsnorm(x, weight, eps)`.
-pub fn rmsnorm_inplace<T: Dtype>(
+pub fn rmsnorm_inplace<T: RmsNormKernel>(
     stream: cudaStream_t,
     x: &mut Tensor<T, Cuda>,
     weight: &Tensor<T, Cuda>,
@@ -92,22 +181,23 @@ pub fn rmsnorm_inplace<T: Dtype>(
     let ptr = x.data_ptr_mut();
 
     unsafe {
-        dispatch::<T>(
-            ptr as *mut _,
+        T::rmsnorm(
+            ptr,
             ptr as *const _,
-            weight.data_ptr() as *const _,
+            weight.data_ptr(),
             layout,
             layout,
             eps,
             stream,
         )
     }
+    Ok(())
 }
 
 // ─── Internal ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-struct Layout {
+pub struct Layout {
     outer0: i32,
     outer1: i32,
     dim: i32,
@@ -155,38 +245,4 @@ fn derive_layout<T: Dtype, D: infer_core::ports::MemoryPort>(
             "rmsnorm: unsupported rank for strided input".into(),
         )),
     }
-}
-
-unsafe fn dispatch<T: Dtype>(
-    out: *mut std::ffi::c_void,
-    inp: *const std::ffi::c_void,
-    w: *const std::ffi::c_void,
-    il: Layout,
-    ol: Layout,
-    eps: f32,
-    stream: cudaStream_t,
-) -> OpResult<()> {
-    unsafe {
-        match T::DATA_TYPE {
-            DataType::F32 => rmsnorm_kernel_cu_dim(
-                out as _, inp as _, w as _, il.outer0, il.outer1, il.dim, il.stride0, il.stride1,
-                ol.stride0, ol.stride1, eps, stream,
-            ),
-            DataType::BF16 => rmsnorm_kernel_cu_bf16x8(
-                out as _, inp as _, w as _, il.outer0, il.outer1, il.dim, il.stride0, il.stride1,
-                ol.stride0, ol.stride1, eps, stream,
-            ),
-            DataType::F16 => rmsnorm_kernel_cu_fp16x8(
-                out as _, inp as _, w as _, il.outer0, il.outer1, il.dim, il.stride0, il.stride1,
-                ol.stride0, ol.stride1, eps, stream,
-            ),
-            _ => {
-                return Err(OpError::Kernel(format!(
-                    "rmsnorm: unsupported dtype {:?}",
-                    T::DATA_TYPE
-                )));
-            }
-        }
-    }
-    Ok(())
 }
