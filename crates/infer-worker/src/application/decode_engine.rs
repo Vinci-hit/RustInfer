@@ -149,33 +149,38 @@ impl DecodeEngine {
         self.rows.retain_active(active);
     }
 
-    /// Finalize the in-flight ABC decode step (if any) and send its output.
-    /// Used before a fused (prefill+decode) step so the prior step's tokens are
-    /// committed and the copy-out is synced — the fused eager forward then can't
-    /// race buffer A. Does NOT issue a new step.
-    pub(crate) fn finalize_and_send<M>(
+    /// Issue a new decode step (leaving it pending for the next `run_step` to
+    /// finalize) if nothing is in flight and there are active rows. Called at
+    /// the tail of a fused step so the next decode's GPU compute overlaps the
+    /// fused step's host tail (scheduler send + serve-loop turnaround), and so
+    /// the pipeline resumes 1-deep instead of paying the cold-start 0-deep
+    /// restart on the next `run_step`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue_if_idle<M>(
         &mut self,
         runner: &mut Runtime<bf16, Cuda, M>,
         active: &mut ActiveSeqMap,
+        prefilling: &mut PrefillSeqMap,
         kv_allocator: &mut GlobalKvAllocator,
         control: &ControlPump,
-        data: &DataPump,
+        eos_ids: &[i32],
         enable_prefix_caching: bool,
     ) -> OpResult<()>
     where
         M: DecoderModel<bf16, Cuda>,
     {
-        if let Some(output) =
-            self.finalize_pending(runner, active, kv_allocator, control, enable_prefix_caching)?
-        {
-            data.send_step_output(&output).map_err(|e| {
-                OpError::Kernel(format!(
-                    "data plane send_step_output (fused finalize) failed: {}",
-                    e
-                ))
-            })?;
+        if self.pending.is_some() || active.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.issue_new(
+            runner,
+            active,
+            prefilling,
+            kv_allocator,
+            control,
+            eos_ids,
+            enable_prefix_caching,
+        )
     }
 
     /// Prepare the current decode rows for a fused step: materialize the row
@@ -443,7 +448,10 @@ impl DecodeEngine {
     }
 
     /// Collect + commit the in-flight step. Returns its `StepOutput` to send.
-    fn finalize_pending<M>(
+    /// Also used by the fused path to drain the pipeline before a mixed
+    /// forward (the caller defers the send until the fused step is issued, so
+    /// the ZMQ send overlaps GPU compute).
+    pub(crate) fn finalize_pending<M>(
         &mut self,
         runner: &mut Runtime<bf16, Cuda, M>,
         active: &mut ActiveSeqMap,

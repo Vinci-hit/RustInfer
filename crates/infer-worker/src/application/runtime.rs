@@ -1595,17 +1595,22 @@ where
         result
     }
 
-    /// Mixed/ragged forward through the ABC data model.
+    /// Mixed/ragged forward through the ABC data model — issue half.
     ///
     /// Hot path: an exact-shape mixed CUDA graph captures forward + finalize +
     /// selected-row argmax + mixed merge + optional next-control compact. Eager
     /// remains the fallback and keeps the same flat-token ABC contract.
-    pub fn step_fused_abc_eager(
+    ///
+    /// Launches the forward and enqueues the result copy-out WITHOUT syncing,
+    /// so the caller can do host work (e.g. send the prior step's tokens)
+    /// while the GPU runs. Exactly one `finalize_fused_abc` must follow each
+    /// successful issue before any other step is issued.
+    pub fn issue_fused_abc(
         &mut self,
         req: &StepRequest,
         row_kind: &[RaggedRowKind],
         next_slots: Option<&[u32]>,
-    ) -> OpResult<StepOutput> {
+    ) -> OpResult<MixedStepTicket> {
         let plan = self.validate_mixed_abc_request(req, row_kind)?;
         if let Some(slots) = next_slots {
             self.upload_mixed_next_slots(slots)?;
@@ -1625,19 +1630,68 @@ where
             cfg.arena_end();
             result?;
         }
-        if trace {
-            let _ = self.scope.synchronize();
+        self.copy_out_mixed_abc(plan.batch)?;
+        Ok(MixedStepTicket {
+            plan,
+            ran_graph,
+            trace,
+            t0,
+        })
+    }
+
+    /// Collect a mixed step issued by `issue_fused_abc`: drain the copy-out
+    /// (this is where the host blocks for the forward) and decode the host
+    /// mirrors into a `StepOutput`. `req`/`row_kind` must be the same values
+    /// the issue ran with.
+    pub fn finalize_fused_abc(
+        &mut self,
+        ticket: MixedStepTicket,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+    ) -> OpResult<StepOutput> {
+        let cfg = self.scope.device().config.clone();
+        cfg.synchronize_copy_out()?;
+        if ticket.trace {
+            // `elapsed` spans issue→sync, so it includes any host work the
+            // caller overlapped between the two halves.
             tracing::info!(
                 "[mixed-trace] mode={} rows={} tokens={} tiles={} elapsed={:.2}ms",
-                if ran_graph { "graph" } else { "eager" },
-                plan.batch,
-                plan.num_tokens,
-                plan.total_q_tiles,
-                t0.elapsed().as_secs_f64() * 1e3
+                if ticket.ran_graph { "graph" } else { "eager" },
+                ticket.plan.batch,
+                ticket.plan.num_tokens,
+                ticket.plan.total_q_tiles,
+                ticket.t0.elapsed().as_secs_f64() * 1e3
             );
         }
-        self.copy_out_mixed_abc(plan.batch)?;
-        self.finalize_mixed_abc(&plan, req, row_kind)
+        self.finalize_mixed_abc(&ticket.plan, req, row_kind)
+    }
+
+    /// Synchronous mixed step: issue + finalize back-to-back. Used by the
+    /// bootstrap prewarm; serving uses the split halves to overlap host work
+    /// with the fused forward.
+    pub fn step_fused_abc_eager(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_slots: Option<&[u32]>,
+    ) -> OpResult<StepOutput> {
+        let ticket = self.issue_fused_abc(req, row_kind, next_slots)?;
+        self.finalize_fused_abc(ticket, req, row_kind)
+    }
+
+    /// Largest mixed-graph token bucket the bootstrap prewarm covers. The
+    /// fused-step packer bounds each step's prefill admission to this so live
+    /// mixed steps replay a prewarmed graph instead of falling back to eager.
+    /// `None` when graphs are unavailable (packer falls back to the raw cap).
+    pub fn mixed_step_token_budget(&self) -> Option<usize> {
+        if self.graph.is_none() || !self.scope.supports_graphs() {
+            return None;
+        }
+        MIXED_GRAPH_PREWARM_TOKEN_BUCKETS
+            .iter()
+            .copied()
+            .filter(|&b| b <= self.cap_num_tokens)
+            .max()
     }
 
     fn validate_mixed_abc_request(
@@ -1992,7 +2046,10 @@ where
             )?;
         }
         cfg.record_copy_out()?;
-        cfg.synchronize_copy_out()?;
+        // No sync here: the D2H runs async on the copy-out stream and is
+        // collected by `finalize_fused_abc`, so the caller can overlap host
+        // work with the fused forward. `copy_out_recorded` gates the next
+        // step's A overwrite via `compute_wait_copy_out`.
         self.abc.copy_out_recorded = true;
         Ok(())
     }
@@ -2799,7 +2856,11 @@ const MIXED_GRAPH_TOKEN_BUCKET: usize = 64;
 const MIXED_GRAPH_TILE_BUCKET: usize = 32;
 /// Number of common mixed graph buckets to capture at bootstrap. Keep this
 /// below the total mixed graph budget so rare live buckets can still be learned.
-const MIXED_GRAPH_PREWARM_MAX: usize = 48;
+/// 48 truncated the case grid inside the 192-token bucket, so every live mixed
+/// step above ~192 tokens (any real prompt riding a loaded decode batch) missed
+/// the graph and ran eager — the qps32 ITL p99 tail. 112 covers the full
+/// prefix(≤128) × token-bucket(≤384) grid (104 cases).
+const MIXED_GRAPH_PREWARM_MAX: usize = 112;
 const MIXED_GRAPH_PREWARM_MAX_DECODE_PREFIX: usize = 128;
 const MIXED_GRAPH_PREWARM_TOKEN_BUCKETS: &[usize] = &[64, 128, 192, 256, 320, 384];
 /// Default max prompt length (tokens) eligible for a single-seq prefill graph.
@@ -2809,6 +2870,16 @@ const MIXED_GRAPH_PREWARM_TOKEN_BUCKETS: &[usize] = &[64, 128, 192, 256, 320, 38
 /// cached algo. The graph machinery is retained (Stage B) but off by default;
 /// raise this to re-enable single-seq prefill graphs.
 const PREFILL_GRAPH_MAX_TOKENS: usize = 0;
+
+/// In-flight mixed step handle: `issue_fused_abc` → overlapped host work →
+/// `finalize_fused_abc`. Owns the issue's `BatchPlan` so finalize decodes the
+/// host mirrors against the exact issued shape.
+pub struct MixedStepTicket {
+    plan: BatchPlan,
+    ran_graph: bool,
+    trace: bool,
+    t0: std::time::Instant,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MixedGraphShape {

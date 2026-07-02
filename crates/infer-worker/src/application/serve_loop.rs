@@ -325,6 +325,11 @@ where
         tracing::info!("[step-trace] enabled, threshold={:.1}ms", step_trace_ms);
     }
 
+    // Prefill cmds deferred by the fused-step token budget (a burst larger
+    // than one prewarmed mixed-graph bucket is spread across consecutive
+    // steps). Carried across iterations, consumed ahead of fresh arrivals.
+    let mut deferred_prefills: Vec<PrefillBatchCmd> = Vec::new();
+
     loop {
         let mut ctx = WorkerCtx {
             active: &mut active,
@@ -354,7 +359,8 @@ where
         //
         // This removes the old `idle_wait_ms = heartbeat/2` polling window
         // that dominated TTFT at low QPS.
-        let mut pending_prefills = drain_data(data);
+        let mut pending_prefills = std::mem::take(&mut deferred_prefills);
+        pending_prefills.extend(drain_data(data));
         if pending_prefills.is_empty() && active.is_empty() && !decode_engine.has_pending() {
             maybe_heartbeat(
                 control,
@@ -431,11 +437,14 @@ where
 
         // ── Fused step: prefill chunks + decode in ONE ragged forward ──
         //
-        // Every pending prefill chunk and every active decode row go through a
-        // single eager ragged forward (`handle_fused_step`). This pays the fixed
-        // per-forward host overhead once per step instead of once per prefill,
-        // and in-flight decode rows advance a token in that same forward rather
-        // than stalling behind the prefills. When nothing is prefilling, steady-
+        // Pending prefill chunks and every active decode row go through a
+        // single ragged forward (`handle_fused_step`; prewarmed mixed-graph
+        // replay when the shape bucket is covered, eager otherwise). This pays
+        // the fixed per-forward host overhead once per step instead of once
+        // per prefill, and in-flight decode rows advance a token in that same
+        // forward rather than stalling behind the prefills. Admission is
+        // bounded to one mixed-graph token bucket per step; surplus cmds carry
+        // over via `deferred_prefills`. When nothing is prefilling, steady-
         // state decode keeps the fast graphed ABC pipeline (`run_step`).
         let prefill_rounds = if pending_prefills.is_empty() {
             0usize
@@ -468,6 +477,7 @@ where
                 cap_batch,
                 cap_num_tokens,
                 std::mem::take(&mut pending_prefills),
+                &mut deferred_prefills,
             ) {
                 if matches!(e, OpError::Shutdown) {
                     tracing::info!("[serve] fused step interrupted by shutdown.");

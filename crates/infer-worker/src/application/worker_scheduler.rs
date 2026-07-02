@@ -313,14 +313,25 @@ struct ForwardGroup {
 }
 
 /// Run ONE fused step: finalize the in-flight decode, then drive all active
-/// decode rows + every pending prefill chunk through a single ragged forward.
+/// decode rows + admitted pending prefill chunks through a single ragged
+/// forward.
 ///
 /// Replaces the old "prefill-first, then decode" serialization. Prefill chunks
-/// and decode rows share one eager ragged forward, so the fixed per-forward
-/// host overhead (per-layer alloc/build) is paid ONCE per step instead of once
-/// per prefill, and in-flight decode rows are never stalled behind prefills —
-/// they advance a token in the same forward. Overflowing prefill cmds (past the
-/// batch/token cap) spill into extra pure-prefill forwards; the decode rows
+/// and decode rows share one ragged forward, so the fixed per-forward host
+/// overhead is paid ONCE per step instead of once per prefill, and in-flight
+/// decode rows are never stalled behind prefills — they advance a token in the
+/// same forward.
+///
+/// Pipelining: the prior decode step's tokens are sent AFTER the fused forward
+/// is issued (the send overlaps GPU compute), and on exit the next pure-decode
+/// step is issued and left pending, so the fused step's host tail overlaps the
+/// next step's compute instead of idling the GPU.
+///
+/// Admission is bounded to the largest prewarmed mixed-graph token bucket;
+/// surplus cmds are pushed to `deferred_out` for the next serve-loop iteration
+/// (decode advances every iteration, so a burst is spread across consecutive
+/// graphed steps instead of one huge eager step). Cmds that still overflow the
+/// batch/token cap spill into extra pure-prefill forwards; the decode rows
 /// always ride the first forward.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_fused_step<M>(
@@ -336,30 +347,37 @@ pub fn handle_fused_step<M>(
     cap_batch: usize,
     cap_num_tokens: usize,
     pending_prefills: Vec<PrefillBatchCmd>,
+    deferred_out: &mut Vec<PrefillBatchCmd>,
 ) -> OpResult<()>
 where
     M: DecoderModel<bf16, Cuda>,
 {
-    // 1. Drain the in-flight ABC decode step and send its tokens. This commits
-    //    the prior step and syncs the copy-out so the fused eager forward (which
-    //    uses the prefill input buffer, not buffer A) cannot race it.
-    decode_engine.finalize_and_send(
+    // 1. Drain the in-flight ABC decode step: commit it and sync its copy-out
+    //    so the fused forward cannot race buffer A. The SEND is deferred until
+    //    the fused forward below is issued, moving the ZMQ send out of the
+    //    GPU-idle window between the two steps.
+    let mut prior_output = decode_engine.finalize_pending(
         runner,
         active,
         kv_allocator,
         control,
-        data,
         enable_prefix_caching,
     )?;
 
     // 2. Decode rows for this step: one new KV slot each.
-    let decode = decode_engine.prepare_fused_decode(
+    let decode = match decode_engine.prepare_fused_decode(
         active,
         prefilling,
         kv_allocator,
         control,
         enable_prefix_caching,
-    )?;
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = send_prior_output(data, &mut prior_output);
+            return Err(e);
+        }
+    };
     let (decode_order, decode_new_indices, decode_build) = match decode {
         Some((order, idx)) => {
             let build = build_decode_request(&order, &idx, active, eos_ids, enable_prefix_caching);
@@ -369,11 +387,44 @@ where
     };
     let decode_count = decode_order.len();
 
-    // 3. Plan + allocate KV for every pending prefill cmd. Reject cmds that
+    // 2.5 Bound this step's prefill admission to the largest prewarmed
+    //     mixed-graph token bucket. Surplus cmds are deferred to the next
+    //     serve-loop iteration: decode rows advance every iteration
+    //     regardless, so a burst of arrivals is spread across consecutive
+    //     graphed steps instead of one oversized eager step that stalls every
+    //     decode row for the burst's whole prefill time. FCFS: once one cmd
+    //     defers, every later cmd defers behind it. The first cmd is always
+    //     admitted (progress guarantee even past the budget).
+    let decode_slot = runner
+        .next_capture_slot(decode_count)
+        .unwrap_or(decode_count);
+    let step_token_budget = runner
+        .mixed_step_token_budget()
+        .unwrap_or(cap_num_tokens)
+        .min(cap_num_tokens);
+    let mut admitted_cmds: Vec<PrefillBatchCmd> = Vec::with_capacity(pending_prefills.len());
+    let mut budget_tokens = 0usize;
+    let mut deferring = false;
+    for cmd in pending_prefills {
+        // Upper-bound token estimate (ignores prefix-cache hits) — fine for a
+        // packing budget.
+        let est = cmd.input_ids.len();
+        if deferring
+            || (!admitted_cmds.is_empty() && decode_slot + budget_tokens + est > step_token_budget)
+        {
+            deferring = true;
+            deferred_out.push(cmd);
+            continue;
+        }
+        budget_tokens += est;
+        admitted_cmds.push(cmd);
+    }
+
+    // 3. Plan + allocate KV for every admitted prefill cmd. Reject cmds that
     //    would push the concurrent decode-row count past the batch cap.
     let mut admitted_decode = active.len();
     let mut preps: Vec<CmdPrep> = Vec::new();
-    for cmd in &pending_prefills {
+    for cmd in &admitted_cmds {
         let (plans, total_new) = plan_prefill_segments(cmd, prefilling);
         let new_decode = count_new_decode(cmd, &plans);
         if admitted_decode + new_decode > cap_batch {
@@ -424,7 +475,10 @@ where
                 );
                 continue;
             }
-            AllocWithReliefOutcome::Shutdown => return Err(OpError::Shutdown),
+            AllocWithReliefOutcome::Shutdown => {
+                let _ = send_prior_output(data, &mut prior_output);
+                return Err(OpError::Shutdown);
+            }
         };
         admitted_decode += new_decode;
         preps.push(CmdPrep {
@@ -577,7 +631,7 @@ where
                 }
             }
         }
-        let out = match runner.step_fused_abc_eager(
+        let issue_res = runner.issue_fused_abc(
             &req,
             &row_kinds,
             if mixed_next_slots.is_empty() {
@@ -585,7 +639,13 @@ where
             } else {
                 Some(mixed_next_slots.as_slice())
             },
-        ) {
+        );
+        // The fused forward is on the GPU now (on success): send the prior
+        // decode step's tokens while it runs. The result is propagated only
+        // after this group's commit so a transport error cannot leave the
+        // fused step's host state half-applied.
+        let prior_send = send_prior_output(data, &mut prior_output);
+        let out = match issue_res.and_then(|t| runner.finalize_fused_abc(t, &req, &row_kinds)) {
             Ok(out) => out,
             Err(e) => {
                 if !mixed_next_slots.is_empty() {
@@ -609,6 +669,7 @@ where
                     kv_allocator.free(&pad_indices);
                 }
                 decode_engine.invalidate_abc_reuse();
+                prior_send?;
                 continue;
             }
         };
@@ -687,9 +748,43 @@ where
         if !pad_indices.is_empty() {
             kv_allocator.free(&pad_indices);
         }
+        prior_send?;
     }
+    // Rare path: no group issued a forward (e.g. every decode row finished in
+    // the drained step and all cmds were rejected) — the prior step's tokens
+    // still must go out.
+    send_prior_output(data, &mut prior_output)?;
     if !recorded_abc_rows {
         decode_engine.invalidate_abc_reuse();
+    }
+    // Overlap the fused step's host tail (scheduler send + serve-loop
+    // turnaround) with GPU compute: issue the next pure-decode step now and
+    // leave it pending for the next `run_step` call to finalize. Also removes
+    // the cold-start 0-deep restart the pipeline used to pay after every
+    // fused step.
+    decode_engine.issue_if_idle(
+        runner,
+        active,
+        prefilling,
+        kv_allocator,
+        control,
+        eos_ids,
+        enable_prefix_caching,
+    )?;
+    Ok(())
+}
+
+/// Send the prior decode step's finalized output, if still unsent. Called
+/// right after the fused forward is issued so the ZMQ send overlaps GPU
+/// compute; the early-return paths call it too so the tokens are never lost.
+fn send_prior_output(data: &DataPump, prior: &mut Option<StepOutput>) -> OpResult<()> {
+    if let Some(out) = prior.take() {
+        data.send_step_output(&out).map_err(|e| {
+            OpError::Kernel(format!(
+                "data plane send_step_output (fused prior) failed: {}",
+                e
+            ))
+        })?;
     }
     Ok(())
 }

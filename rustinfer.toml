@@ -38,7 +38,7 @@ batch_wait_ms = 0
 
 # Paged KV.
 paged_block_size = 1
-chunked_prefill_size = 0      # 0 => disabled (whole prompt in one step). Set 256 to re-enable the graph-prefill foundation (see docs/HANDOFF_graph_prefill.md)
+chunked_prefill_size = 256    # bound prefill tokens per fused step so burst arrivals can't stall decode rows (qps32 ITL p99 tail); 0 => whole prompt in one step
 enable_prefix_caching = false
 mem_fraction_static = 0.9
 num_blocks = 0                # 0 => auto-size
