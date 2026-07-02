@@ -27,7 +27,8 @@ use infer_worker::infrastructure::cuda::Cuda;
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
-use infer_worker::models::loader::{LoadConfig, RopeScaling, WeightLoader};
+use infer_worker::models::decoder::build_decoder;
+use infer_worker::models::loader::{LinearAttnConfig, LoadConfig, RopeScaling, WeightLoader};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker", version = "0.3.0")]
@@ -69,6 +70,51 @@ struct HfConfig {
     /// quantized checkpoints; we support int4 `pack-quantized` on the MLP.
     #[serde(default)]
     quantization_config: Option<HfQuantConfig>,
+
+    // ── Qwen3.5 hybrid-stack fields (absent / defaulted for Llama3 & Qwen3) ──
+    /// Per-layer mixer selector, e.g. `["linear_attention", ..., "full_attention"]`.
+    /// Non-empty only for the hybrid Gated-DeltaNet stack.
+    #[serde(default)]
+    layer_types: Vec<String>,
+    /// Fallback when `layer_types` is absent: every `full_attention_interval`-th
+    /// layer is full attention, the rest are linear (Gated DeltaNet).
+    #[serde(default)]
+    full_attention_interval: Option<usize>,
+    /// Full-attn `[gate | query]` output gate (`q_proj` emits 2× q_dim).
+    #[serde(default)]
+    attn_output_gate: bool,
+    /// Partial RoPE fraction (Qwen3.5 full-attn: 0.25 → 64 of 256). May also
+    /// live under `rope_parameters`; [`build_load_config`] prefers that.
+    #[serde(default)]
+    partial_rotary_factor: Option<f32>,
+    /// Gated-DeltaNet key/query head count.
+    #[serde(default)]
+    linear_num_key_heads: Option<usize>,
+    /// Gated-DeltaNet value head count (one recurrent state each).
+    #[serde(default)]
+    linear_num_value_heads: Option<usize>,
+    /// Gated-DeltaNet per-head key/query dim.
+    #[serde(default)]
+    linear_key_head_dim: Option<usize>,
+    /// Gated-DeltaNet per-head value dim.
+    #[serde(default)]
+    linear_value_head_dim: Option<usize>,
+    /// Gated-DeltaNet causal-conv kernel width.
+    #[serde(default)]
+    linear_conv_kernel_dim: Option<usize>,
+    /// Newer checkpoints nest `rope_theta` / `partial_rotary_factor` here.
+    #[serde(default)]
+    rope_parameters: Option<HfRopeParameters>,
+}
+
+/// Qwen3.5's nested `rope_parameters` block. Older configs keep `rope_theta`
+/// flat at the top level; this captures the newer nested form.
+#[derive(Debug, Deserialize)]
+struct HfRopeParameters {
+    #[serde(default)]
+    rope_theta: Option<f64>,
+    #[serde(default)]
+    partial_rotary_factor: Option<f32>,
 }
 
 /// Subset of the HuggingFace `quantization_config` block we act on. Only the
@@ -107,6 +153,69 @@ fn default_rms_eps() -> f32 {
 }
 fn default_rope_theta() -> f64 {
     10000.0
+}
+
+/// Parse a HuggingFace `config.json` into our flat [`HfConfig`].
+///
+/// Qwen3.5 (`Qwen3_5ForConditionalGeneration`) nests every text-model field
+/// under `text_config` (with `vision_config` / MTP fields as siblings we skip
+/// in v1). Older Llama3 / Qwen3 configs are already flat. We normalize by
+/// lifting `text_config`'s keys to the root — root keys win on conflict so an
+/// explicit top-level override is respected — then deserialize the flat shape.
+/// This keeps `HfConfig` a single flat struct rather than forking the parser on
+/// model family.
+fn parse_hf_config(bytes: &[u8]) -> Result<HfConfig, String> {
+    let mut root: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("parse config json: {}", e))?;
+
+    if let Some(text_cfg) = root.get("text_config").cloned() {
+        if let (Some(root_map), Some(text_map)) = (root.as_object_mut(), text_cfg.as_object()) {
+            for (k, v) in text_map {
+                root_map.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+
+    serde_json::from_value(root).map_err(|e| format!("deserialize HfConfig: {}", e))
+}
+
+/// Build the per-layer full-vs-linear mixer selector for the hybrid stack.
+///
+/// Prefers the explicit `layer_types` list; falls back to
+/// `full_attention_interval` (every k-th layer is full, matching HF's
+/// `(i + 1) % interval == 0` convention seen in Qwen3.5: layers 3,7,…,31).
+fn build_layer_is_full(cfg: &HfConfig) -> Vec<bool> {
+    if !cfg.layer_types.is_empty() {
+        return cfg
+            .layer_types
+            .iter()
+            .map(|t| t == "full_attention")
+            .collect();
+    }
+    let interval = cfg.full_attention_interval.unwrap_or(0);
+    (0..cfg.num_hidden_layers)
+        .map(|i| interval != 0 && (i + 1) % interval == 0)
+        .collect()
+}
+
+/// Assemble the Gated-DeltaNet config when the checkpoint declares a hybrid
+/// stack (any `linear_attention` layer). Returns `None` for homogeneous
+/// full-attention decoders (Llama3 / Qwen3).
+fn build_linear_attn(cfg: &HfConfig) -> Option<LinearAttnConfig> {
+    let layer_is_full = build_layer_is_full(cfg);
+    // A hybrid stack has at least one non-full (linear) layer AND the GDN dims.
+    let has_linear = layer_is_full.iter().any(|&f| !f);
+    if !has_linear {
+        return None;
+    }
+    Some(LinearAttnConfig {
+        num_key_heads: cfg.linear_num_key_heads?,
+        num_value_heads: cfg.linear_num_value_heads?,
+        key_head_dim: cfg.linear_key_head_dim?,
+        value_head_dim: cfg.linear_value_head_dim?,
+        conv_kernel_dim: cfg.linear_conv_kernel_dim?,
+        layer_is_full,
+    })
 }
 
 /// Derive the MLP int4 quant scheme from `quantization_config`, or `None` for a
@@ -168,6 +277,11 @@ fn read_eos_ids(model_path: &str, model_type: &str) -> Vec<i32> {
     if let Some(ids) = eos_from(&dir.join("generation_config.json")) {
         return ids;
     }
+    // NOTE: for qwen3_5 the only top-level `eos_token_id` is nested under
+    // `text_config` and holds just `<|endoftext|>` (248044) — chat generation
+    // must ALSO stop on `<|im_end|>` (248046). We deliberately do not pick up
+    // that incomplete nested value here; the `qwen3_5` default below is the
+    // complete stop set. Top-level (flat) configs are still honored.
     if let Some(ids) = eos_from(&dir.join("config.json")) {
         return ids;
     }
@@ -175,6 +289,8 @@ fn read_eos_ids(model_path: &str, model_type: &str) -> Vec<i32> {
     // No config eos — fall back on an architecture default, but say so, since a
     // wrong stop-token set silently produces run-on or truncated generations.
     let default = match model_type {
+        // <|endoftext|>=248044, <|im_end|>=248046
+        "qwen3_5" => vec![248044, 248046],
         "qwen3" => vec![151643, 151645], // <|endoftext|>, <|im_end|>
         _ => vec![128001, 128008, 128009], // Llama 3.x default
     };
@@ -216,6 +332,27 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
             original_max_position_embeddings: rs.original_max_position_embeddings?,
         })
     });
+
+    // rope_theta may be flat (Llama3/Qwen3) or nested under rope_parameters
+    // (Qwen3.5). Nested wins when present.
+    let rope_theta = cfg
+        .rope_parameters
+        .as_ref()
+        .and_then(|rp| rp.rope_theta)
+        .unwrap_or(cfg.rope_theta);
+
+    // partial_rotary_factor: nested rope_parameters wins, then flat, else 1.0
+    // (full rotary). rotary_dim rounds to an even count of head dims.
+    let partial = cfg
+        .rope_parameters
+        .as_ref()
+        .and_then(|rp| rp.partial_rotary_factor)
+        .or(cfg.partial_rotary_factor)
+        .unwrap_or(1.0);
+    let rotary_dim = (((head_dim as f32) * partial) as usize) & !1;
+
+    let linear_attn = build_linear_attn(cfg);
+
     LoadConfig {
         dim: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
@@ -226,9 +363,12 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
         vocab_size: cfg.vocab_size,
         seq_len: max_seq_len.max(cfg.max_position_embeddings.min(max_seq_len)),
         rms_norm_eps: cfg.rms_norm_eps,
-        rope_theta: cfg.rope_theta,
+        rope_theta,
         rope_scaling,
         mlp_quant: derive_mlp_quant(cfg),
+        rotary_dim,
+        attn_output_gate: cfg.attn_output_gate,
+        linear_attn,
     }
 }
 
@@ -310,7 +450,7 @@ fn main() -> Result<(), String> {
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
-    let hf_cfg: HfConfig = serde_json::from_slice(&cfg_bytes)
+    let hf_cfg: HfConfig = parse_hf_config(&cfg_bytes)
         .map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
     let max_seq_len = load.max_model_len;
     let mut load_cfg = build_load_config(&hf_cfg, max_seq_len);
@@ -372,14 +512,26 @@ fn main() -> Result<(), String> {
     };
     let eos_ids: Vec<i32> = read_eos_ids(&load.model_path, &model_type);
 
-    // One loader backs every decoder family: `load_decoder` builds the shared
-    // `Decoder`, and per-family differences (e.g. Qwen3's Q/K norms) are already
-    // resolved inside it by weight presence — so there is nothing to dispatch on.
-    // `model_type` still rides along in `bootstrap`/`send_ready` for logging and
-    // the server's chat-template selection.
-    let model = loader
-        .load_decoder::<bf16, Cuda>(&load_cfg, &cuda)
-        .map_err(|e| format!("load_decoder: {:?}", e))?;
+    // qwen3_5 (hybrid Gated-DeltaNet + full-attention) is config-parsed but has
+    // no forward path yet (GatedDeltaNet + gated attention land in Phase 2/3).
+    // Fail loudly rather than mis-loading via the dense decoder builder, which
+    // assumes the flat `model.layers.` prefix and fused q+2kv — neither matches
+    // this checkpoint.
+    if model_type == "qwen3_5" {
+        return Err(
+            "qwen3_5 forward path not yet implemented (config parsing done; \
+             GatedDeltaNet + gated attention land in Phase 2/3)"
+                .to_string(),
+        );
+    }
+
+    // One builder backs every dense decoder family: `build_decoder` assembles
+    // the shared `Decoder` using the generic loader primitives, and per-family
+    // differences (e.g. Qwen3's Q/K norms) are resolved inside it by weight
+    // presence — so there is nothing to dispatch on. `model_type` still rides
+    // along in `bootstrap`/`send_ready` for logging and chat-template selection.
+    let model = build_decoder::<bf16, Cuda>(&loader, &load_cfg, &cuda)
+        .map_err(|e| format!("build_decoder: {:?}", e))?;
     eprintln!(
         "[bootstrap] weights loaded in {:.2}s",
         load_start.elapsed().as_secs_f32()
@@ -394,4 +546,133 @@ fn main() -> Result<(), String> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// Minimal qwen3_5 config with everything nested under `text_config`, plus a
+    /// sibling `vision_config` we must ignore in v1. Trimmed from the real
+    /// Qwen3.5-4B config.json (layer_types cut to one [L,L,L,F] period).
+    const QWEN3_5_JSON: &str = r#"{
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": true,
+        "vision_config": { "model_type": "qwen3_5", "hidden_size": 1024, "depth": 24 },
+        "text_config": {
+            "attn_output_gate": true,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_size": 2560,
+            "intermediate_size": 9216,
+            "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "max_position_embeddings": 262144,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-06,
+            "vocab_size": 248320,
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 10000000,
+                "partial_rotary_factor": 0.25
+            }
+        }
+    }"#;
+
+    /// A flat Qwen3-style config (no text_config nesting, no hybrid stack).
+    const QWEN3_FLAT_JSON: &str = r#"{
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "max_position_embeddings": 40960
+    }"#;
+
+    #[test]
+    fn parses_nested_text_config() {
+        let cfg = parse_hf_config(QWEN3_5_JSON.as_bytes()).expect("parse qwen3_5");
+        // Fields lifted out of text_config.
+        assert_eq!(cfg.hidden_size, 2560);
+        assert_eq!(cfg.intermediate_size, 9216);
+        assert_eq!(cfg.num_hidden_layers, 4);
+        assert_eq!(cfg.num_attention_heads, 16);
+        assert_eq!(cfg.num_key_value_heads, 4);
+        assert_eq!(cfg.head_dim, Some(256));
+        assert_eq!(cfg.vocab_size, 248320);
+        assert!(cfg.attn_output_gate);
+        assert_eq!(cfg.linear_num_key_heads, Some(16));
+        assert_eq!(cfg.linear_num_value_heads, Some(32));
+        assert_eq!(cfg.linear_key_head_dim, Some(128));
+        assert_eq!(cfg.linear_conv_kernel_dim, Some(4));
+        assert_eq!(cfg.layer_types.len(), 4);
+        // rope_theta lives under the nested rope_parameters block.
+        let rp = cfg.rope_parameters.as_ref().expect("rope_parameters");
+        assert_eq!(rp.rope_theta, Some(10_000_000.0));
+        assert_eq!(rp.partial_rotary_factor, Some(0.25));
+    }
+
+    #[test]
+    fn hybrid_dims_and_partial_rope() {
+        let cfg = parse_hf_config(QWEN3_5_JSON.as_bytes()).unwrap();
+        let lc = build_load_config(&cfg, 4096);
+
+        // Nested rope_theta wins over the flat default.
+        assert_eq!(lc.rope_theta, 10_000_000.0);
+        // partial_rotary_factor 0.25 * head_dim 256 = 64 (even).
+        assert_eq!(lc.rotary_dim, 64);
+        assert!(lc.attn_output_gate);
+
+        let la = lc.linear_attn.expect("hybrid stack detected");
+        assert_eq!(la.num_key_heads, 16);
+        assert_eq!(la.num_value_heads, 32);
+        assert_eq!(la.key_dim(), 2048);
+        assert_eq!(la.value_dim(), 4096);
+        assert_eq!(la.conv_dim(), 8192); // 2048 + 2048 + 4096
+        // layer_types = [L,L,L,F] → last layer is full.
+        assert_eq!(la.layer_is_full, vec![false, false, false, true]);
+        assert_eq!(la.num_full_layers(), 1);
+        assert_eq!(la.num_linear_layers(), 3);
+    }
+
+    #[test]
+    fn flat_config_has_no_linear_attn() {
+        let cfg = parse_hf_config(QWEN3_FLAT_JSON.as_bytes()).expect("parse flat qwen3");
+        assert_eq!(cfg.hidden_size, 2048);
+        assert_eq!(cfg.num_hidden_layers, 28);
+        let lc = build_load_config(&cfg, 4096);
+        // Homogeneous full-attention decoder: no hybrid stack, full rotary.
+        assert!(lc.linear_attn.is_none());
+        assert!(!lc.attn_output_gate);
+        assert_eq!(lc.rotary_dim, lc.head_dim); // partial factor defaults to 1.0
+        assert_eq!(lc.head_dim, 128);
+        assert_eq!(lc.rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn full_attention_interval_fallback() {
+        // Same model but layer_types omitted — selector derived from interval.
+        let json = QWEN3_5_JSON.replace(
+            r#""layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],"#,
+            "",
+        );
+        let cfg = parse_hf_config(json.as_bytes()).expect("parse without layer_types");
+        assert!(cfg.layer_types.is_empty());
+        let la = build_linear_attn(&cfg).expect("interval-derived hybrid");
+        // interval=4, num_layers=4 → (i+1)%4==0 → only layer index 3 is full.
+        assert_eq!(la.layer_is_full, vec![false, false, false, true]);
+    }
 }

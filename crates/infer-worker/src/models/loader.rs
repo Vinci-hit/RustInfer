@@ -1,18 +1,16 @@
-//! Weight loader — loads safetensors into model structures.
+//! Weight loader — generic safetensors → tensor/`Linear`/`RMSNorm` primitives.
 //!
-//! This lives in models/ (not domain) because it's about constructing
-//! concrete model instances. Filesystem access is delegated to
-//! `infra::io::SafetensorsReader` to keep the I/O concern in the
-//! infrastructure layer.
+//! This lives in models/ (not domain) because it's about constructing concrete
+//! model tensors. It is deliberately *model-agnostic*: every method takes the
+//! tensor name(s) from the caller and reads exactly what the file declares
+//! (shape, dtype). Which tensors a given architecture needs — and how they wire
+//! into components — lives in the model modules (`models/decoder.rs`, …), not
+//! here. Filesystem access is delegated to `infra::io::SafetensorsReader`.
 
 use safetensors::tensor::TensorView;
 
-use super::decoder::Decoder;
 use super::layers::{Embedding, Linear, RMSNorm};
-use crate::components::{
-    Attention, DecoderBlock, DenseFfn, Embed, Linear as CompLinear, LmHead, RmsNorm as CompRmsNorm,
-};
-use crate::domain::model::ModelDims;
+use crate::components::Linear as CompLinear;
 use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
@@ -31,6 +29,54 @@ pub struct RopeScaling {
     pub low_freq_factor: f32,
     pub high_freq_factor: f32,
     pub original_max_position_embeddings: u32,
+}
+
+/// Gated-DeltaNet (linear-attention) dimensions for the Qwen3.5 hybrid stack.
+///
+/// These describe the *recurrent* mixer that replaces full attention in 24 of
+/// the 32 layers. They are attributes of the checkpoint, not a distinct config
+/// type: a dense Llama/Qwen3 model simply has `LoadConfig::linear_attn = None`
+/// and every layer is full attention. When `Some`, `layer_is_full[i]` selects
+/// per layer which mixer (full vs Gated-DeltaNet) layer `i` uses.
+#[derive(Debug, Clone)]
+pub struct LinearAttnConfig {
+    /// Number of key/query heads (query is L2-normed, shared GQA-style across
+    /// value heads). Qwen3.5-4B: 16.
+    pub num_key_heads: usize,
+    /// Number of value heads (one recurrent state per value head). 32.
+    pub num_value_heads: usize,
+    /// Per-head dim for keys/queries. 128 → key_dim = 16*128 = 2048.
+    pub key_head_dim: usize,
+    /// Per-head dim for values. 128 → value_dim = 32*128 = 4096.
+    pub value_head_dim: usize,
+    /// Causal depthwise conv kernel width over the concatenated qkv channels. 4.
+    pub conv_kernel_dim: usize,
+    /// Per-layer mixer selector: `true` = full attention, `false` = Gated
+    /// DeltaNet. Length == `LoadConfig::layer_num`.
+    pub layer_is_full: Vec<bool>,
+}
+
+impl LinearAttnConfig {
+    /// key_dim = num_key_heads * key_head_dim (also the q channel width).
+    pub fn key_dim(&self) -> usize {
+        self.num_key_heads * self.key_head_dim
+    }
+    /// value_dim = num_value_heads * value_head_dim.
+    pub fn value_dim(&self) -> usize {
+        self.num_value_heads * self.value_head_dim
+    }
+    /// conv operates over q(key_dim) | k(key_dim) | v(value_dim).
+    pub fn conv_dim(&self) -> usize {
+        self.key_dim() + self.key_dim() + self.value_dim()
+    }
+    /// Count of full-attention layers (the paged-KV pool is sized to these).
+    pub fn num_full_layers(&self) -> usize {
+        self.layer_is_full.iter().filter(|&&f| f).count()
+    }
+    /// Count of Gated-DeltaNet layers (the LinearStatePool is sized to these).
+    pub fn num_linear_layers(&self) -> usize {
+        self.layer_is_full.len() - self.num_full_layers()
+    }
 }
 
 /// Configuration for model loading.
@@ -52,6 +98,18 @@ pub struct LoadConfig {
     /// (compressed-tensors `pack-quantized`) with this scheme; attention and
     /// the head stay full-precision. `None` → a fully dense model.
     pub mlp_quant: Option<QuantScheme>,
+    /// Number of head dims that receive RoPE. Equals `head_dim` for the usual
+    /// full-rotary case; Qwen3.5 full-attn layers use partial rotary
+    /// (`partial_rotary_factor = 0.25` → 64 of 256). Attribute, not a branch:
+    /// the rope cache is simply built over `rotary_dim` columns.
+    pub rotary_dim: usize,
+    /// Qwen3.5 full-attn `attn_output_gate`: `q_proj` emits `[gate | query]` and
+    /// the attention output is elementwise-gated by `sigmoid(gate)`. `false` for
+    /// every model we ship today.
+    pub attn_output_gate: bool,
+    /// `Some` for the Qwen3.5 hybrid stack (Gated-DeltaNet + full attention).
+    /// `None` → homogeneous full-attention decoder (Llama3 / Qwen3).
+    pub linear_attn: Option<LinearAttnConfig>,
 }
 
 /// Weight loader — pulls tensors out of a `SafetensorsReader` and builds
@@ -126,14 +184,20 @@ impl<'a> WeightLoader<'a> {
         Ok(Embedding { table })
     }
 
-    /// Load fused QKV: concatenate q_proj, k_proj, v_proj along rows → [q_dim+2*kv_dim, dim].
+    /// Load fused QKV: concatenate q/k/v_proj along rows → [q_dim+2*kv_dim, dim].
+    ///
+    /// `prefix` is the caller-supplied tensor-name stem (e.g.
+    /// `"model.layers.0"`); the three projections are read as
+    /// `{prefix}.self_attn.{q,k,v}_proj.weight`. Keeping the naming in the
+    /// caller is deliberate — the loader stays a generic primitive that knows
+    /// nothing about any model's layout.
     ///
     /// To keep the tensor on `device` and avoid host↔device round-trips, we
     /// concatenate at the host-bytes level (in target dtype T) and upload
     /// the fused result in a single `Tensor::from_host_bytes`.
     pub fn load_fused_qkv<T: Dtype, D: OpBackend>(
         &self,
-        layer_idx: usize,
+        prefix: &str,
         q_dim: usize,
         kv_dim: usize,
         dim: usize,
@@ -141,25 +205,16 @@ impl<'a> WeightLoader<'a> {
     ) -> OpResult<Linear<T, D>> {
         let q_view = self
             .reader
-            .read_view(&format!(
-                "model.layers.{}.self_attn.q_proj.weight",
-                layer_idx
-            ))
-            .map_err(|e| OpError::Kernel(format!("q_proj layer {}: {}", layer_idx, e)))?;
+            .read_view(&format!("{}.self_attn.q_proj.weight", prefix))
+            .map_err(|e| OpError::Kernel(format!("q_proj {}: {}", prefix, e)))?;
         let k_view = self
             .reader
-            .read_view(&format!(
-                "model.layers.{}.self_attn.k_proj.weight",
-                layer_idx
-            ))
-            .map_err(|e| OpError::Kernel(format!("k_proj layer {}: {}", layer_idx, e)))?;
+            .read_view(&format!("{}.self_attn.k_proj.weight", prefix))
+            .map_err(|e| OpError::Kernel(format!("k_proj {}: {}", prefix, e)))?;
         let v_view = self
             .reader
-            .read_view(&format!(
-                "model.layers.{}.self_attn.v_proj.weight",
-                layer_idx
-            ))
-            .map_err(|e| OpError::Kernel(format!("v_proj layer {}: {}", layer_idx, e)))?;
+            .read_view(&format!("{}.self_attn.v_proj.weight", prefix))
+            .map_err(|e| OpError::Kernel(format!("v_proj {}: {}", prefix, e)))?;
 
         let total_rows = q_dim + 2 * kv_dim;
         let elem = T::SIZE_BYTES;
@@ -174,8 +229,8 @@ impl<'a> WeightLoader<'a> {
             let shape: Vec<usize> = view.shape().to_vec();
             if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
                 return Err(OpError::Shape(format!(
-                    "fused_qkv layer {}: expected [{}, {}], got {:?}",
-                    layer_idx, expected_rows, dim, shape,
+                    "fused_qkv {}: expected [{}, {}], got {:?}",
+                    prefix, expected_rows, dim, shape,
                 )));
             }
             let src = view.data();
@@ -193,9 +248,9 @@ impl<'a> WeightLoader<'a> {
                 let n = numel * elem;
                 if src.len() != n {
                     return Err(OpError::Shape(format!(
-                        "fused_qkv layer {}: view byte length {} != expected {} for shape {:?} \
+                        "fused_qkv {}: view byte length {} != expected {} for shape {:?} \
                          (corrupt safetensors?)",
-                        layer_idx,
+                        prefix,
                         src.len(),
                         n,
                         shape,
@@ -228,19 +283,19 @@ impl<'a> WeightLoader<'a> {
     /// `swiglu_packed` consumes the fused output without splitting.
     pub fn load_fused_gate_up<T: Dtype, D: OpBackend>(
         &self,
-        layer_idx: usize,
+        prefix: &str,
         intermediate_size: usize,
         dim: usize,
         device: &D,
     ) -> OpResult<Linear<T, D>> {
         let g_view = self
             .reader
-            .read_view(&format!("model.layers.{}.mlp.gate_proj.weight", layer_idx))
-            .map_err(|e| OpError::Kernel(format!("gate_proj layer {}: {}", layer_idx, e)))?;
+            .read_view(&format!("{}.mlp.gate_proj.weight", prefix))
+            .map_err(|e| OpError::Kernel(format!("gate_proj {}: {}", prefix, e)))?;
         let u_view = self
             .reader
-            .read_view(&format!("model.layers.{}.mlp.up_proj.weight", layer_idx))
-            .map_err(|e| OpError::Kernel(format!("up_proj layer {}: {}", layer_idx, e)))?;
+            .read_view(&format!("{}.mlp.up_proj.weight", prefix))
+            .map_err(|e| OpError::Kernel(format!("up_proj {}: {}", prefix, e)))?;
 
         let total_rows = 2 * intermediate_size;
         let elem = T::SIZE_BYTES;
@@ -254,8 +309,8 @@ impl<'a> WeightLoader<'a> {
             let shape: Vec<usize> = view.shape().to_vec();
             if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
                 return Err(OpError::Shape(format!(
-                    "fused_gate_up layer {}: expected [{}, {}], got {:?}",
-                    layer_idx, expected_rows, dim, shape,
+                    "fused_gate_up {}: expected [{}, {}], got {:?}",
+                    prefix, expected_rows, dim, shape,
                 )));
             }
             let src = view.data();
@@ -273,9 +328,9 @@ impl<'a> WeightLoader<'a> {
                 let n = numel * elem;
                 if src.len() != n {
                     return Err(OpError::Shape(format!(
-                        "fused_gate_up layer {}: view byte length {} != expected {} for shape {:?} \
+                        "fused_gate_up {}: view byte length {} != expected {} for shape {:?} \
                          (corrupt safetensors?)",
-                        layer_idx,
+                        prefix,
                         src.len(),
                         n,
                         shape,
@@ -342,7 +397,7 @@ impl<'a> WeightLoader<'a> {
     /// Load a single int4 (`pack-quantized`) projection — e.g. `down_proj` —
     /// into a quantized `Linear`. `prefix` is the tensor-name stem, e.g.
     /// `"model.layers.0.mlp.down_proj"`.
-    fn load_awq_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+    pub(crate) fn load_awq_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
         &self,
         prefix: &str,
         scheme: QuantScheme,
@@ -356,14 +411,18 @@ impl<'a> WeightLoader<'a> {
 
     /// Load int4 `gate_proj` + `up_proj` fused along rows into one quantized
     /// `Linear` (`[2*inter, K/8]` packed), matching the dense fused layout.
-    fn load_fused_gate_up_awq<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+    /// `mlp_prefix` is the caller-supplied MLP stem, e.g. `"model.layers.0.mlp"`.
+    pub(crate) fn load_fused_gate_up_awq<
+        T: Dtype + crate::domain::dtype::Dtype,
+        D: OpBackend + LlmBackend,
+    >(
         &self,
-        layer_idx: usize,
+        mlp_prefix: &str,
         scheme: QuantScheme,
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
         let view = |proj: &str, part: &str| -> OpResult<TensorView<'_>> {
-            let name = format!("model.layers.{}.mlp.{}.{}", layer_idx, proj, part);
+            let name = format!("{}.{}.{}", mlp_prefix, proj, part);
             self.reader
                 .read_view(&name)
                 .map_err(|e| OpError::Kernel(format!("{}: {}", name, e)))
@@ -387,180 +446,6 @@ impl<'a> WeightLoader<'a> {
             device,
         )?;
         Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None))
-    }
-
-    /// Load the shared decoder for any supported family. Per-block Q/K norms are
-    /// populated when the weights contain them (Qwen3) and left absent otherwise
-    /// (Llama3), and the MLP is dense or int4 by `cfg.mlp_quant` — every
-    /// family-specific difference is decided by the weights/config here, so a
-    /// single loader backs all decoder models with no architecture branch above.
-    pub fn load_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
-        &self,
-        cfg: &LoadConfig,
-        device: &D,
-    ) -> OpResult<Decoder<T, D>> {
-        let embed_table = self
-            .load_embedding("model.embed_tokens.weight", device)?
-            .table;
-        let final_norm = self.load_rmsnorm("model.norm.weight", device, cfg.rms_norm_eps)?;
-        let lm_head = if self.reader.contains("lm_head.weight") {
-            self.load_linear("lm_head.weight", None, device)?
-        } else {
-            Linear::new(embed_table.clone(), None)
-        };
-
-        let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
-            cfg.seq_len,
-            cfg.head_dim,
-            cfg.rope_theta,
-            cfg.rope_scaling.as_ref(),
-            device,
-        )?;
-
-        let q_dim = cfg.head_num * cfg.head_dim;
-        let kv_dim = cfg.kv_head_num * cfg.head_dim;
-        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-
-        let mut blocks = Vec::with_capacity(cfg.layer_num);
-        for i in 0..cfg.layer_num {
-            let input_layernorm = self.load_rmsnorm(
-                &format!("model.layers.{}.input_layernorm.weight", i),
-                device,
-                cfg.rms_norm_eps,
-            )?;
-            let post_attention_layernorm = self.load_rmsnorm(
-                &format!("model.layers.{}.post_attention_layernorm.weight", i),
-                device,
-                cfg.rms_norm_eps,
-            )?;
-            let qkv_proj = self.load_fused_qkv(i, q_dim, kv_dim, cfg.dim, device)?;
-            let o_proj = self.load_linear(
-                &format!("model.layers.{}.self_attn.o_proj.weight", i),
-                None,
-                device,
-            )?;
-            // MLP: int4 `pack-quantized` when `mlp_quant` is set, else dense.
-            // Both arms yield a `components::Linear`; the quant arm carries the
-            // packed weight + scales/zeros and drives `matmul_quant` internally.
-            let (gate_up_proj, down_proj): (CompLinear<T, D>, CompLinear<T, D>) =
-                if let Some(scheme) = cfg.mlp_quant {
-                    (
-                        self.load_fused_gate_up_awq(i, scheme, device)?,
-                        self.load_awq_linear(
-                            &format!("model.layers.{}.mlp.down_proj", i),
-                            scheme,
-                            device,
-                        )?,
-                    )
-                } else {
-                    (
-                        comp_linear(self.load_fused_gate_up(
-                            i,
-                            cfg.intermediate_size,
-                            cfg.dim,
-                            device,
-                        )?),
-                        comp_linear(self.load_linear(
-                            &format!("model.layers.{}.mlp.down_proj.weight", i),
-                            None,
-                            device,
-                        )?),
-                    )
-                };
-
-            let q_norm_name = format!("model.layers.{}.self_attn.q_norm.weight", i);
-            let k_norm_name = format!("model.layers.{}.self_attn.k_norm.weight", i);
-            let q_norm = if self.reader.contains(&q_norm_name) {
-                Some(comp_rms(self.load_rmsnorm(
-                    &q_norm_name,
-                    device,
-                    cfg.rms_norm_eps,
-                )?))
-            } else {
-                None
-            };
-            let k_norm = if self.reader.contains(&k_norm_name) {
-                Some(comp_rms(self.load_rmsnorm(
-                    &k_norm_name,
-                    device,
-                    cfg.rms_norm_eps,
-                )?))
-            } else {
-                None
-            };
-            if q_norm.is_some() != k_norm.is_some() {
-                return Err(OpError::Shape(format!(
-                    "load: layer {} has q_norm={} but k_norm={}; require both or neither",
-                    i,
-                    q_norm.is_some(),
-                    k_norm.is_some()
-                )));
-            }
-
-            blocks.push(DecoderBlock {
-                attention: Attention {
-                    input_layernorm: comp_rms(input_layernorm),
-                    qkv_proj: comp_linear(qkv_proj),
-                    o_proj: comp_linear(o_proj),
-                    q_norm,
-                    k_norm,
-                    sin: sin_cache.clone(),
-                    cos: cos_cache.clone(),
-                    head_num: cfg.head_num,
-                    kv_head_num: cfg.kv_head_num,
-                    head_dim: cfg.head_dim,
-                    scale,
-                    scratch: None,
-                },
-                ffn: DenseFfn {
-                    post_attention_layernorm: comp_rms(post_attention_layernorm),
-                    gate_up_proj,
-                    down_proj,
-                    scratch: None,
-                },
-            });
-        }
-
-        Ok(Decoder {
-            embed: Embed { table: embed_table },
-            blocks,
-            norm: comp_rms(final_norm),
-            lm_head: LmHead {
-                proj: comp_linear(lm_head),
-            },
-            dims: ModelDims {
-                dim: cfg.dim,
-                q_dim,
-                kv_dim,
-                qkv_dim: q_dim + 2 * kv_dim,
-                intermediate_size: cfg.intermediate_size,
-                vocab_size: cfg.vocab_size,
-                head_num: cfg.head_num,
-                head_dim: cfg.head_dim,
-                kv_head_num: cfg.kv_head_num,
-                num_layers: cfg.layer_num,
-                num_experts: 0,
-                experts_per_tok: 0,
-                moe_intermediate_size: 0,
-                num_shared_experts: 0,
-            },
-            scratch: None,
-        })
-    }
-}
-
-fn comp_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
-    l: Linear<T, D>,
-) -> CompLinear<T, D> {
-    CompLinear::new(l.weight, l.bias)
-}
-
-fn comp_rms<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
-    r: RMSNorm<T, D>,
-) -> CompRmsNorm<T, D> {
-    CompRmsNorm {
-        weight: r.weight,
-        eps: r.eps,
     }
 }
 
@@ -723,7 +608,7 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
 ///
 /// Actually stored as [max_seq_len, head_dim/2] for half-dim RoPE variant
 /// (matching our rope_inplace kernel which processes pairs).
-fn compute_rope_cache<T: Dtype, D: OpBackend>(
+pub(crate) fn compute_rope_cache<T: Dtype, D: OpBackend>(
     max_seq_len: usize,
     head_dim: usize,
     theta: f64,

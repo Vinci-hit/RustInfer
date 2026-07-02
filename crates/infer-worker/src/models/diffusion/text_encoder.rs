@@ -148,7 +148,7 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                 cfg.norm_eps,
             )?;
             // Build fused QKV [q_dim+2*kv_dim, dim] from individual q/k/v_proj.
-            let qkv_proj = loader.load_fused_qkv::<T, Cuda>(i, q_dim, kv_dim, dim, device)?;
+            let qkv_proj = loader.load_fused_qkv::<T, Cuda>(&prefix, q_dim, kv_dim, dim, device)?;
             let o_proj = loader.load_linear::<T, Cuda>(
                 &format!("{}.self_attn.o_proj.weight", prefix),
                 None,
@@ -165,7 +165,7 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                 cfg.norm_eps,
             )?;
             // Fused gate_up [2*inter, dim] from gate/up_proj.
-            let gate_up_proj = loader.load_fused_gate_up::<T, Cuda>(i, inter, dim, device)?;
+            let gate_up_proj = loader.load_fused_gate_up::<T, Cuda>(&prefix, inter, dim, device)?;
             let down_proj = loader.load_linear::<T, Cuda>(
                 &format!("{}.mlp.down_proj.weight", prefix),
                 None,

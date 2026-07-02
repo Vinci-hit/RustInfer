@@ -276,12 +276,13 @@ impl RustInferConfig {
     }
 }
 
-/// Resolve the internal model type (`"llama3"` / `"qwen3"`) from a model
-/// directory's `config.json`.
+/// Resolve the internal model type (`"llama3"` / `"qwen3"` / `"qwen3_5"`) from a
+/// model directory's `config.json`.
 ///
 /// Reads the HuggingFace `model_type` field, falling back to
-/// `architectures[0]`. Returns `"qwen3"` when the hint contains `"qwen"`,
-/// otherwise `"llama3"`.
+/// `architectures[0]`. The mapping itself is pure ([`classify_model_type`]) so
+/// it can be unit-tested without touching the filesystem; this wrapper adds the
+/// I/O and the visible fallback warning.
 pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
     let cfg_path = Path::new(model_path).join("config.json");
     let bytes =
@@ -303,9 +304,7 @@ pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
         .unwrap_or_default()
         .to_lowercase();
 
-    let resolved = if hint.contains("qwen") {
-        "qwen3"
-    } else {
+    let resolved = classify_model_type(&hint).unwrap_or_else(|| {
         // Unknown or missing architecture hint. We still default to the llama3
         // dispatch (the most common weights layout), but this is a frequent
         // source of "wrong template / wrong attention" confusion, so make the
@@ -325,6 +324,59 @@ pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
             );
         }
         "llama3"
-    };
+    });
     Ok(resolved.to_string())
+}
+
+/// Pure hint → internal model-type mapping. `hint` is a lowercased
+/// `model_type`/`architectures[0]` string. Returns `None` when nothing matches
+/// so the caller can apply the visible llama3 fallback.
+///
+/// Order matters: `qwen3_5` is a superset hint of `qwen`, so it must be tested
+/// **before** the generic `qwen → qwen3` arm, otherwise every Qwen3.5 model
+/// would silently dispatch as plain Qwen3 (wrong attention: it has a hybrid
+/// Gated-DeltaNet / full-attention stack, not homogeneous full attention).
+fn classify_model_type(hint: &str) -> Option<&'static str> {
+    // `model_type = "qwen3_5"`, arch `"Qwen3_5ForConditionalGeneration"` (also
+    // matches the nested text `model_type = "qwen3_5_text"`).
+    if hint.contains("qwen3_5") {
+        Some("qwen3_5")
+    } else if hint.contains("qwen") {
+        Some("qwen3")
+    } else if hint.contains("llama") {
+        Some("llama3")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod model_type_tests {
+    use super::classify_model_type;
+
+    #[test]
+    fn qwen3_5_beats_generic_qwen() {
+        // Both the top-level model_type and the arch string must resolve to the
+        // hybrid dispatch, not plain qwen3.
+        assert_eq!(classify_model_type("qwen3_5"), Some("qwen3_5"));
+        assert_eq!(
+            classify_model_type("qwen3_5forconditionalgeneration"),
+            Some("qwen3_5")
+        );
+        assert_eq!(classify_model_type("qwen3_5_text"), Some("qwen3_5"));
+    }
+
+    #[test]
+    fn plain_qwen_and_llama_unchanged() {
+        assert_eq!(classify_model_type("qwen3"), Some("qwen3"));
+        assert_eq!(classify_model_type("qwen2"), Some("qwen3"));
+        assert_eq!(classify_model_type("llamaforcausallm"), Some("llama3"));
+        assert_eq!(classify_model_type("llama"), Some("llama3"));
+    }
+
+    #[test]
+    fn unknown_hint_falls_through() {
+        assert_eq!(classify_model_type(""), None);
+        assert_eq!(classify_model_type("mistral"), None);
+    }
 }
