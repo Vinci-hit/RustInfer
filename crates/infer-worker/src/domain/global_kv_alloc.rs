@@ -229,54 +229,47 @@ impl GlobalKvAllocator {
         debug_assert_eq!(w, i);
     }
 
-    /// P0: Release builds skip the expensive O(n²) `released.contains()`
-    /// and `binary_search` checks. Debug builds retain full validation.
-    fn sanitize_returned_indices(&self, indices: &[u32], _op: &str) -> Vec<u32> {
+    /// Filter out-of-range, already-free, and already-released indices.
+    /// A double-freed index silently duplicates a slot in the pool and the
+    /// next alloc hands the same KV slot to two sequences — validation runs
+    /// in release builds too. Cost per index: O(log n) `binary_search` on
+    /// the sorted free pool plus O(m) over the (in practice empty)
+    /// `released` list — negligible next to the O(n) merge in `free()`.
+    fn sanitize_returned_indices(&self, indices: &[u32], op: &str) -> Vec<u32> {
         let mut returned = indices.to_vec();
         returned.sort_unstable();
         returned.dedup();
 
-        #[cfg(debug_assertions)]
-        {
-            let mut valid = Vec::with_capacity(returned.len());
-            for idx in returned {
-                if idx >= self.total {
-                    tracing::warn!(
-                        "[kv-alloc] ignoring {} index out of range: idx={} total={}",
-                        _op,
-                        idx,
-                        self.total
-                    );
-                    continue;
-                }
-                if self.free[self.head..].binary_search(&idx).is_ok() {
-                    tracing::warn!(
-                        "[kv-alloc] ignoring {} index that is already free: idx={}",
-                        _op,
-                        idx
-                    );
-                    continue;
-                }
-                if self.released.contains(&idx) {
-                    tracing::warn!(
-                        "[kv-alloc] ignoring {} index that is already released: idx={}",
-                        _op,
-                        idx
-                    );
-                    continue;
-                }
-                valid.push(idx);
+        let mut valid = Vec::with_capacity(returned.len());
+        for idx in returned {
+            if idx >= self.total {
+                tracing::warn!(
+                    "[kv-alloc] ignoring {} index out of range: idx={} total={}",
+                    op,
+                    idx,
+                    self.total
+                );
+                continue;
             }
-            return valid;
+            if self.free[self.head..].binary_search(&idx).is_ok() {
+                tracing::warn!(
+                    "[kv-alloc] ignoring {} index that is already free: idx={}",
+                    op,
+                    idx
+                );
+                continue;
+            }
+            if self.released.contains(&idx) {
+                tracing::warn!(
+                    "[kv-alloc] ignoring {} index that is already released: idx={}",
+                    op,
+                    idx
+                );
+                continue;
+            }
+            valid.push(idx);
         }
-
-        #[cfg(not(debug_assertions))]
-        {
-            // Fast path: only filter out-of-range (O(n)), skip the expensive
-            // free-list and released-list searches.
-            returned.retain(|&idx| idx < self.total);
-            returned
-        }
+        valid
     }
 
     /// Move indices to the released holding list (real-time recycling mode).
