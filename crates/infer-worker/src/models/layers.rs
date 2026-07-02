@@ -34,27 +34,6 @@ impl<T: Dtype, D: CoreOps> Linear<T, D> {
     }
 }
 
-/// Quantized linear layer (AWQ int4): output = dequant(input × weight_packed)
-pub struct QuantLinear<A: Dtype, W: Dtype, D: CoreOps> {
-    pub weight_packed: Tensor<W, D>,
-    pub scales: Tensor<A, D>,
-    pub zeros: Option<Tensor<W, D>>,
-    pub group_size: usize,
-}
-
-impl<A: Dtype, W: Dtype, D: CoreOps> QuantLinear<A, W, D> {
-    pub fn forward(&self, input: &Tensor<A, D>, output: &mut Tensor<A, D>) -> OpResult<()> {
-        D::matmul_quant(
-            input,
-            &self.weight_packed,
-            output,
-            &self.scales,
-            self.zeros.as_ref(),
-            self.group_size,
-        )
-    }
-}
-
 /// RMSNorm layer
 pub struct RMSNorm<T: Dtype, D: CoreOps> {
     pub weight: Tensor<T, D>,

@@ -323,7 +323,7 @@ impl infer_core::ports::MathOps for Cuda {
             output,
             scales,
             zeros,
-            scheme.group,
+            scheme,
         )
     }
 
@@ -1119,7 +1119,7 @@ impl CoreOps for Cuda {
         output: &mut Tensor<O, Self>,
         scales: &Tensor<A, Self>,
         zeros: Option<&Tensor<W, Self>>,
-        group_size: usize,
+        scheme: &infer_core::dtype::quant::QuantScheme,
     ) -> OpResult<()> {
         kernels::matmul::matmul_quant(
             input.device().config.stream,
@@ -1128,7 +1128,7 @@ impl CoreOps for Cuda {
             output,
             scales,
             zeros,
-            group_size,
+            scheme,
         )
     }
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {

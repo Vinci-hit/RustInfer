@@ -9,8 +9,6 @@ use safetensors::tensor::TensorView;
 
 use super::decoder::Decoder;
 use super::layers::{Embedding, Linear, RMSNorm};
-use super::llama3::Llama3Model;
-use super::qwen3::Qwen3Model;
 use crate::components::{
     Attention, DecoderBlock, DenseFfn, Embed, Linear as CompLinear, LmHead, RmsNorm as CompRmsNorm,
 };
@@ -391,10 +389,12 @@ impl<'a> WeightLoader<'a> {
         Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None))
     }
 
-    /// Build the shared dense decoder. Per-block Q/K norms are populated when
-    /// the weights contain them (Qwen3) and left absent otherwise (Llama3), so
-    /// one builder backs both `load_llama3` and `load_qwen3`.
-    fn build_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+    /// Load the shared decoder for any supported family. Per-block Q/K norms are
+    /// populated when the weights contain them (Qwen3) and left absent otherwise
+    /// (Llama3), and the MLP is dense or int4 by `cfg.mlp_quant` — every
+    /// family-specific difference is decided by the weights/config here, so a
+    /// single loader backs all decoder models with no architecture branch above.
+    pub fn load_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
         &self,
         cfg: &LoadConfig,
         device: &D,
@@ -546,25 +546,6 @@ impl<'a> WeightLoader<'a> {
             },
             scratch: None,
         })
-    }
-
-    /// Load a complete Llama3 model (no per-block Q/K norms).
-    pub fn load_llama3<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
-        &self,
-        cfg: &LoadConfig,
-        device: &D,
-    ) -> OpResult<Llama3Model<T, D>> {
-        self.build_decoder(cfg, device)
-    }
-
-    /// Load a complete Qwen3 model. Per-block Q/K RMSNorms are populated when
-    /// present in the weights.
-    pub fn load_qwen3<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
-        &self,
-        cfg: &LoadConfig,
-        device: &D,
-    ) -> OpResult<Qwen3Model<T, D>> {
-        self.build_decoder(cfg, device)
     }
 }
 

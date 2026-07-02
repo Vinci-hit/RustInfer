@@ -142,6 +142,50 @@ fn derive_mlp_quant(cfg: &HfConfig) -> Option<QuantScheme> {
     None
 }
 
+/// Resolve the stop-token ids for a checkpoint. EOS is an attribute of the
+/// model's config, not of its architecture family, so we read it rather than
+/// hardcoding per `model_type`:
+///   1. `generation_config.json` `eos_token_id` (scalar or array) — authoritative
+///   2. `config.json` `eos_token_id` (scalar or array)
+///   3. an architecture-keyed default, with a warning (config-less checkpoints)
+fn read_eos_ids(model_path: &str, model_type: &str) -> Vec<i32> {
+    // Pull `eos_token_id` from one JSON file: accepts an int or an int array.
+    fn eos_from(path: &Path) -> Option<Vec<i32>> {
+        let bytes = std::fs::read(path).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let e = v.get("eos_token_id")?;
+        if let Some(n) = e.as_i64() {
+            Some(vec![n as i32])
+        } else if let Some(arr) = e.as_array() {
+            let ids: Vec<i32> = arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect();
+            (!ids.is_empty()).then_some(ids)
+        } else {
+            None
+        }
+    }
+
+    let dir = Path::new(model_path);
+    if let Some(ids) = eos_from(&dir.join("generation_config.json")) {
+        return ids;
+    }
+    if let Some(ids) = eos_from(&dir.join("config.json")) {
+        return ids;
+    }
+
+    // No config eos — fall back on an architecture default, but say so, since a
+    // wrong stop-token set silently produces run-on or truncated generations.
+    let default = match model_type {
+        "qwen3" => vec![151643, 151645], // <|endoftext|>, <|im_end|>
+        _ => vec![128001, 128008, 128009], // Llama 3.x default
+    };
+    eprintln!(
+        "[bootstrap] no eos_token_id in generation_config.json/config.json; \
+         falling back to {} default {:?}",
+        model_type, default
+    );
+    default
+}
+
 #[derive(Debug, Deserialize)]
 struct HfRopeScaling {
     #[serde(default)]
@@ -195,63 +239,6 @@ fn parse_device_id(spec: &str) -> Result<i32, String> {
     suffix
         .parse()
         .map_err(|e: std::num::ParseIntError| format!("invalid device id: {}", e))
-}
-
-macro_rules! dispatch_worker_model {
-    (
-        model_type = $model_type:expr,
-        loader = $loader:expr,
-        load_cfg = $load_cfg:expr,
-        cuda = $cuda:expr,
-        control = $control:expr,
-        data = $data:expr,
-        bootstrap = $bootstrap:expr,
-        eos_ids = $eos_ids:expr,
-        profile_cuda_steps = $profile_cuda_steps:expr,
-        load_start = $load_start:expr,
-        shipped { $( $arch:literal => $load_method:ident ),+ $(,)? },
-        default => $default_method:ident
-    ) => {{
-        match $model_type.as_str() {
-            $(
-                $arch => {
-                    let model = $loader
-                        .$load_method::<bf16, Cuda>($load_cfg, $cuda)
-                        .map_err(|e| format!("{}: {:?}", stringify!($load_method), e))?;
-                    eprintln!(
-                        "[bootstrap] weights loaded in {:.2}s",
-                        $load_start.elapsed().as_secs_f32()
-                    );
-                    run_with_model(
-                        $control,
-                        $data,
-                        model,
-                        $bootstrap,
-                        $eos_ids,
-                        $profile_cuda_steps,
-                    )?;
-                }
-            )+
-            _ => {
-                let model = $loader
-                    .$default_method::<bf16, Cuda>($load_cfg, $cuda)
-                    .map_err(|e| format!("{}: {:?}", stringify!($default_method), e))?;
-                eprintln!(
-                    "[bootstrap] weights loaded in {:.2}s",
-                    $load_start.elapsed().as_secs_f32()
-                );
-                run_with_model(
-                    $control,
-                    $data,
-                    model,
-                    $bootstrap,
-                    $eos_ids,
-                    $profile_cuda_steps,
-                )?;
-            }
-        }
-        Ok::<(), String>(())
-    }};
 }
 
 fn main() -> Result<(), String> {
@@ -383,26 +370,27 @@ fn main() -> Result<(), String> {
         model_type: model_type.clone(),
         capture_sizes: cfg.capture_sizes.clone(),
     };
-    let eos_ids: Vec<i32> = match model_type.as_str() {
-        "qwen3" => vec![151643, 151645],   // <|endoftext|>, <|im_end|>
-        _ => vec![128001, 128008, 128009], // Llama 3.x default
-    };
+    let eos_ids: Vec<i32> = read_eos_ids(&load.model_path, &model_type);
 
-    dispatch_worker_model!(
-        model_type = model_type,
-        loader = loader,
-        load_cfg = &load_cfg,
-        cuda = &cuda,
-        control = &control,
-        data = &data,
-        bootstrap = bootstrap,
-        eos_ids = &eos_ids,
-        profile_cuda_steps = args.profile_cuda_steps,
-        load_start = load_start,
-        shipped {
-            "qwen3" => load_qwen3,
-        },
-        default => load_llama3
+    // One loader backs every decoder family: `load_decoder` builds the shared
+    // `Decoder`, and per-family differences (e.g. Qwen3's Q/K norms) are already
+    // resolved inside it by weight presence — so there is nothing to dispatch on.
+    // `model_type` still rides along in `bootstrap`/`send_ready` for logging and
+    // the server's chat-template selection.
+    let model = loader
+        .load_decoder::<bf16, Cuda>(&load_cfg, &cuda)
+        .map_err(|e| format!("load_decoder: {:?}", e))?;
+    eprintln!(
+        "[bootstrap] weights loaded in {:.2}s",
+        load_start.elapsed().as_secs_f32()
+    );
+    run_with_model(
+        &control,
+        &data,
+        model,
+        bootstrap,
+        &eos_ids,
+        args.profile_cuda_steps,
     )?;
 
     Ok(())

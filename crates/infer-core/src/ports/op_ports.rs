@@ -1,5 +1,6 @@
 use super::device::MemoryPort;
 use super::error::OpResult;
+use infer_core::dtype::quant::QuantScheme;
 use infer_core::tensor::Tensor;
 use infer_core::types::{Dtype, Shape};
 
@@ -57,13 +58,18 @@ pub trait CoreOps: MemoryPort {
     /// Quantized matmul: activation A × weight W → output O
     /// A: activation dtype, W: weight dtype (e.g. i8, i4-packed-as-i32), O: output dtype
     /// Supports mixed-precision: bf16 activation × int8 weight → bf16 output
+    ///
+    /// The full [`QuantScheme`] rides along (not just the group size) so the
+    /// packing format is the weight's own attribute: the backend derives the
+    /// logical-per-word factor from `scheme.packing` instead of hardcoding it,
+    /// and rejects a packing it does not implement rather than mis-decoding.
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         input: &Tensor<A, Self>,
         weight: &Tensor<W, Self>,
         output: &mut Tensor<O, Self>,
         scales: &Tensor<A, Self>,
         zeros: Option<&Tensor<W, Self>>,
-        group_size: usize,
+        scheme: &QuantScheme,
     ) -> OpResult<()>;
 
     // ─── Activations ─────────────────────────────────────────────────

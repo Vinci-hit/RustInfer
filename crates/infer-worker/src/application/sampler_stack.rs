@@ -154,39 +154,6 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
     }
 }
 
-pub struct ChainSampler;
-impl<T: Dtype, D: LlmBackend> Sampler<T, D> for ChainSampler {
-    fn sample(
-        &self,
-        logits: &Tensor<T, D>,
-        params: &[SamplingParams],
-        ctx: &StepCtx<'_, D>,
-    ) -> OpResult<SampleBatch> {
-        GreedySampler.sample(logits, params, ctx)
-    }
-
-    fn probs(
-        &self,
-        logits: &Tensor<T, D>,
-        params: &[SamplingParams],
-        out: &mut Tensor<f32, D>,
-        ctx: &StepCtx<'_, D>,
-    ) -> OpResult<()> {
-        GreedySampler.probs(logits, params, out, ctx)
-    }
-
-    fn verify(
-        &self,
-        target_logits: &Tensor<T, D>,
-        draft_tokens: &[i32],
-        draft_probs: &Tensor<f32, D>,
-        params: &[SamplingParams],
-        ctx: &StepCtx<'_, D>,
-    ) -> OpResult<AcceptReject> {
-        GreedySampler.verify(target_logits, draft_tokens, draft_probs, params, ctx)
-    }
-}
-
 fn sampled_rows(plan: &crate::domain::plan::BatchPlan) -> Vec<usize> {
     let mut rows = Vec::with_capacity(plan.batch);
     let mut offset = 0usize;

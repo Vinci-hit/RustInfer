@@ -172,11 +172,12 @@ pub fn matmul<T: Dtype>(
 
 /// AWQ int4 quantized matmul.
 /// - input: activation [M, K] (A dtype, typically bf16)
-/// - weight_packed: [N, K/8] (W dtype, i32 — 8 int4 values packed)
+/// - weight_packed: [N, K/per_word] (W dtype, i32 — `per_word` int4 values packed)
 /// - scales: [N, num_groups] (A dtype)
 /// - zeros: [N/8, num_groups] (W dtype, i32 packed)
 /// - output: [M, N] (O dtype, typically bf16)
-/// - group_size: quantization group size (e.g. 128)
+/// - scheme: quantization scheme — `group` (e.g. 128) and `packing` (must be
+///   `AwqInt4` for this build; `logical_per_word()` gives the pack factor)
 pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
     stream: cudaStream_t,
     input: &Tensor<A, Cuda>,
@@ -184,11 +185,23 @@ pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
     output: &mut Tensor<O, Cuda>,
     scales: &Tensor<A, Cuda>,
     zeros: Option<&Tensor<W, Cuda>>,
-    group_size: usize,
+    scheme: &infer_core::dtype::quant::QuantScheme,
 ) -> OpResult<()> {
+    use infer_core::dtype::quant::Packing;
+    // This build ships the AWQ int4 kernels (kpack_gemv/kpack_gemm). Reject any
+    // other packing loudly instead of silently mis-decoding K — the packing is
+    // an attribute of the scheme, so the per-word factor comes from it.
+    if scheme.packing != Packing::AwqInt4 {
+        return Err(OpError::Kernel(format!(
+            "matmul_quant: unsupported packing {:?} (this build supports AwqInt4)",
+            scheme.packing
+        )));
+    }
+    let per_word = scheme.logical_per_word(); // 8 int4 per int32 word
+    let group_size = scheme.group;
     let wp_shape = weight_packed.shape().as_slice();
     let n = wp_shape[0];
-    let k = wp_shape[1] * 8; // 8 int4 per int32
+    let k = wp_shape[1] * per_word;
     let m = input.shape().as_slice()[0];
 
     let zeros_ptr = zeros.map_or(std::ptr::null(), |z| z.data_ptr() as *const _);

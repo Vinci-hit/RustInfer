@@ -224,9 +224,12 @@ impl CoreOps for Cpu {
         output: &mut Tensor<O, Self>,
         scales: &Tensor<A, Self>,
         _zeros: Option<&Tensor<W, Self>>,
-        group_size: usize,
+        scheme: &infer_core::dtype::quant::QuantScheme,
     ) -> OpResult<()> {
-        // CPU reference: dequantize weight per group, then matmul
+        // CPU reference: dequantize weight per group, then matmul. The weight is
+        // stored already-expanded `[N, K]` here (not bit-packed), so the packing
+        // factor is 1 for this reference path; only the group size matters.
+        let group_size = scheme.group;
         let m = input.shape().as_slice()[0];
         let k = input.shape().as_slice()[1];
         let n = weight.shape().as_slice()[0];
@@ -913,25 +916,35 @@ impl DiffusionOps for Cpu {
 
 // ─── Generic numeric helpers ─────────────────────────────────────────────────
 
+// The f64 round-trip is a *capability of the dtype*, not of this backend:
+// `infer_core::dtype::Dtype` already defines correct `read_f64`/`write_f64` for
+// every concrete type (including i32/i8, which the old hand-rolled match here
+// silently zeroed with a `_ => 0.0` arm). So we only translate the runtime
+// `DataType` tag to the concrete type and delegate. The match is exhaustive over
+// `DataType` — adding a variant is a compile error, never a silent wrong value.
 #[inline]
 unsafe fn read_f64<T: Dtype>(ptr: *const T) -> f64 {
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, T::SIZE_BYTES) };
+    use infer_core::dtype::Dtype as NumDtype;
+    // `ptr` points at a contiguous `T`, and `T::DATA_TYPE` fixes its layout, so
+    // reinterpreting to the matching concrete type is aligned and valid.
     match T::DATA_TYPE {
-        DataType::F32 => f64::from(f32::from_le_bytes(bytes[..4].try_into().unwrap())),
-        DataType::BF16 => f64::from(bf16::from_le_bytes(bytes[..2].try_into().unwrap()).to_f32()),
-        DataType::F16 => f64::from(f16::from_le_bytes(bytes[..2].try_into().unwrap()).to_f32()),
-        _ => 0.0,
+        DataType::F32 => NumDtype::read_f64(unsafe { &*(ptr as *const f32) }),
+        DataType::BF16 => NumDtype::read_f64(unsafe { &*(ptr as *const bf16) }),
+        DataType::F16 => NumDtype::read_f64(unsafe { &*(ptr as *const f16) }),
+        DataType::I32 => NumDtype::read_f64(unsafe { &*(ptr as *const i32) }),
+        DataType::I8 => NumDtype::read_f64(unsafe { &*(ptr as *const i8) }),
     }
 }
 
 #[inline]
 unsafe fn write_f64<T: Dtype>(ptr: *mut T, val: f64) {
-    let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, T::SIZE_BYTES) };
+    use infer_core::dtype::Dtype as NumDtype;
     match T::DATA_TYPE {
-        DataType::F32 => dst.copy_from_slice(&(val as f32).to_le_bytes()),
-        DataType::BF16 => dst.copy_from_slice(&bf16::from_f64(val).to_le_bytes()),
-        DataType::F16 => dst.copy_from_slice(&f16::from_f64(val).to_le_bytes()),
-        _ => {}
+        DataType::F32 => unsafe { *(ptr as *mut f32) = NumDtype::write_f64(val) },
+        DataType::BF16 => unsafe { *(ptr as *mut bf16) = NumDtype::write_f64(val) },
+        DataType::F16 => unsafe { *(ptr as *mut f16) = NumDtype::write_f64(val) },
+        DataType::I32 => unsafe { *(ptr as *mut i32) = NumDtype::write_f64(val) },
+        DataType::I8 => unsafe { *(ptr as *mut i8) = NumDtype::write_f64(val) },
     }
 }
 
@@ -1059,6 +1072,25 @@ mod tests {
         assert!((r[0] - 0.0).abs() < 1e-6);
         assert!((r[1] - 0.7311).abs() < 0.001);
     }
+
+    #[test]
+    fn read_write_f64_handles_integer_dtypes() {
+        // Regression: the old hand-rolled match had `_ => 0.0` / `_ => {}`, so
+        // i32/i8 round-tripped as 0. Delegating to `infer_core::dtype::Dtype`
+        // must preserve integer values (not silently zero them).
+        for v in [0i32, 7, -13, 12345] {
+            let mut cell = v;
+            let got = unsafe { read_f64(&cell as *const i32) };
+            assert_eq!(got, v as f64, "i32 read_f64 must not zero {}", v);
+            unsafe { write_f64(&mut cell as *mut i32, 99.0) };
+            assert_eq!(cell, 99, "i32 write_f64 must round-trip");
+        }
+        let mut b = -5i8;
+        assert_eq!(unsafe { read_f64(&b as *const i8) }, -5.0);
+        unsafe { write_f64(&mut b as *mut i8, 42.0) };
+        assert_eq!(b, 42);
+    }
+
 
     #[test]
     fn op_embedding() {

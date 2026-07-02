@@ -265,7 +265,7 @@ macro_rules! impl_math_ops_via_core_ops {
                     output,
                     scales,
                     zeros,
-                    scheme.group,
+                    scheme,
                 )
             }
 
