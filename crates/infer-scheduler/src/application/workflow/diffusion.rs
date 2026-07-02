@@ -78,7 +78,7 @@ impl EngineWorkflow for DiffusionWorkflow {
         let prefilling_view = ctx.requests.prefilling();
         let batch_data = self
             .planning
-            .build_batch(&prefilling_view, ctx.config, ctx.codec)?;
+            .build_diffusion_batch(&prefilling_view, ctx.codec)?;
 
         if !batch_data.is_empty() {
             if let Some(first) = prefilling_view.first() {

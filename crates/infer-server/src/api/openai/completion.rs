@@ -12,6 +12,7 @@ use crate::client::InferClient;
 use crate::error::AppError;
 use crate::state::SharedState;
 
+use super::shared;
 use super::streaming;
 use super::types::*;
 
@@ -52,22 +53,10 @@ pub async fn completions(
 
     // 3. 构建 InferenceRequest
     //
-    // vLLM 语义：未传 max_tokens 时默认为 max_model_len - prompt_len；
-    // 传了也会被 cap 到该上限。否则 worker 解到 prompt+max_tokens > max_seq_len
-    // 会在 SeqStep validate 处抛 kv_len_after > max。
-    let max_model_len = state.config.max_model_len;
-    let prompt_len_usize = prompt_tokens as usize;
-    if prompt_len_usize >= max_model_len {
-        return Err(AppError::bad_request(format!(
-            "prompt_tokens {} exceeds max_model_len {}",
-            prompt_len_usize, max_model_len
-        )));
-    }
-    let remaining = max_model_len - prompt_len_usize;
-    let effective_max_tokens = match req.max_tokens {
-        Some(n) => n.min(remaining),
-        None => remaining,
-    };
+    // vLLM 语义：max_tokens 默认/上限均为 max_model_len - prompt_len。
+    // 详见 shared::cap_max_tokens。
+    let effective_max_tokens =
+        shared::cap_max_tokens(prompt_tokens, req.max_tokens, state.config.max_model_len)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         request_id: request_id.clone(),
@@ -116,28 +105,8 @@ pub async fn completions(
             .await
             .map_err(AppError::from_submit)?;
 
-        if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
-            return Err(AppError::internal(anyhow::anyhow!(
-                "Engine error: {}",
-                engine_resp.error.unwrap_or_else(|| "Unknown".to_string())
-            )));
-        }
-
-        // Decode
-        let output_ids_u32: Vec<u32> = engine_resp
-            .output_token_ids
-            .iter()
-            .map(|&id| id as u32)
-            .collect();
-        let generated_text = state
-            .tokenizer
-            .decode(&output_ids_u32, true)
-            .map_err(|e| AppError::internal(anyhow::anyhow!("Decode error: {}", e)))?;
-        let completion_tokens = engine_resp.output_token_ids.len() as u32;
-
-        let finish_reason = engine_resp
-            .finish_reason
-            .unwrap_or_else(|| "stop".to_string());
+        let (generated_text, completion_tokens, finish_reason) =
+            shared::decode_completion(&state.tokenizer, engine_resp)?;
 
         let response = CompletionResponse {
             id: format!("cmpl-{}", request_id),
@@ -172,51 +141,7 @@ fn validate_request(req: &CompletionRequest) -> Result<(), AppError> {
         }
         _ => {}
     }
-
-    if let Some(temp) = req.temperature
-        && (!(0.0..=2.0).contains(&temp))
-    {
-        return Err(AppError::bad_request("temperature must be between 0 and 2"));
-    }
-
-    if let Some(top_p) = req.top_p
-        && !(0.0..=1.0).contains(&top_p)
-    {
-        return Err(AppError::bad_request("top_p must be between 0 and 1"));
-    }
-
-    if let Some(max_tokens) = req.max_tokens
-        && max_tokens == 0
-    {
-        return Err(AppError::bad_request("max_tokens must be greater than 0"));
-    }
-
-    reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
-
-    Ok(())
-}
-
-fn reject_unsupported_sampling(
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    seed: Option<u64>,
-) -> Result<(), AppError> {
-    if let Some(value) = frequency_penalty
-        && value != 0.0
-    {
-        return Err(AppError::bad_request(
-            "frequency_penalty is not supported yet",
-        ));
-    }
-    if let Some(value) = presence_penalty
-        && value != 0.0
-    {
-        return Err(AppError::bad_request(
-            "presence_penalty is not supported yet",
-        ));
-    }
-    if seed.is_some() {
-        return Err(AppError::bad_request("seed is not supported for LLM yet"));
-    }
+    shared::validate_sampling(req.temperature, req.top_p, req.max_tokens)?;
+    shared::reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
     Ok(())
 }

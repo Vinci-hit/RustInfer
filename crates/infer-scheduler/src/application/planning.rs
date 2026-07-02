@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::{SchedulerConfig, SchedulerMode};
+use crate::config::SchedulerConfig;
 use crate::domain::inference_session::lifecycle::{InferenceSession, Prefilling, RequestId};
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::inference_session::table::{Bucket, PrefillStartOutcome, RequestTable};
@@ -213,29 +213,33 @@ impl PlanningSystem {
             .sum()
     }
 
-    /// Build the worker batch command for the current iteration, reusing the
-    /// builder's internal staging buffers. Dispatches by mode: LLM emits
-    /// prefill segments (decoding is the worker's job); Diffusion emits the
-    /// per-request batch. The scheduled chunk sizes and prefix hints captured
-    /// by `execute_plan` ride along.
-    pub fn build_batch(
+    /// Build the LLM prefill batch for the current iteration, reusing the
+    /// builder's internal staging buffers. The scheduled chunk sizes and prefix
+    /// hints captured by `execute_plan` ride along. Called only from
+    /// `LlmWorkflow` — the mode is fixed by the caller, not re-tested here.
+    pub fn build_llm_batch(
         &mut self,
         prefilling: &[&InferenceSession<Prefilling>],
         config: &SchedulerConfig,
         codec: &MsgPackCodec,
     ) -> Result<Vec<u8>> {
-        match config.mode {
-            SchedulerMode::Llm => self.builder.build_llm_batch(
-                prefilling,
-                config,
-                codec,
-                &self.current_chunk_sizes,
-                &self.current_prefix_hints,
-            ),
-            SchedulerMode::Diffusion => {
-                self.builder
-                    .build_diffusion_batch(prefilling, codec, &self.current_chunk_sizes)
-            }
-        }
+        self.builder.build_llm_batch(
+            prefilling,
+            config,
+            codec,
+            &self.current_chunk_sizes,
+            &self.current_prefix_hints,
+        )
+    }
+
+    /// Build the Diffusion per-request batch for the current iteration. Called
+    /// only from `DiffusionWorkflow`.
+    pub fn build_diffusion_batch(
+        &mut self,
+        prefilling: &[&InferenceSession<Prefilling>],
+        codec: &MsgPackCodec,
+    ) -> Result<Vec<u8>> {
+        self.builder
+            .build_diffusion_batch(prefilling, codec, &self.current_chunk_sizes)
     }
 }

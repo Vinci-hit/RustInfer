@@ -14,6 +14,7 @@ use crate::error::AppError;
 use crate::state::SharedState;
 use std::time::Instant;
 
+use super::shared;
 use super::streaming;
 use super::types::*;
 
@@ -57,25 +58,11 @@ pub async fn chat_completions(
 
     // 4. 构建 InferenceRequest
     //
-    // vLLM 语义对齐：当 client 不传 max_tokens 时，vLLM 默认 max_tokens =
-    // max_model_len - prompt_len（见 vllm/entrypoints/openai/serving_chat.py
-    // 中的 _get_max_tokens 逻辑）。即使 client 传了 max_tokens，vLLM 也会把
-    // 它 cap 到 max_model_len - prompt_len 以保证 prompt+output ≤ ctx 窗口。
-    // 这里不对齐就会让 ignore_eos 测试解到 prompt+512 token，触发 worker
-    // SeqStep validate 的 kv_len_after > max_seq_len。
-    let max_model_len = state.config.max_model_len;
-    let prompt_len_usize = prompt_tokens as usize;
-    if prompt_len_usize >= max_model_len {
-        return Err(AppError::bad_request(format!(
-            "prompt_tokens {} exceeds max_model_len {}",
-            prompt_len_usize, max_model_len
-        )));
-    }
-    let remaining = max_model_len - prompt_len_usize;
-    let effective_max_tokens = match req.max_tokens {
-        Some(n) => n.min(remaining),
-        None => remaining,
-    };
+    // vLLM 语义对齐：max_tokens 默认/上限均为 max_model_len - prompt_len，
+    // 保证 prompt+output ≤ ctx 窗口，否则 worker 的 SeqStep validate 会因
+    // kv_len_after > max_seq_len 而中止。详见 shared::cap_max_tokens。
+    let effective_max_tokens =
+        shared::cap_max_tokens(prompt_tokens, req.max_tokens, state.config.max_model_len)?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let tokenize_elapsed = request_start.elapsed();
     tracing::debug!(
@@ -144,30 +131,8 @@ pub async fn chat_completions(
             "chat response received"
         );
 
-        // 检查错误
-        if let infer_protocol::scheduler_to_server::ResponseStatus::Error = engine_resp.status {
-            return Err(AppError::internal(anyhow::anyhow!(
-                "Engine error: {}",
-                engine_resp.error.unwrap_or_else(|| "Unknown".to_string())
-            )));
-        }
-
-        // Decode output tokens → 文本
-        let output_ids_u32: Vec<u32> = engine_resp
-            .output_token_ids
-            .iter()
-            .map(|&id| id as u32)
-            .collect();
-        let generated_text = state
-            .tokenizer
-            .decode(&output_ids_u32, true)
-            .map_err(|e| AppError::internal(anyhow::anyhow!("Decode error: {}", e)))?;
-        let completion_tokens = engine_resp.output_token_ids.len() as u32;
-
-        // 确定 finish_reason
-        let finish_reason = engine_resp
-            .finish_reason
-            .unwrap_or_else(|| "stop".to_string());
+        let (generated_text, completion_tokens, finish_reason) =
+            shared::decode_completion(&state.tokenizer, engine_resp)?;
 
         // 构造 OpenAI 格式响应
         let response = ChatCompletionResponse {
@@ -199,51 +164,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
     if req.messages.is_empty() {
         return Err(AppError::bad_request("messages must not be empty"));
     }
-
-    if let Some(temp) = req.temperature
-        && (!(0.0..=2.0).contains(&temp))
-    {
-        return Err(AppError::bad_request("temperature must be between 0 and 2"));
-    }
-
-    if let Some(top_p) = req.top_p
-        && !(0.0..=1.0).contains(&top_p)
-    {
-        return Err(AppError::bad_request("top_p must be between 0 and 1"));
-    }
-
-    if let Some(max_tokens) = req.max_tokens
-        && max_tokens == 0
-    {
-        return Err(AppError::bad_request("max_tokens must be greater than 0"));
-    }
-
-    reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
-
-    Ok(())
-}
-
-fn reject_unsupported_sampling(
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    seed: Option<u64>,
-) -> Result<(), AppError> {
-    if let Some(value) = frequency_penalty
-        && value != 0.0
-    {
-        return Err(AppError::bad_request(
-            "frequency_penalty is not supported yet",
-        ));
-    }
-    if let Some(value) = presence_penalty
-        && value != 0.0
-    {
-        return Err(AppError::bad_request(
-            "presence_penalty is not supported yet",
-        ));
-    }
-    if seed.is_some() {
-        return Err(AppError::bad_request("seed is not supported for LLM yet"));
-    }
+    shared::validate_sampling(req.temperature, req.top_p, req.max_tokens)?;
+    shared::reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
     Ok(())
 }

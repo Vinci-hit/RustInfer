@@ -507,37 +507,43 @@ impl SchedulerEngine {
 /// This is the key offload: MsgPack deserialization (which can be
 /// expensive for large step outputs) never blocks the main event
 /// loop.
+///
+/// The wire format is fixed by the mode for the whole task lifetime, so we
+/// resolve the per-message decoder once up front rather than re-matching
+/// `mode` on every message.
 async fn decode_worker_output(
     mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     decoded_tx: mpsc::UnboundedSender<SchedulerEvent>,
     mode: SchedulerMode,
 ) {
     let codec = MsgPackCodec;
+    let decode: fn(&MsgPackCodec, &[u8]) -> SchedulerEvent = match mode {
+        SchedulerMode::Llm => decode_llm_step,
+        SchedulerMode::Diffusion => decode_diffusion_step,
+    };
 
     while let Some(data) = raw_rx.recv().await {
-        let event = match mode {
-            SchedulerMode::Llm => {
-                match codec.decode::<infer_protocol::worker_to_scheduler_data::StepOutput>(&data) {
-                    Ok(output) => SchedulerEvent::WorkerLlmStep(output),
-                    Err(e) => SchedulerEvent::WorkerDecodeError(e.to_string()),
-                }
-            }
-            SchedulerMode::Diffusion => {
-                match codec
-                    .decode::<infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput>(&data)
-                {
-                    Ok(output) => SchedulerEvent::WorkerDiffusionStep(output),
-                    Err(e) => SchedulerEvent::WorkerDecodeError(e.to_string()),
-                }
-            }
-        };
-        if decoded_tx.send(event).is_err() {
+        if decoded_tx.send(decode(&codec, &data)).is_err() {
             // Engine dropped the receiver — shut down.
             break;
         }
     }
     // Raw channel closed — worker transport shut down.
     let _ = decoded_tx.send(SchedulerEvent::WorkerShutdown);
+}
+
+fn decode_llm_step(codec: &MsgPackCodec, data: &[u8]) -> SchedulerEvent {
+    match codec.decode::<infer_protocol::worker_to_scheduler_data::StepOutput>(data) {
+        Ok(output) => SchedulerEvent::WorkerLlmStep(output),
+        Err(e) => SchedulerEvent::WorkerDecodeError(e.to_string()),
+    }
+}
+
+fn decode_diffusion_step(codec: &MsgPackCodec, data: &[u8]) -> SchedulerEvent {
+    match codec.decode::<infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput>(data) {
+        Ok(output) => SchedulerEvent::WorkerDiffusionStep(output),
+        Err(e) => SchedulerEvent::WorkerDecodeError(e.to_string()),
+    }
 }
 
 /// Sleep until an optional absolute deadline.
