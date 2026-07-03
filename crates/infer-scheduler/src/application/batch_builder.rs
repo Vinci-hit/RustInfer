@@ -181,7 +181,14 @@ impl BatchBuilder {
                 prompt_len: seq.state.prompt_len as u32,
                 segment_start: start as u32,
                 segment_end: end as u32,
-                max_tokens: seq.meta.max_tokens,
+                // A resumed session's wire budget is the REMAINING generation:
+                // the resumed tokens already count against `meta.max_tokens`
+                // scheduler-side (they re-seed `output_tokens` at
+                // start_decode), and the worker counts generated tokens from
+                // this prefill onward.
+                max_tokens: seq.meta.max_tokens.saturating_sub(
+                    seq.state.resume.as_ref().map_or(0, |resume| resume.generated),
+                ),
                 sampling_params: WorkerSamplingParams {
                     temperature: seq.meta.sampling.temperature,
                     top_p: seq.meta.sampling.top_p,
@@ -257,6 +264,7 @@ mod tests {
                 }),
                 prompt_len: 4,
                 prefill_start: Instant::now(),
+                resume: None,
             },
         }
     }

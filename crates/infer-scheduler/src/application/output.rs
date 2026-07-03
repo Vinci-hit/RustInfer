@@ -98,6 +98,7 @@ mod tests {
                 inflight: None,
                 prompt_len: 4,
                 prefill_start: Instant::now(),
+                resume: None,
             },
         }
     }
@@ -110,6 +111,7 @@ mod tests {
                 output_tokens: output,
                 seq_position: 4,
                 prompt_len: 4,
+                original_prompt_len: 4,
                 first_token_time: Instant::now(),
                 preemption_count: 0,
             },

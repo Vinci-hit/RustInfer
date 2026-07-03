@@ -120,10 +120,28 @@ mod sealed {
 /// state machine cannot be extended by external crates.
 pub trait SessionState: sealed::Sealed {}
 
+/// State carried across a decode preemption so the re-prefilled session
+/// *resumes* generation instead of restarting it. At preempt time the
+/// generated tokens are appended to a fresh `meta.input_ids` (recompute
+/// preemption, vLLM-style), so every prompt reader — policy length, radix
+/// prefix lookup, batch slicing — sees `prompt ++ generated` with no special
+/// cases; this struct records where the original prompt ended and the timing
+/// state the resumed decode must not reset.
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeState {
+    /// Tokens generated before preemption — now the tail of `meta.input_ids`.
+    pub generated: usize,
+    /// Original first-token time: TTFT must survive the resume.
+    pub first_token_time: Instant,
+    pub preemption_count: u32,
+}
+
 /// Data for a queued (waiting) session.
 pub struct Queued {
     /// Prefix match result (computed on enqueue for cache-aware scheduling).
     pub prefix_match: Option<PrefixMatch>,
+    /// `Some` when re-queued by decode preemption (see [`ResumeState`]).
+    pub resume: Option<ResumeState>,
 }
 
 /// Data for a session actively being prefilled.
@@ -134,6 +152,8 @@ pub struct Prefilling {
     pub inflight: Option<InFlightPrefillSegment>,
     pub prompt_len: usize,
     pub prefill_start: Instant,
+    /// Carried through from a preempted session (see [`ResumeState`]).
+    pub resume: Option<ResumeState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +168,10 @@ pub struct Decoding {
     pub output_tokens: Vec<i32>,
     pub seq_position: usize,
     pub prompt_len: usize,
+    /// Length of the *client's* prompt. Equal to `prompt_len` for fresh
+    /// sessions; smaller after a resume, where `meta.input_ids` also carries
+    /// previously generated tokens. Preemption re-splits `input_ids` here.
+    pub original_prompt_len: usize,
     pub first_token_time: Instant,
     /// Number of times this session has been preempted by the worker
     /// under KV pressure. The current implementation does not yet
@@ -235,7 +259,10 @@ impl InferenceSession<Queued> {
         Self {
             meta,
             handle,
-            state: Queued { prefix_match: None },
+            state: Queued {
+                prefix_match: None,
+                resume: None,
+            },
         }
     }
 
@@ -250,6 +277,7 @@ impl InferenceSession<Queued> {
                 inflight: None,
                 prompt_len,
                 prefill_start: Instant::now(),
+                resume: self.state.resume,
             },
         }
     }
@@ -271,15 +299,42 @@ impl InferenceSession<Prefilling> {
         // `max_tokens` so very small `max_tokens=8` requests don't
         // over-allocate either.
         let initial_cap = self.meta.max_tokens.min(64);
+        let prompt_len = self.state.prompt_len;
+        // Resumed session: re-seed the output with the previously generated
+        // tokens (the tail of the extended `input_ids`), restore the original
+        // TTFT clock and preemption count, and remember where the client's
+        // prompt actually ended. The stream sent those tokens already; only
+        // tokens appended after this point produce new chunks.
+        let (output_tokens, first_token_time, preemption_count, original_prompt_len) =
+            match self.state.resume {
+                Some(resume) => {
+                    let seed_start = prompt_len.saturating_sub(resume.generated);
+                    let mut out = Vec::with_capacity(resume.generated.max(initial_cap));
+                    out.extend_from_slice(&self.meta.input_ids[seed_start..prompt_len]);
+                    (
+                        out,
+                        resume.first_token_time,
+                        resume.preemption_count,
+                        seed_start,
+                    )
+                }
+                None => (
+                    Vec::with_capacity(initial_cap),
+                    Instant::now(),
+                    0,
+                    prompt_len,
+                ),
+            };
         InferenceSession {
             meta: self.meta,
             handle: self.handle,
             state: Decoding {
-                output_tokens: Vec::with_capacity(initial_cap),
-                seq_position: self.state.prompt_len,
-                prompt_len: self.state.prompt_len,
-                first_token_time: Instant::now(),
-                preemption_count: 0,
+                output_tokens,
+                seq_position: prompt_len,
+                prompt_len,
+                original_prompt_len,
+                first_token_time,
+                preemption_count,
             },
         }
     }

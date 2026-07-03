@@ -141,6 +141,7 @@ fn prefilling_sequence() -> InferenceSession<Prefilling> {
             }),
             prompt_len: 4,
             prefill_start: Instant::now(),
+            resume: None,
         },
     }
 }

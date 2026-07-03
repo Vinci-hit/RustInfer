@@ -43,7 +43,7 @@ use slotmap::{SlotMap, new_key_type};
 use crate::domain::inference_session::handle::{ClientId, RequestHandle};
 use crate::domain::inference_session::lifecycle::{
     Decoding, InFlightPrefillSegment, InferenceSession, Prefilling, Queued, RequestId, RequestMeta,
-    SequenceId,
+    ResumeState, SequenceId,
 };
 use crate::domain::inference_session::queue::WaitingQueue;
 use crate::domain::prefix::PrefixMatch;
@@ -708,20 +708,19 @@ impl RequestTable {
     }
 
     /// Move an active sequence (Decoding or Prefilling) back to the
-    /// front of `waiting` as a fresh `Queued` state.
+    /// front of `waiting` as a `Queued` state that RESUMES on re-admission.
     ///
-    /// Decoding-bucket sequences also have `bump_preempted()` called
-    /// before the type-state flip, so the
-    /// `CompletionMetrics.num_preemptions` carries through to the
-    /// final response. Prefilling sessions don't carry that field —
-    /// metric is decoding-only by design.
+    /// Recompute preemption with resume (vLLM-style): a Decoding session's
+    /// generated tokens are appended to a fresh `meta.input_ids` (the Arc'd
+    /// meta is rebuilt once), so the re-prefill covers `prompt ++ generated`
+    /// and decode continues from the next unseen token. Without this, a
+    /// streaming client that already received chunks would silently get the
+    /// sequence regenerated from the prompt — duplicated and (with sampling)
+    /// divergent text. `Queued.resume` carries the token count, original TTFT
+    /// clock, and preemption count across the round trip.
     ///
-    /// On success the sequence is in the waiting queue (push_front so
-    /// it gets re-admitted ahead of fresh requests) with its
-    /// `prefix_match` reset to `None`. Output tokens / inflight
-    /// segment / num_computed_tokens are dropped — re-prefill restarts
-    /// from scratch using whatever RadixTree prefix hits the next
-    /// scheduling round finds.
+    /// Prefilling sessions re-queue with their (possibly already extended)
+    /// prompt intact and their `resume` passthrough — no tokens are lost.
     ///
     /// Returns `Err(Internal)` if the sequence is missing or in a
     /// non-active bucket.
@@ -742,10 +741,32 @@ impl RequestTable {
                     ))
                 })?;
                 seq.bump_preempted();
+                let generated = seq.state.output_tokens.len();
+                let meta = if generated > 0 {
+                    // Rebuild input_ids as original prompt ++ ALL generated
+                    // tokens. `output_tokens` already includes tokens from any
+                    // earlier resume (they were re-seeded at start_decode), so
+                    // truncate back to the client's prompt first — extending
+                    // the already-extended input would duplicate them.
+                    let mut m = (*seq.meta).clone();
+                    m.input_ids.truncate(seq.state.original_prompt_len);
+                    m.input_ids.extend_from_slice(&seq.state.output_tokens);
+                    Arc::new(m)
+                } else {
+                    seq.meta
+                };
+                let resume = (generated > 0).then_some(ResumeState {
+                    generated,
+                    first_token_time: seq.state.first_token_time,
+                    preemption_count: seq.state.preemption_count,
+                });
                 let queued = InferenceSession {
-                    meta: seq.meta,
+                    meta,
                     handle: seq.handle,
-                    state: Queued { prefix_match: None },
+                    state: Queued {
+                        prefix_match: None,
+                        resume,
+                    },
                 };
                 self.locations.insert(sequence_id, Address::waiting());
                 self.waiting.push_front(queued);
@@ -762,7 +783,10 @@ impl RequestTable {
                 let queued = InferenceSession {
                     meta: seq.meta,
                     handle: seq.handle,
-                    state: Queued { prefix_match: None },
+                    state: Queued {
+                        prefix_match: None,
+                        resume: seq.state.resume,
+                    },
                 };
                 self.locations.insert(sequence_id, Address::waiting());
                 self.waiting.push_front(queued);
@@ -1231,24 +1255,35 @@ mod tests {
 
         table.preempt_to_queued(SequenceId(7)).unwrap();
 
-        // Front of waiting now == preempted sequence.
+        // Front of waiting now == preempted sequence, with the generated
+        // token appended to the prompt (recompute-with-resume) and resume
+        // state recording it.
         let front = table.waiting().front().unwrap();
         assert_eq!(front.meta.sequence_id, SequenceId(7));
-        // Bumped preemption_count survives a full lifecycle (meta is Arc).
-        // Re-promote → Decode → Finish, and inspect num_preemptions.
+        assert_eq!(front.meta.input_ids.len(), 3, "prompt ++ generated");
+        assert_eq!(*front.meta.input_ids.last().unwrap(), 99);
+        let resume = front.state.resume.as_ref().expect("resume state present");
+        assert_eq!(resume.generated, 1);
+        assert_eq!(resume.preemption_count, 1);
+
+        // Re-promote over the EXTENDED prompt (3 tokens) → decode resumes
+        // with the prior output re-seeded.
         let queued = table.take_waiting(&req).unwrap();
-        table.commit_prefill_start(queued, no_prefix(), 2).unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 3).unwrap();
         let _ = table.ack_prefill(SequenceId(7)).unwrap();
-        // The counter resides on Decoding state; preempt-then-rebuild
-        // rebuilds Decoding starting at preemption_count=0. The bump
-        // we want to verify happened on the OLD Decoding before flip
-        // — confirmed by the front-of-waiting check above. The
-        // post-rebuild state is a fresh Decoding by design.
-        // Instead assert that another preempt round bumps cleanly.
         let _ = table
             .append_generated_token(SequenceId(7), 11, false)
             .unwrap();
         table.preempt_to_queued(SequenceId(7)).unwrap();
+
+        // Second preempt: input_ids must be original prompt ++ ALL generated
+        // ([.., 99, 11]) — NOT double-extended — and the counters advance.
+        let front = table.waiting().front().unwrap();
+        assert_eq!(front.meta.input_ids.len(), 4, "no duplicate resume tail");
+        assert_eq!(front.meta.input_ids[2..], [99, 11]);
+        let resume = front.state.resume.as_ref().expect("resume state present");
+        assert_eq!(resume.generated, 2);
+        assert_eq!(resume.preemption_count, 2);
         let _ = req_back; // keep alive
     }
 
