@@ -26,8 +26,9 @@
 //!   This is also where KV-pressure heartbeats from the worker
 //!   trigger RadixTree LRU eviction + `FreeKvIndices` replies.
 //!
-//! Plus the [`cancel`] free helpers and an internal `batch_builder`
-//! wire serializer used by `PlanningSystem`.
+//! Plus the [`cancel`] free helpers, the [`kv_reclaim`] KV-release owner
+//! (every termination path funnels through it), and an internal
+//! `batch_builder` wire serializer used by `PlanningSystem`.
 
 mod batch_builder;
 
@@ -37,6 +38,7 @@ pub mod dispatch;
 pub mod engine;
 pub mod event_loop;
 pub mod ingestion;
+pub mod kv_reclaim;
 pub mod outcomes;
 pub mod output;
 pub mod output_fns;

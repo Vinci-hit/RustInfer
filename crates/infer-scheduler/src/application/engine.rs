@@ -389,6 +389,7 @@ impl SchedulerEngine {
                 Ok(())
             }
             ControlOutcome::Terminate { error } => {
+                let msg = error.to_string();
                 let running: Vec<RequestId> = self
                     .requests
                     .running_sequence_ids()
@@ -396,8 +397,32 @@ impl SchedulerEngine {
                     .filter_map(|sid| self.requests.request_id_for_sequence(sid))
                     .collect();
                 if !running.is_empty() {
-                    let msg = error.to_string();
                     let _ = self.fail_request_ids(&running, &msg).await;
+                }
+                // Waiting sessions never reached the worker, but their clients
+                // are parked on live HTTP connections — fail them too, or they
+                // silently wait out the full request timeout against a dead
+                // engine. `fail_sequence` skips the Waiting bucket, so drain
+                // the queue directly.
+                let waiting_ids: Vec<RequestId> = self
+                    .requests
+                    .waiting()
+                    .iter()
+                    .map(|s| s.meta.id.clone())
+                    .collect();
+                for rid in waiting_ids {
+                    let Ok(seq) = self.requests.take_waiting(&rid) else {
+                        continue;
+                    };
+                    let _ = crate::application::output_fns::send_request_error(
+                        self.dispatch.frontend_mut(),
+                        seq.handle.client_id.clone(),
+                        seq.meta.external_id.clone(),
+                        seq.meta.stream,
+                        msg.clone(),
+                        0,
+                    )
+                    .await;
                 }
                 Err(error)
             }
@@ -461,6 +486,7 @@ impl SchedulerEngine {
             &mut self.kv_budget,
             &self.control_cmd,
             &self.default_worker,
+            &self.worker_group.model_instance_id,
             external_id,
             self.config.enable_prefix_caching,
         )

@@ -6,20 +6,19 @@
 //! borrow, keeping the `&mut requests` borrow here disjoint from the follow-up
 //! `&mut output`.
 
-use infer_protocol::scheduler_to_worker_control::{
-    FreeKvIndices, Preempt, SchedulerControlMessage,
-};
+use infer_protocol::scheduler_to_worker_control::{Preempt, SchedulerControlMessage};
 use infer_protocol::worker_to_scheduler_control::{AllocFailed, WorkerStepError};
 
 use crate::domain::inference_session::lifecycle::SequenceId;
 use crate::domain::inference_session::table::{PreemptCandidate, RequestTable, accounting};
 use crate::domain::kv_budget::KvBudget;
 use crate::error::SchedulerError;
-use crate::infrastructure::kv_cache::radix_tree::{GlobalIndex, RadixTree};
+use crate::infrastructure::kv_cache::radix_tree::RadixTree;
 use crate::infrastructure::transport::control_plane::{
     ControlEvent, ControlPlaneCmdTx, WorkerGroup, WorkerId,
 };
 
+use super::kv_reclaim::{KvReclaimer, SeqKv};
 use super::outcomes::ControlOutcome;
 
 /// P2: Context struct grouping the repeated parameters that every internal
@@ -33,6 +32,34 @@ struct ControlCtx<'a> {
     control_cmd: &'a ControlPlaneCmdTx,
     worker_group: &'a WorkerGroup,
     enable_prefix_caching: bool,
+}
+
+impl ControlCtx<'_> {
+    /// Borrow-view for KV release — all termination paths in this module go
+    /// through it (see `application::kv_reclaim`).
+    fn reclaimer(&mut self) -> KvReclaimer<'_> {
+        KvReclaimer {
+            radix: &mut *self.radix,
+            kv_budget: &mut *self.kv_budget,
+            control_cmd: self.control_cmd,
+            model_instance_id: &self.worker_group.model_instance_id,
+            enable_prefix_caching: self.enable_prefix_caching,
+        }
+    }
+
+    /// Capture `(sequence_id, live kv slot count)` for sequences that are
+    /// about to be terminated — must run before any table removal.
+    fn seq_kv_snapshot(&self, sids: &[u64]) -> Vec<SeqKv> {
+        sids.iter()
+            .map(|raw| SeqKv {
+                sequence_id: *raw,
+                kv_slots: self
+                    .sessions
+                    .kv_slots_for_sequence(SequenceId(*raw))
+                    .unwrap_or(0),
+            })
+            .collect()
+    }
 }
 
 /// Translate a single control-plane event.
@@ -171,18 +198,17 @@ fn handle_alloc_failed(
 
     // Round 0: try to satisfy the shortfall purely from RadixTree LRU leaves.
     if req.round == 0 {
-        let indices = ctx.radix.evict_collect_at_least(target as usize);
-        if !indices.is_empty() {
-            release_budget_up_to(ctx.kv_budget, indices.len() as u32, "alloc_failed_round0");
+        let freed = ctx
+            .reclaimer()
+            .evict_and_free(target, target_worker, "alloc_failed_round0");
+        if freed > 0 {
             tracing::info!(
                 worker_id = %req.worker_id,
                 shortfall = req.shortfall,
                 target,
-                freed = indices.len(),
+                freed,
                 "AllocFailed round=0: evicting RadixTree LRU leaves"
             );
-            let msg = free_kv_indices_msg(ctx, indices);
-            send_to_worker(ctx, target_worker, msg, "AllocFailed round=0 FreeKvIndices");
             return ControlOutcome::noop();
         }
         tracing::debug!(
@@ -214,7 +240,10 @@ fn handle_alloc_failed(
 
     // Release the victims' KV (while their slot counts are still resolvable),
     // then flip them back to Queued.
-    let free_indices = release_kv_for_sequences(ctx, &victims, target, "alloc_failed_round1");
+    let victim_kv = ctx.seq_kv_snapshot(&victims);
+    let free_indices =
+        ctx.reclaimer()
+            .reclaim_terminated_collect(&victim_kv, target, "alloc_failed_round1");
     for sid in &victims {
         if let Err(e) = ctx.sessions.preempt_to_queued(SequenceId(*sid)) {
             tracing::error!(sequence_id = sid, "preempt_to_queued failed: {}", e);
@@ -247,20 +276,14 @@ fn handle_worker_step_error(
     target_worker: &WorkerId,
 ) -> ControlOutcome {
     let failed_sequence_ids = collect_failed_sequence_ids(&err, ctx.sessions);
-    let failed_kv_slots: u32 = failed_sequence_ids
+    let failed_kv = ctx.seq_kv_snapshot(&failed_sequence_ids);
+    let failed_kv_slots: u32 = failed_kv
         .iter()
-        .filter_map(|raw| ctx.sessions.kv_slots_for_sequence(SequenceId(*raw)))
-        .sum();
-    let free_indices = release_kv_for_sequences(
-        ctx,
-        &failed_sequence_ids,
-        failed_kv_slots,
-        "worker_step_error",
-    );
-    if !free_indices.is_empty() {
-        let msg = free_kv_indices_msg(ctx, free_indices);
-        send_to_worker(ctx, target_worker, msg, "worker StepError FreeKvIndices");
-    }
+        .fold(0u32, |acc, s| acc.saturating_add(s.kv_slots));
+    let mut reclaimer = ctx.reclaimer();
+    let free_indices =
+        reclaimer.reclaim_terminated_collect(&failed_kv, failed_kv_slots, "worker_step_error");
+    reclaimer.free_indices_to_worker(free_indices, target_worker, "worker_step_error");
 
     let failed_ids = failed_sequence_ids
         .iter()
@@ -276,16 +299,6 @@ fn handle_worker_step_error(
         failed_request_ids: failed_ids,
         fail_message: Some(message),
     }
-}
-
-// ─── KV-relief helpers (shared by alloc_failed + worker_step_error) ──────────
-
-/// Build a `FreeKvIndices` control message for the group's model instance.
-fn free_kv_indices_msg(ctx: &ControlCtx<'_>, indices: Vec<GlobalIndex>) -> SchedulerControlMessage {
-    SchedulerControlMessage::FreeKvIndices(FreeKvIndices {
-        model_instance_id: ctx.worker_group.model_instance_id.clone(),
-        indices,
-    })
 }
 
 /// Unicast a control message to a worker, logging on failure.
@@ -321,61 +334,6 @@ fn select_victims(mut candidates: Vec<PreemptCandidate>, target: u32) -> (Vec<u6
         }
     }
     (victims, freed)
-}
-
-/// Release the KV held by `sids` back to the budget.
-///
-/// In prefix-caching mode this marks each sequence's RadixTree chain finished
-/// and evicts up to `evict_target` reusable leaves, returning the global
-/// indices the worker should free. In non-prefix mode it sums the sequences'
-/// occupied slots, releases that much budget, and returns an empty list (the
-/// worker frees its own slots on preempt/fail). Must be called while the
-/// sequences are still active (before any `preempt_to_queued` / removal), since
-/// it reads their live slot counts.
-fn release_kv_for_sequences(
-    ctx: &mut ControlCtx<'_>,
-    sids: &[u64],
-    evict_target: u32,
-    reason: &'static str,
-) -> Vec<GlobalIndex> {
-    if ctx.enable_prefix_caching {
-        for sid in sids {
-            ctx.radix.mark_finished_chain(*sid);
-        }
-        let indices = ctx.radix.evict_collect_at_least(evict_target as usize);
-        if !indices.is_empty() {
-            release_budget_up_to(ctx.kv_budget, indices.len() as u32, reason);
-        }
-        indices
-    } else {
-        let mut released = 0u32;
-        for sid in sids {
-            if let Some(n) = ctx.sessions.kv_slots_for_sequence(SequenceId(*sid)) {
-                released = released.saturating_add(n);
-            }
-        }
-        if released > 0 {
-            release_budget_up_to(ctx.kv_budget, released, reason);
-        }
-        Vec::new()
-    }
-}
-
-fn release_budget_up_to(kv_budget: &mut KvBudget, requested: u32, reason: &'static str) -> u32 {
-    let releasable = requested.min(kv_budget.outstanding());
-    if releasable < requested {
-        tracing::warn!(
-            requested,
-            outstanding = kv_budget.outstanding(),
-            released = releasable,
-            reason,
-            "KV budget release exceeds outstanding; clamping"
-        );
-    }
-    if releasable > 0 {
-        kv_budget.release(releasable);
-    }
-    releasable
 }
 
 /// Worker liveness watchdog timed out.

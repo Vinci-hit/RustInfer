@@ -1,12 +1,12 @@
 //! LLM workflow — continuous batching with KV cache management.
 
 use async_trait::async_trait;
-use infer_protocol::scheduler_to_worker_control::{FreeKvIndices, SchedulerControlMessage};
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, StepOutput};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::application::dispatch::DispatchSystem;
+use crate::application::kv_reclaim::{KvReclaimer, SeqKv};
 use crate::application::output_fns;
 use crate::application::planning::PlanningSystem;
 use crate::application::scheduler_event::SchedulerEvent;
@@ -16,6 +16,18 @@ use crate::domain::inference_session::table::{Bucket, RequestTable, accounting};
 use crate::domain::policy::token_budget::TokenBudget;
 use crate::domain::policy::traits::{RunningSet, SchedulingPolicy};
 use crate::error::Result;
+
+/// Borrow-view for KV release (see `application::kv_reclaim`) — every KV
+/// release in this workflow goes through it.
+fn reclaimer<'x>(ctx: &'x mut ResourceContext<'_>) -> KvReclaimer<'x> {
+    KvReclaimer {
+        radix: &mut *ctx.radix,
+        kv_budget: &mut *ctx.kv_budget,
+        control_cmd: ctx.control_cmd,
+        model_instance_id: &ctx.worker_group.model_instance_id,
+        enable_prefix_caching: ctx.config.enable_prefix_caching,
+    }
+}
 
 /// LLM workflow: continuous batching, KV cache management, chunked prefill.
 ///
@@ -187,18 +199,16 @@ fn ensure_worker_kv_headroom(
         return;
     }
     let missing = required - headroom;
-    let indices = ctx.radix.evict_collect_at_least(missing as usize);
-    if indices.is_empty() {
+    let default_worker = ctx.default_worker;
+    let freed = reclaimer(ctx).evict_and_free(missing, default_worker, reason);
+    if freed == 0 {
         tracing::debug!(
             required,
             headroom,
             missing,
             "prefix cache proactive eviction found no LRU entries"
         );
-        return;
     }
-    release_budget_up_to(ctx.kv_budget, indices.len() as u32, reason);
-    send_free_indices(ctx, indices, reason);
 }
 
 /// Core LLM step-output processing. Separated from the trait impl
@@ -224,50 +234,44 @@ async fn handle_llm_step(
 
         if enable_prefix {
             output_fns::feed_radix_assigned_indices(ctx.radix, step);
-            for tk in &step.tokens {
-                if tk.finished {
-                    output_fns::radix_mark_finished(ctx.radix, tk.sequence_id);
-                }
-            }
         }
     }
 
-    // Collect KV slot counts for finished sequences before they are
-    // removed by `process_llm_step_decoded`. Only needed for the
-    // real-time recycling path (prefix caching disabled), where the
-    // scheduler must release the budget itself instead of waiting for
-    // RadixTree LRU eviction.
-    let finished_kv_slots: u32 = if !enable_prefix {
-        let assigned_slots = assigned_slots_by_sequence(step);
-        step.tokens
-            .iter()
-            .filter(|tk| tk.finished)
-            .map(|tk| {
-                let before_step = ctx
-                    .requests
-                    .kv_slots_for_sequence(SequenceId(tk.sequence_id))
-                    .unwrap_or(0);
-                before_step.saturating_add(
+    // Snapshot `(sequence_id, kv slots)` for sequences finishing this step
+    // **before** `process_llm_step_decoded` removes them from the table. Slot
+    // counts include the slots assigned in this very step (reserved above but
+    // not yet visible on the session).
+    let assigned_slots = assigned_slots_by_sequence(step);
+    let finished: Vec<SeqKv> = step
+        .tokens
+        .iter()
+        .filter(|tk| tk.finished)
+        .map(|tk| {
+            let before_step = ctx
+                .requests
+                .kv_slots_for_sequence(SequenceId(tk.sequence_id))
+                .unwrap_or(0);
+            SeqKv {
+                sequence_id: tk.sequence_id,
+                kv_slots: before_step.saturating_add(
                     assigned_slots
                         .get(&tk.sequence_id)
                         .copied()
                         .unwrap_or_default(),
-                )
-            })
-            .sum()
-    } else {
-        0
-    };
+                ),
+            }
+        })
+        .collect();
 
     output_fns::process_llm_step_decoded(ctx.requests, dispatch.frontend_mut(), ctx.metrics, step)
         .await?;
 
-    // Real-time recycling: release KV budget for finished sequences.
-    // The worker has already moved these blocks to its released list or
-    // recycled them into the free pool — the scheduler just aligns its
-    // budget count.
-    if finished_kv_slots > 0 {
-        release_budget_up_to(ctx.kv_budget, finished_kv_slots, "finished_non_prefix");
+    // Terminated-KV reclamation, one entry point for both modes: with prefix
+    // caching the chains are marked finished (KV stays cached, budget follows
+    // LRU eviction); without it the budget is released now — the worker has
+    // already recycled the physical slots on its side.
+    if !finished.is_empty() {
+        reclaimer(ctx).reclaim_terminated_collect(&finished, 0, "finished");
     }
 
     Ok(())
@@ -322,7 +326,12 @@ fn sanitize_step_output<'s>(
             "dropping stale KV indices from late StepOutput"
         );
         if release_stale_indices {
-            send_free_indices(ctx, stale_indices, "stale_step_output");
+            let default_worker = ctx.default_worker;
+            reclaimer(ctx).free_indices_to_worker(
+                stale_indices,
+                default_worker,
+                "stale_step_output",
+            );
         }
     }
 
@@ -363,25 +372,6 @@ fn assigned_indices(assigned: &AssignedIndices) -> impl Iterator<Item = u32> + '
     assigned.base..assigned.end()
 }
 
-fn send_free_indices(ctx: &ResourceContext<'_>, indices: Vec<u32>, reason: &'static str) {
-    if indices.is_empty() {
-        return;
-    }
-    let len = indices.len();
-    let msg = SchedulerControlMessage::FreeKvIndices(FreeKvIndices {
-        model_instance_id: ctx.worker_group.model_instance_id.clone(),
-        indices,
-    });
-    if let Err(err) = ctx.control_cmd.send_to(ctx.default_worker, msg) {
-        tracing::error!(
-            count = len,
-            reason,
-            "failed to send FreeKvIndices to worker: {}",
-            err
-        );
-    }
-}
-
 fn reserve_reported_kv(kv_budget: &mut crate::domain::kv_budget::KvBudget, requested: u32) {
     if requested == 0 {
         return;
@@ -403,25 +393,4 @@ fn reserve_reported_kv(kv_budget: &mut crate::domain::kv_budget::KvBudget, reque
             let _ = kv_budget.try_reserve(headroom);
         }
     }
-}
-
-fn release_budget_up_to(
-    kv_budget: &mut crate::domain::kv_budget::KvBudget,
-    requested: u32,
-    reason: &'static str,
-) -> u32 {
-    let releasable = requested.min(kv_budget.outstanding());
-    if releasable < requested {
-        tracing::warn!(
-            requested,
-            outstanding = kv_budget.outstanding(),
-            released = releasable,
-            reason,
-            "KV budget release exceeds outstanding; clamping"
-        );
-    }
-    if releasable > 0 {
-        kv_budget.release(releasable);
-    }
-    releasable
 }

@@ -8,6 +8,7 @@
 
 use infer_protocol::scheduler_to_worker_control::{CancelSequence, SchedulerControlMessage};
 
+use crate::application::kv_reclaim::{KvReclaimer, SeqKv};
 use crate::domain::inference_session::lifecycle::{RequestId, SequenceId};
 use crate::domain::inference_session::table::{CancelOutcome, RequestTable};
 use crate::domain::kv_budget::KvBudget;
@@ -52,12 +53,14 @@ pub async fn cancel_request_by_external_id(
 
 /// Cancel by external id and keep scheduler-side KV state aligned with the
 /// worker-side active removal.
+#[allow(clippy::too_many_arguments)]
 pub async fn cancel_request_by_external_id_with_kv(
     sessions: &mut RequestTable,
     radix: &mut RadixTree,
     kv_budget: &mut KvBudget,
     control_cmd: &ControlPlaneCmdTx,
     default_worker: &WorkerId,
+    model_instance_id: &str,
     external_id: &str,
     enable_prefix_caching: bool,
 ) -> Result<()> {
@@ -75,11 +78,21 @@ pub async fn cancel_request_by_external_id_with_kv(
         CancelOutcome::RemovedWaiting { .. } | CancelOutcome::NotFound => Ok(()),
         CancelOutcome::RemovedPrefilling { sequence_id, .. }
         | CancelOutcome::RemovedDecoding { sequence_id, .. } => {
-            if enable_prefix_caching {
-                radix.mark_finished_chain(sequence_id.0);
-            } else if let Some(n) = kv_slots {
-                kv_budget.release(n);
-            }
+            let mut reclaimer = KvReclaimer {
+                radix,
+                kv_budget,
+                control_cmd,
+                model_instance_id,
+                enable_prefix_caching,
+            };
+            reclaimer.reclaim_terminated_collect(
+                &[SeqKv {
+                    sequence_id: sequence_id.0,
+                    kv_slots: kv_slots.unwrap_or(0),
+                }],
+                0,
+                "cancel",
+            );
             send_cancel_to_worker(control_cmd, default_worker, sequence_id)
         }
     }

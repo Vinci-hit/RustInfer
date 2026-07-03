@@ -5,7 +5,7 @@ use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WorkerControlMessage;
 
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
-use crate::domain::global_kv_alloc::GlobalKvAllocator;
+use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::infrastructure::transport::control_pump::ControlPump;
 
 /// Control-plane operations the KV-relief loop depends on. Abstracted into a
@@ -42,9 +42,10 @@ pub enum ReliefWaitOutcome {
     Shutdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AllocWithReliefOutcome {
-    Allocated(Vec<u32>),
+    /// Slots checked out as a lease — the caller must commit or release them.
+    Allocated(KvLease),
     Unavailable,
     Shutdown,
 }
@@ -169,9 +170,9 @@ pub fn alloc_with_relief<C: ReliefControl>(
             n = n.min(active.len() as u32);
         }
         if n == 0 {
-            return AllocWithReliefOutcome::Allocated(Vec::new());
+            return AllocWithReliefOutcome::Allocated(KvLease::empty());
         }
-        match kv_allocator.alloc_indices(n) {
+        match kv_allocator.lease(n) {
             Ok(v) => return AllocWithReliefOutcome::Allocated(v),
             Err(e) => {
                 if retried_after_round1_relief {
@@ -454,7 +455,13 @@ mod tests {
         let mut prefilling = PrefillSeqMap::new();
         let ctl = MockControl::new(vec![]);
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 2, false, false);
-        assert_eq!(out, AllocWithReliefOutcome::Allocated(vec![0, 1]));
+        match out {
+            AllocWithReliefOutcome::Allocated(lease) => {
+                assert_eq!(lease.as_slice(), &[0, 1]);
+                lease.release(&mut kv);
+            }
+            other => panic!("expected Allocated, got {:?}", other),
+        }
         assert!(
             ctl.alloc_failed.borrow().is_empty(),
             "no relief should be requested"
@@ -470,7 +477,7 @@ mod tests {
         let ctl = MockControl::new(vec![]);
         // shrink_to_active clamps n to active.len()==0 → Allocated(empty), no relief.
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 3, false, true);
-        assert_eq!(out, AllocWithReliefOutcome::Allocated(Vec::new()));
+        assert_eq!(out, AllocWithReliefOutcome::Allocated(KvLease::empty()));
         assert!(ctl.alloc_failed.borrow().is_empty());
     }
 
@@ -500,7 +507,13 @@ mod tests {
         // round0: AllocFailed → relief frees [0,1] → retry allocates.
         let ctl = MockControl::new(vec![free_kv(vec![0, 1])]);
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 2, false, false);
-        assert_eq!(out, AllocWithReliefOutcome::Allocated(vec![0, 1]));
+        match out {
+            AllocWithReliefOutcome::Allocated(lease) => {
+                assert_eq!(lease.as_slice(), &[0, 1]);
+                lease.release(&mut kv);
+            }
+            other => panic!("expected Allocated, got {:?}", other),
+        }
         assert_eq!(ctl.alloc_failed.borrow().as_slice(), &[(2, 0)]);
     }
 
@@ -524,7 +537,13 @@ mod tests {
         ));
         let ctl = MockControl::new(vec![preempt]);
         let out = alloc_with_relief(&mut kv, &ctl, &mut active, &mut prefilling, 2, false, false);
-        assert_eq!(out, AllocWithReliefOutcome::Allocated(vec![0, 1]));
+        match out {
+            AllocWithReliefOutcome::Allocated(lease) => {
+                assert_eq!(lease.as_slice(), &[0, 1]);
+                lease.release(&mut kv);
+            }
+            other => panic!("expected Allocated, got {:?}", other),
+        }
         assert!(
             !active.contains_key(&7),
             "preempted victim removed from active"

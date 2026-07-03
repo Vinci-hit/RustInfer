@@ -8,7 +8,7 @@ use crate::application::decode_engine::{DecodeEngine, build_decode_request};
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
 use crate::application::runtime::{RaggedRowKind, Runtime};
 use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
-use crate::domain::global_kv_alloc::GlobalKvAllocator;
+use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::{SampledToken, SeqStep, StepRequest, StopCriteria};
 use crate::domain::ports::{OpError, OpResult};
@@ -294,7 +294,10 @@ fn commit_prefill_outputs(
 struct CmdPrep<'a> {
     cmd: &'a PrefillBatchCmd,
     plans: Vec<SegmentPlan>,
-    base_indices: Vec<u32>,
+    /// Slots for this cmd's new tokens. Committed after the group's outputs
+    /// are routed (ownership moves into `prefilling`/`active` block tables),
+    /// or released on the group's failure path / the post-loop sweep.
+    base_indices: KvLease,
     /// Non-skipped segment count = rows this cmd adds to the forward.
     rows: usize,
     /// New tokens this cmd adds to the forward.
@@ -378,12 +381,18 @@ where
             return Err(e);
         }
     };
-    let (decode_order, decode_new_indices, decode_build) = match decode {
-        Some((order, idx)) => {
-            let build = build_decode_request(&order, &idx, active, eos_ids, enable_prefix_caching);
-            (order, idx, Some(build))
+    let (decode_order, mut decode_lease, decode_build) = match decode {
+        Some((order, lease)) => {
+            let build = build_decode_request(
+                &order,
+                lease.as_slice(),
+                active,
+                eos_ids,
+                enable_prefix_caching,
+            );
+            (order, Some(lease), Some(build))
         }
-        None => (Vec::new(), Vec::new(), None),
+        None => (Vec::new(), None, None),
     };
     let decode_count = decode_order.len();
 
@@ -517,10 +526,14 @@ where
         }
     }
 
-    // 5. Issue each group as one ragged forward and route its outputs.
+    // 5. Issue each group as one ragged forward and route its outputs. A hard
+    //    error (commit/send failure) breaks out so the post-loop sweep can
+    //    release the leases of any group that never ran — the pre-lease code
+    //    silently leaked those slots on this path.
     let can_record_abc_rows = groups.len() == 1;
     let mut recorded_abc_rows = false;
-    for group in &groups {
+    let mut hard_err: Option<OpError> = None;
+    'groups: for group in &groups {
         let has_decode = group.decode && decode_count > 0;
         if !has_decode && group.preps.is_empty() {
             continue;
@@ -550,7 +563,7 @@ where
         // prefill (so the Ragged split path actually runs). Best-effort: if the
         // tiny KV alloc fails, skip and accept the cold build for this one step.
         let mut decode_prefix_len = if has_decode { decode_count } else { 0 };
-        let mut pad_indices: Vec<u32> = Vec::new();
+        let mut pad_lease = KvLease::empty();
         if has_decode && !group.preps.is_empty() {
             if let Some(slot) = runner.next_capture_slot(decode_count) {
                 let pad = slot - decode_count;
@@ -558,8 +571,8 @@ where
                 let padded_rows_fit = slot.saturating_add(prefill_rows) <= cap_batch;
                 let padded_tokens_fit = group.tokens.saturating_add(pad) <= cap_num_tokens;
                 if pad > 0 && padded_rows_fit && padded_tokens_fit {
-                    if let Ok(idx) = kv_allocator.alloc_indices(pad as u32) {
-                        for &blk in &idx {
+                    if let Ok(lease) = kv_allocator.lease(pad as u32) {
+                        for &blk in lease.as_slice() {
                             seqs.push(SeqStep {
                                 sequence_id: u64::MAX, // sentinel: inert pad row
                                 input_ids: vec![1],
@@ -574,7 +587,7 @@ where
                             row_kinds.push(RaggedRowKind::Pad);
                         }
                         decode_prefix_len = slot;
-                        pad_indices = idx;
+                        pad_lease = lease;
                     }
                 }
             }
@@ -584,7 +597,7 @@ where
             build_prefill_steps_into(
                 prep.cmd,
                 &mut prep.plans,
-                &prep.base_indices,
+                prep.base_indices.as_slice(),
                 &mut seqs,
                 &mut max_tokens,
                 &mut ignore_eos,
@@ -609,7 +622,7 @@ where
             seqs,
         };
 
-        let mut mixed_next_slots: Vec<u32> = Vec::new();
+        let mut mixed_lease = KvLease::empty();
         let mut mixed_device_prepared = false;
         if can_record_abc_rows {
             let potential_next = row_kinds
@@ -617,9 +630,9 @@ where
                 .filter(|&&k| matches!(k, RaggedRowKind::Decode | RaggedRowKind::PrefillFinal))
                 .count();
             if potential_next > 0 {
-                match kv_allocator.alloc_indices(potential_next as u32) {
-                    Ok(slots) => {
-                        mixed_next_slots = slots;
+                match kv_allocator.lease(potential_next as u32) {
+                    Ok(lease) => {
+                        mixed_lease = lease;
                         mixed_device_prepared = true;
                     }
                     Err(e) => {
@@ -634,10 +647,10 @@ where
         let issue_res = runner.issue_fused_abc(
             &req,
             &row_kinds,
-            if mixed_next_slots.is_empty() {
+            if mixed_lease.is_empty() {
                 None
             } else {
-                Some(mixed_next_slots.as_slice())
+                Some(mixed_lease.as_slice())
             },
         );
         // The fused forward is on the GPU now (on success): send the prior
@@ -648,14 +661,16 @@ where
         let out = match issue_res.and_then(|t| runner.finalize_fused_abc(t, &req, &row_kinds)) {
             Ok(out) => out,
             Err(e) => {
-                if !mixed_next_slots.is_empty() {
-                    kv_allocator.free(&mixed_next_slots);
+                mixed_lease.release(kv_allocator);
+                if has_decode {
+                    if let Some(lease) = decode_lease.take() {
+                        lease.release(kv_allocator);
+                    }
                 }
                 fail_fused_group(
                     e,
                     has_decode,
                     &decode_order,
-                    &decode_new_indices,
                     decode_engine,
                     group,
                     &mut preps,
@@ -665,11 +680,12 @@ where
                     control,
                     enable_prefix_caching,
                 );
-                if !pad_indices.is_empty() {
-                    kv_allocator.free(&pad_indices);
-                }
+                pad_lease.release(kv_allocator);
                 decode_engine.invalidate_abc_reuse();
-                prior_send?;
+                if let Err(send_err) = prior_send {
+                    hard_err = Some(send_err);
+                    break 'groups;
+                }
                 continue;
             }
         };
@@ -693,16 +709,23 @@ where
                     abc_next_rows.push(sid);
                 }
             }
-            decode_engine.commit_fused_decode(
+            let lease = decode_lease
+                .take()
+                .expect("decode lease present when has_decode");
+            if let Err(e) = decode_engine.commit_fused_decode(
                 active,
                 kv_allocator,
                 &decode_order,
-                &decode_new_indices,
+                lease,
                 &out.tokens,
                 &out.finished,
                 enable_prefix_caching,
                 &mut output,
-            )?;
+            ) {
+                pad_lease.release(kv_allocator);
+                hard_err = Some(e);
+                break 'groups;
+            }
             cursor = decode_prefix_len;
         }
         for &pi in &group.preps {
@@ -729,26 +752,57 @@ where
                 cursor,
                 &mut output,
             );
+            // The cmd's slots now live in `prefilling`/`active` block tables
+            // (or were released for finished seqs by commit_prefill_outputs).
+            let _ = prep.base_indices.take().commit();
             cursor += prep.rows;
         }
+        // Reclaim the inert decode-prefix pad KV (transient; never owned by any
+        // sequence). The forward has completed (finalize above), so nothing is
+        // reading these slots.
+        pad_lease.release(kv_allocator);
         if can_record_abc_rows {
             decode_engine.record_mixed_abc_rows(
                 abc_next_rows,
-                mixed_next_slots,
+                mixed_lease,
                 mixed_device_prepared,
                 kv_allocator,
             );
             recorded_abc_rows = true;
+        } else {
+            mixed_lease.release(kv_allocator);
         }
-        data.send_step_output(&output)
-            .map_err(|e| OpError::Kernel(format!("data plane send_step_output failed: {}", e)))?;
-        // Reclaim the inert decode-prefix pad KV (transient; never owned by any
-        // sequence). Done after the forward + commits so the cuDNN call (which
-        // read these rows' KV) has been issued.
-        if !pad_indices.is_empty() {
-            kv_allocator.free(&pad_indices);
+        if let Err(e) = data.send_step_output(&output) {
+            hard_err = Some(OpError::Kernel(format!(
+                "data plane send_step_output failed: {}",
+                e
+            )));
+            break 'groups;
         }
-        prior_send?;
+        if let Err(e) = prior_send {
+            hard_err = Some(e);
+            break 'groups;
+        }
+    }
+    // Post-loop sweep: on a hard error, groups after the break never ran —
+    // return their leases (and an uncommitted decode lease) to the pool. The
+    // pre-lease code leaked these slots. On the normal path every lease was
+    // consumed and this sweep is a no-op.
+    if let Some(lease) = decode_lease.take() {
+        lease.release(kv_allocator);
+    }
+    for prep in &mut preps {
+        let lease = prep.base_indices.take();
+        if !lease.is_empty() {
+            tracing::warn!(
+                slots = lease.len(),
+                "returning unconsumed prefill KV lease (group never ran)"
+            );
+            lease.release(kv_allocator);
+        }
+    }
+    if let Some(e) = hard_err {
+        return Err(e);
     }
     // Rare path: no group issued a forward (e.g. every decode row finished in
     // the drained step and all cmds were rejected) — the prior step's tokens
@@ -789,15 +843,14 @@ fn send_prior_output(data: &DataPump, prior: &mut Option<StepOutput>) -> OpResul
     Ok(())
 }
 
-/// Clean up a fused forward that failed: free the group's freshly-allocated KV,
-/// drop its decode rows + prefilling state, and report the error for every
-/// affected sequence.
+/// Clean up a fused forward that failed: free the group's freshly-allocated KV
+/// (the decode rows' step lease is released by the caller), drop its decode
+/// rows + prefilling state, and report the error for every affected sequence.
 #[allow(clippy::too_many_arguments)]
 fn fail_fused_group(
     e: OpError,
     has_decode: bool,
     decode_order: &[u64],
-    decode_new_indices: &[u32],
     decode_engine: &mut DecodeEngine,
     group: &ForwardGroup,
     preps: &mut [CmdPrep],
@@ -809,9 +862,6 @@ fn fail_fused_group(
 ) {
     let mut failed: Vec<u64> = Vec::new();
     if has_decode {
-        if !decode_new_indices.is_empty() {
-            kv_allocator.free(decode_new_indices);
-        }
         for &sid in decode_order {
             if let Some(removed) = active.remove(&sid) {
                 if !enable_prefix_caching {
@@ -824,9 +874,7 @@ fn fail_fused_group(
     }
     for &pi in &group.preps {
         let prep = &mut preps[pi];
-        if !prep.base_indices.is_empty() {
-            kv_allocator.free(&prep.base_indices);
-        }
+        prep.base_indices.take().release(kv_allocator);
         for seg in &prep.cmd.segments {
             if let Some(removed) = prefilling.remove(&seg.sequence_id) {
                 kv_allocator.release_owned(&removed.block_table, enable_prefix_caching);

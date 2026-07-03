@@ -370,6 +370,94 @@ impl GlobalKvAllocator {
     pub fn free_snapshot(&self) -> Vec<u32> {
         self.free[self.head..].to_vec()
     }
+
+    /// Allocate `n` indices as a [`KvLease`] that must be explicitly committed
+    /// or released. Prefer this over [`Self::alloc_indices`] anywhere the slots
+    /// live across function/step boundaries before finding an owner.
+    pub fn lease(&mut self, n: u32) -> Result<KvLease, AllocFull> {
+        self.alloc_indices(n).map(|slots| KvLease { slots })
+    }
+}
+
+/// A batch of KV slot indices checked out of [`GlobalKvAllocator`] that MUST
+/// be explicitly consumed — committed into an owning block table
+/// ([`KvLease::commit`]) or returned to the pool ([`KvLease::release`]).
+///
+/// The decode/fused pipelines hold slots in "outstanding-but-unowned" windows
+/// (speculative next-step reservations, in-flight step slots, prefill base
+/// slots) whose reclamation used to be enforced by call-ordering comments —
+/// the seam the historical double-free/leak incidents grew from. A lease makes
+/// the obligation structural: dropping a non-empty lease panics in debug
+/// builds and logs an error in release builds instead of silently shrinking
+/// the pool.
+#[must_use = "a KvLease must be committed or released, or its slots leak"]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct KvLease {
+    slots: Vec<u32>,
+}
+
+impl KvLease {
+    pub fn empty() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[u32] {
+        &self.slots
+    }
+
+    /// Move the lease out of a struct field, leaving an empty lease behind.
+    pub fn take(&mut self) -> KvLease {
+        KvLease {
+            slots: std::mem::take(&mut self.slots),
+        }
+    }
+
+    /// Consume the lease: ownership of the slots has been transferred to a
+    /// live owner (a sequence block table / the prefilling map). The returned
+    /// indices are for the caller's bookkeeping; dropping them is fine.
+    pub fn commit(mut self) -> Vec<u32> {
+        std::mem::take(&mut self.slots)
+    }
+
+    /// Consume the lease by returning every slot to the pool. No-op if empty.
+    pub fn release(mut self, alloc: &mut GlobalKvAllocator) {
+        let slots = std::mem::take(&mut self.slots);
+        if !slots.is_empty() {
+            alloc.free(&slots);
+        }
+    }
+
+    /// Keep the first `keep` slots, returning the surplus tail to the pool.
+    pub fn shrink_to(&mut self, keep: usize, alloc: &mut GlobalKvAllocator) {
+        if self.slots.len() > keep {
+            let surplus = self.slots.split_off(keep);
+            alloc.free(&surplus);
+        }
+    }
+}
+
+impl Drop for KvLease {
+    fn drop(&mut self) {
+        if !self.slots.is_empty() {
+            debug_assert!(
+                false,
+                "KvLease dropped with {} unconsumed slots — commit() or release() it",
+                self.slots.len()
+            );
+            tracing::error!(
+                slots = self.slots.len(),
+                "KvLease dropped without commit/release; KV pool leaked"
+            );
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

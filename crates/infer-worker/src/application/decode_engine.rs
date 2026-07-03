@@ -6,7 +6,7 @@ use crate::application::decode_common::fail_decode_seqs;
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
 use crate::application::runtime::{DecodeCompactOutput, Runtime};
 use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
-use crate::domain::global_kv_alloc::GlobalKvAllocator;
+use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::{SampledToken, SeqStep, StepRequest, StopCriteria};
 use crate::domain::ports::{OpError, OpResult};
@@ -23,7 +23,7 @@ use crate::infrastructure::transport::data_pump::DataPump;
 /// `run_step` call so the next step's compute overlaps this step's host commit.
 struct PendingDecode {
     order: Vec<u64>,
-    new_indices: Vec<u32>,
+    new_indices: KvLease,
     assigned: Vec<AssignedIndices>,
     batch: usize,
     /// True when this step ran the async `compact_extend` (device control for
@@ -48,10 +48,11 @@ pub struct DecodeEngine {
     /// the optimistic assumption every row survives; `prepare_step` consumes
     /// these, frees any surplus when rows finished, and tops up for fresh
     /// admissions. Best-effort: under a tight pool nothing is reserved and
-    /// `prepare_step` falls back to the on-path relief alloc. These slots are
-    /// outstanding-but-unowned (in no block table), so they must be freed on
-    /// drain/idle to avoid a pool leak.
-    prealloc: Vec<u32>,
+    /// `prepare_step` falls back to the on-path relief alloc. Held as a
+    /// [`KvLease`] because the slots are outstanding-but-unowned (in no block
+    /// table): the lease must be consumed on drain/idle, and dropping it
+    /// non-empty is a debug panic instead of a silent pool leak.
+    prealloc: KvLease,
     /// Device-resident decode control plane: each step maintains the per-row
     /// control (block tables, kv_lens, positions) ON DEVICE via
     /// `compact_extend_control` instead of rebuilding + uploading it from the
@@ -74,7 +75,7 @@ impl DecodeEngine {
             rows: DecodeRows::new(),
             prev_a_rows: Vec::new(),
             pending: None,
-            prealloc: Vec::new(),
+            prealloc: KvLease::empty(),
             device_rows: Vec::new(),
         }
     }
@@ -112,9 +113,7 @@ impl DecodeEngine {
     /// seq would otherwise leak them. Call this BEFORE `clear()` on drain.
     pub fn reclaim_pending(&mut self, kv_allocator: &mut GlobalKvAllocator) {
         if let Some(p) = self.pending.take() {
-            if !p.new_indices.is_empty() {
-                kv_allocator.free(&p.new_indices);
-            }
+            p.new_indices.release(kv_allocator);
         }
         self.release_prealloc(kv_allocator);
     }
@@ -122,10 +121,7 @@ impl DecodeEngine {
     /// Return any speculatively-reserved next-step slots to the pool. Called
     /// when no next step will consume them (active drained to empty, or drain).
     fn release_prealloc(&mut self, kv_allocator: &mut GlobalKvAllocator) {
-        if !self.prealloc.is_empty() {
-            let slots = std::mem::take(&mut self.prealloc);
-            kv_allocator.free(&slots);
-        }
+        self.prealloc.take().release(kv_allocator);
     }
 
     /// Best-effort reservation of `n` KV slots for the NEXT decode step, issued
@@ -140,8 +136,8 @@ impl DecodeEngine {
         if n == 0 {
             return;
         }
-        if let Ok(slots) = kv_allocator.alloc_indices(n as u32) {
-            self.prealloc = slots;
+        if let Ok(lease) = kv_allocator.lease(n as u32) {
+            self.prealloc = lease;
         }
     }
 
@@ -195,7 +191,7 @@ impl DecodeEngine {
         kv_allocator: &mut GlobalKvAllocator,
         control: &ControlPump,
         enable_prefix_caching: bool,
-    ) -> OpResult<Option<(Vec<u64>, Vec<u32>)>> {
+    ) -> OpResult<Option<(Vec<u64>, KvLease)>> {
         let ready = self.prepare_step(
             active,
             prefilling,
@@ -225,12 +221,15 @@ impl DecodeEngine {
         active: &mut ActiveSeqMap,
         kv_allocator: &mut GlobalKvAllocator,
         order: &[u64],
-        new_indices: &[u32],
+        new_indices: KvLease,
         tokens: &[Vec<SampledToken>],
         finished: &[bool],
         enable_prefix_caching: bool,
         output: &mut StepOutput,
     ) -> OpResult<()> {
+        // Consume the lease up front: from here every slot either enters a
+        // sequence block table via `commit_accepted` or joins `to_free`.
+        let new_indices: Vec<u32> = new_indices.commit();
         let mut to_free: Vec<u32> = Vec::new();
         let mut to_remove: Vec<u64> = Vec::new();
         for (i, &sid) in order.iter().enumerate() {
@@ -299,28 +298,20 @@ impl DecodeEngine {
     pub(crate) fn record_mixed_abc_rows(
         &mut self,
         rows: Vec<u64>,
-        next_slots: Vec<u32>,
+        next_slots: KvLease,
         device_prepared: bool,
         kv_allocator: &mut GlobalKvAllocator,
     ) {
-        if !self.prealloc.is_empty() {
-            let old = std::mem::take(&mut self.prealloc);
-            kv_allocator.free(&old);
-        }
+        self.prealloc.take().release(kv_allocator);
         if next_slots.len() < rows.len() {
-            if !next_slots.is_empty() {
-                kv_allocator.free(&next_slots);
-            }
+            next_slots.release(kv_allocator);
             self.rows.replace_rows(rows.clone());
             self.prev_a_rows = rows;
             self.device_rows.clear();
             return;
         }
         let mut next_slots = next_slots;
-        if next_slots.len() > rows.len() {
-            let surplus = next_slots.split_off(rows.len());
-            kv_allocator.free(&surplus);
-        }
+        next_slots.shrink_to(rows.len(), kv_allocator);
         self.rows.replace_rows(rows.clone());
         self.prev_a_rows = rows.clone();
         self.prealloc = next_slots;
@@ -471,7 +462,7 @@ impl DecodeEngine {
                     active,
                     kv_allocator,
                     &p.order,
-                    &p.new_indices,
+                    p.new_indices,
                     p.assigned,
                     &compact,
                     enable_prefix_caching,
@@ -483,9 +474,7 @@ impl DecodeEngine {
                 Ok(Some(output))
             }
             Err(e) => {
-                if !p.new_indices.is_empty() {
-                    kv_allocator.free(&p.new_indices);
-                }
+                p.new_indices.release(kv_allocator);
                 fail_decode_seqs(
                     control,
                     active,
@@ -547,13 +536,18 @@ impl DecodeEngine {
         // out-of-band eviction. Otherwise re-seed it from the host request.
         let reuse_device_control = device_ctrl_ok && self.device_rows == order;
         let next_slots: Option<Vec<u32>> = if device_ctrl_ok {
-            Some(self.prealloc.clone())
+            Some(self.prealloc.as_slice().to_vec())
         } else {
             None
         };
 
-        let req =
-            build_decode_request(&order, &new_indices, active, eos_ids, enable_prefix_caching);
+        let req = build_decode_request(
+            &order,
+            new_indices.as_slice(),
+            active,
+            eos_ids,
+            enable_prefix_caching,
+        );
 
         // ABC A-reuse: the leading rows of `order` that match the prior step's
         // device-row order already hold the right token in buffer A (written by
@@ -582,9 +576,7 @@ impl DecodeEngine {
                 Ok(())
             }
             Err(e) => {
-                if !new_indices.is_empty() {
-                    kv_allocator.free(&new_indices);
-                }
+                new_indices.release(kv_allocator);
                 fail_decode_seqs(
                     control,
                     active,
@@ -617,7 +609,7 @@ impl DecodeEngine {
         kv_allocator: &mut GlobalKvAllocator,
         control: &ControlPump,
         enable_prefix_caching: bool,
-    ) -> OpResult<Option<(Vec<u64>, Vec<u32>)>> {
+    ) -> OpResult<Option<(Vec<u64>, KvLease)>> {
         self.rows.retain_active(active);
         let pending = self.rows.pending_admissions(active);
         if !pending.is_empty() {
@@ -630,16 +622,13 @@ impl DecodeEngine {
         }
 
         let initial_n = order.len();
-        let new_indices = if self.prealloc.len() >= initial_n {
+        let mut new_indices = if self.prealloc.len() >= initial_n {
             // Fast path: slots reserved during the previous step's forward cover
             // this step. Take exactly `initial_n`; return any surplus (rows that
             // finished since the speculative reservation) to the pool.
-            let mut slots = std::mem::take(&mut self.prealloc);
-            if slots.len() > initial_n {
-                let surplus = slots.split_off(initial_n);
-                kv_allocator.free(&surplus);
-            }
-            slots
+            let mut lease = self.prealloc.take();
+            lease.shrink_to(initial_n, kv_allocator);
+            lease
         } else {
             // Speculation fell short (batch grew via admissions, or the pool was
             // too tight to reserve last step). Return the partial reservation
@@ -681,19 +670,12 @@ impl DecodeEngine {
         self.rows.retain_active(active);
         order = self.rows.as_slice().to_vec();
         if order.is_empty() {
-            if !new_indices.is_empty() {
-                kv_allocator.free(&new_indices);
-            }
+            new_indices.release(kv_allocator);
             return Ok(None);
         }
 
-        let new_indices: Vec<u32> = if new_indices.len() > order.len() {
-            let (take, give_back) = new_indices.split_at(order.len());
-            kv_allocator.free(give_back);
-            take.to_vec()
-        } else {
-            new_indices
-        };
+        // Return the surplus for rows that vanished during relief.
+        new_indices.shrink_to(order.len(), kv_allocator);
         if new_indices.len() < order.len() {
             let failed: Vec<u64> = order[new_indices.len()..].to_vec();
             fail_decode_seqs(
@@ -711,9 +693,7 @@ impl DecodeEngine {
             self.rows.retain_active(active);
             order.truncate(new_indices.len());
             if order.is_empty() {
-                if !new_indices.is_empty() {
-                    kv_allocator.free(&new_indices);
-                }
+                new_indices.release(kv_allocator);
                 return Ok(None);
             }
         }
@@ -732,12 +712,15 @@ impl DecodeEngine {
         active: &mut ActiveSeqMap,
         kv_allocator: &mut GlobalKvAllocator,
         order: &[u64],
-        new_indices: &[u32],
+        new_indices: KvLease,
         assigned: Vec<AssignedIndices>,
         compact: &DecodeCompactOutput,
         enable_prefix_caching: bool,
         device_prepared: bool,
     ) -> OpResult<StepOutput> {
+        // Consume the lease up front: from here every slot either enters a
+        // sequence block table via `commit_accepted` or joins `to_free`.
+        let new_indices: Vec<u32> = new_indices.commit();
         let mut output = StepOutput {
             prefill_done: Vec::new(),
             tokens: Vec::new(),
@@ -925,6 +908,12 @@ mod prealloc_tests {
     // the two leak-critical seams (`reserve_next_step_slots`, `release_prealloc`
     // + the surplus split in `prepare_step`) without needing a GPU `Runtime`.
 
+    /// Drain an engine's leases back to the pool so test teardown does not
+    /// trip the KvLease drop assertion.
+    fn drain(eng: &mut DecodeEngine, kv: &mut GlobalKvAllocator) {
+        eng.reclaim_pending(kv);
+    }
+
     #[test]
     fn reserve_then_release_conserves_pool() {
         let mut kv = GlobalKvAllocator::new(16);
@@ -940,7 +929,7 @@ mod prealloc_tests {
     #[test]
     fn reserve_is_best_effort_on_tight_pool() {
         let mut kv = GlobalKvAllocator::new(4);
-        let _held = kv.alloc_indices(3).unwrap(); // total_free = 1
+        let held = kv.lease(3).unwrap(); // total_free = 1
         let mut eng = DecodeEngine::new();
         // Cannot fit 2 → reserve nothing rather than partially; the on-path
         // relief alloc handles the step instead.
@@ -951,6 +940,7 @@ mod prealloc_tests {
             3,
             "no speculative slots taken under pressure"
         );
+        held.release(&mut kv);
     }
 
     #[test]
@@ -962,16 +952,15 @@ mod prealloc_tests {
         let mut eng = DecodeEngine::new();
         eng.reserve_next_step_slots(&mut kv, 4);
         let needed = 2;
-        let mut slots = std::mem::take(&mut eng.prealloc);
-        let surplus = slots.split_off(needed);
-        kv.free(&surplus);
-        assert_eq!(slots.len(), 2, "kept exactly the needed slots");
+        let mut lease = eng.prealloc.take();
+        lease.shrink_to(needed, &mut kv);
+        assert_eq!(lease.len(), 2, "kept exactly the needed slots");
         assert_eq!(
             kv.outstanding(),
             2,
             "only the 2 kept slots remain outstanding"
         );
-        kv.free(&slots); // emulate later commit/free of the kept slots
+        lease.release(&mut kv); // emulate later commit/free of the kept slots
         assert_eq!(kv.outstanding(), 0);
     }
 
@@ -989,41 +978,45 @@ mod prealloc_tests {
     #[test]
     fn mixed_record_sets_a_rows_prealloc_and_device_rows() {
         let mut kv = GlobalKvAllocator::new(16);
-        let slots = kv.alloc_indices(3).unwrap();
+        let slots = kv.lease(3).unwrap();
+        let expected = slots.as_slice().to_vec();
         let mut eng = DecodeEngine::new();
 
-        eng.record_mixed_abc_rows(vec![10, 11, 12], slots.clone(), true, &mut kv);
+        eng.record_mixed_abc_rows(vec![10, 11, 12], slots, true, &mut kv);
 
         assert_eq!(eng.rows.as_slice(), &[10, 11, 12]);
         assert_eq!(eng.prev_a_rows, vec![10, 11, 12]);
         assert_eq!(eng.device_rows, vec![10, 11, 12]);
-        assert_eq!(eng.prealloc, slots);
+        assert_eq!(eng.prealloc.as_slice(), expected.as_slice());
         assert_eq!(kv.outstanding(), 3, "next slots stay reserved");
+        drain(&mut eng, &mut kv);
     }
 
     #[test]
     fn mixed_record_without_device_control_keeps_only_a_rows() {
         let mut kv = GlobalKvAllocator::new(16);
-        let slots = kv.alloc_indices(2).unwrap();
+        let slots = kv.lease(2).unwrap();
+        let expected = slots.as_slice().to_vec();
         let mut eng = DecodeEngine::new();
 
-        eng.record_mixed_abc_rows(vec![20, 21], slots.clone(), false, &mut kv);
+        eng.record_mixed_abc_rows(vec![20, 21], slots, false, &mut kv);
 
         assert_eq!(eng.rows.as_slice(), &[20, 21]);
         assert_eq!(eng.prev_a_rows, vec![20, 21]);
         assert!(eng.device_rows.is_empty());
-        assert_eq!(eng.prealloc, slots);
+        assert_eq!(eng.prealloc.as_slice(), expected.as_slice());
         assert_eq!(
             kv.outstanding(),
             2,
             "host fallback still consumes reserved slots"
         );
+        drain(&mut eng, &mut kv);
     }
 
     #[test]
     fn mixed_record_mismatched_slots_releases_reservation() {
         let mut kv = GlobalKvAllocator::new(16);
-        let slots = kv.alloc_indices(2).unwrap();
+        let slots = kv.lease(2).unwrap();
         let mut eng = DecodeEngine::new();
 
         eng.record_mixed_abc_rows(vec![30, 31, 32], slots, true, &mut kv);
@@ -1038,8 +1031,8 @@ mod prealloc_tests {
     #[test]
     fn mixed_record_releases_surplus_next_slots() {
         let mut kv = GlobalKvAllocator::new(16);
-        let slots = kv.alloc_indices(4).unwrap();
-        let keep = slots[..2].to_vec();
+        let slots = kv.lease(4).unwrap();
+        let keep = slots.as_slice()[..2].to_vec();
         let mut eng = DecodeEngine::new();
 
         eng.record_mixed_abc_rows(vec![50, 51], slots, true, &mut kv);
@@ -1047,24 +1040,27 @@ mod prealloc_tests {
         assert_eq!(eng.rows.as_slice(), &[50, 51]);
         assert_eq!(eng.prev_a_rows, vec![50, 51]);
         assert_eq!(eng.device_rows, vec![50, 51]);
-        assert_eq!(eng.prealloc, keep);
+        assert_eq!(eng.prealloc.as_slice(), keep.as_slice());
         assert_eq!(kv.outstanding(), 2, "surplus reservation was returned");
+        drain(&mut eng, &mut kv);
     }
 
     #[test]
     fn mixed_record_replaces_old_prealloc() {
         let mut kv = GlobalKvAllocator::new(16);
-        let old = kv.alloc_indices(2).unwrap();
-        let new = kv.alloc_indices(1).unwrap();
+        let old = kv.lease(2).unwrap();
+        let new = kv.lease(1).unwrap();
+        let expected = new.as_slice().to_vec();
         let mut eng = DecodeEngine::new();
         eng.prealloc = old;
 
-        eng.record_mixed_abc_rows(vec![40], new.clone(), true, &mut kv);
+        eng.record_mixed_abc_rows(vec![40], new, true, &mut kv);
 
         assert_eq!(eng.rows.as_slice(), &[40]);
         assert_eq!(eng.prev_a_rows, vec![40]);
         assert_eq!(eng.device_rows, vec![40]);
-        assert_eq!(eng.prealloc, new);
+        assert_eq!(eng.prealloc.as_slice(), expected.as_slice());
         assert_eq!(kv.outstanding(), 1, "old reservation was returned");
+        drain(&mut eng, &mut kv);
     }
 }
