@@ -1517,3 +1517,153 @@ impl DiffusionOps for Cuda {
         })
     }
 }
+
+
+// ─── DecodePipelineOps: the real CUDA implementation ─────────────────────────
+// Delegates the merge/control kernels to `kernels::gather_merge` and the
+// event/copy choreography to the device's dual-stream `CudaConfig` machinery.
+impl infer_core::ports::DecodePipelineOps for Cuda {
+    fn append_decode_admissions(
+        scope: &CudaScope,
+        a_out: &mut Tensor<i32, Cuda>,
+        b_new: &Tensor<i32, Cuda>,
+        start: usize,
+        count: usize,
+    ) -> OpResult<()> {
+        let stream = infer_core::exec::ExecScope::stream(scope).0;
+        kernels::gather_merge::append_decode_admissions_into(a_out, b_new, start, count, stream)
+    }
+
+    fn merge_compact_decode(
+        scope: &CudaScope,
+        args: infer_core::ports::MergeCompactDecodeArgs<'_, Cuda>,
+    ) -> OpResult<()> {
+        let stream = infer_core::exec::ExecScope::stream(scope).0;
+        kernels::gather_merge::merge_compact_decode_into(
+            kernels::gather_merge::MergeCompactDecodeArgs {
+                a_out: args.a_out,
+                c_prev: args.c_prev,
+                generated_counts: args.generated_counts,
+                max_tokens: args.max_tokens,
+                ignore_eos: args.ignore_eos,
+                eos_ids: args.eos_ids,
+                eos_len: args.eos_len,
+                old_batch: args.old_batch,
+                active_src_rows: &*args.active_src_rows,
+                finished_src_rows: &*args.finished_src_rows,
+                finished_tokens: &*args.finished_tokens,
+                counts: &*args.counts,
+                stream,
+            },
+        )
+    }
+
+    fn merge_compact_mixed(
+        scope: &CudaScope,
+        args: infer_core::ports::MergeCompactMixedArgs<'_, Cuda>,
+    ) -> OpResult<()> {
+        let stream = infer_core::exec::ExecScope::stream(scope).0;
+        kernels::gather_merge::merge_compact_mixed_into(
+            kernels::gather_merge::MergeCompactMixedArgs {
+                a_out: args.a_out,
+                c_prev: args.c_prev,
+                row_kind: args.row_kind,
+                generated_counts: args.generated_counts,
+                max_tokens: args.max_tokens,
+                ignore_eos: args.ignore_eos,
+                eos_ids: args.eos_ids,
+                eos_len: args.eos_len,
+                old_rows: args.old_rows,
+                active_src_rows: &*args.active_src_rows,
+                active_tokens: &*args.active_tokens,
+                finished_src_rows: &*args.finished_src_rows,
+                finished_tokens: &*args.finished_tokens,
+                prefill_final_src_rows: &*args.prefill_final_src_rows,
+                prefill_final_tokens: &*args.prefill_final_tokens,
+                counts: &*args.counts,
+                stream,
+            },
+        )
+    }
+
+    fn compact_extend_control(
+        scope: &CudaScope,
+        args: infer_core::ports::CompactExtendControlArgs<'_, Cuda>,
+    ) -> OpResult<()> {
+        let stream = infer_core::exec::ExecScope::stream(scope).0;
+        kernels::gather_merge::compact_extend_control_into(
+            kernels::gather_merge::CompactExtendControlArgs {
+                block_tables: args.block_tables,
+                block_tables_scratch: args.block_tables_scratch,
+                kv_lens: args.kv_lens,
+                kv_lens_scratch: args.kv_lens_scratch,
+                seq_positions_out: args.seq_positions_out,
+                seq_lens_step_out: args.seq_lens_step_out,
+                rope_positions_out: args.rope_positions_out,
+                cu_q_lens_out: args.cu_q_lens_out,
+                block2req_out: args.block2req_out,
+                block2tile_out: args.block2tile_out,
+                active_src_rows: args.active_src_rows,
+                counts: args.counts,
+                new_slots: args.new_slots,
+                mbps: args.mbps,
+                cap_batch: args.cap_batch,
+                stream,
+            },
+        )
+    }
+
+    fn pipeline_pin_host_i32(scope: &CudaScope, buf: &[i32]) -> OpResult<()> {
+        scope.device.config.pin_host_i32(buf)
+    }
+
+    fn pipeline_record_copy_in(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.record_copy_in()
+    }
+    fn pipeline_compute_wait_copy_in(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.compute_wait_copy_in()
+    }
+    fn pipeline_record_compute_a(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.record_compute_a()
+    }
+    fn pipeline_copy_out_wait_compute_a(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.copy_out_wait_compute_a()
+    }
+    fn pipeline_record_copy_out(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.record_copy_out()
+    }
+    fn pipeline_compute_wait_copy_out(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.compute_wait_copy_out()
+    }
+    fn pipeline_synchronize_copy_in(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.synchronize_copy_in()
+    }
+    fn pipeline_synchronize_copy_out(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.synchronize_copy_out()
+    }
+
+    unsafe fn pipeline_upload_h2d_copy_in(
+        scope: &CudaScope,
+        dst: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        bytes: usize,
+    ) -> OpResult<()> {
+        unsafe { scope.device.config.upload_h2d_copy_in(dst, src, bytes) }
+    }
+
+    unsafe fn pipeline_download_d2h_copy_out(
+        scope: &CudaScope,
+        dst: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        bytes: usize,
+    ) -> OpResult<()> {
+        unsafe { scope.device.config.download_d2h_copy_out(dst, src, bytes) }
+    }
+
+    fn pipeline_arena_begin(scope: &CudaScope) {
+        scope.device.config.arena_begin();
+    }
+    fn pipeline_arena_end(scope: &CudaScope) {
+        scope.device.config.arena_end();
+    }
+}

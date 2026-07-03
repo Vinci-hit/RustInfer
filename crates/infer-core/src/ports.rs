@@ -11,6 +11,7 @@ pub mod backend;
 pub mod collective;
 pub mod fused_ops;
 pub mod math_ops;
+pub mod pipeline_ops;
 pub mod sampler;
 
 // Two op surfaces coexist intentionally (both load-bearing, not duplication):
@@ -28,4 +29,7 @@ pub use error::{OpError, OpResult};
 pub use fused_ops::FusedOps;
 pub use math_ops::MathOps;
 pub use op_ports::{CoreOps, DiffusionOps, OpBackend};
+pub use pipeline_ops::{
+    CompactExtendControlArgs, DecodePipelineOps, MergeCompactDecodeArgs, MergeCompactMixedArgs,
+};
 pub use sampler::{AcceptReject, SampleBatch, SampledToken, Sampler, SamplingParams};

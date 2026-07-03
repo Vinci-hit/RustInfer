@@ -40,6 +40,9 @@ infer_core::impl_math_ops_via_core_ops!(Cpu);
 
 impl infer_core::ports::FusedOps for Cpu {}
 
+// Decode-pipeline port: the host reference defaults ARE the CPU implementation.
+impl infer_core::ports::DecodePipelineOps for Cpu {}
+
 // ─── Cpu MemoryPort ──────────────────────────────────────────────────────────
 
 /// CPU layout: 16-byte aligned, size rounded up to 16 (matches existing kernel
