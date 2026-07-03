@@ -15,7 +15,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// Every field has a default so a minimal file containing only `model = "..."`
 /// loads cleanly. The four IPC endpoints are derived from [`Self::cluster_id`].
+///
+/// `deny_unknown_fields`: a typo'd key (`max_batch_seq` for `max_batch_seqs`)
+/// must fail the load instead of silently falling back to the default — all
+/// three processes share this file, and a silent default here surfaces as a
+/// confusing capacity/limit mismatch at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RustInferConfig {
     /// Model directory (weights + tokenizer.json + config.json). Required.
     #[serde(default)]
@@ -196,10 +202,53 @@ impl RustInferConfig {
             std::fs::read_to_string(path).map_err(|e| format!("read config {}: {}", path, e))?;
         let cfg: RustInferConfig =
             toml::from_str(&bytes).map_err(|e| format!("parse config {}: {}", path, e))?;
-        if cfg.model.trim().is_empty() {
-            return Err(format!("config {}: `model` is required", path));
-        }
+        cfg.validate()
+            .map_err(|e| format!("config {}: {}", path, e))?;
         Ok(cfg)
+    }
+
+    /// Range-check the fields every process depends on. All three binaries load
+    /// the same file through [`Self::load`], so a bad value fails at startup in
+    /// each of them with the same message instead of surfacing later as a
+    /// worker abort or a nonsense capacity.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("`model` is required".into());
+        }
+        if !(self.mem_fraction_static > 0.0 && self.mem_fraction_static <= 1.0) {
+            return Err(format!(
+                "`mem_fraction_static` must be in (0, 1], got {}",
+                self.mem_fraction_static
+            ));
+        }
+        if self.max_model_len == 0 {
+            return Err("`max_model_len` must be > 0".into());
+        }
+        if self.max_batch_tokens == 0 {
+            return Err("`max_batch_tokens` must be > 0".into());
+        }
+        if self.max_batch_seqs == 0 {
+            return Err("`max_batch_seqs` must be > 0".into());
+        }
+        if self.paged_block_size == 0 {
+            return Err("`paged_block_size` must be > 0".into());
+        }
+        if self.request_timeout_secs == 0 {
+            return Err("`request_timeout_secs` must be > 0".into());
+        }
+        if self.port == 0 {
+            return Err("`port` must be > 0".into());
+        }
+        match self.mode.as_str() {
+            "llm" | "diffusion" => {}
+            other => {
+                return Err(format!(
+                    "`mode` must be \"llm\" or \"diffusion\", got {:?}",
+                    other
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// ZMQ frontend endpoint (ROUTER; HTTP server connects here).

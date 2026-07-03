@@ -2,8 +2,6 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use infer_protocol::scheduler_to_worker_control::LoadModel;
-
 use crate::device::MemoryPort;
 use crate::error::OpResult;
 
@@ -208,21 +206,6 @@ impl TopologyShape {
         dp: RankPair { rank: 0, size: 1 },
         node: RankPair { rank: 0, size: 1 },
     };
-
-    pub fn from_load_model(load: &LoadModel) -> Self {
-        Self {
-            tp: RankPair {
-                rank: load.tp_rank,
-                size: load.tp_size.max(1),
-            },
-            pp: RankPair {
-                rank: load.pp_rank,
-                size: load.pp_size.max(1),
-            },
-            dp: RankPair { rank: 0, size: 1 },
-            node: RankPair { rank: 0, size: 1 },
-        }
-    }
 
     pub fn world_size(&self) -> usize {
         self.tp.size * self.pp.size * self.dp.size * self.node.size

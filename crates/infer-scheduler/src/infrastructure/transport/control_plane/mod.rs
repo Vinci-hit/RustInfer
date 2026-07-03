@@ -408,6 +408,16 @@ fn drive_handshake(
                     hello.device,
                     hello.protocol_version,
                 );
+                // Enforce, don't just log: a mismatched worker build would
+                // otherwise handshake fine and fail mid-batch with opaque
+                // msgpack decode errors. Fail the bootstrap loudly instead.
+                if hello.protocol_version != WORKER_CONTROL_PROTOCOL_VERSION {
+                    return Err(ControlError::Router(format!(
+                        "worker {} speaks control protocol v{} but scheduler requires v{}; \
+                         rebuild/redeploy the mismatched side",
+                        hello.worker_id, hello.protocol_version, WORKER_CONTROL_PROTOCOL_VERSION,
+                    )));
+                }
                 send_scheduler_msg(
                     socket,
                     &identity,

@@ -2125,7 +2125,6 @@ name = "infer-core"
 version = "0.1.0"
 dependencies = [
  "half",
- "infer-protocol",
  "thiserror 2.0.17",
 ]
 

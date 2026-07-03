@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 pub enum ServerCommand {
     Infer(InferenceRequest),
     Cancel(CancelRequest),
+    /// Liveness probe. The scheduler's frontend ZMQ thread answers with
+    /// `SchedulerReply::Pong` immediately (no engine round-trip); the server
+    /// uses the reply age to drive `/ready`. Appended last so the wire tags of
+    /// the existing variants are unchanged.
+    Ping,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

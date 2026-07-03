@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// Protocol version of the server↔scheduler (frontend) plane. Bumped on any
+/// wire-incompatible change. The scheduler reports it in [`SchedulerPong`];
+/// the server refuses readiness (`/ready` 503) on mismatch.
+pub const FRONTEND_PROTOCOL_VERSION: u32 = 1;
+
+/// Scheduler -> Server 的统一回复信封（tagged union）。
+///
+/// 服务端此前对裸 `InferenceResponse` / `StreamChunk` 做试探性反序列化来区分
+/// 两种回复；rmp 的 positional 编码下任何字段增删都可能让一种类型静默解析成
+/// 另一种。所有回复统一走这个带 tag 的枚举，与 `ServerCommand` 对称。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SchedulerReply {
+    Full(InferenceResponse),
+    Chunk(StreamChunk),
+    /// Liveness reply to [`crate::server_to_scheduler::ServerCommand::Ping`].
+    Pong(SchedulerPong),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerPong {
+    pub protocol_version: u32,
+}
+
 /// Scheduler -> Server 的完整响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceResponse {

@@ -53,6 +53,27 @@ impl std::fmt::Display for ServerOverloaded {
 }
 impl std::error::Error for ServerOverloaded {}
 
+/// Marker error: the per-request deadline elapsed without a scheduler reply
+/// (scheduler/worker dead or overloaded). [`AppError::from_submit`] downcasts
+/// it to a 504 instead of a 500 so load balancers and clients can tell a
+/// timeout from a server bug.
+#[derive(Debug)]
+pub struct RequestTimedOut {
+    pub request_id: String,
+    pub secs: u64,
+}
+
+impl std::fmt::Display for RequestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request {} timed out after {}s waiting for the inference engine",
+            self.request_id, self.secs
+        )
+    }
+}
+impl std::error::Error for RequestTimedOut {}
+
 impl AppError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::BadRequest(msg.into())
@@ -70,11 +91,14 @@ impl AppError {
         Self::TooManyRequests(msg.into())
     }
 
-    /// Map an error returned by a client submit (`infer`/`infer_stream`): an
-    /// overload marker becomes 429 (rate_limit_error); anything else is 500.
+    /// Map an error returned by a client call (`infer`/`infer_stream`): an
+    /// overload marker becomes 429 (rate_limit_error), a request-deadline
+    /// marker becomes 504 (timeout_error); anything else is 500.
     pub fn from_submit(err: anyhow::Error) -> Self {
         if err.downcast_ref::<ServerOverloaded>().is_some() {
             Self::TooManyRequests("server overloaded, please retry later".to_string())
+        } else if let Some(timeout) = err.downcast_ref::<RequestTimedOut>() {
+            Self::Timeout(timeout.to_string())
         } else {
             Self::Internal(err)
         }

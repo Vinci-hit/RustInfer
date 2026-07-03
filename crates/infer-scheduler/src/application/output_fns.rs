@@ -290,7 +290,22 @@ pub async fn process_llm_step_decoded(
     finished_sequence_ids.sort_unstable_by_key(|id| id.0);
     finished_sequence_ids.dedup();
     for sequence_id in finished_sequence_ids {
-        let seq = sessions.finish_decoding(sequence_id)?;
+        // Error-severity policy: a per-sequence table inconsistency is
+        // request-scoped — log and move on, exactly like the ack/append arms
+        // above. Only transport failures (frontend gone ⇒ `Shutdown`, from
+        // `complete_session`/`send_stream_chunk`) propagate out of this
+        // function and terminate the event loop.
+        let seq = match sessions.finish_decoding(sequence_id) {
+            Ok(seq) => seq,
+            Err(e) => {
+                tracing::error!(
+                    sequence_id = sequence_id.0,
+                    "finish_decoding failed; dropping completion for this sequence: {}",
+                    e
+                );
+                continue;
+            }
+        };
         let outcome = complete_session(frontend, metrics, seq).await?;
         tracing::info!(
             "Completed {}: {} tokens e2e={}ms ttft={}ms decode={}ms e2e_tps={:.1} decode_tps={:.1}",

@@ -175,7 +175,16 @@ async fn main() -> Result<()> {
     // `systemctl stop` / `docker stop` (SIGTERM) would kill the scheduler
     // without ever telling the worker to exit.
     tokio::select! {
-        res = engine.run() => { res?; }
+        res = engine.run() => {
+            if res.is_err() {
+                // The engine failed in-flight/waiting requests on its way out,
+                // but those responses are only queued to the detached frontend
+                // ZMQ thread. Give it a beat to flush to the sockets before
+                // the process exit tears it down.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            res?;
+        }
         sig = wait_for_shutdown_signal() => {
             tracing::info!("Received {}; shutting down scheduler and notifying worker.", sig);
         }

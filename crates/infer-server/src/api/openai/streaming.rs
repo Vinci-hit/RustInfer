@@ -209,6 +209,11 @@ where
         let _permit = permit;
         let mut completion_tokens: u32 = 0;
         let mut first_content_sent = false;
+        // Set on the Done/Error arms. False after the loop means the channel
+        // closed without a terminal chunk (ZMQ thread dropped the stream:
+        // slow-consumer cancel or scheduler link death) — surfaced to the
+        // client below instead of silently closing the connection.
+        let mut ended_clean = false;
         let mut decoder = IncrementalDecoder::new(tokenizer);
 
         if let Some(opening) = shape.opening() {
@@ -252,6 +257,7 @@ where
                     // 会触发 stream future drop → StreamHandle::Drop → 向 scheduler 发出
                     // 一个不必要的 cancel。
                     stream_handle.mark_finished();
+                    ended_clean = true;
 
                     // 流结束前 flush decoder：把任何被滞留的「未确认」字符吐出去。
                     // 走到这里说明流自然结束，残留的 U+FFFD 是真实的不可解码序列，
@@ -277,10 +283,40 @@ where
                 }
                 ChunkType::Error => {
                     stream_handle.mark_finished();
+                    ended_clean = true;
+                    // Surface the failure instead of masquerading as success —
+                    // same policy as the serializer-failure path in
+                    // `json_event`: an explicit `error` SSE event carrying the
+                    // engine message, a finish chunk with `finish_reason:
+                    // "error"`, then the `[DONE]` terminator.
+                    let message = chunk
+                        .finish_reason
+                        .unwrap_or_else(|| "inference engine error".to_string());
+                    let body = serde_json::json!({
+                        "error": { "message": message, "type": "engine_error" }
+                    });
+                    yield Ok(Event::default().event("error").data(body.to_string()));
+                    yield Ok(json_event(&request_id, &shape.finish("error".to_string())));
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
             }
+        }
+
+        if !ended_clean {
+            // Channel closed mid-stream with no terminal chunk. mark_finished
+            // suppresses the Drop-cancel (the server side already dropped the
+            // request when it closed the channel).
+            stream_handle.mark_finished();
+            let body = serde_json::json!({
+                "error": {
+                    "message": "stream aborted by server (slow consumer or scheduler failure)",
+                    "type": "engine_error",
+                }
+            });
+            yield Ok(Event::default().event("error").data(body.to_string()));
+            yield Ok(json_event(&request_id, &shape.finish("error".to_string())));
+            yield Ok(Event::default().data("[DONE]"));
         }
     };
 

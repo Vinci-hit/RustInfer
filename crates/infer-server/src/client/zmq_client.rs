@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use infer_protocol::scheduler_to_server::{
-    ChunkType, InferenceMetrics, InferenceResponse, StreamChunk,
+    ChunkType, FRONTEND_PROTOCOL_VERSION, InferenceMetrics, InferenceResponse, SchedulerReply,
+    StreamChunk,
 };
 use infer_protocol::server_to_scheduler::{
     CancelReason, CancelRequest as ServerCancelRequest, InferenceRequest, ServerCommand,
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +23,14 @@ use super::InferClient;
 
 const CLIENT_COMMAND_BUFFER: usize = 1024;
 const STREAM_CHUNK_BUFFER: usize = 64;
+/// Send a liveness `Ping` when nothing has been heard from the scheduler for
+/// this long. The scheduler's frontend thread answers `Pong` immediately, so
+/// under a healthy link `last_contact` stays fresh even with zero traffic.
+const PING_INTERVAL: Duration = Duration::from_secs(3);
+/// `/ready` reports ready only if the scheduler was heard from within this
+/// window. Must comfortably exceed `PING_INTERVAL` so one lost pong does not
+/// flap readiness.
+const READY_STALE_MS: u64 = 10_000;
 /// Idle ceiling on a single `zmq::poll`: with the wake pipe restored, new
 /// commands interrupt the poll instantly and responses arrive via POLLIN, so
 /// this only bounds how often `cancel_timed_out_requests` runs while fully
@@ -119,6 +129,51 @@ pub struct ZmqClient {
     command_tx: SyncSender<RequestEnvelope>,
     waker: std::sync::Arc<Waker>,
     timeout: Duration,
+    /// Unix millis of the last decoded scheduler reply (any kind). `0` until
+    /// first contact. Written by the ZMQ thread, read by `/ready`.
+    last_contact: std::sync::Arc<AtomicU64>,
+}
+
+/// Current unix time in milliseconds (0 if the clock is before the epoch).
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Cancels a oneshot (non-stream) request if the HTTP handler future is
+/// dropped mid-await — the non-stream twin of [`StreamHandle`]'s drop-cancel.
+/// Without this, an abandoned non-stream request keeps decoding (and holding
+/// KV) until completion or timeout.
+struct OneshotCancelGuard {
+    /// `Some` while armed; `take()`n on disarm or drop.
+    request_id: Option<String>,
+    command_tx: SyncSender<RequestEnvelope>,
+    waker: std::sync::Arc<Waker>,
+}
+
+impl OneshotCancelGuard {
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for OneshotCancelGuard {
+    fn drop(&mut self) {
+        if let Some(request_id) = self.request_id.take() {
+            if self
+                .command_tx
+                .try_send(RequestEnvelope::Cancel {
+                    request_id,
+                    reason: CancelReason::ClientDisconnected,
+                })
+                .is_ok()
+            {
+                self.waker.wake();
+            }
+        }
+    }
 }
 
 /// Classify a failed submit into the bounded command channel: a full channel
@@ -149,10 +204,15 @@ impl ZmqClient {
             writer: Mutex::new(wake_tx),
         });
 
+        let last_contact = std::sync::Arc::new(AtomicU64::new(0));
+        let last_contact_thread = last_contact.clone();
+
         thread::Builder::new()
             .name("zmq-client".to_string())
             .spawn(move || {
-                if let Err(e) = Self::zmq_thread(endpoint, command_rx, wake_rx, timeout) {
+                if let Err(e) =
+                    Self::zmq_thread(endpoint, command_rx, wake_rx, timeout, last_contact_thread)
+                {
                     tracing::error!("ZMQ thread exited with error: {:?}", e);
                 }
             })?;
@@ -161,7 +221,17 @@ impl ZmqClient {
             command_tx,
             waker,
             timeout,
+            last_contact,
         })
+    }
+
+    /// Whether the scheduler has been heard from recently enough to accept
+    /// traffic. Drives `/ready`: false until the first reply/pong after boot,
+    /// and false again within `READY_STALE_MS` of the scheduler dying (DEALER
+    /// `connect` is lazy and never fails, so socket state says nothing).
+    pub fn scheduler_alive(&self) -> bool {
+        let last = self.last_contact.load(Ordering::Relaxed);
+        last != 0 && unix_ms().saturating_sub(last) < READY_STALE_MS
     }
 
     fn zmq_thread(
@@ -169,6 +239,7 @@ impl ZmqClient {
         command_rx: Receiver<RequestEnvelope>,
         mut wake_rx: std::io::PipeReader,
         timeout: Duration,
+        last_contact: std::sync::Arc<AtomicU64>,
     ) -> Result<()> {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::DEALER)?;
@@ -177,6 +248,7 @@ impl ZmqClient {
 
         tracing::info!("ZMQ client connected to {}", endpoint);
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
+        let mut last_ping = Instant::now() - PING_INTERVAL;
 
         loop {
             // 1) 处理所有已到达的命令（无论是被 wakeup 唤醒还是被 POLLIN 唤醒，都先排空 channel）
@@ -206,7 +278,21 @@ impl ZmqClient {
 
             // 4) DEALER 有数据：尽量多收（一次 poll 唤醒可能对应多个消息到达）
             if items[0].is_readable() {
-                Self::drain_dealer(&socket, &mut pending, timeout);
+                Self::drain_dealer(&socket, &mut pending, &last_contact, timeout);
+            }
+
+            // 4b) Liveness probe: nothing heard within PING_INTERVAL → send a
+            //     Ping (rate-limited by last_ping). The poll above wakes at
+            //     least every POLL_MAX_TIMEOUT, so this runs on time even when
+            //     fully idle.
+            let contact_age = unix_ms().saturating_sub(last_contact.load(Ordering::Relaxed));
+            if contact_age >= PING_INTERVAL.as_millis() as u64
+                && last_ping.elapsed() >= PING_INTERVAL
+            {
+                last_ping = Instant::now();
+                if let Err(e) = Self::send_command(&socket, &ServerCommand::Ping) {
+                    tracing::warn!("failed to send liveness ping: {:?}", e);
+                }
             }
 
             // 5) wake 管道有信号：排空一次（POLLIN 保证至少 1 字节，不会阻塞；
@@ -275,13 +361,16 @@ impl ZmqClient {
     fn drain_dealer(
         socket: &zmq::Socket,
         pending: &mut HashMap<String, PendingRequest>,
+        last_contact: &AtomicU64,
         timeout: Duration,
     ) {
         loop {
             // DEALER 收到的第一帧是空 delimiter（来自 ROUTER 的回程）
             match socket.recv_bytes(zmq::DONTWAIT) {
                 Ok(_delim) => match socket.recv_bytes(zmq::DONTWAIT) {
-                    Ok(data) => Self::handle_response(socket, pending, &data, timeout),
+                    Ok(data) => {
+                        Self::handle_response(socket, pending, last_contact, &data, timeout)
+                    }
                     Err(zmq::Error::EAGAIN) => {
                         tracing::warn!("ZMQ response delimiter without payload");
                         break;
@@ -343,101 +432,133 @@ impl ZmqClient {
     fn handle_response(
         socket: &zmq::Socket,
         pending: &mut HashMap<String, PendingRequest>,
+        last_contact: &AtomicU64,
         data: &[u8],
         timeout: Duration,
     ) {
-        if let Ok(response) = rmp_serde::from_slice::<InferenceResponse>(data) {
-            let request_id = response.request_id.clone();
-            if let Some(pending_req) = pending.remove(&request_id) {
-                match pending_req {
-                    PendingRequest::Oneshot { tx, .. } => {
-                        if tx.send(response).is_err() {
-                            tracing::debug!("Response receiver dropped for request {}", request_id);
-                            if let Err(e) = Self::send_cancel(
-                                socket,
-                                &request_id,
-                                CancelReason::ClientDisconnected,
-                            ) {
-                                tracing::warn!(
-                                    request_id = %request_id,
-                                    error = ?e,
-                                    "failed to send cancel after oneshot receiver dropped"
-                                );
-                            }
-                        }
-                    }
-                    PendingRequest::Stream { tx, .. } => {
-                        let chunk = StreamChunk {
-                            request_id: request_id.clone(),
-                            chunk_type: ChunkType::Done,
-                            token_id: None,
-                            finish_reason: response.finish_reason.clone(),
-                            metrics: Some(response.metrics),
-                        };
-                        if tx.try_send(chunk).is_err() {
-                            if let Err(e) = Self::send_cancel(
-                                socket,
-                                &request_id,
-                                CancelReason::ClientDisconnected,
-                            ) {
-                                tracing::warn!(
-                                    request_id = %request_id,
-                                    error = ?e,
-                                    "failed to send cancel after stream receiver dropped"
-                                );
-                            }
-                        }
-                    }
-                }
-            } else {
-                tracing::debug!("Received response for inactive request: {}", request_id);
+        // Single tagged decode — no trial deserialization. The scheduler wraps
+        // every reply in `SchedulerReply`.
+        let reply = match rmp_serde::from_slice::<SchedulerReply>(data) {
+            Ok(reply) => reply,
+            Err(e) => {
+                tracing::error!("Failed to deserialize SchedulerReply: {}", e);
+                return;
             }
-            return;
-        }
+        };
 
-        if let Ok(chunk) = rmp_serde::from_slice::<StreamChunk>(data) {
-            let request_id = chunk.request_id.clone();
-            let is_done = matches!(chunk.chunk_type, ChunkType::Done | ChunkType::Error);
-
-            let mut cancel_reason = None;
-            if let Some(PendingRequest::Stream { tx, deadline }) = pending.get_mut(&request_id) {
-                *deadline = Instant::now() + timeout;
-                match tx.try_send(chunk) {
-                    Ok(()) => {}
-                    Err(TokioTrySendError::Full(_)) => {
-                        cancel_reason = Some(CancelReason::StreamTimeout)
-                    }
-                    Err(TokioTrySendError::Closed(_)) => {
-                        cancel_reason = Some(CancelReason::ClientDisconnected)
-                    }
-                }
-            } else if pending.contains_key(&request_id) {
-                tracing::warn!(
-                    "Received stream chunk for non-stream request: {}",
-                    request_id
-                );
-            } else {
-                tracing::debug!("Received chunk for inactive request: {}", request_id);
-            }
-
-            if is_done || cancel_reason.is_some() {
-                pending.remove(&request_id);
-            }
-            if let Some(reason) = cancel_reason {
-                if let Err(e) = Self::send_cancel(socket, &request_id, reason) {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        error = ?e,
-                        "failed to send cancel after stream send failure"
+        match reply {
+            SchedulerReply::Pong(pong) => {
+                if pong.protocol_version != FRONTEND_PROTOCOL_VERSION {
+                    // Refuse readiness on mismatch: don't refresh last_contact,
+                    // so /ready keeps reporting 503.
+                    tracing::error!(
+                        scheduler_version = pong.protocol_version,
+                        server_version = FRONTEND_PROTOCOL_VERSION,
+                        "scheduler frontend protocol version mismatch; holding /ready at 503"
                     );
+                    return;
+                }
+                last_contact.store(unix_ms(), Ordering::Relaxed);
+            }
+            SchedulerReply::Full(response) => {
+                last_contact.store(unix_ms(), Ordering::Relaxed);
+                Self::handle_full_response(socket, pending, response);
+            }
+            SchedulerReply::Chunk(chunk) => {
+                last_contact.store(unix_ms(), Ordering::Relaxed);
+                Self::handle_stream_chunk(socket, pending, chunk, timeout);
+            }
+        }
+    }
+
+    fn handle_full_response(
+        socket: &zmq::Socket,
+        pending: &mut HashMap<String, PendingRequest>,
+        response: InferenceResponse,
+    ) {
+        let request_id = response.request_id.clone();
+        if let Some(pending_req) = pending.remove(&request_id) {
+            match pending_req {
+                PendingRequest::Oneshot { tx, .. } => {
+                    if tx.send(response).is_err() {
+                        tracing::debug!("Response receiver dropped for request {}", request_id);
+                        if let Err(e) =
+                            Self::send_cancel(socket, &request_id, CancelReason::ClientDisconnected)
+                        {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                error = ?e,
+                                "failed to send cancel after oneshot receiver dropped"
+                            );
+                        }
+                    }
+                }
+                PendingRequest::Stream { tx, .. } => {
+                    let chunk = StreamChunk {
+                        request_id: request_id.clone(),
+                        chunk_type: ChunkType::Done,
+                        token_id: None,
+                        finish_reason: response.finish_reason.clone(),
+                        metrics: Some(response.metrics),
+                    };
+                    if tx.try_send(chunk).is_err() {
+                        if let Err(e) =
+                            Self::send_cancel(socket, &request_id, CancelReason::ClientDisconnected)
+                        {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                error = ?e,
+                                "failed to send cancel after stream receiver dropped"
+                            );
+                        }
+                    }
                 }
             }
-            return;
+        } else {
+            tracing::debug!("Received response for inactive request: {}", request_id);
+        }
+    }
+
+    fn handle_stream_chunk(
+        socket: &zmq::Socket,
+        pending: &mut HashMap<String, PendingRequest>,
+        chunk: StreamChunk,
+        timeout: Duration,
+    ) {
+        let request_id = chunk.request_id.clone();
+        let is_done = matches!(chunk.chunk_type, ChunkType::Done | ChunkType::Error);
+
+        let mut cancel_reason = None;
+        if let Some(PendingRequest::Stream { tx, deadline }) = pending.get_mut(&request_id) {
+            *deadline = Instant::now() + timeout;
+            match tx.try_send(chunk) {
+                Ok(()) => {}
+                Err(TokioTrySendError::Full(_)) => cancel_reason = Some(CancelReason::StreamTimeout),
+                Err(TokioTrySendError::Closed(_)) => {
+                    cancel_reason = Some(CancelReason::ClientDisconnected)
+                }
+            }
+        } else if pending.contains_key(&request_id) {
+            tracing::warn!(
+                "Received stream chunk for non-stream request: {}",
+                request_id
+            );
+        } else {
+            tracing::debug!("Received chunk for inactive request: {}", request_id);
         }
 
-        tracing::error!(
-            "Failed to deserialize response (neither InferenceResponse nor StreamChunk)"
-        );
+        if is_done || cancel_reason.is_some() {
+            pending.remove(&request_id);
+        }
+        if let Some(reason) = cancel_reason {
+            if let Err(e) = Self::send_cancel(socket, &request_id, reason) {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = ?e,
+                    "failed to send cancel after stream send failure"
+                );
+            }
+        }
     }
 
     fn cancel_timed_out_requests(
@@ -508,10 +629,28 @@ impl InferClient for ZmqClient {
             .map_err(map_submit_err)?;
         self.waker.wake();
 
+        // If the HTTP handler future is dropped while parked on `rx` (client
+        // disconnected), the guard's Drop cancels the request scheduler-side —
+        // without it the engine decodes to completion for a dead connection.
+        let mut cancel_guard = OneshotCancelGuard {
+            request_id: Some(request_id.clone()),
+            command_tx: self.command_tx.clone(),
+            waker: self.waker.clone(),
+        };
+
         match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow::anyhow!("Response channel closed")),
+            Ok(Ok(response)) => {
+                cancel_guard.disarm();
+                Ok(response)
+            }
+            Ok(Err(_)) => {
+                // ZMQ thread dropped the sender — pending entry is already
+                // gone; a follow-up cancel would be noise.
+                cancel_guard.disarm();
+                Err(anyhow::anyhow!("Response channel closed"))
+            }
             Err(_) => {
+                cancel_guard.disarm();
                 if self
                     .command_tx
                     .try_send(RequestEnvelope::Cancel {
@@ -522,11 +661,11 @@ impl InferClient for ZmqClient {
                 {
                     self.waker.wake();
                 }
-                Err(anyhow::anyhow!(
-                    "Request {} timeout after {}s",
+                // Typed marker so the handler maps this to HTTP 504, not 500.
+                Err(anyhow::Error::new(crate::error::RequestTimedOut {
                     request_id,
-                    self.timeout.as_secs()
-                ))
+                    secs: self.timeout.as_secs(),
+                }))
             }
         }
     }

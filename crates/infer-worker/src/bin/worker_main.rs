@@ -20,6 +20,7 @@ use half::bf16;
 use serde::Deserialize;
 
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
+use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION;
 
 use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
 use infer_worker::domain::dtype::quant::QuantScheme;
@@ -429,6 +430,16 @@ fn main() -> Result<(), String> {
                     "[bootstrap] SchedulerHello: protocol={} heartbeat={}ms",
                     h.protocol_version, h.heartbeat_interval_ms,
                 );
+                // Enforce the control-protocol version instead of just logging
+                // it: a mismatched scheduler build would otherwise fail later
+                // with opaque msgpack decode errors mid-batch.
+                if h.protocol_version != WORKER_CONTROL_PROTOCOL_VERSION {
+                    return Err(format!(
+                        "scheduler speaks control protocol v{} but this worker requires v{}; \
+                         rebuild/redeploy the mismatched side",
+                        h.protocol_version, WORKER_CONTROL_PROTOCOL_VERSION,
+                    ));
+                }
                 server_heartbeat_ms = Some(h.heartbeat_interval_ms);
             }
             other => {

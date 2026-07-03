@@ -2,7 +2,9 @@
 //! with tokio channels bridging to the async world.
 
 use async_trait::async_trait;
-use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+use infer_protocol::scheduler_to_server::{
+    FRONTEND_PROTOCOL_VERSION, InferenceResponse, SchedulerPong, SchedulerReply, StreamChunk,
+};
 use infer_protocol::server_to_scheduler::ServerCommand;
 use tokio::sync::mpsc;
 
@@ -151,6 +153,21 @@ impl ZmqFrontendTransport {
                                         reason: cancel.reason,
                                     });
                                 }
+                                Ok(ServerCommand::Ping) => {
+                                    // Liveness probe: answer directly from this
+                                    // thread (no engine round-trip) so the
+                                    // server's `/ready` reflects this process
+                                    // being alive and its frontend thread
+                                    // responsive.
+                                    let pong = SchedulerReply::Pong(SchedulerPong {
+                                        protocol_version: FRONTEND_PROTOCOL_VERSION,
+                                    });
+                                    if let Ok(data) = codec.encode(&pong) {
+                                        let _ = socket.send(identity.as_slice(), zmq::SNDMORE);
+                                        let _ = socket.send(&b""[..], zmq::SNDMORE);
+                                        let _ = socket.send(&data, 0);
+                                    }
+                                }
                                 Err(e) => tracing::error!("Decode: {}", e),
                             },
                             Err(e) => tracing::error!("ZMQ recv data: {:?}", e),
@@ -167,24 +184,22 @@ impl ZmqFrontendTransport {
             // 2. Drain wakeup + send outgoing.
             while wakeup_rx.recv_bytes(zmq::DONTWAIT).is_ok() {}
             while let Ok(msg) = msg_rx.try_recv() {
-                match msg {
+                // All replies go out wrapped in the tagged `SchedulerReply`
+                // envelope — the server decodes exactly one type, never by
+                // trial deserialization.
+                let (client_id, reply) = match msg {
                     OutgoingResponse::Full {
                         client_id,
                         response,
-                    } => {
-                        if let Ok(data) = codec.encode(&response) {
-                            let _ = socket.send(client_id.as_bytes(), zmq::SNDMORE);
-                            let _ = socket.send(&b""[..], zmq::SNDMORE);
-                            let _ = socket.send(&data, 0);
-                        }
-                    }
+                    } => (client_id, SchedulerReply::Full(response)),
                     OutgoingResponse::Chunk { client_id, chunk } => {
-                        if let Ok(data) = codec.encode(&chunk) {
-                            let _ = socket.send(client_id.as_bytes(), zmq::SNDMORE);
-                            let _ = socket.send(&b""[..], zmq::SNDMORE);
-                            let _ = socket.send(&data, 0);
-                        }
+                        (client_id, SchedulerReply::Chunk(chunk))
                     }
+                };
+                if let Ok(data) = codec.encode(&reply) {
+                    let _ = socket.send(client_id.as_bytes(), zmq::SNDMORE);
+                    let _ = socket.send(&b""[..], zmq::SNDMORE);
+                    let _ = socket.send(&data, 0);
                 }
             }
         }

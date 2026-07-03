@@ -6,6 +6,5 @@ description = "RustInfer foundation crate: dtypes, the extended DTypeId/quant sc
 license = "Apache-2.0"
 
 [dependencies]
-infer-protocol = { path = "../infer-protocol" }
 half = { version = "2.7.1", features = ["std", "num-traits"] }
 thiserror = "2.0.17"
