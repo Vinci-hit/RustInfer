@@ -22,14 +22,14 @@ use serde::Deserialize;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION;
 
-use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
+use infer_worker::application::serve_loop::{run_with_model, Bootstrap};
 use infer_worker::domain::dtype::quant::QuantScheme;
 use infer_worker::infrastructure::cuda::Cuda;
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
-use infer_worker::models::decoder::build_decoder;
 use infer_worker::models::loader::{LinearAttnConfig, LoadConfig, RopeScaling, WeightLoader};
+use infer_worker::models::{llama3, qwen3, qwen3_moe};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker", version = "0.3.0")]
@@ -71,6 +71,18 @@ struct HfConfig {
     /// quantized checkpoints; we support int4 `pack-quantized` on the MLP.
     #[serde(default)]
     quantization_config: Option<HfQuantConfig>,
+
+    // ── Sparse MoE fields (Qwen3 MoE; absent / zero for dense models) ──
+    #[serde(default)]
+    num_experts: usize,
+    #[serde(default)]
+    num_experts_per_tok: usize,
+    #[serde(default)]
+    moe_intermediate_size: usize,
+    #[serde(default)]
+    norm_topk_prob: bool,
+    #[serde(default)]
+    decoder_sparse_step: usize,
 
     // ── Qwen3.5 hybrid-stack fields (absent / defaulted for Llama3 & Qwen3) ──
     /// Per-layer mixer selector, e.g. `["linear_attention", ..., "full_attention"]`.
@@ -267,7 +279,10 @@ fn read_eos_ids(model_path: &str, model_type: &str) -> Vec<i32> {
         if let Some(n) = e.as_i64() {
             Some(vec![n as i32])
         } else if let Some(arr) = e.as_array() {
-            let ids: Vec<i32> = arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect();
+            let ids: Vec<i32> = arr
+                .iter()
+                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                .collect();
             (!ids.is_empty()).then_some(ids)
         } else {
             None
@@ -292,8 +307,8 @@ fn read_eos_ids(model_path: &str, model_type: &str) -> Vec<i32> {
     let default = match model_type {
         // <|endoftext|>=248044, <|im_end|>=248046
         "qwen3_5" => vec![248044, 248046],
-        "qwen3" => vec![151643, 151645], // <|endoftext|>, <|im_end|>
-        _ => vec![128001, 128008, 128009], // Llama 3.x default
+        "qwen3" | "qwen3_moe" => vec![151643, 151645], // <|endoftext|>, <|im_end|>
+        _ => vec![128001, 128008, 128009],             // Llama 3.x default
     };
     eprintln!(
         "[bootstrap] no eos_token_id in generation_config.json/config.json; \
@@ -370,6 +385,11 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
         rotary_dim,
         attn_output_gate: cfg.attn_output_gate,
         linear_attn,
+        num_experts: cfg.num_experts,
+        experts_per_tok: cfg.num_experts_per_tok,
+        moe_intermediate_size: cfg.moe_intermediate_size,
+        norm_topk_prob: cfg.norm_topk_prob,
+        decoder_sparse_step: cfg.decoder_sparse_step,
     }
 }
 
@@ -461,8 +481,8 @@ fn main() -> Result<(), String> {
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
-    let hf_cfg: HfConfig = parse_hf_config(&cfg_bytes)
-        .map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
+    let hf_cfg: HfConfig =
+        parse_hf_config(&cfg_bytes).map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
     let max_seq_len = load.max_model_len;
     let mut load_cfg = build_load_config(&hf_cfg, max_seq_len);
     eprintln!(
@@ -510,7 +530,9 @@ fn main() -> Result<(), String> {
     );
 
     // ── 5/6/7. Build runner + send Ready + run serve loop, dispatched on model_type ──
-    let bootstrap = Bootstrap {
+    let eos_ids: Vec<i32> = read_eos_ids(&load.model_path, &model_type);
+
+    let make_bootstrap = || Bootstrap {
         load: &load,
         cuda: &cuda,
         load_cfg: &load_cfg,
@@ -521,40 +543,64 @@ fn main() -> Result<(), String> {
         model_type: model_type.clone(),
         capture_sizes: cfg.capture_sizes.clone(),
     };
-    let eos_ids: Vec<i32> = read_eos_ids(&load.model_path, &model_type);
 
-    // qwen3_5 (hybrid Gated-DeltaNet + full-attention) is config-parsed but has
-    // no forward path yet (GatedDeltaNet + gated attention land in Phase 2/3).
-    // Fail loudly rather than mis-loading via the dense decoder builder, which
-    // assumes the flat `model.layers.` prefix and fused q+2kv — neither matches
-    // this checkpoint.
-    if model_type == "qwen3_5" {
-        return Err(
-            "qwen3_5 forward path not yet implemented (config parsing done; \
-             GatedDeltaNet + gated attention land in Phase 2/3)"
-                .to_string(),
-        );
+    match model_type.as_str() {
+        "llama3" => {
+            let model = llama3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
+                .map_err(|e| format!("llama3::build: {:?}", e))?;
+            eprintln!(
+                "[bootstrap] weights loaded in {:.2}s",
+                load_start.elapsed().as_secs_f32()
+            );
+            run_with_model(
+                &control,
+                &data,
+                model,
+                make_bootstrap(),
+                &eos_ids,
+                args.profile_cuda_steps,
+            )?;
+        }
+        "qwen3" => {
+            let model = qwen3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
+                .map_err(|e| format!("qwen3::build: {:?}", e))?;
+            eprintln!(
+                "[bootstrap] weights loaded in {:.2}s",
+                load_start.elapsed().as_secs_f32()
+            );
+            run_with_model(
+                &control,
+                &data,
+                model,
+                make_bootstrap(),
+                &eos_ids,
+                args.profile_cuda_steps,
+            )?;
+        }
+        "qwen3_moe" => {
+            let model = qwen3_moe::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
+                .map_err(|e| format!("qwen3_moe::build: {:?}", e))?;
+            eprintln!(
+                "[bootstrap] weights loaded in {:.2}s",
+                load_start.elapsed().as_secs_f32()
+            );
+            run_with_model(
+                &control,
+                &data,
+                model,
+                make_bootstrap(),
+                &eos_ids,
+                args.profile_cuda_steps,
+            )?;
+        }
+        other => {
+            return Err(format!(
+                "unsupported model_type '{}'; supported models: {}",
+                other,
+                infer_protocol::supported_model_types_csv()
+            ));
+        }
     }
-
-    // One builder backs every dense decoder family: `build_decoder` assembles
-    // the shared `Decoder` using the generic loader primitives, and per-family
-    // differences (e.g. Qwen3's Q/K norms) are resolved inside it by weight
-    // presence — so there is nothing to dispatch on. `model_type` still rides
-    // along in `bootstrap`/`send_ready` for logging and chat-template selection.
-    let model = build_decoder::<bf16, Cuda>(&loader, &load_cfg, &cuda)
-        .map_err(|e| format!("build_decoder: {:?}", e))?;
-    eprintln!(
-        "[bootstrap] weights loaded in {:.2}s",
-        load_start.elapsed().as_secs_f32()
-    );
-    run_with_model(
-        &control,
-        &data,
-        model,
-        bootstrap,
-        &eos_ids,
-        args.profile_cuda_steps,
-    )?;
 
     Ok(())
 }
@@ -613,6 +659,26 @@ mod config_tests {
         "max_position_embeddings": 40960
     }"#;
 
+    const QWEN3_MOE_JSON: &str = r#"{
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "max_position_embeddings": 40960,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 768,
+        "decoder_sparse_step": 1,
+        "norm_topk_prob": true
+    }"#;
+
     #[test]
     fn parses_nested_text_config() {
         let cfg = parse_hf_config(QWEN3_5_JSON.as_bytes()).expect("parse qwen3_5");
@@ -653,7 +719,7 @@ mod config_tests {
         assert_eq!(la.key_dim(), 2048);
         assert_eq!(la.value_dim(), 4096);
         assert_eq!(la.conv_dim(), 8192); // 2048 + 2048 + 4096
-        // layer_types = [L,L,L,F] → last layer is full.
+                                         // layer_types = [L,L,L,F] → last layer is full.
         assert_eq!(la.layer_is_full, vec![false, false, false, true]);
         assert_eq!(la.num_full_layers(), 1);
         assert_eq!(la.num_linear_layers(), 3);
@@ -671,6 +737,24 @@ mod config_tests {
         assert_eq!(lc.rotary_dim, lc.head_dim); // partial factor defaults to 1.0
         assert_eq!(lc.head_dim, 128);
         assert_eq!(lc.rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn qwen3_moe_config_maps_sparse_fields() {
+        let cfg = parse_hf_config(QWEN3_MOE_JSON.as_bytes()).expect("parse qwen3_moe");
+        assert_eq!(cfg.num_experts, 128);
+        assert_eq!(cfg.num_experts_per_tok, 8);
+        assert_eq!(cfg.moe_intermediate_size, 768);
+        assert_eq!(cfg.decoder_sparse_step, 1);
+        assert!(cfg.norm_topk_prob);
+
+        let lc = build_load_config(&cfg, 4096);
+        assert_eq!(lc.num_experts, 128);
+        assert_eq!(lc.experts_per_tok, 8);
+        assert_eq!(lc.moe_intermediate_size, 768);
+        assert_eq!(lc.decoder_sparse_step, 1);
+        assert!(lc.norm_topk_prob);
+        assert!(lc.linear_attn.is_none());
     }
 
     #[test]

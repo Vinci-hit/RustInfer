@@ -16,6 +16,25 @@ pub trait FusedOps: MathOps {
     /// Default: no-op (only the CUDA backend implements it).
     fn set_prefill_gemm_mode(_on: bool) {}
 
+    /// True when the backend serves an EAGER ragged/mixed forward with a
+    /// unified single-kernel varlen attention (FA3 on Hopper) for this
+    /// dtype/head_dim, so the runtime should default mixed steps to eager
+    /// instead of bucketed mixed-graph replay (whose captured region carries
+    /// the slower legacy split attention plus row/token padding).
+    /// Default: false (only the CUDA backend implements it).
+    fn unified_mixed_attention_available<T: Dtype>(_head_dim: usize) -> bool {
+        false
+    }
+
+    /// Permit the unified varlen attention (FA3) to run *under CUDA graph
+    /// capture*. Normally FA3 declines to launch while a stream is capturing
+    /// (its grid/`max_q` bounds bake host-side, wrong at replay); the runtime
+    /// sets this only around the mixed FA3-graph capture region, where the
+    /// bucket plan bakes `max_q` to a proven upper bound over every replay
+    /// composition, so the captured FA3 node stays correct. Cleared right
+    /// after the region. Default: no-op (only the CUDA backend implements it).
+    fn set_unified_mixed_capture(_on: bool) {}
+
     fn fused_add_rmsnorm<T: Dtype>(
         ctx: &StepCtx<'_, Self>,
         output: &mut Tensor<T, Self>,

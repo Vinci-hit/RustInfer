@@ -1,7 +1,10 @@
 //! Paged ragged / paged decode attention wrapper.
 //!
 //! - `BatchKind::DecodeOnly` → cuDNN frontend SDPA, then Flash fallback
-//! - `BatchKind::Ragged`     → `launch_flash_attn_paged_ragged_cute_*`
+//! - `BatchKind::Ragged`     → ONE FA3 varlen+paged launch for the whole
+//!   batch (Hopper, eager, bf16 hd128); otherwise the legacy split — decode
+//!   prefix on cuDNN SDPA, prefill suffix on the CuTe ragged kernel (also
+//!   used inside CUDA graph capture)
 //!
 //! Both kernels read K/V from a single `[num_blocks, block_size, kv_dim]`
 //! pool per layer; per-seq routing comes from the device `block_tables`
@@ -15,6 +18,20 @@ use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// When set, FA3 is allowed to launch under CUDA graph capture. The runtime
+/// raises this only around the mixed FA3-graph capture region (where the bucket
+/// plan bakes `max_q`/`b` to proven upper bounds over every replay composition)
+/// and lowers it immediately after. Replay does not re-enter this dispatch — the
+/// captured FA3 node runs directly — so the flag matters only during capture.
+static FA3_CAPTURE_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Toggle FA3-under-capture (see `FA3_CAPTURE_ALLOWED`). Called from the Cuda
+/// `FusedOps::set_unified_mixed_capture` impl.
+pub fn set_fa3_capture_allowed(on: bool) {
+    FA3_CAPTURE_ALLOWED.store(on, Ordering::Relaxed);
+}
 
 unsafe extern "C" {
     fn launch_flash_attn_paged_decode_bf16(
@@ -173,6 +190,239 @@ unsafe extern "C" {
 
 const DISABLE_CUDNN_ATTENTION_ENV: &str = "RUSTINFER_DISABLE_CUDNN_ATTENTION";
 const STRICT_CUDNN_ATTENTION_ENV: &str = "RUSTINFER_STRICT_CUDNN_ATTENTION";
+const PREFILL_FA3_ENV: &str = "RUSTINFER_PREFILL_FA3";
+
+#[cfg(rustinfer_fa3)]
+unsafe extern "C" {
+    fn rustinfer_fa3_varlen_paged_bf16_hd128(
+        q: *const c_void,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        o: *mut c_void,
+        softmax_lse: *mut f32,
+        cu_seqlens_q: *const i32,
+        seqused_k: *const i32,
+        page_table: *const i32,
+        page_table_batch_stride: i64,
+        tile_count_semaphore: *mut i32,
+        b: i32,
+        max_seqlen_q: i32,
+        max_pages_per_seq: i32,
+        page_size: i32,
+        num_pages: i32,
+        q_extent: i32,
+        h: i32,
+        h_k: i32,
+        q_row_stride: i64,
+        q_head_stride: i64,
+        k_row_stride: i64,
+        k_head_stride: i64,
+        k_page_stride: i64,
+        v_row_stride: i64,
+        v_head_stride: i64,
+        v_page_stride: i64,
+        o_row_stride: i64,
+        o_head_stride: i64,
+        softmax_scale: f32,
+        stream: cudaStream_t,
+    ) -> i32;
+}
+
+/// Process-lifetime FA3 scratch: softmax LSE (`head_num * q_extent` f32) and
+/// the tile-count semaphore. Grow-only, so steady state issues zero
+/// allocations (a per-step `cudaMalloc` is the known TTFT-regression shape).
+#[cfg(rustinfer_fa3)]
+struct Fa3Scratch {
+    lse: *mut f32,
+    lse_cap: usize,
+    semaphore: *mut i32,
+}
+
+#[cfg(rustinfer_fa3)]
+unsafe impl Send for Fa3Scratch {}
+
+#[cfg(rustinfer_fa3)]
+static FA3_SCRATCH: std::sync::Mutex<Fa3Scratch> = std::sync::Mutex::new(Fa3Scratch {
+    lse: std::ptr::null_mut(),
+    lse_cap: 0,
+    semaphore: std::ptr::null_mut(),
+});
+
+#[cfg(rustinfer_fa3)]
+fn fa3_scratch(head_num: usize, q_extent: usize) -> OpResult<(*mut f32, *mut i32)> {
+    use crate::ffi;
+    let mut guard = FA3_SCRATCH.lock().unwrap();
+    if guard.semaphore.is_null() {
+        let mut p: *mut c_void = std::ptr::null_mut();
+        let err = unsafe { ffi::cudaMalloc(&mut p, std::mem::size_of::<i32>()) };
+        if err != ffi::cudaError_cudaSuccess {
+            return Err(OpError::Kernel(format!(
+                "FA3 semaphore cudaMalloc failed: {:?}",
+                err
+            )));
+        }
+        guard.semaphore = p as *mut i32;
+    }
+    // Floor at 8192 rows so the common config allocates exactly once.
+    let need = head_num * q_extent;
+    if guard.lse_cap < need {
+        let want = need.max(head_num * 8192);
+        if !guard.lse.is_null() {
+            unsafe { ffi::cudaFree(guard.lse as *mut c_void) };
+        }
+        let mut p: *mut c_void = std::ptr::null_mut();
+        let err = unsafe { ffi::cudaMalloc(&mut p, want * std::mem::size_of::<f32>()) };
+        if err != ffi::cudaError_cudaSuccess {
+            guard.lse = std::ptr::null_mut();
+            guard.lse_cap = 0;
+            return Err(OpError::Kernel(format!(
+                "FA3 LSE scratch cudaMalloc({} f32) failed: {:?}",
+                want, err
+            )));
+        }
+        guard.lse = p as *mut f32;
+        guard.lse_cap = want;
+    }
+    Ok((guard.lse, guard.semaphore))
+}
+
+/// FA3 serves ragged prefill launches outside CUDA graph capture unconditionally;
+/// under capture it runs only when the runtime has raised `FA3_CAPTURE_ALLOWED`
+/// (the mixed FA3-graph path, whose bucket plan bakes `max_q`/`b` to proven upper
+/// bounds). Otherwise capture stays on the CuTe kernel, which holds correct at
+/// padded bucket shapes through its device-side `valid_q_tiles` cutoff while FA3
+/// trusts host-side `b`/`cu_seqlens`.
+#[cfg(rustinfer_fa3)]
+fn fa3_ragged_eligible<T: Dtype>(head_dim: usize, stream: cudaStream_t) -> bool {
+    if T::DATA_TYPE != DataType::BF16 || head_dim != 128 {
+        return false;
+    }
+    if std::env::var_os(PREFILL_FA3_ENV).is_some_and(|v| v == "0") {
+        return false;
+    }
+    let mut status: crate::ffi::cudaStreamCaptureStatus = Default::default();
+    let err = unsafe { crate::ffi::cudaStreamIsCapturing(stream, &mut status) };
+    if err != crate::ffi::cudaError_cudaSuccess {
+        return false;
+    }
+    // 0 == cudaStreamCaptureStatusNone. When capturing, only the opted-in mixed
+    // FA3-graph region (bounded max_q/b) may launch FA3.
+    status as u32 == 0 || FA3_CAPTURE_ALLOWED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(rustinfer_fa3))]
+fn fa3_ragged_eligible<T: Dtype>(_head_dim: usize, _stream: cudaStream_t) -> bool {
+    false
+}
+
+/// Build/dtype/env eligibility for the unified FA3 ragged path, WITHOUT the
+/// stream-capture check. This is the POLICY predicate the runtime consults to
+/// pick the mixed-step mode (eager-FA3 vs bucketed mixed-graph replay) before
+/// any forward is issued; the per-launch dispatch still goes through
+/// `fa3_ragged_eligible`, whose capture check keeps captured graphs on CuTe.
+#[cfg(rustinfer_fa3)]
+pub fn fa3_unified_available<T: Dtype>(head_dim: usize) -> bool {
+    T::DATA_TYPE == DataType::BF16
+        && head_dim == 128
+        && !std::env::var_os(PREFILL_FA3_ENV).is_some_and(|v| v == "0")
+}
+
+#[cfg(not(rustinfer_fa3))]
+pub fn fa3_unified_available<T: Dtype>(_head_dim: usize) -> bool {
+    false
+}
+
+/// FA3 varlen + paged-KV forward over the whole ragged batch — one launch,
+/// any row composition (q=1 decode rows included).
+#[cfg(rustinfer_fa3)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_fa3_ragged<T: Dtype>(
+    q: &Tensor<T, Cuda>,
+    k_pool: &Tensor<T, Cuda>,
+    v_pool: &Tensor<T, Cuda>,
+    output: &mut Tensor<T, Cuda>,
+    plan: &PagedAttentionPlan<'_>,
+    q_stride_seq: i64,
+    q_stride_head: i64,
+    o_stride_seq: i64,
+    o_stride_head: i64,
+    head_num: usize,
+    kv_head_num: usize,
+    head_dim: usize,
+    scale: f32,
+    stream: cudaStream_t,
+) -> OpResult<()> {
+    let max_q = plan.q_lens[..plan.batch].iter().copied().max().unwrap_or(0);
+    if plan.batch == 0 || max_q <= 0 {
+        return Ok(());
+    }
+    let q_extent = q.shape().as_slice()[0];
+    let num_pages = k_pool.shape().as_slice()[0];
+    let (lse, semaphore) = fa3_scratch(head_num, q_extent)?;
+    let kv_row = (kv_head_num * head_dim) as i64;
+    let page_stride = plan.block_size as i64 * kv_row;
+    let rc = unsafe {
+        rustinfer_fa3_varlen_paged_bf16_hd128(
+            q.data_ptr() as *const c_void,
+            k_pool.data_ptr() as *const c_void,
+            v_pool.data_ptr() as *const c_void,
+            output.data_ptr_mut() as *mut c_void,
+            lse,
+            plan.cu_q_lens.data_ptr(),
+            plan.kv_lens.data_ptr(),
+            plan.block_tables.data_ptr(),
+            plan.max_blocks_per_seq as i64,
+            semaphore,
+            plan.batch as i32,
+            max_q,
+            plan.max_blocks_per_seq as i32,
+            plan.block_size as i32,
+            num_pages as i32,
+            q_extent as i32,
+            head_num as i32,
+            kv_head_num as i32,
+            q_stride_seq,
+            q_stride_head,
+            kv_row,
+            head_dim as i64,
+            page_stride,
+            kv_row,
+            head_dim as i64,
+            page_stride,
+            o_stride_seq,
+            o_stride_head,
+            scale,
+            stream,
+        )
+    };
+    if rc != 0 {
+        return Err(OpError::Kernel(format!(
+            "FA3 varlen paged prefill failed: cudaError {rc}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(rustinfer_fa3))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_fa3_ragged<T: Dtype>(
+    _q: &Tensor<T, Cuda>,
+    _k_pool: &Tensor<T, Cuda>,
+    _v_pool: &Tensor<T, Cuda>,
+    _output: &mut Tensor<T, Cuda>,
+    _plan: &PagedAttentionPlan<'_>,
+    _q_stride_seq: i64,
+    _q_stride_head: i64,
+    _o_stride_seq: i64,
+    _o_stride_head: i64,
+    _head_num: usize,
+    _kv_head_num: usize,
+    _head_dim: usize,
+    _scale: f32,
+    _stream: cudaStream_t,
+) -> OpResult<()> {
+    Err(OpError::Kernel("FA3 kernels not built for this arch".into()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PagedAttentionKind {
@@ -585,19 +835,46 @@ pub fn attention_paged<T: Dtype>(
             }
         }
         PagedAttentionKind::Ragged => {
-            // Fused mixed batch is laid out decode-first, so the leading run of
-            // q==1 rows is the decode prefix. Rescue it onto cuDNN's fast decode
-            // SDPA and run the q>1 prefill suffix on the CuTe ragged kernel
-            // (efficient at q>1; its bottom-right causal mask works on any cuDNN
-            // backend, unlike paged-SDPA causal which needs backend >= 9.21).
+            // FA3 (Hopper, eager) takes the WHOLE ragged batch — decode q=1
+            // rows included — in one varlen+paged launch. The historical
+            // decode/prefill split below exists only because the CuTe ragged
+            // kernel runs q=1 rows at 1/128 tile utilization; FA3's persistent
+            // varlen scheduler has no such penalty, so no rescue is needed.
+            if fa3_ragged_eligible::<T>(head_dim, stream) {
+                unsafe {
+                    launch_fa3_ragged(
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        &plan,
+                        q_stride_seq,
+                        q_stride_head,
+                        o_stride_seq,
+                        o_stride_head,
+                        head_num,
+                        kv_head_num,
+                        head_dim,
+                        scale,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
+
+            // Legacy split path — non-Hopper builds, non-bf16/hd128 models,
+            // RUSTINFER_PREFILL_FA3=0, and always inside CUDA graph capture
+            // (FA3 trusts host-side b/cu_seqlens; only CuTe's device-side
+            // valid_q_tiles cutoff stays correct at padded bucket shapes).
             //
-            // The split is pure pointer arithmetic: each decode row is one tile,
-            // so the first `decode_count` tiles are the decode rows. Shifting
-            // block2req/block2tile past them and reducing total_q_tiles selects
-            // exactly the prefill tiles, and the CuTe kernel's absolute
-            // block2req[tile] / cu_q_lens[req] indexing keeps every lookup
-            // correct against the full base pointers. Decode output rows are
-            // never touched by the suffix launch.
+            // The fused mixed batch is laid out decode-first, so the leading
+            // run of q==1 rows is the decode prefix. Rescue it onto cuDNN's
+            // fast decode SDPA and run the q>1 prefill suffix on the CuTe
+            // ragged kernel: each decode row is one tile, so shifting
+            // block2req/block2tile past the first `decode_count` tiles and
+            // reducing total_q_tiles selects exactly the prefill tiles, and
+            // the kernel's absolute block2req[tile] / cu_q_lens[req] indexing
+            // keeps every lookup correct against the full base pointers.
             let cudnn_enabled = std::env::var_os(DISABLE_CUDNN_ATTENTION_ENV).is_none();
             let decode_count = plan.q_lens.iter().take_while(|&&q| q == 1).count();
 

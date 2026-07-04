@@ -4,7 +4,9 @@ use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, PrefillSegmentCo
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
 use crate::application::decode_common::send_step_error;
-use crate::application::decode_engine::{DecodeEngine, build_decode_request};
+use crate::application::decode_engine::{
+    DecodeEngine, DecodeRequestBuild, build_decode_request, build_overlap_decode_request,
+};
 use crate::application::kv_relief::{AllocWithReliefOutcome, alloc_with_relief};
 use crate::application::runtime::{RaggedRowKind, Runtime};
 use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
@@ -355,45 +357,81 @@ pub fn handle_fused_step<M>(
 where
     M: DecoderModel<bf16, Cuda>,
 {
-    // 1. Drain the in-flight ABC decode step: commit it and sync its copy-out
-    //    so the fused forward cannot race buffer A. The SEND is deferred until
-    //    the fused forward below is issued, moving the ZMQ send out of the
-    //    GPU-idle window between the two steps.
-    let mut prior_output = decode_engine.finalize_pending(
-        runner,
-        active,
-        kv_allocator,
-        control,
-        enable_prefix_caching,
-    )?;
+    // 1. Drain OR overlap the in-flight ABC decode step. Overlap (eager-mixed
+    //    mode): leave it in flight, build this step's decode rows
+    //    OPTIMISTICALLY from its row set (every row assumed to survive; input
+    //    tokens gathered from buffer C on device), and finalize it only AFTER
+    //    the fused forward is issued — its GPU tail then runs concurrently
+    //    with this step's host planning + issue instead of stalling it (the
+    //    measured ~4.6ms fused-step drain). Fall back to the drain whenever
+    //    the optimistic build is blocked: no in-flight step, a row evicted
+    //    mid-flight, no KV slots without relief (relief could preempt the
+    //    in-flight rows), or RUSTINFER_FUSED_OVERLAP=0.
+    let overlap_enabled = runner.mixed_eager_mode()
+        && !std::env::var_os("RUSTINFER_FUSED_OVERLAP").is_some_and(|v| v == "0");
+    let mut overlap_prior: Option<(Vec<u64>, Vec<u32>, KvLease)> = None;
+    if overlap_enabled {
+        if let Some((order, step_slots)) = decode_engine.overlap_fused_snapshot(active) {
+            let lease = decode_engine
+                .take_prealloc_for_overlap(order.len(), kv_allocator)
+                .or_else(|| kv_allocator.lease(order.len() as u32).ok());
+            if let Some(lease) = lease {
+                overlap_prior = Some((order, step_slots, lease));
+            }
+        }
+    }
+    let optimistic_decode = overlap_prior.is_some();
+    let mut overlap_active = optimistic_decode;
 
-    // 2. Decode rows for this step: one new KV slot each.
-    let decode = match decode_engine.prepare_fused_decode(
-        active,
-        prefilling,
-        kv_allocator,
-        control,
-        enable_prefix_caching,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = send_prior_output(data, &mut prior_output);
-            return Err(e);
-        }
+    let mut prior_output = if overlap_active {
+        None
+    } else {
+        decode_engine.finalize_pending(
+            runner,
+            active,
+            kv_allocator,
+            control,
+            enable_prefix_caching,
+        )?
     };
-    let (decode_order, mut decode_lease, decode_build) = match decode {
-        Some((order, lease)) => {
-            let build = build_decode_request(
-                &order,
-                lease.as_slice(),
-                active,
-                eos_ids,
-                enable_prefix_caching,
-            );
+    // Rows of the overlapped prior step that it turns out to have FINISHED:
+    // filled once the prior step is finalized (post-issue), consumed by the
+    // fused commit to discard their optimistic extra forward.
+    let mut skip_rows: Vec<bool> = Vec::new();
+
+    // 2. Decode rows for this step: one new KV slot each. Overlap path: the
+    //    in-flight step's rows advanced by one position; drain path: the
+    //    committed active rows as before.
+    let (decode_order, mut decode_lease, mut decode_build) =
+        if let Some((order, step_slots, lease)) = overlap_prior {
+            let build =
+                build_overlap_decode_request(&order, &step_slots, lease.as_slice(), active, eos_ids);
             (order, Some(lease), Some(build))
-        }
-        None => (Vec::new(), None, None),
-    };
+        } else {
+            match decode_engine.prepare_fused_decode(
+                active,
+                prefilling,
+                kv_allocator,
+                control,
+                enable_prefix_caching,
+            ) {
+                Ok(Some((order, lease))) => {
+                    let build = build_decode_request(
+                        &order,
+                        lease.as_slice(),
+                        active,
+                        eos_ids,
+                        enable_prefix_caching,
+                    );
+                    (order, Some(lease), Some(build))
+                }
+                Ok(None) => (Vec::new(), None, None),
+                Err(e) => {
+                    let _ = send_prior_output(data, &mut prior_output);
+                    return Err(e);
+                }
+            }
+        };
     let decode_count = decode_order.len();
 
     // 2.5 Bound this step's prefill admission to the largest prewarmed
@@ -526,6 +564,28 @@ where
         }
     }
 
+    // Overlap is single-group only: the fused issue must precede the prior
+    // step's finalize, and the deferred copy-out interleave assumes exactly
+    // one fused forward. On the rare spill, drain NOW — the optimistic
+    // request stays valid (it matches the post-commit row state exactly);
+    // only the C-gathered input prefix still requires the overlapped issue.
+    if overlap_active && groups.len() > 1 {
+        prior_output = decode_engine.finalize_pending(
+            runner,
+            active,
+            kv_allocator,
+            control,
+            enable_prefix_caching,
+        )?;
+        skip_rows = overlap_skip_rows(&prior_output, &decode_order, active);
+        if enable_prefix_caching {
+            if let Some(b) = decode_build.as_mut() {
+                patch_overlap_assigned_tokens(&prior_output, b);
+            }
+        }
+        overlap_active = false;
+    }
+
     // 5. Issue each group as one ragged forward and route its outputs. A hard
     //    error (commit/send failure) breaks out so the post-loop sweep can
     //    release the leases of any group that never ran — the pre-lease code
@@ -644,15 +704,49 @@ where
                 }
             }
         }
-        let issue_res = runner.issue_fused_abc(
-            &req,
-            &row_kinds,
-            if mixed_lease.is_empty() {
-                None
-            } else {
-                Some(mixed_lease.as_slice())
-            },
-        );
+        let group_next_slots = if mixed_lease.is_empty() {
+            None
+        } else {
+            Some(mixed_lease.as_slice())
+        };
+        // The optimistic decode rows carry placeholder input ids: their real
+        // tokens (the prior step's argmax) are gathered from buffer C on
+        // device, so any group holding them must use the overlapped issue —
+        // even after a fallback drain (C is untouched by the finalize).
+        let issue_res = if optimistic_decode && has_decode {
+            runner.issue_fused_abc_overlapped(&req, &row_kinds, group_next_slots, decode_count)
+        } else {
+            runner.issue_fused_abc(&req, &row_kinds, group_next_slots)
+        };
+        // Overlap: drain the prior step only NOW — after the fused issue — so
+        // its GPU tail overlapped this step's planning + issue. Runs on the
+        // issue-failure path too: the prior step's tokens must still be
+        // collected and its host state committed.
+        if overlap_active {
+            match decode_engine.finalize_pending(
+                runner,
+                active,
+                kv_allocator,
+                control,
+                enable_prefix_caching,
+            ) {
+                Ok(out) => {
+                    prior_output = out;
+                    skip_rows = overlap_skip_rows(&prior_output, &decode_order, active);
+                    if enable_prefix_caching {
+                        if let Some(b) = decode_build.as_mut() {
+                            patch_overlap_assigned_tokens(&prior_output, b);
+                        }
+                    }
+                }
+                Err(e) => {
+                    mixed_lease.release(kv_allocator);
+                    hard_err = Some(e);
+                    break 'groups;
+                }
+            }
+            overlap_active = false;
+        }
         // The fused forward is on the GPU now (on success): send the prior
         // decode step's tokens while it runs. The result is propagated only
         // after this group's commit so a transport error cannot leave the
@@ -703,9 +797,19 @@ where
         let mut cursor = 0usize;
         if has_decode {
             let b = decode_build.as_ref().unwrap();
-            output.assigned_indices.extend(b.assigned.iter().cloned());
+            // Skipped rows' slots are freed by the commit below — don't report
+            // them assigned (the prior step already finished those sequences).
+            output.assigned_indices.extend(
+                b.assigned
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !skip_rows.get(*i).copied().unwrap_or(false))
+                    .map(|(_, a)| a.clone()),
+            );
             for (i, &sid) in decode_order.iter().enumerate() {
-                if !out.finished.get(i).copied().unwrap_or(false) {
+                if !out.finished.get(i).copied().unwrap_or(false)
+                    && !skip_rows.get(i).copied().unwrap_or(false)
+                {
                     abc_next_rows.push(sid);
                 }
             }
@@ -721,6 +825,7 @@ where
                 &out.finished,
                 enable_prefix_caching,
                 &mut output,
+                &skip_rows,
             ) {
                 pad_lease.release(kv_allocator);
                 hard_err = Some(e);
@@ -761,7 +866,16 @@ where
         // sequence). The forward has completed (finalize above), so nothing is
         // reading these slots.
         pad_lease.release(kv_allocator);
-        if can_record_abc_rows {
+        // A skipped row the device merge kept ACTIVE (an EOS finish the prior
+        // step saw but the fused stop-check cannot re-detect) sits in A / the
+        // device control plane while the host dropped it — the on-device state
+        // no longer matches `abc_next_rows`, so it must not be recorded for
+        // reuse. (Max-token finishes re-finish on device and stay consistent.)
+        let device_rows_tainted = skip_rows
+            .iter()
+            .enumerate()
+            .any(|(i, &s)| s && !out.finished.get(i).copied().unwrap_or(true));
+        if can_record_abc_rows && !device_rows_tainted {
             decode_engine.record_mixed_abc_rows(
                 abc_next_rows,
                 mixed_lease,
@@ -826,6 +940,56 @@ where
         enable_prefix_caching,
     )?;
     Ok(())
+}
+
+/// Per-row skip mask for an overlapped fused step's decode rows: rows the
+/// just-drained prior step FINISHED (the client already saw `finished`, so
+/// the optimistic extra token must not be emitted). When the prior finalize
+/// failed internally (its rows were failed and evicted), skip everything no
+/// longer active.
+fn overlap_skip_rows(
+    prior_output: &Option<StepOutput>,
+    decode_order: &[u64],
+    active: &ActiveSeqMap,
+) -> Vec<bool> {
+    match prior_output {
+        Some(out) => {
+            let finished: std::collections::HashSet<u64> = out
+                .tokens
+                .iter()
+                .filter(|t| t.finished)
+                .map(|t| t.sequence_id)
+                .collect();
+            decode_order
+                .iter()
+                .map(|sid| finished.contains(sid))
+                .collect()
+        }
+        None => decode_order
+            .iter()
+            .map(|sid| active.get(sid).is_none())
+            .collect(),
+    }
+}
+
+/// Prefix caching reports the token WRITTEN into each assigned slot. For the
+/// overlapped decode rows that token is the prior step's output — unknown at
+/// build time — so patch it in once the prior step is finalized (always
+/// before this step's output is sent).
+fn patch_overlap_assigned_tokens(prior_output: &Option<StepOutput>, build: &mut DecodeRequestBuild) {
+    let Some(out) = prior_output else {
+        return;
+    };
+    let tokens: std::collections::HashMap<u64, i32> = out
+        .tokens
+        .iter()
+        .map(|t| (t.sequence_id, t.token_id))
+        .collect();
+    for a in &mut build.assigned {
+        if let Some(&t) = tokens.get(&a.sequence_id) {
+            a.token_ids = vec![t];
+        }
+    }
 }
 
 /// Send the prior decode step's finalized output, if still unsent. Called

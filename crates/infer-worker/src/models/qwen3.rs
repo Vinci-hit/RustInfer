@@ -1,4 +1,22 @@
-//! Qwen3 model — the same assembled [`Decoder`](crate::models::decoder::Decoder)
-//! as Llama3, with each block's `Attention` Q/K RMSNorms populated by the loader.
+//! Qwen3 dense model. Model-specific behavior belongs in this file; the shared
+//! loader remains name-driven and model-agnostic.
 
-pub use crate::models::decoder::Decoder as Qwen3Model;
+use crate::domain::dtype::Dtype;
+use crate::domain::ports::backend::LlmBackend;
+use crate::domain::ports::{OpBackend, OpResult};
+use crate::models::decoder::{build_dense_decoder, Decoder};
+use crate::models::loader::{LoadConfig, WeightLoader};
+
+pub type Qwen3Model<T, D> = Decoder<T, D>;
+
+pub fn build<T, D>(
+    loader: &WeightLoader<'_>,
+    cfg: &LoadConfig,
+    device: &D,
+) -> OpResult<Qwen3Model<T, D>>
+where
+    T: Dtype,
+    D: OpBackend + LlmBackend,
+{
+    build_dense_decoder(loader, cfg, device)
+}

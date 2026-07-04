@@ -325,13 +325,23 @@ impl RustInferConfig {
     }
 }
 
-/// Resolve the internal model type (`"llama3"` / `"qwen3"` / `"qwen3_5"`) from a
-/// model directory's `config.json`.
+pub const SUPPORTED_MODEL_TYPES: &[&str] = &["llama3", "qwen3", "qwen3_moe"];
+
+pub fn supported_model_types() -> &'static [&'static str] {
+    SUPPORTED_MODEL_TYPES
+}
+
+pub fn supported_model_types_csv() -> String {
+    SUPPORTED_MODEL_TYPES.join(", ")
+}
+
+/// Resolve the internal model type (`"llama3"` / `"qwen3"` / `"qwen3_moe"`)
+/// from a model directory's `config.json`.
 ///
 /// Reads the HuggingFace `model_type` field, falling back to
 /// `architectures[0]`. The mapping itself is pure ([`classify_model_type`]) so
 /// it can be unit-tested without touching the filesystem; this wrapper adds the
-/// I/O and the visible fallback warning.
+/// I/O and the visible unsupported-model error.
 pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
     let cfg_path = Path::new(model_path).join("config.json");
     let bytes =
@@ -353,44 +363,34 @@ pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
         .unwrap_or_default()
         .to_lowercase();
 
-    let resolved = classify_model_type(&hint).unwrap_or_else(|| {
-        // Unknown or missing architecture hint. We still default to the llama3
-        // dispatch (the most common weights layout), but this is a frequent
-        // source of "wrong template / wrong attention" confusion, so make the
-        // fallback visible rather than silent.
-        if hint.is_empty() {
-            eprintln!(
-                "warning: resolve_model_type: no `model_type`/`architectures` in {}; \
-                 defaulting to \"llama3\"",
-                cfg_path.display()
-            );
-        } else if !hint.contains("llama") {
-            eprintln!(
-                "warning: resolve_model_type: unrecognized model hint {:?} in {}; \
-                 defaulting to \"llama3\" (supported: llama*, qwen*)",
-                hint,
-                cfg_path.display()
-            );
-        }
-        "llama3"
-    });
+    let Some(resolved) = classify_model_type(&hint) else {
+        let shown = if hint.is_empty() {
+            "<missing model_type/architectures>".to_string()
+        } else {
+            hint
+        };
+        return Err(format!(
+            "unsupported model hint {} in {}; supported models: {}",
+            shown,
+            cfg_path.display(),
+            supported_model_types_csv()
+        ));
+    };
     Ok(resolved.to_string())
 }
 
 /// Pure hint → internal model-type mapping. `hint` is a lowercased
 /// `model_type`/`architectures[0]` string. Returns `None` when nothing matches
-/// so the caller can apply the visible llama3 fallback.
+/// so the caller can produce the visible unsupported-model error.
 ///
-/// Order matters: `qwen3_5` is a superset hint of `qwen`, so it must be tested
-/// **before** the generic `qwen → qwen3` arm, otherwise every Qwen3.5 model
-/// would silently dispatch as plain Qwen3 (wrong attention: it has a hybrid
-/// Gated-DeltaNet / full-attention stack, not homogeneous full attention).
+/// Order matters: more specific Qwen variants must be tested before plain
+/// `qwen3`, and unsupported variants such as Qwen3.5 must not fall through.
 fn classify_model_type(hint: &str) -> Option<&'static str> {
-    // `model_type = "qwen3_5"`, arch `"Qwen3_5ForConditionalGeneration"` (also
-    // matches the nested text `model_type = "qwen3_5_text"`).
     if hint.contains("qwen3_5") {
-        Some("qwen3_5")
-    } else if hint.contains("qwen") {
+        None
+    } else if hint.contains("qwen3_moe") || hint.contains("qwen3moe") {
+        Some("qwen3_moe")
+    } else if hint.contains("qwen3") {
         Some("qwen3")
     } else if hint.contains("llama") {
         Some("llama3")
@@ -404,21 +404,25 @@ mod model_type_tests {
     use super::classify_model_type;
 
     #[test]
-    fn qwen3_5_beats_generic_qwen() {
-        // Both the top-level model_type and the arch string must resolve to the
-        // hybrid dispatch, not plain qwen3.
-        assert_eq!(classify_model_type("qwen3_5"), Some("qwen3_5"));
+    fn unsupported_qwen3_5_does_not_fall_through() {
+        assert_eq!(classify_model_type("qwen3_5"), None);
+        assert_eq!(classify_model_type("qwen3_5forconditionalgeneration"), None);
+        assert_eq!(classify_model_type("qwen3_5_text"), None);
+    }
+
+    #[test]
+    fn qwen3_moe_beats_plain_qwen3() {
+        assert_eq!(classify_model_type("qwen3_moe"), Some("qwen3_moe"));
         assert_eq!(
-            classify_model_type("qwen3_5forconditionalgeneration"),
-            Some("qwen3_5")
+            classify_model_type("qwen3moeforcausallm"),
+            Some("qwen3_moe")
         );
-        assert_eq!(classify_model_type("qwen3_5_text"), Some("qwen3_5"));
     }
 
     #[test]
     fn plain_qwen_and_llama_unchanged() {
         assert_eq!(classify_model_type("qwen3"), Some("qwen3"));
-        assert_eq!(classify_model_type("qwen2"), Some("qwen3"));
+        assert_eq!(classify_model_type("qwen2"), None);
         assert_eq!(classify_model_type("llamaforcausallm"), Some("llama3"));
         assert_eq!(classify_model_type("llama"), Some("llama3"));
     }

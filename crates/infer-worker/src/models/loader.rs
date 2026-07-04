@@ -110,6 +110,16 @@ pub struct LoadConfig {
     /// `Some` for the Qwen3.5 hybrid stack (Gated-DeltaNet + full attention).
     /// `None` → homogeneous full-attention decoder (Llama3 / Qwen3).
     pub linear_attn: Option<LinearAttnConfig>,
+    /// MoE expert count. `0` for dense models.
+    pub num_experts: usize,
+    /// Top-k routed experts per token. `0` for dense models.
+    pub experts_per_tok: usize,
+    /// Per-expert SwiGLU intermediate width. `0` for dense models.
+    pub moe_intermediate_size: usize,
+    /// Whether router top-k probabilities are renormalized after top-k.
+    pub norm_topk_prob: bool,
+    /// HF sparse-layer interval. Qwen3-30B-A3B uses `1` (every layer is MoE).
+    pub decoder_sparse_step: usize,
 }
 
 /// Weight loader — pulls tensors out of a `SafetensorsReader` and builds
@@ -397,7 +407,10 @@ impl<'a> WeightLoader<'a> {
     /// Load a single int4 (`pack-quantized`) projection — e.g. `down_proj` —
     /// into a quantized `Linear`. `prefix` is the tensor-name stem, e.g.
     /// `"model.layers.0.mlp.down_proj"`.
-    pub(crate) fn load_awq_linear<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+    pub(crate) fn load_awq_linear<
+        T: Dtype + crate::domain::dtype::Dtype,
+        D: OpBackend + LlmBackend,
+    >(
         &self,
         prefix: &str,
         scheme: QuantScheme,

@@ -10,7 +10,10 @@ use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
-use super::{Runtime, upload_i32_full_zeropad, upload_i32_prefix, validate_step_request_vectors};
+use super::{
+    Runtime, upload_i32_full_zeropad, upload_i32_prefix, upload_i32_range,
+    validate_step_request_vectors,
+};
 
 impl<T, D, M> Runtime<T, D, M>
 where
@@ -222,6 +225,61 @@ where
                 self.scope.device(),
                 &self.prefill_ids_buf,
                 &self.prefill_ids_host[..token_bucket],
+            )?;
+        }
+        Ok(self.prefill_ids_buf.view_raw(
+            Shape::from_slice(&[token_bucket]),
+            Shape::from_slice(&[token_bucket.max(1)]).contiguous_strides(),
+            0,
+            true,
+        ))
+    }
+
+    /// Like `upload_input_ids_bucket`, but skips the first `skip_tokens` flat
+    /// tape entries: those device rows are filled by an on-device gather (the
+    /// overlapped fused path's C-prefix — the prior step's argmax output),
+    /// so only `[skip_tokens, token_bucket)` is staged and uploaded. The
+    /// request carries placeholder ids for the skipped rows.
+    pub(super) fn upload_input_ids_suffix(
+        &mut self,
+        req: &StepRequest,
+        skip_tokens: usize,
+        actual_tokens: usize,
+        token_bucket: usize,
+    ) -> OpResult<Tensor<i32, D>> {
+        if skip_tokens > actual_tokens || actual_tokens > token_bucket {
+            return Err(OpError::Shape(format!(
+                "upload_input_ids_suffix: skip {} actual {} bucket {}",
+                skip_tokens, actual_tokens, token_bucket
+            )));
+        }
+        if token_bucket > self.prefill_ids_host.len() {
+            return Err(OpError::Shape(format!(
+                "upload_input_ids_suffix: bucket {} > cap {}",
+                token_bucket,
+                self.prefill_ids_host.len()
+            )));
+        }
+        let mut off = 0usize;
+        for seq in &req.seqs {
+            let len = seq.input_ids.len();
+            if off + len > skip_tokens {
+                let from = skip_tokens.saturating_sub(off);
+                self.prefill_ids_host[off + from..off + len]
+                    .copy_from_slice(&seq.input_ids[from..]);
+            }
+            off += len;
+        }
+        debug_assert_eq!(off, actual_tokens);
+        if token_bucket > off {
+            self.prefill_ids_host[off..token_bucket].fill(0);
+        }
+        unsafe {
+            upload_i32_range(
+                self.scope.device(),
+                &self.prefill_ids_buf,
+                skip_tokens,
+                &self.prefill_ids_host[skip_tokens..token_bucket],
             )?;
         }
         Ok(self.prefill_ids_buf.view_raw(

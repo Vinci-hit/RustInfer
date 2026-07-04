@@ -44,6 +44,12 @@ const MIXED_GRAPH_TILE_BUCKET: usize = 32;
 const MIXED_GRAPH_PREWARM_MAX: usize = 112;
 const MIXED_GRAPH_PREWARM_MAX_DECODE_PREFIX: usize = 128;
 const MIXED_GRAPH_PREWARM_TOKEN_BUCKETS: &[usize] = &[64, 128, 192, 256, 320, 384];
+/// Round the EAGER fused step's flat token tape up to this multiple. Bounds
+/// the eager GEMM M-shape set (the per-novel-`num_tokens` first-build jitter
+/// was the measured eager fused-step p99 tail: issue p50 6.2ms vs p99 13.1ms,
+/// warmup-concentrated), so with the boot prewarm every live token count hits
+/// a warmed shape. 32 wastes at most 31 token rows of GEMM work (~2.5µs/row).
+const EAGER_MIXED_TOKEN_BUCKET: usize = 32;
 
 /// In-flight mixed step handle: `issue_fused_abc` → overlapped host work →
 /// `finalize_fused_abc`. Owns the issue's `BatchPlan` so finalize decodes the
@@ -53,6 +59,11 @@ pub struct MixedStepTicket {
     ran_graph: bool,
     trace: bool,
     t0: std::time::Instant,
+    /// Whether the D2H copy-out of the merge side-bands has been enqueued.
+    /// The overlapped issue defers it — the host mirrors still belong to the
+    /// prior in-flight decode step at issue time — and `finalize_fused_abc`
+    /// enqueues it lazily once the caller has drained that step.
+    copied_out: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +273,35 @@ where
         case: MixedGraphWarmupCase,
         eos_ids: &[i32],
     ) -> OpResult<Option<(StepRequest, Vec<RaggedRowKind>, Vec<u32>, u64)>> {
+        let Some((req, row_kind, next_slots)) = self.mixed_warmup_request(case, eos_ids)? else {
+            return Ok(None);
+        };
+        let plan = self.build_plan(&req)?;
+        let Some(shape) = self.graph.as_ref().and_then(|graph| {
+            mixed_graph_shape(
+                &plan,
+                &row_kind,
+                self.cap_batch,
+                self.cap_num_tokens,
+                self.mixed_graph_tile_capacity(),
+                graph.capture_sizes(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        let key = mixed_graph_key(shape, eos_ids.len(), true);
+        Ok(Some((req, row_kind, next_slots, key)))
+    }
+
+    /// Build the synthetic mixed request for one warmup case: `decode_prefix`
+    /// q=1 rows followed by one prefill-final row of `prefill_len` tokens,
+    /// with per-row next-step slots. Shared by the graph prewarm (which then
+    /// derives the bucket key) and the eager GEMM-shape prewarm.
+    fn mixed_warmup_request(
+        &self,
+        case: MixedGraphWarmupCase,
+        eos_ids: &[i32],
+    ) -> OpResult<Option<(StepRequest, Vec<RaggedRowKind>, Vec<u32>)>> {
         if case.prefill_len < 2 {
             return Ok(None);
         }
@@ -330,21 +370,48 @@ where
             draft_tokens: Vec::new(),
             seqs,
         };
-        let plan = self.build_plan(&req)?;
-        let Some(shape) = self.graph.as_ref().and_then(|graph| {
-            mixed_graph_shape(
-                &plan,
-                &row_kind,
-                self.cap_batch,
-                self.cap_num_tokens,
-                self.mixed_graph_tile_capacity(),
-                graph.capture_sizes(),
-            )
-        }) else {
-            return Ok(None);
-        };
-        let key = mixed_graph_key(shape, eos_ids.len(), true);
-        Ok(Some((req, row_kind, next_slots, key)))
+        Ok(Some((req, row_kind, next_slots)))
+    }
+
+    /// Warm every eager fused-step GEMM token bucket before Ready — the
+    /// eager-mixed mode's counterpart to `prewarm_mixed_graphs`. Each synthetic
+    /// mixed step (1 decode row + one prefill admission filling the bucket)
+    /// runs the REAL eager fused path, so whatever the first live step at that
+    /// `num_tokens` would lazily build (GEMM shape state, FA3 scratch growth,
+    /// allocator bins) is paid here instead of in the timed path — the
+    /// measured warmup-concentrated eager p99 spikes. The grid extends past
+    /// the admission budget because a step's decode rows ride on top of it
+    /// (budget bounds prefill admission, not total tokens).
+    pub fn prewarm_mixed_eager_shapes(&mut self, eos_ids: &[i32]) -> OpResult<usize> {
+        if !self.mixed_eager {
+            return Ok(0);
+        }
+        const EAGER_MIXED_PREWARM_MAX_TOKENS: usize = 768;
+        let top = self.cap_num_tokens.min(EAGER_MIXED_PREWARM_MAX_TOKENS);
+        let max_prefill_len = self
+            .max_seq_len
+            .min(self.cap_num_tokens)
+            .min(self.max_blocks_per_seq.saturating_mul(self.block_size));
+        let mut warmed = 0usize;
+        let mut bucket = EAGER_MIXED_TOKEN_BUCKET;
+        while bucket <= top {
+            let case = MixedGraphWarmupCase {
+                decode_prefix: 1,
+                token_bucket: bucket,
+                prefill_len: bucket - 1,
+            };
+            if case.prefill_len <= max_prefill_len {
+                if let Some((req, row_kind, next_slots)) =
+                    self.mixed_warmup_request(case, eos_ids)?
+                {
+                    self.step_fused_abc_eager(&req, &row_kind, Some(&next_slots))?;
+                    warmed += 1;
+                }
+            }
+            bucket += EAGER_MIXED_TOKEN_BUCKET;
+        }
+        self.scope.synchronize()?;
+        Ok(warmed)
     }
 
     /// ABC GPU-resident decode step (buffer A = `input_ids_buf`).
@@ -405,7 +472,59 @@ where
         row_kind: &[RaggedRowKind],
         next_slots: Option<&[u32]>,
     ) -> OpResult<MixedStepTicket> {
+        self.issue_fused_abc_inner(req, row_kind, next_slots, 0, false)
+    }
+
+    /// Overlapped issue for the drain-overlap fused path: the PRIOR decode
+    /// step is still in flight on the GPU when this enqueues. Differences from
+    /// the plain issue:
+    /// - the first `c_prefix_rows` (q=1 decode) rows' input tokens are
+    ///   gathered ON DEVICE from buffer C — the in-flight step's argmax
+    ///   output, which the host does not know yet; the request carries
+    ///   placeholder ids for them and only the tape suffix is uploaded;
+    /// - the copy-out is deferred: the single-buffered host mirrors still
+    ///   belong to the in-flight step. The caller must finalize that step
+    ///   before `finalize_fused_abc` (which enqueues the copy-out lazily).
+    /// Every enqueue here rides the compute stream, so it is ordered after the
+    /// in-flight step's kernels; the eager region additionally waits on the
+    /// prior copy-out event before its merge rewrites A / the side-bands.
+    pub fn issue_fused_abc_overlapped(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_slots: Option<&[u32]>,
+        c_prefix_rows: usize,
+    ) -> OpResult<MixedStepTicket> {
+        self.issue_fused_abc_inner(req, row_kind, next_slots, c_prefix_rows, true)
+    }
+
+    fn issue_fused_abc_inner(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_slots: Option<&[u32]>,
+        c_prefix_rows: usize,
+        defer_copy_out: bool,
+    ) -> OpResult<MixedStepTicket> {
         let plan = self.validate_mixed_abc_request(req, row_kind)?;
+        if c_prefix_rows > 0 {
+            // The C-gathered prefix is an eager-only contract: the graph path
+            // re-uploads the whole bucketed tape from the host, which would
+            // clobber the gathered tokens.
+            if !self.mixed_eager {
+                return Err(OpError::Shape(
+                    "issue_fused_abc: C-prefix gather requires eager-mixed mode".into(),
+                ));
+            }
+            if c_prefix_rows > plan.batch
+                || plan.q_lens[..c_prefix_rows].iter().any(|&q| q != 1)
+            {
+                return Err(OpError::Shape(format!(
+                    "issue_fused_abc: C-prefix {} not a q=1 row prefix of batch {}",
+                    c_prefix_rows, plan.batch
+                )));
+            }
+        }
         if let Some(slots) = next_slots {
             self.upload_mixed_next_slots(slots)?;
         }
@@ -415,20 +534,59 @@ where
         let ran_graph = self.try_run_mixed_abc_graph(&plan, req, row_kind, next_slots.is_some())?;
         if !ran_graph {
             self.upload_index(&plan, req)?;
-            let input_ids = self.input_ids_tensor(req, &plan)?;
+            let run_plan = self.eager_mixed_run_plan(&plan);
+            let run_tokens = run_plan
+                .as_ref()
+                .map(|rp| rp.num_tokens)
+                .unwrap_or(plan.num_tokens);
+            let input_ids = if c_prefix_rows > 0 {
+                // q=1 decode rows lead the batch, so flat tape offset == row
+                // index: gather C[0..c] into the tape prefix on device and
+                // upload only the suffix (pad rows + prefill tokens + bucket
+                // zero-pad) from the host.
+                let ids =
+                    self.upload_input_ids_suffix(req, c_prefix_rows, plan.num_tokens, run_tokens)?;
+                D::append_decode_admissions(
+                    &self.scope,
+                    &mut self.prefill_ids_buf,
+                    &self.abc.argmax_out_dev,
+                    0,
+                    c_prefix_rows,
+                )?;
+                ids
+            } else if run_tokens > plan.num_tokens {
+                self.upload_input_ids_bucket(req, plan.num_tokens, run_tokens)?
+            } else {
+                self.input_ids_tensor(req, &plan)?
+            };
             self.upload_mixed_abc_metadata(req, row_kind, plan.batch)?;
+            // WAR guard for the overlapped issue: the in-flight step's copy-out
+            // (So) reads A + the merge side-bands; make compute wait its ev_out
+            // before this region's merge rewrites them. No-op after a drain
+            // (the sync already collected the copy-out).
+            if self.abc.copy_out_recorded {
+                D::pipeline_compute_wait_copy_out(&self.scope)?;
+            }
             D::pipeline_arena_begin(&self.scope);
-            let result =
-                self.run_mixed_abc_eager_region(&plan, req, &input_ids, next_slots.is_some());
+            let result = self.run_mixed_abc_eager_region(
+                run_plan.as_ref().unwrap_or(&plan),
+                req,
+                &input_ids,
+                next_slots.is_some(),
+            );
             D::pipeline_arena_end(&self.scope);
             result?;
         }
-        self.copy_out_mixed_abc(plan.batch)?;
+        let copied_out = !defer_copy_out;
+        if copied_out {
+            self.copy_out_mixed_abc(plan.batch)?;
+        }
         Ok(MixedStepTicket {
             plan,
             ran_graph,
             trace,
             t0,
+            copied_out,
         })
     }
 
@@ -442,6 +600,12 @@ where
         req: &StepRequest,
         row_kind: &[RaggedRowKind],
     ) -> OpResult<StepOutput> {
+        // Overlapped issue deferred the copy-out (the host mirrors belonged to
+        // the then-in-flight decode step); by the time the caller finalizes
+        // the fused step that step has been drained, so enqueue it now.
+        if !ticket.copied_out {
+            self.copy_out_mixed_abc(ticket.plan.batch)?;
+        }
         D::pipeline_synchronize_copy_out(&self.scope)?;
         if ticket.trace {
             // `elapsed` spans issue→sync, so it includes any host work the
@@ -471,12 +635,13 @@ where
         self.finalize_fused_abc(ticket, req, row_kind)
     }
 
-    /// Largest mixed-graph token bucket the bootstrap prewarm covers. The
+    /// Largest mixed-step token bucket the bootstrap prewarm covers. The
     /// fused-step packer bounds each step's prefill admission to this so live
-    /// mixed steps replay a prewarmed graph instead of falling back to eager.
-    /// `None` when graphs are unavailable (packer falls back to the raw cap).
+    /// mixed steps replay a prewarmed graph (graph mode) / hit a prewarmed
+    /// eager GEMM shape and keep decode-row stall per step bounded (eager
+    /// mode). `None` when neither applies (packer falls back to the raw cap).
     pub fn mixed_step_token_budget(&self) -> Option<usize> {
-        if self.graph.is_none() || !self.scope.supports_graphs() {
+        if !self.mixed_eager && (self.graph.is_none() || !self.scope.supports_graphs()) {
             return None;
         }
         MIXED_GRAPH_PREWARM_TOKEN_BUCKETS
@@ -521,6 +686,13 @@ where
         row_kind: &[RaggedRowKind],
         next_control: bool,
     ) -> OpResult<bool> {
+        // Eager-mixed mode: never replay or capture a mixed graph. The graph's
+        // captured region carries the legacy split attention (FA3 declines to
+        // run under capture) plus row/token padding — the eager unified-FA3
+        // forward is faster at every measured shape.
+        if self.mixed_eager {
+            return Ok(false);
+        }
         if self.graph.is_none() || !self.scope.supports_graphs() {
             return Ok(false);
         }
@@ -568,9 +740,19 @@ where
         self.upload_input_ids_bucket(req, plan.num_tokens, shape.tokens)?;
         self.upload_mixed_abc_metadata(req, row_kind, shape.rows)?;
         self.scope.graph_capture_begin()?;
-        if let Err(e) =
-            self.run_mixed_abc_graph_region(&graph_plan, req.stop.eos_ids.len(), next_control)
-        {
+        // FA3 declines to launch under capture unless this is raised; the bucket
+        // plan bakes `max_q`/`b` to upper bounds, so the captured FA3 node stays
+        // correct at replay. Lower it before `graph_capture_end` on every path so
+        // no later capture inherits the permission.
+        if self.mixed_fa3_graph {
+            D::set_unified_mixed_capture(true);
+        }
+        let region =
+            self.run_mixed_abc_graph_region(&graph_plan, req.stop.eos_ids.len(), next_control);
+        if self.mixed_fa3_graph {
+            D::set_unified_mixed_capture(false);
+        }
+        if let Err(e) = region {
             let _ = self.scope.graph_capture_end(key);
             return Err(e);
         }
@@ -591,6 +773,32 @@ where
         );
         self.scope.graph_launch(key)?;
         Ok(true)
+    }
+
+    /// The eager run-shape for a fused step: the actual plan with its flat
+    /// token tape padded up to `EAGER_MIXED_TOKEN_BUCKET` (eager-mixed mode
+    /// only; `None` = run the actual plan). Mirrors the graph path's bucketed
+    /// run plan: the device control is uploaded from the ACTUAL plan with
+    /// zero-padded tails, so the padded token rows belong to no sequence —
+    /// they flow through the GEMMs (garbage in, garbage out, per-row
+    /// independent) but are never scattered into KV, attended, or sampled.
+    /// Unlike the graph bucket plan, `q_lens` stay REAL: FA3 sizes its varlen
+    /// launch from the host q_lens and the `LastPerSeq` finalize gathers by
+    /// them, so only `num_tokens` (and `rope_positions`, kept length-consistent)
+    /// may be padded.
+    fn eager_mixed_run_plan(&self, plan: &BatchPlan) -> Option<BatchPlan> {
+        if !self.mixed_eager {
+            return None;
+        }
+        let padded = round_up_to_bucket(plan.num_tokens, EAGER_MIXED_TOKEN_BUCKET)?
+            .min(self.cap_num_tokens);
+        if padded <= plan.num_tokens {
+            return None;
+        }
+        let mut run = plan.clone();
+        run.num_tokens = padded;
+        run.rope_positions.resize(padded, 0);
+        Some(run)
     }
 
     fn run_mixed_abc_eager_region(
@@ -646,7 +854,20 @@ where
             // Keep the host-side attention branch stable: the leading q==1 run
             // is the decode prefix, and a non-1 row after it forces the ragged
             // suffix path. Real q lengths live in the device control tensors.
-            q_lens[shape.decode_prefix] = 2;
+            //
+            // FA3-graph mode additionally bakes `max_q = max(q_lens)` into the
+            // captured kernel's `num_blocks_m`; it must cover every replay
+            // composition mapping to this bucket. `tokens - decode_prefix` is
+            // that upper bound: any live step here has `actual_num_tokens <=
+            // tokens` and `actual_decode >= decode_prefix`, so its longest
+            // prefill row <= actual_num_tokens - actual_decode <= tokens -
+            // decode_prefix. (CuTe reads tile counts from the device, so the
+            // legacy path only needs this value to be > 1.)
+            q_lens[shape.decode_prefix] = if self.mixed_fa3_graph {
+                (shape.tokens - shape.decode_prefix) as i32
+            } else {
+                2
+            };
         }
         BatchPlan {
             kind: BatchKind::Ragged,

@@ -111,6 +111,89 @@ fn main() {
         println!("cargo:rustc-link-lib=static=infer_kernels");
         println!("cargo:rustc-link-lib=cudart");
 
+        // FA3 (flash-attention v2.8.3 hopper) prefill kernels need sm_90a for
+        // wgmma/TMA, so they get their own translation units; every other arch
+        // keeps the CuTe ragged prefill path.
+        //
+        // Compiled via direct nvcc, NOT cc: cc's cuda mode hardcodes
+        // `--device-c` (relocatable device code), and ptxas then ignores
+        // FA3's setmaxnreg warp-specialization hints (C7504) leaving the
+        // consumer warps register-starved — wgmma goes fully serialized
+        // (C7512). Whole-program `-c` per TU keeps the register reallocation.
+        // NDEBUG matters too: device assert() leaves __assertfail extern
+        // calls that also serialize wgmma (C7509).
+        println!("cargo:rustc-check-cfg=cfg(rustinfer_fa3)");
+        if cuda_arch.starts_with("sm_90") {
+            let fa3_dir = root.join("src/kernels/third_party/fa3");
+            let fa3_files = [
+                "flash_fwd_hdim128_bf16_paged_sm90.cu",
+                "flash_prepare_scheduler.cu",
+                "rustinfer_fa3_api.cu",
+            ];
+            let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+            let nvcc = cuda_path.join("bin/nvcc");
+            let mut children = Vec::new();
+            let mut objs = Vec::new();
+            for f in fa3_files {
+                let src = fa3_dir.join(f);
+                let obj = out_dir.join(format!("{}.o", f.replace('.', "_")));
+                let child = std::process::Command::new(&nvcc)
+                    .args([
+                        "-O3",
+                        "-std=c++17",
+                        "-arch=sm_90a",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "--use_fast_math",
+                        "-w",
+                        "-DNDEBUG",
+                        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                        "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+                        "-DFLASHATTENTION_DISABLE_LOCAL",
+                        "-DFLASHATTENTION_DISABLE_APPENDKV",
+                        "-DFLASHATTENTION_DISABLE_CLUSTER",
+                        "-DFLASHATTENTION_DISABLE_SM8x",
+                        "-Xcompiler",
+                        "-fPIC",
+                    ])
+                    .arg("-I")
+                    .arg(&fa3_dir)
+                    .arg("-I")
+                    .arg(&cutlass_include)
+                    .arg("-c")
+                    .arg(&src)
+                    .arg("-o")
+                    .arg(&obj)
+                    .spawn()
+                    .unwrap_or_else(|e| panic!("failed to spawn nvcc for {}: {}", f, e));
+                children.push((f, child));
+                objs.push(obj);
+                println!("cargo:rerun-if-changed={}", src.display());
+            }
+            for (f, mut child) in children {
+                let status = child
+                    .wait()
+                    .unwrap_or_else(|e| panic!("nvcc wait failed for {}: {}", f, e));
+                if !status.success() {
+                    panic!("nvcc failed for {} ({})", f, status);
+                }
+            }
+            let lib = out_dir.join("librustinfer_fa3.a");
+            let _ = std::fs::remove_file(&lib);
+            let status = std::process::Command::new("ar")
+                .arg("crs")
+                .arg(&lib)
+                .args(&objs)
+                .status()
+                .expect("failed to run ar for librustinfer_fa3.a");
+            if !status.success() {
+                panic!("ar failed for librustinfer_fa3.a ({})", status);
+            }
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=rustinfer_fa3");
+            println!("cargo:rustc-cfg=rustinfer_fa3");
+        }
+
         let target = env::var("TARGET").expect("TARGET environment variable not set");
 
         // 3. 配置 bindgen

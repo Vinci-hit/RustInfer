@@ -254,13 +254,33 @@ where
             Err(e) => tracing::info!("[bootstrap] prefill prewarm skipped: {:?}", e),
         }
         let t_mixed = Instant::now();
-        match runner.prewarm_mixed_graphs(eos_ids) {
-            Ok(n) => tracing::info!(
-                "[bootstrap] mixed ABC graphs prewarmed ({} buckets) in {:.2}s",
-                n,
-                t_mixed.elapsed().as_secs_f64(),
-            ),
-            Err(e) => tracing::info!("[bootstrap] mixed graph prewarm skipped: {:?}", e),
+        if runner.mixed_eager_mode() {
+            // Eager-mixed mode (unified FA3): mixed graphs are never replayed,
+            // so skip the 104-bucket capture pass and warm the eager fused
+            // path's GEMM token buckets instead.
+            match runner.prewarm_mixed_eager_shapes(eos_ids) {
+                Ok(n) => tracing::info!(
+                    "[bootstrap] mixed eager shapes prewarmed ({} token buckets) in {:.2}s",
+                    n,
+                    t_mixed.elapsed().as_secs_f64(),
+                ),
+                Err(e) => tracing::info!("[bootstrap] mixed eager prewarm skipped: {:?}", e),
+            }
+        } else {
+            let attn = if runner.mixed_fa3_graph_mode() {
+                "FA3"
+            } else {
+                "CuTe-split"
+            };
+            match runner.prewarm_mixed_graphs(eos_ids) {
+                Ok(n) => tracing::info!(
+                    "[bootstrap] mixed ABC graphs prewarmed ({} buckets, {} attention) in {:.2}s",
+                    n,
+                    attn,
+                    t_mixed.elapsed().as_secs_f64(),
+                ),
+                Err(e) => tracing::info!("[bootstrap] mixed graph prewarm skipped: {:?}", e),
+            }
         }
     }
 

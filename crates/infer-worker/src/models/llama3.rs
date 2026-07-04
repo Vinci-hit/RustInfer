@@ -1,6 +1,24 @@
 //! Llama3 model — a dense decoder assembled from reusable components.
 //!
-//! `Llama3Model` is the shared [`Decoder`](crate::models::decoder::Decoder);
-//! the loader builds it with each block's `Attention` Q/K norms absent.
+//! Model-specific behavior belongs in this file. The shared loader remains
+//! name-driven and model-agnostic.
 
-pub use crate::models::decoder::Decoder as Llama3Model;
+use crate::domain::dtype::Dtype;
+use crate::domain::ports::backend::LlmBackend;
+use crate::domain::ports::{OpBackend, OpResult};
+use crate::models::decoder::{build_dense_decoder, Decoder};
+use crate::models::loader::{LoadConfig, WeightLoader};
+
+pub type Llama3Model<T, D> = Decoder<T, D>;
+
+pub fn build<T, D>(
+    loader: &WeightLoader<'_>,
+    cfg: &LoadConfig,
+    device: &D,
+) -> OpResult<Llama3Model<T, D>>
+where
+    T: Dtype,
+    D: OpBackend + LlmBackend,
+{
+    build_dense_decoder(loader, cfg, device)
+}

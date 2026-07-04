@@ -530,6 +530,14 @@ impl infer_core::ports::FusedOps for Cuda {
         kernels::matmul::set_eager_prefill_gemm(on);
     }
 
+    fn set_unified_mixed_capture(on: bool) {
+        kernels::flash_attn_gqa::set_fa3_capture_allowed(on);
+    }
+
+    fn unified_mixed_attention_available<T: infer_core::dtype::Dtype>(head_dim: usize) -> bool {
+        kernels::flash_attn_gqa::fa3_unified_available::<T>(head_dim)
+    }
+
     fn fused_add_rmsnorm<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         output: &mut Tensor<T, Self>,

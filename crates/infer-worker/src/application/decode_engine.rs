@@ -179,6 +179,46 @@ impl DecodeEngine {
         )
     }
 
+    /// Snapshot the in-flight decode step for the overlapped fused path: its
+    /// row order and the per-row KV slots it is writing this step. `None`
+    /// unless a step is in flight AND every row is still in `active` — an
+    /// out-of-band eviction mid-flight makes the optimistic row build
+    /// unsound, so the caller drains first instead.
+    pub(crate) fn overlap_fused_snapshot(
+        &self,
+        active: &ActiveSeqMap,
+    ) -> Option<(Vec<u64>, Vec<u32>)> {
+        let p = self.pending.as_ref()?;
+        if p.order.is_empty() || p.new_indices.len() < p.order.len() {
+            return None;
+        }
+        if !p.order.iter().all(|sid| active.get(sid).is_some()) {
+            return None;
+        }
+        Some((
+            p.order.clone(),
+            p.new_indices.as_slice()[..p.order.len()].to_vec(),
+        ))
+    }
+
+    /// Take the speculative next-step reservation for an overlapped fused
+    /// step's decode rows — the in-flight decode issue reserved one slot per
+    /// row exactly for its successor step, which the fused step now is.
+    /// `None` when it does not cover `n`; the caller allocates plainly or
+    /// falls back to the drain path.
+    pub(crate) fn take_prealloc_for_overlap(
+        &mut self,
+        n: usize,
+        kv_allocator: &mut GlobalKvAllocator,
+    ) -> Option<KvLease> {
+        if n == 0 || self.prealloc.len() < n {
+            return None;
+        }
+        let mut lease = self.prealloc.take();
+        lease.shrink_to(n, kv_allocator);
+        Some(lease)
+    }
+
     /// Prepare the current decode rows for a fused step: materialize the row
     /// order and allocate exactly one new KV slot per row (prealloc fast path /
     /// relief fallback), WITHOUT reserving next-step slots — a fused step does
@@ -226,6 +266,12 @@ impl DecodeEngine {
         finished: &[bool],
         enable_prefix_caching: bool,
         output: &mut StepOutput,
+        // Overlapped fused path: rows the PRIOR (drained-after-issue) decode
+        // step finished. Their optimistic extra forward is discarded — no
+        // token is emitted (the client already saw `finished`), only this
+        // step's throwaway KV slot is reclaimed (the prior commit already
+        // released the sequence's blocks). Empty slice = no skips.
+        skip_prior_finished: &[bool],
     ) -> OpResult<()> {
         // Consume the lease up front: from here every slot either enters a
         // sequence block table via `commit_accepted` or joins `to_free`.
@@ -245,6 +291,10 @@ impl DecodeEngine {
                     i, sid
                 )));
             };
+            if skip_prior_finished.get(i).copied().unwrap_or(false) {
+                to_free.push(new_index);
+                continue;
+            }
             if let Some(seq) = active.get_mut(&sid) {
                 seq.commit_accepted(token, 1, &[new_index]).map_err(|e| {
                     OpError::Shape(format!("fused decode commit failed for seq {}: {}", sid, e))
@@ -869,6 +919,84 @@ pub(crate) fn build_decode_request(
             },
         });
         generated_counts.push(seq.generated_count as u32);
+        max_tokens.push(seq.max_tokens as u32);
+        ignore_eos.push(seq.ignore_eos);
+    }
+
+    let req = StepRequest {
+        sampling: Vec::new(),
+        stop: StopCriteria {
+            eos_ids: eos_ids.to_vec(),
+            generated_counts: generated_counts.clone(),
+            max_tokens: max_tokens.clone(),
+            ignore_eos: ignore_eos.clone(),
+        },
+        draft_tokens: Vec::new(),
+        seqs,
+    };
+
+    DecodeRequestBuild {
+        req,
+        generated_counts,
+        max_tokens,
+        ignore_eos,
+        assigned,
+    }
+}
+
+/// Build the OPTIMISTIC decode request for the overlapped fused path: the
+/// in-flight step's rows advanced one position, BEFORE its results are known.
+/// Every row is assumed to survive; a row the in-flight step actually
+/// finishes runs one inert extra forward whose output the commit discards
+/// (`skip_prior_finished`).
+///
+/// This mirrors `build_decode_request` applied to the post-commit state:
+/// `commit_accepted` will append `step_slots[i]`, advance `kv_len` and
+/// `generated_count` by one, and set `last_token` to the in-flight step's
+/// argmax — which the host does not know yet, so `input_ids` carry a
+/// placeholder and the real token is gathered from buffer C on device by
+/// `issue_fused_abc_overlapped`. `assigned` reports this step's fresh slot
+/// with EMPTY token ids; when prefix caching is on the caller patches them
+/// from the prior step's output after it is finalized (and before this
+/// step's output is sent).
+pub(crate) fn build_overlap_decode_request(
+    order: &[u64],
+    step_slots: &[u32],
+    fused_slots: &[u32],
+    active: &ActiveSeqMap,
+    eos_ids: &[i32],
+) -> DecodeRequestBuild {
+    debug_assert_eq!(order.len(), step_slots.len());
+    debug_assert_eq!(order.len(), fused_slots.len());
+    let mut seqs = Vec::with_capacity(order.len());
+    let mut assigned = Vec::with_capacity(order.len());
+    let mut generated_counts = Vec::with_capacity(order.len());
+    let mut max_tokens = Vec::with_capacity(order.len());
+    let mut ignore_eos = Vec::with_capacity(order.len());
+    for (i, &sid) in order.iter().enumerate() {
+        let seq = active
+            .get(&sid)
+            .expect("overlap snapshot verified every row is active");
+        let kv_after_prior = seq.kv_len as i32 + 1;
+        let mut block_table = Vec::with_capacity(seq.block_table.len() + 2);
+        block_table.extend_from_slice(&seq.block_table);
+        block_table.push(step_slots[i]);
+        block_table.push(fused_slots[i]);
+        seqs.push(SeqStep {
+            sequence_id: sid,
+            input_ids: vec![0], // placeholder — C-gather supplies the real token
+            positions: vec![kv_after_prior],
+            kv_write_start: kv_after_prior,
+            kv_len_after: kv_after_prior + 1,
+            block_table,
+        });
+        assigned.push(AssignedIndices {
+            sequence_id: sid,
+            base: fused_slots[i],
+            len: 1,
+            token_ids: Vec::new(),
+        });
+        generated_counts.push(seq.generated_count as u32 + 1);
         max_tokens.push(seq.max_tokens as u32);
         ignore_eos.push(seq.ignore_eos);
     }

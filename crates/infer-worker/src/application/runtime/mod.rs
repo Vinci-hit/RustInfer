@@ -95,6 +95,25 @@ where
     /// ready bucket, but an unseen bucket falls back to eager instead of doing
     /// eager warmup + synchronize + stream capture on the request path.
     mixed_graph_capture_enabled: bool,
+    /// Mixed (fused decode+prefill) steps run EAGER by default instead of
+    /// replaying a bucketed mixed graph. On when the backend serves eager
+    /// ragged batches with the unified single-kernel attention (FA3 on
+    /// Hopper): the measured eager fused forward beats the graph replay
+    /// (6.4ms vs 7.5ms p50 at qps32 — no row/token padding, no legacy split
+    /// attention), and the eager GEMM shape set is bounded by
+    /// `EAGER_MIXED_TOKEN_BUCKET` + boot prewarm. `RUSTINFER_MIXED_GRAPH=1`
+    /// forces the graph path back on; `=0` forces eager even without FA3.
+    mixed_eager: bool,
+    /// Mixed steps replay a bucketed CUDA graph whose captured attention is the
+    /// unified FA3 kernel (not the legacy CuTe split). Combines the eager FA3
+    /// forward's speed with graph determinism — no per-step launch/shape jitter,
+    /// so the fused-step ITL tail collapses to its median. DEFAULT when FA3 is
+    /// available; `RUSTINFER_MIXED_FA3_GRAPH=0` (or `RUSTINFER_MIXED_GRAPH=0/1`)
+    /// opts back down to eager / legacy CuTe graph. Mutually exclusive with
+    /// `mixed_eager`. The bucket plan bakes `max_q` to `tokens-decode_prefix` (a
+    /// proven upper bound over every replay composition), which is what makes
+    /// FA3 safe to capture. See `mixed_graph_bucket_plan` / `try_run_mixed_abc_graph`.
+    mixed_fa3_graph: bool,
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -351,6 +370,30 @@ where
         )?;
         model.install_scratch(scratch);
 
+        // Mixed-step mode. FA3-graph (unified FA3 attention captured in a CUDA
+        // graph — eager-FA3 speed + graph determinism) is the DEFAULT when the
+        // backend has unified FA3, since it collapses the fused-step ITL tail to
+        // its median (qps32 ITL p99 12.9->8.7, beats vLLM). Escape hatches:
+        //   RUSTINFER_MIXED_GRAPH=1     -> legacy CuTe-split mixed graph
+        //   RUSTINFER_MIXED_GRAPH=0     -> eager unified-FA3, uncaptured
+        //   RUSTINFER_MIXED_FA3_GRAPH=0 -> eager (opt out of FA3 capture)
+        let fa3_avail = D::unified_mixed_attention_available::<T>(dims.head_dim);
+        let (mixed_eager, mixed_fa3_graph) =
+            match std::env::var("RUSTINFER_MIXED_GRAPH").ok().as_deref() {
+                Some("1") => (false, false),
+                Some("0") => (true, false),
+                _ => {
+                    let fa3_graph = fa3_avail
+                        && std::env::var("RUSTINFER_MIXED_FA3_GRAPH").ok().as_deref()
+                            != Some("0");
+                    if fa3_graph {
+                        (false, true)
+                    } else {
+                        (fa3_avail, false)
+                    }
+                }
+            };
+
         Ok(Self {
             model,
             kv_pool,
@@ -375,7 +418,21 @@ where
             prefill_graphs_captured: 0,
             mixed_graphs_captured: 0,
             mixed_graph_capture_enabled: false,
+            mixed_eager,
+            mixed_fa3_graph,
         })
+    }
+
+    /// True when fused mixed steps default to the eager unified-attention path
+    /// (mixed graphs disabled). Drives which mixed prewarm bootstrap runs.
+    pub fn mixed_eager_mode(&self) -> bool {
+        self.mixed_eager
+    }
+
+    /// True when mixed steps capture a CUDA graph with the unified FA3 attention
+    /// (`RUSTINFER_MIXED_FA3_GRAPH=1`). Mutually exclusive with `mixed_eager`.
+    pub fn mixed_fa3_graph_mode(&self) -> bool {
+        self.mixed_fa3_graph
     }
 
     pub fn step(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
@@ -947,6 +1004,31 @@ pub(super) unsafe fn upload_i32_prefix<D: Device>(
     }
     let bytes = std::mem::size_of_val(host);
     let ptr = unsafe { NonNull::new_unchecked(dst.data_ptr_mut() as *mut u8) };
+    unsafe { device.upload_async(ptr, host.as_ptr() as *const u8, bytes) }
+}
+
+/// Upload `host` into `dst[start .. start + host.len()]`, leaving the prefix
+/// untouched (the overlapped fused path fills it with an on-device gather).
+pub(super) unsafe fn upload_i32_range<D: Device>(
+    device: &D,
+    dst: &Tensor<i32, D>,
+    start: usize,
+    host: &[i32],
+) -> OpResult<()> {
+    if host.is_empty() {
+        return Ok(());
+    }
+    if start + host.len() > dst.numel() {
+        return Err(OpError::Shape(format!(
+            "upload_i32_range: {}..{} > dst {}",
+            start,
+            start + host.len(),
+            dst.numel()
+        )));
+    }
+    let bytes = std::mem::size_of_val(host);
+    let base = dst.data_ptr_mut() as *mut i32;
+    let ptr = unsafe { NonNull::new_unchecked(base.add(start) as *mut u8) };
     unsafe { device.upload_async(ptr, host.as_ptr() as *const u8, bytes) }
 }
 

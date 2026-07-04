@@ -4,17 +4,17 @@
 //! Llama3 and Qwen3 share this exact structure; the only difference is whether
 //! each block's `Attention` carries Qwen3-style Q/K norms (set at load time).
 //!
-//! This module also owns the *assembly* of that structure from weights
-//! ([`build_decoder`]): the tensor-name convention (`model.embed_tokens.weight`,
-//! `model.layers.{i}.self_attn.*`, tied `lm_head`) is model knowledge and lives
-//! here, not in the generic [`WeightLoader`](crate::models::loader::WeightLoader).
+//! Concrete model files decide which FFN type and tensor convention to use.
+//! This module only provides the shared decoder shell plus a dense-decoder
+//! helper reused by dense Llama3/Qwen3 implementations.
 
 use crate::components::attention::Attention;
 use crate::components::decoder_block::DecoderBlock;
 use crate::components::embed::Embed;
 use crate::components::ffn_dense::DenseFfn;
-use crate::components::lm_head::LmHead;
+use crate::components::ffn_moe::MoeFfn;
 use crate::components::linear::Linear as CompLinear;
+use crate::components::lm_head::LmHead;
 use crate::components::norm::RmsNorm;
 use std::rc::Rc;
 
@@ -29,16 +29,34 @@ use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 use crate::models::layers::{Linear as LayerLinear, RMSNorm as LayerRmsNorm};
-use crate::models::loader::{LoadConfig, WeightLoader, compute_rope_cache};
+use crate::models::loader::{compute_rope_cache, LoadConfig, WeightLoader};
 
 const STAGES: [StageKind; 3] = [StageKind::Embed, StageKind::DecoderBlock, StageKind::LmHead];
 
-/// A dense autoregressive decoder assembled from components. Generic over the
-/// backend `D`; the same type backs both Llama3 and Qwen3 (Qwen3 populates the
-/// per-block `Attention` Q/K norms).
-pub struct Decoder<T: Dtype, D: LlmBackend> {
+/// FFN contract required by the shared decoder shell.
+pub trait DecoderFfn<T: Dtype, D: LlmBackend>: Component<T, D> {
+    fn install_scratch(&mut self, scratch: Rc<ForwardScratch<T, D>>);
+}
+
+impl<T: Dtype, D: LlmBackend> DecoderFfn<T, D> for DenseFfn<T, D> {
+    fn install_scratch(&mut self, scratch: Rc<ForwardScratch<T, D>>) {
+        self.scratch = Some(scratch);
+    }
+}
+
+impl<T: Dtype, D: LlmBackend> DecoderFfn<T, D> for MoeFfn<T, D> {
+    fn install_scratch(&mut self, scratch: Rc<ForwardScratch<T, D>>) {
+        if let Some(shared) = &mut self.shared {
+            shared.scratch = Some(scratch);
+        }
+    }
+}
+
+/// Autoregressive decoder shell assembled from shared components. The FFN type
+/// is supplied by the concrete model implementation file.
+pub struct Decoder<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D> = DenseFfn<T, D>> {
     pub embed: Embed<T, D>,
-    pub blocks: Vec<DecoderBlock<T, D, DenseFfn<T, D>>>,
+    pub blocks: Vec<DecoderBlock<T, D, F>>,
     pub norm: RmsNorm<T, D>,
     pub lm_head: LmHead<T, D>,
     pub dims: ModelDims,
@@ -47,7 +65,7 @@ pub struct Decoder<T: Dtype, D: LlmBackend> {
     pub scratch: Option<Rc<ForwardScratch<T, D>>>,
 }
 
-impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
+impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decoder<T, D, F> {
     fn dims(&self) -> ModelDims {
         self.dims
     }
@@ -62,7 +80,7 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
     ) {
         for block in &mut self.blocks {
             block.attention.scratch = Some(scratch.clone());
-            block.ffn.scratch = Some(scratch.clone());
+            block.ffn.install_scratch(scratch.clone());
         }
         self.scratch = Some(scratch);
     }
@@ -183,20 +201,19 @@ impl<T: Dtype, D: LlmBackend> DecoderModel<T, D> for Decoder<T, D> {
     }
 }
 
-/// Assemble a dense [`Decoder`] (Llama3 / Qwen3) from a checkpoint.
+/// Assemble a dense [`Decoder`] from a checkpoint.
 ///
-/// This owns the model's tensor-name convention and structural assumptions —
+/// This owns the shared dense decoder tensor convention —
 /// flat `model.embed_tokens.weight` / `model.norm.weight`, per-layer
 /// `model.layers.{i}.{self_attn,mlp}.*`, fused q+2kv attention, dense-or-int4
 /// SwiGLU MLP, tied `lm_head` when `lm_head.weight` is absent. The generic
-/// [`WeightLoader`] only supplies name-driven read/fuse primitives; nothing
-/// architecture-specific lives there.
+/// [`WeightLoader`] only supplies name-driven read/fuse primitives.
 ///
 /// Per-family differences are resolved by weight presence, not a branch above:
 /// Qwen3 carries `self_attn.{q,k}_norm.weight` and Llama3 does not, so the Q/K
 /// norms are simply populated when present. int4 (`compressed-tensors`
 /// pack-quantized) MLP is selected by `cfg.mlp_quant`.
-pub fn build_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+pub fn build_dense_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
     loader: &WeightLoader<'_>,
     cfg: &LoadConfig,
     device: &D,
@@ -226,8 +243,11 @@ pub fn build_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmB
     let mut blocks = Vec::with_capacity(cfg.layer_num);
     for i in 0..cfg.layer_num {
         let lp = format!("model.layers.{}", i);
-        let input_layernorm =
-            loader.load_rmsnorm::<T, D>(&format!("{}.input_layernorm.weight", lp), device, cfg.rms_norm_eps)?;
+        let input_layernorm = loader.load_rmsnorm::<T, D>(
+            &format!("{}.input_layernorm.weight", lp),
+            device,
+            cfg.rms_norm_eps,
+        )?;
         let post_attention_layernorm = loader.load_rmsnorm::<T, D>(
             &format!("{}.post_attention_layernorm.weight", lp),
             device,
@@ -240,43 +260,52 @@ pub fn build_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmB
         // MLP: int4 `pack-quantized` when `mlp_quant` is set, else dense. Both
         // arms yield a `components::Linear`; the quant arm carries the packed
         // weight + scales/zeros and drives `matmul_quant` internally.
-        let (gate_up_proj, down_proj): (CompLinear<T, D>, CompLinear<T, D>) =
-            if let Some(scheme) = cfg.mlp_quant {
-                (
-                    loader.load_fused_gate_up_awq::<T, D>(&format!("{}.mlp", lp), scheme, device)?,
-                    loader.load_awq_linear::<T, D>(&format!("{}.mlp.down_proj", lp), scheme, device)?,
-                )
-            } else {
-                (
-                    comp_linear(loader.load_fused_gate_up::<T, D>(
-                        &lp,
-                        cfg.intermediate_size,
-                        cfg.dim,
-                        device,
-                    )?),
-                    comp_linear(loader.load_linear::<T, D>(
-                        &format!("{}.mlp.down_proj.weight", lp),
-                        None,
-                        device,
-                    )?),
-                )
-            };
+        let (gate_up_proj, down_proj): (CompLinear<T, D>, CompLinear<T, D>) = if let Some(scheme) =
+            cfg.mlp_quant
+        {
+            (
+                loader.load_fused_gate_up_awq::<T, D>(&format!("{}.mlp", lp), scheme, device)?,
+                loader.load_awq_linear::<T, D>(&format!("{}.mlp.down_proj", lp), scheme, device)?,
+            )
+        } else {
+            (
+                comp_linear(loader.load_fused_gate_up::<T, D>(
+                    &lp,
+                    cfg.intermediate_size,
+                    cfg.dim,
+                    device,
+                )?),
+                comp_linear(loader.load_linear::<T, D>(
+                    &format!("{}.mlp.down_proj.weight", lp),
+                    None,
+                    device,
+                )?),
+            )
+        };
 
         let q_norm_name = format!("{}.self_attn.q_norm.weight", lp);
         let k_norm_name = format!("{}.self_attn.k_norm.weight", lp);
         let q_norm = if loader.has_tensor(&q_norm_name) {
-            Some(comp_rms(loader.load_rmsnorm::<T, D>(&q_norm_name, device, cfg.rms_norm_eps)?))
+            Some(comp_rms(loader.load_rmsnorm::<T, D>(
+                &q_norm_name,
+                device,
+                cfg.rms_norm_eps,
+            )?))
         } else {
             None
         };
         let k_norm = if loader.has_tensor(&k_norm_name) {
-            Some(comp_rms(loader.load_rmsnorm::<T, D>(&k_norm_name, device, cfg.rms_norm_eps)?))
+            Some(comp_rms(loader.load_rmsnorm::<T, D>(
+                &k_norm_name,
+                device,
+                cfg.rms_norm_eps,
+            )?))
         } else {
             None
         };
         if q_norm.is_some() != k_norm.is_some() {
             return Err(OpError::Shape(format!(
-                "build_decoder: layer {} has q_norm={} but k_norm={}; require both or neither",
+                "build_dense_decoder: layer {} has q_norm={} but k_norm={}; require both or neither",
                 i,
                 q_norm.is_some(),
                 k_norm.is_some()
@@ -311,7 +340,9 @@ pub fn build_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmB
         embed: Embed { table: embed_table },
         blocks,
         norm: comp_rms(final_norm),
-        lm_head: LmHead { proj: comp_linear(lm_head) },
+        lm_head: LmHead {
+            proj: comp_linear(lm_head),
+        },
         dims: ModelDims {
             dim: cfg.dim,
             q_dim,
@@ -339,7 +370,10 @@ fn comp_linear<T: Dtype, D: OpBackend + LlmBackend>(l: LayerLinear<T, D>) -> Com
 
 /// `models::layers::RMSNorm` → `components::RmsNorm`.
 fn comp_rms<T: Dtype, D: OpBackend + LlmBackend>(r: LayerRmsNorm<T, D>) -> RmsNorm<T, D> {
-    RmsNorm { weight: r.weight, eps: r.eps }
+    RmsNorm {
+        weight: r.weight,
+        eps: r.eps,
+    }
 }
 
 #[cfg(test)]

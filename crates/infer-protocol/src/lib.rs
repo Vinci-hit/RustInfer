@@ -24,7 +24,9 @@ mod syntax_test;
 // types must be imported through their module to keep the plane visible at
 // every use site.
 pub use common::{ProtocolError, ProtocolResult};
-pub use config::{RustInferConfig, resolve_model_type};
+pub use config::{
+    resolve_model_type, supported_model_types, supported_model_types_csv, RustInferConfig,
+};
 pub use control_envelope::{ControlEnvelope, RequestId};
 pub use scheduler_to_server::{
     ChunkType, ImageOutput, InferenceMetrics, InferenceResponse, ResponseStatus, StreamChunk,
