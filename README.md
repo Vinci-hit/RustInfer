@@ -20,16 +20,10 @@ than vLLM (blue) at equal or higher throughput:
 
 ![RustInfer vs vLLM — online QPS sweep, H200](bench/plots/ri_vs_vllm_qps_final.png)
 
-> **RustInfer beats vLLM on the tail, not just the median.** The hardest metric —
-> **tail inter-token latency (ITL p99)** — stays below vLLM at *every* arrival rate:
-> **6.6 → 9.0 ms** for RustInfer vs **7.2 → 10.9 ms** for vLLM (qps 1 → 32), a
-> 10–18% tail reduction that widens under load. RustInfer likewise leads on ITL /
-> TPOT median and end-to-end latency at matched (or higher) throughput.
->
-> The win comes from **capturing the fused decode+prefill step's FlashAttention-3
-> kernel inside a CUDA graph** — eager-FA3 speed with graph determinism, which
-> collapses the mixed-step latency spike that otherwise fattens the ITL tail.
-> Bench harness and configs live under `bench/`.
+> **RustInfer beats vLLM on the tail, not just the median.** Tail inter-token
+> latency (**ITL p99**) stays below vLLM at *every* arrival rate — **6.6 → 9.0 ms**
+> vs **7.2 → 10.9 ms** (qps 1 → 32) — alongside lower ITL / TPOT median and
+> end-to-end latency at matched or higher throughput. Bench harness under `bench/`.
 
 ---
 
