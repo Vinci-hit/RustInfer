@@ -1,14 +1,23 @@
 /target
+/.venv
 /.history
 /.cargo
 /.claude
 /.codex
+/.codebuddy
 /crates/infer-frontend/node_modules
-/crates/infer-frontend/assets/output.css
 /crates/infer-frontend/dist
-/crates/infer-frontend/package-lock.json
 # Profiling artifacts
 *.nsys-rep
 *.sqlite
 *.nsys-rep.bak
 crates/infer-worker/.codex
+*.log
+__pycache__/
+*.py[cod]
+/docs/**
+!/docs/
+!/docs/**/
+!/docs/*.md
+!/docs/**/*.md
+CLAUDE_FABLE_5.md

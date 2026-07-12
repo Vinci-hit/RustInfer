@@ -1,0 +1,64 @@
+# RustInfer shared launch config.
+#
+# One file drives all processes: rustinfer-scheduler, rustinfer-worker,
+# rustinfer-server. Each binary takes only `--config <path>` (defaults to
+# ./rustinfer.toml).
+#
+# `model_type` is intentionally NOT here — it is resolved from the model's
+# config.json so the worker dispatch / chat template always match the weights.
+
+# Model directory (weights + tokenizer.json + config.json). Required. Relative
+# paths are resolved from the directory where the binaries are launched.
+model = "./models/model"
+
+# Display name for /v1/models. Empty => derive from `model` basename.
+model_name = ""
+
+# Cluster id. All four IPC endpoints derive from this. Use a distinct id to
+# run multiple independent instances on the same host.
+cluster_id = "rustinfer"
+
+# CUDA device.
+device = "cuda:0"
+
+# HTTP API server.
+host = "127.0.0.1"
+port = 8000
+request_timeout_secs = 600
+
+# Batching / capacity.
+max_batch_tokens = 4096
+max_batch_seqs = 32
+max_model_len = 4096
+
+# Throughput knob: max time (ms) the scheduler waits accumulating freshly
+# arrived requests into one larger prefill batch before dispatching.
+# 0 => low-latency mode (dispatch each request immediately, no waiting).
+# Non-zero trades up to this much TTFT for higher throughput under high QPS.
+batch_wait_ms = 0
+
+# Paged KV.
+paged_block_size = 1
+chunked_prefill_size = 256    # bound prefill tokens per fused step so burst arrivals can't stall decode rows (qps32 ITL p99 tail); 0 => whole prompt in one step
+enable_prefix_caching = false
+mem_fraction_static = 0.85
+num_blocks = 0                # 0 => auto-size
+
+# Generation.
+ignore_eos = false
+
+# Scheduler mode. Diffusion is disabled in this release.
+mode = "llm"
+
+# Worker.
+worker_id = "worker-0"
+
+# Logging.
+log_level = "info"
+
+# CUDA graph capture sizes for decode batches.
+# Determines which batch sizes have pre-captured CUDA graphs.
+# Batch sizes not in this list will fall back to eager mode.
+# Keep the default template modest; tune this list with `max_batch_seqs` for the
+# deployment GPU after validating its memory headroom.
+capture_sizes = [1, 2, 4, 8, 16, 24, 32]

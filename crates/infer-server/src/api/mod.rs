@@ -1,3 +1,5 @@
+//! API 模块
+
 pub mod health;
-pub mod openai;
 pub mod metrics;
+pub mod openai;

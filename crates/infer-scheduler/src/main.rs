@@ -1,118 +1,241 @@
+//! RustInfer Scheduler binary entry point.
+
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod engine;
-mod scheduler;
-mod zmq_server;
-
-use engine::{InferenceEngine, ModelInstance};
-use infer_worker::base::DeviceType;
+use infer_protocol::scheduler_to_worker_control::LoadModel;
+use infer_protocol::{RustInferConfig, resolve_model_type};
+use infer_scheduler::application::SchedulerEngine;
+use infer_scheduler::config::{SchedulerConfig, SchedulerMode};
+use infer_scheduler::domain::BlockSize;
+use infer_scheduler::domain::policy::{ContinuousBatchingPolicy, SchedulingPolicy};
+use infer_scheduler::infrastructure::transport::control_plane::{ControlPlane, ControlPlaneConfig};
+use infer_scheduler::infrastructure::transport::zmq_transport::{
+    ZmqFrontendTransport, ZmqWorkerTransport,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-scheduler")]
-#[command(about = "RustInfer Scheduler - 调度与推理进程", long_about = None)]
+#[command(about = "RustInfer Scheduler — production-grade continuous batching scheduler")]
 struct Args {
-    /// 模型路径
-    #[arg(short, long)]
-    model: String,
+    /// Path to the shared TOML launch config.
+    #[arg(long, default_value = "rustinfer.toml")]
+    config: String,
+}
 
-    /// 模型类型: llama3 或 qwen3
-    #[arg(long, default_value = "llama3")]
-    model_type: String,
+fn parse_block_size(s: usize) -> BlockSize {
+    let raw = u32::try_from(s).unwrap_or(1);
+    BlockSize::new(if raw == 0 { 1 } else { raw })
+}
 
-    /// 设备: cpu 或 cuda:0, cuda:1 等
-    #[arg(short, long, default_value = "cuda:0")]
-    device: String,
-
-    /// ZMQ绑定地址
-    #[arg(short, long, default_value = "ipc:///tmp/rustinfer.ipc")]
-    zmq_endpoint: String,
-
-    /// 最大batch size
-    #[arg(long, default_value = "32")]
-    batch_size: usize,
-
-    /// 请求队列最大长度
-    #[arg(long, default_value = "128")]
-    max_queue_size: usize,
-
-    /// 调度间隔 (毫秒)
-    #[arg(long, default_value = "10")]
-    schedule_interval_ms: u64,
-
-    /// 日志级别
-    #[arg(long, default_value = "info")]
-    log_level: String,
+fn release_scheduler_mode(mode: &str) -> Result<SchedulerMode> {
+    match mode {
+        "llm" => Ok(SchedulerMode::Llm),
+        "diffusion" => {
+            anyhow::bail!("diffusion mode is disabled in this release; configure `mode = \"llm\"`")
+        }
+        other => anyhow::bail!("unsupported scheduler mode {:?}", other),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let cfg = RustInferConfig::load(&args.config).map_err(|e| anyhow::anyhow!(e))?;
 
-    // 初始化日志
+    // Initialize logging.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.into()),
+                .unwrap_or_else(|_| cfg.log_level.clone().into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("🚀 RustInfer Scheduler starting...");
-    tracing::info!("  Model: {}", args.model);
-    tracing::info!("  Model Type: {}", args.model_type);
-    tracing::info!("  Device: {}", args.device);
-    tracing::info!("  ZMQ Endpoint: {}", args.zmq_endpoint);
-    tracing::info!("  Max Batch Size: {}", args.batch_size);
+    let frontend_endpoint = cfg.frontend_endpoint();
+    let worker_push_endpoint = cfg.worker_in_endpoint();
+    let worker_pull_endpoint = cfg.worker_out_endpoint();
+    let worker_control_endpoint = cfg.worker_control_endpoint();
 
-    // 解析设备
-    let device = parse_device(&args.device)?;
+    let paged_block_size = parse_block_size(cfg.paged_block_size);
+    let scheduler_mode = release_scheduler_mode(&cfg.mode)?;
 
-    // 加载模型
-    tracing::info!("Loading model...");
-    let model = match args.model_type.to_lowercase().as_str() {
-        "llama3" | "llama" => {
-            let m = infer_worker::model::llm::llama3::Llama3::new(&args.model, device)?;
-            let state = m.create_state()?;
-            ModelInstance::Llama3(m, state)
-        }
-        "qwen3" | "qwen" => {
-            let m = infer_worker::model::llm::qwen3::Qwen3::new(&args.model, device)?;
-            let state = m.create_state()?;
-            ModelInstance::Qwen3(m, state)
-        }
-        _ => {
-            anyhow::bail!(
-                "Unsupported model type: {}. Use 'llama3' or 'qwen3'.",
-                args.model_type
-            );
-        }
+    // model_type is derived from the model's config.json (never a CLI flag),
+    // so the worker dispatch always matches the loaded weights.
+    let model_type = resolve_model_type(&cfg.model).map_err(|e| anyhow::anyhow!(e))?;
+
+    tracing::info!("RustInfer Scheduler v0.2.0 starting...");
+    tracing::info!("  Mode: {:?}", scheduler_mode);
+    tracing::info!("  Frontend: {}", frontend_endpoint);
+    tracing::info!("  Worker PUSH: {}", worker_push_endpoint);
+    tracing::info!("  Worker PULL: {}", worker_pull_endpoint);
+    tracing::info!("  Worker Control: {}", worker_control_endpoint);
+    tracing::info!("  Assigned model: {}", cfg.model);
+    tracing::info!("  Assigned model type: {}", model_type);
+    tracing::info!("  max_batch_seqs: {}", cfg.max_batch_seqs);
+    tracing::info!("  max_batch_tokens: {}", cfg.max_batch_tokens);
+    tracing::info!("  max_model_len: {}", cfg.max_model_len);
+    tracing::info!("  paged_block_size: {}", paged_block_size);
+    tracing::info!("  chunked_prefill_size: {:?}", cfg.chunked_prefill());
+    tracing::info!("  enable_prefix_caching: {}", cfg.enable_prefix_caching);
+    match cfg.batch_wait() {
+        Some(d) => tracing::info!("  batch_wait: {:?} (throughput mode)", d),
+        None => tracing::info!("  batch_wait: off (low-latency mode)"),
+    }
+
+    // Build config from the shared launch config (single mapping + validation).
+    let mut config = SchedulerConfig::from_launch(&cfg, scheduler_mode, paged_block_size);
+
+    // Create transports.
+    let frontend = ZmqFrontendTransport::new(&frontend_endpoint)?;
+    let worker = ZmqWorkerTransport::new(&worker_push_endpoint, &worker_pull_endpoint)?;
+
+    let load_model = Some(LoadModel {
+        model_instance_id: "default".to_string(),
+        model_path: cfg.model.clone(),
+        model_type: model_type.clone(),
+        device: cfg.device.clone(),
+        max_batch_tokens: cfg.max_batch_tokens,
+        max_batch_seqs: cfg.max_batch_seqs,
+        max_model_len: cfg.max_model_len,
+        mem_fraction_static: cfg.mem_fraction_static,
+        tp_rank: 0,
+        tp_size: 1,
+        pp_rank: 0,
+        pp_size: 1,
+        kv_cache_mode: Some(format!("paged:{}", paged_block_size.raw())),
+        kv_cache_memory_fraction: Some(cfg.mem_fraction_static),
+        enable_prefix_caching: cfg.enable_prefix_caching,
+    });
+
+    // Bind the control-plane ROUTER, optionally assign a model, then
+    // wait for `WorkerReady`. The same socket continues to serve
+    // runtime control once the handshake completes.
+    let cp_cfg = ControlPlaneConfig {
+        heartbeat_interval: Duration::from_secs(1),
+        heartbeat_timeout: Duration::from_secs(cfg.worker_heartbeat_timeout_secs.max(1)),
+        ..ControlPlaneConfig::default()
     };
-    tracing::info!("✅ Model loaded successfully!");
+    tracing::info!(
+        "  worker heartbeat_interval: {:?}",
+        cp_cfg.heartbeat_interval
+    );
+    tracing::info!("  worker heartbeat_timeout: {:?}", cp_cfg.heartbeat_timeout);
+    let (mut control_plane, worker_group) =
+        ControlPlane::bootstrap(&worker_control_endpoint, load_model, cp_cfg).await?;
+    tracing::info!(
+        "WorkerGroup ready: group_id={} model_instance_id={} ranks={} effective_max_batch_tokens={} effective_max_batch_seqs={}",
+        worker_group.group_id,
+        worker_group.model_instance_id,
+        worker_group.rank_count(),
+        worker_group.effective_capacity.max_batch_tokens,
+        worker_group.effective_capacity.max_batch_seqs,
+    );
+    let workers = control_plane.workers();
+    let default_worker = workers
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("control plane reports no workers after bootstrap"))?;
+    let control_cmd = control_plane.cmd_tx();
+    let control_events = control_plane.take_event_rx();
+    // Keep the ControlPlane owned for the whole run. `cmd_tx()` / `take_event_rx()`
+    // hand the engine independent owned handles, so the plane itself does not need
+    // to be borrowed or leaked. Holding it in this binding keeps the router thread
+    // and liveness watchdog alive for the duration of `engine.run()`, and lets its
+    // `Drop` run on exit — performing graceful shutdown (Shutdown to the worker,
+    // router-thread join, pending-RPC drain) that the previous `Box::leak` skipped.
 
-    // 创建Engine
-    let engine = InferenceEngine::new(
-        model,
-        args.batch_size,
-        args.max_queue_size,
-        args.schedule_interval_ms,
+    config.apply_worker_capacity(worker_group.effective_capacity.max_total_kv_tokens);
+
+    // The worker is the sole owner of physical block allocation; the
+    // scheduler only tracks slot accounting via `KvBudget` + `RadixTree`,
+    // wired up inside `SchedulerEngine::new`.
+
+    let policy: Box<dyn SchedulingPolicy> = Box::new(
+        ContinuousBatchingPolicy::new(config.chunked_prefill_size)
+            .with_admission(config.max_prefill_seqs_per_iter, config.prefill_sjf),
     );
 
-    // 启动ZMQ服务器
-    tracing::info!("Starting ZMQ server...");
-    zmq_server::run(engine, &args.zmq_endpoint).await?;
+    // Build and run engine.
+    let engine = SchedulerEngine::new(
+        config,
+        policy,
+        worker_group,
+        frontend,
+        worker,
+        control_cmd,
+        control_events,
+        default_worker,
+    );
 
+    tracing::info!("Scheduler engine running...");
+    // Run the engine until it exits on its own OR a shutdown signal arrives.
+    // Catching SIGTERM/SIGINT here is what prevents an orphaned worker holding
+    // the GPU: on a signal we fall through to `drop(control_plane)`, which sends
+    // `Shutdown` to the worker and joins the router thread. Without this, a
+    // `systemctl stop` / `docker stop` (SIGTERM) would kill the scheduler
+    // without ever telling the worker to exit.
+    tokio::select! {
+        res = engine.run() => {
+            if res.is_err() {
+                // The engine failed in-flight/waiting requests on its way out,
+                // but those responses are only queued to the detached frontend
+                // ZMQ thread. Give it a beat to flush to the sockets before
+                // the process exit tears it down.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            res?;
+        }
+        sig = wait_for_shutdown_signal() => {
+            tracing::info!("Received {}; shutting down scheduler and notifying worker.", sig);
+        }
+    }
+
+    // Engine loop has exited (or a signal arrived); tear the control plane down
+    // gracefully (Shutdown to the worker + router-thread join) before returning.
+    drop(control_plane);
     Ok(())
 }
 
-fn parse_device(s: &str) -> Result<DeviceType> {
-    match s.to_lowercase().as_str() {
-        "cpu" => Ok(DeviceType::Cpu),
-        s if s.starts_with("cuda:") => {
-            let device_id: i32 = s[5..].parse()?;
-            Ok(DeviceType::Cuda(device_id))
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM (the signal
+/// `systemctl stop` / `docker stop` send by default). Returns the signal name
+/// for logging. On non-unix targets only Ctrl-C is observed.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = term.recv() => "SIGTERM",
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler ({}); Ctrl-C only", e);
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
         }
-        _ => Err(anyhow::anyhow!("Invalid device: {}. Use 'cpu' or 'cuda:0'", s)),
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SchedulerMode, release_scheduler_mode};
+
+    #[test]
+    fn release_binary_rejects_diffusion_mode() {
+        assert_eq!(release_scheduler_mode("llm").unwrap(), SchedulerMode::Llm);
+        let error = release_scheduler_mode("diffusion").unwrap_err().to_string();
+        assert!(error.contains("disabled in this release"));
     }
 }

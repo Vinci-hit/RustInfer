@@ -1,11 +1,16 @@
-// Public API for reusable components
+//! RustInfer HTTP API Server
+//!
+//! 提供 OpenAI 兼容的 HTTP API，通过 ZMQ 与 Scheduler 通信。
 
 pub mod api;
 pub mod chat;
-pub mod zmq_client;  // ZMQ客户端（分离式架构）
+pub mod client;
+pub mod config;
+pub mod error;
+pub mod middleware;
+pub mod router;
+pub mod state;
 
-// Re-export commonly used types
-pub use chat::get_template;
-pub use zmq_client::ZmqClient;
-
-
+// Re-exports
+pub use client::ZmqClient;
+pub use state::{AppState, SharedState};

@@ -1,0 +1,31 @@
+# RustInfer launch config for e2e smoke test of dense Llama-3.2-1B-Instruct.
+# Exercises the merged `load_decoder` (non-Qwen default path) and config-derived
+# eos_token_id [128001,128008,128009].
+# Paths are resolved from the directory where the binaries are launched.
+model = "./models/Llama-3.2-1B-Instruct"
+model_name = "Llama-3.2-1B-Instruct"
+cluster_id = "rustinfer-llama1b"
+device = "cuda:0"
+
+host = "127.0.0.1"
+port = 8102
+request_timeout_secs = 600
+
+max_batch_tokens = 8192
+max_batch_seqs = 32
+max_model_len = 4096
+batch_wait_ms = 0
+
+paged_block_size = 1
+chunked_prefill_size = 0
+enable_prefix_caching = false
+mem_fraction_static = 0.9
+num_blocks = 0
+
+ignore_eos = false
+
+mode = "llm"
+worker_id = "worker-0"
+log_level = "info"
+
+capture_sizes = [1, 2, 4, 8, 16, 24, 32]

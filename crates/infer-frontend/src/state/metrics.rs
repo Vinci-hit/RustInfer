@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SystemMetrics {
-    pub cpu: CpuMetrics,
-    pub memory: MemoryMetrics,
+    pub cpu: Option<CpuMetrics>,
+    pub memory: Option<MemoryMetrics>,
     pub gpu: Option<GpuMetrics>,
+    pub uptime_secs: Option<u64>,
+    pub timestamp: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

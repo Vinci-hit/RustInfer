@@ -1,17 +1,28 @@
-pub mod base;
-pub mod op;
-pub mod tensor;
-pub mod model;
-pub use model::runtime;
+//! # `infer-worker` — GPU Inference Runtime
+//!
+//! Internal architecture follows DDD (Domain-Driven Design):
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │ application/      应用层 (Runtime, DecodeEngine,          │
+//! │                   ServeLoop)                             │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ models/           具体模型 (Qwen3, Llama3)               │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ domain/           域层 — 纯的，零 FFI，零 I/O             │
+//! │   types, tensor, ports, batch, model trait               │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ infrastructure/   基础设施 — 实现 domain 的 trait          │
+//! │   cuda/, cpu/, io/, transport/                           │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! **依赖方向**: domain ← infrastructure ← models ← application
+//! domain 不 `use` infrastructure 的任何东西（通过 trait 反转依赖）。
 
-#[cfg(feature = "cuda")]
-pub mod cuda;
-
-/// 统一算子配置类型，所有算子接口使用 `Option<&OpConfig>` 作为参数。
-/// - cuda 编译: `OpConfig = cuda::CudaConfig`（cublas/cudnn handle, stream 等）
-/// - 纯 CPU 编译: `OpConfig = ()`（零开销）
-/// CPU 路径传 `None` 即可。
-#[cfg(feature = "cuda")]
-pub type OpConfig = cuda::CudaConfig;
-#[cfg(not(feature = "cuda"))]
-pub type OpConfig = ();
+pub mod application;
+pub mod components;
+pub mod domain;
+pub use infer_core::env_flags;
+pub mod infrastructure;
+pub mod models;

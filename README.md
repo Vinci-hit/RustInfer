@@ -1,510 +1,257 @@
-# RustInfer: Rust实现的高性能LLM推理引擎
+# RustInfer
 
-RustInfer是一个用Rust语言实现的高性能大语言模型(LLM)推理引擎，手写CUDA算子，支持BF16与INT4(AWQ)量化推理，**单请求decode吞吐量超越vLLM**。
+A high-performance, **architecture-first** LLM inference engine written in Rust.
+OpenAI-compatible API, continuous batching, paged KV cache, and CUDA-graph decode
+— built on a hexagonal, zero-cost multi-backend core that swaps CUDA for CPU at
+compile time with no runtime penalty.
 
-## 🏗️ 核心架构
-
-<div align="center">
-
-![RustInfer Architecture](assets/arch.jpg)
-
-*高性能推理内核架构 - 从零成本抽象到显存优化*
-
-</div>
-
-RustInfer 采用**分层模块化架构**，核心包括：
-
-- **Model Runtime**: Llama3/Qwen3 模型加载和执行
-- **Base Foundation**: 内存管理、CUDA显存分配器、设备抽象
-- **Tensor Engine**: 零拷贝张量系统，Shape/Stride/Zero-Copy Slice Views
-- **Operator Fabric**: CPU/CUDA 融合算子库（Matmul、FlashAttnGQA、RoPE、RMSNorm 等）
-- **CUDA Acceleration Plane**: 手写 GEMV/GEMM、INT4 量化、CUDA Graph、BF16/INT4 AWQ 推理
-- **Workspace Reuse**: 推理循环内存预分配，零动态分配
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-H200-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
 ---
 
-## 📊 性能对比：RustInfer vs vLLM
+## Performance
 
-> **测试环境**: H20, Batch Size=1, BF16, CUDA Graph enabled, vLLM compile disabled, temperature = 0, topk = None
+RustInfer **outperforms vLLM** on an online QPS sweep — **Qwen3-4B, NVIDIA H200**,
+`max_tokens=512`, `ignore_eos`, matched CUDA-graph decode capture sizes. Across the
+sweep, RustInfer (red) holds lower TTFT / TPOT / ITL and lower end-to-end latency
+than vLLM (blue) at equal or higher throughput:
 
-### Qwen3-4B
+![RustInfer vs vLLM — online QPS sweep, H200](bench/plots/ri_vs_vllm_qps_final.png)
 
-| | RustInfer | vLLM |
-|--|-----------|------|
-| **Decode 吞吐量** | **294 tok/s** | 259 tok/s |
-
-### Llama-3.2-1B-Instruct
-
-| | RustInfer | vLLM |
-|--|-----------|------|
-| **Decode 吞吐量** | **920 tok/s** | **735 tok/s**  |
-
-### INT4 AWQ 量化推理
-
-> Batch Size=1, compressed-tensors K-packed INT4, BF16 activation
-
-| 模型 | A10 (sm_86) | H20 (sm_90) |
-|------|-------------|-------------|
-| Llama-3.2-1B-AWQ | 326 tok/s (1.74x vs BF16) | **1000 tok/s** |
-| Qwen3-4B-AWQ (MLP only) | 105 tok/s | 303 tok/s |
-
-> **注意**: 长序列性能受到 flashdecode 影响，输出越长越慢。
-
-**v0.7.0 优化路径（259 → 281 tok/s, Qwen3-4B）**:
-- 手写 BF16 GEMV kernel，decode 阶段小矩阵比 cublasLt 快 25-44%
-- 融合 scatter_kv kernel，每层省 1 次 kernel launch
-- RMSNorm/fused_add_rmsnorm 线程数 128→256，提升 SM 占用率
-- SwiGLU 精度修复（bf16 h2exp → FP32 expf）+ 去除运行时设备查询开销
-- Benchmark 关闭流式打印，消除 tokenizer O(n²) decode 开销
+> **RustInfer beats vLLM on the tail, not just the median.** Tail inter-token
+> latency (**ITL p99**) stays below vLLM at *every* arrival rate — **6.6 → 9.0 ms**
+> vs **7.2 → 10.9 ms** (qps 1 → 32) — alongside lower ITL / TPOT median and
+> end-to-end latency at matched or higher throughput. Bench harness under `bench/`.
 
 ---
 
-## 🎨 文生图（Text-to-Image）
+## Design philosophy
 
-RustInfer 支持 **Z-Image** 系列模型进行高质量文生图推理，完全使用 Rust + CUDA 实现，无需 Python 依赖。
+RustInfer is organized around a few principles, applied consistently top to bottom.
 
-### 支持的模型
+### Hexagonal core (ports & adapters)
 
-| 模型 | 推理步数 | 1024×1024 耗时 | 特点 |
-|------|----------|----------------|------|
-| [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | 2 步 | **1.1 秒** | 蒸馏加速版，极速生成 |
-| [Z-Image](https://huggingface.co/Tongyi-MAI/Z-Image) | 50 步 | 24 秒 | 完整版，更高质量 |
+`infer-core` owns nothing but **ports** — trait definitions for everything the
+inference path needs from hardware:
 
-> **测试环境**: H20 GPU, BF16 精度, CUDA Graph 优化
-
-### 效果展示
-
-**Prompt**: *一只可爱的橘色小猫咪，戴着白色围裙和厨师帽，在温馨明亮的厨房里做饭，阳光透过窗户洒进来，灶台上有一口冒着热气的锅，小猫用锅铲翻炒着五颜六色的蔬菜，表情专注又开心，厨房里摆放着绿植和可爱的厨房用品，温暖治愈的氛围，高清细腻，皮克斯风格*
-
-<div align="center">
-<table>
-<tr>
-<td align="center"><b>Z-Image-Turbo (2步, 1.1秒)</b></td>
-<td align="center"><b>Z-Image (50步, 24秒)</b></td>
-</tr>
-<tr>
-<td><img src="assets/z_image_turbo_demo.png" width="400"/></td>
-<td><img src="assets/z_image_full_demo.png" width="400"/></td>
-</tr>
-</table>
-</div>
-
-### 快速使用
-
-**1. 下载模型**
-
-```bash
-# Z-Image-Turbo（推荐，极速生成）
-huggingface-cli download Tongyi-MAI/Z-Image-Turbo --local-dir ./Z-Image-Turbo
-
-# Z-Image（完整版，更高质量）
-huggingface-cli download Tongyi-MAI/Z-Image --local-dir ./Z-Image
+```
+infer-core/ports/
+  backend.rs      math_ops.rs     fused_ops.rs
+  sampler.rs      collective.rs   op_ports.rs
 ```
 
-**2. Rust 代码示例**
+The backends are **adapters** that implement those ports: `infer-backend-cuda`
+(`.cu` kernels + cuBLASLt + CUTLASS) and `infer-backend-cpu` (a pure-Rust reference
+implementation, always linked, used as baseline and for tests). The core has zero
+knowledge of CUDA; the entire GPU toolchain (nvcc / bindgen / cuDNN / CUTLASS) is
+confined to the single `infer-backend-cuda` leaf crate.
 
-```rust
-use infer_worker::model::diffusion::z_image::{ZImagePipeline, DiffusionRequest};
-use infer_worker::base::device::DeviceType;
+### Heterogeneous backends at zero cost
 
-// 加载模型
-let mut pipeline = ZImagePipeline::from_pretrained(
-    "/path/to/Z-Image-Turbo",
-    DeviceType::Cuda(0)
-)?;
+The model layer is generic over an `LlmBackend` trait and **monomorphizes at
+compile time** to whichever backend is selected — CUDA or CPU. There is no virtual
+dispatch on the inference hot path: dispatch cost is paid by the compiler, not per
+op. The same model code runs on GPU in production and on the CPU reference backend
+in unit tests, byte-for-byte the same call sites.
 
-// Warmup（首次运行，预热 CUDA kernel）
-pipeline.warmup_for(1024, 1024)?;
+### High cohesion, low coupling
 
-// 生成图片
-let request = DiffusionRequest {
-    prompt: "一只可爱的橘猫在厨房做饭，皮克斯风格".to_string(),
-    height: 1024,
-    width: 1024,
-    num_inference_steps: 2,   // Turbo 用 2 步，Full 用 28-50 步
-    guidance_scale: 1.0,      // Turbo 用 1.0，Full 用 4.5
-    seed: Some(42),
-    ..Default::default()
-};
+Eight crates form an acyclic dependency graph with a GPU-free bottom. Each crate
+has one job; cross-crate contact happens only through `infer-protocol` (wire types)
+and `infer-core` (ports). Swapping a backend, a scheduler policy, or a transport
+touches exactly one crate.
 
-let output = pipeline.generate(&request)?;
-// output.output: [1, 3, H, W] 的 RGB 张量，值域 [0, 255]
+### DDD layering inside the worker
+
+The worker — the most complex crate — is split into Domain / Application /
+Infrastructure, so pure inference logic never mixes with I/O or orchestration:
+
+```
+infer-worker/src/
+  domain/          model.rs, plan.rs, kv, forward_scratch, global_kv_alloc
+                   → pure inference logic; no I/O, no transport
+  application/     runtime, decode_engine, serve_loop, worker_scheduler,
+                   sampler_stack, hosting  → orchestration & lifecycle
+  infrastructure/  io, transport           → ZMQ / MsgPack adapters
+  components/      attention, ffn, norm, embed, lm_head  → reusable NN blocks
+  models/          llama3, qwen3, decoder, loader        → composition
 ```
 
-**3. 运行测试**
+### Model variation lives in the data, not in branches
 
-```bash
-# Z-Image-Turbo 测试
-cargo test --lib model::diffusion::z_image::pipeline::tests::test_pipeline_generate_cuda \
-    --release -- --nocapture --ignored
-
-# Z-Image 完整版测试
-cargo test --lib model::diffusion::z_image::pipeline::tests::test_pipeline_z_image_full_cuda \
-    --release -- --nocapture --ignored
-```
-
-### 参数说明
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `prompt` | String | 文本描述，支持中英文 |
-| `height` / `width` | u32 | 图片尺寸，建议 512-1024 |
-| `num_inference_steps` | u32 | 去噪步数，Turbo=2，Full=28-50 |
-| `guidance_scale` | f32 | CFG 强度，Turbo=1.0，Full=4.5 |
-| `seed` | Option<u64> | 随机种子，固定可复现结果 |
-
-### 技术特性
-
-- **FlowMatch Euler Scheduler**: 支持可配置的 shift 参数（Turbo=3.0, Full=6.0）
-- **BF16 精度**: 模型权重原生 BF16，减少显存占用
-- **CUDA Graph 加速**: Warmup 后去噪循环高度优化
-- **灵活参数**: 支持自定义分辨率、推理步数、CFG guidance scale、seed 等
+A model's specialness (quantization, hybrid attention, tied embeddings) is an
+**attribute of the operator/weight it lives on**, not a conditional threaded through
+higher layers. The weight loader is generic and name-driven — it reads exactly the
+tensor names and shapes the checkpoint declares; only the model module knows how to
+assemble them.
 
 ---
 
-### 项目结构
+## Architecture
+
+Three cooperating processes share a single TOML config and communicate over
+ZMQ (IPC) with MessagePack framing:
 
 ```
-RustInfer/
-├── crates/
-│   ├── infer-protocol/    # 通信协议定义（MessagePack）
-│   ├── infer-scheduler/      # 独立推理引擎进程
-│   ├── infer-worker/        # 核心推理库
-│   │   ├── base/          # 内存管理、分配器
-│   │   ├── tensor/        # 张量系统（零拷贝）
-│   │   ├── op/            # 算子库（CPU/CUDA）
-│   │   ├── model/         # 模型实现（Llama3 / Qwen3）
-│   │   └── cuda/          # CUDA集成
-│   ├── infer-server/      # HTTP API服务器（Axum）
-│   │   ├── api/           # OpenAI兼容端点
-│   │   ├── chat/          # 聊天模板
-│   │   └── zmq_client.rs  # ZMQ客户端
-│   └── infer-frontend/    # Web UI（Dioxus WASM）
-├── DEVELOPERS.md          # 开发者文档（架构深度解析）
-├── README.md              # 本文件
-└── Cargo.toml             # 工作区配置
+  infer-server              infer-scheduler                infer-worker
+  ┌──────────────┐          ┌──────────────────┐          ┌────────────────────┐
+  │ Axum /v1/... │          │ RadixTree prefix   │          │ Runtime<T,D,Model>  │
+  │ chat template│  ZMQ     │   cache            │  ZMQ     │  ├ persistent ABC   │
+  │ tokenizer    │ ───────► │ continuous batching│ ───────► │  ├ CUDA-graph capture│
+  │ SSE stream   │ ◄─────── │ chunked prefill    │ ◄─────── │  └ KV / scratch pool │
+  └──────────────┘          └──────────────────┘          │        │            │
+         │                          │                       │        ▼            │
+         └──────────┬───────────────┘                       │  DecoderModel       │
+                    ▼                                        │  (Decoder<T,D>)     │
+            infer-protocol                                   │        │            │
+  (config / server↔sched / sched↔worker msgs)                │        ▼            │
+                                                             │  Components         │
+                                                             │ (Attention/FFN/...) │
+                                                             └────────┬───────────┘
+                                                                      │ calls ops
+                                                                      ▼
+                                                   infer-core ── LlmBackend (trait port)
+                                                                      ▲        ▲
+                                                        impl          │        │  impl
+                                                  ┌───────────────────┘        └──────────┐
+                                          infer-backend-cuda            infer-backend-cpu
+                                          (.cu kernels + cuBLASLt)      (reference / tests)
 ```
+
+### Workspace
+
+| Crate                 | Role |
+|-----------------------|------|
+| `infer-core`          | Foundation: dtypes, quant scheme, value types, and the `LlmBackend` **ports**. GPU-free — the bottom of the DAG. |
+| `infer-protocol`      | Wire types: config parsing + server↔scheduler↔worker messages. |
+| `infer-server`        | Axum HTTP front end, OpenAI `/v1` API, chat template, SSE streaming. |
+| `infer-scheduler`     | RadixTree prefix cache, continuous batching, chunked prefill, batch planning. |
+| `infer-worker`        | GPU inference runtime (DDD: domain / application / infrastructure), models, components. |
+| `infer-backend-cuda`  | CUDA adapter: `.cu` kernels + cuBLASLt; statically links the kernel set + CUTLASS. |
+| `infer-backend-cpu`   | CPU adapter: pure-Rust reference backend; always linked as baseline / fallback. |
+| `infer-frontend`      | Optional front end (outside the core inference path). |
 
 ---
 
-## 🚀 快速开始
+## Features
 
-### 1. 安装依赖
+- **OpenAI-compatible API** — `/v1/chat/completions` and `/v1/completions`, with
+  SSE streaming, chat templates, and HF tokenizers.
+- **Continuous batching** with chunked prefill and RadixTree prefix caching.
+- **Paged KV cache** with profile-driven sizing and KV recycling.
+- **CUDA-graph decode** — captured graphs over a fixed set of batch sizes, with a
+  persistent ABC buffer that eliminates per-step allocation in the hot loop.
+- **Quantization** — dense BF16 and AWQ int4 (W4A16) MLP.
+- **Models** — Llama-3.2, Qwen3, Qwen3 (AWQ). Qwen3.5 hybrid attention
+  (Gated DeltaNet + full attention) is in progress; see [Status](#status).
+
+---
+
+## Quick start
+
+### Prerequisites
+
+- Rustup (the repository pins Rust 1.91.1), a CUDA-capable GPU, and the CUDA
+  toolkit.
+- The cuDNN frontend headers on the include path:
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install clang libclang-dev pkg-config libssl-dev
-
-# OpenBLAS（CPU后端）
-sudo apt-get install libopenblas-dev
-
-# 或使用Conda
-conda install conda-forge::libclang anaconda::openssl
+export CUDNN_FRONTEND_INCLUDE_DIR=/path/to/site-packages/include
 ```
 
-### 2. 克隆仓库
+### Build
 
 ```bash
-git clone https://github.com/Vinci-hit/RustInfer.git
-cd RustInfer
-```
-
-### 3. 构建项目
-
-```bash
-# CPU版本
 cargo build --release
-
-# CUDA版本（需要CUDA toolkit）
-cargo build --release --features cuda
 ```
 
-**注意**: `build.rs` 会自动检测GPU计算能力（通过 nvidia-smi），也可通过 `CUDA_ARCH=sm_90` 环境变量手动指定。
+### Run (one-shot e2e smoke test)
 
-### 4. 运行测试
-
-先下载测试模型（Llama-3.2-1B-Instruct）：
+Launches scheduler + worker + server for a config, sends one chat completion,
+prints the reply, and tears everything down:
 
 ```bash
-uv run hf download unsloth/Llama-3.2-1B-Instruct --local-dir ./Llama-3.2-1B-Instruct
+scripts/e2e_smoke.sh run_qwen3.toml 8100 "Say hello in one short sentence."
 ```
+
+The checked-in configs are portable templates. Set their `model` field to the
+local Hugging Face model directory before launching; they bind to
+`127.0.0.1` and use `cuda:0` by default.
+
+### Run (manual, three processes)
+
+Each binary takes the same `--config`:
 
 ```bash
-# 基础测试
-cd RustInfer/crates/infer-worker
-cargo test
-
-# CUDA性能测试
-cargo test test_llama3_cuda_performance --release -- --nocapture --ignored
-
-# CPU推理测试
-cargo test test_llama3_cpu_loading_and_generation --release -- --nocapture --ignored
+./target/release/rustinfer-scheduler --config run_qwen3.toml &
+./target/release/rustinfer-worker    --config run_qwen3.toml &
+./target/release/rustinfer-server     --config run_qwen3.toml &
 ```
 
----
+Then hit the OpenAI-compatible endpoint:
 
-## 📦 支持的模型
+```bash
+curl http://127.0.0.1:8100/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3-4B-Instruct-2507",
+       "messages":[{"role":"user","content":"What is the capital of France?"}]}'
+```
 
-### Llama 3 系列
+Ready-to-use configs: `run_qwen3.toml`, `run_qwen3_awq.toml` (AWQ int4),
+`run_llama1b.toml`.
 
-| 模型 | 参数量 | BF16 | INT4 AWQ | 推荐设备 |
-|------|--------|------|----------|----------|
-| Llama-3.2-1B-Instruct | 1B | ✅ | ✅ 912 tok/s (H20) | CPU / GPU |
+### Python benchmark tools
 
-### Qwen3 系列
+The Python project keeps benchmark dependencies optional so building RustInfer
+does not install another inference engine. Install only the group a script uses:
 
-| 模型 | 参数量 | BF16 | INT4 AWQ | 推荐设备 |
-|------|--------|------|----------|----------|
-| Qwen3-4B-Instruct | 4B | ✅ | ✅ 105 tok/s (A10, MLP only) | GPU (8GB+) |
+```bash
+uv sync --extra bench
+uv sync --extra vllm-reference
+uv sync --extra sglang-reference
+```
 
-**下载地址**:
-- [Llama-3.2-1B-Instruct](https://huggingface.co/unsloth/Llama-3.2-1B-Instruct)
-
-**支持格式**:
-- ✅ SafeTensors (.safetensors)
-- ✅ 分片模型 (model.safetensors.index.json)
-- ✅ HuggingFace Tokenizer (tokenizer.json)
-- ✅ compressed-tensors K-packed INT4 量化
-
----
-
-## 📊 性能基准与版本演进
-
-### 性能提升历程
-
-> **测试环境**: H20, Qwen3-4B, Batch Size=1
-
-| 版本 | Decode 吞吐量 | 关键优化 |
-|------|--------------|----------|
-| v0.8.0 | **1000 tok/s (Llama-1B-AWQ, H20)** / **303 tok/s (Qwen3-4B-AWQ, H20)** | INT4 AWQ 量化推理 |
-| v0.7.0 | **281 tok/s (Qwen3-4B)** / **829 tok/s (Llama-3.2-1B-Instruct)** | 手写GEMV + kernel融合 + 算子调优 |
-| v0.6.0 | 259 tok/s | 融合GEMM + 零拷贝decode + 融合add+rmsnorm |
-| v0.5.0 | 192 tok/s | Qwen3-4B支持 |
-| v0.2.0 | 436 tok/s (Llama-3.2-1B-Instruct) | BF16 + Flash Attention |
-| v0.1.0 | 220 tok/s (Llama-3.2-1B-Instruct) | 基线 |
-
-### 版本历史
-
-#### v0.8.0 (当前) - INT4 AWQ 量化推理
-**发布日期**: 2026-04
-
-**核心改进**:
-- INT4 AWQ 量化推理：compressed-tensors K-packed 格式，手写 GEMV/GEMM CUDA kernel
-- Llama-3.2-1B-AWQ: **912 tok/s** decode（H20），**326 tok/s**（A10），相比 BF16 提速 1.74x
-- Qwen3-4B-AWQ (MLP only): **105 tok/s** decode（A10），H20 待调优
-- QuantParams 抽象 enum，可扩展 GPTQ / FP8
-- RoPE scaling (Llama3.1/3.2) 移入 CUDA kernel，支持 BF16/FP16
-- 量化 GEMV/GEMM 合并到 matmul 统一模块
-
-#### v0.7.0 - 手写GEMV + Kernel级优化，281 tok/s
-**发布日期**: 2026-04
-
-**核心改进**:
-- 手写 BF16 GEMV kernel：decode 阶段 M=1 时替代 cublasLt，bf16x8 向量化 + shared memory 缓存输入 + warp shuffle 归约 + `__ldg` read-only cache，小矩阵（QKV/wo/w2）比 cublasLt 快 25-44%
-- 智能 dispatch：N≤16384 走自定义 GEMV，N>16384（lm_head）走 cublasLt
-- 融合 scatter_kv kernel：K/V cache 写入合并为单次 kernel launch，每层省 1 次 launch
-- RMSNorm / fused_add_rmsnorm 线程数 128→256，提升 SM 占用率
-- SwiGLU 精度修复：bf16 原生 h2exp 替换为 FP32 expf，消除精度损失
-- SwiGLU 去除运行时 cudaGetDevice/cudaDeviceGetAttribute 开销
-- Benchmark 关闭流式打印，消除 tokenizer 全量 decode 的 O(n²) 开销
-- 新增 SGLang benchmark 脚本
-
-**性能**:
-- Qwen3-4B (H20): **281 tok/s**
-- Llama-3.2-1B-Instruct (H20): **829 tok/s**
-
-#### v0.6.0 - Decode性能优化，超越vLLM
-**发布日期**: 2026-04
-
-**核心改进**:
-- 融合 QKV GEMM：加载时拼接 Wq/Wk/Wv，每层 3 次矩阵乘 → 1 次
-- 融合 Gate-Up GEMM：拼接 W1/W3，每层 2 次矩阵乘 → 1 次
-- Decode 零拷贝列切片：seq_len=1 时直接 slice 出 q/k/v view，无需 split_cols kernel
-- 多 block 并行 argmax：替代单 block 扫描（202µs → 5µs）
-- 融合 residual-add + RMSNorm：合并残差加法与归一化，跨层融合（每层 2 处）
-- cudaGraphLaunch 开销：752µs → 90µs（减少 180 个 graph node）
-
-#### v0.5.0 - Qwen3 模型支持
-**发布日期**: 2026-04
-
-- Qwen3-4B 推理支持（per-head QK-norm, head_dim=128, CUTE Flash Attention）
-- 参数化 RoPE theta，UTF-8 增量安全流式输出
-
-#### v0.4.0 - 架构升级
-**发布日期**: 2026-01
-
-- 进程分离架构（infer-scheduler + infer-server + infer-protocol）
-- ZeroMQ IPC 通信（MessagePack，10-50µs 延迟）
-
-#### v0.3.0 - CUDA Graph优化
-**发布日期**: 2026-01
-
-- CUDA Graph 捕获与回放，decode kernel 启动开销大幅降低
-
-#### v0.2.0 - 性能突破
-**发布日期**: 2026-01
-
-- BF16 混合精度：decode 220 → 436 tok/s (2x)，显存 4GB → 2GB
-- Flash Attention GQA，cuBLASLt 自动调优
-
-#### v0.1.0 - 初始版本
-**发布日期**: 2025-10
-
-- Llama3 完整推理，CPU/CUDA 双后端，KV缓存，OpenAI兼容API
-- 基线: decode 220 tok/s, prefill 355 tok/s (F32)
+The vLLM and SGLang groups are reference-benchmark environments; they are not
+runtime dependencies of RustInfer.
 
 ---
 
-## ⚡ 性能优化技术
+## Configuration
 
-### 已实现的优化
+Config is a single TOML shared by all three processes. Key fields:
 
-1. **CUDA内存池化** (`/crates/infer-worker/src/base/allocator.rs`)
-   - 分配延迟: 800µs → 1µs
-   - 线程安全并发访问（DashMap）
-   - 双层池策略（小块first-fit，大块best-fit）
-
-2. **零拷贝模型加载** (`/crates/infer-worker/src/model/loader.rs`)
-   - mmap直接映射文件
-   - 无需反序列化（100x加速）
-   - 安全的生命周期扩展
-
-3. **Workspace预分配** (`/crates/infer-worker/src/model/llama3.rs`)
-   - 预分配最大尺寸缓冲区
-   - 推理循环零内存分配
-   - HashMap管理命名缓冲区
-
-4. **CUDA Graph捕获** (`/crates/infer-worker/src/cuda/config.rs`)
-   - 首次迭代捕获计算图
-   - 后续迭代回放图（10-100x加速）
-   - 消除kernel启动开销
-
-5. **Flash Attention** (`/crates/infer-worker/src/op/kernels/cuda/flash_attn_gqa/`)
-   - 分块注意力计算
-   - 在线softmax
-   - 减少3x内存访问
-
-6. **算子融合**
-   - SwiGLU: gate + silu + multiply单kernel
-   - 融合 QKV / Gate-Up GEMM：加载时拼接权重，减少kernel数量
-   - 融合 residual-add + RMSNorm：单kernel完成残差加法+归一化
-   - 融合 scatter_kv：K/V cache 单次kernel写入
-   - Decode 零拷贝列切片：seq_len=1时无需split kernel
-
-7. **手写 BF16 GEMV kernel**
-   - Decode M=1 场景替代 cublasLt（避免 splitK + Tensor Core 填充开销）
-   - bf16x8 向量化加载 + FP32 累加 + warp shuffle 归约
-   - `__ldg` read-only cache 路径减少 L1 thrashing
-   - 智能 dispatch：小矩阵走 GEMV，大矩阵走 cublasLt
-
-8. **INT4 AWQ 量化推理**
-   - compressed-tensors K-packed INT4 格式
-   - 手写 INT4 GEMV kernel：int4 向量化 weight + input 读取，warp reduction
-   - QuantParams enum 抽象，可扩展 GPTQ / FP8
-   - RoPE scaling (Llama3.1/3.2) 直接在 CUDA kernel 内完成
-
-9. **BF16混合精度**
-   - GPU使用BFloat16
-   - 2x内存带宽
-   - FP32累加器保证精度
+| Field                   | Meaning |
+|-------------------------|---------|
+| `model`                 | Path to the HF model directory (config + safetensors + tokenizer). |
+| `model_name`            | Name reported by the `/v1` API. |
+| `device`                | e.g. `cuda:0`. |
+| `port`                  | HTTP port for the server. |
+| `max_batch_tokens`      | Token budget per forward batch. |
+| `max_batch_seqs`        | Max concurrent sequences in a batch. |
+| `max_model_len`         | Max context length. |
+| `chunked_prefill_size`  | Chunked-prefill chunk size (`0` = disabled). |
+| `enable_prefix_caching` | Toggle the RadixTree prefix cache. |
+| `mem_fraction_static`   | Fraction of GPU memory reserved for weights + static buffers. |
+| `num_blocks`            | KV-cache blocks (`0` = auto-size from a memory profile). |
+| `capture_sizes`         | Batch sizes to capture CUDA graphs for, e.g. `[1,2,4,8,16,24,32]`. |
+| `ignore_eos`            | Ignore EOS (useful for fixed-length benchmarking). |
 
 ---
 
-## ⚠️ 当前限制
+## Status
 
-### 已实现 ✅
-- [x] Llama3 / Qwen3 模型推理
-- [x] 进程分离架构（ZeroMQ IPC）
-- [x] KV缓存管理
-- [x] CPU和CUDA双后端
-- [x] F32和BF16数据类型
-- [x] OpenAI兼容API
-- [x] 流式响应（SSE）
-- [x] CUDA Graph优化
-- [x] Flash Attention GQA
-- [x] 融合 QKV / Gate-Up GEMM
-- [x] 融合 residual-add + RMSNorm
-- [x] Decode 零拷贝列切片
-- [x] 手写 BF16 GEMV kernel（decode M=1）
-- [x] 融合 scatter_kv（K/V cache 单次写入）
-- [x] INT4 AWQ 量化推理（compressed-tensors K-packed）
-- [x] **文生图（Z-Image / Z-Image-Turbo）**: 1024×1024 图片 1.1 秒生成
+RustInfer serves Llama-3.2, Qwen3, and Qwen3-AWQ end to end today.
 
-### 待实现 🔄
-
-**高优先级**:
-- 
-- 采样器：仅argmax，缺少temperature/top-p/top-k
-- 连续批处理：目前串行处理请求
-- PagedAttention：固定KV缓存大小
-
-**中优先级**:
-- 多模型架构支持
-- 部分算子CUDA优化不足
-- 错误处理改进（减少unwrap）
-
-**低优先级**:
-- 自定义停止序列
-- Token概率输出
-- Function calling
-- API认证机制
-
-详细技术实现指南请参阅 **[DEVELOPERS.md](DEVELOPERS.md)**
+Qwen3.5 (hybrid Gated DeltaNet + full attention) is being brought up in phases:
+config parsing and the generic name-driven weight loader are done; the
+heterogeneous forward path (recurrent state cache + full-attention output gate +
+partial RoPE) is in progress.
 
 ---
 
-## 🛠️ 开发指南
+## License
 
-### 添加新算子
-
-请参阅 [DEVELOPERS.md](DEVELOPERS.md) 中的详细模板和示例。
-
-关键步骤:
-1. 实现 `Op` trait
-2. CPU和CUDA双后端
-3. 编写CUDA kernel
-4. 添加单元测试
-
-### 添加新模型
-
-参考 `/crates/infer-worker/src/model/llama3.rs` 实现:
-1. 定义配置结构
-2. 实现层组合
-3. Workspace管理
-4. 两阶段推理（prefill/decode）
-
-完整指南: [DEVELOPERS.md](DEVELOPERS.md)
-
----
-
-## 📄 许可证
-
-Apache License 2.0 - 详见 [LICENSE](LICENSE)
-
----
-
-## 🙏 致谢
-
-**灵感来源**:
-- [KuiperLLama](https://github.com/zjhellofss/KuiperLLama) - 课程项目
-- [vLLM](https://github.com/vllm-project/vllm) - 推理引擎设计
-
-**技术栈**:
-- 🦀 Rust - 内存安全与零成本抽象
-- ⚡ CUDA - GPU加速
-- 🌐 Axum + Dioxus - 现代Web
-- 📦 ZeroMQ - 高性能IPC
-- 🎯 HuggingFace - 模型生态
-
----
-
-<div align="center">
-
-**如果这个项目对你有帮助，请给我们一个 ⭐ Star！**
-
-Made with ❤️ and 🦀 Rust
-
-[GitHub](https://github.com/Vinci-hit/RustInfer) • [Issues](https://github.com/Vinci-hit/RustInfer/issues)
-
-</div>
+Licensed under the [Apache License 2.0](LICENSE). Vendored components retain
+their own terms; see [Third-party notices](THIRD_PARTY_NOTICES.md).

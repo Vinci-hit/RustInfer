@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (GPU-independent)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libzmq3-dev
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Audit Rust dependencies
+        run: cargo install cargo-audit --locked && cargo audit --deny warnings
+      - name: Lint GPU-independent crates
+        run: |
+          cargo clippy -p infer-core -p infer-backend-cpu -p infer-protocol \
+            -p infer-scheduler -p infer-server --all-targets -- -D warnings
+          cargo clippy -p infer-worker --no-default-features --lib -- -D warnings
+      - name: Test GPU-independent crates
+        run: |
+          cargo test -p infer-core -p infer-backend-cpu -p infer-protocol \
+            -p infer-scheduler -p infer-server
+          cargo test -p infer-worker --no-default-features --lib
+
+  frontend:
+    name: Browser frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: crates/infer-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/infer-frontend/package-lock.json
+      - name: Install Rust WASM target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Check Rust frontend
+        run: cargo check --target wasm32-unknown-unknown
+      - name: Rebuild CSS from the lockfile
+        run: npm ci && npm run build:css
+      - name: Audit frontend dependencies
+        run: npm audit --package-lock-only --audit-level=high
+      - name: Verify generated CSS is current
+        run: git diff --exit-code -- assets/output.css
+
+  repository:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell syntax
+        run: bash -n scripts/*.sh scripts/lib/*.sh bench/*.sh crates/infer-frontend/dev.sh
+      - name: Compile Python tools
+        run: PYTHONPYCACHEPREFIX=/tmp/rustinfer-pyc python3 -m compileall -q bench scripts
+      - name: Reject generated Python bytecode
+        run: test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -print -quit)"

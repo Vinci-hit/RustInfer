@@ -1,0 +1,14 @@
+[package]
+name = "infer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "RustInfer foundation crate: dtypes, the extended DTypeId/quant scheme, value types (Shape/Strides/Dims/DataType), and the OpError family. Builds with rustc only — the GPU-free bottom of the dependency DAG."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+half = { version = "2.7.1", features = ["std", "num-traits"] }
+thiserror = "2.0.17"

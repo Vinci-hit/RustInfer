@@ -1,0 +1,29 @@
+# RustInfer launch config for end-to-end smoke test of Qwen3-4B-Instruct-2507.
+# Paths are resolved from the directory where the binaries are launched.
+model = "./models/Qwen3-4B-Instruct-2507"
+model_name = "Qwen3-4B-Instruct-2507"
+cluster_id = "rustinfer-qwen3test"
+device = "cuda:0"
+
+host = "127.0.0.1"
+port = 8100
+request_timeout_secs = 600
+
+max_batch_tokens = 8192
+max_batch_seqs = 32
+max_model_len = 4096
+batch_wait_ms = 0
+
+paged_block_size = 1
+chunked_prefill_size = 0
+enable_prefix_caching = false
+mem_fraction_static = 0.9
+num_blocks = 0
+
+ignore_eos = false
+
+mode = "llm"
+worker_id = "worker-0"
+log_level = "info"
+
+capture_sizes = [1, 2, 4, 8, 16, 24, 32]

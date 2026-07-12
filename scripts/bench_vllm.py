@@ -15,7 +15,7 @@ from vllm import LLM, SamplingParams
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct")
+    parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="请用中文详细介绍二叉树的中序遍历算法，并给出Python实现代码。")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--dtype", type=str, default="bfloat16")

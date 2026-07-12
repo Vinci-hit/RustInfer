@@ -1,0 +1,304 @@
+//! Scheduler → Worker **data plane** commands.
+//!
+//! Only batch execution payloads cross this channel. Lifecycle and KV control
+//! semantics (cancel, drain, unload, KV grant) live on the control plane —
+//! see [`crate::scheduler_to_worker_control::SchedulerControlMessage`].
+
+use serde::{Deserialize, Serialize};
+
+use crate::common::{ProtocolError, ProtocolResult};
+
+/// Scheduler → Worker batch command. The data plane carries nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BatchCommand {
+    Prefill(PrefillBatchCmd),
+    DiffusionBatch(DiffusionBatchCmd),
+}
+
+/// Scheduler -> Worker 的 prefill segment batch (paged-only).
+///
+/// 每个 segment 明确描述：写入哪个 paged block table、写入 prompt/KV 的哪个绝对区间，
+/// 以及该 segment 完成后是否进入 decode。`q_start_loc` 只表示该 segment 在
+/// `input_ids` 扁平数组中的起点，不承载 KV 语义。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefillBatchCmd {
+    pub input_ids: Vec<i32>,
+    pub q_start_loc: Vec<u32>,
+    pub segments: Vec<PrefillSegmentMeta>,
+}
+
+/// Per-segment KV placement.
+///
+/// `prefix_hint` carries the prefix-cache hit produced by the scheduler's
+/// `RadixTree::lookup_prefix`: if `Some(indices)`, the first
+/// `indices.len()` tokens of the segment have already been written to the
+/// worker's global KV pool at those indices, and the worker should skip
+/// them on the data-plane side and prepend them to the segment's final
+/// block table. The remaining tokens get their slots from the worker-side
+/// `GlobalKvAllocator::alloc_segment` at step time. `None` ⇒ no hit; the
+/// worker writes the full segment fresh.
+///
+/// `block_table` is currently shipped empty by the scheduler — the worker
+/// owns physical block allocation. The field is kept on the wire so that
+/// future deployments wishing to override worker-side allocation (e.g. a
+/// remote KV store) can do so without breaking compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefillSegmentMeta {
+    pub sequence_id: u64,
+    /// Paged KV block table. Currently always empty; reserved for
+    /// future use.
+    pub block_table: Vec<u32>,
+    /// Tokens per paged block (worker kernel still consumes this).
+    pub block_size: u32,
+    pub prompt_len: u32,
+    pub segment_start: u32,
+    pub segment_end: u32,
+    pub max_tokens: usize,
+    pub sampling_params: SamplingParams,
+    pub completion: PrefillSegmentCompletion,
+    /// Ignore EOS tokens and decode all the way to `max_tokens`.
+    /// Used for fixed-length benchmarking. Defaults to `false`.
+    #[serde(default)]
+    pub ignore_eos: bool,
+    /// Prefix-cache hit. Length is the number of leading prompt tokens
+    /// already cached on the worker; values are global KV indices into
+    /// the worker's `GlobalKvAllocator` pool. `None` ⇒ no hit.
+    /// Defaults to `None` for compatibility with older builds.
+    #[serde(default)]
+    pub prefix_hint: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrefillSegmentCompletion {
+    /// 只写 KV，不进入 decode。
+    ContinuePrefill,
+    /// prompt 已完整写入 KV；本次 prefill 输出 token 是第一个生成 token。
+    FinishPrefillAndStartDecode,
+}
+
+impl PrefillBatchCmd {
+    pub fn num_requests(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn segment_token_range(&self, i: usize) -> std::ops::Range<usize> {
+        let start = self.q_start_loc[i] as usize;
+        let end = if i + 1 < self.q_start_loc.len() {
+            self.q_start_loc[i + 1] as usize
+        } else {
+            self.input_ids.len()
+        };
+        start..end
+    }
+
+    pub fn validate(&self, max_batch_tokens: usize, max_seqs: usize) -> ProtocolResult<()> {
+        let n = self.num_requests();
+        if n == 0 {
+            return Err(ProtocolError::invalid_argument(
+                "PrefillBatchCmd must contain at least one segment",
+            ));
+        }
+        if n > max_seqs {
+            return Err(ProtocolError::invalid_argument(format!(
+                "PrefillBatchCmd has {} segments, exceeds max_seqs {}",
+                n, max_seqs
+            )));
+        }
+        if self.input_ids.len() > max_batch_tokens {
+            return Err(ProtocolError::invalid_argument(format!(
+                "PrefillBatchCmd has {} tokens, exceeds max_batch_tokens {}",
+                self.input_ids.len(),
+                max_batch_tokens
+            )));
+        }
+        if self.q_start_loc.len() != n {
+            return Err(ProtocolError::invalid_argument(format!(
+                "q_start_loc length {} != segments length {}",
+                self.q_start_loc.len(),
+                n
+            )));
+        }
+
+        for i in 0..n {
+            let range = self.segment_token_range(i);
+            if range.start > range.end || range.end > self.input_ids.len() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has invalid token range [{}..{}) for input len {}",
+                    i,
+                    range.start,
+                    range.end,
+                    self.input_ids.len()
+                )));
+            }
+            if range.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has empty token range",
+                    i
+                )));
+            }
+
+            let segment = &self.segments[i];
+            if segment.sequence_id == 0 {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has sequence_id=0",
+                    i
+                )));
+            }
+            if segment.block_size == 0 {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has block_size=0",
+                    i
+                )));
+            }
+            if segment.segment_end <= segment.segment_start {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has invalid segment range [{}..{})",
+                    i, segment.segment_start, segment.segment_end
+                )));
+            }
+            if segment.segment_end > segment.prompt_len {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} end {} exceeds prompt_len {}",
+                    i, segment.segment_end, segment.prompt_len
+                )));
+            }
+            let segment_len = (segment.segment_end - segment.segment_start) as usize;
+            if segment_len != range.len() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} token len {} != segment len {}",
+                    i,
+                    range.len(),
+                    segment_len
+                )));
+            }
+            match segment.completion {
+                PrefillSegmentCompletion::ContinuePrefill => {
+                    if segment.segment_end >= segment.prompt_len {
+                        return Err(ProtocolError::invalid_argument(format!(
+                            "ContinuePrefill segment {} must end before prompt_len",
+                            i
+                        )));
+                    }
+                }
+                PrefillSegmentCompletion::FinishPrefillAndStartDecode => {
+                    if segment.segment_end != segment.prompt_len {
+                        return Err(ProtocolError::invalid_argument(format!(
+                            "FinishPrefill segment {} must end at prompt_len",
+                            i
+                        )));
+                    }
+                }
+            }
+            if segment.max_tokens == 0 {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} has max_tokens=0",
+                    i
+                )));
+            }
+            segment.sampling_params.validate().map_err(|e| {
+                ProtocolError::invalid_argument(format!(
+                    "PrefillBatchCmd segment {} invalid sampling params: {}",
+                    i, e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffusionBatchCmd {
+    pub requests: Vec<DiffusionBatchItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffusionBatchItem {
+    pub request_id: String,
+    /// Original prompt text for logging / response metadata.
+    pub prompt: String,
+    /// Server-tokenized prompt ids consumed by the Worker text encoder.
+    pub prompt_input_ids: Vec<i32>,
+    pub negative_prompt: Option<String>,
+    pub negative_prompt_input_ids: Option<Vec<i32>>,
+    pub height: u32,
+    pub width: u32,
+    pub num_inference_steps: usize,
+    pub sigmas: Option<Vec<f32>>,
+    pub guidance_scale: f32,
+    pub seed: Option<u64>,
+    pub output_format: String,
+}
+
+impl DiffusionBatchCmd {
+    pub fn validate(&self, max_batch_size: usize) -> ProtocolResult<()> {
+        if self.requests.is_empty() {
+            return Err(ProtocolError::invalid_argument(
+                "DiffusionBatchCmd must contain at least one request",
+            ));
+        }
+        if self.requests.len() > max_batch_size {
+            return Err(ProtocolError::invalid_argument(format!(
+                "DiffusionBatchCmd has {} requests, exceeds max_batch_size {}",
+                self.requests.len(),
+                max_batch_size
+            )));
+        }
+        for (i, req) in self.requests.iter().enumerate() {
+            if req.request_id.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} has empty request_id",
+                    i
+                )));
+            }
+            if req.prompt.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} has empty prompt",
+                    i
+                )));
+            }
+            if req.prompt_input_ids.is_empty() {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} has empty server-tokenized prompt_input_ids",
+                    i
+                )));
+            }
+            if req.height == 0 || req.width == 0 || req.height % 16 != 0 || req.width % 16 != 0 {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} invalid shape {}x{}; dimensions must be positive multiples of 16",
+                    i, req.height, req.width
+                )));
+            }
+            if req.num_inference_steps == 0
+                && req.sigmas.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+            {
+                return Err(ProtocolError::invalid_argument(format!(
+                    "DiffusionBatchCmd request {} needs num_inference_steps > 0 or non-empty sigmas",
+                    i
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+}
+
+impl SamplingParams {
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err("temperature must be finite and >= 0");
+        }
+        if !self.top_p.is_finite() || !(0.0..=1.0).contains(&self.top_p) {
+            return Err("top_p must be finite and in [0, 1]");
+        }
+        if self.top_k < -1 {
+            return Err("top_k must be -1 or non-negative");
+        }
+        Ok(())
+    }
+}

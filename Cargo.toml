@@ -4,9 +4,21 @@ members = [
     "crates/infer-server",
     "crates/infer-frontend",
     "crates/infer-protocol",
-    "crates/infer-scheduler"
+    "crates/infer-scheduler",
+    "crates/infer-core",
+    "crates/infer-backend-cpu",
+    "crates/infer-backend-cuda"
 ]
 resolver = "3"
+
+[workspace.package]
+version = "1.0.1"
+edition = "2024"
+rust-version = "1.91.1"
+license = "Apache-2.0"
+repository = "https://github.com/Vinci-hit/RustInfer"
+homepage = "https://github.com/Vinci-hit/RustInfer"
+publish = false
 
 [profile]
 
