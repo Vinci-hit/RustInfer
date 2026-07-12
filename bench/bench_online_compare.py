@@ -10,6 +10,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List
 
 import aiohttp
@@ -31,7 +32,7 @@ RUSTINFER_MODEL = "llama3.2-1b"
 URL = "http://127.0.0.1:8000"
 DURATION = 60
 CONCURRENCY = 32
-PROMPTS_FILE = "/root/RustInfer/bench/bench_prompts.json"
+PROMPTS_FILE = Path(__file__).with_name("bench_prompts.json")
 
 
 async def send_rustinfer(session, url, prompt):
@@ -167,9 +168,10 @@ async def main():
     ap.add_argument("--url", default=URL, help="Target URL (default: " + URL + ")")
     ap.add_argument("--duration", type=int, default=DURATION)
     ap.add_argument("--concurrency", type=int, default=CONCURRENCY)
+    ap.add_argument("--prompts", type=Path, default=PROMPTS_FILE)
     args = ap.parse_args()
 
-    with open(PROMPTS_FILE) as f:
+    with args.prompts.open(encoding="utf-8") as f:
         pool = json.load(f)
     prompts = [p for p in pool if isinstance(p, str) and 40 <= len(p) <= 500]
     print(f"Loaded {len(prompts)} prompts")

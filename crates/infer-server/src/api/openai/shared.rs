@@ -10,12 +10,15 @@ use tokenizers::Tokenizer;
 
 use crate::error::AppError;
 
+use super::types::StopSequence;
+
 /// Validate the sampling params common to both endpoints (`temperature`,
 /// `top_p`, `max_tokens`). Endpoint-specific checks (non-empty messages /
 /// prompt) stay in each handler's own `validate_request`.
 pub fn validate_sampling(
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<i32>,
     max_tokens: Option<usize>,
 ) -> Result<(), AppError> {
     if let Some(temp) = temperature
@@ -33,6 +36,64 @@ pub fn validate_sampling(
     {
         return Err(AppError::bad_request("max_tokens must be greater than 0"));
     }
+    if let Some(top_k) = top_k
+        && top_k < -1
+    {
+        return Err(AppError::bad_request("top_k must be -1 or non-negative"));
+    }
+    Ok(())
+}
+
+/// Tokenize user-provided stop strings once at the HTTP boundary. The
+/// scheduler intentionally does not load a tokenizer; it receives token-id
+/// sequences and performs suffix matching on generated ids.
+pub fn tokenize_stop_sequences(
+    tokenizer: &Tokenizer,
+    stop: Option<&StopSequence>,
+) -> Result<Vec<Vec<i32>>, AppError> {
+    let Some(stop) = stop else {
+        return Ok(Vec::new());
+    };
+
+    let mut encoded = Vec::new();
+    match stop {
+        StopSequence::Single(value) => encode_stop(tokenizer, value, &mut encoded)?,
+        StopSequence::Multiple(values) => {
+            for value in values {
+                encode_stop(tokenizer, value, &mut encoded)?;
+            }
+        }
+    }
+    Ok(encoded)
+}
+
+fn encode_stop(
+    tokenizer: &Tokenizer,
+    value: &str,
+    encoded: &mut Vec<Vec<i32>>,
+) -> Result<(), AppError> {
+    if value.is_empty() {
+        return Err(AppError::bad_request("stop sequences must not be empty"));
+    }
+    let encoding = tokenizer
+        .encode(value, false)
+        .map_err(|e| AppError::internal(anyhow::anyhow!("stop tokenization failed: {}", e)))?;
+    if encoding.get_ids().is_empty() {
+        return Err(AppError::bad_request(
+            "stop sequence did not produce any tokens",
+        ));
+    }
+    let token_ids = encoding
+        .get_ids()
+        .iter()
+        .copied()
+        .map(|id| {
+            i32::try_from(id).map_err(|_| {
+                AppError::internal(anyhow::anyhow!("token id {} exceeds protocol range", id))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    encoded.push(token_ids);
     Ok(())
 }
 
@@ -115,4 +176,48 @@ pub fn decode_completion(
         .unwrap_or_else(|| "stop".to_string());
 
     Ok((generated_text, completion_tokens, finish_reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    fn tokenizer() -> Tokenizer {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".to_string(), 0),
+                    ("END".to_string(), 1),
+                    ("NOW".to_string(), 2),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+        tokenizer
+    }
+
+    #[test]
+    fn tokenizes_stop_strings_without_template_special_tokens() {
+        let stop = StopSequence::Single("END NOW".to_string());
+        assert_eq!(
+            tokenize_stop_sequences(&tokenizer(), Some(&stop)).unwrap(),
+            vec![vec![1, 2]]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_stop_and_invalid_top_k() {
+        let stop = StopSequence::Single(String::new());
+        assert!(tokenize_stop_sequences(&tokenizer(), Some(&stop)).is_err());
+        assert!(validate_sampling(None, None, Some(-2), None).is_err());
+        assert!(validate_sampling(None, None, Some(-1), None).is_ok());
+        assert!(validate_sampling(None, None, Some(0), None).is_ok());
+    }
 }

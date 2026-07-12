@@ -12,14 +12,16 @@ __global__ void embedding_kernel_bf16x8(
     int vocab_size
 ) {
     const int token_idx = blockIdx.x;
-    
+    float4* out_row = output + token_idx * dim_units;
     int32_t token = input_token_ids[token_idx];
     if (token < 0 || token >= vocab_size) {
-        // 如果 token ID 非法，可以不做处理或设为 0
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int i = threadIdx.x; i < dim_units; i += blockDim.x) {
+            out_row[i] = zero;
+        }
         return;
     }
 
-    float4* out_row = output + token_idx * dim_units;
     const float4* wei_row = weight + token * dim_units;
 
     for (int i = threadIdx.x; i < dim_units; i += blockDim.x) {
@@ -59,12 +61,16 @@ __global__ void embedding_kernel(
     int dim, int vocab_size
 ) {
     const int token_idx = blockIdx.x;
+    float4* output_ptr_start = output + token_idx * dim;
     int32_t token = input_token_ids[token_idx];
-    if (token >= vocab_size) {
+    if (token < 0 || token >= vocab_size) {
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+            output_ptr_start[i] = zero;
+        }
         return;
     }
 
-    float4* output_ptr_start = output + token_idx * dim;
     const float4* weight_ptr_start = weight + token * dim;
 
     for (int32_t i = threadIdx.x; i < dim; i += blockDim.x) {
@@ -108,14 +114,16 @@ __global__ void embedding_kernel_fp16x8(
     int vocab_size
 ) {
     const int token_idx = blockIdx.x;
-    
+    float4* out_row = output + token_idx * dim_units;
     int32_t token = input_token_ids[token_idx];
     if (token < 0 || token >= vocab_size) {
-        // 如果 token ID 非法，可以不做处理或设为 0
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int i = threadIdx.x; i < dim_units; i += blockDim.x) {
+            out_row[i] = zero;
+        }
         return;
     }
 
-    float4* out_row = output + token_idx * dim_units;
     const float4* wei_row = weight + token * dim_units;
 
     for (int i = threadIdx.x; i < dim_units; i += blockDim.x) {
@@ -147,4 +155,3 @@ extern "C" void embedding_kernel_cu_fp16x8(
         out_f4, input_token_ids, weight_f4, dim_units, vocab_size
     );
 }
-

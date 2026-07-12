@@ -218,10 +218,10 @@ fn bridge_loop(
     }
 }
 
+type WorkerFrame = (Vec<u8>, ControlEnvelope<WorkerControlMessage>);
+
 /// Receive one full ROUTER frame. Returns `Ok(None)` on EAGAIN.
-fn recv_frame(
-    socket: &zmq::Socket,
-) -> Result<Option<(Vec<u8>, ControlEnvelope<WorkerControlMessage>)>, ControlError> {
+fn recv_frame(socket: &zmq::Socket) -> Result<Option<WorkerFrame>, ControlError> {
     let identity = match socket.recv_bytes(zmq::DONTWAIT) {
         Ok(b) => b,
         Err(zmq::Error::EAGAIN) => return Ok(None),

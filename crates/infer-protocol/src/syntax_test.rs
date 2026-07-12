@@ -14,7 +14,7 @@ fn test_protocol_types() {
         top_k: 50,
         stream: false,
         priority: 0,
-        stop_sequences: vec!["<|eot_id|>".to_string()],
+        stop_sequences: vec![vec![128_009]],
         ignore_eos: false,
         diffusion: None,
     };

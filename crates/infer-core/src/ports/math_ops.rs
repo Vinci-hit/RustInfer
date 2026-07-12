@@ -1,3 +1,6 @@
+// Math ports preserve explicit matrix/tensor dimensions for backend kernels.
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use crate::ports::{OpError, OpResult};
@@ -260,12 +263,7 @@ macro_rules! impl_math_ops_via_core_ops {
             ) -> $crate::ports::OpResult<()> {
                 let _guard = infer_core::exec::ExecScope::enter(scope);
                 <Self as $crate::ports::CoreOps>::matmul_quant(
-                    input,
-                    weight,
-                    output,
-                    scales,
-                    zeros,
-                    scheme,
+                    input, weight, output, scales, zeros, scheme,
                 )
             }
 

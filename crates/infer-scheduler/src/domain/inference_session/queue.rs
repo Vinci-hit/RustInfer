@@ -212,7 +212,7 @@ mod tests {
         let a = make_seq("a", 0);
         let b = make_seq("b", 0);
         let c = make_seq("c", 0);
-        let b_id = b.meta.id.clone();
+        let b_id = b.meta.id;
         q.push(a);
         q.push(b);
         q.push(c);
@@ -243,7 +243,7 @@ mod tests {
     fn front_and_total_tokens_skip_tombstones() {
         let mut q = WaitingQueue::new();
         let a = make_seq("a", 0);
-        let a_id = a.meta.id.clone();
+        let a_id = a.meta.id;
         q.push(a);
         q.push(make_seq("b", 0));
 
@@ -262,7 +262,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..64 {
             let s = make_seq(&format!("s{i}"), 0);
-            ids.push((i, s.meta.id.clone()));
+            ids.push((i, s.meta.id));
             q.push(s);
         }
         // Remove every even index.
@@ -285,7 +285,7 @@ mod tests {
     fn priority_order_survives_removal() {
         let mut q = WaitingQueue::new();
         let normal = make_seq("normal", 0);
-        let normal_id = normal.meta.id.clone();
+        let normal_id = normal.meta.id;
         q.push(make_seq("low", -1));
         q.push(normal);
         q.push(make_seq("high", 1));

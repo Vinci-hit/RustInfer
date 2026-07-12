@@ -353,13 +353,13 @@ mod tests {
         let d = 4usize;
         let n = 1usize;
         let target = 3usize;
-        let src_host: Vec<bf16> = vec![1.0, 2.0, 3.0, 4.0]
-            .iter()
-            .map(|&v| bf16::from_f32(v))
+        let src_host: Vec<bf16> = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .map(bf16::from_f32)
             .collect();
-        let pad_host: Vec<bf16> = vec![-1.0, -2.0, -3.0, -4.0]
-            .iter()
-            .map(|&v| bf16::from_f32(v))
+        let pad_host: Vec<bf16> = [-1.0, -2.0, -3.0, -4.0]
+            .into_iter()
+            .map(bf16::from_f32)
             .collect();
         let src: Tensor<bf16, Cuda> = Tensor::from_host_slice(&src_host, [n, d], &cuda).unwrap();
         let pad: Tensor<bf16, Cuda> = Tensor::from_host_slice(&pad_host, [d], &cuda).unwrap();

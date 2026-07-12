@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # `paste` is an unmaintained proc-macro dependency of current
+    # `tokenizers` 0.23.1. RUSTSEC-2024-0436 reports maintenance status only;
+    # it has no vulnerability or patched version. Revisit when tokenizers
+    # removes the dependency.
+    "RUSTSEC-2024-0436",
+]

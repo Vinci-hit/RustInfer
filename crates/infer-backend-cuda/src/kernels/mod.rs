@@ -1,6 +1,11 @@
 //! CUDA kernel wrappers — paged KV path only.
 //! Each kernel co-located with its `.cu`/`.h` source in its own dir.
 
+// Kernel launch wrappers intentionally mirror their fixed C ABI signatures.
+// Bundling those arguments into Rust-only structs would obscure the FFI
+// boundary without making the launches safer.
+#![allow(clippy::too_many_arguments)]
+
 // Zero-cost dtype dispatch: per-kernel binding traits (`CudaFloat` supertrait)
 // plus the single `narrow_float!` narrowing point used at the `MathOps for
 // Cuda` boundary. See `dtype_kernel.rs`.
@@ -40,4 +45,3 @@ pub mod sdpa;
 // --- no-cu (pure Rust / cudnn) modules, kept flat ---
 pub mod concat_seq;
 pub mod conv2d;
-pub mod fused_qk_norm_rope; // note: not yet wired into a caller

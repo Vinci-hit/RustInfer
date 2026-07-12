@@ -207,7 +207,7 @@ The CLI `num_blocks_override` path short-circuits all of this (no probe, no dumm
 
 ```rust
 let initial_n = order.len();
-let new_indices = if self.prealloc.len() >= initial_n { ... } else { 
+let new_indices = if self.prealloc.len() >= initial_n { ... } else {
     match alloc_with_relief(...) { ... }
 };
 self.rows.retain_active(active); // rows may evict

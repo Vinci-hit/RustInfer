@@ -29,12 +29,117 @@ pub struct Tensor<T: Dtype, D: MemoryPort> {
 }
 
 impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
+    /// Validate that a logical tensor view can only address elements inside
+    /// `storage`. This stays on the construction path so pointer accessors can
+    /// rely on the invariant without repeating the arithmetic.
+    fn assert_valid_view(
+        storage: &Storage<D>,
+        shape: &Shape,
+        strides: &Strides,
+        offset_elems: usize,
+        numel: usize,
+        is_contiguous: bool,
+    ) {
+        assert_eq!(
+            shape.ndim(),
+            strides.as_slice().len(),
+            "Tensor view rank mismatch: shape rank {} != stride rank {}",
+            shape.ndim(),
+            strides.as_slice().len(),
+        );
+
+        let elem_size = std::mem::size_of::<T>();
+        assert!(
+            elem_size > 0,
+            "Tensor views do not support zero-sized dtypes"
+        );
+        assert_eq!(
+            elem_size,
+            T::SIZE_BYTES,
+            "Tensor dtype byte-size mismatch: Rust layout is {} bytes but Dtype::SIZE_BYTES is {}",
+            elem_size,
+            T::SIZE_BYTES,
+        );
+        assert_eq!(
+            storage.ptr().addr() % std::mem::align_of::<T>(),
+            0,
+            "Tensor storage pointer is not aligned for its dtype",
+        );
+
+        let storage_elems = storage.size() / elem_size;
+        assert!(
+            offset_elems <= storage_elems,
+            "Tensor view offset {} exceeds storage capacity {} elements",
+            offset_elems,
+            storage_elems,
+        );
+
+        // Empty views touch no element. The offset check above still ensures
+        // that data_ptr() is at most one element past the backing allocation.
+        if numel == 0 {
+            return;
+        }
+
+        let max_relative_index = shape
+            .as_slice()
+            .iter()
+            .zip(strides.as_slice())
+            .try_fold(0usize, |span, (&extent, &stride)| {
+                let dim_span = (extent - 1).checked_mul(stride)?;
+                span.checked_add(dim_span)
+            })
+            .expect("Tensor view address calculation overflow");
+        let required_elems = offset_elems
+            .checked_add(max_relative_index)
+            .and_then(|last| last.checked_add(1))
+            .expect("Tensor view address calculation overflow");
+        assert!(
+            required_elems <= storage_elems,
+            "Tensor view requires {} elements but storage capacity is {}",
+            required_elems,
+            storage_elems,
+        );
+
+        // Some operations intentionally treat a non-contiguous tensor as a
+        // linear prefix (for example host uploads). Keep that independent
+        // access pattern in bounds as well as the logical strided span above.
+        let linear_end = offset_elems
+            .checked_add(numel)
+            .expect("Tensor linear view address calculation overflow");
+        assert!(
+            linear_end <= storage_elems,
+            "Tensor linear view requires {} elements but storage capacity is {}",
+            linear_end,
+            storage_elems,
+        );
+
+        if is_contiguous {
+            // Singleton dimensions do not constrain their stride because they
+            // never advance the address. Every non-singleton dimension must
+            // still describe a packed row-major layout.
+            let mut expected_stride = 1usize;
+            for (&extent, &stride) in shape.as_slice().iter().zip(strides.as_slice()).rev() {
+                if extent > 1 {
+                    assert_eq!(
+                        stride, expected_stride,
+                        "Tensor view marked contiguous has invalid stride {} (expected {})",
+                        stride, expected_stride,
+                    );
+                }
+                expected_stride = expected_stride
+                    .checked_mul(extent)
+                    .expect("Tensor contiguous stride calculation overflow");
+            }
+        }
+    }
     // ─── Construction ──────────────────────────────────────────────
 
-    /// Build a tensor from already-validated raw parts that alias `storage`.
-    /// `numel` is derived from `shape`. This is the public replacement for the
-    /// struct-literal construction op layers used before `Tensor` moved into
-    /// `infer-core` (e.g. dtype-bitcast / reinterpret views).
+    /// Build a tensor from checked raw parts that alias `storage`.
+    /// `numel` is derived from `shape`; invalid ranks, layouts, arithmetic, or
+    /// storage bounds panic before a tensor can expose an invalid pointer.
+    /// This is the public replacement for the struct-literal construction op
+    /// layers used before `Tensor` moved into `infer-core` (e.g. dtype-bitcast /
+    /// reinterpret views).
     pub fn from_raw_parts(
         storage: Arc<Storage<D>>,
         shape: Shape,
@@ -43,6 +148,14 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         is_contiguous: bool,
     ) -> Self {
         let numel = shape.numel();
+        Self::assert_valid_view(
+            &storage,
+            &shape,
+            &strides,
+            offset_elems,
+            numel,
+            is_contiguous,
+        );
         Tensor {
             storage,
             shape,
@@ -166,9 +279,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         Ok(out)
     }
 
-    /// Construct a view sharing the same storage with a custom shape /
-    /// strides / element offset. Caller is responsible for asserting
-    /// the view stays within the storage bounds.
+    /// Construct a view sharing the same storage with a custom shape, strides,
+    /// and absolute element offset. Invalid ranks, layouts, arithmetic, or
+    /// storage bounds panic before the view is created.
     pub fn view_raw(
         &self,
         shape: Shape,
@@ -177,24 +290,13 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         is_contiguous: bool,
     ) -> Self {
         let numel = shape.numel();
-        // Validate the view stays inside the backing allocation. Debug-only so
-        // the hot path (data_ptr / data_ptr_mut) can stay unchecked: the offset
-        // is baked in here once, not re-derived per access. `offset_elems`
-        // addresses element `T`; for a max-strided (non-contiguous) view the
-        // last touched element is at `offset + Σ (dim-1)*stride`, but for the
-        // contiguous / prefix views this constructor is used for, `offset +
-        // numel` is the tight upper bound.
-        debug_assert!(
-            offset_elems
-                .checked_add(numel)
-                .and_then(|end| end.checked_mul(std::mem::size_of::<T>()))
-                .map(|bytes| bytes <= self.storage.size())
-                .unwrap_or(false),
-            "view_raw out of bounds: offset_elems={} numel={} elem_size={} storage_bytes={}",
+        Self::assert_valid_view(
+            &self.storage,
+            &shape,
+            &strides,
             offset_elems,
             numel,
-            std::mem::size_of::<T>(),
-            self.storage.size(),
+            is_contiguous,
         );
         Self {
             storage: Arc::clone(&self.storage),
@@ -239,7 +341,7 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
                 shape.len(),
             )));
         }
-        if start + length > shape[dim] {
+        if start > shape[dim] || length > shape[dim] - start {
             return Err(OpError::Shape(format!(
                 "narrow: dim {} out of bounds (start={}, length={}, extent={})",
                 dim, start, length, shape[dim],
@@ -249,15 +351,24 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
         let mut new_shape_vec: Vec<usize> = shape.to_vec();
         new_shape_vec[dim] = length;
         let new_shape = Shape::from_slice(&new_shape_vec);
-        let extra_offset = start * strides[dim] as usize;
-        let new_offset = self.offset_elems + extra_offset;
+        let extra_offset = start.checked_mul(strides[dim]).ok_or_else(|| {
+            OpError::Shape(format!(
+                "narrow: offset overflow (start={}, stride={})",
+                start, strides[dim],
+            ))
+        })?;
+        let new_offset = self.offset_elems.checked_add(extra_offset).ok_or_else(|| {
+            OpError::Shape(format!(
+                "narrow: offset overflow (base={}, extra={})",
+                self.offset_elems, extra_offset,
+            ))
+        })?;
         // Contiguity after narrow: a slice along `dim == 0` stays a single
         // contiguous block (only the base offset shifts), so it remains
         // contiguous for any `start`/`length`. Narrowing an inner dim to less
         // than its full extent introduces gaps between rows and is
         // non-contiguous (unless it is the identity slice).
-        let is_contig = self.is_contiguous
-            && (dim == 0 || (start == 0 && length == shape[dim]));
+        let is_contig = self.is_contiguous && (dim == 0 || (start == 0 && length == shape[dim]));
         Ok(self.view_raw(new_shape, self.strides, new_offset, is_contig))
     }
 
@@ -302,9 +413,8 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
     /// from host code; pass to kernels only.
     #[inline]
     pub fn data_ptr(&self) -> *const T {
-        // SAFETY: storage.ptr() is valid for storage.size() bytes; offset
-        // stays within bounds by construction (caller of view_raw is
-        // responsible).
+        // SAFETY: every construction path validates that offset is within (or,
+        // for an empty view, one past) the backing allocation.
         unsafe { (self.storage.ptr() as *const T).add(self.offset_elems) }
     }
 
@@ -588,11 +698,191 @@ impl<T: Dtype, D: HostDevice + MemoryPort> Tensor<T, D> {
         unsafe { std::slice::from_raw_parts(self.data_ptr(), self.numel()) }
     }
 
-    /// Mutable typed slice. `&mut self` encodes exclusive access at the call
-    /// site even though the underlying Arc is shared.
+    /// Mutable typed slice. Panics unless this tensor is the sole owner of its
+    /// storage; `&mut self` alone cannot make storage exclusive when cloned
+    /// tensors or views retain the same `Arc`.
     pub fn as_slice_mut(&mut self) -> &mut [T] {
         assert!(self.is_contiguous(), "as_slice_mut requires contiguous");
-        // SAFETY: host-accessible storage; pointer valid for `numel` elements.
-        unsafe { std::slice::from_raw_parts_mut(self.data_ptr_mut(), self.numel()) }
+        let storage = Arc::get_mut(&mut self.storage)
+            .expect("as_slice_mut requires uniquely owned tensor storage");
+        // SAFETY: Arc::get_mut proves no other strong or weak Arc can access
+        // the storage, the &mut self borrow prevents cloning until the returned
+        // slice expires, and construction validated this contiguous range.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                (storage.ptr() as *mut T).add(self.offset_elems),
+                self.numel,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Layout;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr::NonNull;
+
+    use super::*;
+    use crate::device::Device;
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestDevice;
+
+    impl Device for TestDevice {
+        type ExecCtx = ();
+
+        fn exec_ctx(&self) -> &Self::ExecCtx {
+            &()
+        }
+
+        fn name(&self) -> &'static str {
+            "tensor-test"
+        }
+    }
+
+    impl HostDevice for TestDevice {}
+
+    fn test_layout(size: usize) -> Layout {
+        Layout::from_size_align(size.max(1), 16).expect("valid test layout")
+    }
+
+    impl MemoryPort for TestDevice {
+        fn alloc_bytes(&self, size: usize) -> OpResult<NonNull<u8>> {
+            let ptr = unsafe { std::alloc::alloc_zeroed(test_layout(size)) };
+            NonNull::new(ptr).ok_or_else(|| OpError::Kernel("test allocation failed".into()))
+        }
+
+        unsafe fn free_bytes(&self, ptr: NonNull<u8>, size: usize) {
+            unsafe { std::alloc::dealloc(ptr.as_ptr(), test_layout(size)) };
+        }
+
+        unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
+            unsafe { std::ptr::copy_nonoverlapping(src, dst.as_ptr(), size) };
+            Ok(())
+        }
+
+        unsafe fn upload_async(
+            &self,
+            dst: NonNull<u8>,
+            src: *const u8,
+            size: usize,
+        ) -> OpResult<()> {
+            unsafe { self.upload(dst, src, size) }
+        }
+
+        unsafe fn download(&self, dst: *mut u8, src: NonNull<u8>, size: usize) -> OpResult<()> {
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, size) };
+            Ok(())
+        }
+
+        fn synchronize(&self) -> OpResult<()> {
+            Ok(())
+        }
+
+        unsafe fn copy_device_to_device(
+            &self,
+            dst: NonNull<u8>,
+            src: NonNull<u8>,
+            size: usize,
+        ) -> OpResult<()> {
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr(), size) };
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn raw_parts_reject_out_of_bounds_and_rank_mismatch() {
+        let storage = Storage::alloc(&TestDevice, 4 * std::mem::size_of::<f32>()).unwrap();
+
+        let out_of_bounds = catch_unwind(AssertUnwindSafe(|| {
+            Tensor::<f32, TestDevice>::from_raw_parts(
+                Arc::clone(&storage),
+                Shape::from([5]),
+                Strides::from_slice(&[1]),
+                0,
+                true,
+            )
+        }));
+        assert!(out_of_bounds.is_err());
+
+        let rank_mismatch = catch_unwind(AssertUnwindSafe(|| {
+            Tensor::<f32, TestDevice>::from_raw_parts(
+                Arc::clone(&storage),
+                Shape::from([2, 2]),
+                Strides::from_slice(&[1]),
+                0,
+                false,
+            )
+        }));
+        assert!(rank_mismatch.is_err());
+    }
+
+    #[test]
+    fn raw_views_reject_invalid_contiguous_strided_and_overflowing_ranges() {
+        let tensor = Tensor::<f32, TestDevice>::zeros([4], &TestDevice).unwrap();
+
+        let invalid_contiguous = catch_unwind(AssertUnwindSafe(|| {
+            tensor.view_raw(Shape::from([2, 2]), Strides::from_slice(&[1, 1]), 0, true)
+        }));
+        assert!(invalid_contiguous.is_err());
+
+        let strided_out_of_bounds = catch_unwind(AssertUnwindSafe(|| {
+            tensor.view_raw(Shape::from([2, 2]), Strides::from_slice(&[3, 1]), 0, false)
+        }));
+        assert!(strided_out_of_bounds.is_err());
+
+        // The logical stride span is in bounds, but linear operations would
+        // overrun from this offset. Construction must protect both patterns.
+        let linear_out_of_bounds = catch_unwind(AssertUnwindSafe(|| {
+            tensor.view_raw(Shape::from([2, 2]), Strides::from_slice(&[0, 0]), 1, false)
+        }));
+        assert!(linear_out_of_bounds.is_err());
+
+        let overflowing = catch_unwind(AssertUnwindSafe(|| {
+            tensor.view_raw(
+                Shape::from([2]),
+                Strides::from_slice(&[usize::MAX]),
+                1,
+                false,
+            )
+        }));
+        assert!(overflowing.is_err());
+    }
+
+    #[test]
+    fn valid_contiguous_and_narrow_views_preserve_data() {
+        let data: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let tensor = Tensor::from_host_slice(&data, [3, 4], &TestDevice).unwrap();
+
+        let raw = tensor.view_raw(Shape::from([2, 4]), Strides::from_slice(&[4, 1]), 4, true);
+        assert_eq!(raw.as_slice(), &data[4..]);
+
+        let narrow = tensor.narrow(0, 1, 2).unwrap();
+        assert!(narrow.is_contiguous());
+        assert_eq!(narrow.offset_elems(), 4);
+        assert_eq!(narrow.as_slice(), &data[4..]);
+
+        let inner = tensor.narrow(1, 1, 2).unwrap();
+        assert!(!inner.is_contiguous());
+        assert_eq!(inner.shape().as_slice(), &[3, 2]);
+        assert_eq!(inner.offset_elems(), 1);
+
+        assert!(tensor.narrow(0, usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn mutable_slice_requires_unique_storage() {
+        let tensor = Tensor::from_host_slice(&[1_i32, 2, 3], [3], &TestDevice).unwrap();
+        let mut alias = tensor.clone();
+
+        let aliased_mutation = catch_unwind(AssertUnwindSafe(|| {
+            alias.as_slice_mut()[0] = 9;
+        }));
+        assert!(aliased_mutation.is_err());
+
+        drop(tensor);
+        alias.as_slice_mut()[0] = 9;
+        assert_eq!(alias.as_slice(), &[9, 2, 3]);
     }
 }

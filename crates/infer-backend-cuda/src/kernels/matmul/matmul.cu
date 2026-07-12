@@ -46,7 +46,7 @@ __global__ void sgemv_kernel_cu_fp32x4(
                    input_float4.z * weight_float4.z + input_float4.w * weight_float4.w;
     sdata[tid] += part_sum;
   }
-    
+
   for(int i = pack_off + tid;i<M;i += blockDim.x){
     sdata[tid] += input[i] * weight[start_row * M + i];
   }
@@ -61,7 +61,7 @@ __global__ void sgemv_kernel_cu_fp32x4(
     output[start_row] = part_sum;
   }
   __syncthreads();
-    
+
 }
 
 // input是一列M，weight是KxM，也就是其实是weight @ input
@@ -78,9 +78,9 @@ void sgemv_cu_fp32x4(
 }
 
 __global__ void sgemm_naive_f32_transpose_b_kernel(
-    const float *a, 
-    const float *b, 
-    float *c, 
+    const float *a,
+    const float *b,
+    float *c,
     int M, // A 的行数
     int N, // B 的行数 (也是 B^T 的列数)
     int K  // A 的列数 (也是 B 的列数)
@@ -91,7 +91,7 @@ __global__ void sgemm_naive_f32_transpose_b_kernel(
     // 边界检查，C 的形状是 [M, N]
     if (m_out < M && n_out < N) {
         float psum = 0.0;
-        
+
         // 循环点积的长度是 K
         for (int k = 0; k < K; k++) {
             // 从 A 中获取第 m_out 行, 第 k 列的元素
@@ -104,7 +104,7 @@ __global__ void sgemm_naive_f32_transpose_b_kernel(
 
             psum += a_val * b_val;
         }
-        
+
         // 将结果写入 C 的 [m_out, n_out] 位置
         c[m_out * N + n_out] = psum;
     }
@@ -121,7 +121,7 @@ extern "C" void sgemm_naive_f32_cu(
 ) {
     // 定义 block 的大小
     dim3 threads_per_block(16, 16);
-    
+
     // 计算 grid 的大小
     dim3 blocks_per_grid(
         (N + threads_per_block.x - 1) / threads_per_block.x,

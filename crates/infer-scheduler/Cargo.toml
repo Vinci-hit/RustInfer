@@ -1,7 +1,13 @@
 [package]
 name = "infer-scheduler"
-version = "0.2.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "RustInfer continuous-batching and paged-KV scheduler."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "rustinfer-scheduler"
@@ -9,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Protocol
-infer-protocol = { path = "../infer-protocol" }
+infer-protocol = { version = "1.0.1", path = "../infer-protocol" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -40,7 +46,7 @@ slotmap = "1"
 async-trait = "0.1"
 
 # Metrics (optional)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] }

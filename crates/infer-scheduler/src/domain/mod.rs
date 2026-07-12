@@ -8,7 +8,7 @@
 //! - [`ids`]                  — NewType dictionary
 //! - [`inference_session`]    — typestate `InferenceSession<S>` + repository
 //! - [`kv_budget`]            — `KvBudget` capacity gate over
-//!                              worker-reported global KV slots
+//!   worker-reported global KV slots
 //! - [`policy`]               — scheduling policy domain service
 
 pub mod ids;

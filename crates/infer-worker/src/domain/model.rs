@@ -8,7 +8,7 @@ use super::ports::OpResult;
 use super::ports::backend::LlmBackend;
 use super::tensor::Tensor;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ModelDims {
     pub dim: usize,
     pub q_dim: usize,
@@ -24,27 +24,6 @@ pub struct ModelDims {
     pub experts_per_tok: usize,
     pub moe_intermediate_size: usize,
     pub num_shared_experts: usize,
-}
-
-impl Default for ModelDims {
-    fn default() -> Self {
-        Self {
-            dim: 0,
-            q_dim: 0,
-            kv_dim: 0,
-            qkv_dim: 0,
-            intermediate_size: 0,
-            vocab_size: 0,
-            head_num: 0,
-            head_dim: 0,
-            kv_head_num: 0,
-            num_layers: 0,
-            num_experts: 0,
-            experts_per_tok: 0,
-            moe_intermediate_size: 0,
-            num_shared_experts: 0,
-        }
-    }
 }
 
 impl ModelDims {

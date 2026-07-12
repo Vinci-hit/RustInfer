@@ -35,13 +35,11 @@ fn json_event<T: serde::Serialize>(request_id: &str, payload: &T) -> Event {
             // response was truncated.
             let body = serde_json::json!({
                 "error": {
-                    "message": format!("failed to serialize streaming payload: {error}"),
+                    "message": "failed to serialize streaming response",
                     "type": "internal_error",
                 }
             });
-            Event::default()
-                .event("error")
-                .data(body.to_string())
+            Event::default().event("error").data(body.to_string())
         }
     }
 }
@@ -98,7 +96,10 @@ impl ChunkShape for ChatShape {
             model: self.model.clone(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta { role: None, content: Some(delta) },
+                delta: Delta {
+                    role: None,
+                    content: Some(delta),
+                },
                 finish_reason: None,
             }],
             usage: None,
@@ -151,7 +152,11 @@ impl ChunkShape for CompletionShape {
             object: "text_completion".to_string(),
             created: self.created,
             model: self.model.clone(),
-            choices: vec![CompletionChunkChoice { index: 0, text, finish_reason: None }],
+            choices: vec![CompletionChunkChoice {
+                index: 0,
+                text,
+                finish_reason: None,
+            }],
             usage: None,
         }
     }
@@ -289,11 +294,19 @@ where
                     // `json_event`: an explicit `error` SSE event carrying the
                     // engine message, a finish chunk with `finish_reason:
                     // "error"`, then the `[DONE]` terminator.
-                    let message = chunk
+                    let engine_message = chunk
                         .finish_reason
                         .unwrap_or_else(|| "inference engine error".to_string());
+                    tracing::error!(
+                        request_id = %request_id,
+                        error = %engine_message,
+                        "inference engine returned a streaming error"
+                    );
                     let body = serde_json::json!({
-                        "error": { "message": message, "type": "engine_error" }
+                        "error": {
+                            "message": "inference engine error",
+                            "type": "engine_error"
+                        }
                     });
                     yield Ok(Event::default().event("error").data(body.to_string()));
                     yield Ok(json_event(&request_id, &shape.finish("error".to_string())));

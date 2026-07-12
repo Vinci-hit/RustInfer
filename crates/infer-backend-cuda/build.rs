@@ -471,12 +471,12 @@ fn detect_cuda_arch() -> String {
         ])
         .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let sm = cap.replace('.', "");
-            return format!("sm_{}", sm);
-        }
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let cap = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let sm = cap.replace('.', "");
+        return format!("sm_{}", sm);
     }
     println!("cargo:warning=Could not detect GPU arch, falling back to sm_80");
     "sm_80".to_string()
@@ -508,15 +508,13 @@ fn find_cuda_path() -> PathBuf {
 
     for candidate in candidates {
         // 放宽验证条件，支持 Conda 奇特的文件布局
-        if candidate.join("include").exists()
-            || candidate.join("targets/x86_64-linux/include").exists()
-        {
-            if candidate.join("lib64").exists()
-                || candidate.join("lib").exists()
-                || candidate.join("targets/x86_64-linux/lib").exists()
-            {
-                return candidate;
-            }
+        let has_headers = candidate.join("include").exists()
+            || candidate.join("targets/x86_64-linux/include").exists();
+        let has_libraries = candidate.join("lib64").exists()
+            || candidate.join("lib").exists()
+            || candidate.join("targets/x86_64-linux/lib").exists();
+        if has_headers && has_libraries {
+            return candidate;
         }
     }
 

@@ -58,7 +58,7 @@ pub async fn run_event_loop(
         match event {
             SchedulerEvent::NewRequest { client_id, request } => {
                 let _t = std::time::Instant::now();
-                engine.handle_new_request(client_id, request);
+                engine.handle_new_request(client_id, request).await?;
                 engine.maybe_schedule().await?;
                 if std::env::var_os("RUSTINFER_SCHED_TRACE").is_some() {
                     tracing::info!(

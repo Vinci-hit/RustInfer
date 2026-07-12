@@ -6,7 +6,7 @@
 use crate::domain::dtype::Dtype;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpBackend, OpResult};
-use crate::models::decoder::{build_dense_decoder, Decoder};
+use crate::models::decoder::{Decoder, build_dense_decoder};
 use crate::models::loader::{LoadConfig, WeightLoader};
 
 pub type Llama3Model<T, D> = Decoder<T, D>;

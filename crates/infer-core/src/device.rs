@@ -86,13 +86,21 @@ pub trait MemoryPort: Device {
     ) -> OpResult<()>;
 }
 
-/// Layout-aware allocator port used by diffusion VAE buffer pools.
+/// Layout-aware raw-storage allocator port.
 pub trait Allocator: Debug + Send + Sync {
     /// Allocate raw bytes.
-    /// # Safety: caller must dealloc with same allocator + layout.
+    ///
+    /// # Safety
+    ///
+    /// The caller must deallocate the returned pointer with this allocator and
+    /// the identical layout, and must not access it outside that layout.
     unsafe fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
     /// Deallocate.
-    /// # Safety: ptr must come from this allocator with matching layout.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by this allocator for the identical
+    /// `layout`, must still be live, and must not be used after this call.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
 }
 

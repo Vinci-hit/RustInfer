@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // Stable wire shape; boxing would complicate every ingress.
 pub enum ServerCommand {
     Infer(InferenceRequest),
     Cancel(CancelRequest),
@@ -56,9 +57,10 @@ pub struct InferenceRequest {
     /// 优先级。
     #[serde(default)]
     pub priority: i32,
-    /// Stop sequences。
+    /// Server-tokenized stop sequences. Tokenization belongs at the HTTP
+    /// boundary so the scheduler can suffix-match without loading a tokenizer.
     #[serde(default)]
-    pub stop_sequences: Vec<String>,
+    pub stop_sequences: Vec<Vec<i32>>,
     /// 忽略 EOS token，强制生成到 max_tokens（用于定长基准测试）。
     #[serde(default)]
     pub ignore_eos: bool,

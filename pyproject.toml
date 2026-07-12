@@ -1,8 +1,17 @@
 [project]
 name = "rustinfer-python-tools"
-version = "0.1.0"
+version = "1.0.1"
 requires-python = ">=3.12"
 dependencies = []
+
+[project.optional-dependencies]
+bench = [
+    "aiohttp>=3.10,<4",
+    "matplotlib>=3.9,<4",
+    "numpy>=2,<3",
+]
+vllm-reference = ["vllm>=0.10"]
+sglang-reference = ["sglang>=0.4"]
 
 [tool.uv]
 package = false

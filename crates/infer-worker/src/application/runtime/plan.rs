@@ -316,8 +316,10 @@ where
         // iterate to capacity and therefore must be zero-padded.)
         let mbps = self.max_blocks_per_seq;
         let upload_len = plan.batch * mbps;
+        let host_index = self.block_tables_host_next;
+        self.block_tables_host_next = (host_index + 1) % self.block_tables_host.len();
         {
-            let block_tables_host = &mut self.block_tables_host;
+            let block_tables_host = &mut self.block_tables_host[host_index];
             for (i, seq) in req.seqs.iter().enumerate() {
                 let row = i * mbps;
                 for (j, &block) in seq.block_table.iter().enumerate() {
@@ -331,7 +333,7 @@ where
             upload_i32_prefix(
                 device,
                 &self.kv_index.block_tables,
-                &self.block_tables_host[..upload_len],
+                &self.block_tables_host[host_index][..upload_len],
             )?;
             // The per-sequence control buffers are sized to `cap_batch` but the
             // attention/scatter kernels iterate over `seq_positions.shape()[0]`

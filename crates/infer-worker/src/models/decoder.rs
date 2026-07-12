@@ -29,7 +29,7 @@ use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 use crate::models::layers::{Linear as LayerLinear, RMSNorm as LayerRmsNorm};
-use crate::models::loader::{compute_rope_cache, LoadConfig, WeightLoader};
+use crate::models::loader::{LoadConfig, WeightLoader, compute_rope_cache};
 
 const STAGES: [StageKind; 3] = [StageKind::Embed, StageKind::DecoderBlock, StageKind::LmHead];
 

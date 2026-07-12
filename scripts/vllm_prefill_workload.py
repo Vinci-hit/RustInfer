@@ -3,10 +3,9 @@ import os
 
 from vllm import LLM, SamplingParams
 
-MODEL_PATH = os.environ.get(
-    "MODEL_PATH",
-    "/apdcephfs_qy2/share_303432435/vinciiliu/models/checkpoint-800-1",
-)
+MODEL_PATH = os.environ.get("MODEL_PATH")
+if not MODEL_PATH:
+    raise SystemExit("Set MODEL_PATH to a local model path or model ID")
 
 llm = LLM(
     model=MODEL_PATH,

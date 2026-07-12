@@ -1,11 +1,57 @@
-use crate::api::client::ApiClient;
-use crate::api::types::{ChatMessage, ChatRequest};
+use crate::api::client::{ApiClient, ChatSseParser, ChatStreamEvent};
+use crate::api::types::{ChatMessage, ChatRequest, Usage};
 use crate::state::conversation::{Conversation, Message, MessageMetrics};
 use dioxus::prelude::*;
+use futures_util::StreamExt;
+
+fn handle_stream_events(
+    events: Vec<Result<ChatStreamEvent, String>>,
+    conversations: &mut Signal<Vec<Conversation>>,
+    active_id: &str,
+    assistant_id: &str,
+    full_content: &mut String,
+    final_usage: &mut Option<Usage>,
+) -> Result<bool, String> {
+    for event in events {
+        match event? {
+            ChatStreamEvent::Done => return Ok(true),
+            ChatStreamEvent::Error(message) => return Err(message),
+            ChatStreamEvent::Chunk(chunk) => {
+                if let Some(content) = chunk
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.delta.content.as_deref())
+                {
+                    full_content.push_str(content);
+                    let mut convs = conversations.write();
+                    if let Some(message) = convs
+                        .iter_mut()
+                        .find(|conversation| conversation.id == active_id)
+                        .and_then(|conversation| {
+                            conversation
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.id == assistant_id)
+                        })
+                    {
+                        message.content.clone_from(full_content);
+                    }
+                }
+                if let Some(usage) = chunk.usage {
+                    *final_usage = Some(usage);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
 
 #[component]
 pub fn ChatArea(conversations: Signal<Vec<Conversation>>, active_id: Signal<String>) -> Element {
     let mut is_generating = use_signal(|| false);
+    let mut live_status = use_signal(|| "Connected".to_string());
+    let mut stream_error = use_signal(|| None::<String>);
 
     // 获取当前活跃对话
     let active_conv = conversations
@@ -30,6 +76,8 @@ pub fn ChatArea(conversations: Signal<Vec<Conversation>>, active_id: Signal<Stri
         }
 
         let model = model.clone();
+        stream_error.set(None);
+        live_status.set("Generating response".to_string());
 
         // 添加用户消息
         let user_msg = Message::user(text.clone());
@@ -88,32 +136,55 @@ pub fn ChatArea(conversations: Signal<Vec<Conversation>>, active_id: Signal<Stri
 
             match client.chat_completion_stream(request).await {
                 Ok(response) => {
-                    // 读取 SSE 流
-                    let text = response.text().await.unwrap_or_default();
+                    // Consume the browser response body as bytes so each SSE
+                    // event updates the conversation as soon as it arrives.
+                    let mut body = response.bytes_stream();
+                    let mut parser = ChatSseParser::default();
                     let mut full_content = String::new();
-                    let mut final_usage = None;
+                    let mut final_usage = None::<Usage>;
+                    let mut failure = None;
+                    let mut reached_done = false;
 
-                    for line in text.lines() {
-                        if let Some(chunk) = ApiClient::parse_sse_line(line) {
-                            if let Some(choice) = chunk.choices.first() {
-                                if let Some(content) = &choice.delta.content {
-                                    full_content.push_str(content);
-                                    // 更新 streaming 消息
-                                    let mut convs = conversations.write();
-                                    if let Some(conv) =
-                                        convs.iter_mut().find(|c| c.id == active_id_val)
-                                    {
-                                        if let Some(msg) =
-                                            conv.messages.iter_mut().find(|m| m.id == assistant_id)
-                                        {
-                                            msg.content = full_content.clone();
-                                        }
-                                    }
+                    while let Some(next) = body.next().await {
+                        let bytes = match next {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                failure = Some(format!("response stream failed: {error}"));
+                                break;
+                            }
+                        };
+
+                        match handle_stream_events(
+                            parser.push(&bytes),
+                            &mut conversations,
+                            &active_id_val,
+                            &assistant_id,
+                            &mut full_content,
+                            &mut final_usage,
+                        ) {
+                            Ok(done) => {
+                                if done {
+                                    reached_done = true;
+                                    break;
                                 }
                             }
-                            if chunk.usage.is_some() {
-                                final_usage = chunk.usage;
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
                             }
+                        }
+                    }
+
+                    if failure.is_none() && !reached_done {
+                        if let Err(error) = handle_stream_events(
+                            parser.finish(),
+                            &mut conversations,
+                            &active_id_val,
+                            &assistant_id,
+                            &mut full_content,
+                            &mut final_usage,
+                        ) {
+                            failure = Some(error);
                         }
                     }
 
@@ -135,19 +206,35 @@ pub fn ChatArea(conversations: Signal<Vec<Conversation>>, active_id: Signal<Stri
                             msg.is_streaming = false;
                             msg.metrics = metrics;
                             if msg.content.is_empty() {
-                                msg.content = full_content;
+                                msg.content = if failure.is_some() {
+                                    "The response could not be completed.".to_string()
+                                } else {
+                                    full_content
+                                };
                             }
                         }
                     }
+
+                    drop(convs);
+                    if let Some(error) = failure {
+                        live_status.set("Response failed".to_string());
+                        stream_error.set(Some(error));
+                    } else {
+                        live_status.set("Response complete".to_string());
+                    }
                 }
                 Err(e) => {
+                    let error = e.to_string();
                     let mut convs = conversations.write();
                     if let Some(conv) = convs.iter_mut().find(|c| c.id == active_id_val) {
                         if let Some(msg) = conv.messages.iter_mut().find(|m| m.id == assistant_id) {
-                            msg.content = format!("Error: {}", e);
+                            msg.content = "The response could not be completed.".to_string();
                             msg.is_streaming = false;
                         }
                     }
+                    drop(convs);
+                    live_status.set("Response failed".to_string());
+                    stream_error.set(Some(error));
                 }
             }
             is_generating.set(false);
@@ -176,8 +263,30 @@ pub fn ChatArea(conversations: Signal<Vec<Conversation>>, active_id: Signal<Stri
                 // Connection status indicator
                 div {
                     class: "flex items-center gap-2",
-                    div { class: "w-2 h-2 rounded-full bg-[var(--color-success)] animate-pulse" }
-                    span { class: "text-xs text-[var(--color-text-muted)]", "Connected" }
+                    role: "status",
+                    aria_live: "polite",
+                    aria_atomic: "true",
+                    div {
+                        aria_hidden: "true",
+                        class: if stream_error().is_some() {
+                            "w-2 h-2 rounded-full bg-[var(--color-error)]"
+                        } else if is_generating() {
+                            "w-2 h-2 rounded-full bg-[var(--color-warning)] animate-pulse"
+                        } else {
+                            "w-2 h-2 rounded-full bg-[var(--color-success)]"
+                        }
+                    }
+                    span { class: "text-xs text-[var(--color-text-muted)]", "{live_status}" }
+                }
+            }
+
+            if let Some(error) = stream_error() {
+                div {
+                    class: "px-6 py-3 border-b border-red-400/20 bg-red-500/10 text-sm text-red-200",
+                    role: "alert",
+                    aria_live: "assertive",
+                    aria_atomic: "true",
+                    "Response failed: {error}"
                 }
             }
 

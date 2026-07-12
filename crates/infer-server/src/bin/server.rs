@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -22,6 +21,16 @@ struct ServerArgs {
     /// Path to the shared TOML launch config.
     #[arg(long, default_value = "rustinfer.toml")]
     config: String,
+
+    /// Explicit browser origins allowed to call the API cross-origin.
+    /// Repeat the flag or provide a comma-separated environment value.
+    /// Omitted by default, which leaves browser access same-origin only.
+    #[arg(
+        long = "cors-allowed-origin",
+        env = "RUSTINFER_CORS_ALLOWED_ORIGINS",
+        value_delimiter = ','
+    )]
+    cors_allowed_origins: Vec<String>,
 }
 
 #[tokio::main]
@@ -49,6 +58,12 @@ async fn main() -> Result<()> {
     tracing::info!("  Model: {}", config.model);
     tracing::info!("  Model type: {}", model_type);
     tracing::info!("  API Server Port: {}", config.port);
+    tracing::info!("  API Server Host: {}", config.host);
+    if args.cors_allowed_origins.is_empty() {
+        tracing::info!("  CORS: same-origin only");
+    } else {
+        tracing::info!("  CORS allowed origins: {:?}", args.cors_allowed_origins);
+    }
     tracing::info!("  Frontend Endpoint: {}", frontend_endpoint);
 
     // Load tokenizer
@@ -93,11 +108,10 @@ async fn main() -> Result<()> {
         admission,
     });
 
-    let app = build_router(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let app = build_router(state, &args.cors_allowed_origins)?;
     tracing::info!("API Server listening on http://{}:{}", host, port);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = bind_listener(&host, port).await?;
 
     // Create shutdown channel
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -130,6 +144,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn bind_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind((host, port)).await
+}
+
 /// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM. On non-unix
 /// targets only Ctrl-C is observed.
 async fn wait_for_shutdown_signal() {
@@ -152,5 +170,16 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_listener;
+
+    #[tokio::test]
+    async fn listener_honors_configured_host() {
+        let listener = bind_listener("127.0.0.1", 0).await.unwrap();
+        assert_eq!(listener.local_addr().unwrap().ip().to_string(), "127.0.0.1");
     }
 }

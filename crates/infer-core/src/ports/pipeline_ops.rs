@@ -10,7 +10,7 @@
 //! copy-in (Si) / compute / copy-out (So) stream machinery.
 //!
 //! Reference semantics are pinned by the CUDA kernel unit tests in
-//! `infer-backend-cuda::kernels::gather_merge` — a row is *finished* when
+//! the CUDA backend's gather/merge kernels — a row is *finished* when
 //! `(!ignore_eos && token ∈ eos_ids) || generated + 1 >= max_tokens`; survivors
 //! compact to the front of A in row order.
 

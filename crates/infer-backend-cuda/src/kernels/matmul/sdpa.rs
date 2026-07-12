@@ -139,7 +139,7 @@ pub fn sdpa<T: Dtype>(
     head_dim: usize,
     scale: f32,
 ) -> OpResult<()> {
-    if num_heads % num_kv_heads != 0 {
+    if !num_heads.is_multiple_of(num_kv_heads) {
         return Err(OpError::Kernel(format!(
             "sdpa: n_heads ({}) must be divisible by n_kv_heads ({})",
             num_heads, num_kv_heads,
@@ -302,7 +302,11 @@ pub fn sdpa<T: Dtype>(
             &mut scores.reinterpret::<F>(),
             scale as f64,
         )?;
-        super::softmax::softmax::<F>(stream, &scores.reinterpret::<F>(), &mut attn.reinterpret::<F>())
+        super::softmax::softmax::<F>(
+            stream,
+            &scores.reinterpret::<F>(),
+            &mut attn.reinterpret::<F>(),
+        )
     })?;
 
     // ── 6. out_hsd = attn[H,S,S] @ V[H,S,D].
@@ -386,7 +390,7 @@ pub fn sdpa_masked<T: Dtype>(
     head_dim: usize,
     scale: f32,
 ) -> OpResult<()> {
-    if num_heads % num_kv_heads != 0 {
+    if !num_heads.is_multiple_of(num_kv_heads) {
         return Err(OpError::Kernel(format!(
             "sdpa_masked: n_heads ({}) must be divisible by n_kv_heads ({})",
             num_heads, num_kv_heads,
@@ -565,7 +569,11 @@ pub fn sdpa_masked<T: Dtype>(
             &mut scores.reinterpret::<F>(),
             &mask.reinterpret::<F>(),
         )?;
-        super::softmax::softmax::<F>(stream, &scores.reinterpret::<F>(), &mut attn.reinterpret::<F>())
+        super::softmax::softmax::<F>(
+            stream,
+            &scores.reinterpret::<F>(),
+            &mut attn.reinterpret::<F>(),
+        )
     })?;
 
     // out = attn @ V (via V permute to [H, D, S] + axbt)
@@ -813,7 +821,7 @@ mod tests {
         let v_host: Vec<f32> = (0..seq * h * d).map(|i| i as f32 * 0.07 - 0.5).collect();
 
         // Build causal mask host: 0 for j<=i, -INF for j>i.
-        let neg = -3.3895313892515355e+38_f32;
+        let neg = -3.389_531_4e38_f32;
         let mut mask_host = vec![0.0f32; seq * seq];
         for i in 0..seq {
             for j in 0..seq {
@@ -886,7 +894,7 @@ mod tests {
         let q_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.011).sin()).collect();
         let k_f32: Vec<f32> = (0..seq * h * d).map(|i| (i as f32 * 0.019).cos()).collect();
         let v_f32: Vec<f32> = (0..seq * h * d).map(|i| i as f32 * 0.05 - 0.3).collect();
-        let neg = -3.3895313892515355e+38_f32;
+        let neg = -3.389_531_4e38_f32;
 
         // mask: causal AND attention_mask[j]==1 for j in 0..5
         let am = [1, 1, 1, 1, 1, 0, 0, 0];

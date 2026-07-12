@@ -5,9 +5,9 @@ suffixes. With `enable_prefix_caching = true`, the first request should populate
 the RadixTree cache and later requests should reuse the shared prefix.
 
 Usage:
-    python3 /root/RustInfer/bench/bench_prefix_cache.py --url http://127.0.0.1:8000
-    python3 /root/RustInfer/bench/bench_prefix_cache.py --endpoint chat --rounds 5
-    python3 /root/RustInfer/bench/bench_prefix_cache.py --dump-json /tmp/prefix_cache.json
+    python3 bench/bench_prefix_cache.py --url http://127.0.0.1:8000
+    python3 bench/bench_prefix_cache.py --endpoint chat --rounds 5
+    python3 bench/bench_prefix_cache.py --dump-json /tmp/prefix_cache.json
 """
 
 from __future__ import annotations

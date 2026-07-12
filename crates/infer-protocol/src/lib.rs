@@ -25,7 +25,7 @@ mod syntax_test;
 // every use site.
 pub use common::{ProtocolError, ProtocolResult};
 pub use config::{
-    resolve_model_type, supported_model_types, supported_model_types_csv, RustInferConfig,
+    RustInferConfig, resolve_model_type, supported_model_types, supported_model_types_csv,
 };
 pub use control_envelope::{ControlEnvelope, RequestId};
 pub use scheduler_to_server::{

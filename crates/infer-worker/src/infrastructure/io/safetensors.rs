@@ -159,10 +159,14 @@ impl SafetensorsReader {
                 .name_to_shard
                 .get(name)
                 .ok_or_else(|| format!("tensor '{}' not in weight_map", name))?;
-            let shard = self
-                .shards
-                .get(idx)
-                .ok_or_else(|| format!("tensor '{}' maps to shard {} but only {} shard(s) loaded", name, idx, self.shards.len()))?;
+            let shard = self.shards.get(idx).ok_or_else(|| {
+                format!(
+                    "tensor '{}' maps to shard {} but only {} shard(s) loaded",
+                    name,
+                    idx,
+                    self.shards.len()
+                )
+            })?;
             shard
                 .header
                 .tensor(name)

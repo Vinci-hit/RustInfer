@@ -11,9 +11,7 @@ use infer_protocol::{RustInferConfig, resolve_model_type};
 use infer_scheduler::application::SchedulerEngine;
 use infer_scheduler::config::{SchedulerConfig, SchedulerMode};
 use infer_scheduler::domain::BlockSize;
-use infer_scheduler::domain::policy::{
-    ContinuousBatchingPolicy, DiffusionPolicy, SchedulingPolicy,
-};
+use infer_scheduler::domain::policy::{ContinuousBatchingPolicy, SchedulingPolicy};
 use infer_scheduler::infrastructure::transport::control_plane::{ControlPlane, ControlPlaneConfig};
 use infer_scheduler::infrastructure::transport::zmq_transport::{
     ZmqFrontendTransport, ZmqWorkerTransport,
@@ -31,6 +29,16 @@ struct Args {
 fn parse_block_size(s: usize) -> BlockSize {
     let raw = u32::try_from(s).unwrap_or(1);
     BlockSize::new(if raw == 0 { 1 } else { raw })
+}
+
+fn release_scheduler_mode(mode: &str) -> Result<SchedulerMode> {
+    match mode {
+        "llm" => Ok(SchedulerMode::Llm),
+        "diffusion" => {
+            anyhow::bail!("diffusion mode is disabled in this release; configure `mode = \"llm\"`")
+        }
+        other => anyhow::bail!("unsupported scheduler mode {:?}", other),
+    }
 }
 
 #[tokio::main]
@@ -53,10 +61,7 @@ async fn main() -> Result<()> {
     let worker_control_endpoint = cfg.worker_control_endpoint();
 
     let paged_block_size = parse_block_size(cfg.paged_block_size);
-    let scheduler_mode = match cfg.mode.as_str() {
-        "diffusion" => SchedulerMode::Diffusion,
-        _ => SchedulerMode::Llm,
-    };
+    let scheduler_mode = release_scheduler_mode(&cfg.mode)?;
 
     // model_type is derived from the model's config.json (never a CLI flag),
     // so the worker dispatch always matches the loaded weights.
@@ -109,9 +114,11 @@ async fn main() -> Result<()> {
     // Bind the control-plane ROUTER, optionally assign a model, then
     // wait for `WorkerReady`. The same socket continues to serve
     // runtime control once the handshake completes.
-    let mut cp_cfg = ControlPlaneConfig::default();
-    cp_cfg.heartbeat_interval = Duration::from_secs(1);
-    cp_cfg.heartbeat_timeout = Duration::from_secs(cfg.worker_heartbeat_timeout_secs.max(1));
+    let cp_cfg = ControlPlaneConfig {
+        heartbeat_interval: Duration::from_secs(1),
+        heartbeat_timeout: Duration::from_secs(cfg.worker_heartbeat_timeout_secs.max(1)),
+        ..ControlPlaneConfig::default()
+    };
     tracing::info!(
         "  worker heartbeat_interval: {:?}",
         cp_cfg.heartbeat_interval
@@ -147,13 +154,10 @@ async fn main() -> Result<()> {
     // scheduler only tracks slot accounting via `KvBudget` + `RadixTree`,
     // wired up inside `SchedulerEngine::new`.
 
-    let policy: Box<dyn SchedulingPolicy> = match scheduler_mode {
-        SchedulerMode::Diffusion => Box::new(DiffusionPolicy::new(cfg.max_batch_seqs)),
-        SchedulerMode::Llm => Box::new(
-            ContinuousBatchingPolicy::new(config.chunked_prefill_size)
-                .with_admission(config.max_prefill_seqs_per_iter, config.prefill_sjf),
-        ),
-    };
+    let policy: Box<dyn SchedulingPolicy> = Box::new(
+        ContinuousBatchingPolicy::new(config.chunked_prefill_size)
+            .with_admission(config.max_prefill_seqs_per_iter, config.prefill_sjf),
+    );
 
     // Build and run engine.
     let engine = SchedulerEngine::new(
@@ -221,5 +225,17 @@ async fn wait_for_shutdown_signal() -> &'static str {
     {
         let _ = tokio::signal::ctrl_c().await;
         "SIGINT"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SchedulerMode, release_scheduler_mode};
+
+    #[test]
+    fn release_binary_rejects_diffusion_mode() {
+        assert_eq!(release_scheduler_mode("llm").unwrap(), SchedulerMode::Llm);
+        let error = release_scheduler_mode("diffusion").unwrap_err().to_string();
+        assert!(error.contains("disabled in this release"));
     }
 }

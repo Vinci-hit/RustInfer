@@ -3,10 +3,12 @@
 
 use async_trait::async_trait;
 use infer_protocol::scheduler_to_server::{
-    FRONTEND_PROTOCOL_VERSION, InferenceResponse, SchedulerPong, SchedulerReply, StreamChunk,
+    ChunkType, FRONTEND_PROTOCOL_VERSION, InferenceMetrics, InferenceResponse, ResponseStatus,
+    SchedulerPong, SchedulerReply, StreamChunk,
 };
 use infer_protocol::server_to_scheduler::ServerCommand;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::domain::inference_session::handle::ClientId;
 use crate::error::{Result, SchedulerError, TransportError};
@@ -21,6 +23,22 @@ use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport,
 /// unbounded queue grow without limit. Large enough to never throttle healthy
 /// traffic.
 const OUTBOUND_QUEUE_BOUND: usize = 16_384;
+/// Hard bound on decoded frontend commands waiting for the scheduler event
+/// loop. When full, new inference requests receive an immediate overload
+/// response instead of accumulating without limit.
+const FRONTEND_INFERENCE_BOUND: usize = 1_024;
+/// Slots inference submissions cannot consume, so cancellation remains
+/// deliverable while the request queue is saturated.
+const FRONTEND_CANCEL_RESERVE: usize = 64;
+const FRONTEND_INGRESS_BOUND: usize = FRONTEND_INFERENCE_BOUND + FRONTEND_CANCEL_RESERVE;
+
+fn frontend_ingress_channel<T>() -> (mpsc::Sender<T>, mpsc::Receiver<T>) {
+    mpsc::channel(FRONTEND_INGRESS_BOUND)
+}
+
+fn outbound_bridge_channel<T>() -> (std::sync::mpsc::SyncSender<T>, std::sync::mpsc::Receiver<T>) {
+    std::sync::mpsc::sync_channel(OUTBOUND_QUEUE_BOUND)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ZMQ Frontend Transport
@@ -44,7 +62,7 @@ pub enum OutgoingResponse {
 /// Communication with the async scheduler is via tokio mpsc channels.
 pub struct ZmqFrontendTransport {
     /// Receive channel: ZMQ thread sends incoming requests here.
-    incoming_rx: mpsc::UnboundedReceiver<FrontendEvent>,
+    incoming_rx: mpsc::Receiver<FrontendEvent>,
     /// Send channel: scheduler sends responses here, ZMQ thread drains.
     /// Bounded so a stalled client cannot make the scheduler accumulate an
     /// unbounded backlog of undelivered responses (OOM backstop).
@@ -54,7 +72,7 @@ pub struct ZmqFrontendTransport {
 impl ZmqFrontendTransport {
     /// Spawn the ZMQ I/O thread and return the transport handle.
     pub fn new(endpoint: &str) -> Result<Self> {
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = frontend_ingress_channel();
         let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTBOUND_QUEUE_BOUND);
         let endpoint = endpoint.to_string();
 
@@ -83,7 +101,7 @@ impl ZmqFrontendTransport {
     /// 用 zmq_poll 同时监听 ROUTER + inproc PAIR，任一有数据立即唤醒。
     fn zmq_thread(
         endpoint: String,
-        incoming_tx: mpsc::UnboundedSender<FrontendEvent>,
+        incoming_tx: mpsc::Sender<FrontendEvent>,
         mut outgoing_rx: mpsc::Receiver<OutgoingResponse>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = zmq::Context::new();
@@ -99,8 +117,10 @@ impl ZmqFrontendTransport {
         tracing::info!("ZMQ frontend ROUTER bound to {}", endpoint);
         let codec = MsgPackCodec;
 
-        // Helper: bridge outgoing_rx → std channel + inproc wakeup.
-        let (msg_tx, msg_rx) = std::sync::mpsc::channel::<OutgoingResponse>();
+        // Helper: bridge outgoing_rx → bounded std channel + inproc wakeup.
+        // Keeping both sides bounded is essential: an unbounded second hop
+        // would silently erase the Tokio queue's backpressure.
+        let (msg_tx, msg_rx) = outbound_bridge_channel::<OutgoingResponse>();
         let ctx_clone = ctx.clone();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
@@ -142,16 +162,36 @@ impl ZmqFrontendTransport {
                         match socket.recv_bytes(0) {
                             Ok(data) => match codec.decode::<ServerCommand>(&data) {
                                 Ok(ServerCommand::Infer(request)) => {
-                                    let _ = incoming_tx.send(FrontendEvent::Infer {
-                                        client_id: ClientId::new(identity),
-                                        request,
-                                    });
+                                    let request_id = request.request_id.clone();
+                                    let stream = request.stream;
+                                    if incoming_tx.capacity() <= FRONTEND_CANCEL_RESERVE {
+                                        Self::reject_overload(
+                                            &socket, &codec, &identity, request_id, stream,
+                                        );
+                                    } else {
+                                        match incoming_tx.try_send(FrontendEvent::Infer {
+                                            client_id: ClientId::new(identity.clone()),
+                                            request,
+                                        }) {
+                                            Ok(()) => {}
+                                            Err(TrySendError::Full(_)) => Self::reject_overload(
+                                                &socket, &codec, &identity, request_id, stream,
+                                            ),
+                                            Err(TrySendError::Closed(_)) => return Ok(()),
+                                        }
+                                    }
                                 }
                                 Ok(ServerCommand::Cancel(cancel)) => {
-                                    let _ = incoming_tx.send(FrontendEvent::Cancel {
+                                    match incoming_tx.try_send(FrontendEvent::Cancel {
                                         external_id: cancel.request_id,
                                         reason: cancel.reason,
-                                    });
+                                    }) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => tracing::error!(
+                                            "frontend cancellation reserve exhausted; dropping cancel"
+                                        ),
+                                        Err(TrySendError::Closed(_)) => return Ok(()),
+                                    }
                                 }
                                 Ok(ServerCommand::Ping) => {
                                     // Liveness probe: answer directly from this
@@ -162,10 +202,10 @@ impl ZmqFrontendTransport {
                                     let pong = SchedulerReply::Pong(SchedulerPong {
                                         protocol_version: FRONTEND_PROTOCOL_VERSION,
                                     });
-                                    if let Ok(data) = codec.encode(&pong) {
-                                        let _ = socket.send(identity.as_slice(), zmq::SNDMORE);
-                                        let _ = socket.send(&b""[..], zmq::SNDMORE);
-                                        let _ = socket.send(&data, 0);
+                                    if let Err(e) =
+                                        Self::send_reply(&socket, &codec, &identity, &pong)
+                                    {
+                                        tracing::error!(error = ?e, "failed to send scheduler pong");
                                     }
                                 }
                                 Err(e) => tracing::error!("Decode: {}", e),
@@ -196,13 +236,61 @@ impl ZmqFrontendTransport {
                         (client_id, SchedulerReply::Chunk(chunk))
                     }
                 };
-                if let Ok(data) = codec.encode(&reply) {
-                    let _ = socket.send(client_id.as_bytes(), zmq::SNDMORE);
-                    let _ = socket.send(&b""[..], zmq::SNDMORE);
-                    let _ = socket.send(&data, 0);
+                if let Err(e) = Self::send_reply(&socket, &codec, client_id.as_bytes(), &reply) {
+                    tracing::error!(error = ?e, "failed to send scheduler frontend reply");
                 }
             }
         }
+    }
+
+    fn overload_reply(request_id: String, stream: bool) -> SchedulerReply {
+        const MESSAGE: &str = "scheduler overloaded, please retry later";
+        if stream {
+            SchedulerReply::Chunk(StreamChunk {
+                request_id,
+                chunk_type: ChunkType::Error,
+                token_id: None,
+                finish_reason: Some(MESSAGE.to_string()),
+                metrics: Some(InferenceMetrics::default()),
+            })
+        } else {
+            SchedulerReply::Full(InferenceResponse {
+                request_id,
+                status: ResponseStatus::Error,
+                output_token_ids: vec![],
+                images: vec![],
+                finish_reason: Some("error".to_string()),
+                error: Some(MESSAGE.to_string()),
+                metrics: InferenceMetrics::default(),
+            })
+        }
+    }
+
+    fn reject_overload(
+        socket: &zmq::Socket,
+        codec: &MsgPackCodec,
+        identity: &[u8],
+        request_id: String,
+        stream: bool,
+    ) {
+        tracing::warn!(%request_id, "frontend ingress queue full; rejecting request");
+        let reply = Self::overload_reply(request_id, stream);
+        if let Err(e) = Self::send_reply(socket, codec, identity, &reply) {
+            tracing::error!(error = ?e, "failed to send frontend overload response");
+        }
+    }
+
+    fn send_reply(
+        socket: &zmq::Socket,
+        codec: &MsgPackCodec,
+        identity: &[u8],
+        reply: &SchedulerReply,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let data = codec.encode(reply)?;
+        socket.send(identity, zmq::SNDMORE)?;
+        socket.send(&b""[..], zmq::SNDMORE)?;
+        socket.send(&data, 0)?;
+        Ok(())
     }
 }
 
@@ -308,7 +396,10 @@ impl ZmqWorkerTransport {
         wakeup_rx.bind("inproc://wk-cmd-wakeup")?;
         wakeup_rx.set_rcvtimeo(0)?;
 
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Preserve the bounded Tokio command queue through the bridge. If the
+        // ZMQ PUSH socket stalls, this bounded hop fills and backpressure
+        // reaches `send_batch()` instead of accumulating in std mpsc memory.
+        let (cmd_tx, cmd_rx) = outbound_bridge_channel::<Vec<u8>>();
         let ctx_clone = ctx.clone();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let barrier2 = barrier.clone();
@@ -388,5 +479,52 @@ impl WorkerTransport for ZmqWorkerTransport {
 
     fn take_output_rx(&mut self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
         self.output_rx.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_bridge_remains_bounded() {
+        let (tx, _rx) = outbound_bridge_channel();
+        for value in 0..OUTBOUND_QUEUE_BOUND {
+            tx.try_send(value).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(OUTBOUND_QUEUE_BOUND),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn frontend_ingress_queue_remains_bounded() {
+        let (tx, _rx) = frontend_ingress_channel();
+        for value in 0..FRONTEND_INGRESS_BOUND {
+            tx.try_send(value).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(FRONTEND_INGRESS_BOUND),
+            Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn overload_reply_preserves_stream_shape() {
+        assert!(matches!(
+            ZmqFrontendTransport::overload_reply("stream".to_string(), true),
+            SchedulerReply::Chunk(StreamChunk {
+                chunk_type: ChunkType::Error,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ZmqFrontendTransport::overload_reply("full".to_string(), false),
+            SchedulerReply::Full(InferenceResponse {
+                status: ResponseStatus::Error,
+                ..
+            })
+        ));
     }
 }

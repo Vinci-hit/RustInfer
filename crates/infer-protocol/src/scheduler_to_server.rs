@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol version of the server↔scheduler (frontend) plane. Bumped on any
 /// wire-incompatible change. The scheduler reports it in [`SchedulerPong`];
 /// the server refuses readiness (`/ready` 503) on mismatch.
-pub const FRONTEND_PROTOCOL_VERSION: u32 = 1;
+pub const FRONTEND_PROTOCOL_VERSION: u32 = 2;
 
 /// Scheduler -> Server 的统一回复信封（tagged union）。
 ///

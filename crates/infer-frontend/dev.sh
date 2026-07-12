@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Start Tailwind CSS watcher in background
-npx tailwindcss -i ./assets/main.css -o ./assets/output.css --watch &
+# Start the lockfile-pinned Tailwind CSS watcher in background.
+npm run tailwind &
 TAILWIND_PID=$!
 
 # Start Dioxus dev server

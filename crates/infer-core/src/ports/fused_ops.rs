@@ -1,3 +1,7 @@
+// Fused kernel ports mirror launch signatures, and tensor triples are the
+// natural Q/K/V result. These shapes are clearer than one-off argument structs.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use crate::kv::{KvView, LayerKv};
 use crate::ports::math_ops::MathOps;
 use crate::ports::{OpError, OpResult};

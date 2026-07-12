@@ -242,10 +242,9 @@ async fn handle_llm_step(
     // counts include the slots assigned in this very step (reserved above but
     // not yet visible on the session).
     let assigned_slots = assigned_slots_by_sequence(step);
-    let finished: Vec<SeqKv> = step
+    let kv_by_sequence: HashMap<u64, SeqKv> = step
         .tokens
         .iter()
-        .filter(|tk| tk.finished)
         .map(|tk| {
             let before_step = ctx
                 .requests
@@ -261,10 +260,33 @@ async fn handle_llm_step(
                 ),
             }
         })
+        .map(|seq| (seq.sequence_id, seq))
         .collect();
 
-    output_fns::process_llm_step_decoded(ctx.requests, dispatch.frontend_mut(), ctx.metrics, step)
-        .await?;
+    let completed = output_fns::process_llm_step_decoded(
+        ctx.requests,
+        dispatch.frontend_mut(),
+        ctx.metrics,
+        step,
+    )
+    .await?;
+
+    // A scheduler-matched stop sequence finishes before the worker marks the
+    // row done. Explicitly cancel that row so worker-owned active/KV state is
+    // released and late output is not produced indefinitely.
+    for sequence in &completed {
+        if sequence.stop_sequence_finished && !sequence.worker_finished {
+            crate::application::cancel::send_cancel_to_worker(
+                ctx.control_cmd,
+                ctx.default_worker,
+                sequence.sequence_id,
+            )?;
+        }
+    }
+    let finished: Vec<SeqKv> = completed
+        .iter()
+        .filter_map(|sequence| kv_by_sequence.get(&sequence.sequence_id.0).copied())
+        .collect();
 
     // Terminated-KV reclamation, one entry point for both modes: with prefix
     // caching the chains are marked finished (KV stays cached, budget follows

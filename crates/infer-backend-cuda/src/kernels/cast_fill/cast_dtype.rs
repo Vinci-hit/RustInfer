@@ -88,6 +88,7 @@ pub fn cast_dtype<S: Dtype, D: Dtype>(
 }
 
 /// Allocate a new `Tensor<D, Cuda>` and cast `src` into it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn cast_dtype_new<S: Dtype, D: Dtype>(
     stream: cudaStream_t,
     src: &Tensor<S, Cuda>,

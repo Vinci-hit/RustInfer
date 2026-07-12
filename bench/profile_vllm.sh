@@ -1,11 +1,11 @@
 #!/bin/bash
 # vLLM startup script for Qwen3-4B-Instruct
-# Usage: bash start_vllm.sh [extra_args...]
+# Usage: MODEL_PATH=/path/to/model bash profile_vllm.sh [extra_args...]
 
 set -euo pipefail
 
 # === Model Config ===
-MODEL_PATH="/apdcephfs_qy2/share_303432435/vinciiliu/models/qwen3-4b-instruct"
+: "${MODEL_PATH:?Set MODEL_PATH to a local model path or model ID}"
 
 # === Runtime Config ===
 MAX_NUM_SEQS=32

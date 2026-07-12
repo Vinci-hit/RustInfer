@@ -131,6 +131,10 @@ pub trait SessionState: sealed::Sealed {}
 pub struct ResumeState {
     /// Tokens generated before preemption — now the tail of `meta.input_ids`.
     pub generated: usize,
+    /// Prefix of those generated tokens already delivered to a streaming
+    /// client. Tokens held back as a possible stop-sequence prefix remain
+    /// undelivered across preemption.
+    pub streamed: usize,
     /// Original first-token time: TTFT must survive the resume.
     pub first_token_time: Instant,
     pub preemption_count: u32,
@@ -166,6 +170,10 @@ pub struct InFlightPrefillSegment {
 /// Data for a session in the decode phase.
 pub struct Decoding {
     pub output_tokens: Vec<i32>,
+    /// Number of output tokens already emitted to a streaming client.
+    pub num_streamed_tokens: usize,
+    /// Set when scheduler-side stop suffix matching ended generation.
+    pub stop_sequence_matched: bool,
     pub seq_position: usize,
     pub prompt_len: usize,
     /// Length of the *client's* prompt. Equal to `prompt_len` for fresh
@@ -305,31 +313,40 @@ impl InferenceSession<Prefilling> {
         // TTFT clock and preemption count, and remember where the client's
         // prompt actually ended. The stream sent those tokens already; only
         // tokens appended after this point produce new chunks.
-        let (output_tokens, first_token_time, preemption_count, original_prompt_len) =
-            match self.state.resume {
-                Some(resume) => {
-                    let seed_start = prompt_len.saturating_sub(resume.generated);
-                    let mut out = Vec::with_capacity(resume.generated.max(initial_cap));
-                    out.extend_from_slice(&self.meta.input_ids[seed_start..prompt_len]);
-                    (
-                        out,
-                        resume.first_token_time,
-                        resume.preemption_count,
-                        seed_start,
-                    )
-                }
-                None => (
-                    Vec::with_capacity(initial_cap),
-                    Instant::now(),
-                    0,
-                    prompt_len,
-                ),
-            };
+        let (
+            output_tokens,
+            num_streamed_tokens,
+            first_token_time,
+            preemption_count,
+            original_prompt_len,
+        ) = match self.state.resume {
+            Some(resume) => {
+                let seed_start = prompt_len.saturating_sub(resume.generated);
+                let mut out = Vec::with_capacity(resume.generated.max(initial_cap));
+                out.extend_from_slice(&self.meta.input_ids[seed_start..prompt_len]);
+                (
+                    out,
+                    resume.streamed.min(resume.generated),
+                    resume.first_token_time,
+                    resume.preemption_count,
+                    seed_start,
+                )
+            }
+            None => (
+                Vec::with_capacity(initial_cap),
+                0,
+                Instant::now(),
+                0,
+                prompt_len,
+            ),
+        };
         InferenceSession {
             meta: self.meta,
             handle: self.handle,
             state: Decoding {
                 output_tokens,
+                num_streamed_tokens,
+                stop_sequence_matched: false,
                 seq_position: prompt_len,
                 prompt_len,
                 original_prompt_len,

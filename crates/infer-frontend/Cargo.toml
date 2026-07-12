@@ -1,7 +1,12 @@
 [package]
 name = "infer-frontend"
-version = "0.3.0"
+version.workspace = true
 edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "rustinfer-frontend"
@@ -12,7 +17,8 @@ path = "src/main.rs"
 dioxus = { version = "0.7.9", features = ["web"] }
 
 # HTTP client (WASM-compatible)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
 gloo-net = { version = "0.6", features = ["eventsource"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 

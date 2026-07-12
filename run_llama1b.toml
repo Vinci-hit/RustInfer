@@ -1,12 +1,13 @@
 # RustInfer launch config for e2e smoke test of dense Llama-3.2-1B-Instruct.
 # Exercises the merged `load_decoder` (non-Qwen default path) and config-derived
 # eos_token_id [128001,128008,128009].
-model = "/data/home/vinciiliu/models/Llama-3.2-1B-Instruct"
+# Paths are resolved from the directory where the binaries are launched.
+model = "./models/Llama-3.2-1B-Instruct"
 model_name = "Llama-3.2-1B-Instruct"
 cluster_id = "rustinfer-llama1b"
 device = "cuda:0"
 
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8102
 request_timeout_secs = 600
 

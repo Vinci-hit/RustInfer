@@ -149,10 +149,10 @@ impl PendingCalls {
     /// entries or unknown ids.
     pub(crate) fn fail_one(&self, id: RequestId, error: ControlError) {
         let mut g = lock_inner(&self.inner);
-        if matches!(g.get(&id), Some(PendingEntry::One { .. })) {
-            if let Some(PendingEntry::One { tx, .. }) = g.remove(&id) {
-                let _ = tx.send(Err(error));
-            }
+        if matches!(g.get(&id), Some(PendingEntry::One { .. }))
+            && let Some(PendingEntry::One { tx, .. }) = g.remove(&id)
+        {
+            let _ = tx.send(Err(error));
         }
     }
 

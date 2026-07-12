@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::domain::ports::sampler::SamplingParams;
+
 /// Per-sequence prefill state held between chunked prefill segments.
 pub struct PrefillSeq {
     pub kv_len: usize,
@@ -15,6 +17,7 @@ pub struct ActiveSeq {
     pub block_table: Vec<u32>,
     pub max_tokens: usize,
     pub generated_count: usize,
+    pub sampling: SamplingParams,
     /// When true, EOS tokens do not terminate the sequence; it decodes
     /// all the way to `max_tokens` (fixed-length benchmarking).
     pub ignore_eos: bool,
@@ -29,6 +32,7 @@ impl ActiveSeq {
         mut block_table: Vec<u32>,
         max_tokens: usize,
         ignore_eos: bool,
+        sampling: SamplingParams,
     ) -> Self {
         let remaining = max_tokens.saturating_sub(1); // first token already counted
         block_table.reserve(remaining);
@@ -38,6 +42,7 @@ impl ActiveSeq {
             block_table,
             max_tokens,
             generated_count: 1,
+            sampling,
             ignore_eos,
         }
     }
@@ -141,7 +146,7 @@ mod tests {
 
     #[test]
     fn active_seq_commit_accepted_updates_token_counts_and_blocks() {
-        let mut seq = ActiveSeq::new(10, vec![1, 2], 8, false);
+        let mut seq = ActiveSeq::new(10, vec![1, 2], 8, false, SamplingParams::default());
 
         seq.commit_accepted(11, 2, &[3, 4]).unwrap();
 

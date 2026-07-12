@@ -97,21 +97,9 @@ unsafe extern "C" {
 /// performs no checks.
 pub trait ScalarKernel: CudaFloat {
     /// `dst = src * val`, elementwise over `n` elements.
-    unsafe fn scalar_mul(
-        dst: *mut Self,
-        src: *const Self,
-        val: f32,
-        n: i32,
-        stream: cudaStream_t,
-    );
+    unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t);
     /// `dst = src + val`, elementwise over `n` elements.
-    unsafe fn scalar_add(
-        dst: *mut Self,
-        src: *const Self,
-        val: f32,
-        n: i32,
-        stream: cudaStream_t,
-    );
+    unsafe fn scalar_add(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t);
     /// `data = silu(data)`, in place over `n` elements.
     unsafe fn silu_inplace(data: *mut Self, n: i32, stream: cudaStream_t);
     /// `data = tanh(data)`, in place over `n` elements.
@@ -241,7 +229,10 @@ pub fn scalar_add_inplace<T: ScalarKernel>(
 }
 
 /// In-place SiLU activation: `x = x * sigmoid(x)`.
-pub fn silu_inplace<T: ScalarKernel>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn silu_inplace<T: ScalarKernel>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+) -> OpResult<()> {
     let n = x.numel() as i32;
     let p = x.data_ptr_mut();
     unsafe {
@@ -251,7 +242,10 @@ pub fn silu_inplace<T: ScalarKernel>(stream: cudaStream_t, x: &mut Tensor<T, Cud
 }
 
 /// In-place tanh activation.
-pub fn tanh_inplace<T: ScalarKernel>(stream: cudaStream_t, x: &mut Tensor<T, Cuda>) -> OpResult<()> {
+pub fn tanh_inplace<T: ScalarKernel>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+) -> OpResult<()> {
     let n = x.numel() as i32;
     let p = x.data_ptr_mut();
     unsafe {
@@ -297,9 +291,9 @@ mod tests {
     #[test]
     fn scalar_mul_inplace_bf16_basic() {
         let cuda = Cuda::new(0).unwrap();
-        let host: Vec<bf16> = vec![1.0, 2.0, -3.0, 4.5]
-            .iter()
-            .map(|&x| bf16::from_f32(x))
+        let host: Vec<bf16> = [1.0, 2.0, -3.0, 4.5]
+            .into_iter()
+            .map(bf16::from_f32)
             .collect();
         let mut t: Tensor<bf16, Cuda> = Tensor::from_host_slice(&host, [4], &cuda).unwrap();
         scalar_mul_inplace(cuda.config.stream, &mut t, 2.0).unwrap();

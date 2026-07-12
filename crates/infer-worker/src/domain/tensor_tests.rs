@@ -2,6 +2,9 @@
 //! backend-agnostic and can collapse into `infer-core`. These exercise `Tensor`
 //! against concrete backends (`Cpu`/`Cuda`), which live in the worker, through
 //! the public Tensor API only.
+#[cfg(all(test, feature = "cuda"))]
+static CUDA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod helper_tests {
     use crate::domain::ports::OpError;
@@ -79,6 +82,9 @@ mod helper_tests {
     #[test]
     fn randn_bf16_cuda_seeded_matches_cpu() {
         use crate::infrastructure::cuda::Cuda;
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cpu = Cpu;
         let cuda = Cuda::new(0).expect("cuda init");
         let n = 1024usize;
@@ -114,6 +120,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_apply_rope_interleaved_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let (seq, h, d) = (4usize, 2usize, 8usize);
         let half = d / 2;
@@ -138,6 +147,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_concat_seq_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let a: Tensor<bf16, Cuda> = Tensor::from_host_slice(
             &(0..8).map(|i| bf16::from_f32(i as f32)).collect::<Vec<_>>(),
@@ -164,6 +176,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_sdpa_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let (seq, h, d) = (3usize, 2usize, 4usize);
         let scale = 1.0 / (d as f32).sqrt();
@@ -180,6 +195,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_pad_with_token_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let src: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [1, 4], &cuda).unwrap();
@@ -194,6 +212,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_cast_dtype_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let src: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [4], &cuda).unwrap();
@@ -210,6 +231,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_silu_and_tanh_dispatch() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let mut s: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&[1.0, 2.0, -1.0], [3], &cuda).unwrap();
@@ -230,6 +254,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_scalar_mul_from_dev_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let mut x: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&[1.0, 2.0, 3.0], [3], &cuda).unwrap();
@@ -243,6 +270,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_split_cols_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let src_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
         let src: Tensor<f32, Cuda> = Tensor::from_host_slice(&src_host, [2, 3], &cuda).unwrap();
@@ -254,6 +284,9 @@ mod opbackend_dispatch_tests {
 
     #[test]
     fn opbackend_broadcast_add_dispatches() {
+        let _cuda_guard = super::CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cuda = Cuda::new(0).unwrap();
         let mut x: Tensor<f32, Cuda> =
             Tensor::from_host_slice(&[1.0, 2.0, 3.0, 4.0], [2, 2], &cuda).unwrap();

@@ -103,10 +103,10 @@ impl LruList {
 
     fn pop_front_valid(&mut self) -> Option<NodeId> {
         while let Some((node, g)) = self.queue.pop_front() {
-            if let Some(&cur) = self.generations.get(&node) {
-                if cur == g {
-                    return Some(node);
-                }
+            if let Some(&cur) = self.generations.get(&node)
+                && cur == g
+            {
+                return Some(node);
             }
         }
         None
@@ -121,7 +121,7 @@ impl LruList {
     /// from lazy-removed entries.
     fn compact(&mut self) {
         self.queue
-            .retain(|&(node, g)| self.generations.get(&node).map_or(false, |&cur| cur == g));
+            .retain(|&(node, g)| self.generations.get(&node).is_some_and(|&cur| cur == g));
         // Also prune the generations map for nodes no longer in the queue.
         // After retain, any node not in the queue can have its gen removed.
         // However, re-scanning is O(generations.len()); to keep this cheap,

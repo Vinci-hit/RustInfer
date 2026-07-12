@@ -50,6 +50,8 @@ const MIXED_GRAPH_PREWARM_TOKEN_BUCKETS: &[usize] = &[64, 128, 192, 256, 320, 38
 /// warmup-concentrated), so with the boot prewarm every live token count hits
 /// a warmed shape. 32 wastes at most 31 token rows of GEMM work (~2.5µs/row).
 const EAGER_MIXED_TOKEN_BUCKET: usize = 32;
+type MixedWarmupRequest = (StepRequest, Vec<RaggedRowKind>, Vec<u32>);
+type MixedGraphWarmupRequest = (StepRequest, Vec<RaggedRowKind>, Vec<u32>, u64);
 
 /// In-flight mixed step handle: `issue_fused_abc` → overlapped host work →
 /// `finalize_fused_abc`. Owns the issue's `BatchPlan` so finalize decodes the
@@ -144,7 +146,7 @@ fn mixed_graph_shape(
     if plan.batch == 0 || plan.batch > cap_batch || plan.num_tokens > cap_num_tokens {
         return None;
     }
-    let has_decode = row_kind.iter().any(|&k| k == RaggedRowKind::Decode);
+    let has_decode = row_kind.contains(&RaggedRowKind::Decode);
     let has_prefill = row_kind
         .iter()
         .any(|&k| matches!(k, RaggedRowKind::PrefillFinal | RaggedRowKind::PrefillCont));
@@ -272,7 +274,7 @@ where
         &self,
         case: MixedGraphWarmupCase,
         eos_ids: &[i32],
-    ) -> OpResult<Option<(StepRequest, Vec<RaggedRowKind>, Vec<u32>, u64)>> {
+    ) -> OpResult<Option<MixedGraphWarmupRequest>> {
         let Some((req, row_kind, next_slots)) = self.mixed_warmup_request(case, eos_ids)? else {
             return Ok(None);
         };
@@ -301,7 +303,7 @@ where
         &self,
         case: MixedGraphWarmupCase,
         eos_ids: &[i32],
-    ) -> OpResult<Option<(StepRequest, Vec<RaggedRowKind>, Vec<u32>)>> {
+    ) -> OpResult<Option<MixedWarmupRequest>> {
         if case.prefill_len < 2 {
             return Ok(None);
         }
@@ -400,13 +402,12 @@ where
                 token_bucket: bucket,
                 prefill_len: bucket - 1,
             };
-            if case.prefill_len <= max_prefill_len {
-                if let Some((req, row_kind, next_slots)) =
+            if case.prefill_len <= max_prefill_len
+                && let Some((req, row_kind, next_slots)) =
                     self.mixed_warmup_request(case, eos_ids)?
-                {
-                    self.step_fused_abc_eager(&req, &row_kind, Some(&next_slots))?;
-                    warmed += 1;
-                }
+            {
+                self.step_fused_abc_eager(&req, &row_kind, Some(&next_slots))?;
+                warmed += 1;
             }
             bucket += EAGER_MIXED_TOKEN_BUCKET;
         }
@@ -485,6 +486,7 @@ where
     /// - the copy-out is deferred: the single-buffered host mirrors still
     ///   belong to the in-flight step. The caller must finalize that step
     ///   before `finalize_fused_abc` (which enqueues the copy-out lazily).
+    ///
     /// Every enqueue here rides the compute stream, so it is ordered after the
     /// in-flight step's kernels; the eager region additionally waits on the
     /// prior copy-out event before its merge rewrites A / the side-bands.
@@ -516,9 +518,7 @@ where
                     "issue_fused_abc: C-prefix gather requires eager-mixed mode".into(),
                 ));
             }
-            if c_prefix_rows > plan.batch
-                || plan.q_lens[..c_prefix_rows].iter().any(|&q| q != 1)
-            {
+            if c_prefix_rows > plan.batch || plan.q_lens[..c_prefix_rows].iter().any(|&q| q != 1) {
                 return Err(OpError::Shape(format!(
                     "issue_fused_abc: C-prefix {} not a q=1 row prefix of batch {}",
                     c_prefix_rows, plan.batch
@@ -790,8 +790,8 @@ where
         if !self.mixed_eager {
             return None;
         }
-        let padded = round_up_to_bucket(plan.num_tokens, EAGER_MIXED_TOKEN_BUCKET)?
-            .min(self.cap_num_tokens);
+        let padded =
+            round_up_to_bucket(plan.num_tokens, EAGER_MIXED_TOKEN_BUCKET)?.min(self.cap_num_tokens);
         if padded <= plan.num_tokens {
             return None;
         }
@@ -1063,7 +1063,7 @@ where
         let mut max_i32 = Vec::with_capacity(rows_to_upload);
         let mut ign_i32 = Vec::with_capacity(rows_to_upload);
         let mut token_offset = 0i32;
-        for i in 0..batch {
+        for (i, &kind) in row_kind.iter().take(batch).enumerate() {
             gen_i32.push(u32_to_i32_saturating(
                 req.stop.generated_counts.get(i).copied().unwrap_or(0),
             ));
@@ -1073,7 +1073,7 @@ where
             ign_i32.push(i32::from(
                 req.stop.ignore_eos.get(i).copied().unwrap_or(false),
             ));
-            self.abc.row_kind_host[i] = row_kind[i].as_i32();
+            self.abc.row_kind_host[i] = kind.as_i32();
             let q = req.seqs[i].input_ids.len().max(1) as i32;
             // `token_offset` indexes into the flat token tape, bounded by
             // `max_batch_tokens` in practice. Use a checked add so a malformed
@@ -1194,8 +1194,8 @@ where
 
         let mut row_results: Vec<Option<(i32, bool)>> = vec![None; batch];
         let mut seen = vec![false; batch];
-        for k in 0..active_n {
-            let row = validate_mixed_src_row(active_src[k], batch, "active")?;
+        for &source_row in active_src.iter().take(active_n) {
+            let row = validate_mixed_src_row(source_row, batch, "active")?;
             if !row_kind[row].emits_token() {
                 return Err(OpError::Kernel(format!(
                     "step_fused_abc_eager: active row {} has non-emitting kind {:?}",
@@ -1211,8 +1211,8 @@ where
             seen[row] = true;
             row_results[row] = Some((row_tokens[row], false));
         }
-        for k in 0..finished_n {
-            let row = validate_mixed_src_row(finished_src[k], batch, "finished")?;
+        for &source_row in finished_src.iter().take(finished_n) {
+            let row = validate_mixed_src_row(source_row, batch, "finished")?;
             if !row_kind[row].emits_token() {
                 return Err(OpError::Kernel(format!(
                     "step_fused_abc_eager: finished row {} has non-emitting kind {:?}",

@@ -153,7 +153,8 @@ ZMQ (IPC) with MessagePack framing:
 
 ### Prerequisites
 
-- Rust (2024 edition), a CUDA-capable GPU, and the CUDA toolkit.
+- Rustup (the repository pins Rust 1.91.1), a CUDA-capable GPU, and the CUDA
+  toolkit.
 - The cuDNN frontend headers on the include path:
 
 ```bash
@@ -174,6 +175,10 @@ prints the reply, and tears everything down:
 ```bash
 scripts/e2e_smoke.sh run_qwen3.toml 8100 "Say hello in one short sentence."
 ```
+
+The checked-in configs are portable templates. Set their `model` field to the
+local Hugging Face model directory before launching; they bind to
+`127.0.0.1` and use `cuda:0` by default.
 
 ### Run (manual, three processes)
 
@@ -196,6 +201,20 @@ curl http://127.0.0.1:8100/v1/chat/completions \
 
 Ready-to-use configs: `run_qwen3.toml`, `run_qwen3_awq.toml` (AWQ int4),
 `run_llama1b.toml`.
+
+### Python benchmark tools
+
+The Python project keeps benchmark dependencies optional so building RustInfer
+does not install another inference engine. Install only the group a script uses:
+
+```bash
+uv sync --extra bench
+uv sync --extra vllm-reference
+uv sync --extra sglang-reference
+```
+
+The vLLM and SGLang groups are reference-benchmark environments; they are not
+runtime dependencies of RustInfer.
 
 ---
 
@@ -234,4 +253,5 @@ partial RoPE) is in progress.
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE). Vendored components retain
+their own terms; see [Third-party notices](THIRD_PARTY_NOTICES.md).

@@ -41,8 +41,8 @@ class RequestResult:
     error: str = ""
 
 
-RUSTINFER_MODEL = "dir"
-VLLM_MODEL = "/mnt/md2/liuwenqi/vllm_bench/dir"
+RUSTINFER_MODEL = "model"
+VLLM_MODEL = "model"
 URL = "http://127.0.0.1:8000"
 DURATION = 60
 import os

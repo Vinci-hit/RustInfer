@@ -7,7 +7,10 @@ pub mod config;
 pub mod device_utils;
 pub mod error;
 pub mod ffi;
-pub mod kernels;
+// Raw kernel launch wrappers are an implementation detail. Keeping this module
+// private prevents external callers from manufacturing invalid CUDA streams or
+// device pointers; the safe backend traits below are the supported API.
+mod kernels;
 
 pub use config::{CudaConfig, GraphSlot};
 pub use error::CudaError;
@@ -1525,7 +1528,6 @@ impl DiffusionOps for Cuda {
         })
     }
 }
-
 
 // ─── DecodePipelineOps: the real CUDA implementation ─────────────────────────
 // Delegates the merge/control kernels to `kernels::gather_merge` and the

@@ -1,55 +1,64 @@
-#!/bin/bash
-# Local perf bench harness: launch scheduler+worker+server on GPU 7 against
-# the local Llama-3.2-1B model, wait for readiness, run the online bench, tear
-# down. Usage: bash scripts/bench_local.sh [duration_s] [concurrency] [label]
-set -u
+#!/usr/bin/env bash
+# Local RustInfer online benchmark harness.
+# Environment: CONFIG, PORT, BIN_DIR, READY_TIMEOUT_SECS may override defaults.
 
-REPO=/mnt/md2/liuwenqi/RustInfer
-CFG=$REPO/rustinfer.bench.toml
-DUR="${1:-30}"
-CONC="${2:-32}"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+CONFIG="${CONFIG:-$REPO_ROOT/rustinfer.toml}"
+PORT="${PORT:-8000}"
+BIN_DIR="${BIN_DIR:-$REPO_ROOT/target/release}"
+READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-180}"
+DURATION="${1:-30}"
+CONCURRENCY="${2:-32}"
 LABEL="${3:-run}"
-LOGDIR=/tmp/rustinfer_bench
-mkdir -p "$LOGDIR"
+LOG_DIR="${LOG_DIR:-${TMPDIR:-/tmp}/rustinfer-bench}"
 
-export CUDA_VISIBLE_DEVICES=7
-export LD_LIBRARY_PATH=/home/liuwenqi/miniconda3/lib:${LD_LIBRARY_PATH:-}
+[[ -f "$CONFIG" ]] || { echo "Config not found: $CONFIG" >&2; exit 2; }
+mkdir -p "$LOG_DIR"
 
+# shellcheck source=scripts/lib/cuda_env.sh
+source "$SCRIPT_DIR/lib/cuda_env.sh"
+rustinfer_discover_cuda_libraries
+
+pids=()
 cleanup() {
-  pkill -f "rustinfer-server --config $CFG" 2>/dev/null
-  pkill -f "rustinfer-worker --config $CFG" 2>/dev/null
-  pkill -f "infer-scheduler -- --config $CFG" 2>/dev/null
-  pkill -f "rustinfer-scheduler --config $CFG" 2>/dev/null
-  sleep 1
+    local pid
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
-trap cleanup EXIT
-cleanup
+trap cleanup EXIT INT TERM
 
-cd "$REPO"
-echo "[harness] launching scheduler..."
-./target/release/rustinfer-scheduler --config "$CFG" >"$LOGDIR/sched.log" 2>&1 &
-sleep 2
-echo "[harness] launching worker on GPU 7..."
-./target/release/rustinfer-worker --config "$CFG" >"$LOGDIR/worker.log" 2>&1 &
-echo "[harness] launching server..."
-./target/release/rustinfer-server --config "$CFG" >"$LOGDIR/server.log" 2>&1 &
-
-echo "[harness] waiting for worker Ready + :8000 ..."
-for i in $(seq 1 120); do
-  if grep -q "Entering serve loop" "$LOGDIR/worker.log" 2>/dev/null && \
-     curl -s -o /dev/null http://127.0.0.1:8000/v1/models 2>/dev/null; then
-    echo "[harness] ready after ${i}s"
-    break
-  fi
-  sleep 1
+for name in scheduler worker server; do
+    "$BIN_DIR/rustinfer-$name" --config "$CONFIG" >"$LOG_DIR/$name.log" 2>&1 &
+    pids+=("$!")
 done
 
-if ! curl -s -o /dev/null http://127.0.0.1:8000/v1/models 2>/dev/null; then
-  echo "[harness] SERVER NOT READY — tail worker.log:"; tail -20 "$LOGDIR/worker.log"
-  exit 1
-fi
+deadline=$((SECONDS + READY_TIMEOUT_SECS))
+ready=false
+while (( SECONDS < deadline )); do
+    for pid in "${pids[@]}"; do
+        kill -0 "$pid" 2>/dev/null || {
+            echo "RustInfer process exited before readiness" >&2
+            tail -n 40 "$LOG_DIR"/*.log >&2 || true
+            exit 1
+        }
+    done
+    if grep -q "Entering serve loop" "$LOG_DIR/worker.log" 2>/dev/null \
+        && curl --fail --silent --max-time 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null; then
+        ready=true
+        break
+    fi
+    sleep 1
+done
+[[ "$ready" == true ]] || { echo "Benchmark stack readiness timed out" >&2; exit 1; }
 
-echo "[harness] running bench: dur=${DUR}s conc=${CONC} label=${LABEL}"
-python3 bench/_local_compare.py --tag rustinfer --duration "$DUR" --concurrency "$CONC" 2>&1
-cp /tmp/bench_online_rustinfer.json "$LOGDIR/bench_${LABEL}.json" 2>/dev/null
-echo "[harness] saved $LOGDIR/bench_${LABEL}.json"
+python3 "$REPO_ROOT/bench/_local_compare.py" \
+    --tag rustinfer \
+    --url "http://127.0.0.1:$PORT" \
+    --duration "$DURATION" \
+    --concurrency "$CONCURRENCY"
+
+cp "/tmp/bench_online_rustinfer.json" "$LOG_DIR/bench_${LABEL}.json"
+echo "[bench] saved $LOG_DIR/bench_${LABEL}.json"

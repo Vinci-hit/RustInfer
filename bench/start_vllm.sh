@@ -1,12 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # vLLM startup script for Qwen3-4B-Instruct
 # Based on bootstrap log configuration
-# Usage: bash start_vllm.sh [extra_args...]
+# Usage: MODEL_PATH=/path/to/model bash bench/start_vllm.sh [extra_args...]
 
 set -euo pipefail
 
 # === Model Config ===
-MODEL_PATH="/mnt/md2/liuwenqi/vllm_bench/dir"
+MODEL_PATH="${MODEL_PATH:-}"
+if [[ -z "$MODEL_PATH" ]]; then
+    echo "MODEL_PATH must point to a local model directory" >&2
+    exit 2
+fi
 
 # === Runtime Config (from bootstrap log) ===
 MAX_NUM_SEQS=256
@@ -24,7 +28,7 @@ ENABLE_PREFIX_CACHING=false
 TENSOR_PARALLEL_SIZE=1
 
 # === Port ===
-PORT=8000
+PORT="${PORT:-8000}"
 
 # === Build vllm serve command ===
 exec uv run vllm serve \

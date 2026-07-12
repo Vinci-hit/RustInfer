@@ -239,7 +239,7 @@ impl CoreOps for Cpu {
         if !input.is_contiguous() || !weight.is_contiguous() || !output.is_contiguous() {
             return Err(OpError::NotContiguous(*input.shape()));
         }
-        if group_size == 0 || k % group_size != 0 {
+        if group_size == 0 || !k.is_multiple_of(group_size) {
             return Err(OpError::Shape(format!(
                 "matmul_quant: k {} not divisible by group_size {}",
                 k, group_size
@@ -254,7 +254,14 @@ impl CoreOps for Cpu {
         {
             return Err(OpError::Shape(format!(
                 "matmul_quant: operand smaller than declared m={} n={} k={} groups={} (input={}, weight={}, scales={}, output={})",
-                m, n, k, groups, input.numel(), weight.numel(), scales.numel(), output.numel()
+                m,
+                n,
+                k,
+                groups,
+                input.numel(),
+                weight.numel(),
+                scales.numel(),
+                output.numel()
             )));
         }
         for i in 0..m {
@@ -262,8 +269,7 @@ impl CoreOps for Cpu {
                 let mut sum = 0.0f64;
                 for p in 0..k {
                     let group = p / group_size;
-                    let scale =
-                        unsafe { read_f64(scales.data_ptr().add(j * groups + group)) };
+                    let scale = unsafe { read_f64(scales.data_ptr().add(j * groups + group)) };
                     let w = unsafe { read_f64(weight.data_ptr().add(j * k + p)) };
                     let a = unsafe { read_f64(input.data_ptr().add(i * k + p)) };
                     sum += a * w * scale;
@@ -277,7 +283,7 @@ impl CoreOps for Cpu {
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
         for i in 0..x.numel() {
             unsafe {
-                let v = read_f64((x.data_ptr() as *const T).add(i));
+                let v = read_f64(x.data_ptr().add(i));
                 write_f64(x.data_ptr_mut().add(i), v / (1.0 + (-v).exp()));
             }
         }
@@ -308,7 +314,7 @@ impl CoreOps for Cpu {
             }
             for i in 0..dim {
                 unsafe {
-                    let v = read_f64((output.data_ptr() as *const T).add(off + i));
+                    let v = read_f64(output.data_ptr().add(off + i));
                     write_f64(output.data_ptr_mut().add(off + i), v / sum);
                 }
             }
@@ -325,8 +331,7 @@ impl CoreOps for Cpu {
         let vocab = table.shape().as_slice()[0];
         let seq_len = indices.numel();
         let idx_slice = unsafe { std::slice::from_raw_parts(indices.data_ptr(), seq_len) };
-        for i in 0..seq_len {
-            let raw = idx_slice[i];
+        for (i, &raw) in idx_slice.iter().enumerate() {
             if raw < 0 || (raw as usize) >= vocab {
                 return Err(OpError::Shape(format!(
                     "embedding: index {} at position {} out of range [0, {})",
@@ -348,7 +353,7 @@ impl CoreOps for Cpu {
     fn scalar_mul_inplace<T: Dtype>(x: &mut Tensor<T, Self>, scalar: f64) -> OpResult<()> {
         for i in 0..x.numel() {
             unsafe {
-                let v = read_f64((x.data_ptr() as *const T).add(i));
+                let v = read_f64(x.data_ptr().add(i));
                 write_f64(x.data_ptr_mut().add(i), v * scalar);
             }
         }
@@ -364,7 +369,7 @@ impl CoreOps for Cpu {
         for row in 0..rows {
             for i in 0..dim {
                 unsafe {
-                    let v = read_f64((x.data_ptr() as *const T).add(row * dim + i));
+                    let v = read_f64(x.data_ptr().add(row * dim + i));
                     let s = read_f64(scale.data_ptr().add(i));
                     write_f64(x.data_ptr_mut().add(row * dim + i), v * s);
                 }
@@ -414,7 +419,11 @@ impl CoreOps for Cpu {
         if rows * total_cols > src.numel() || rows * dst_cols > dst.numel() {
             return Err(OpError::Shape(format!(
                 "split_cols: declared shape exceeds storage (rows={}, total_cols={}, dst_cols={}, src_numel={}, dst_numel={})",
-                rows, total_cols, dst_cols, src.numel(), dst.numel()
+                rows,
+                total_cols,
+                dst_cols,
+                src.numel(),
+                dst.numel()
             )));
         }
         let src_ptr = src.data_ptr();
@@ -488,14 +497,14 @@ impl CoreOps for Cpu {
             let mut ss = 0.0f64;
             for i in 0..dim {
                 unsafe {
-                    let v = read_f64((x.data_ptr() as *const T).add(off + i));
+                    let v = read_f64(x.data_ptr().add(off + i));
                     ss += v * v;
                 }
             }
             let inv_rms = 1.0 / ((ss / dim as f64) + eps as f64).sqrt();
             for i in 0..dim {
                 unsafe {
-                    let v = read_f64((x.data_ptr() as *const T).add(off + i));
+                    let v = read_f64(x.data_ptr().add(off + i));
                     let w = read_f64(weight.data_ptr().add(i));
                     write_f64(x.data_ptr_mut().add(off + i), v * w * inv_rms);
                 }
@@ -513,9 +522,8 @@ impl CoreOps for Cpu {
         for r in 0..rows {
             for d in 0..inter {
                 unsafe {
-                    let g = read_f64((gate_up.data_ptr() as *const T).add(r * 2 * inter + d));
-                    let u =
-                        read_f64((gate_up.data_ptr() as *const T).add(r * 2 * inter + inter + d));
+                    let g = read_f64(gate_up.data_ptr().add(r * 2 * inter + d));
+                    let u = read_f64(gate_up.data_ptr().add(r * 2 * inter + inter + d));
                     let silu = g / (1.0 + (-g).exp());
                     write_f64(out.data_ptr_mut().add(r * inter + d), silu * u);
                 }
@@ -533,14 +541,63 @@ impl CoreOps for Cpu {
         kv_head_num: usize,
         head_dim: usize,
     ) -> OpResult<()> {
-        // CPU RoPE implementation
-        let num_tokens = positions.numel();
-        let pos_slice = unsafe { std::slice::from_raw_parts(positions.data_ptr(), num_tokens) };
+        if head_num == 0 || kv_head_num == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
+            return Err(OpError::Shape(format!(
+                "rope_inplace: invalid heads head_num={head_num} kv_head_num={kv_head_num} head_dim={head_dim}"
+            )));
+        }
         let q_dim = head_num * head_dim;
         let kv_dim = kv_head_num * head_dim;
+        let q_shape = q.shape().as_slice();
+        let k_shape = k.shape().as_slice();
+        if q_shape.len() != 2 || q_shape[1] != q_dim {
+            return Err(OpError::Shape(format!(
+                "rope_inplace: q shape {q_shape:?} is not [tokens, {q_dim}]"
+            )));
+        }
+        let num_tokens = q_shape[0];
+        if k_shape != [num_tokens, kv_dim] {
+            return Err(OpError::Shape(format!(
+                "rope_inplace: k shape {k_shape:?} is not [{num_tokens}, {kv_dim}]"
+            )));
+        }
+        if !q.is_contiguous()
+            || !k.is_contiguous()
+            || !positions.is_contiguous()
+            || !sin.is_contiguous()
+            || !cos.is_contiguous()
+        {
+            return Err(OpError::NotContiguous(*q.shape()));
+        }
+        if positions.numel() < num_tokens {
+            return Err(OpError::Shape(format!(
+                "rope_inplace: positions has {} entries for {num_tokens} active tokens",
+                positions.numel()
+            )));
+        }
+        let sin_shape = sin.shape().as_slice();
+        let cos_shape = cos.shape().as_slice();
+        if sin_shape.len() != 2
+            || cos_shape.len() != 2
+            || sin_shape[1] != head_dim
+            || cos_shape[1] != head_dim
+        {
+            return Err(OpError::Shape(format!(
+                "rope_inplace: sin/cos shapes {sin_shape:?}/{cos_shape:?} must have width {head_dim}"
+            )));
+        }
+        let cache_rows = sin_shape[0].min(cos_shape[0]);
+        // The index tensors are capacity-sized; only Q's active row count is
+        // valid for this step. Iterating positions.numel() would write past Q/K.
+        let pos_slice = unsafe { std::slice::from_raw_parts(positions.data_ptr(), num_tokens) };
 
-        for t in 0..num_tokens {
-            let pos = pos_slice[t] as usize;
+        for (t, &raw_pos) in pos_slice.iter().enumerate() {
+            if raw_pos < 0 || raw_pos as usize >= cache_rows {
+                return Err(OpError::Shape(format!(
+                    "rope_inplace: position {raw_pos} at token {t} is outside [0, {cache_rows})"
+                )));
+            }
+            let pos = raw_pos as usize;
             for h in 0..head_num {
                 for i in 0..(head_dim / 2) {
                     let sin_val = unsafe { read_f64(sin.data_ptr().add(pos * head_dim + i)) };
@@ -705,7 +762,7 @@ impl DiffusionOps for Cpu {
         let n = output.numel();
         for i in 0..n {
             unsafe {
-                let v = read_f64((output.data_ptr() as *const T).add(i));
+                let v = read_f64(output.data_ptr().add(i));
                 write_f64(output.data_ptr_mut().add(i), v / (1.0 + (-v).exp()));
             }
         }
@@ -809,7 +866,7 @@ impl DiffusionOps for Cpu {
             let kv_h = h / kv_mul;
             for t in 0..seq_len {
                 let mut scores = vec![0.0f64; seq_len];
-                for s in 0..seq_len {
+                for (s, score) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0f64;
                     for d in 0..head_dim {
                         unsafe {
@@ -824,7 +881,7 @@ impl DiffusionOps for Cpu {
                             dot += qi * ki;
                         }
                     }
-                    scores[s] = dot * scale as f64;
+                    *score = dot * scale as f64;
                 }
                 // Softmax
                 let max_s = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -839,13 +896,13 @@ impl DiffusionOps for Cpu {
                 // Weighted sum
                 for d in 0..head_dim {
                     let mut val = 0.0f64;
-                    for s in 0..seq_len {
+                    for (s, &score) in scores.iter().enumerate() {
                         unsafe {
                             let vi = read_f64(
                                 v.data_ptr()
                                     .add(s * num_kv_heads * head_dim + kv_h * head_dim + d),
                             );
-                            val += scores[s] * vi;
+                            val += score * vi;
                         }
                     }
                     unsafe {
@@ -1094,7 +1151,6 @@ mod tests {
         assert_eq!(b, 42);
     }
 
-
     #[test]
     fn op_embedding() {
         let table =
@@ -1104,6 +1160,23 @@ mod tests {
         Cpu::embedding(&table, &indices, &mut output).unwrap();
         assert_eq!(&output.as_slice()[..3], &[2.1, 2.2, 2.3]);
         assert_eq!(&output.as_slice()[3..6], &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn rope_uses_active_q_rows_not_position_capacity() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut q = Tensor::<f32, Cpu>::from_slice(&values, [2, 4]);
+        let mut k = Tensor::<f32, Cpu>::from_slice(&values, [2, 4]);
+        let sin = Tensor::<f32, Cpu>::from_slice(&[0.0; 16], [4, 4]);
+        let cos = Tensor::<f32, Cpu>::from_slice(&[1.0; 16], [4, 4]);
+        // Runtime index buffers are capacity-sized. Only the first q.shape()[0]
+        // positions describe active rows in this step.
+        let positions = Tensor::<i32, Cpu>::from_slice(&[0, 1, 3, 3, 3, 3], [6]);
+
+        Cpu::rope_inplace(&mut q, &mut k, &sin, &cos, &positions, 1, 1, 4).unwrap();
+
+        assert_eq!(q.as_slice(), &values);
+        assert_eq!(k.as_slice(), &values);
     }
 
     // ─── Diffusion op tests ─────────────────────────────────────────
@@ -1118,8 +1191,8 @@ mod tests {
         let mut output = Tensor::<f32, Cpu>::zeros_cpu(Shape::from_slice(&[1, 1, 3, 3]));
         Cpu::conv2d(&input, &weight, None, &mut output, 1, 0).unwrap();
         let out = output.as_slice();
-        for i in 0..9 {
-            assert!((out[i] - (i + 1) as f32 * 2.0).abs() < 1e-5);
+        for (i, &actual) in out.iter().enumerate().take(9) {
+            assert!((actual - (i + 1) as f32 * 2.0).abs() < 1e-5);
         }
     }
 

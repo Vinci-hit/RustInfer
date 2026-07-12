@@ -16,6 +16,7 @@ import json
 import random
 import time
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List
 
 import aiohttp
@@ -201,7 +202,11 @@ async def main():
     ap.add_argument("--target", choices=["rustinfer", "vllm"], required=True)
     ap.add_argument("--url", default=None, help="Override URL (default: localhost:8000 for RI, :8001 for vLLM)")
     ap.add_argument("--port", type=int, default=None)
-    ap.add_argument("--prompts", default="/root/RustInfer/bench/bench_prompts.json")
+    ap.add_argument(
+        "--prompts",
+        type=Path,
+        default=Path(__file__).with_name("bench_prompts.json"),
+    )
     ap.add_argument("--duration", type=int, default=60, help="Test duration in seconds")
     ap.add_argument("--concurrency", type=int, default=32, help="Max concurrent requests")
     ap.add_argument("--output", default=None, help="Save results JSON")

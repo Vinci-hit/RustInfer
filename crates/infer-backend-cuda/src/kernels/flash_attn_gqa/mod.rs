@@ -228,31 +228,47 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// Process-lifetime FA3 scratch: softmax LSE (`head_num * q_extent` f32) and
-/// the tile-count semaphore. Grow-only, so steady state issues zero
-/// allocations (a per-step `cudaMalloc` is the known TTFT-regression shape).
+/// Process-lifetime, per-device FA3 scratch: softmax LSE
+/// (`head_num * q_extent` f32) and the tile-count semaphore. Grow-only, so
+/// steady state issues zero allocations (a per-step `cudaMalloc` is the known
+/// TTFT-regression shape).
+///
+/// A captured CUDA graph stores the LSE address passed to its FA3 node. Old
+/// allocations therefore remain alive when a larger eager request grows the
+/// current scratch; freeing them would leave every graph captured with the old
+/// address holding a dangling pointer. Growth is rare and geometric in normal
+/// workloads, so retaining those allocations until process exit is a small,
+/// bounded trade for address stability.
 #[cfg(rustinfer_fa3)]
 struct Fa3Scratch {
     lse: *mut f32,
     lse_cap: usize,
     semaphore: *mut i32,
+    retired_lse: Vec<*mut f32>,
 }
 
 #[cfg(rustinfer_fa3)]
 unsafe impl Send for Fa3Scratch {}
 
 #[cfg(rustinfer_fa3)]
-static FA3_SCRATCH: std::sync::Mutex<Fa3Scratch> = std::sync::Mutex::new(Fa3Scratch {
-    lse: std::ptr::null_mut(),
-    lse_cap: 0,
-    semaphore: std::ptr::null_mut(),
-});
+static FA3_SCRATCH: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i32, Fa3Scratch>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(rustinfer_fa3)]
 fn fa3_scratch(head_num: usize, q_extent: usize) -> OpResult<(*mut f32, *mut i32)> {
     use crate::ffi;
-    let mut guard = FA3_SCRATCH.lock().unwrap();
-    if guard.semaphore.is_null() {
+    let device = crate::device_utils::current_device()?;
+    let mut all_scratch = FA3_SCRATCH
+        .lock()
+        .map_err(|_| OpError::Kernel("FA3 scratch lock poisoned".into()))?;
+    let scratch = all_scratch.entry(device).or_insert_with(|| Fa3Scratch {
+        lse: std::ptr::null_mut(),
+        lse_cap: 0,
+        semaphore: std::ptr::null_mut(),
+        retired_lse: Vec::new(),
+    });
+    if scratch.semaphore.is_null() {
         let mut p: *mut c_void = std::ptr::null_mut();
         let err = unsafe { ffi::cudaMalloc(&mut p, std::mem::size_of::<i32>()) };
         if err != ffi::cudaError_cudaSuccess {
@@ -261,29 +277,27 @@ fn fa3_scratch(head_num: usize, q_extent: usize) -> OpResult<(*mut f32, *mut i32
                 err
             )));
         }
-        guard.semaphore = p as *mut i32;
+        scratch.semaphore = p as *mut i32;
     }
     // Floor at 8192 rows so the common config allocates exactly once.
     let need = head_num * q_extent;
-    if guard.lse_cap < need {
+    if scratch.lse_cap < need {
         let want = need.max(head_num * 8192);
-        if !guard.lse.is_null() {
-            unsafe { ffi::cudaFree(guard.lse as *mut c_void) };
-        }
         let mut p: *mut c_void = std::ptr::null_mut();
         let err = unsafe { ffi::cudaMalloc(&mut p, want * std::mem::size_of::<f32>()) };
         if err != ffi::cudaError_cudaSuccess {
-            guard.lse = std::ptr::null_mut();
-            guard.lse_cap = 0;
             return Err(OpError::Kernel(format!(
                 "FA3 LSE scratch cudaMalloc({} f32) failed: {:?}",
                 want, err
             )));
         }
-        guard.lse = p as *mut f32;
-        guard.lse_cap = want;
+        if !scratch.lse.is_null() {
+            scratch.retired_lse.push(scratch.lse);
+        }
+        scratch.lse = p as *mut f32;
+        scratch.lse_cap = want;
     }
-    Ok((guard.lse, guard.semaphore))
+    Ok((scratch.lse, scratch.semaphore))
 }
 
 /// FA3 serves ragged prefill launches outside CUDA graph capture unconditionally;
@@ -324,7 +338,7 @@ fn fa3_ragged_eligible<T: Dtype>(_head_dim: usize, _stream: cudaStream_t) -> boo
 pub fn fa3_unified_available<T: Dtype>(head_dim: usize) -> bool {
     T::DATA_TYPE == DataType::BF16
         && head_dim == 128
-        && !std::env::var_os(PREFILL_FA3_ENV).is_some_and(|v| v == "0")
+        && std::env::var_os(PREFILL_FA3_ENV).is_none_or(|v| v != "0")
 }
 
 #[cfg(not(rustinfer_fa3))]
@@ -421,7 +435,9 @@ unsafe fn launch_fa3_ragged<T: Dtype>(
     _scale: f32,
     _stream: cudaStream_t,
 ) -> OpResult<()> {
-    Err(OpError::Kernel("FA3 kernels not built for this arch".into()))
+    Err(OpError::Kernel(
+        "FA3 kernels not built for this arch".into(),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,7 +507,7 @@ pub fn flash_decode_workspace_capacity_f32(
     let bytes = unsafe {
         flash_attn_batched_decode_workspace_bytes(batch as i32, num_q_heads as i32, head_dim as i32)
     } as usize;
-    (bytes + 3) / 4
+    bytes.div_ceil(4)
 }
 
 /// Launch the CuTe paged ragged Flash kernel over a (sub)set of q tiles. The
@@ -723,8 +739,8 @@ pub fn attention_paged<T: Dtype>(
             // cudnn_paged_attention.cu), so warmup and the captured graph run the
             // SAME cuDNN kernel. Opt out (custom kernel) via env.
             let use_cudnn = std::env::var_os(DISABLE_CUDNN_ATTENTION_ENV).is_none();
-            if use_cudnn {
-                if let Some(cudnn_status) = unsafe {
+            if use_cudnn
+                && let Some(cudnn_status) = unsafe {
                     try_cudnn_paged_decode(
                         device,
                         q,
@@ -743,18 +759,18 @@ pub fn attention_paged<T: Dtype>(
                         batch,
                         stream,
                     )
-                } {
-                    if cudnn_status == 0 {
-                        return Ok(());
-                    }
-                    if std::env::var_os(STRICT_CUDNN_ATTENTION_ENV).is_some() {
-                        return Err(OpError::Kernel(format!(
-                            "cuDNN paged decode attention failed with status {}",
-                            cudnn_status
-                        )));
-                    }
                 }
-            } // end if use_cudnn
+            {
+                if cudnn_status == 0 {
+                    return Ok(());
+                }
+                if std::env::var_os(STRICT_CUDNN_ATTENTION_ENV).is_some() {
+                    return Err(OpError::Kernel(format!(
+                        "cuDNN paged decode attention failed with status {}",
+                        cudnn_status
+                    )));
+                }
+            }
 
             // The caller pre-allocated `workspace` with at least
             // `flash_attn_batched_decode_workspace_bytes(cap_batch, head_num, head_dim)`

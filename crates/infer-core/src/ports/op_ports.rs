@@ -1,3 +1,7 @@
+// Operator ports intentionally expose complete kernel launch geometry; bundling
+// these stable ABI-like parameters would obscure backend implementations.
+#![allow(clippy::too_many_arguments)]
+
 use super::device::MemoryPort;
 use super::error::OpResult;
 use infer_core::dtype::quant::QuantScheme;

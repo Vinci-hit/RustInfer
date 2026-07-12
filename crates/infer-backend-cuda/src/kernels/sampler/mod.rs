@@ -54,7 +54,7 @@ pub fn argmax<T: Dtype>(
     // the C entry's `batch_size` is the selector length, not logits rows.
     let (sel_ptr, eff_batch) = match selected_rows {
         None => (std::ptr::null::<i32>(), logits_rows),
-        Some(sel) => (sel.data_ptr() as *const i32, sel.numel() as i32),
+        Some(sel) => (sel.data_ptr(), sel.numel() as i32),
     };
     unsafe {
         match T::DATA_TYPE {

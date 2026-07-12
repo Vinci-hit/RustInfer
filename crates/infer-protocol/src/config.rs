@@ -127,7 +127,7 @@ pub struct RustInferConfig {
     #[serde(default)]
     pub ignore_eos: bool,
 
-    /// Scheduler mode: "llm" or "diffusion".
+    /// Scheduler mode. Only `"llm"` is supported in this release.
     #[serde(default = "default_mode")]
     pub mode: String,
 
@@ -239,14 +239,11 @@ impl RustInferConfig {
         if self.port == 0 {
             return Err("`port` must be > 0".into());
         }
-        match self.mode.as_str() {
-            "llm" | "diffusion" => {}
-            other => {
-                return Err(format!(
-                    "`mode` must be \"llm\" or \"diffusion\", got {:?}",
-                    other
-                ));
-            }
+        if self.mode != "llm" {
+            return Err(format!(
+                "`mode` must be \"llm\"; diffusion is disabled in this release, got {:?}",
+                self.mode
+            ));
         }
         Ok(())
     }
@@ -431,5 +428,25 @@ mod model_type_tests {
     fn unknown_hint_falls_through() {
         assert_eq!(classify_model_type(""), None);
         assert_eq!(classify_model_type("mistral"), None);
+    }
+}
+
+#[cfg(test)]
+mod launch_config_tests {
+    use super::RustInferConfig;
+
+    #[test]
+    fn diffusion_mode_is_rejected() {
+        let config: RustInferConfig = toml::from_str(
+            r#"
+                model = "/tmp/model"
+                mode = "diffusion"
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.contains("diffusion is disabled"));
     }
 }

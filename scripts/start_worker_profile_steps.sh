@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Profile RustInfer Worker with --profile-cuda-steps (cudaProfilerApi range)
 #
@@ -13,11 +13,27 @@
 # Startup order: run AFTER start_scheduler.sh
 #
 
-set -e
+set -euo pipefail
 
-CONFIG="${CONFIG:-${1:-rustinfer.toml}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+CONFIG="${CONFIG:-${1:-$REPO_ROOT/rustinfer.toml}}"
 PROFILE_STEPS="${PROFILE_STEPS:-200}"
 NSYS_OUTPUT="${NSYS_OUTPUT:-result/nsys_worker_steps}"
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Config not found: $CONFIG" >&2
+    exit 2
+fi
+command -v nsys >/dev/null 2>&1 || {
+    echo "nsys is required for profiling" >&2
+    exit 127
+}
+CONFIG="$(cd -- "$(dirname -- "$CONFIG")" && pwd)/$(basename -- "$CONFIG")"
+
+# shellcheck source=scripts/lib/cuda_env.sh
+source "$SCRIPT_DIR/lib/cuda_env.sh"
+rustinfer_discover_cuda_libraries
 
 mkdir -p "$(dirname "$NSYS_OUTPUT")"
 
@@ -31,6 +47,7 @@ echo "════════════════════════�
 echo ""
 
 # Build first (release mode)
+cd "$REPO_ROOT"
 cargo build --release -p infer-worker --bin rustinfer-worker
 
 nsys profile \

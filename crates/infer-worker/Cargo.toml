@@ -1,29 +1,32 @@
 [package]
 name = "infer-worker"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "RustInfer Worker: GPU inference runtime with DDD architecture (domain/infra/app)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+autoexamples = false
 
 [[bin]]
 name = "rustinfer-worker"
 path = "src/bin/worker_main.rs"
 required-features = ["cuda"]
 
-[[example]]
-name = "zimage_demo"
-required-features = ["cuda"]
-
 [dependencies]
-infer-protocol = { path = "../infer-protocol" }
-infer-core = { path = "../infer-core" }
-infer-backend-cpu = { path = "../infer-backend-cpu" }
-infer-backend-cuda = { path = "../infer-backend-cuda", optional = true }
+infer-protocol = { version = "1.0.1", path = "../infer-protocol" }
+infer-core = { version = "1.0.1", path = "../infer-core" }
+infer-backend-cpu = { version = "1.0.1", path = "../infer-backend-cpu" }
+infer-backend-cuda = { version = "1.0.1", path = "../infer-backend-cuda", optional = true }
 half = { version = "2.7.1", features = ["std", "num-traits"] }
 thiserror = "2.0.17"
 num-traits = "0.2.19"
 dashmap = "6.1.0"
 once_cell = "1.21.3"
 rayon = "1.11.0"
+rand = "0.9"
 safetensors = "0.6.2"
 memmap2 = "0.9"
 serde = { version = "1.0", features = ["derive"] }
@@ -33,9 +36,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmp-serde = "1.3"
 clap = { version = "4", features = ["derive"] }
 zmq = "0.10"
-tokenizers = "0.22.2"
+tokenizers = "0.23.1"
 anyhow = "1"
-png = "0.17"
 
 [features]
 default = ["cuda"]

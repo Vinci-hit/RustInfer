@@ -119,7 +119,7 @@ impl PlanningSystem {
             if is_continuation {
                 match sessions.set_prefill_inflight(&entry.request_id, scheduled_len) {
                     Ok(segment) => self.current_chunk_sizes.push((
-                        entry.request_id.clone(),
+                        entry.request_id,
                         segment.segment_end - segment.segment_start,
                     )),
                     Err(e) => tracing::warn!(
@@ -166,10 +166,8 @@ impl PlanningSystem {
                         segment,
                         ..
                     } => {
-                        self.current_chunk_sizes.push((
-                            request_id.clone(),
-                            segment.segment_end - segment.segment_start,
-                        ));
+                        self.current_chunk_sizes
+                            .push((request_id, segment.segment_end - segment.segment_start));
                         if !matched_indices.is_empty() {
                             self.current_prefix_hints
                                 .push((request_id, matched_indices));

@@ -187,7 +187,10 @@ impl BatchBuilder {
                 // start_decode), and the worker counts generated tokens from
                 // this prefill onward.
                 max_tokens: seq.meta.max_tokens.saturating_sub(
-                    seq.state.resume.as_ref().map_or(0, |resume| resume.generated),
+                    seq.state
+                        .resume
+                        .as_ref()
+                        .map_or(0, |resume| resume.generated),
                 ),
                 sampling_params: WorkerSamplingParams {
                     temperature: seq.meta.sampling.temperature,
@@ -278,7 +281,7 @@ mod tests {
         };
         let codec = MsgPackCodec;
         let seq = make_prefilling_with_blocks();
-        let request_id = seq.meta.id.clone();
+        let request_id = seq.meta.id;
 
         let mut builder = BatchBuilder::new();
         let bytes = builder
@@ -306,7 +309,7 @@ mod tests {
         };
         let codec = MsgPackCodec;
         let seq = make_prefilling_with_blocks();
-        let request_id = seq.meta.id.clone();
+        let request_id = seq.meta.id;
 
         let mut builder = BatchBuilder::new();
         let bytes = builder
@@ -314,7 +317,7 @@ mod tests {
                 &[&seq],
                 &config,
                 &codec,
-                &[(request_id.clone(), 4)],
+                &[(request_id, 4)],
                 &[(request_id, vec![100, 101, 102])],
             )
             .unwrap();
@@ -340,7 +343,7 @@ mod tests {
         };
         let codec = MsgPackCodec;
         let seq1 = make_prefilling_with_blocks();
-        let id1 = seq1.meta.id.clone();
+        let id1 = seq1.meta.id;
         let mut builder = BatchBuilder::new();
         let _bytes1 = builder
             .build_llm_batch(&[&seq1], &config, &codec, &[(id1, 4)], &[])
@@ -348,7 +351,7 @@ mod tests {
 
         // Second iteration: same builder, fresh session.
         let seq2 = make_prefilling_with_blocks();
-        let id2 = seq2.meta.id.clone();
+        let id2 = seq2.meta.id;
         let bytes2 = builder
             .build_llm_batch(&[&seq2], &config, &codec, &[(id2, 4)], &[])
             .unwrap();

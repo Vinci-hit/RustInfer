@@ -55,7 +55,7 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for MoeFfn<T, D> {
         let num_experts = gate_shape[0];
         let gate_cols = gate_shape[1];
         let inter = gate_cols / 2;
-        if gate_cols == 0 || gate_cols % 2 != 0 || gate_shape[2] != dim {
+        if gate_cols == 0 || !gate_cols.is_multiple_of(2) || gate_shape[2] != dim {
             return Err(OpError::Shape(format!(
                 "MoeFfn::run: invalid gate shape {:?} for dim {}",
                 gate_shape, dim

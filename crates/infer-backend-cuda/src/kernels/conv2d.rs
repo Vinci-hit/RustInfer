@@ -94,11 +94,8 @@ pub fn conv2d<T: Dtype>(
             kw,
         ))?;
 
-        let compute_type = if T::DATA_TYPE == DataType::F32 {
-            ffi::cudnnDataType_t::CUDNN_DATA_FLOAT
-        } else {
-            ffi::cudnnDataType_t::CUDNN_DATA_FLOAT // accumulate in f32
-        };
+        // cuDNN accumulates every supported input dtype in f32.
+        let compute_type = ffi::cudnnDataType_t::CUDNN_DATA_FLOAT;
         check_cudnn(ffi::cudnnSetConvolution2dDescriptor(
             conv_desc,
             padding as i32,

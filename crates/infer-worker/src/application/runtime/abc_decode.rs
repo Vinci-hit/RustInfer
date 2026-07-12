@@ -41,7 +41,9 @@ where
         // Pin the persistent block-table staging too — it is the largest
         // per-step H2D on the decode path and was previously a pageable
         // (host-synchronous) copy.
-        D::pipeline_pin_host_i32(&self.scope, &self.block_tables_host)?;
+        for block_tables_host in &self.block_tables_host {
+            D::pipeline_pin_host_i32(&self.scope, block_tables_host)?;
+        }
         self.abc.pinned = true;
         Ok(())
     }

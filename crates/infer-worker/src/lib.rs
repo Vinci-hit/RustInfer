@@ -7,7 +7,7 @@
 //! │ application/      应用层 (Runtime, DecodeEngine,          │
 //! │                   ServeLoop)                             │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ models/           具体模型 (Qwen3, Llama3, Diffusion)    │
+//! │ models/           具体模型 (Qwen3, Llama3)               │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ domain/           域层 — 纯的，零 FFI，零 I/O             │
 //! │   types, tensor, ports, batch, model trait               │

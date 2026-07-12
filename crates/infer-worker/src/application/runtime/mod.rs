@@ -63,17 +63,23 @@ where
     /// `from_host_slice` tensor whose throwaway host Vec forced a full sync.
     pub prefill_ids_buf: Tensor<i32, D>,
     prefill_ids_host: Vec<i32>,
-    /// Persistent host staging for the paged block tables (capacity
-    /// `cap_batch * max_blocks_per_seq`). Rewritten in place every step and
-    /// async-uploaded into `kv_index.block_tables`. Lives for the runtime's
-    /// lifetime so the `upload_async` (cudaMemcpyAsync) contract holds — the
+    /// Double-buffered persistent host staging for the paged block tables
+    /// (each buffer has capacity `cap_batch * max_blocks_per_seq`). The active
+    /// buffer is rewritten and async-uploaded into `kv_index.block_tables`.
+    /// Both live for the runtime's lifetime so the `upload_async`
+    /// (`cudaMemcpyAsync`) contract holds — the
     /// previous code allocated+zeroed a fresh `Vec` per step and uploaded from
     /// it, which (a) churned 1–4 MiB/step in the decode hot loop, (b) was
     /// pageable so the "async" copy silently degraded to a synchronous one, and
     /// (c) freed the host buffer before the stream consumed it. Pinned lazily
     /// alongside the ABC buffers so the copy is genuinely async on the decode
     /// path.
-    block_tables_host: Vec<i32>,
+    /// Two buffers are required by the one-deep overlapped pipeline: step N+1
+    /// may be issued before step N is finalized, so reusing one pinned host
+    /// buffer would race step N's H2D DMA. By the time step N+2 reuses N's
+    /// buffer, finalizing N has proved that its transfer completed.
+    block_tables_host: [Vec<i32>; 2],
+    block_tables_host_next: usize,
     /// ABC GPU-resident decode pipeline buffers. Buffer A is `input_ids_buf`.
     pub abc: AbcBuffers<D>,
     /// Async-decode device control plane scratch (built lazily on first async
@@ -196,7 +202,10 @@ struct AsyncControlBuffers<D: Device> {
 /// RAII guard that restores the default (decode) GEMM mode when an eager prefill
 /// forward returns — including early `?` returns. The `bool` records whether the
 /// mode was actually flipped on, so the no-prefill case is a cheap no-op.
-pub(super) struct PrefillGemmGuard<D: LlmBackend>(pub(super) bool, pub(super) std::marker::PhantomData<D>);
+pub(super) struct PrefillGemmGuard<D: LlmBackend>(
+    pub(super) bool,
+    pub(super) std::marker::PhantomData<D>,
+);
 impl<D: LlmBackend> Drop for PrefillGemmGuard<D> {
     fn drop(&mut self) {
         if self.0 {
@@ -294,7 +303,7 @@ where
         // batches and for the bucketed mixed graph's padded `cap_batch + ⌈B/TILE⌉`
         // tile grid).
         let tile = crate::domain::plan::RAGGED_Q_TILE as usize;
-        let cap_total_q_tiles = (cap_batch + (cap_num_tokens + tile - 1) / tile).max(1);
+        let cap_total_q_tiles = (cap_batch + cap_num_tokens.div_ceil(tile)).max(1);
         let alloc_i32 = |n: usize| D::alloc_tensor::<i32>(Shape::from_slice(&[n.max(1)]), device);
         let kv_index = KvIndexTensors {
             block_tables: alloc_i32(cap_batch * max_blocks_per_seq)?,
@@ -318,7 +327,11 @@ where
         let prefill_ids_buf =
             D::alloc_tensor::<i32>(Shape::from_slice(&[cap_num_tokens.max(1)]), device)?;
         let prefill_ids_host = vec![0i32; cap_num_tokens.max(1)];
-        let block_tables_host = vec![0i32; (cap_batch * max_blocks_per_seq).max(1)];
+        let block_tables_host_len = (cap_batch * max_blocks_per_seq).max(1);
+        let block_tables_host = [
+            vec![0i32; block_tables_host_len],
+            vec![0i32; block_tables_host_len],
+        ];
 
         // ── ABC pipeline buffers (Stage 1: allocated, wired in later stages) ──
         let cb = cap_batch.max(1);
@@ -384,8 +397,7 @@ where
                 Some("0") => (true, false),
                 _ => {
                     let fa3_graph = fa3_avail
-                        && std::env::var("RUSTINFER_MIXED_FA3_GRAPH").ok().as_deref()
-                            != Some("0");
+                        && std::env::var("RUSTINFER_MIXED_FA3_GRAPH").ok().as_deref() != Some("0");
                     if fa3_graph {
                         (false, true)
                     } else {
@@ -414,6 +426,7 @@ where
             prefill_ids_buf,
             prefill_ids_host,
             block_tables_host,
+            block_tables_host_next: 0,
             abc,
             prefill_graphs_captured: 0,
             mixed_graphs_captured: 0,
@@ -438,7 +451,15 @@ where
     pub fn step(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
         let plan = self.build_plan(req)?;
         self.upload_index(&plan, req)?;
-        match self.decide(&plan) {
+        let decision = if req.sampling.iter().any(|params| !params.is_greedy()) {
+            // Captured decode and mixed ABC graphs include an argmax node and
+            // expose no logits to the sampler. Stochastic requests therefore
+            // use the eager tail, while deterministic traffic retains graphs.
+            GraphDecision::Eager
+        } else {
+            self.decide(&plan)
+        };
+        match decision {
             GraphDecision::Eager => self.step_eager(&plan, req),
             GraphDecision::Graph(slot) => self.step_graph(slot, &plan, req),
             GraphDecision::PrefillGraph(num_tokens) => {
@@ -549,51 +570,69 @@ where
         let logits = self.model.finalize(&hidden, sample_rows, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
-            // Greedy fast path: reuse the ABC argmax workspace instead of having
-            // `Sampler::sample` allocate a fresh `[rows]` output + `[rows*512]`
-            // scratch every call. The CUDA backend's `argmax` (used by
-            // `GreedySampler::sample`) otherwise pays two `Tensor::zeros`
-            // (cudaMallocAsync + memset) per prefill, which directly inflated
-            // TTFT at low QPS after the buffer-pipeline refactor.
-            //
-            // `finalize(LastPerSeq)` already projected exactly one logits row per
-            // sequence (the last token of each), in `q_lens` order. So
-            // `argmax_into` yields one id per sequence and seq `i` maps directly
-            // to row `i` — no per-sequence `offset + q_len - 1` indexing.
-            let logits_rows = logits.0.shape().as_slice()[0];
-            if logits_rows > self.abc.argmax_out_dev.numel() {
-                return Err(OpError::Shape(format!(
-                    "sample_tail: logits rows {} exceeds argmax_out capacity {}",
-                    logits_rows,
-                    self.abc.argmax_out_dev.numel()
-                )));
-            }
-            // Pass a `[logits_rows]`-sized view of the (capacity `argmax_cap`)
-            // output buffer: `argmax_into` writes exactly one id per logits row,
-            // and the reference path requires the output numel to match.
-            let mut argmax_out = self.abc.argmax_out_dev.view_raw(
-                Shape::from_slice(&[logits_rows]),
-                Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
-                0,
-                true,
-            );
-            D::argmax_into(&ctx, &logits.0, &mut argmax_out, &self.abc.argmax_ws, None)?;
-            let ids = argmax_out.to_host_vec()?;
-            let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
-            for i in 0..plan.q_lens.len() {
-                let token_id = *ids.get(i).ok_or_else(|| {
-                    OpError::Shape(format!(
-                        "sample_tail: sampled row {} out of argmax range {}",
-                        i,
-                        ids.len()
-                    ))
-                })?;
-                tokens.push(vec![SampledToken {
-                    token_id,
-                    logprob: 0.0,
-                    top_logprobs: Vec::new(),
-                }]);
-            }
+            let mut tokens: Vec<Vec<SampledToken>> =
+                if req.sampling.iter().any(|params| !params.is_greedy()) {
+                    let sampled = self.sampler.sample(&logits.0, &req.sampling, &ctx)?;
+                    if sampled.tokens.len() != plan.batch {
+                        return Err(OpError::Shape(format!(
+                            "sample_tail: sampler returned {} rows for batch {}",
+                            sampled.tokens.len(),
+                            plan.batch
+                        )));
+                    }
+                    sampled
+                        .tokens
+                        .into_iter()
+                        .map(|token| vec![token])
+                        .collect()
+                } else {
+                    // Greedy fast path: reuse the ABC argmax workspace instead of having
+                    // `Sampler::sample` allocate a fresh `[rows]` output + `[rows*512]`
+                    // scratch every call. The CUDA backend's `argmax` (used by
+                    // `GreedySampler::sample`) otherwise pays two `Tensor::zeros`
+                    // (cudaMallocAsync + memset) per prefill, which directly inflated
+                    // TTFT at low QPS after the buffer-pipeline refactor.
+                    //
+                    // `finalize(LastPerSeq)` already projected exactly one logits row per
+                    // sequence (the last token of each), in `q_lens` order. So
+                    // `argmax_into` yields one id per sequence and seq `i` maps directly
+                    // to row `i` — no per-sequence `offset + q_len - 1` indexing.
+                    let logits_rows = logits.0.shape().as_slice()[0];
+                    if logits_rows > self.abc.argmax_out_dev.numel() {
+                        return Err(OpError::Shape(format!(
+                            "sample_tail: logits rows {} exceeds argmax_out capacity {}",
+                            logits_rows,
+                            self.abc.argmax_out_dev.numel()
+                        )));
+                    }
+                    // Pass a `[logits_rows]`-sized view of the (capacity `argmax_cap`)
+                    // output buffer: `argmax_into` writes exactly one id per logits row,
+                    // and the reference path requires the output numel to match.
+                    let mut argmax_out = self.abc.argmax_out_dev.view_raw(
+                        Shape::from_slice(&[logits_rows]),
+                        Shape::from_slice(&[logits_rows.max(1)]).contiguous_strides(),
+                        0,
+                        true,
+                    );
+                    D::argmax_into(&ctx, &logits.0, &mut argmax_out, &self.abc.argmax_ws, None)?;
+                    let ids = argmax_out.to_host_vec()?;
+                    let mut tokens: Vec<Vec<SampledToken>> = Vec::with_capacity(plan.batch);
+                    for i in 0..plan.q_lens.len() {
+                        let token_id = *ids.get(i).ok_or_else(|| {
+                            OpError::Shape(format!(
+                                "sample_tail: sampled row {} out of argmax range {}",
+                                i,
+                                ids.len()
+                            ))
+                        })?;
+                        tokens.push(vec![SampledToken {
+                            token_id,
+                            logprob: 0.0,
+                            top_logprobs: Vec::new(),
+                        }]);
+                    }
+                    tokens
+                };
             tokens.resize_with(plan.batch, Vec::new);
             let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
             let speculative_len = vec![0; plan.batch];
@@ -835,14 +874,8 @@ where
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             layers.push(PagedKvLayer {
-                k: D::alloc_tensor(
-                    Shape::from_slice(&[num_blocks, block_size, kv_dim]),
-                    device,
-                )?,
-                v: D::alloc_tensor(
-                    Shape::from_slice(&[num_blocks, block_size, kv_dim]),
-                    device,
-                )?,
+                k: D::alloc_tensor(Shape::from_slice(&[num_blocks, block_size, kv_dim]), device)?,
+                v: D::alloc_tensor(Shape::from_slice(&[num_blocks, block_size, kv_dim]), device)?,
             });
         }
         self.kv_pool.layers = layers;
@@ -1027,7 +1060,7 @@ pub(super) unsafe fn upload_i32_range<D: Device>(
         )));
     }
     let bytes = std::mem::size_of_val(host);
-    let base = dst.data_ptr_mut() as *mut i32;
+    let base = dst.data_ptr_mut();
     let ptr = unsafe { NonNull::new_unchecked(base.add(start) as *mut u8) };
     unsafe { device.upload_async(ptr, host.as_ptr() as *const u8, bytes) }
 }
@@ -1099,7 +1132,7 @@ mod tests {
     use crate::domain::exec::{HostScope, StepCtx};
     use crate::domain::kv::KvView;
     use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
-    use crate::domain::plan::{BatchKind, SeqStep, StopCriteria};
+    use crate::domain::plan::{SeqStep, StopCriteria};
     use crate::infrastructure::cpu::Cpu;
 
     struct TinyDecoder;
@@ -1242,7 +1275,6 @@ mod tests {
 
         assert!(format!("{err:?}").contains("max_tokens len 1 != batch 2"));
     }
-
 
     #[test]
     fn runtime_prime_graphs_unsupported_scope_stays_eager() {

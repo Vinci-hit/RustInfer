@@ -12,6 +12,7 @@ use crate::domain::tensor::Tensor;
 /// gains int4 support with no change to callers. Extending to GPTQ / FP8 later
 /// means adding a variant here — the [`Linear::forward`] dispatch is the only
 /// place that needs to learn the new format.
+#[allow(clippy::large_enum_variant)] // Dense and AWQ layouts stay allocation-free after loading.
 pub enum LinearWeight<T: Dtype, D: LlmBackend> {
     /// Dense `[N, K]` weight in the activation dtype `T`.
     Dense(Tensor<T, D>),

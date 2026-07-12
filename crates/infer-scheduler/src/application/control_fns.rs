@@ -67,6 +67,7 @@ impl ControlCtx<'_> {
 /// **Does not** call any output functions. The orchestrator is
 /// responsible for driving any returned `failed_request_ids`
 /// through `output_fns::fail_sessions(...)`.
+#[allow(clippy::too_many_arguments)] // Explicit state partitions keep control handling testable.
 pub fn handle_control_event(
     event: ControlEvent,
     sessions: &mut RequestTable,
@@ -411,7 +412,7 @@ mod tests {
     fn dummy_running_session(table: &mut RequestTable, external_id: &str, sid: u64) -> RequestId {
         let request_id = RequestId::new_v4();
         let meta = Arc::new(RequestMeta {
-            id: request_id.clone(),
+            id: request_id,
             external_id: external_id.into(),
             sequence_id: SequenceId(sid),
             input_ids: vec![1, 2, 3, 4],

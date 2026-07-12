@@ -77,13 +77,13 @@ impl<D: LlmBackend> GraphRunner<D> {
                 "GraphRunner::new: capture size 0 is invalid".into(),
             ));
         }
-        if let Some(&max_size) = capture_sizes.last() {
-            if max_size > cap_batch {
-                return Err(OpError::Shape(format!(
-                    "GraphRunner::new: capture size {} > cap_batch {}",
-                    max_size, cap_batch
-                )));
-            }
+        if let Some(&max_size) = capture_sizes.last()
+            && max_size > cap_batch
+        {
+            return Err(OpError::Shape(format!(
+                "GraphRunner::new: capture size {} > cap_batch {}",
+                max_size, cap_batch
+            )));
         }
         Ok(Self {
             capture_sizes,

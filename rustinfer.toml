@@ -7,8 +7,9 @@
 # `model_type` is intentionally NOT here — it is resolved from the model's
 # config.json so the worker dispatch / chat template always match the weights.
 
-# Model directory (weights + tokenizer.json + config.json). Required.
-model = "/mnt/md2/liuwenqi/vllm_bench/dir"
+# Model directory (weights + tokenizer.json + config.json). Required. Relative
+# paths are resolved from the directory where the binaries are launched.
+model = "./models/model"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
@@ -18,17 +19,17 @@ model_name = ""
 cluster_id = "rustinfer"
 
 # CUDA device.
-device = "cuda:7"
+device = "cuda:0"
 
 # HTTP API server.
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8000
 request_timeout_secs = 600
 
 # Batching / capacity.
-max_batch_tokens = 8192
-max_batch_seqs = 256
-max_model_len = 1024
+max_batch_tokens = 4096
+max_batch_seqs = 32
+max_model_len = 4096
 
 # Throughput knob: max time (ms) the scheduler waits accumulating freshly
 # arrived requests into one larger prefill batch before dispatching.
@@ -40,13 +41,13 @@ batch_wait_ms = 0
 paged_block_size = 1
 chunked_prefill_size = 256    # bound prefill tokens per fused step so burst arrivals can't stall decode rows (qps32 ITL p99 tail); 0 => whole prompt in one step
 enable_prefix_caching = false
-mem_fraction_static = 0.9
+mem_fraction_static = 0.85
 num_blocks = 0                # 0 => auto-size
 
 # Generation.
-ignore_eos = true
+ignore_eos = false
 
-# Scheduler mode: "llm" or "diffusion".
+# Scheduler mode. Diffusion is disabled in this release.
 mode = "llm"
 
 # Worker.
@@ -58,8 +59,6 @@ log_level = "info"
 # CUDA graph capture sizes for decode batches.
 # Determines which batch sizes have pre-captured CUDA graphs.
 # Batch sizes not in this list will fall back to eager mode.
-# Matched to vLLM 0.23.0 default FULL-cudagraph decode sizes (max_num_seqs=256):
-# [1,2,4] + multiples of 8 up to 256. vLLM's 272..512 entries are chunked-prefill
-# token batches (piecewise), not pure decode, so excluded — decode batch is capped
-# at max_batch_seqs=256. Apples-to-apples decode graph capture vs vLLM.
-capture_sizes = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256]
+# Keep the default template modest; tune this list with `max_batch_seqs` for the
+# deployment GPU after validating its memory headroom.
+capture_sizes = [1, 2, 4, 8, 16, 24, 32]

@@ -1,67 +1,119 @@
-#!/bin/bash
-# One-shot e2e smoke: launch scheduler + worker + server for a given config,
-# wait for the server to answer, send one chat completion, print it, tear down.
-# Usage: e2e_smoke.sh <config.toml> <port> <prompt>
-set -u
+#!/usr/bin/env bash
+# One-shot LLM smoke test: launch the three release binaries, wait for bounded
+# readiness, issue one chat completion, validate it, and tear the stack down.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 <config.toml> <port> [prompt]" >&2
+}
+
+if (( $# < 2 || $# > 3 )); then
+    usage
+    exit 2
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 CONFIG="$1"
 PORT="$2"
 PROMPT="${3:-Say hello in one short sentence.}"
+READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-180}"
+BIN_DIR="${BIN_DIR:-$REPO_ROOT/target/release}"
 
-export CUDNN_FRONTEND_INCLUDE_DIR=/data/home/vinciiliu/vllm-bench/.venv/lib/python3.12/site-packages/include
+[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "Invalid port: $PORT" >&2; exit 2; }
+[[ -f "$CONFIG" ]] || { echo "Config not found: $CONFIG" >&2; exit 2; }
+CONFIG="$(cd -- "$(dirname -- "$CONFIG")" && pwd)/$(basename -- "$CONFIG")"
+for binary in rustinfer-scheduler rustinfer-worker rustinfer-server; do
+    [[ -x "$BIN_DIR/$binary" ]] || {
+        echo "Missing release binary: $BIN_DIR/$binary" >&2
+        echo "Build first with: cargo build --release" >&2
+        exit 2
+    }
+done
+
+# shellcheck source=scripts/lib/cuda_env.sh
+source "$SCRIPT_DIR/lib/cuda_env.sh"
+rustinfer_discover_cuda_libraries
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="localhost,127.0.0.1,::1"
+export NO_PROXY="$no_proxy"
 
-# CUDA runtime libs on the linker path (mirror start_worker.sh probe).
-if ! ldconfig -p 2>/dev/null | grep -q 'libcublas\.so\.12'; then
-  _w="$(python -c 'import os,nvidia.cublas as c;print(os.path.join(os.path.dirname(c.__file__),"lib"))' 2>/dev/null || true)"
-  [ -n "$_w" ] && export LD_LIBRARY_PATH="$_w:${LD_LIBRARY_PATH:-}"
-fi
-
-LOG=/tmp/e2e_$$
-mkdir -p "$LOG"
-BIN=./target/release
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustinfer-e2e-smoke.XXXXXX")"
 pids=()
 cleanup() {
-  for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
-  sleep 1
-  for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
+    local pid
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
-echo "[e2e] scheduler..."
-$BIN/rustinfer-scheduler --config "$CONFIG" >"$LOG/sched.log" 2>&1 &
-pids+=($!)
-sleep 2
+start_process() {
+    local name="$1"
+    "$BIN_DIR/rustinfer-$name" --config "$CONFIG" >"$LOG_DIR/$name.log" 2>&1 &
+    pids+=("$!")
+}
 
-echo "[e2e] worker..."
-$BIN/rustinfer-worker --config "$CONFIG" >"$LOG/worker.log" 2>&1 &
-pids+=($!)
+start_process scheduler
+start_process worker
+start_process server
 
-echo "[e2e] server..."
-$BIN/rustinfer-server --config "$CONFIG" >"$LOG/server.log" 2>&1 &
-pids+=($!)
-
-# Wait for weights to load + Ready (up to 120s).
-echo "[e2e] waiting for worker Ready..."
-for i in $(seq 1 120); do
-  grep -q "Entering serve loop" "$LOG/worker.log" 2>/dev/null && break
-  if ! kill -0 "${pids[1]}" 2>/dev/null; then echo "[e2e] WORKER DIED"; tail -30 "$LOG/worker.log"; exit 1; fi
-  sleep 1
+deadline=$((SECONDS + READY_TIMEOUT_SECS))
+ready=false
+while (( SECONDS < deadline )); do
+    for index in "${!pids[@]}"; do
+        if ! kill -0 "${pids[$index]}" 2>/dev/null; then
+            echo "A RustInfer process exited before readiness; logs: $LOG_DIR" >&2
+            tail -n 40 "$LOG_DIR"/*.log >&2 || true
+            exit 1
+        fi
+    done
+    if grep -q "Entering serve loop" "$LOG_DIR/worker.log" 2>/dev/null \
+        && curl --fail --silent --show-error --max-time 2 \
+            "http://127.0.0.1:$PORT/health" >/dev/null; then
+        ready=true
+        break
+    fi
+    sleep 1
 done
+if [[ "$ready" != true ]]; then
+    echo "RustInfer did not become ready within ${READY_TIMEOUT_SECS}s; logs: $LOG_DIR" >&2
+    tail -n 40 "$LOG_DIR"/*.log >&2 || true
+    exit 1
+fi
 
-# Wait for the HTTP port.
-echo "[e2e] waiting for server port $PORT..."
-for i in $(seq 1 30); do
-  curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  sleep 1
-done
+payload="$(python3 - "$PROMPT" <<'PY'
+import json
+import sys
 
-echo "[e2e] === worker eos line ==="
-grep -i "eos\|no eos_token" "$LOG/worker.log" | head -3
-echo "[e2e] === /v1/chat/completions ==="
-curl -s "http://127.0.0.1:$PORT/v1/chat/completions" \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":64,\"temperature\":0}" \
-  | tee "$LOG/resp.json"
-echo
-echo "[e2e] logs in $LOG"
+print(json.dumps({
+    "model": "m",
+    "messages": [{"role": "user", "content": sys.argv[1]}],
+    "max_tokens": 64,
+    "temperature": 0,
+}))
+PY
+)"
+response="$LOG_DIR/response.json"
+curl --fail-with-body --silent --show-error --max-time 120 \
+    "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$payload" >"$response"
+
+python3 - "$response" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    response = json.load(handle)
+choices = response.get("choices") or []
+if not choices or not choices[0].get("message", {}).get("content"):
+    raise SystemExit(f"invalid completion response: {response}")
+print(json.dumps(response, ensure_ascii=False))
+PY
+
+echo "[e2e] smoke passed; logs: $LOG_DIR"

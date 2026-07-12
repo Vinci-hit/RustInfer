@@ -1,8 +1,6 @@
-//! Concrete model implementations — LLM (Llama3, Qwen3) + Diffusion (Z-Image).
+//! Concrete LLM model implementations.
 
 pub mod decoder;
-#[cfg(feature = "cuda")]
-pub mod diffusion;
 pub mod layers;
 pub mod llama3;
 pub mod loader;

@@ -6,12 +6,51 @@ use infer_core::ports::{OpError, OpResult};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 
+#[cfg(test)]
+static CUDA_TEST_IN_USE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+#[cfg(test)]
+static CUDA_TEST_AVAILABLE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Test-only process-wide lease. A `CudaConfig` reserves roughly 5 GiB, so
+/// constructing one per default test-runner thread exhausts even large GPUs.
+/// The lease is Send-safe and remains held through `CudaConfig::drop`.
+#[cfg(test)]
+#[derive(Debug)]
+struct CudaTestLease;
+
+#[cfg(test)]
+impl CudaTestLease {
+    fn acquire() -> Self {
+        let mut in_use = CUDA_TEST_IN_USE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *in_use {
+            in_use = CUDA_TEST_AVAILABLE
+                .wait(in_use)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *in_use = true;
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CudaTestLease {
+    fn drop(&mut self) {
+        let mut in_use = CUDA_TEST_IN_USE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *in_use = false;
+        CUDA_TEST_AVAILABLE.notify_one();
+    }
+}
+
 const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 4usize * 1024 * 1024 * 1024;
 
 /// Size of the graph-capture scratch arena (1 GiB). Bounds the peak per-step
 /// decode scratch; for a 1B–8B dense model at batch ≤ 256 the real peak is a
 /// few hundred MiB, so this leaves comfortable headroom.
-const GRAPH_ARENA_SIZE: usize = 1usize * 1024 * 1024 * 1024;
+const GRAPH_ARENA_SIZE: usize = 1024usize * 1024 * 1024;
 
 /// Upper bound on bytes the recycling pool retains across the free lists. The
 /// hot per-forward scratch is served from `ForwardScratch` (not the pool), so
@@ -71,6 +110,8 @@ struct PoolState {
 
 #[derive(Debug)]
 pub struct CudaConfig {
+    #[cfg(test)]
+    _test_lease: CudaTestLease,
     pub stream: ffi::cudaStream_t,
     pub cublaslt_handle: ffi::cublasLtHandle_t,
     pub cublas_handle_v2: ffi::cublasHandle_t,
@@ -125,6 +166,8 @@ pub struct CudaConfig {
 
 impl CudaConfig {
     pub fn new() -> OpResult<Self> {
+        #[cfg(test)]
+        let test_lease = CudaTestLease::acquire();
         let mut stream: ffi::cudaStream_t = std::ptr::null_mut();
         unsafe {
             cuda_check!(ffi::cudaStreamCreate(&mut stream));
@@ -183,6 +226,8 @@ impl CudaConfig {
             }
         }
         Ok(Self {
+            #[cfg(test)]
+            _test_lease: test_lease,
             stream,
             cublaslt_handle,
             cublas_handle_v2,
@@ -307,7 +352,7 @@ impl CudaConfig {
     /// retaining it would push the pool over `POOL_RETAIN_BUDGET` — then the
     /// block is `cudaFree`d (outside the lock; legal here since arena/capture
     /// pointers were already filtered out by `free_bytes`).
-    pub fn pool_push(&self, n: usize, ptr: *mut c_void) {
+    pub(crate) fn pool_push(&self, n: usize, ptr: *mut c_void) {
         let retained = {
             let mut g = self.pool.lock().unwrap();
             g.live_bytes = g.live_bytes.saturating_sub(n);
@@ -315,7 +360,7 @@ impl CudaConfig {
                 false
             } else {
                 debug_assert!(
-                    g.free.get(&n).map_or(true, |v| !v.contains(&ptr)),
+                    g.free.get(&n).is_none_or(|v| !v.contains(&ptr)),
                     "double-free into cuda pool: ptr={:?} size-class={}",
                     ptr,
                     n

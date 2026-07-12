@@ -31,7 +31,7 @@ pub async fn completions(
         .map_err(|_| AppError::too_many("server overloaded, please retry later"))?;
 
     // 1. 校验
-    validate_request(&req)?;
+    validate_request(&req, state.tokenizer.get_vocab_size(true))?;
     let response_model = state.model_info.model_id.clone();
 
     // 2. 获取 input_ids（直接 tokenize prompt，不经过 chat template）
@@ -57,6 +57,7 @@ pub async fn completions(
     // 详见 shared::cap_max_tokens。
     let effective_max_tokens =
         shared::cap_max_tokens(prompt_tokens, req.max_tokens, state.config.max_model_len)?;
+    let stop_sequences = shared::tokenize_stop_sequences(&state.tokenizer, req.stop.as_ref())?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         request_id: request_id.clone(),
@@ -68,7 +69,7 @@ pub async fn completions(
         top_k: req.top_k.unwrap_or(-1),
         stream: req.stream,
         priority: 0,
-        stop_sequences: req.stop.map(|s| s.into_vec()).unwrap_or_default(),
+        stop_sequences,
         ignore_eos: req.ignore_eos || state.config.ignore_eos,
         diffusion: None,
     };
@@ -129,7 +130,7 @@ pub async fn completions(
     }
 }
 
-fn validate_request(req: &CompletionRequest) -> Result<(), AppError> {
+fn validate_request(req: &CompletionRequest, vocab_size: usize) -> Result<(), AppError> {
     match &req.prompt {
         CompletionPrompt::Text(text) if text.is_empty() => {
             return Err(AppError::bad_request("prompt must not be empty"));
@@ -139,9 +140,39 @@ fn validate_request(req: &CompletionRequest) -> Result<(), AppError> {
                 "prompt token array must not be empty",
             ));
         }
+        CompletionPrompt::Tokens(ids) => {
+            if let Some((index, token_id)) = ids
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, token_id)| *token_id < 0 || (*token_id as usize) >= vocab_size)
+            {
+                return Err(AppError::bad_request(format!(
+                    "prompt token at index {} is outside valid range [0, {}): {}",
+                    index, vocab_size, token_id
+                )));
+            }
+        }
         _ => {}
     }
-    shared::validate_sampling(req.temperature, req.top_p, req.max_tokens)?;
+    shared::validate_sampling(req.temperature, req.top_p, req.top_k, req.max_tokens)?;
     shared::reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_request;
+    use crate::api::openai::types::CompletionRequest;
+
+    fn request(json: &str) -> CompletionRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn token_prompt_must_be_inside_tokenizer_vocabulary() {
+        assert!(validate_request(&request(r#"{"prompt":[0,99]}"#), 100).is_ok());
+        assert!(validate_request(&request(r#"{"prompt":[-1]}"#), 100).is_err());
+        assert!(validate_request(&request(r#"{"prompt":[100]}"#), 100).is_err());
+    }
 }

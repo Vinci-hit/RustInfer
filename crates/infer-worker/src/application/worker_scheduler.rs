@@ -1,6 +1,8 @@
 use half::bf16;
 
-use infer_protocol::scheduler_to_worker_data::{PrefillBatchCmd, PrefillSegmentCompletion};
+use infer_protocol::scheduler_to_worker_data::{
+    PrefillBatchCmd, PrefillSegmentCompletion, SamplingParams as WireSamplingParams,
+};
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
 
 use crate::application::decode_common::send_step_error;
@@ -13,10 +15,32 @@ use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, Pref
 use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::{SampledToken, SeqStep, StepRequest, StopCriteria};
+use crate::domain::ports::sampler::SamplingParams;
 use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
+
+fn sampling_params(params: &WireSamplingParams) -> SamplingParams {
+    SamplingParams {
+        temperature: params.temperature,
+        top_k: u32::try_from(params.top_k).unwrap_or(0),
+        top_p: params.top_p,
+        ..SamplingParams::default()
+    }
+}
+
+fn cmd_requires_stochastic_sampling(cmd: &PrefillBatchCmd) -> bool {
+    cmd.segments
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment.completion,
+                PrefillSegmentCompletion::FinishPrefillAndStartDecode
+            )
+        })
+        .any(|segment| !sampling_params(&segment.sampling_params).is_greedy())
+}
 
 /// Per-segment prefill plan. Replaces the parallel `per_seg_*` arrays that
 /// were index-correlated across three loops: each segment now carries its own
@@ -136,11 +160,15 @@ fn prefill_row_count(plans: &[SegmentPlan]) -> usize {
 /// forward. `base_indices` are this cmd's freshly-allocated KV slots
 /// (`len == total_new`). Each plan's `step_idx` records its row index in the
 /// merged `seqs` so `reclaim_prefill_step_data` can move its buffers back.
+// The output vectors are parallel row accumulators whose shared indices are a
+// deliberate invariant; grouping them would not reduce the launch state.
+#[allow(clippy::too_many_arguments)]
 fn build_prefill_steps_into(
     cmd: &PrefillBatchCmd,
     plans: &mut [SegmentPlan],
     base_indices: &[u32],
     seqs: &mut Vec<SeqStep>,
+    sampling: &mut Vec<SamplingParams>,
     max_tokens: &mut Vec<u32>,
     ignore_eos: &mut Vec<bool>,
     row_kinds: &mut Vec<RaggedRowKind>,
@@ -183,6 +211,16 @@ fn build_prefill_steps_into(
             block_table,
         });
         max_tokens.push(seg.max_tokens as u32);
+        sampling.push(
+            if matches!(
+                seg.completion,
+                PrefillSegmentCompletion::FinishPrefillAndStartDecode
+            ) {
+                sampling_params(&seg.sampling_params)
+            } else {
+                SamplingParams::default()
+            },
+        );
         ignore_eos.push(seg.ignore_eos);
         row_kinds.push(match seg.completion {
             PrefillSegmentCompletion::ContinuePrefill => RaggedRowKind::PrefillCont,
@@ -282,7 +320,13 @@ fn commit_prefill_outputs(
                 if !finished {
                     active.insert(
                         seg.sequence_id,
-                        ActiveSeq::new(token, full_block_table, seg.max_tokens, seg.ignore_eos),
+                        ActiveSeq::new(
+                            token,
+                            full_block_table,
+                            seg.max_tokens,
+                            seg.ignore_eos,
+                            sampling_params(&seg.sampling_params),
+                        ),
                     );
                 } else {
                     kv_allocator.release_owned(&full_block_table, enable_prefix_caching);
@@ -367,17 +411,22 @@ where
     //    the optimistic build is blocked: no in-flight step, a row evicted
     //    mid-flight, no KV slots without relief (relief could preempt the
     //    in-flight rows), or RUSTINFER_FUSED_OVERLAP=0.
-    let overlap_enabled = runner.mixed_eager_mode()
-        && !std::env::var_os("RUSTINFER_FUSED_OVERLAP").is_some_and(|v| v == "0");
+    let stochastic_requested = active.values().any(|seq| !seq.sampling.is_greedy())
+        || pending_prefills
+            .iter()
+            .any(cmd_requires_stochastic_sampling);
+    let overlap_enabled = !stochastic_requested
+        && runner.mixed_eager_mode()
+        && std::env::var_os("RUSTINFER_FUSED_OVERLAP").is_none_or(|v| v != "0");
     let mut overlap_prior: Option<(Vec<u64>, Vec<u32>, KvLease)> = None;
-    if overlap_enabled {
-        if let Some((order, step_slots)) = decode_engine.overlap_fused_snapshot(active) {
-            let lease = decode_engine
-                .take_prealloc_for_overlap(order.len(), kv_allocator)
-                .or_else(|| kv_allocator.lease(order.len() as u32).ok());
-            if let Some(lease) = lease {
-                overlap_prior = Some((order, step_slots, lease));
-            }
+    if overlap_enabled
+        && let Some((order, step_slots)) = decode_engine.overlap_fused_snapshot(active)
+    {
+        let lease = decode_engine
+            .take_prealloc_for_overlap(order.len(), kv_allocator)
+            .or_else(|| kv_allocator.lease(order.len() as u32).ok());
+        if let Some(lease) = lease {
+            overlap_prior = Some((order, step_slots, lease));
         }
     }
     let optimistic_decode = overlap_prior.is_some();
@@ -404,8 +453,13 @@ where
     //    committed active rows as before.
     let (decode_order, mut decode_lease, mut decode_build) =
         if let Some((order, step_slots, lease)) = overlap_prior {
-            let build =
-                build_overlap_decode_request(&order, &step_slots, lease.as_slice(), active, eos_ids);
+            let build = build_overlap_decode_request(
+                &order,
+                &step_slots,
+                lease.as_slice(),
+                active,
+                eos_ids,
+            );
             (order, Some(lease), Some(build))
         } else {
             match decode_engine.prepare_fused_decode(
@@ -578,10 +632,8 @@ where
             enable_prefix_caching,
         )?;
         skip_rows = overlap_skip_rows(&prior_output, &decode_order, active);
-        if enable_prefix_caching {
-            if let Some(b) = decode_build.as_mut() {
-                patch_overlap_assigned_tokens(&prior_output, b);
-            }
+        if enable_prefix_caching && let Some(b) = decode_build.as_mut() {
+            patch_overlap_assigned_tokens(&prior_output, b);
         }
         overlap_active = false;
     }
@@ -600,6 +652,7 @@ where
         }
 
         let mut seqs: Vec<SeqStep> = Vec::with_capacity(group.rows);
+        let mut sampling: Vec<SamplingParams> = Vec::with_capacity(group.rows);
         let mut max_tokens: Vec<u32> = Vec::with_capacity(group.rows);
         let mut ignore_eos: Vec<bool> = Vec::with_capacity(group.rows);
         let mut generated_counts: Vec<u32> = Vec::with_capacity(group.rows);
@@ -607,10 +660,11 @@ where
         if has_decode {
             let b = decode_build.as_ref().unwrap();
             seqs.extend(b.req.seqs.iter().cloned());
+            sampling.extend_from_slice(&b.req.sampling);
             max_tokens.extend_from_slice(&b.max_tokens);
             ignore_eos.extend_from_slice(&b.ignore_eos);
             generated_counts.extend_from_slice(&b.generated_counts);
-            row_kinds.extend(std::iter::repeat(RaggedRowKind::Decode).take(decode_count));
+            row_kinds.extend(std::iter::repeat_n(RaggedRowKind::Decode, decode_count));
         }
         // Pad the decode prefix up to a decode capture slot so the split
         // attention's cuDNN decode-prefix call (the leading run of q=1 rows)
@@ -624,32 +678,36 @@ where
         // tiny KV alloc fails, skip and accept the cold build for this one step.
         let mut decode_prefix_len = if has_decode { decode_count } else { 0 };
         let mut pad_lease = KvLease::empty();
-        if has_decode && !group.preps.is_empty() {
-            if let Some(slot) = runner.next_capture_slot(decode_count) {
-                let pad = slot - decode_count;
-                let prefill_rows = group.rows.saturating_sub(decode_count);
-                let padded_rows_fit = slot.saturating_add(prefill_rows) <= cap_batch;
-                let padded_tokens_fit = group.tokens.saturating_add(pad) <= cap_num_tokens;
-                if pad > 0 && padded_rows_fit && padded_tokens_fit {
-                    if let Ok(lease) = kv_allocator.lease(pad as u32) {
-                        for &blk in lease.as_slice() {
-                            seqs.push(SeqStep {
-                                sequence_id: u64::MAX, // sentinel: inert pad row
-                                input_ids: vec![1],
-                                positions: vec![0],
-                                kv_write_start: 0,
-                                kv_len_after: 1,
-                                block_table: vec![blk],
-                            });
-                            max_tokens.push(u32::MAX);
-                            ignore_eos.push(true);
-                            generated_counts.push(0);
-                            row_kinds.push(RaggedRowKind::Pad);
-                        }
-                        decode_prefix_len = slot;
-                        pad_lease = lease;
-                    }
+        if has_decode
+            && !group.preps.is_empty()
+            && let Some(slot) = runner.next_capture_slot(decode_count)
+        {
+            let pad = slot - decode_count;
+            let prefill_rows = group.rows.saturating_sub(decode_count);
+            let padded_rows_fit = slot.saturating_add(prefill_rows) <= cap_batch;
+            let padded_tokens_fit = group.tokens.saturating_add(pad) <= cap_num_tokens;
+            if pad > 0
+                && padded_rows_fit
+                && padded_tokens_fit
+                && let Ok(lease) = kv_allocator.lease(pad as u32)
+            {
+                for &blk in lease.as_slice() {
+                    seqs.push(SeqStep {
+                        sequence_id: u64::MAX, // sentinel: inert pad row
+                        input_ids: vec![1],
+                        positions: vec![0],
+                        kv_write_start: 0,
+                        kv_len_after: 1,
+                        block_table: vec![blk],
+                    });
+                    sampling.push(SamplingParams::default());
+                    max_tokens.push(u32::MAX);
+                    ignore_eos.push(true);
+                    generated_counts.push(0);
+                    row_kinds.push(RaggedRowKind::Pad);
                 }
+                decode_prefix_len = slot;
+                pad_lease = lease;
             }
         }
         for &pi in &group.preps {
@@ -659,6 +717,7 @@ where
                 &mut prep.plans,
                 prep.base_indices.as_slice(),
                 &mut seqs,
+                &mut sampling,
                 &mut max_tokens,
                 &mut ignore_eos,
                 &mut row_kinds,
@@ -671,7 +730,7 @@ where
         }
 
         let req = StepRequest {
-            sampling: Vec::new(),
+            sampling,
             stop: StopCriteria {
                 eos_ids: eos_ids.to_vec(),
                 generated_counts,
@@ -681,10 +740,11 @@ where
             draft_tokens: Vec::new(),
             seqs,
         };
+        let stochastic_group = req.sampling.iter().any(|params| !params.is_greedy());
 
         let mut mixed_lease = KvLease::empty();
         let mut mixed_device_prepared = false;
-        if can_record_abc_rows {
+        if can_record_abc_rows && !stochastic_group {
             let potential_next = row_kinds
                 .iter()
                 .filter(|&&k| matches!(k, RaggedRowKind::Decode | RaggedRowKind::PrefillFinal))
@@ -709,57 +769,62 @@ where
         } else {
             Some(mixed_lease.as_slice())
         };
-        // The optimistic decode rows carry placeholder input ids: their real
-        // tokens (the prior step's argmax) are gathered from buffer C on
-        // device, so any group holding them must use the overlapped issue —
-        // even after a fallback drain (C is untouched by the finalize).
-        let issue_res = if optimistic_decode && has_decode {
-            runner.issue_fused_abc_overlapped(&req, &row_kinds, group_next_slots, decode_count)
+        let (out_res, prior_send) = if stochastic_group {
+            // Mixed ABC bakes argmax into its graph/eager region. The regular
+            // eager runtime leaves logits available to the filtered sampler.
+            // Stochastic admission disabled overlap above, so no placeholder
+            // decode ids can reach this branch.
+            let out = runner.step(&req);
+            let sent = send_prior_output(data, &mut prior_output);
+            (out, sent)
         } else {
-            runner.issue_fused_abc(&req, &row_kinds, group_next_slots)
-        };
-        // Overlap: drain the prior step only NOW — after the fused issue — so
-        // its GPU tail overlapped this step's planning + issue. Runs on the
-        // issue-failure path too: the prior step's tokens must still be
-        // collected and its host state committed.
-        if overlap_active {
-            match decode_engine.finalize_pending(
-                runner,
-                active,
-                kv_allocator,
-                control,
-                enable_prefix_caching,
-            ) {
-                Ok(out) => {
-                    prior_output = out;
-                    skip_rows = overlap_skip_rows(&prior_output, &decode_order, active);
-                    if enable_prefix_caching {
-                        if let Some(b) = decode_build.as_mut() {
+            // The optimistic decode rows carry placeholder input ids: their
+            // real tokens (the prior step's argmax) are gathered from buffer C
+            // on device, so any group holding them must use the overlapped
+            // issue even after a fallback drain (C is untouched by finalize).
+            let issue_res = if optimistic_decode && has_decode {
+                runner.issue_fused_abc_overlapped(&req, &row_kinds, group_next_slots, decode_count)
+            } else {
+                runner.issue_fused_abc(&req, &row_kinds, group_next_slots)
+            };
+            // Drain the prior step only after the fused issue so its GPU tail
+            // overlaps planning and issue. The failure path also drains it.
+            if overlap_active {
+                match decode_engine.finalize_pending(
+                    runner,
+                    active,
+                    kv_allocator,
+                    control,
+                    enable_prefix_caching,
+                ) {
+                    Ok(out) => {
+                        prior_output = out;
+                        skip_rows = overlap_skip_rows(&prior_output, &decode_order, active);
+                        if enable_prefix_caching && let Some(b) = decode_build.as_mut() {
                             patch_overlap_assigned_tokens(&prior_output, b);
                         }
                     }
+                    Err(e) => {
+                        mixed_lease.release(kv_allocator);
+                        hard_err = Some(e);
+                        break 'groups;
+                    }
                 }
-                Err(e) => {
-                    mixed_lease.release(kv_allocator);
-                    hard_err = Some(e);
-                    break 'groups;
-                }
+                overlap_active = false;
             }
-            overlap_active = false;
-        }
-        // The fused forward is on the GPU now (on success): send the prior
-        // decode step's tokens while it runs. The result is propagated only
-        // after this group's commit so a transport error cannot leave the
-        // fused step's host state half-applied.
-        let prior_send = send_prior_output(data, &mut prior_output);
-        let out = match issue_res.and_then(|t| runner.finalize_fused_abc(t, &req, &row_kinds)) {
+            // The fused forward is on the GPU now: send the prior decode tokens
+            // while it runs, but propagate a send failure only after commit.
+            let sent = send_prior_output(data, &mut prior_output);
+            let out =
+                issue_res.and_then(|ticket| runner.finalize_fused_abc(ticket, &req, &row_kinds));
+            (out, sent)
+        };
+        let out = match out_res {
             Ok(out) => out,
             Err(e) => {
                 mixed_lease.release(kv_allocator);
-                if has_decode {
-                    if let Some(lease) = decode_lease.take() {
-                        lease.release(kv_allocator);
-                    }
+                if has_decode && let Some(lease) = decode_lease.take() {
+                    lease.release(kv_allocator);
                 }
                 fail_fused_group(
                     e,
@@ -875,7 +940,7 @@ where
             .iter()
             .enumerate()
             .any(|(i, &s)| s && !out.finished.get(i).copied().unwrap_or(true));
-        if can_record_abc_rows && !device_rows_tainted {
+        if can_record_abc_rows && !stochastic_group && !device_rows_tainted {
             decode_engine.record_mixed_abc_rows(
                 abc_next_rows,
                 mixed_lease,
@@ -976,7 +1041,10 @@ fn overlap_skip_rows(
 /// overlapped decode rows that token is the prior step's output — unknown at
 /// build time — so patch it in once the prior step is finalized (always
 /// before this step's output is sent).
-fn patch_overlap_assigned_tokens(prior_output: &Option<StepOutput>, build: &mut DecodeRequestBuild) {
+fn patch_overlap_assigned_tokens(
+    prior_output: &Option<StepOutput>,
+    build: &mut DecodeRequestBuild,
+) {
     let Some(out) = prior_output else {
         return;
     };
@@ -1027,10 +1095,10 @@ fn fail_fused_group(
     let mut failed: Vec<u64> = Vec::new();
     if has_decode {
         for &sid in decode_order {
-            if let Some(removed) = active.remove(&sid) {
-                if !enable_prefix_caching {
-                    kv_allocator.free(&removed.block_table);
-                }
+            if let Some(removed) = active.remove(&sid)
+                && !enable_prefix_caching
+            {
+                kv_allocator.free(&removed.block_table);
             }
             failed.push(sid);
         }

@@ -17,6 +17,7 @@ use crate::infrastructure::transport::control_plane::ControlEvent;
 /// represented as `WorkerDecodeError`; the engine logs them and
 /// continues.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Events are moved through one bounded channel, never cloned.
 pub enum SchedulerEvent {
     /// New inference request from the frontend.
     NewRequest {

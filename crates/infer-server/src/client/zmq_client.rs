@@ -57,7 +57,6 @@ enum RequestEnvelope {
 enum PendingRequest {
     Oneshot {
         tx: oneshot::Sender<InferenceResponse>,
-        deadline: Instant,
     },
     Stream {
         tx: mpsc::Sender<StreamChunk>,
@@ -161,17 +160,16 @@ impl OneshotCancelGuard {
 
 impl Drop for OneshotCancelGuard {
     fn drop(&mut self) {
-        if let Some(request_id) = self.request_id.take() {
-            if self
+        if let Some(request_id) = self.request_id.take()
+            && self
                 .command_tx
                 .try_send(RequestEnvelope::Cancel {
                     request_id,
                     reason: CancelReason::ClientDisconnected,
                 })
                 .is_ok()
-            {
-                self.waker.wake();
-            }
+        {
+            self.waker.wake();
         }
     }
 }
@@ -319,13 +317,12 @@ impl ZmqClient {
             match command_rx.try_recv() {
                 Ok(RequestEnvelope::Oneshot { request, reply_tx }) => {
                     let request_id = request.request_id.clone();
-                    pending.insert(
-                        request_id.clone(),
-                        PendingRequest::Oneshot {
-                            tx: reply_tx,
-                            deadline: Instant::now() + timeout,
-                        },
-                    );
+                    // Unary timeout ownership lives solely in `infer()`'s
+                    // Tokio timeout. Giving this ZMQ-thread entry the same
+                    // deadline creates a race where this sender is dropped
+                    // first and the handler observes a closed channel (500)
+                    // instead of the typed timeout marker (504).
+                    pending.insert(request_id.clone(), PendingRequest::Oneshot { tx: reply_tx });
                     if let Err(e) = Self::send_command(socket, &ServerCommand::Infer(request)) {
                         tracing::error!("Failed to send request {}: {:?}", request_id, e);
                         pending.remove(&request_id);
@@ -391,13 +388,16 @@ impl ZmqClient {
 
     /// 计算下一次 zmq::poll 的超时（毫秒）。
     /// - 无 pending request：返回 `POLL_MAX_TIMEOUT`（兜底，正常会被 wakeup/POLLIN 提前唤醒）。
-    /// - 有 pending request：取最近的 deadline，限制在 `[1ms, POLL_MAX_TIMEOUT]`。
+    /// - 有 pending stream：取最近的 deadline，限制在 `[1ms, POLL_MAX_TIMEOUT]`。
+    ///
+    /// Unary requests are timed out by their async waiter and do not own a
+    /// second deadline here.
     fn next_poll_timeout_ms(pending: &HashMap<String, PendingRequest>) -> i64 {
         let now = Instant::now();
         let nearest = pending
             .values()
             .filter_map(|r| match r {
-                PendingRequest::Oneshot { deadline, .. } => Some(*deadline),
+                PendingRequest::Oneshot { .. } => None,
                 PendingRequest::Stream { deadline, .. } => Some(*deadline),
             })
             .min();
@@ -501,16 +501,15 @@ impl ZmqClient {
                         finish_reason: response.finish_reason.clone(),
                         metrics: Some(response.metrics),
                     };
-                    if tx.try_send(chunk).is_err() {
-                        if let Err(e) =
+                    if tx.try_send(chunk).is_err()
+                        && let Err(e) =
                             Self::send_cancel(socket, &request_id, CancelReason::ClientDisconnected)
-                        {
-                            tracing::warn!(
-                                request_id = %request_id,
-                                error = ?e,
-                                "failed to send cancel after stream receiver dropped"
-                            );
-                        }
+                    {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            error = ?e,
+                            "failed to send cancel after stream receiver dropped"
+                        );
                     }
                 }
             }
@@ -533,7 +532,9 @@ impl ZmqClient {
             *deadline = Instant::now() + timeout;
             match tx.try_send(chunk) {
                 Ok(()) => {}
-                Err(TokioTrySendError::Full(_)) => cancel_reason = Some(CancelReason::StreamTimeout),
+                Err(TokioTrySendError::Full(_)) => {
+                    cancel_reason = Some(CancelReason::StreamTimeout)
+                }
                 Err(TokioTrySendError::Closed(_)) => {
                     cancel_reason = Some(CancelReason::ClientDisconnected)
                 }
@@ -550,14 +551,14 @@ impl ZmqClient {
         if is_done || cancel_reason.is_some() {
             pending.remove(&request_id);
         }
-        if let Some(reason) = cancel_reason {
-            if let Err(e) = Self::send_cancel(socket, &request_id, reason) {
-                tracing::warn!(
-                    request_id = %request_id,
-                    error = ?e,
-                    "failed to send cancel after stream send failure"
-                );
-            }
+        if let Some(reason) = cancel_reason
+            && let Err(e) = Self::send_cancel(socket, &request_id, reason)
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                error = ?e,
+                "failed to send cancel after stream send failure"
+            );
         }
     }
 
@@ -566,49 +567,35 @@ impl ZmqClient {
         pending: &mut HashMap<String, PendingRequest>,
     ) {
         let now = Instant::now();
-        let timed_out: Vec<(String, bool)> = pending
+        let timed_out: Vec<String> = pending
             .iter()
             .filter_map(|(request_id, pending_req)| match pending_req {
                 PendingRequest::Stream { deadline, .. } if *deadline <= now => {
-                    Some((request_id.clone(), true))
-                }
-                PendingRequest::Oneshot { deadline, .. } if *deadline <= now => {
-                    Some((request_id.clone(), false))
+                    Some(request_id.clone())
                 }
                 _ => None,
             })
             .collect();
 
-        for (request_id, is_stream) in timed_out {
-            if let Some(pending_req) = pending.remove(&request_id) {
-                if let PendingRequest::Stream { tx, .. } = pending_req {
-                    let _ = tx.try_send(StreamChunk {
-                        request_id: request_id.clone(),
-                        chunk_type: ChunkType::Error,
-                        token_id: None,
-                        finish_reason: Some("stream timeout".to_string()),
-                        metrics: Some(InferenceMetrics {
-                            total_ms: 0,
-                            num_tokens: 0,
-                            tokens_per_second: 0.0,
-                        }),
-                    });
-                } else if is_stream {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        "timed-out request changed kind before cleanup"
-                    );
-                }
-                let reason = if is_stream {
-                    CancelReason::StreamTimeout
-                } else {
-                    CancelReason::RequestTimeout
-                };
-                if let Err(e) = Self::send_cancel(socket, &request_id, reason) {
+        for request_id in timed_out {
+            if let Some(PendingRequest::Stream { tx, .. }) = pending.remove(&request_id) {
+                let _ = tx.try_send(StreamChunk {
+                    request_id: request_id.clone(),
+                    chunk_type: ChunkType::Error,
+                    token_id: None,
+                    finish_reason: Some("stream timeout".to_string()),
+                    metrics: Some(InferenceMetrics {
+                        total_ms: 0,
+                        num_tokens: 0,
+                        tokens_per_second: 0.0,
+                    }),
+                });
+                if let Err(e) = Self::send_cancel(socket, &request_id, CancelReason::StreamTimeout)
+                {
                     tracing::warn!(
                         request_id = %request_id,
                         error = ?e,
-                        "failed to send cancel after request timeout"
+                        "failed to send cancel after stream timeout"
                     );
                 }
             }
@@ -689,5 +676,22 @@ impl InferClient for ZmqClient {
             waker: self.waker.clone(),
             finished: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unary_pending_requests_have_no_zmq_thread_deadline() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = HashMap::new();
+        pending.insert("req".to_string(), PendingRequest::Oneshot { tx });
+
+        assert_eq!(
+            ZmqClient::next_poll_timeout_ms(&pending),
+            POLL_MAX_TIMEOUT.as_millis() as i64
+        );
     }
 }

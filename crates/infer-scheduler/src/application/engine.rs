@@ -94,6 +94,7 @@ pub struct SchedulerEngine {
 
 impl SchedulerEngine {
     /// Create a new scheduler engine.
+    #[allow(clippy::too_many_arguments)] // Constructor wires the scheduler's independent ports.
     pub fn new<F, W>(
         config: SchedulerConfig,
         policy: Box<dyn SchedulingPolicy>,
@@ -197,10 +198,16 @@ impl SchedulerEngine {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle an incoming request from the frontend.
-    pub(crate) fn handle_new_request(&mut self, client_id: ClientId, request: InferenceRequest) {
+    pub(crate) async fn handle_new_request(
+        &mut self,
+        client_id: ClientId,
+        request: InferenceRequest,
+    ) -> Result<()> {
         use crate::application::ingestion::{IngestOutcome, RejectReason};
 
         let external_id = request.request_id.clone();
+        let stream = request.stream;
+        let response_client = client_id.clone();
         let outcome = self
             .ingestion
             .ingest(client_id, request, &self.config, &mut self.requests);
@@ -215,16 +222,28 @@ impl SchedulerEngine {
             }
             IngestOutcome::Rejected { reason, .. } => {
                 let msg = reason.as_message();
-                match reason {
+                let public_message = match reason {
                     RejectReason::Repository(_) => {
                         tracing::error!(%external_id, "ingestion repository rejection: {}", msg);
+                        "internal scheduler error".to_string()
                     }
                     _ => {
                         tracing::warn!(%external_id, "rejecting request: {}", msg);
+                        msg
                     }
-                }
+                };
+                crate::application::output_fns::send_request_error(
+                    self.dispatch.frontend_mut(),
+                    response_client,
+                    external_id,
+                    stream,
+                    public_message,
+                    0,
+                )
+                .await?;
             }
         }
+        Ok(())
     }
 
     /// Split disjoint borrows of `self` into the workflow handle, the dispatch
@@ -258,7 +277,7 @@ impl SchedulerEngine {
             requests,
             radix,
             kv_budget,
-            metrics: &**metrics,
+            metrics,
             codec,
             config,
             control_cmd,
@@ -294,10 +313,10 @@ impl SchedulerEngine {
             // Open the accumulation window on the first held request; keep the
             // existing deadline otherwise so the window is measured from the
             // oldest waiter (bounded TTFT), not reset by later arrivals.
-            if self.schedule_deadline.is_none() {
-                if let Some(wait) = self.batch_wait {
-                    self.schedule_deadline = Some(tokio::time::Instant::now() + wait);
-                }
+            if self.schedule_deadline.is_none()
+                && let Some(wait) = self.batch_wait
+            {
+                self.schedule_deadline = Some(tokio::time::Instant::now() + wait);
             }
             return Ok(());
         }
@@ -404,12 +423,8 @@ impl SchedulerEngine {
                 // silently wait out the full request timeout against a dead
                 // engine. `fail_sequence` skips the Waiting bucket, so drain
                 // the queue directly.
-                let waiting_ids: Vec<RequestId> = self
-                    .requests
-                    .waiting()
-                    .iter()
-                    .map(|s| s.meta.id.clone())
-                    .collect();
+                let waiting_ids: Vec<RequestId> =
+                    self.requests.waiting().iter().map(|s| s.meta.id).collect();
                 for rid in waiting_ids {
                     let Ok(seq) = self.requests.take_waiting(&rid) else {
                         continue;
@@ -510,7 +525,6 @@ impl SchedulerEngine {
         let control_events = &mut self.control_events;
 
         tokio::select! {
-            biased;
             Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
             result = frontend.recv_event() => frontend_result_to_event(result),
             // Batch-accumulation deadline (throughput mode only). The deadline

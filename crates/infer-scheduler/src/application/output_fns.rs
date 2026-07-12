@@ -21,6 +21,13 @@ use crate::infrastructure::transport::traits::FrontendTransport;
 
 pub use super::output::CompleteOutcome;
 
+#[derive(Debug, Clone, Copy)]
+pub struct CompletedSequence {
+    pub sequence_id: crate::domain::inference_session::lifecycle::SequenceId,
+    pub worker_finished: bool,
+    pub stop_sequence_finished: bool,
+}
+
 /// Emit an error to the client. Does not touch KV (callers do).
 pub async fn send_request_error(
     frontend: &mut dyn FrontendTransport,
@@ -120,7 +127,9 @@ pub async fn complete_session(
     let client_id = seq.handle.client_id.clone();
     let stream = seq.meta.stream;
 
-    let reason = if seq.reached_max_tokens() {
+    let reason = if seq.state.stop_sequence_matched {
+        FinishReason::StopSequence
+    } else if seq.reached_max_tokens() {
         FinishReason::MaxTokens
     } else {
         FinishReason::Eos
@@ -236,7 +245,7 @@ pub async fn process_llm_step_decoded(
     frontend: &mut dyn FrontendTransport,
     metrics: &MetricsRecorder,
     output: &StepOutput,
-) -> Result<()> {
+) -> Result<Vec<CompletedSequence>> {
     use crate::domain::inference_session::lifecycle::SequenceId;
     use crate::domain::inference_session::table::PrefillAckOutcome;
 
@@ -250,7 +259,7 @@ pub async fn process_llm_step_decoded(
     }
 
     // 2. Process generated tokens.
-    let mut finished_sequence_ids: Vec<SequenceId> = Vec::new();
+    let mut finished_sequences: Vec<CompletedSequence> = Vec::new();
     let mut token_chunks: Vec<(ClientId, StreamChunk)> = Vec::new();
     for token in &output.tokens {
         match sessions.append_generated_token(
@@ -260,19 +269,25 @@ pub async fn process_llm_step_decoded(
         ) {
             Ok(outcome) => {
                 if let Some(delivery) = outcome.stream {
-                    token_chunks.push((
-                        delivery.client_id,
-                        StreamChunk {
-                            request_id: delivery.external_id,
-                            chunk_type: ChunkType::Token,
-                            token_id: Some(outcome.token_id),
-                            finish_reason: None,
-                            metrics: None,
-                        },
-                    ));
+                    for token_id in outcome.tokens_to_stream {
+                        token_chunks.push((
+                            delivery.client_id.clone(),
+                            StreamChunk {
+                                request_id: delivery.external_id.clone(),
+                                chunk_type: ChunkType::Token,
+                                token_id: Some(token_id),
+                                finish_reason: None,
+                                metrics: None,
+                            },
+                        ));
+                    }
                 }
-                if outcome.worker_finished {
-                    finished_sequence_ids.push(outcome.sequence_id);
+                if outcome.finished {
+                    finished_sequences.push(CompletedSequence {
+                        sequence_id: outcome.sequence_id,
+                        worker_finished: outcome.worker_finished,
+                        stop_sequence_finished: outcome.stop_sequence_finished,
+                    });
                 }
             }
             Err(e) => tracing::warn!(
@@ -287,9 +302,10 @@ pub async fn process_llm_step_decoded(
         frontend.send_stream_chunk(&client_id, chunk).await?;
     }
 
-    finished_sequence_ids.sort_unstable_by_key(|id| id.0);
-    finished_sequence_ids.dedup();
-    for sequence_id in finished_sequence_ids {
+    finished_sequences.sort_unstable_by_key(|completed| completed.sequence_id.0);
+    finished_sequences.dedup_by_key(|completed| completed.sequence_id.0);
+    for completed in &finished_sequences {
+        let sequence_id = completed.sequence_id;
         // Error-severity policy: a per-sequence table inconsistency is
         // request-scoped — log and move on, exactly like the ack/append arms
         // above. Only transport failures (frontend gone ⇒ `Shutdown`, from
@@ -319,7 +335,7 @@ pub async fn process_llm_step_decoded(
         );
     }
 
-    Ok(())
+    Ok(finished_sequences)
 }
 
 /// Process one batch of worker step output (Diffusion mode) with a

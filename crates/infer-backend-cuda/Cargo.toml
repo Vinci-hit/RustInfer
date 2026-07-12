@@ -1,13 +1,17 @@
 [package]
 name = "infer-backend-cuda"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 build = "build.rs"
 description = "RustInfer CUDA backend: implements the infer-core op-port traits with CUDA kernels. Statically links its compiled .cu kernels (the 29-file kernel set + CUTLASS); confines the entire CUDA toolchain (nvcc/bindgen/cuDNN) to this one leaf crate. Linked into the worker only when the `cuda` feature is on."
-license = "Apache-2.0"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [dependencies]
-infer-core = { path = "../infer-core" }
+infer-core = { version = "1.0.1", path = "../infer-core" }
 half = { version = "2.7.1", features = ["std", "num-traits"] }
 tracing = "0.1"
 

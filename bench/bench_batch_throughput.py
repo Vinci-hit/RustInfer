@@ -18,6 +18,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List
 
 import aiohttp
@@ -82,7 +83,11 @@ def pick_prompts(pool, n, min_chars=80):
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8000")
-    ap.add_argument("--prompts", default="/root/RustInfer/bench/bench_prompts.json")
+    ap.add_argument(
+        "--prompts",
+        type=Path,
+        default=Path(__file__).with_name("bench_prompts.json"),
+    )
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--batches", default="1,2,4,8,16,32")
     ap.add_argument("--warmup", type=int, default=2)
@@ -96,7 +101,7 @@ async def main():
                     help="Save full results (with generated text) for quality check")
     args = ap.parse_args()
 
-    with open(args.prompts) as f:
+    with args.prompts.open(encoding="utf-8") as f:
         pool = json.load(f)
     print(f"loaded {len(pool)} prompts")
 

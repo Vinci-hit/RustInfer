@@ -70,7 +70,7 @@ impl SchedulingPolicy for DiffusionPolicy {
             if !groups.contains_key(&key) {
                 key_order.push(key.clone());
             }
-            groups.entry(key).or_default().push(seq.meta.id.clone());
+            groups.entry(key).or_default().push(seq.meta.id);
         }
 
         let Some(best_key) = key_order

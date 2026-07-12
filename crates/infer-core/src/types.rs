@@ -36,6 +36,10 @@ impl Dims {
         self.len as usize
     }
     #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    #[inline]
     pub fn as_slice(&self) -> &[usize] {
         &self.data[..self.len as usize]
     }

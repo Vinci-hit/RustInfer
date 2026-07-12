@@ -1,7 +1,13 @@
 [package]
 name = "infer-server"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "RustInfer OpenAI-compatible HTTP and SSE server."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "rustinfer-server"
@@ -9,10 +15,10 @@ path = "src/bin/server.rs"
 
 [dependencies]
 # Core inference
-infer-protocol = { path = "../infer-protocol" }
+infer-protocol = { version = "1.0.1", path = "../infer-protocol" }
 
 # Tokenizer
-tokenizers = "0.22.2"
+tokenizers = "0.23.1"
 
 # Web framework
 axum = { version = "0.8.9", features = ["macros"] }
@@ -25,8 +31,6 @@ async-stream = "0.3"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # CLI & config
 clap = { version = "4.5", features = ["derive", "env"] }

@@ -39,6 +39,13 @@ impl Default for SamplingParams {
     }
 }
 
+impl SamplingParams {
+    /// Whether filtering can only select the maximum-logit token.
+    pub fn is_greedy(self) -> bool {
+        self.temperature <= 0.0 || self.top_k == 1 || self.top_p <= 0.0
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SampleBatch {
     pub tokens: Vec<SampledToken>,

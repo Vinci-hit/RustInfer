@@ -63,6 +63,7 @@ pub async fn chat_completions(
     // kv_len_after > max_seq_len 而中止。详见 shared::cap_max_tokens。
     let effective_max_tokens =
         shared::cap_max_tokens(prompt_tokens, req.max_tokens, state.config.max_model_len)?;
+    let stop_sequences = shared::tokenize_stop_sequences(&state.tokenizer, req.stop.as_ref())?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let tokenize_elapsed = request_start.elapsed();
     tracing::debug!(
@@ -81,7 +82,7 @@ pub async fn chat_completions(
         top_k: req.top_k.unwrap_or(-1),
         stream: req.stream,
         priority: 0,
-        stop_sequences: req.stop.map(|s| s.into_vec()).unwrap_or_default(),
+        stop_sequences,
         ignore_eos: req.ignore_eos || state.config.ignore_eos,
         diffusion: None,
     };
@@ -164,7 +165,7 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
     if req.messages.is_empty() {
         return Err(AppError::bad_request("messages must not be empty"));
     }
-    shared::validate_sampling(req.temperature, req.top_p, req.max_tokens)?;
+    shared::validate_sampling(req.temperature, req.top_p, req.top_k, req.max_tokens)?;
     shared::reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
     Ok(())
 }

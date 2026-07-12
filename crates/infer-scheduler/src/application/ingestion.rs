@@ -2,11 +2,8 @@
 //!
 //! Responsibilities:
 //!
-//! 1. Validate the protocol payload:
-//!    - LLM mode: non-empty `input_ids`, length within
-//!      `config.max_model_len`.
-//!    - Diffusion mode: non-empty prompt + non-empty
-//!      `prompt_input_ids` (server pre-tokenized).
+//! 1. Reject disabled diffusion payloads and validate the LLM protocol payload:
+//!    non-empty `input_ids`, length within `config.max_model_len`.
 //! 2. Mint a fresh `RequestId` (uuid-backed) and the next monotonic
 //!    `SequenceId`.
 //! 3. Build the `RequestMeta` aggregate root and hand it to
@@ -60,12 +57,8 @@ pub enum RejectReason {
     MaxTokensZero,
     /// Prompt + generated tokens would exceed the model context window.
     TotalTokensTooLong { requested: usize, limit: usize },
-    /// Diffusion mode but request carried no `diffusion` payload.
-    DiffusionPayloadMissing,
-    /// Diffusion mode but `diffusion.prompt` was empty.
-    DiffusionPromptEmpty,
-    /// Diffusion mode but `diffusion.prompt_input_ids` was empty.
-    DiffusionPromptIdsEmpty,
+    /// Diffusion requests are disabled in this release.
+    DiffusionDisabled,
     /// `RequestTable::insert_new` rejected the entry (duplicate id /
     /// duplicate sequence). Usually indicates a bug, not user input.
     Repository(String),
@@ -85,9 +78,7 @@ impl RejectReason {
                     requested, limit
                 )
             }
-            Self::DiffusionPayloadMissing => "missing diffusion payload".to_string(),
-            Self::DiffusionPromptEmpty => "empty diffusion prompt".to_string(),
-            Self::DiffusionPromptIdsEmpty => "empty server-tokenized prompt_input_ids".to_string(),
+            Self::DiffusionDisabled => "diffusion is disabled in this release".to_string(),
             Self::Repository(msg) => format!("repository rejected: {}", msg),
         }
     }
@@ -130,10 +121,17 @@ impl IngestionSystem {
         sessions: &mut RequestTable,
     ) -> IngestOutcome {
         let external_id = request.request_id.clone();
-        let is_diffusion = request.modality == InferenceModality::Diffusion
-            || matches!(config.mode, SchedulerMode::Diffusion);
+        if request.modality == InferenceModality::Diffusion
+            || request.diffusion.is_some()
+            || matches!(config.mode, SchedulerMode::Diffusion)
+        {
+            return IngestOutcome::Rejected {
+                external_id,
+                reason: RejectReason::DiffusionDisabled,
+            };
+        }
 
-        if let Err(reason) = self.validate(&request, config, is_diffusion) {
+        if let Err(reason) = self.validate(&request, config) {
             return IngestOutcome::Rejected {
                 external_id,
                 reason,
@@ -143,22 +141,12 @@ impl IngestionSystem {
         let sequence_id = SequenceId(self.next_sequence_id);
         self.next_sequence_id += 1;
 
-        // Diffusion uses a placeholder input_ids for the LLM-typed
-        // session machinery; max_tokens is fixed to 1 because the
-        // diffusion worker emits one image per request.
-        let input_ids = if is_diffusion && request.input_ids.is_empty() {
-            vec![0]
-        } else {
-            request.input_ids
-        };
-        let max_tokens = if is_diffusion { 1 } else { request.max_tokens };
-
         let meta = Arc::new(RequestMeta {
             id: RequestId::new_v4(),
             external_id: external_id.clone(),
             sequence_id,
-            input_ids,
-            max_tokens,
+            input_ids: request.input_ids,
+            max_tokens: request.max_tokens,
             sampling: SamplingParams {
                 temperature: request.temperature,
                 top_p: request.top_p,
@@ -166,12 +154,12 @@ impl IngestionSystem {
             },
             priority: Priority(request.priority),
             stream: request.stream,
-            stop_sequences: vec![],
+            stop_sequences: request.stop_sequences,
             ignore_eos: request.ignore_eos,
-            diffusion: request.diffusion,
+            diffusion: None,
             arrival_time: Instant::now(),
         });
-        let request_id = meta.id.clone();
+        let request_id = meta.id;
 
         let handle = RequestHandle::new(client_id, request.stream);
         if let Err(SchedulerError::Internal(msg)) = sessions.insert_new(meta, handle) {
@@ -194,21 +182,7 @@ impl IngestionSystem {
         &self,
         request: &InferenceRequest,
         config: &SchedulerConfig,
-        is_diffusion: bool,
     ) -> Result<(), RejectReason> {
-        if is_diffusion {
-            let Some(diffusion) = request.diffusion.as_ref() else {
-                return Err(RejectReason::DiffusionPayloadMissing);
-            };
-            if diffusion.prompt.is_empty() {
-                return Err(RejectReason::DiffusionPromptEmpty);
-            }
-            if diffusion.prompt_input_ids.is_empty() {
-                return Err(RejectReason::DiffusionPromptIdsEmpty);
-            }
-            return Ok(());
-        }
-
         if request.input_ids.is_empty() {
             return Err(RejectReason::EmptyPrompt);
         }
@@ -240,19 +214,12 @@ impl IngestionSystem {
 mod tests {
     use super::*;
     use crate::config::SchedulerConfig;
-    use infer_protocol::server_to_scheduler::{DiffusionRequest, InferenceModality};
+    use infer_protocol::server_to_scheduler::InferenceModality;
 
     fn config_llm(max_len: usize) -> SchedulerConfig {
         SchedulerConfig {
             max_model_len: max_len,
             mode: SchedulerMode::Llm,
-            ..Default::default()
-        }
-    }
-
-    fn config_diffusion() -> SchedulerConfig {
-        SchedulerConfig {
-            mode: SchedulerMode::Diffusion,
             ..Default::default()
         }
     }
@@ -271,35 +238,6 @@ mod tests {
             stop_sequences: vec![],
             ignore_eos: false,
             diffusion: None,
-        }
-    }
-
-    fn dummy_diffusion_request(id: &str, with_payload: bool, prompt: &str) -> InferenceRequest {
-        InferenceRequest {
-            request_id: id.to_string(),
-            modality: InferenceModality::Diffusion,
-            input_ids: vec![],
-            max_tokens: 1,
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: 0,
-            priority: 0,
-            stream: false,
-            stop_sequences: vec![],
-            ignore_eos: false,
-            diffusion: with_payload.then(|| DiffusionRequest {
-                prompt: prompt.to_string(),
-                prompt_input_ids: vec![1, 2, 3],
-                negative_prompt: None,
-                negative_prompt_input_ids: None,
-                height: 512,
-                width: 512,
-                num_inference_steps: 20,
-                sigmas: None,
-                guidance_scale: 7.5,
-                seed: None,
-                output_format: "png".to_string(),
-            }),
         }
     }
 
@@ -326,6 +264,22 @@ mod tests {
             other => panic!("expected Admitted, got {:?}", other),
         }
         assert_eq!(sessions.active_count(), 1);
+    }
+
+    #[test]
+    fn preserves_server_tokenized_stop_sequences() {
+        let mut sys = IngestionSystem::new();
+        let mut sessions = RequestTable::new();
+        let cfg = config_llm(4096);
+        let mut request = dummy_llm_request("req-stop", 10);
+        request.stop_sequences = vec![vec![7, 8], vec![9]];
+
+        let outcome = sys.ingest(ClientId::dummy(), request, &cfg, &mut sessions);
+        assert!(matches!(outcome, IngestOutcome::Admitted { .. }));
+        assert_eq!(
+            sessions.waiting().front().unwrap().meta.stop_sequences,
+            vec![vec![7, 8], vec![9]]
+        );
     }
 
     #[test]
@@ -370,58 +324,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_diffusion_without_payload() {
+    fn rejects_diffusion_modality_when_disabled() {
         let mut sys = IngestionSystem::new();
         let mut sessions = RequestTable::new();
-        let cfg = config_diffusion();
+        let cfg = config_llm(4096);
+        let mut request = dummy_llm_request("img-1", 1);
+        request.modality = InferenceModality::Diffusion;
+        let outcome = sys.ingest(ClientId::dummy(), request, &cfg, &mut sessions);
+        assert!(matches!(
+            outcome,
+            IngestOutcome::Rejected {
+                reason: RejectReason::DiffusionDisabled,
+                ..
+            }
+        ));
+        assert_eq!(sessions.active_count(), 0);
+    }
+
+    #[test]
+    fn rejects_hidden_diffusion_payload_and_diffusion_mode() {
+        let mut sys = IngestionSystem::new();
+        let mut sessions = RequestTable::new();
+        let mut payload_request = dummy_llm_request("img-payload", 1);
+        payload_request.diffusion = Some(Default::default());
         let outcome = sys.ingest(
             ClientId::dummy(),
-            dummy_diffusion_request("img-1", false, "ignored"),
+            payload_request,
+            &config_llm(4096),
+            &mut sessions,
+        );
+        assert!(matches!(
+            outcome,
+            IngestOutcome::Rejected {
+                reason: RejectReason::DiffusionDisabled,
+                ..
+            }
+        ));
+
+        let cfg = SchedulerConfig {
+            mode: SchedulerMode::Diffusion,
+            ..Default::default()
+        };
+        let outcome = sys.ingest(
+            ClientId::dummy(),
+            dummy_llm_request("img-mode", 1),
             &cfg,
             &mut sessions,
         );
         assert!(matches!(
             outcome,
             IngestOutcome::Rejected {
-                reason: RejectReason::DiffusionPayloadMissing,
+                reason: RejectReason::DiffusionDisabled,
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn rejects_diffusion_with_empty_prompt_string() {
-        let mut sys = IngestionSystem::new();
-        let mut sessions = RequestTable::new();
-        let cfg = config_diffusion();
-        let outcome = sys.ingest(
-            ClientId::dummy(),
-            dummy_diffusion_request("img-2", true, ""),
-            &cfg,
-            &mut sessions,
-        );
-        assert!(matches!(
-            outcome,
-            IngestOutcome::Rejected {
-                reason: RejectReason::DiffusionPromptEmpty,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn admits_valid_diffusion_request() {
-        let mut sys = IngestionSystem::new();
-        let mut sessions = RequestTable::new();
-        let cfg = config_diffusion();
-        let outcome = sys.ingest(
-            ClientId::dummy(),
-            dummy_diffusion_request("img-3", true, "a sunset"),
-            &cfg,
-            &mut sessions,
-        );
-        assert!(matches!(outcome, IngestOutcome::Admitted { .. }));
-        assert_eq!(sessions.active_count(), 1);
+        assert_eq!(sessions.active_count(), 0);
     }
 
     #[test]

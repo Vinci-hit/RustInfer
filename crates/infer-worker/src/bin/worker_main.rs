@@ -22,7 +22,7 @@ use serde::Deserialize;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION;
 
-use infer_worker::application::serve_loop::{run_with_model, Bootstrap};
+use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
 use infer_worker::domain::dtype::quant::QuantScheme;
 use infer_worker::infrastructure::cuda::Cuda;
 use infer_worker::infrastructure::io::SafetensorsReader;
@@ -181,11 +181,11 @@ fn parse_hf_config(bytes: &[u8]) -> Result<HfConfig, String> {
     let mut root: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("parse config json: {}", e))?;
 
-    if let Some(text_cfg) = root.get("text_config").cloned() {
-        if let (Some(root_map), Some(text_map)) = (root.as_object_mut(), text_cfg.as_object()) {
-            for (k, v) in text_map {
-                root_map.entry(k.clone()).or_insert_with(|| v.clone());
-            }
+    if let Some(text_cfg) = root.get("text_config").cloned()
+        && let (Some(root_map), Some(text_map)) = (root.as_object_mut(), text_cfg.as_object())
+    {
+        for (k, v) in text_map {
+            root_map.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 
@@ -719,7 +719,7 @@ mod config_tests {
         assert_eq!(la.key_dim(), 2048);
         assert_eq!(la.value_dim(), 4096);
         assert_eq!(la.conv_dim(), 8192); // 2048 + 2048 + 4096
-                                         // layer_types = [L,L,L,F] → last layer is full.
+        // layer_types = [L,L,L,F] → last layer is full.
         assert_eq!(la.layer_is_full, vec![false, false, false, true]);
         assert_eq!(la.num_full_layers(), 1);
         assert_eq!(la.num_linear_layers(), 3);

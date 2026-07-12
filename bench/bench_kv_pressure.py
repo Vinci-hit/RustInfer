@@ -5,9 +5,9 @@ long-prompt requests with long fixed-length decoding so the worker has to handle
 KV pressure, preemption/relief, and recovery without hanging or crashing.
 
 Usage:
-    python3 /root/RustInfer/bench/bench_kv_pressure.py --url http://127.0.0.1:8000
-    python3 /root/RustInfer/bench/bench_kv_pressure.py --concurrency 128 --waves 3
-    python3 /root/RustInfer/bench/bench_kv_pressure.py --dump-json /tmp/kv_pressure.json
+    python3 bench/bench_kv_pressure.py --url http://127.0.0.1:8000
+    python3 bench/bench_kv_pressure.py --concurrency 128 --waves 3
+    python3 bench/bench_kv_pressure.py --dump-json /tmp/kv_pressure.json
 """
 
 from __future__ import annotations

@@ -297,7 +297,7 @@ impl GlobalKvAllocator {
         }
         let n = self.released.len();
         self.compact_head();
-        self.free.extend(self.released.drain(..));
+        self.free.append(&mut self.released);
         self.free.sort_unstable();
         n
     }

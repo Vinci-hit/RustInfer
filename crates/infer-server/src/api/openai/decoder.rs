@@ -177,22 +177,18 @@ mod tests {
             .ok()
             .map(std::path::PathBuf::from)
             .into_iter()
-            .chain(
-                [
-                    "tests/data/tokenizer.json",
-                    "../../tests/data/tokenizer.json",
-                    "/root/RustInfer/tests/data/tokenizer.json",
-                ]
-                .iter()
-                .map(std::path::PathBuf::from),
-            )
+            .chain([
+                std::path::PathBuf::from("tests/data/tokenizer.json"),
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/data/tokenizer.json"),
+            ])
             .collect();
 
         for path in candidates {
-            if path.exists() {
-                if let Ok(tk) = Tokenizer::from_file(&path) {
-                    return Some(tk);
-                }
+            if path.exists()
+                && let Ok(tk) = Tokenizer::from_file(&path)
+            {
+                return Some(tk);
             }
         }
         None

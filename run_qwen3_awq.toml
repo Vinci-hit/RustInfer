@@ -1,11 +1,12 @@
 # RustInfer launch config for end-to-end smoke test of the int4-MLP AWQ
 # (compressed-tensors pack-quantized, W4A16) Qwen3-4B checkpoint.
-model = "/data/home/vinciiliu/models/qwen3-4b-instruct-AWQ-mlp3"
+# Paths are resolved from the directory where the binaries are launched.
+model = "./models/qwen3-4b-instruct-AWQ-mlp3"
 model_name = "qwen3-4b-instruct-AWQ-mlp3"
 cluster_id = "rustinfer-qwen3awq"
 device = "cuda:0"
 
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8101
 request_timeout_secs = 600
 

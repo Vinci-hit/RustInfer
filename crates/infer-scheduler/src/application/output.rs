@@ -37,8 +37,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use super::*;
-
     /// Capturing FrontendTransport: records every send_* call so tests
     /// can assert on emitted responses/chunks.
     #[derive(Default, Clone)]
@@ -109,6 +107,8 @@ mod tests {
             handle: RequestHandle::noop(),
             state: Decoding {
                 output_tokens: output,
+                num_streamed_tokens: 0,
+                stop_sequence_matched: false,
                 seq_position: 4,
                 prompt_len: 4,
                 original_prompt_len: 4,
@@ -184,5 +184,21 @@ mod tests {
         assert!(matches!(resps[0].status, ResponseStatus::Success));
         assert_eq!(resps[0].output_token_ids, vec![10, 11, 12]);
         assert!(outcome.num_tokens >= 1);
+    }
+
+    #[tokio::test]
+    async fn complete_session_reports_scheduler_stop_reason() {
+        let mut frontend = CapturingFrontend::default();
+        let metrics = MetricsRecorder::new(false);
+        let mut sequence = decoding_session(false, vec![10, 11]);
+        sequence.state.stop_sequence_matched = true;
+
+        crate::application::output_fns::complete_session(&mut frontend, &metrics, sequence)
+            .await
+            .unwrap();
+
+        let responses = frontend.responses.lock().unwrap();
+        assert_eq!(responses[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(responses[0].output_token_ids, vec![10, 11]);
     }
 }

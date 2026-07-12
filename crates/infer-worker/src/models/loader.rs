@@ -534,17 +534,6 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
     Tensor::<T, D>::from_host_bytes(&host_buf, shape, device)
 }
 
-/// Public re-export of the internal cast helper for diffusion loaders.
-pub unsafe fn cast_bytes_pub(
-    src: &[u8],
-    src_dt: DataType,
-    dst: *mut u8,
-    dst_dt: DataType,
-    numel: usize,
-) {
-    cast_bytes(src, src_dt, dst, dst_dt, numel);
-}
-
 /// Element-wise dtype cast via f64 intermediate.
 fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, numel: usize) {
     use half::{bf16, f16};
@@ -667,8 +656,8 @@ pub(crate) fn compute_rope_cache<T: Dtype, D: OpBackend>(
     let mut sin_host = vec![0u8; n * elem];
     let mut cos_host = vec![0u8; n * elem];
     for pos in 0..max_seq_len {
-        for i in 0..half_dim {
-            let angle = pos as f64 * freqs[i];
+        for (i, &frequency) in freqs.iter().enumerate().take(half_dim) {
+            let angle = pos as f64 * frequency;
             let offset = (pos * half_dim + i) * elem;
             // SAFETY: offset + elem <= n * elem by construction.
             unsafe {

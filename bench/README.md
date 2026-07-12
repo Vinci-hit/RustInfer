@@ -36,7 +36,7 @@ Last updated: 2026-06-15
 | `worker_id` | `worker-0` |
 | `log_level` | `info` |
 
-**Build**: `cargo build --release` (from `/root/RustInfer`)
+**Build**: `cargo build --release` from the repository root.
 
 **Start**: Each binary (`rustinfer-server`, `rustinfer-scheduler`, `rustinfer-worker`) takes `--config rustinfer.toml`.
 

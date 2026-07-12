@@ -94,7 +94,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
             let is_partial = chunk < *remaining;
 
             prefill_batch.push(PrefillEntry {
-                request_id: req_id.clone(),
+                request_id: *req_id,
                 token_range: start..(start + chunk),
                 is_partial,
             });
@@ -116,7 +116,6 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 let mut candidates: Vec<_> = waiting.iter().collect();
                 candidates.sort_by_key(|seq| seq.meta.input_ids.len());
 
-                let mut new_admitted = 0usize;
                 for (seqs_used, seq) in candidates.into_iter().enumerate() {
                     if seqs_used >= seq_budget
                         || kv_budget_remaining == 0
@@ -125,7 +124,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                         break;
                     }
                     if self.max_new_prefills_per_iter != 0
-                        && new_admitted >= self.max_new_prefills_per_iter
+                        && seqs_used >= self.max_new_prefills_per_iter
                     {
                         break;
                     }
@@ -148,12 +147,10 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 
                     let is_partial = tokens_to_prefill < prompt_len;
                     prefill_batch.push(PrefillEntry {
-                        request_id: seq.meta.id.clone(),
+                        request_id: seq.meta.id,
                         token_range: 0..tokens_to_prefill,
                         is_partial,
                     });
-                    new_admitted += 1;
-
                     kv_budget_remaining =
                         kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
                     tile_budget_remaining = tile_budget_remaining
@@ -161,9 +158,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 }
             } else {
                 // FCFS: iterate queue directly without collecting.
-                let mut new_admitted = 0usize;
-                let mut seqs_used = 0usize;
-                for seq in waiting.iter() {
+                for (seqs_used, seq) in waiting.iter().enumerate() {
                     if seqs_used >= seq_budget
                         || kv_budget_remaining == 0
                         || tile_budget_remaining == 0
@@ -171,7 +166,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                         break;
                     }
                     if self.max_new_prefills_per_iter != 0
-                        && new_admitted >= self.max_new_prefills_per_iter
+                        && seqs_used >= self.max_new_prefills_per_iter
                     {
                         break;
                     }
@@ -194,13 +189,10 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 
                     let is_partial = tokens_to_prefill < prompt_len;
                     prefill_batch.push(PrefillEntry {
-                        request_id: seq.meta.id.clone(),
+                        request_id: seq.meta.id,
                         token_range: 0..tokens_to_prefill,
                         is_partial,
                     });
-                    new_admitted += 1;
-                    seqs_used += 1;
-
                     kv_budget_remaining =
                         kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
                     tile_budget_remaining = tile_budget_remaining
@@ -380,7 +372,7 @@ mod tests {
     fn chunked_prefill_continuation_has_priority() {
         let policy = ContinuousBatchingPolicy::new(Some(10));
         let waiting = make_waiting(&[("new", 5)]);
-        let new_id = waiting.iter().next().unwrap().meta.id.clone();
+        let new_id = waiting.iter().next().unwrap().meta.id;
         // Simulate a sequence already in prefilling with 15 tokens remaining.
         let cont_id = RequestId::new_v4();
         let running = RunningSet {

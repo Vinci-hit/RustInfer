@@ -165,7 +165,10 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
-        if self.pending.is_some() || active.is_empty() {
+        if self.pending.is_some()
+            || active.is_empty()
+            || active.values().any(|seq| !seq.sampling.is_greedy())
+        {
             return Ok(());
         }
         self.issue_new(
@@ -314,10 +317,10 @@ impl DecodeEngine {
             }
         }
         for sid in &to_remove {
-            if let Some(removed) = active.remove(sid) {
-                if !enable_prefix_caching {
-                    to_free.extend_from_slice(&removed.block_table);
-                }
+            if let Some(removed) = active.remove(sid)
+                && !enable_prefix_caching
+            {
+                to_free.extend_from_slice(&removed.block_table);
             }
         }
         if !to_free.is_empty() {
@@ -404,6 +407,43 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
+        if active.values().any(|seq| !seq.sampling.is_greedy()) {
+            // A stochastic sequence cannot use the ABC pipeline because ABC
+            // embeds argmax and never returns logits. Drain any older greedy
+            // step first, then run the current mixed row set synchronously via
+            // Runtime::step (which forces eager sampling for this request).
+            let prior = self.finalize_pending(
+                runner,
+                active,
+                kv_allocator,
+                control,
+                enable_prefix_caching,
+            )?;
+            if let Some(output) = prior {
+                data.send_step_output(&output).map_err(|e| {
+                    OpError::Kernel(format!(
+                        "data plane send_step_output (before stochastic decode) failed: {}",
+                        e
+                    ))
+                })?;
+            }
+            if active.is_empty() {
+                self.rows.clear();
+                self.release_prealloc(kv_allocator);
+                return Ok(());
+            }
+            return self.run_eager_decode_step(
+                runner,
+                active,
+                prefilling,
+                kv_allocator,
+                control,
+                data,
+                eos_ids,
+                enable_prefix_caching,
+            );
+        }
+
         // Track whether this call starts with nothing in flight. If so, the
         // 1-deep pipeline would otherwise emit *no* token this iteration
         // (finalize sees `pending=None` → `to_send=None`) and the first decode
@@ -486,6 +526,78 @@ impl DecodeEngine {
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_eager_decode_step<M>(
+        &mut self,
+        runner: &mut Runtime<bf16, Cuda, M>,
+        active: &mut ActiveSeqMap,
+        prefilling: &mut PrefillSeqMap,
+        kv_allocator: &mut GlobalKvAllocator,
+        control: &ControlPump,
+        data: &DataPump,
+        eos_ids: &[i32],
+        enable_prefix_caching: bool,
+    ) -> OpResult<()>
+    where
+        M: DecoderModel<bf16, Cuda>,
+    {
+        let Some((order, new_indices)) = self.prepare_step(
+            active,
+            prefilling,
+            kv_allocator,
+            control,
+            enable_prefix_caching,
+        )?
+        else {
+            return Ok(());
+        };
+        let build = build_decode_request(
+            &order,
+            new_indices.as_slice(),
+            active,
+            eos_ids,
+            enable_prefix_caching,
+        );
+        let sampled = match runner.step(&build.req) {
+            Ok(output) => output,
+            Err(error) => {
+                new_indices.release(kv_allocator);
+                fail_decode_seqs(
+                    control,
+                    active,
+                    kv_allocator,
+                    &order,
+                    format!("stochastic decode failed: {error}"),
+                    enable_prefix_caching,
+                );
+                self.reset_after_fused();
+                return Ok(());
+            }
+        };
+        let mut output = StepOutput {
+            prefill_done: Vec::new(),
+            tokens: Vec::new(),
+            assigned_indices: build.assigned,
+        };
+        self.commit_fused_decode(
+            active,
+            kv_allocator,
+            &order,
+            new_indices,
+            &sampled.tokens,
+            &sampled.finished,
+            enable_prefix_caching,
+            &mut output,
+            &[],
+        )?;
+        data.send_step_output(&output).map_err(|e| {
+            OpError::Kernel(format!(
+                "data plane send_step_output (stochastic decode) failed: {}",
+                e
+            ))
+        })
     }
 
     /// Collect + commit the in-flight step. Returns its `StepOutput` to send.
@@ -757,6 +869,9 @@ impl DecodeEngine {
     /// rows, so that (2) removing a finished row reclaims its full KV (all prior
     /// blocks plus the slot allocated this step). Surviving rows become the next
     /// device-row order, in compaction (active_src_rows) order, matching A.
+    // These values are the atomic commit boundary for one decode step. Keeping
+    // them explicit makes ownership of the KV lease and device state visible.
+    #[allow(clippy::too_many_arguments)]
     fn commit_results(
         &mut self,
         active: &mut ActiveSeqMap,
@@ -892,6 +1007,7 @@ pub(crate) fn build_decode_request(
     let mut generated_counts = Vec::with_capacity(order.len());
     let mut max_tokens = Vec::with_capacity(order.len());
     let mut ignore_eos = Vec::with_capacity(order.len());
+    let mut sampling = Vec::with_capacity(order.len());
     for (i, &sid) in order.iter().enumerate() {
         let new_idx = new_indices[i];
         let seq = active
@@ -921,10 +1037,11 @@ pub(crate) fn build_decode_request(
         generated_counts.push(seq.generated_count as u32);
         max_tokens.push(seq.max_tokens as u32);
         ignore_eos.push(seq.ignore_eos);
+        sampling.push(seq.sampling);
     }
 
     let req = StepRequest {
-        sampling: Vec::new(),
+        sampling,
         stop: StopCriteria {
             eos_ids: eos_ids.to_vec(),
             generated_counts: generated_counts.clone(),
@@ -973,6 +1090,7 @@ pub(crate) fn build_overlap_decode_request(
     let mut generated_counts = Vec::with_capacity(order.len());
     let mut max_tokens = Vec::with_capacity(order.len());
     let mut ignore_eos = Vec::with_capacity(order.len());
+    let mut sampling = Vec::with_capacity(order.len());
     for (i, &sid) in order.iter().enumerate() {
         let seq = active
             .get(&sid)
@@ -999,10 +1117,11 @@ pub(crate) fn build_overlap_decode_request(
         generated_counts.push(seq.generated_count as u32 + 1);
         max_tokens.push(seq.max_tokens as u32);
         ignore_eos.push(seq.ignore_eos);
+        sampling.push(seq.sampling);
     }
 
     let req = StepRequest {
-        sampling: Vec::new(),
+        sampling,
         stop: StopCriteria {
             eos_ids: eos_ids.to_vec(),
             generated_counts: generated_counts.clone(),

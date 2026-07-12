@@ -7,6 +7,7 @@ use infer_protocol::server_to_scheduler::{CancelReason, InferenceRequest};
 use crate::domain::inference_session::handle::ClientId;
 use crate::error::Result;
 
+#[allow(clippy::large_enum_variant)] // Avoid a second allocation on every inference submission.
 pub enum FrontendEvent {
     Infer {
         client_id: ClientId,

@@ -15,7 +15,7 @@ pub struct ChatCompletionRequest {
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
 
-    #[serde(default = "default_max_tokens")]
+    #[serde(default)]
     pub max_tokens: Option<usize>,
 
     /// Force generation of exactly `max_tokens` by ignoring EOS tokens.
@@ -61,15 +61,6 @@ pub enum StopSequence {
     Multiple(Vec<String>),
 }
 
-impl StopSequence {
-    pub fn into_vec(self) -> Vec<String> {
-        match self {
-            StopSequence::Single(s) => vec![s],
-            StopSequence::Multiple(v) => v,
-        }
-    }
-}
-
 /// 流式选项
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamOptions {
@@ -107,7 +98,7 @@ pub struct CompletionRequest {
     pub model: Option<String>,
     pub prompt: CompletionPrompt,
 
-    #[serde(default = "default_max_tokens")]
+    #[serde(default)]
     pub max_tokens: Option<usize>,
 
     /// Force generation of exactly `max_tokens` by ignoring EOS tokens.
@@ -209,66 +200,6 @@ pub struct CompletionChunkChoice {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Image Generation 请求/响应 (/v1/images/generations)
-// ═══════════════════════════════════════════════════════════════
-
-#[derive(Debug, Deserialize)]
-pub struct ImageGenerationRequest {
-    #[serde(default)]
-    pub model: Option<String>,
-    pub prompt: String,
-
-    #[serde(default)]
-    pub negative_prompt: Option<String>,
-    /// Number of images. For binary response this must be 1.
-    pub n: Option<usize>,
-    /// OpenAI-style size string, e.g. "1024x1024".
-    pub size: Option<String>,
-    /// "b64_json" (default) or "binary".
-    pub response_format: Option<ImageResponseFormat>,
-    /// Encoded image format: "png" (default) or "jpeg".
-    pub output_format: Option<ImageOutputFormat>,
-    /// JPEG quality 1..100. Ignored for PNG.
-    pub jpeg_quality: Option<u8>,
-
-    pub num_inference_steps: Option<usize>,
-    pub guidance_scale: Option<f32>,
-    pub seed: Option<u64>,
-    #[serde(default)]
-    pub sigmas: Option<Vec<f32>>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageResponseFormat {
-    B64Json,
-    Binary,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ImageOutputFormat {
-    Png,
-    Jpeg,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImageGenerationResponse {
-    pub created: i64,
-    pub data: Vec<ImageData>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ImageData {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub b64_json: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revised_prompt: Option<String>,
-}
-
-// ═══════════════════════════════════════════════════════════════
 // 共享类型
 // ═══════════════════════════════════════════════════════════════
 
@@ -299,14 +230,6 @@ pub struct ModelObject {
     pub owned_by: String,
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 默认值函数
-// ═══════════════════════════════════════════════════════════════
-
-fn default_max_tokens() -> Option<usize> {
-    Some(2048)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,17 +239,13 @@ mod tests {
         let req: ChatCompletionRequest =
             serde_json::from_str(r#"{"messages":[{"role":"user","content":"hello"}]}"#).unwrap();
         assert!(req.model.is_none());
+        assert!(req.max_tokens.is_none());
     }
 
     #[test]
     fn completion_request_accepts_missing_model() {
         let req: CompletionRequest = serde_json::from_str(r#"{"prompt":"hello"}"#).unwrap();
         assert!(req.model.is_none());
-    }
-
-    #[test]
-    fn image_request_accepts_missing_model() {
-        let req: ImageGenerationRequest = serde_json::from_str(r#"{"prompt":"hello"}"#).unwrap();
-        assert!(req.model.is_none());
+        assert!(req.max_tokens.is_none());
     }
 }

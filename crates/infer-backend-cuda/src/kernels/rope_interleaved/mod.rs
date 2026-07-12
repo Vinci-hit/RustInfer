@@ -116,7 +116,7 @@ pub fn apply_rope_interleaved<T: RopeInterleavedKernel>(
             hd, head_dim,
         )));
     }
-    if head_dim % 2 != 0 {
+    if !head_dim.is_multiple_of(2) {
         return Err(OpError::Shape(format!(
             "apply_rope_interleaved: head_dim must be even, got {}",
             head_dim,

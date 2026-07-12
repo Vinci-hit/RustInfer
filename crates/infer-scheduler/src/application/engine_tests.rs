@@ -21,7 +21,7 @@ use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
 use crate::infrastructure::transport::control_plane::WorkerGroup;
 use crate::infrastructure::transport::control_plane::WorkerId;
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
-use infer_protocol::scheduler_to_server::{InferenceResponse, StreamChunk};
+use infer_protocol::scheduler_to_server::{InferenceResponse, ResponseStatus, StreamChunk};
 use infer_protocol::worker_to_scheduler_control::{WorkerCapacity, WorkerReady};
 
 /// Build a `(ControlPlaneCmdTx, ControlPlaneEventRx, sent: Arc<Mutex<Vec<RouterCommand>>>)`
@@ -72,6 +72,33 @@ impl FrontendTransport for MockFrontend {
     }
 
     async fn send_stream_chunk(&mut self, _client: &ClientId, _chunk: StreamChunk) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturingFrontend {
+    responses: Arc<Mutex<Vec<InferenceResponse>>>,
+    chunks: Arc<Mutex<Vec<StreamChunk>>>,
+}
+
+#[async_trait]
+impl FrontendTransport for CapturingFrontend {
+    async fn recv_event(&mut self) -> Result<FrontendEvent> {
+        Err(crate::error::SchedulerError::Shutdown)
+    }
+
+    async fn send_response(
+        &mut self,
+        _client: &ClientId,
+        response: InferenceResponse,
+    ) -> Result<()> {
+        self.responses.lock().unwrap().push(response);
+        Ok(())
+    }
+
+    async fn send_stream_chunk(&mut self, _client: &ClientId, chunk: StreamChunk) -> Result<()> {
+        self.chunks.lock().unwrap().push(chunk);
         Ok(())
     }
 }
@@ -147,6 +174,51 @@ fn prefilling_sequence() -> InferenceSession<Prefilling> {
 }
 
 #[tokio::test]
+async fn rejected_ingestion_returns_an_immediate_error() -> Result<()> {
+    use infer_protocol::server_to_scheduler::{InferenceModality, InferenceRequest};
+
+    let frontend = CapturingFrontend::default();
+    let responses = Arc::clone(&frontend.responses);
+    let (control_cmd, control_events, _event_tx, _cmd_rx) = mock_control_plane();
+    let mut engine = SchedulerEngine::new(
+        SchedulerConfig::default(),
+        Box::new(ContinuousBatchingPolicy::new(None)),
+        worker_group(),
+        frontend,
+        MockWorker::default(),
+        control_cmd,
+        control_events,
+        WorkerId::from_identity(b"worker-test"),
+    );
+    let request = InferenceRequest {
+        request_id: "invalid-empty-prompt".to_string(),
+        modality: InferenceModality::Llm,
+        input_ids: vec![],
+        max_tokens: 1,
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: -1,
+        stream: false,
+        priority: 0,
+        stop_sequences: vec![],
+        ignore_eos: false,
+        diffusion: None,
+    };
+
+    engine
+        .handle_new_request(ClientId::dummy(), request)
+        .await?;
+
+    let responses = responses.lock().unwrap();
+    assert_eq!(responses.len(), 1);
+    assert!(matches!(responses[0].status, ResponseStatus::Error));
+    assert_eq!(responses[0].request_id, "invalid-empty-prompt");
+    assert_eq!(responses[0].error.as_deref(), Some("empty input_ids"));
+    assert_eq!(engine.requests.active_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn step_output_final_prefill_decodes_with_existing_blocks() -> Result<()> {
     let config = SchedulerConfig {
         paged_block_size: BlockSize::new(4),
@@ -168,7 +240,7 @@ async fn step_output_final_prefill_decodes_with_existing_blocks() -> Result<()> 
         default_worker.clone(),
     );
     let seq = prefilling_sequence();
-    let request_id = seq.meta.id.clone();
+    let request_id = seq.meta.id;
     engine
         .requests
         .insert_new(Arc::clone(&seq.meta), RequestHandle::noop())?;
@@ -301,7 +373,7 @@ async fn non_prefix_finished_prefill_releases_current_step_kv_budget() -> Result
     engine.config.enable_prefix_caching = false;
 
     let seq = prefilling_sequence();
-    let request_id = seq.meta.id.clone();
+    let request_id = seq.meta.id;
     engine
         .requests
         .insert_new(Arc::clone(&seq.meta), RequestHandle::noop())?;
@@ -515,7 +587,7 @@ fn insert_decoding_session(engine: &mut SchedulerEngine, sid: u64, input_len: us
         diffusion: None,
         arrival_time: Instant::now(),
     });
-    let request_id = meta.id.clone();
+    let request_id = meta.id;
     engine
         .requests
         .insert_new(Arc::clone(&meta), RequestHandle::noop())
@@ -579,7 +651,7 @@ async fn worker_lost_fails_all_inflight() -> Result<()> {
 async fn cancel_emits_control_unicast_not_data_plane() -> Result<()> {
     let (mut engine, default_worker, _event_tx, mut cmd_rx) = make_engine();
     let seq = prefilling_sequence();
-    let request_id = seq.meta.id.clone();
+    let request_id = seq.meta.id;
     engine
         .requests
         .insert_new(Arc::clone(&seq.meta), RequestHandle::noop())?;

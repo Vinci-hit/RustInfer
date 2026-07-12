@@ -105,6 +105,14 @@ pub struct TokenAppendOutcome {
     pub sequence_id: SequenceId,
     pub token_id: i32,
     pub worker_finished: bool,
+    /// True when either the worker finished or scheduler-side stop matching
+    /// finished the sequence.
+    pub finished: bool,
+    pub stop_sequence_finished: bool,
+    /// Safe token ids ready for streaming. Possible stop-sequence prefixes are
+    /// held back until they either mismatch (then released) or fully match
+    /// (then removed from output and never emitted).
+    pub tokens_to_stream: Vec<i32>,
     /// Streaming delivery target. `Some` only for streaming requests, so
     /// non-streaming decode tokens incur no per-token heap allocation here.
     /// The `client_id` clone is a cheap `Arc` refcount bump; the `external_id`
@@ -256,7 +264,7 @@ impl RequestTable {
     }
 
     pub fn insert_new(&mut self, meta: Arc<RequestMeta>, handle: RequestHandle) -> Result<()> {
-        let request_id = meta.id.clone();
+        let request_id = meta.id;
         let external_id = meta.external_id.clone();
         let sequence_id = meta.sequence_id;
         if self.by_request.contains_key(&request_id) {
@@ -316,7 +324,7 @@ impl RequestTable {
             .filter(|seq| !seq.has_inflight())
             .filter_map(|seq| {
                 let remaining = seq.remaining_tokens();
-                (remaining > 0).then(|| (seq.meta.id.clone(), remaining))
+                (remaining > 0).then(|| (seq.meta.id, remaining))
             })
             .collect()
     }
@@ -331,7 +339,7 @@ impl RequestTable {
     }
 
     pub fn restore_waiting_front(&mut self, seq: InferenceSession<Queued>) -> Result<()> {
-        let request_id = seq.meta.id.clone();
+        let request_id = seq.meta.id;
         let sequence_id = seq.meta.sequence_id;
         if self.locations.contains_key(&sequence_id) {
             return Err(SchedulerError::Internal(format!(
@@ -363,7 +371,7 @@ impl RequestTable {
                 seq.meta.id
             )));
         }
-        let request_id = seq.meta.id.clone();
+        let request_id = seq.meta.id;
         let sequence_id = seq.meta.sequence_id;
         if self.by_request.get(&request_id).copied() != Some(sequence_id) {
             return Err(SchedulerError::Internal(format!(
@@ -495,7 +503,7 @@ impl RequestTable {
                 sequence_id
             )));
         };
-        let request_id = seq.meta.id.clone();
+        let request_id = seq.meta.id;
         if inflight.is_final || seq.is_complete() {
             let decoding = seq.start_decode();
             let new_key = self.decoding.insert(decoding);
@@ -541,6 +549,27 @@ impl RequestTable {
             SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
         })?;
         seq.append_token(token_id);
+        let matched_stop_len =
+            longest_stop_suffix(&seq.state.output_tokens, &seq.meta.stop_sequences);
+        let stop_sequence_finished = matched_stop_len > 0;
+        if stop_sequence_finished {
+            let keep = seq.state.output_tokens.len() - matched_stop_len;
+            seq.state.output_tokens.truncate(keep);
+            seq.state.stop_sequence_matched = true;
+        }
+
+        let safe_len = if stop_sequence_finished || worker_finished {
+            seq.state.output_tokens.len()
+        } else {
+            seq.state
+                .output_tokens
+                .len()
+                .saturating_sub(stop_prefix_holdback(
+                    &seq.state.output_tokens,
+                    &seq.meta.stop_sequences,
+                ))
+        };
+
         // Only streaming requests need the per-token delivery target. For
         // non-streaming requests this allocates nothing (the token is buffered
         // and delivered once at completion via `complete_session`).
@@ -552,10 +581,21 @@ impl RequestTable {
         } else {
             None
         };
+        let tokens_to_stream = if stream.is_some() {
+            let start = seq.state.num_streamed_tokens.min(safe_len);
+            let tokens = seq.state.output_tokens[start..safe_len].to_vec();
+            seq.state.num_streamed_tokens = safe_len;
+            tokens
+        } else {
+            Vec::new()
+        };
         Ok(TokenAppendOutcome {
             sequence_id,
             token_id,
             worker_finished,
+            finished: worker_finished || stop_sequence_finished,
+            stop_sequence_finished,
+            tokens_to_stream,
             stream,
         })
     }
@@ -568,7 +608,7 @@ impl RequestTable {
         let seq = self.decoding.remove(key).ok_or_else(|| {
             SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
         })?;
-        self.remove_active(seq.meta.id.clone(), sequence_id, &seq.meta.external_id)?;
+        self.remove_active(seq.meta.id, sequence_id, &seq.meta.external_id)?;
         debug_assert!(self.validate_consistency().is_ok());
         Ok(seq)
     }
@@ -612,9 +652,9 @@ impl RequestTable {
                 let seq = self.prefilling.remove(addr.key).ok_or_else(|| {
                     SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
                 })?;
-                let request_id = seq.meta.id.clone();
+                let request_id = seq.meta.id;
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
+                self.remove_active(request_id, sequence_id, &external_id)?;
                 Ok(FailedOutcome::RemovedPrefilling {
                     request_id,
                     external_id,
@@ -626,9 +666,9 @@ impl RequestTable {
                 let seq = self.decoding.remove(addr.key).ok_or_else(|| {
                     SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
                 })?;
-                let request_id = seq.meta.id.clone();
+                let request_id = seq.meta.id;
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
+                self.remove_active(request_id, sequence_id, &external_id)?;
                 Ok(FailedOutcome::RemovedDecoding {
                     request_id,
                     external_id,
@@ -655,7 +695,7 @@ impl RequestTable {
         let seq = self.prefilling.remove(addr.key).ok_or_else(|| {
             SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
         })?;
-        self.remove_active(request_id.clone(), sequence_id, &seq.meta.external_id)?;
+        self.remove_active(*request_id, sequence_id, &seq.meta.external_id)?;
         Ok(Some(seq))
     }
 
@@ -671,9 +711,9 @@ impl RequestTable {
                 let seq = self.waiting.remove(request_id).ok_or_else(|| {
                     SchedulerError::Internal(format!("waiting request not found: {}", request_id))
                 })?;
-                self.remove_active(request_id.clone(), sequence_id, &seq.meta.external_id)?;
+                self.remove_active(*request_id, sequence_id, &seq.meta.external_id)?;
                 Ok(CancelOutcome::RemovedWaiting {
-                    request_id: seq.meta.id.clone(),
+                    request_id: seq.meta.id,
                     external_id: seq.meta.external_id.clone(),
                     sequence_id,
                 })
@@ -682,9 +722,9 @@ impl RequestTable {
                 let seq = self.prefilling.remove(addr.key).ok_or_else(|| {
                     SchedulerError::Internal(format!("prefilling slot vanished: {}", sequence_id))
                 })?;
-                let request_id_out = seq.meta.id.clone();
+                let request_id_out = seq.meta.id;
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
+                self.remove_active(*request_id, sequence_id, &external_id)?;
                 Ok(CancelOutcome::RemovedPrefilling {
                     request_id: request_id_out,
                     external_id,
@@ -695,9 +735,9 @@ impl RequestTable {
                 let seq = self.decoding.remove(addr.key).ok_or_else(|| {
                     SchedulerError::Internal(format!("decoding slot vanished: {}", sequence_id))
                 })?;
-                let request_id_out = seq.meta.id.clone();
+                let request_id_out = seq.meta.id;
                 let external_id = seq.meta.external_id.clone();
-                self.remove_active(request_id.clone(), sequence_id, &external_id)?;
+                self.remove_active(*request_id, sequence_id, &external_id)?;
                 Ok(CancelOutcome::RemovedDecoding {
                     request_id: request_id_out,
                     external_id,
@@ -757,6 +797,7 @@ impl RequestTable {
                 };
                 let resume = (generated > 0).then_some(ResumeState {
                     generated,
+                    streamed: seq.state.num_streamed_tokens.min(generated),
                     first_token_time: seq.state.first_token_time,
                     preemption_count: seq.state.preemption_count,
                 });
@@ -861,16 +902,15 @@ impl RequestTable {
                     seq.meta.id
                 )));
             }
-            if let Some(inflight) = seq.state.inflight {
-                if inflight.segment_start >= inflight.segment_end
+            if let Some(inflight) = seq.state.inflight
+                && (inflight.segment_start >= inflight.segment_end
                     || inflight.segment_end > seq.state.prompt_len
-                    || inflight.segment_start < seq.state.num_computed_tokens
-                {
-                    return Err(SchedulerError::Internal(format!(
-                        "invalid inflight segment for {}: {:?}",
-                        seq.meta.id, inflight
-                    )));
-                }
+                    || inflight.segment_start < seq.state.num_computed_tokens)
+            {
+                return Err(SchedulerError::Internal(format!(
+                    "invalid inflight segment for {}: {:?}",
+                    seq.meta.id, inflight
+                )));
             }
         }
         for (key, seq) in &self.decoding {
@@ -988,6 +1028,30 @@ impl RequestTable {
     }
 }
 
+fn longest_stop_suffix(tokens: &[i32], stop_sequences: &[Vec<i32>]) -> usize {
+    stop_sequences
+        .iter()
+        .filter(|stop| !stop.is_empty() && tokens.ends_with(stop))
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+}
+
+fn stop_prefix_holdback(tokens: &[i32], stop_sequences: &[Vec<i32>]) -> usize {
+    stop_sequences
+        .iter()
+        .filter(|stop| stop.len() > 1)
+        .map(|stop| {
+            let max_prefix = tokens.len().min(stop.len() - 1);
+            (1..=max_prefix)
+                .rev()
+                .find(|&len| tokens.ends_with(&stop[..len]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,7 +1116,7 @@ mod tests {
     fn waiting_prefilling_decoding_complete_lifecycle() {
         let mut table = RequestTable::new();
         let m = meta("req", 7, 4, 8);
-        let request_id = m.id.clone();
+        let request_id = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&request_id).unwrap();
         let outcome = table.commit_prefill_start(queued, no_prefix(), 4).unwrap();
@@ -1069,11 +1133,69 @@ mod tests {
         assert!(table.validate_consistency().is_ok());
     }
 
+    fn decoding_table_with_stop(stop: Vec<i32>) -> RequestTable {
+        let mut table = RequestTable::new();
+        let mut request_meta = (*meta("stop", 77, 2, 8)).clone();
+        request_meta.stream = true;
+        request_meta.stop_sequences = vec![stop];
+        let request_meta = Arc::new(request_meta);
+        let request_id = request_meta.id;
+        table
+            .insert_new(request_meta, RequestHandle::new(ClientId::dummy(), true))
+            .unwrap();
+        let queued = table.take_waiting(&request_id).unwrap();
+        table.commit_prefill_start(queued, no_prefix(), 2).unwrap();
+        let _ = table.ack_prefill(SequenceId(77)).unwrap();
+        table
+    }
+
+    #[test]
+    fn streaming_holds_back_and_removes_stop_sequence_tokens() {
+        let mut table = decoding_table_with_stop(vec![7, 8]);
+
+        let safe = table
+            .append_generated_token(SequenceId(77), 5, false)
+            .unwrap();
+        assert_eq!(safe.tokens_to_stream, vec![5]);
+
+        let prefix = table
+            .append_generated_token(SequenceId(77), 7, false)
+            .unwrap();
+        assert!(prefix.tokens_to_stream.is_empty());
+        assert!(!prefix.finished);
+
+        let matched = table
+            .append_generated_token(SequenceId(77), 8, false)
+            .unwrap();
+        assert!(matched.tokens_to_stream.is_empty());
+        assert!(matched.finished);
+        assert!(matched.stop_sequence_finished);
+
+        let seq = table.finish_decoding(SequenceId(77)).unwrap();
+        assert_eq!(seq.state.output_tokens, vec![5]);
+        assert!(seq.state.stop_sequence_matched);
+    }
+
+    #[test]
+    fn streaming_releases_held_prefix_after_mismatch() {
+        let mut table = decoding_table_with_stop(vec![7, 8]);
+        let prefix = table
+            .append_generated_token(SequenceId(77), 7, false)
+            .unwrap();
+        assert!(prefix.tokens_to_stream.is_empty());
+
+        let mismatch = table
+            .append_generated_token(SequenceId(77), 9, false)
+            .unwrap();
+        assert_eq!(mismatch.tokens_to_stream, vec![7, 9]);
+        assert!(!mismatch.finished);
+    }
+
     #[test]
     fn cancel_waiting_removes_indexes() {
         let mut table = RequestTable::new();
         let m = meta("req", 1, 4, 8);
-        let request_id = m.id.clone();
+        let request_id = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let outcome = table.cancel_request(&request_id).unwrap();
         assert!(matches!(outcome, CancelOutcome::RemovedWaiting { .. }));
@@ -1085,7 +1207,7 @@ mod tests {
     fn full_prefix_hit_moves_directly_to_decoding() {
         let mut table = RequestTable::new();
         let m = meta("req", 3, 4, 8);
-        let request_id = m.id.clone();
+        let request_id = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&request_id).unwrap();
         let outcome = table
@@ -1112,7 +1234,7 @@ mod tests {
         let mut table = RequestTable::new();
         // Session A, sequence_id=1
         let m_a = meta("req-a", 1, 1, 1);
-        let req_a = m_a.id.clone();
+        let req_a = m_a.id;
         table.insert_new(m_a, RequestHandle::noop()).unwrap();
         let queued_a = table.take_waiting(&req_a).unwrap();
         table
@@ -1125,7 +1247,7 @@ mod tests {
         let _ = table.finish_decoding(SequenceId(1)).unwrap();
         // Now insert B with sequence_id=2; it likely reuses A's freed slot.
         let m_b = meta("req-b", 2, 1, 1);
-        let req_b = m_b.id.clone();
+        let req_b = m_b.id;
         table.insert_new(m_b, RequestHandle::noop()).unwrap();
         let queued_b = table.take_waiting(&req_b).unwrap();
         table
@@ -1150,7 +1272,7 @@ mod tests {
     fn locations_reflect_bucket_transitions() {
         let mut table = RequestTable::new();
         let m = meta("req", 5, 2, 4);
-        let req = m.id.clone();
+        let req = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         assert_eq!(table.location_for_request(&req), Some(Bucket::Waiting));
         let queued = table.take_waiting(&req).unwrap();
@@ -1174,7 +1296,7 @@ mod tests {
         let mut table = RequestTable::new();
         // One prefilling with no progress.
         let m_a = meta("a", 1, 4, 8);
-        let req_a = m_a.id.clone();
+        let req_a = m_a.id;
         table.insert_new(m_a, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req_a).unwrap();
         // Schedule a tiny chunk → enters Prefilling with inflight set,
@@ -1191,7 +1313,7 @@ mod tests {
     fn preemption_candidates_includes_chunked_prefilling_with_progress() {
         let mut table = RequestTable::new();
         let m = meta("p", 5, 4, 8);
-        let req = m.id.clone();
+        let req = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
         table.commit_prefill_start(queued, no_prefix(), 1).unwrap();
@@ -1209,7 +1331,7 @@ mod tests {
     fn decoding_kv_slots_excludes_latest_unwritten_output_token() {
         let mut table = RequestTable::new();
         let m = meta("d", 8, 4, 8);
-        let req = m.id.clone();
+        let req = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
         table.commit_prefill_start(queued, no_prefix(), 4).unwrap();
@@ -1239,12 +1361,12 @@ mod tests {
         let mut table = RequestTable::new();
         // Pre-existing waiting work so we can prove push_front lands on top.
         let m_back = meta("back", 9, 2, 4);
-        let req_back = m_back.id.clone();
+        let req_back = m_back.id;
         table.insert_new(m_back, RequestHandle::noop()).unwrap();
 
         // Promote a session into Decoding.
         let m = meta("d", 7, 2, 4);
-        let req = m.id.clone();
+        let req = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
         table.commit_prefill_start(queued, no_prefix(), 2).unwrap();
@@ -1291,7 +1413,7 @@ mod tests {
     fn preempt_to_queued_prefilling_resets_state() {
         let mut table = RequestTable::new();
         let m = meta("p", 3, 4, 8);
-        let req = m.id.clone();
+        let req = m.id;
         table.insert_new(m, RequestHandle::noop()).unwrap();
         let queued = table.take_waiting(&req).unwrap();
         table.commit_prefill_start(queued, no_prefix(), 1).unwrap();

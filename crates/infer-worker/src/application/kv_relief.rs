@@ -55,6 +55,9 @@ pub enum AllocWithReliefOutcome {
 ///
 /// Other control messages that arrive during the wait (Cancel,
 /// Shutdown, Ping) are handled inline because ZMQ has no peek API.
+// Relief coordinates the control plane and both sequence maps at one explicit
+// boundary; wrapping these independent state references would hide borrowing.
+#[allow(clippy::too_many_arguments)]
 pub fn wait_for_relief<C: ReliefControl>(
     control: &C,
     kv_allocator: &mut GlobalKvAllocator,
@@ -73,7 +76,7 @@ pub fn wait_for_relief<C: ReliefControl>(
         // P1: Reduced poll granularity from 50ms to 5ms. The scheduler
         // answers AllocFailed within single-digit ms; a coarser poll added
         // up to 50ms of wasted latency per round.
-        let poll_ms = remaining.min(5).max(1);
+        let poll_ms = remaining.clamp(1, 5);
         match control.try_recv(poll_ms) {
             Ok(Some((SchedulerControlMessage::FreeKvIndices(f), _))) => {
                 if !f.indices.is_empty() {
@@ -327,6 +330,7 @@ mod tests {
             block_table,
             max_tokens: 16,
             generated_count: 1,
+            sampling: Default::default(),
             ignore_eos: false,
         }
     }

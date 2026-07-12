@@ -127,7 +127,7 @@ impl IntoResponse for AppError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
-                    err.to_string(),
+                    "The server encountered an internal error".to_string(),
                 )
             }
         };
@@ -152,5 +152,33 @@ where
 {
     fn from(err: E) -> Self {
         Self::Internal(err.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn internal_errors_do_not_expose_details() {
+        let response =
+            AppError::internal(anyhow::anyhow!("secret database details")).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("The server encountered an internal error"));
+        assert!(!text.contains("secret database details"));
+    }
+
+    #[test]
+    fn request_timeout_marker_maps_to_gateway_timeout() {
+        let err = anyhow::Error::new(RequestTimedOut {
+            request_id: "req-timeout".to_string(),
+            secs: 3,
+        });
+        let response = AppError::from_submit(err).into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 }

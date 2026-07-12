@@ -152,8 +152,7 @@ where
             device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
         // Hold back a fixed reserve for the incremental allocations the prewarm
         // pass makes after sizing (per-shape cuDNN plans, recycling-pool growth).
-        let usable =
-            free_after.saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
+        let usable = free_after.saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
         let budget = (usable as f64 * fraction as f64) as usize;
         let raw = budget / bytes_per_block.max(1);
         // Small fragmentation slack on top of the fixed prewarm reserve: 1 block
@@ -185,7 +184,7 @@ where
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
         tracing::info!(
             "[bootstrap] KV mem probe (profile-driven): total={:.2}GiB free_after_workspace={:.2}GiB free_after_dummy_fwd={:.2}GiB (dummy committed {:.2}GiB lazy libs) prewarm_reserve={:.2}GiB fraction={} bytes/block={} probed={} -> num_blocks={} (~{:.2}GiB KV pool)",
-            gib(total as usize),
+            gib(total),
             gib(free_before),
             gib(free_after),
             gib(free_before.saturating_sub(free_after)),
@@ -351,18 +350,18 @@ where
     let mut deferred_prefills: Vec<PrefillBatchCmd> = Vec::new();
 
     loop {
-        let mut ctx = WorkerCtx {
-            active: &mut active,
-            prefilling: &mut prefilling,
-            decode_engine: &mut decode_engine,
-            kv_allocator: &mut kv_allocator,
-            enable_prefix_caching,
-        };
-        if drain_control(control, &mut ctx) {
-            return Ok(());
+        {
+            let mut ctx = WorkerCtx {
+                active: &mut active,
+                prefilling: &mut prefilling,
+                decode_engine: &mut decode_engine,
+                kv_allocator: &mut kv_allocator,
+                enable_prefix_caching,
+            };
+            if drain_control(control, &mut ctx) {
+                return Ok(());
+            }
         }
-        // Drop ctx to release the mutable borrows for the rest of the loop body.
-        drop(ctx);
 
         // ── Wait policy: zero-latency event-driven scheduling ──
         //
@@ -400,23 +399,23 @@ where
                 .as_millis() as i64;
             let idle_timeout_ms = until_next_hb.max(1);
 
-            let mut items = [
-                data.recv_socket().as_poll_item(zmq::POLLIN),
-                control.recv_socket().as_poll_item(zmq::POLLIN),
-            ];
-            match zmq::poll(&mut items, idle_timeout_ms) {
-                Ok(_) => {}
-                Err(zmq::Error::EINTR) => continue,
-                Err(e) => {
-                    tracing::info!("[serve] zmq::poll error: {:?}", e);
-                    continue;
+            let (data_ready, control_ready) = {
+                let mut items = [
+                    data.recv_socket().as_poll_item(zmq::POLLIN),
+                    control.recv_socket().as_poll_item(zmq::POLLIN),
+                ];
+                match zmq::poll(&mut items, idle_timeout_ms) {
+                    Ok(_) => {}
+                    Err(zmq::Error::EINTR) => continue,
+                    Err(e) => {
+                        tracing::info!("[serve] zmq::poll error: {:?}", e);
+                        continue;
+                    }
                 }
-            }
-            // Snapshot readiness and release the `PollItem` borrows on the
-            // sockets before re-entering `drain_data` / `drain_control`.
-            let data_ready = items[0].is_readable();
-            let control_ready = items[1].is_readable();
-            drop(items);
+                // Snapshot readiness before the PollItems release their socket
+                // borrows at the end of this scope.
+                (items[0].is_readable(), items[1].is_readable())
+            };
 
             // Data plane ready → pull every queued prefill in one go.
             if data_ready {
@@ -517,19 +516,19 @@ where
             // Runs when nothing is prefilling. Also runs when `active` is empty
             // but a step is still in flight, so the last issued step is
             // finalized and its tokens are sent.
-            if let Some(max_steps) = profile_cuda_steps {
-                if !profile_started {
-                    // SAFETY: extern profiler API; returns a cudaError code.
-                    let rc = unsafe { cudaProfilerStart() };
-                    if rc != 0 {
-                        tracing::warn!(rc, "cudaProfilerStart returned non-zero");
-                    }
-                    profile_started = true;
-                    tracing::info!(
-                        "[profile] cudaProfilerStart (will stop after {} steps)",
-                        max_steps
-                    );
+            if let Some(max_steps) = profile_cuda_steps
+                && !profile_started
+            {
+                // SAFETY: extern profiler API; returns a cudaError code.
+                let rc = unsafe { cudaProfilerStart() };
+                if rc != 0 {
+                    tracing::warn!(rc, "cudaProfilerStart returned non-zero");
                 }
+                profile_started = true;
+                tracing::info!(
+                    "[profile] cudaProfilerStart (will stop after {} steps)",
+                    max_steps
+                );
             }
 
             let dec_t0 = if trace_steps {
@@ -561,21 +560,21 @@ where
                 tr_dec_ms = t.elapsed().as_secs_f64() * 1e3;
             }
 
-            if let Some(max_steps) = profile_cuda_steps {
-                if profile_started {
-                    profile_step_count += 1;
-                    if profile_step_count >= max_steps {
-                        // SAFETY: extern profiler API; returns a cudaError code.
-                        let rc = unsafe { cudaProfilerStop() };
-                        if rc != 0 {
-                            tracing::warn!(rc, "cudaProfilerStop returned non-zero");
-                        }
-                        tracing::info!(
-                            "[profile] cudaProfilerStop after {} steps. Exiting.",
-                            profile_step_count
-                        );
-                        return Ok(());
+            if let Some(max_steps) = profile_cuda_steps
+                && profile_started
+            {
+                profile_step_count += 1;
+                if profile_step_count >= max_steps {
+                    // SAFETY: extern profiler API; returns a cudaError code.
+                    let rc = unsafe { cudaProfilerStop() };
+                    if rc != 0 {
+                        tracing::warn!(rc, "cudaProfilerStop returned non-zero");
                     }
+                    tracing::info!(
+                        "[profile] cudaProfilerStop after {} steps. Exiting.",
+                        profile_step_count
+                    );
+                    return Ok(());
                 }
             }
         }
@@ -640,49 +639,46 @@ fn escalate_fatal_and_exit(
 }
 
 fn drain_control(control: &ControlPump, ctx: &mut WorkerCtx<'_>) -> bool {
-    loop {
-        match control.try_recv(0) {
-            Ok(Some((msg, req_id))) => match msg {
-                SchedulerControlMessage::Shutdown => {
-                    tracing::info!("[serve] Shutdown received, exiting.");
-                    return true;
+    while let Ok(Some((msg, req_id))) = control.try_recv(0) {
+        match msg {
+            SchedulerControlMessage::Shutdown => {
+                tracing::info!("[serve] Shutdown received, exiting.");
+                return true;
+            }
+            SchedulerControlMessage::Cancel(c) => {
+                apply_cancel(control, ctx, c.sequence_id, req_id);
+            }
+            SchedulerControlMessage::FreeKvIndices(free) => {
+                if !free.indices.is_empty() {
+                    ctx.kv_allocator.free(&free.indices);
                 }
-                SchedulerControlMessage::Cancel(c) => {
-                    apply_cancel(control, ctx, c.sequence_id, req_id);
+            }
+            SchedulerControlMessage::Preempt(p) => {
+                apply_preempt(ctx, &p.sequence_ids, &p.free_indices);
+            }
+            SchedulerControlMessage::Ping => {
+                if let Err(e) = control.send(WorkerControlMessage::Pong, req_id) {
+                    tracing::info!("[serve] failed to send Pong: {}", e);
                 }
-                SchedulerControlMessage::FreeKvIndices(free) => {
-                    if !free.indices.is_empty() {
-                        ctx.kv_allocator.free(&free.indices);
-                    }
+            }
+            SchedulerControlMessage::Drain(d) => {
+                apply_drain(control, ctx, d.mode, req_id);
+            }
+            SchedulerControlMessage::UnloadModel(u) => {
+                if req_id.is_correlated()
+                    && let Err(e) = control.send(
+                        WorkerControlMessage::UnloadAck(UnloadAck {
+                            model_instance_id: u.model_instance_id,
+                        }),
+                        req_id,
+                    )
+                {
+                    tracing::info!("[serve] failed to send UnloadAck: {}", e);
                 }
-                SchedulerControlMessage::Preempt(p) => {
-                    apply_preempt(ctx, &p.sequence_ids, &p.free_indices);
-                }
-                SchedulerControlMessage::Ping => {
-                    if let Err(e) = control.send(WorkerControlMessage::Pong, req_id) {
-                        tracing::info!("[serve] failed to send Pong: {}", e);
-                    }
-                }
-                SchedulerControlMessage::Drain(d) => {
-                    apply_drain(control, ctx, d.mode, req_id);
-                }
-                SchedulerControlMessage::UnloadModel(u) => {
-                    if req_id.is_correlated() {
-                        if let Err(e) = control.send(
-                            WorkerControlMessage::UnloadAck(UnloadAck {
-                                model_instance_id: u.model_instance_id,
-                            }),
-                            req_id,
-                        ) {
-                            tracing::info!("[serve] failed to send UnloadAck: {}", e);
-                        }
-                    }
-                    tracing::info!("[serve] UnloadModel received, exiting.");
-                    return true;
-                }
-                _ => {}
-            },
-            _ => break,
+                tracing::info!("[serve] UnloadModel received, exiting.");
+                return true;
+            }
+            _ => {}
         }
     }
     false
@@ -710,16 +706,16 @@ fn apply_cancel(
             .release_owned(&removed.block_table, ctx.enable_prefix_caching);
         tracing::info!("[serve] cancelled prefilling seq {}", sequence_id);
     }
-    if req_id.is_correlated() {
-        if let Err(e) = control.send(
+    if req_id.is_correlated()
+        && let Err(e) = control.send(
             WorkerControlMessage::CancelAck(CancelAck {
                 sequence_id,
                 removed: removed_flag,
             }),
             req_id,
-        ) {
-            tracing::info!("[serve] failed to send CancelAck: {}", e);
-        }
+        )
+    {
+        tracing::info!("[serve] failed to send CancelAck: {}", e);
     }
 }
 
@@ -762,15 +758,15 @@ fn apply_drain(control: &ControlPump, ctx: &mut WorkerCtx<'_>, mode: DrainMode, 
         ctx.decode_engine.reclaim_pending(ctx.kv_allocator);
         ctx.decode_engine.clear();
     }
-    if req_id.is_correlated() {
-        if let Err(e) = control.send(
+    if req_id.is_correlated()
+        && let Err(e) = control.send(
             WorkerControlMessage::DrainAck(DrainAck {
                 remaining_requests: ctx.active.len() + ctx.prefilling.len(),
             }),
             req_id,
-        ) {
-            tracing::info!("[serve] failed to send DrainAck: {}", e);
-        }
+        )
+    {
+        tracing::info!("[serve] failed to send DrainAck: {}", e);
     }
 }
 

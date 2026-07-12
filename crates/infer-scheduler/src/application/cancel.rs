@@ -100,7 +100,7 @@ pub async fn cancel_request_by_external_id_with_kv(
 
 /// Unicast a `Cancel` control message to the worker that owns this
 /// sequence.
-fn send_cancel_to_worker(
+pub(crate) fn send_cancel_to_worker(
     control_cmd: &ControlPlaneCmdTx,
     worker: &WorkerId,
     sequence_id: SequenceId,
