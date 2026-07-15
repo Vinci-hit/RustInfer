@@ -201,6 +201,7 @@ pub enum DataType {
     F32,
     F16,
     BF16,
+    F8E4M3,
     I32,
     I8,
 }
@@ -210,7 +211,7 @@ impl DataType {
         match self {
             DataType::F32 | DataType::I32 => 4,
             DataType::F16 | DataType::BF16 => 2,
-            DataType::I8 => 1,
+            DataType::F8E4M3 | DataType::I8 => 1,
         }
     }
 }

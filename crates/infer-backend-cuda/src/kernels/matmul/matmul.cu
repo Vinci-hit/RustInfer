@@ -2,6 +2,7 @@
 #include "matmul.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <chrono>
 #include <atomic>
@@ -1277,6 +1278,268 @@ extern "C" void kpack_gemm_cu(
             (const int32_t*)weight_zero_point, (const __nv_bfloat16*)weight_scale,
             (__nv_bfloat16*)output, M, N, K, group_size, group_shift);
     }
+}
+
+// ============================================================================
+//  Block-scaled E4M3FN matmul (dynamic W8A8, BF16 input/output)
+//
+//  Scratch is supplied by CudaConfig's address-stable workspace. The first
+//  kernel quantizes every 1x128 BF16 activation block to E4M3 and writes its
+//  dequant scale. Decode uses the quantized data in a warp GEMV; prefill first
+//  attempts the SM90a CUTLASS blockwise Tensor Core kernel and retains a tiled
+//  W8A8 CUDA fallback for unsupported build/runtime configurations.
+// ============================================================================
+
+#ifdef RUSTINFER_HAS_FP8_BLOCK_SM90
+extern "C" int fp8_block_cutlass_sm90_init(int device_id);
+extern "C" int fp8_block_cutlass_sm90_bf16(
+    const void* activation_fp8, const void* weight_fp8,
+    const float* activation_scale_inv, const float* weight_scale_inv,
+    void* output_bf16, int M, int N, int K, int device_id,
+    void* workspace, size_t workspace_size, cudaStream_t stream);
+#endif
+
+extern "C" int fp8_block_matmul_init_cu(int device_id) {
+#ifdef RUSTINFER_HAS_FP8_BLOCK_SM90
+    return fp8_block_cutlass_sm90_init(device_id);
+#else
+    (void)device_id;
+    return 0;
+#endif
+}
+
+__device__ __forceinline__ float e4m3fn_to_float(const unsigned char bits) {
+    const unsigned int exponent = (bits >> 3) & 0x0fu;
+    const unsigned int mantissa = bits & 0x07u;
+    const unsigned int sign = (static_cast<unsigned int>(bits) & 0x80u) << 24;
+
+    if (exponent == 0) {
+        const float magnitude = static_cast<float>(mantissa) * 0x1.0p-9f;
+        return sign ? -magnitude : magnitude;
+    }
+    if (exponent == 0x0f && mantissa == 0x07) {
+        return __uint_as_float(sign | 0x7fc00000u);
+    }
+
+    // E4M3FN normal values map exactly into an f32 exponent/mantissa: bias 7
+    // becomes bias 127 (+120), and the three mantissa bits occupy f32's top 3.
+    return __uint_as_float(sign | ((exponent + 120u) << 23) | (mantissa << 20));
+}
+
+__device__ __forceinline__ float warp_sum_fp8(float value) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float warp_max_fp8(float value) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+__global__ void fp8_block_act_quant_1x128_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    unsigned char* __restrict__ output,
+    float* __restrict__ scale_inv,
+    const int M, const int K, const int scale_cols
+) {
+    const int row = blockIdx.y;
+    const int scale_col = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int k = scale_col * 128 + threadIdx.x;
+    const bool valid = row < M && k < K;
+    const float value = valid
+        ? __bfloat162float(__ldg(input + static_cast<size_t>(row) * K + k))
+        : 0.0f;
+
+    float block_max = warp_max_fp8(fabsf(value));
+    __shared__ float warp_maxima[4];
+    __shared__ float dequant_scale;
+    if (lane == 0) warp_maxima[warp] = block_max;
+    __syncthreads();
+    if (warp == 0) {
+        block_max = lane < 4 ? warp_maxima[lane] : 0.0f;
+        block_max = warp_max_fp8(block_max);
+        if (lane == 0) {
+            // E4M3FN's largest finite magnitude is 448. scale_inv is the
+            // multiplier used to reconstruct BF16/FP32 values from FP8.
+            dequant_scale = block_max > 0.0f ? block_max * (1.0f / 448.0f) : 1.0f;
+            scale_inv[static_cast<size_t>(row) * scale_cols + scale_col] = dequant_scale;
+        }
+    }
+    __syncthreads();
+
+    if (valid) {
+        output[static_cast<size_t>(row) * K + k] = __nv_cvt_float_to_fp8(
+            value / dequant_scale, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+template <int WARPS_PER_BLOCK>
+__global__ void fp8_block_gemv_w8a8_bf16_kernel(
+    const unsigned char* __restrict__ input,
+    const float* __restrict__ input_scale_inv,
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ weight_scale_inv,
+    __nv_bfloat16* __restrict__ output,
+    const int N, const int K, const int scale_cols,
+    const int block_n, const int block_k
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int n = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (n >= N) return;
+
+    const int scale_row = n / block_n;
+    const unsigned char* weight_row = weight + static_cast<size_t>(n) * K;
+    float acc = 0.0f;
+    for (int k = lane; k < K; k += 32) {
+        const float a = e4m3fn_to_float(__ldg(input + k));
+        const float w = e4m3fn_to_float(__ldg(weight_row + k));
+        const int scale_col = k / block_k;
+        const float a_scale = __ldg(input_scale_inv + scale_col);
+        const float w_scale = __ldg(
+            weight_scale_inv + static_cast<size_t>(scale_row) * scale_cols + scale_col);
+        acc = fmaf(a * a_scale, w * w_scale, acc);
+    }
+    acc = warp_sum_fp8(acc);
+    if (lane == 0) output[n] = __float2bfloat16_rn(acc);
+}
+
+template <int TILE_M, int TILE_N, int TILE_K>
+__global__ void fp8_block_gemm_w8a8_bf16_kernel(
+    const unsigned char* __restrict__ input,
+    const float* __restrict__ input_scale_inv,
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ weight_scale_inv,
+    __nv_bfloat16* __restrict__ output,
+    const int M, const int N, const int K, const int scale_cols,
+    const int block_n, const int block_k
+) {
+    __shared__ float a_tile[TILE_M][TILE_K];
+    __shared__ float w_tile[TILE_N][TILE_K];
+
+    const int tid = threadIdx.x;
+    const int local_m = tid / TILE_N;
+    const int local_n = tid % TILE_N;
+    const int global_m = blockIdx.y * TILE_M + local_m;
+    const int global_n = blockIdx.x * TILE_N + local_n;
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+        for (int index = tid; index < TILE_M * TILE_K; index += blockDim.x) {
+            const int row = index / TILE_K;
+            const int col = index % TILE_K;
+            const int m = blockIdx.y * TILE_M + row;
+            const int k = k0 + col;
+            if (m < M && k < K) {
+                const float a = e4m3fn_to_float(
+                    __ldg(input + static_cast<size_t>(m) * K + k));
+                const float s = __ldg(
+                    input_scale_inv + static_cast<size_t>(m) * scale_cols + k / block_k);
+                a_tile[row][col] = a * s;
+            } else {
+                a_tile[row][col] = 0.0f;
+            }
+        }
+        for (int index = tid; index < TILE_N * TILE_K; index += blockDim.x) {
+            const int row = index / TILE_K;
+            const int col = index % TILE_K;
+            const int n = blockIdx.x * TILE_N + row;
+            const int k = k0 + col;
+            if (n < N && k < K) {
+                const float w = e4m3fn_to_float(
+                    __ldg(weight + static_cast<size_t>(n) * K + k));
+                const float s = __ldg(
+                    weight_scale_inv + static_cast<size_t>(n / block_n) * scale_cols + k / block_k);
+                w_tile[row][col] = w * s;
+            } else {
+                w_tile[row][col] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        if (global_m < M && global_n < N) {
+            #pragma unroll
+            for (int k = 0; k < TILE_K; ++k) {
+                acc = fmaf(a_tile[local_m][k], w_tile[local_n][k], acc);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (global_m < M && global_n < N) {
+        output[static_cast<size_t>(global_m) * N + global_n] = __float2bfloat16_rn(acc);
+    }
+}
+
+extern "C" int fp8_block_matmul_bf16_cu(
+    const void* input, const void* weight, const void* weight_scale_inv,
+    void* output, int M, int N, int K, int scale_cols,
+    int block_n, int block_k, int device_id,
+    void* workspace, size_t workspace_size, cudaStream_t stream
+) {
+    if (block_n != 128 || block_k != 128 || scale_cols != K / 128) return -1;
+
+    const size_t activation_bytes = static_cast<size_t>(M) * K;
+    const size_t scale_offset = (activation_bytes + 127u) & ~size_t(127u);
+    const size_t activation_scale_bytes = static_cast<size_t>(M) * scale_cols * sizeof(float);
+    const size_t cutlass_offset = (scale_offset + activation_scale_bytes + 127u) & ~size_t(127u);
+    if (workspace == nullptr || cutlass_offset > workspace_size) return -2;
+
+    auto* workspace_bytes = static_cast<unsigned char*>(workspace);
+    auto* activation_fp8 = workspace_bytes;
+    auto* activation_scale_inv = reinterpret_cast<float*>(workspace_bytes + scale_offset);
+    void* cutlass_workspace = workspace_bytes + cutlass_offset;
+    const size_t cutlass_workspace_size = workspace_size - cutlass_offset;
+
+    const dim3 quant_grid(scale_cols, M);
+    fp8_block_act_quant_1x128_kernel<<<quant_grid, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input), activation_fp8,
+        activation_scale_inv, M, K, scale_cols);
+
+    if (M == 1) {
+        constexpr int WARPS = 4;
+        const int grid_x = (N + WARPS - 1) / WARPS;
+        fp8_block_gemv_w8a8_bf16_kernel<WARPS><<<grid_x, WARPS * 32, 0, stream>>>(
+            activation_fp8, activation_scale_inv,
+            static_cast<const unsigned char*>(weight),
+            static_cast<const float*>(weight_scale_inv),
+            static_cast<__nv_bfloat16*>(output),
+            N, K, scale_cols, block_n, block_k);
+        return 1;  // dynamic W8A8 warp GEMV
+    }
+
+#ifdef RUSTINFER_HAS_FP8_BLOCK_SM90
+    const int cutlass_status = fp8_block_cutlass_sm90_bf16(
+        activation_fp8, weight, activation_scale_inv,
+        static_cast<const float*>(weight_scale_inv), output,
+        M, N, K, device_id, cutlass_workspace, cutlass_workspace_size, stream);
+    if (cutlass_status == 0) return 2;  // Hopper blockwise Tensor Core path
+#else
+    (void)device_id;
+    (void)cutlass_workspace;
+    (void)cutlass_workspace_size;
+#endif
+
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    constexpr int TILE_K = 32;
+    const dim3 block(TILE_M * TILE_N);
+    const dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+    fp8_block_gemm_w8a8_bf16_kernel<TILE_M, TILE_N, TILE_K><<<grid, block, 0, stream>>>(
+        activation_fp8, activation_scale_inv,
+        static_cast<const unsigned char*>(weight),
+        static_cast<const float*>(weight_scale_inv),
+        static_cast<__nv_bfloat16*>(output),
+        M, N, K, scale_cols, block_n, block_k);
+    return 3;  // portable CUDA W8A8 fallback
 }
 
 // ============================================================================

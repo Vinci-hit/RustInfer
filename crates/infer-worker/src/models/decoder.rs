@@ -218,6 +218,12 @@ pub fn build_dense_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend 
     cfg: &LoadConfig,
     device: &D,
 ) -> OpResult<Decoder<T, D>> {
+    if cfg.mlp_quant.is_some() && cfg.fp8_block.is_some() {
+        return Err(OpError::Kernel(
+            "checkpoint cannot enable AWQ int4 and block FP8 simultaneously".into(),
+        ));
+    }
+
     let embed_table = loader
         .load_embedding::<T, D>("model.embed_tokens.weight", device)?
         .table;
@@ -253,9 +259,20 @@ pub fn build_dense_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend 
             device,
             cfg.rms_norm_eps,
         )?;
-        let qkv_proj = loader.load_fused_qkv::<T, D>(&lp, q_dim, kv_dim, cfg.dim, device)?;
-        let o_proj =
-            loader.load_linear::<T, D>(&format!("{}.self_attn.o_proj.weight", lp), None, device)?;
+        let qkv_proj = loader.load_fused_qkv_with_fp8::<T, D>(
+            &lp,
+            q_dim,
+            kv_dim,
+            cfg.dim,
+            cfg.fp8_block,
+            device,
+        )?;
+        let o_proj = loader.load_linear_with_fp8::<T, D>(
+            &format!("{}.self_attn.o_proj.weight", lp),
+            None,
+            cfg.fp8_block,
+            device,
+        )?;
 
         // MLP: int4 `pack-quantized` when `mlp_quant` is set, else dense. Both
         // arms yield a `components::Linear`; the quant arm carries the packed
@@ -269,17 +286,19 @@ pub fn build_dense_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend 
             )
         } else {
             (
-                comp_linear(loader.load_fused_gate_up::<T, D>(
+                loader.load_fused_gate_up_with_fp8::<T, D>(
                     &lp,
                     cfg.intermediate_size,
                     cfg.dim,
+                    cfg.fp8_block,
                     device,
-                )?),
-                comp_linear(loader.load_linear::<T, D>(
+                )?,
+                loader.load_linear_with_fp8::<T, D>(
                     &format!("{}.mlp.down_proj.weight", lp),
                     None,
+                    cfg.fp8_block,
                     device,
-                )?),
+                )?,
             )
         };
 
@@ -315,8 +334,8 @@ pub fn build_dense_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend 
         blocks.push(DecoderBlock {
             attention: Attention {
                 input_layernorm: comp_rms(input_layernorm),
-                qkv_proj: comp_linear(qkv_proj),
-                o_proj: comp_linear(o_proj),
+                qkv_proj,
+                o_proj,
                 q_norm,
                 k_norm,
                 sin: sin_cache.clone(),

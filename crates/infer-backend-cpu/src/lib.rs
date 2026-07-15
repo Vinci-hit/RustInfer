@@ -991,6 +991,9 @@ unsafe fn read_f64<T: Dtype>(ptr: *const T) -> f64 {
         DataType::F32 => NumDtype::read_f64(unsafe { &*(ptr as *const f32) }),
         DataType::BF16 => NumDtype::read_f64(unsafe { &*(ptr as *const bf16) }),
         DataType::F16 => NumDtype::read_f64(unsafe { &*(ptr as *const f16) }),
+        DataType::F8E4M3 => {
+            NumDtype::read_f64(unsafe { &*(ptr as *const infer_core::dtype::Fp8E4m3) })
+        }
         DataType::I32 => NumDtype::read_f64(unsafe { &*(ptr as *const i32) }),
         DataType::I8 => NumDtype::read_f64(unsafe { &*(ptr as *const i8) }),
     }
@@ -1003,6 +1006,9 @@ unsafe fn write_f64<T: Dtype>(ptr: *mut T, val: f64) {
         DataType::F32 => unsafe { *(ptr as *mut f32) = NumDtype::write_f64(val) },
         DataType::BF16 => unsafe { *(ptr as *mut bf16) = NumDtype::write_f64(val) },
         DataType::F16 => unsafe { *(ptr as *mut f16) = NumDtype::write_f64(val) },
+        DataType::F8E4M3 => unsafe {
+            *(ptr as *mut infer_core::dtype::Fp8E4m3) = NumDtype::write_f64(val)
+        },
         DataType::I32 => unsafe { *(ptr as *mut i32) = NumDtype::write_f64(val) },
         DataType::I8 => unsafe { *(ptr as *mut i8) = NumDtype::write_f64(val) },
     }

@@ -1,0 +1,29 @@
+# RustInfer launch config for the block-FP8 Qwen3-4B checkpoint.
+# FP8 projections remain E4M3 on device and dispatch through the native block-FP8 Linear path.
+model = "/mnt/md2/liuwenqi/vllm_bench/qwen3-4b-fp8"
+model_name = "qwen3-4b-fp8"
+cluster_id = "rustinfer-qwen3-fp8"
+device = "cuda:0"
+
+host = "0.0.0.0"
+port = 8102
+request_timeout_secs = 600
+
+max_batch_tokens = 8192
+max_batch_seqs = 32
+max_model_len = 4096
+batch_wait_ms = 0
+
+paged_block_size = 1
+chunked_prefill_size = 0
+enable_prefix_caching = false
+mem_fraction_static = 0.9
+num_blocks = 0
+
+ignore_eos = false
+
+mode = "llm"
+worker_id = "worker-0"
+log_level = "info"
+
+capture_sizes = [1, 2, 4, 8, 16, 24, 32]

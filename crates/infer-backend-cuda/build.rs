@@ -30,7 +30,14 @@ fn main() {
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
             return;
         }
-        let kernel_paths = find_files("src/kernels", "cu");
+        // Hopper FP8 blockwise GEMM uses WGMMA/TMA and must be compiled as
+        // sm_90a in a whole-program TU below. Keep it out of cc-rs's generic
+        // sm_XX --device-c archive to avoid duplicate symbols and serialized
+        // WGMMA code generation.
+        let mut kernel_paths = find_files("src/kernels", "cu");
+        kernel_paths.retain(|path| {
+            path.file_name().and_then(|name| name.to_str()) != Some("fp8_block_gemm_sm90.cu")
+        });
 
         if kernel_paths.is_empty() {
             println!("cargo:warning=No CUDA kernel files (.cu) found in src/kernels/");
@@ -93,6 +100,9 @@ fn main() {
             .include(&cudnn_frontend_include)
             .flag("-std=c++17")
             .flag(format!("-arch={}", cuda_arch));
+        if cuda_arch.starts_with("sm_90") {
+            build.define("RUSTINFER_HAS_FP8_BLOCK_SM90", None);
+        }
 
         // 把所有检测到的 CUDA include 路径都喂给 cc
         for inc in &cuda_includes {
@@ -110,6 +120,61 @@ fn main() {
         build.compile("infer_kernels");
         println!("cargo:rustc-link-lib=static=infer_kernels");
         println!("cargo:rustc-link-lib=cudart");
+
+        // CUTLASS Hopper blockwise FP8 GEMM. As with FA3 below, direct nvcc
+        // whole-program compilation preserves warp-specialization register
+        // reallocation and permits the architecture-accelerated sm_90a ISA.
+        let fp8_sm90_src = root.join("src/kernels/matmul/fp8_block_gemm_sm90.cu");
+        println!("cargo:rerun-if-changed={}", fp8_sm90_src.display());
+        if cuda_arch.starts_with("sm_90") {
+            let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+            let obj = out_dir.join("fp8_block_gemm_sm90.o");
+            let nvcc = cuda_path.join("bin/nvcc");
+            let mut command = std::process::Command::new(&nvcc);
+            command
+                .args([
+                    "-O3",
+                    "-std=c++17",
+                    "-arch=sm_90a",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "-w",
+                    "-DNDEBUG",
+                    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+                    "-Xcompiler",
+                    "-fPIC",
+                ])
+                .arg("-I")
+                .arg(&cutlass_include);
+            for inc in &cuda_includes {
+                command.arg("-I").arg(inc);
+            }
+            let status = command
+                .arg("-c")
+                .arg(&fp8_sm90_src)
+                .arg("-o")
+                .arg(&obj)
+                .status()
+                .expect("failed to spawn nvcc for fp8_block_gemm_sm90.cu");
+            if !status.success() {
+                panic!("nvcc failed for fp8_block_gemm_sm90.cu ({})", status);
+            }
+
+            let lib = out_dir.join("librustinfer_fp8_sm90.a");
+            let _ = std::fs::remove_file(&lib);
+            let status = std::process::Command::new("ar")
+                .arg("crs")
+                .arg(&lib)
+                .arg(&obj)
+                .status()
+                .expect("failed to run ar for librustinfer_fp8_sm90.a");
+            if !status.success() {
+                panic!("ar failed for librustinfer_fp8_sm90.a ({})", status);
+            }
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=rustinfer_fp8_sm90");
+        }
 
         // FA3 (flash-attention v2.8.3 hopper) prefill kernels need sm_90a for
         // wgmma/TMA, so they get their own translation units; every other arch

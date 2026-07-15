@@ -330,6 +330,30 @@ impl infer_core::ports::MathOps for Cuda {
         )
     }
 
+    fn matmul_fp8_block<T: Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<infer_core::dtype::Fp8E4m3, Self>,
+        output: &mut Tensor<T, Self>,
+        weight_scale_inv: &Tensor<f32, Self>,
+        block: [usize; 2],
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        let workspace = infer_core::exec::ExecScope::workspace(scope);
+        kernels::matmul::matmul_fp8_block(
+            scope_stream(scope),
+            input,
+            weight,
+            output,
+            weight_scale_inv,
+            block,
+            workspace
+                .ptr()
+                .map_or(std::ptr::null_mut(), |ptr| ptr.as_ptr().cast()),
+            workspace.size(),
+        )
+    }
+
     fn rmsnorm<T: Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         input: &Tensor<T, Self>,
@@ -857,6 +881,7 @@ impl Cuda {
             CudaConfig::new()
                 .map_err(|e| OpError::Kernel(format!("CudaConfig::new failed: {}", e)))?,
         );
+        kernels::matmul::init_fp8_block_matmul(device_id)?;
         Ok(Self { device_id, config })
     }
 
@@ -1140,6 +1165,25 @@ impl CoreOps for Cuda {
             scales,
             zeros,
             scheme,
+        )
+    }
+    fn matmul_fp8_block<T: Dtype>(
+        input: &Tensor<T, Self>,
+        weight: &Tensor<infer_core::dtype::Fp8E4m3, Self>,
+        output: &mut Tensor<T, Self>,
+        weight_scale_inv: &Tensor<f32, Self>,
+        block: [usize; 2],
+    ) -> OpResult<()> {
+        let cfg = &input.device().config;
+        kernels::matmul::matmul_fp8_block(
+            cfg.stream,
+            input,
+            weight,
+            output,
+            weight_scale_inv,
+            block,
+            cfg.workspace,
+            cfg.workspace_size,
         )
     }
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
