@@ -151,14 +151,56 @@ ZMQ (IPC) with MessagePack framing:
 
 ## Quick start
 
-### Docker (H100 / H200)
+### Run the prebuilt Docker image (H100 / H200)
 
-The runtime image contains the compiled CUDA kernels, CUDA 12 runtime, cuBLAS,
-and cuDNN. The host only needs a compatible NVIDIA driver, Docker, and the
-NVIDIA Container Toolkit; Rust, `nvcc`, libclang, and cuDNN headers are not
-required.
+The public image contains the compiled CUDA kernels, CUDA 12 runtime, cuBLAS,
+and cuDNN. The host only needs:
 
-Build the image once (the default `sm_90` target is for H100/H200):
+- an NVIDIA H100 or H200 with a compatible driver;
+- Docker and the
+  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
+- a local Hugging Face model directory containing `config.json`,
+  `tokenizer.json`, and the model weights.
+
+Start the full scheduler + worker + OpenAI-compatible server stack with one
+command. Replace the host model path and exposed model name as needed:
+
+```bash
+docker run --rm --gpus all \
+  -p 8000:8000 \
+  -v /absolute/path/to/Qwen3:/models/model:ro \
+  ghcr.io/vinci-hit/rustinfer:1.0.1 \
+  serve --model-name Qwen3
+```
+
+Wait for the model to load, then check readiness:
+
+```bash
+curl --fail http://127.0.0.1:8000/ready
+```
+
+Send a chat completion:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3",
+       "messages":[{"role":"user","content":"What is the capital of France?"}],
+       "max_tokens":64}'
+```
+
+No Rust toolchain, CUDA Toolkit, `nvcc`, libclang, cuDNN headers, or local
+operator compilation is required. The `1.0.1` image is `linux/amd64` and
+compiled for CUDA architecture `sm_90`.
+
+Useful container settings include `RUSTINFER_MAX_BATCH_TOKENS`,
+`RUSTINFER_MAX_BATCH_SEQS`, `RUSTINFER_MAX_MODEL_LEN`,
+`RUSTINFER_CHUNKED_PREFILL_SIZE`, and `RUST_LOG`. A complete custom config can
+instead be mounted and selected with `--config`.
+
+### Build the Docker image locally
+
+To build from the current source instead of using the published image:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build \
@@ -166,42 +208,8 @@ DOCKER_BUILDKIT=1 docker build \
   -t rustinfer:local .
 ```
 
-Start the full scheduler + worker + server stack with one command. The mounted
-directory must be a Hugging Face model directory containing `config.json`,
-`tokenizer.json`, and the model weights:
-
-```bash
-docker run --rm --gpus all \
-  -p 8000:8000 \
-  -v /absolute/path/to/Qwen3:/models/model:ro \
-  rustinfer:local
-```
-
-Check readiness:
-
-```bash
-curl --fail http://127.0.0.1:8000/ready
-```
-
-The container also accepts explicit launch options:
-
-```bash
-docker run --rm --gpus all \
-  -p 8100:8100 \
-  -v /absolute/path/to/Qwen3:/models/qwen3:ro \
-  rustinfer:local \
-  serve --model /models/qwen3 --model-name Qwen3 --port 8100
-```
-
-Release tags publish the same image to
-`ghcr.io/vinci-hit/rustinfer:<version>`. Images are architecture-specific;
-build with `CUDA_ARCH=sm_80`, `sm_86`, or `sm_89` for other supported GPUs and
-tag the result accordingly.
-
-Useful container settings include `RUSTINFER_MAX_BATCH_TOKENS`,
-`RUSTINFER_MAX_BATCH_SEQS`, `RUSTINFER_MAX_MODEL_LEN`,
-`RUSTINFER_CHUNKED_PREFILL_SIZE`, and `RUST_LOG`. A complete custom config can
-instead be mounted and selected with `--config`.
+Images are architecture-specific. Use `CUDA_ARCH=sm_80`, `sm_86`, or `sm_89`
+when building for another supported NVIDIA GPU architecture.
 
 ### Build from source
 
