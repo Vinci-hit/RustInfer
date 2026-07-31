@@ -175,6 +175,7 @@ pub fn matmul<T: Dtype>(
                         stream,
                     );
                 } else {
+                    let workspace = cfg.kernel_workspace();
                     gemm_cublaslt_bf16(
                         input.data_ptr() as _,
                         weight.data_ptr() as _,
@@ -184,8 +185,8 @@ pub fn matmul<T: Dtype>(
                         k as i32,
                         stream,
                         cfg.cublaslt_handle,
-                        cfg.workspace,
-                        cfg.workspace_size,
+                        workspace.ptr(),
+                        workspace.size(),
                     );
                 }
             }
@@ -564,8 +565,8 @@ mod fp8_block_tests {
             &mut output,
             &scales,
             block,
-            cuda.config.workspace,
-            cuda.config.workspace_size,
+            cuda.config.kernel_workspace().ptr(),
+            cuda.config.kernel_workspace().size(),
         )
         .expect("fp8 block matmul");
         assert_eq!(path, expected_path, "unexpected FP8 dispatch path");
@@ -586,8 +587,8 @@ mod fp8_block_tests {
                 &mut output,
                 &scales,
                 block,
-                cuda.config.workspace,
-                cuda.config.workspace_size,
+                cuda.config.kernel_workspace().ptr(),
+                cuda.config.kernel_workspace().size(),
             )
             .expect("capture FP8 block matmul");
             assert_eq!(captured_path, expected_path);

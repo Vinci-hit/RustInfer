@@ -447,7 +447,7 @@ where
         // varlen+causal SDPA (needs a varlen-q cuDNN graph; current graph
         // hardcodes q-seqlen=1) or the CuTe ragged kernel. See memory
         // fused-mixed-batch-and-graph.
-        D::pipeline_arena_begin(&self.scope);
+        D::pipeline_arena_begin(&self.scope)?;
         let result = (|| {
             let plan = self.build_plan(req)?;
             self.upload_index(&plan, req)?;
@@ -567,7 +567,7 @@ where
             if self.abc.copy_out_recorded {
                 D::pipeline_compute_wait_copy_out(&self.scope)?;
             }
-            D::pipeline_arena_begin(&self.scope);
+            D::pipeline_arena_begin(&self.scope)?;
             let result = self.run_mixed_abc_eager_region(
                 run_plan.as_ref().unwrap_or(&plan),
                 req,

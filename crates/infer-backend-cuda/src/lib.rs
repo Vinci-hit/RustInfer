@@ -12,7 +12,7 @@ pub mod ffi;
 // device pointers; the safe backend traits below are the supported API.
 mod kernels;
 
-pub use config::{CudaConfig, GraphSlot};
+pub use config::{CudaConfig, CudaMemoryPlan, CudaWorkspace, GraphSlot};
 pub use error::CudaError;
 
 use std::ptr::NonNull;
@@ -50,9 +50,10 @@ pub struct CudaScope {
 impl CudaScope {
     pub fn new(device: Cuda) -> Self {
         let stream = CudaStream(device.config.stream);
+        let kernel_workspace = device.config.kernel_workspace();
         let workspace = infer_core::exec::Workspace::from_raw(
-            NonNull::new(device.config.workspace as *mut u8),
-            device.config.workspace_size,
+            NonNull::new(kernel_workspace.ptr() as *mut u8),
+            kernel_workspace.size(),
         );
         Self {
             device,
@@ -117,7 +118,7 @@ impl infer_core::exec::ExecScope for CudaScope {
     fn graph_capture_begin(&self) -> OpResult<()> {
         // Enable the capture arena BEFORE entering stream capture so the
         // forward's scratch allocations are alloc-free.
-        self.device.config.arena_begin();
+        self.device.config.arena_begin()?;
         if let Err(e) = self.device.config.capture_begin_relaxed() {
             self.device.config.arena_end();
             return Err(e);
@@ -875,11 +876,18 @@ impl infer_core::ports::FusedOps for Cuda {
 impl Cuda {
     /// Create a new Cuda device (allocates stream + handles).
     pub fn new(device_id: i32) -> Result<Self, OpError> {
+        Self::with_memory_plan(device_id, config::CudaMemoryPlan::from_env()?)
+    }
+
+    pub fn with_memory_plan(
+        device_id: i32,
+        memory_plan: config::CudaMemoryPlan,
+    ) -> Result<Self, OpError> {
         device_utils::set_current_device(device_id)
             .map_err(|e| OpError::Kernel(format!("set device failed: {}", e)))?;
         let config = Arc::new(
-            CudaConfig::new()
-                .map_err(|e| OpError::Kernel(format!("CudaConfig::new failed: {}", e)))?,
+            CudaConfig::with_memory_plan(memory_plan)
+                .map_err(|e| OpError::Kernel(format!("CudaConfig creation failed: {}", e)))?,
         );
         kernels::matmul::init_fp8_block_matmul(device_id)?;
         Ok(Self { device_id, config })
@@ -1175,6 +1183,7 @@ impl CoreOps for Cuda {
         block: [usize; 2],
     ) -> OpResult<()> {
         let cfg = &input.device().config;
+        let workspace = cfg.kernel_workspace();
         kernels::matmul::matmul_fp8_block(
             cfg.stream,
             input,
@@ -1182,8 +1191,8 @@ impl CoreOps for Cuda {
             output,
             weight_scale_inv,
             block,
-            cfg.workspace,
-            cfg.workspace_size,
+            workspace.ptr(),
+            workspace.size(),
         )
     }
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()> {
@@ -1714,8 +1723,8 @@ impl infer_core::ports::DecodePipelineOps for Cuda {
         unsafe { scope.device.config.download_d2h_copy_out(dst, src, bytes) }
     }
 
-    fn pipeline_arena_begin(scope: &CudaScope) {
-        scope.device.config.arena_begin();
+    fn pipeline_arena_begin(scope: &CudaScope) -> OpResult<()> {
+        scope.device.config.arena_begin()
     }
     fn pipeline_arena_end(scope: &CudaScope) {
         scope.device.config.arena_end();

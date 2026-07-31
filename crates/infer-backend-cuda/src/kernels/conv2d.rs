@@ -128,13 +128,15 @@ pub fn conv2d<T: Dtype>(
         ))?;
 
         // Use the pre-allocated workspace from CudaConfig
-        let ws_ptr = if ws_size <= config.workspace_size {
-            config.workspace
+        let workspace = config.kernel_workspace();
+        let ws_ptr = if ws_size <= workspace.size() {
+            workspace.ptr()
         } else {
             // Fallback: use algo that needs no workspace
             return Err(OpError::Kernel(format!(
                 "conv2d: workspace {} > available {}",
-                ws_size, config.workspace_size
+                ws_size,
+                workspace.size()
             )));
         };
 

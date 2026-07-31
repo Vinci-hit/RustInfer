@@ -11,7 +11,8 @@ static CUDA_TEST_IN_USE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 #[cfg(test)]
 static CUDA_TEST_AVAILABLE: std::sync::Condvar = std::sync::Condvar::new();
 
-/// Test-only process-wide lease. A `CudaConfig` reserves roughly 5 GiB, so
+/// Test-only process-wide lease. A default `CudaConfig` reserves 256 MiB
+/// eagerly and another 256 MiB on first graph capture, so
 /// constructing one per default test-runner thread exhausts even large GPUs.
 /// The lease is Send-safe and remains held through `CudaConfig::drop`.
 #[cfg(test)]
@@ -45,20 +46,134 @@ impl Drop for CudaTestLease {
     }
 }
 
-const DEFAULT_GEMM_WORKSPACE_SIZE: usize = 4usize * 1024 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
 
-/// Size of the graph-capture scratch arena (1 GiB). Bounds the peak per-step
-/// decode scratch; for a 1B–8B dense model at batch ≤ 256 the real peak is a
-/// few hundred MiB, so this leaves comfortable headroom.
-const GRAPH_ARENA_SIZE: usize = 1024usize * 1024 * 1024;
+/// Central CUDA scratch-memory policy.
+///
+/// This is the single place that defines fixed CUDA scratch regions and cache
+/// limits. Add or remove a region here instead of scattering size constants and
+/// raw pointer/length pairs through `CudaConfig`. Values may be overridden by a
+/// builder or by the corresponding `RUSTINFER_CUDA_*_MIB` environment variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaMemoryPlan {
+    pub kernel_workspace_bytes: usize,
+    pub graph_arena_bytes: usize,
+    pub pool_retain_bytes: usize,
+}
 
-/// Upper bound on bytes the recycling pool retains across the free lists. The
-/// hot per-forward scratch is served from `ForwardScratch` (not the pool), so
-/// the pool only recycles residual/transient allocations; this cap stops a
-/// pathological mix of distinct size classes (e.g. ragged prompt lengths) from
-/// growing the free list without bound. Over budget, freed blocks are
-/// `cudaFree`d instead of retained (off the hot path, never mid-capture).
-const POOL_RETAIN_BUDGET: usize = 512usize * 1024 * 1024;
+impl Default for CudaMemoryPlan {
+    fn default() -> Self {
+        Self {
+            // Qwen3-4B FP8 at the default 4096-token cap needs about 40 MiB
+            // for dynamic activations plus a comparatively small CUTLASS
+            // scheduler workspace. Keep headroom for cuBLASLt/cuDNN users
+            // without reserving the previous unconditional 4 GiB.
+            kernel_workspace_bytes: 256 * MIB,
+            // The graph arena covers all capture-time transient tensors, not
+            // merely one kernel's scratch, so it keeps separate headroom.
+            graph_arena_bytes: 256 * MIB,
+            // This is only a retention ceiling; it is not preallocated.
+            pool_retain_bytes: 256 * MIB,
+        }
+    }
+}
+
+impl CudaMemoryPlan {
+    pub fn with_kernel_workspace_bytes(mut self, bytes: usize) -> Self {
+        self.kernel_workspace_bytes = bytes;
+        self
+    }
+
+    pub fn with_graph_arena_bytes(mut self, bytes: usize) -> Self {
+        self.graph_arena_bytes = bytes;
+        self
+    }
+
+    pub fn with_pool_retain_bytes(mut self, bytes: usize) -> Self {
+        self.pool_retain_bytes = bytes;
+        self
+    }
+
+    pub fn from_env() -> OpResult<Self> {
+        let mut plan = Self::default();
+        for (name, target) in [
+            (
+                "RUSTINFER_CUDA_KERNEL_WORKSPACE_MIB",
+                &mut plan.kernel_workspace_bytes,
+            ),
+            (
+                "RUSTINFER_CUDA_GRAPH_ARENA_MIB",
+                &mut plan.graph_arena_bytes,
+            ),
+            (
+                "RUSTINFER_CUDA_POOL_RETAIN_MIB",
+                &mut plan.pool_retain_bytes,
+            ),
+        ] {
+            let Some(value) = std::env::var_os(name) else {
+                continue;
+            };
+            let mib = value.to_string_lossy().parse::<usize>().map_err(|_| {
+                OpError::Kernel(format!("{name} must be a non-negative integer in MiB"))
+            })?;
+            *target = mib.checked_mul(MIB).ok_or_else(|| {
+                OpError::Kernel(format!("{name} is too large to represent in bytes"))
+            })?;
+        }
+        Ok(plan)
+    }
+}
+
+#[derive(Debug)]
+struct DeviceRegion {
+    ptr: *mut c_void,
+    size: usize,
+}
+
+impl DeviceRegion {
+    fn allocate(size: usize) -> OpResult<Self> {
+        if size == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                size: 0,
+            });
+        }
+        let mut ptr = std::ptr::null_mut();
+        unsafe {
+            cuda_check!(ffi::cudaMalloc(&mut ptr, size));
+        }
+        Ok(Self { ptr, size })
+    }
+}
+
+impl Drop for DeviceRegion {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                ffi::cudaFree(self.ptr);
+            }
+        }
+    }
+}
+
+/// Borrowed view of one address-stable CUDA scratch region. Keeping pointer and
+/// capacity together prevents callers from accidentally pairing different
+/// regions when crossing an FFI boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct CudaWorkspace {
+    ptr: *mut c_void,
+    size: usize,
+}
+
+impl CudaWorkspace {
+    pub fn ptr(self) -> *mut c_void {
+        self.ptr
+    }
+
+    pub fn size(self) -> usize {
+        self.size
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSlot {
@@ -115,8 +230,8 @@ pub struct CudaConfig {
     pub stream: ffi::cudaStream_t,
     pub cublaslt_handle: ffi::cublasLtHandle_t,
     pub cublas_handle_v2: ffi::cublasHandle_t,
-    pub workspace: *mut c_void,
-    pub workspace_size: usize,
+    memory_plan: CudaMemoryPlan,
+    kernel_workspace: DeviceRegion,
     /// Captured CUDA graphs, keyed by slot. Behind a Mutex so the runner
     /// can capture from `&CudaConfig` without an outer `&mut`.
     pub graphs: std::sync::Mutex<HashMap<GraphSlot, CudaGraph>>,
@@ -152,7 +267,9 @@ pub struct CudaConfig {
     // hands out identical addresses every step — exactly what graph replay
     // requires. `free` of an arena pointer is a no-op; the arena is reset to
     // offset 0 at the start of each capture.
-    pub arena_base: std::sync::atomic::AtomicPtr<c_void>,
+    graph_arena: std::sync::Mutex<Option<DeviceRegion>>,
+    arena_base: std::sync::atomic::AtomicPtr<c_void>,
+    arena_failed: std::sync::atomic::AtomicBool,
     pub arena_off: std::sync::atomic::AtomicUsize,
     pub arena_enabled: std::sync::atomic::AtomicBool,
 
@@ -166,6 +283,10 @@ pub struct CudaConfig {
 
 impl CudaConfig {
     pub fn new() -> OpResult<Self> {
+        Self::with_memory_plan(CudaMemoryPlan::from_env()?)
+    }
+
+    pub fn with_memory_plan(memory_plan: CudaMemoryPlan) -> OpResult<Self> {
         #[cfg(test)]
         let test_lease = CudaTestLease::acquire();
         let mut stream: ffi::cudaStream_t = std::ptr::null_mut();
@@ -180,10 +301,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cublasCreate_v2(&mut cublas_handle_v2));
         }
-        let mut workspace: *mut c_void = std::ptr::null_mut();
-        unsafe {
-            cuda_check!(ffi::cudaMalloc(&mut workspace, DEFAULT_GEMM_WORKSPACE_SIZE));
-        }
+        let kernel_workspace = DeviceRegion::allocate(memory_plan.kernel_workspace_bytes)?;
         let mut cudnn_handle: ffi::cudnnHandle_t = std::ptr::null_mut();
         unsafe {
             let s = ffi::cudnnCreate(&mut cudnn_handle);
@@ -216,23 +334,14 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaEventCreate(&mut ev_out));
         }
-        // Graph-capture scratch arena (best-effort: if the reservation fails,
-        // `arena_base` stays null and `supports_graphs()` reports false, so the
-        // worker transparently falls back to eager decode).
-        let mut arena_ptr: *mut c_void = std::ptr::null_mut();
-        unsafe {
-            if ffi::cudaMalloc(&mut arena_ptr, GRAPH_ARENA_SIZE) != ffi::cudaError_cudaSuccess {
-                arena_ptr = std::ptr::null_mut();
-            }
-        }
         Ok(Self {
             #[cfg(test)]
             _test_lease: test_lease,
             stream,
             cublaslt_handle,
             cublas_handle_v2,
-            workspace,
-            workspace_size: DEFAULT_GEMM_WORKSPACE_SIZE,
+            memory_plan,
+            kernel_workspace,
             graphs: std::sync::Mutex::new(HashMap::new()),
             cudnn_handle,
             copy_in_stream,
@@ -240,30 +349,61 @@ impl CudaConfig {
             ev_in,
             ev_a,
             ev_out,
-            arena_base: std::sync::atomic::AtomicPtr::new(arena_ptr),
+            graph_arena: std::sync::Mutex::new(None),
+            arena_base: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            arena_failed: std::sync::atomic::AtomicBool::new(false),
             arena_off: std::sync::atomic::AtomicUsize::new(0),
             arena_enabled: std::sync::atomic::AtomicBool::new(false),
             pool: std::sync::Mutex::new(PoolState::default()),
         })
     }
 
-    // ─── Graph-capture scratch arena ─────────────────────────────────
-
-    /// True if the arena reservation succeeded (graphs are usable).
-    pub fn arena_available(&self) -> bool {
-        !self
-            .arena_base
-            .load(std::sync::atomic::Ordering::Acquire)
-            .is_null()
+    pub fn memory_plan(&self) -> CudaMemoryPlan {
+        self.memory_plan
     }
 
-    /// Reset the bump offset and route subsequent `alloc_bytes` through the
-    /// arena. Called just before `cudaStreamBeginCapture`.
-    pub fn arena_begin(&self) {
-        self.arena_off
-            .store(0, std::sync::atomic::Ordering::Release);
-        self.arena_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
+    pub fn kernel_workspace(&self) -> CudaWorkspace {
+        CudaWorkspace {
+            ptr: self.kernel_workspace.ptr,
+            size: self.kernel_workspace.size,
+        }
+    }
+
+    // ─── Graph-capture scratch arena ─────────────────────────────────
+
+    /// True while graph capture is configured and its lazy arena allocation has
+    /// not failed.
+    pub fn arena_available(&self) -> bool {
+        self.memory_plan.graph_arena_bytes > 0
+            && !self.arena_failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Lazily allocate the graph arena, reset its bump offset, and route
+    /// subsequent `alloc_bytes` through it. Called before stream capture, where
+    /// `cudaMalloc` would no longer be legal.
+    pub fn arena_begin(&self) -> OpResult<()> {
+        use std::sync::atomic::Ordering;
+        if self.memory_plan.graph_arena_bytes == 0 {
+            return Err(OpError::Kernel("CUDA graph arena is disabled".into()));
+        }
+        if self.arena_base.load(Ordering::Acquire).is_null() {
+            let mut arena = self.graph_arena.lock().unwrap();
+            if arena.is_none() {
+                match DeviceRegion::allocate(self.memory_plan.graph_arena_bytes) {
+                    Ok(region) => {
+                        self.arena_base.store(region.ptr, Ordering::Release);
+                        *arena = Some(region);
+                    }
+                    Err(error) => {
+                        self.arena_failed.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.arena_off.store(0, Ordering::Release);
+        self.arena_enabled.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Stop routing allocations through the arena (eager `cudaMalloc` resumes).
@@ -295,7 +435,7 @@ impl CudaConfig {
             .arena_off
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let end = cur.checked_add(n)?;
-                (end <= GRAPH_ARENA_SIZE).then_some(end)
+                (end <= self.memory_plan.graph_arena_bytes).then_some(end)
             });
         let off = match off {
             Ok(prev) => prev, // prev offset; our region is [prev, prev+n)
@@ -318,7 +458,7 @@ impl CudaConfig {
         }
         let p = ptr as usize;
         let b = base as usize;
-        p >= b && p < b + GRAPH_ARENA_SIZE
+        p >= b && p < b + self.memory_plan.graph_arena_bytes
     }
 
     // ─── Recycling scratch allocator ─────────────────────────────────
@@ -349,14 +489,14 @@ impl CudaConfig {
     }
 
     /// Return a block to the free list for later reuse (no `cudaFree`), unless
-    /// retaining it would push the pool over `POOL_RETAIN_BUDGET` — then the
+    /// retaining it would push the pool over the configured retention limit — then the
     /// block is `cudaFree`d (outside the lock; legal here since arena/capture
     /// pointers were already filtered out by `free_bytes`).
     pub(crate) fn pool_push(&self, n: usize, ptr: *mut c_void) {
         let retained = {
             let mut g = self.pool.lock().unwrap();
             g.live_bytes = g.live_bytes.saturating_sub(n);
-            if g.pooled_bytes + n > POOL_RETAIN_BUDGET {
+            if g.pooled_bytes + n > self.memory_plan.pool_retain_bytes {
                 false
             } else {
                 debug_assert!(
@@ -647,15 +787,8 @@ impl Drop for CudaConfig {
             if !self.cublas_handle_v2.is_null() {
                 ffi::cublasDestroy_v2(self.cublas_handle_v2);
             }
-            if !self.workspace.is_null() {
-                ffi::cudaFree(self.workspace);
-            }
             if !self.cudnn_handle.is_null() {
                 ffi::cudnnDestroy(self.cudnn_handle);
-            }
-            let arena = self.arena_base.load(std::sync::atomic::Ordering::Acquire);
-            if !arena.is_null() {
-                ffi::cudaFree(arena);
             }
         }
         // Release every recycled scratch block (disjoint from the arena).
@@ -664,3 +797,32 @@ impl Drop for CudaConfig {
 }
 unsafe impl Send for CudaConfig {}
 unsafe impl Sync for CudaConfig {}
+
+#[cfg(test)]
+mod memory_plan_tests {
+    use super::*;
+
+    #[test]
+    fn default_plan_uses_compact_fixed_regions() {
+        let plan = CudaMemoryPlan::default();
+        assert_eq!(plan.kernel_workspace_bytes, 256 * MIB);
+        assert_eq!(plan.graph_arena_bytes, 256 * MIB);
+        assert_eq!(plan.pool_retain_bytes, 256 * MIB);
+    }
+
+    #[test]
+    fn builder_changes_regions_independently() {
+        let plan = CudaMemoryPlan::default()
+            .with_kernel_workspace_bytes(64)
+            .with_graph_arena_bytes(128)
+            .with_pool_retain_bytes(32);
+        assert_eq!(
+            plan,
+            CudaMemoryPlan {
+                kernel_workspace_bytes: 64,
+                graph_arena_bytes: 128,
+                pool_retain_bytes: 32,
+            }
+        );
+    }
+}
