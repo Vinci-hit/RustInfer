@@ -35,7 +35,7 @@ RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
         --default-toolchain "${RUST_VERSION}" \
         --profile minimal \
         --no-modify-path \
-        --yes \
+        -y \
     && rm /tmp/rustup-init \
     && rustc --version \
     && cargo --version
