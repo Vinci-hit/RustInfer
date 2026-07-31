@@ -182,10 +182,7 @@ impl<'a> WeightLoader<'a> {
     /// Load a decoder Linear, preserving a configured block-FP8 weight and its
     /// inverse-scale grid on device. Without `fp8_block`, this constructs the
     /// same dense component as [`Self::load_linear`].
-    pub fn load_linear_with_fp8<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub fn load_linear_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         weight_name: &str,
         bias_name: Option<&str>,
@@ -301,10 +298,7 @@ impl<'a> WeightLoader<'a> {
     /// Decoder-component form of [`Self::load_fused_qkv`]. For block FP8, raw
     /// E4M3 rows and scale-grid rows are fused independently without expanding
     /// the weight to the activation dtype.
-    pub fn load_fused_qkv_with_fp8<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub fn load_fused_qkv_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         prefix: &str,
         q_dim: usize,
@@ -408,10 +402,7 @@ impl<'a> WeightLoader<'a> {
     /// Decoder-component form of [`Self::load_fused_gate_up`]. For block FP8,
     /// raw E4M3 rows and scale-grid rows are fused independently without host
     /// dequantization.
-    pub fn load_fused_gate_up_with_fp8<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub fn load_fused_gate_up_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         prefix: &str,
         intermediate_size: usize,
@@ -518,10 +509,7 @@ impl<'a> WeightLoader<'a> {
     /// Load a single int4 (`pack-quantized`) projection — e.g. `down_proj` —
     /// into a quantized `Linear`. `prefix` is the tensor-name stem, e.g.
     /// `"model.layers.0.mlp.down_proj"`.
-    pub(crate) fn load_awq_linear<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub(crate) fn load_awq_linear<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         prefix: &str,
         scheme: QuantScheme,
@@ -536,10 +524,7 @@ impl<'a> WeightLoader<'a> {
     /// Load int4 `gate_proj` + `up_proj` fused along rows into one quantized
     /// `Linear` (`[2*inter, K/8]` packed), matching the dense fused layout.
     /// `mlp_prefix` is the caller-supplied MLP stem, e.g. `"model.layers.0.mlp"`.
-    pub(crate) fn load_fused_gate_up_awq<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub(crate) fn load_fused_gate_up_awq<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         mlp_prefix: &str,
         scheme: QuantScheme,
@@ -788,163 +773,6 @@ fn prepare_fp8_fused_host(
     })
 }
 
-#[cfg(test)]
-mod fp8_tests {
-    use super::{Fp8ViewPart, prepare_fp8_fused_host};
-    use crate::domain::dtype::Fp8E4m3;
-    use crate::domain::tensor::Tensor;
-    use crate::domain::types::Shape;
-    use crate::infrastructure::cpu::Cpu;
-    use half::bf16;
-    use safetensors::{Dtype, tensor::TensorView};
-
-    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
-        values
-            .iter()
-            .flat_map(|&value| bf16::from_f32(value).to_le_bytes())
-            .collect()
-    }
-
-    fn decode_f32(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
-    }
-
-    #[test]
-    fn native_fp8_fusion_preserves_one_byte_weights_on_host_and_device() {
-        // block [2,2]. The first segment ends on a block_n boundary; the final
-        // segment deliberately has a tail block.
-        let q_bytes: Vec<u8> = (0..8).collect();
-        let k_bytes: Vec<u8> = (8..20).collect();
-        let q_scale_bytes = bf16_bytes(&[1.0, 2.0]);
-        let k_scale_bytes = bf16_bytes(&[3.0, 4.0, 5.0, 6.0]);
-        let q = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &q_bytes).unwrap();
-        let k = TensorView::new(Dtype::F8_E4M3, vec![3, 4], &k_bytes).unwrap();
-        let q_scales = TensorView::new(Dtype::BF16, vec![1, 2], &q_scale_bytes).unwrap();
-        let k_scales = TensorView::new(Dtype::BF16, vec![2, 2], &k_scale_bytes).unwrap();
-        let parts = [
-            Fp8ViewPart {
-                name: "q.weight",
-                weight: q,
-                scale_inv: q_scales,
-            },
-            Fp8ViewPart {
-                name: "k.weight",
-                weight: k,
-                scale_inv: k_scales,
-            },
-        ];
-
-        let host = prepare_fp8_fused_host(&parts, [2, 2], "test_qk").unwrap();
-        let expected_weight: Vec<u8> = q_bytes.into_iter().chain(k_bytes).collect();
-        assert_eq!(host.weight, expected_weight);
-        assert_eq!(host.weight_shape, [5, 4]);
-        assert_eq!(host.weight.len(), 5 * 4); // E4M3 stays one byte per element.
-        assert_eq!(host.scale_shape, [3, 2]);
-        assert_eq!(decode_f32(&host.scales), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-        let device_weight = Tensor::<Fp8E4m3, Cpu>::from_host_bytes(
-            &host.weight,
-            Shape::from_slice(&host.weight_shape),
-            &Cpu,
-        )
-        .unwrap();
-        assert_eq!(device_weight.storage().size(), 5 * 4);
-        assert_eq!(
-            device_weight
-                .to_host_vec()
-                .unwrap()
-                .into_iter()
-                .map(|value| value.0)
-                .collect::<Vec<_>>(),
-            host.weight
-        );
-    }
-
-    #[test]
-    fn native_fp8_fusion_rejects_unaligned_projection_boundary() {
-        let first_bytes = vec![0x38; 3 * 4];
-        let second_bytes = vec![0x38; 2 * 4];
-        let first_scale_bytes = bf16_bytes(&[1.0; 4]);
-        let second_scale_bytes = bf16_bytes(&[1.0; 2]);
-        let first = TensorView::new(Dtype::F8_E4M3, vec![3, 4], &first_bytes).unwrap();
-        let second = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &second_bytes).unwrap();
-        let first_scales = TensorView::new(Dtype::BF16, vec![2, 2], &first_scale_bytes).unwrap();
-        let second_scales = TensorView::new(Dtype::BF16, vec![1, 2], &second_scale_bytes).unwrap();
-        let parts = [
-            Fp8ViewPart {
-                name: "first.weight",
-                weight: first,
-                scale_inv: first_scales,
-            },
-            Fp8ViewPart {
-                name: "second.weight",
-                weight: second,
-                scale_inv: second_scales,
-            },
-        ];
-
-        let err = prepare_fp8_fused_host(&parts, [2, 2], "test_fusion")
-            .expect_err("unaligned first projection must fail");
-        assert!(format!("{err:?}").contains("fusion boundary"));
-    }
-
-    #[test]
-    fn native_fp8_single_linear_allows_tail_block() {
-        let weight_bytes = vec![0x38; 3 * 5];
-        let scale_bytes = bf16_bytes(&[1.0; 6]);
-        let weight = TensorView::new(Dtype::F8_E4M3, vec![3, 5], &weight_bytes).unwrap();
-        let scales = TensorView::new(Dtype::BF16, vec![2, 3], &scale_bytes).unwrap();
-        let parts = [Fp8ViewPart {
-            name: "tail.weight",
-            weight,
-            scale_inv: scales,
-        }];
-
-        let host = prepare_fp8_fused_host(&parts, [2, 2], "tail").unwrap();
-        assert_eq!(host.weight.len(), 15);
-        assert_eq!(host.scale_shape, [2, 3]);
-    }
-
-    #[test]
-    fn native_fp8_rejects_non_finite_metadata() {
-        let nan_weight_bytes = vec![0x7f; 2 * 2];
-        let good_scale_bytes = 1.0f32.to_le_bytes();
-        let nan_weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &nan_weight_bytes).unwrap();
-        let good_scale = TensorView::new(Dtype::F32, vec![1, 1], &good_scale_bytes).unwrap();
-        let err = prepare_fp8_fused_host(
-            &[Fp8ViewPart {
-                name: "nan.weight",
-                weight: nan_weight,
-                scale_inv: good_scale,
-            }],
-            [2, 2],
-            "nan_weight",
-        )
-        .expect_err("E4M3FN NaN must be rejected");
-        assert!(format!("{err:?}").contains("NaN encoding"));
-
-        let good_weight_bytes = vec![0x38; 2 * 2];
-        let infinite_scale_bytes = f32::INFINITY.to_le_bytes();
-        let good_weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &good_weight_bytes).unwrap();
-        let infinite_scale =
-            TensorView::new(Dtype::F32, vec![1, 1], &infinite_scale_bytes).unwrap();
-        let err = prepare_fp8_fused_host(
-            &[Fp8ViewPart {
-                name: "infinite.weight",
-                weight: good_weight,
-                scale_inv: infinite_scale,
-            }],
-            [2, 2],
-            "infinite_scale",
-        )
-        .expect_err("non-finite scale must be rejected");
-        assert!(format!("{err:?}").contains("non-finite"));
-    }
-}
-
 fn safetensor_view_to_host_bytes<T: Dtype>(view: &TensorView<'_>) -> OpResult<Vec<u8>> {
     let shape_vec: Vec<usize> = view.shape().to_vec();
     let numel: usize = shape_vec.iter().product();
@@ -1114,55 +942,178 @@ pub(crate) fn compute_rope_cache<T: Dtype, D: OpBackend>(
         }
     }
 
-    // Build host buffers in target dtype, then upload.
-    let elem = T::SIZE_BYTES;
+    // Build typed host buffers through the canonical scalar conversion API.
     let n = max_seq_len * half_dim;
-    let mut sin_host = vec![0u8; n * elem];
-    let mut cos_host = vec![0u8; n * elem];
+    let mut sin_host = vec![T::write_f64(0.0); n];
+    let mut cos_host = vec![T::write_f64(0.0); n];
     for pos in 0..max_seq_len {
         for (i, &frequency) in freqs.iter().enumerate().take(half_dim) {
             let angle = pos as f64 * frequency;
-            let offset = (pos * half_dim + i) * elem;
-            // SAFETY: offset + elem <= n * elem by construction.
-            unsafe {
-                write_dtype_bytes(sin_host.as_mut_ptr().add(offset), angle.sin(), T::DATA_TYPE);
-                write_dtype_bytes(cos_host.as_mut_ptr().add(offset), angle.cos(), T::DATA_TYPE);
-            }
+            let offset = pos * half_dim + i;
+            sin_host[offset] = T::write_f64(angle.sin());
+            cos_host[offset] = T::write_f64(angle.cos());
         }
     }
 
     let shape = Shape::from_slice(&[max_seq_len, half_dim]);
-    let sin_tensor = Tensor::<T, D>::from_host_bytes(&sin_host, shape, device)?;
-    let cos_tensor = Tensor::<T, D>::from_host_bytes(&cos_host, shape, device)?;
+    let sin_tensor = Tensor::<T, D>::from_host_slice(&sin_host, shape, device)?;
+    let cos_tensor = Tensor::<T, D>::from_host_slice(&cos_host, shape, device)?;
     Ok((sin_tensor, cos_tensor))
 }
 
-/// Write an f64 value as the target dtype bytes.
-unsafe fn write_dtype_bytes(dst: *mut u8, val: f64, dt: DataType) {
-    unsafe {
-        match dt {
-            DataType::F32 => {
-                std::ptr::copy_nonoverlapping((val as f32).to_le_bytes().as_ptr(), dst, 4)
-            }
-            DataType::BF16 => std::ptr::copy_nonoverlapping(
-                half::bf16::from_f64(val).to_le_bytes().as_ptr(),
-                dst,
-                2,
-            ),
-            DataType::F16 => std::ptr::copy_nonoverlapping(
-                half::f16::from_f64(val).to_le_bytes().as_ptr(),
-                dst,
-                2,
-            ),
-            DataType::I32 => {
-                std::ptr::copy_nonoverlapping((val as i32).to_le_bytes().as_ptr(), dst, 4)
-            }
-            DataType::I8 => {
-                *dst = val as i8 as u8;
-            }
-            DataType::F8E4M3 => {
-                *dst = <Fp8E4m3 as crate::domain::dtype::Dtype>::write_f64(val).0;
-            }
-        }
+#[cfg(test)]
+mod fp8_tests {
+    use super::{Fp8ViewPart, prepare_fp8_fused_host};
+    use crate::domain::dtype::Fp8E4m3;
+    use crate::domain::tensor::Tensor;
+    use crate::domain::types::Shape;
+    use crate::infrastructure::cpu::Cpu;
+    use half::bf16;
+    use safetensors::{Dtype, tensor::TensorView};
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&value| bf16::from_f32(value).to_le_bytes())
+            .collect()
+    }
+
+    fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn native_fp8_fusion_preserves_one_byte_weights_on_host_and_device() {
+        // block [2,2]. The first segment ends on a block_n boundary; the final
+        // segment deliberately has a tail block.
+        let q_bytes: Vec<u8> = (0..8).collect();
+        let k_bytes: Vec<u8> = (8..20).collect();
+        let q_scale_bytes = bf16_bytes(&[1.0, 2.0]);
+        let k_scale_bytes = bf16_bytes(&[3.0, 4.0, 5.0, 6.0]);
+        let q = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &q_bytes).unwrap();
+        let k = TensorView::new(Dtype::F8_E4M3, vec![3, 4], &k_bytes).unwrap();
+        let q_scales = TensorView::new(Dtype::BF16, vec![1, 2], &q_scale_bytes).unwrap();
+        let k_scales = TensorView::new(Dtype::BF16, vec![2, 2], &k_scale_bytes).unwrap();
+        let parts = [
+            Fp8ViewPart {
+                name: "q.weight",
+                weight: q,
+                scale_inv: q_scales,
+            },
+            Fp8ViewPart {
+                name: "k.weight",
+                weight: k,
+                scale_inv: k_scales,
+            },
+        ];
+
+        let host = prepare_fp8_fused_host(&parts, [2, 2], "test_qk").unwrap();
+        let expected_weight: Vec<u8> = q_bytes.into_iter().chain(k_bytes).collect();
+        assert_eq!(host.weight, expected_weight);
+        assert_eq!(host.weight_shape, [5, 4]);
+        assert_eq!(host.weight.len(), 5 * 4); // E4M3 stays one byte per element.
+        assert_eq!(host.scale_shape, [3, 2]);
+        assert_eq!(decode_f32(&host.scales), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let device_weight = Tensor::<Fp8E4m3, Cpu>::from_host_bytes(
+            &host.weight,
+            Shape::from_slice(&host.weight_shape),
+            &Cpu,
+        )
+        .unwrap();
+        assert_eq!(device_weight.storage().size(), 5 * 4);
+        assert_eq!(
+            device_weight
+                .to_host_vec()
+                .unwrap()
+                .into_iter()
+                .map(|value| value.0)
+                .collect::<Vec<_>>(),
+            host.weight
+        );
+    }
+
+    #[test]
+    fn native_fp8_fusion_rejects_unaligned_projection_boundary() {
+        let first_bytes = vec![0x38; 3 * 4];
+        let second_bytes = vec![0x38; 2 * 4];
+        let first_scale_bytes = bf16_bytes(&[1.0; 4]);
+        let second_scale_bytes = bf16_bytes(&[1.0; 2]);
+        let first = TensorView::new(Dtype::F8_E4M3, vec![3, 4], &first_bytes).unwrap();
+        let second = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &second_bytes).unwrap();
+        let first_scales = TensorView::new(Dtype::BF16, vec![2, 2], &first_scale_bytes).unwrap();
+        let second_scales = TensorView::new(Dtype::BF16, vec![1, 2], &second_scale_bytes).unwrap();
+        let parts = [
+            Fp8ViewPart {
+                name: "first.weight",
+                weight: first,
+                scale_inv: first_scales,
+            },
+            Fp8ViewPart {
+                name: "second.weight",
+                weight: second,
+                scale_inv: second_scales,
+            },
+        ];
+
+        let err = prepare_fp8_fused_host(&parts, [2, 2], "test_fusion")
+            .expect_err("unaligned first projection must fail");
+        assert!(format!("{err:?}").contains("fusion boundary"));
+    }
+
+    #[test]
+    fn native_fp8_single_linear_allows_tail_block() {
+        let weight_bytes = vec![0x38; 3 * 5];
+        let scale_bytes = bf16_bytes(&[1.0; 6]);
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![3, 5], &weight_bytes).unwrap();
+        let scales = TensorView::new(Dtype::BF16, vec![2, 3], &scale_bytes).unwrap();
+        let parts = [Fp8ViewPart {
+            name: "tail.weight",
+            weight,
+            scale_inv: scales,
+        }];
+
+        let host = prepare_fp8_fused_host(&parts, [2, 2], "tail").unwrap();
+        assert_eq!(host.weight.len(), 15);
+        assert_eq!(host.scale_shape, [2, 3]);
+    }
+
+    #[test]
+    fn native_fp8_rejects_non_finite_metadata() {
+        let nan_weight_bytes = vec![0x7f; 2 * 2];
+        let good_scale_bytes = 1.0f32.to_le_bytes();
+        let nan_weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &nan_weight_bytes).unwrap();
+        let good_scale = TensorView::new(Dtype::F32, vec![1, 1], &good_scale_bytes).unwrap();
+        let err = prepare_fp8_fused_host(
+            &[Fp8ViewPart {
+                name: "nan.weight",
+                weight: nan_weight,
+                scale_inv: good_scale,
+            }],
+            [2, 2],
+            "nan_weight",
+        )
+        .expect_err("E4M3FN NaN must be rejected");
+        assert!(format!("{err:?}").contains("NaN encoding"));
+
+        let good_weight_bytes = vec![0x38; 2 * 2];
+        let infinite_scale_bytes = f32::INFINITY.to_le_bytes();
+        let good_weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &good_weight_bytes).unwrap();
+        let infinite_scale =
+            TensorView::new(Dtype::F32, vec![1, 1], &infinite_scale_bytes).unwrap();
+        let err = prepare_fp8_fused_host(
+            &[Fp8ViewPart {
+                name: "infinite.weight",
+                weight: good_weight,
+                scale_inv: infinite_scale,
+            }],
+            [2, 2],
+            "infinite_scale",
+        )
+        .expect_err("non-finite scale must be rejected");
+        assert!(format!("{err:?}").contains("non-finite"));
     }
 }

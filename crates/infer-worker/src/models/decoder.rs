@@ -213,7 +213,7 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
 /// Qwen3 carries `self_attn.{q,k}_norm.weight` and Llama3 does not, so the Q/K
 /// norms are simply populated when present. int4 (`compressed-tensors`
 /// pack-quantized) MLP is selected by `cfg.mlp_quant`.
-pub fn build_dense_decoder<T: Dtype + crate::domain::dtype::Dtype, D: OpBackend + LlmBackend>(
+pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
     loader: &WeightLoader<'_>,
     cfg: &LoadConfig,
     device: &D,

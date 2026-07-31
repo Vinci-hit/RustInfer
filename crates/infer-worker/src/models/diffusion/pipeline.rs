@@ -47,42 +47,14 @@ fn load_latent_from_npy<T: Dtype>(
             n_f32, expected, LATENT_CHANNELS, latent_h, latent_w,
         )));
     }
-    // Read raw f32 values.
-    let f32_data: Vec<f32> =
-        unsafe { std::slice::from_raw_parts(buf.as_ptr().add(data_start) as *const f32, n_f32) }
-            .to_vec();
-    // Cast to T host bytes.
-    let mut host: Vec<u8> = vec![0u8; n_f32 * T::SIZE_BYTES];
-    match T::DATA_TYPE {
-        crate::domain::types::DataType::F32 => {
-            let dst =
-                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, n_f32) };
-            dst.copy_from_slice(&f32_data);
-        }
-        crate::domain::types::DataType::BF16 => {
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::bf16, n_f32)
-            };
-            for (i, &v) in f32_data.iter().enumerate() {
-                dst[i] = half::bf16::from_f32(v);
-            }
-        }
-        crate::domain::types::DataType::F16 => {
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut half::f16, n_f32)
-            };
-            for (i, &v) in f32_data.iter().enumerate() {
-                dst[i] = half::f16::from_f32(v);
-            }
-        }
-        other => {
-            return Err(OpError::Kernel(format!(
-                "load_latent: unsupported {:?}",
-                other
-            )));
-        }
-    }
-    Tensor::<T, Cuda>::from_host_bytes(
+    let host: Vec<T> = buf[data_start..]
+        .chunks_exact(4)
+        .map(|bytes| {
+            let value = f32::from_le_bytes(bytes.try_into().expect("four-byte NPY element"));
+            T::write_f64(f64::from(value))
+        })
+        .collect();
+    Tensor::<T, Cuda>::from_host_slice(
         &host,
         crate::domain::types::Shape::from_slice(&[1, LATENT_CHANNELS, latent_h, latent_w]),
         dev,

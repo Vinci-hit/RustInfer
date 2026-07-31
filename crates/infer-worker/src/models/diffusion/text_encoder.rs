@@ -188,9 +188,8 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         // dtype T). We compute on host then upload.
         let half = cfg.head_dim / 2;
         let max_pos = cfg.max_position_embeddings.min(2048); // cap for memory
-        let sin_host = vec![T::DATA_TYPE; 0]; // placeholder
-        let mut cos_host_bytes = vec![0u8; max_pos * half * T::SIZE_BYTES];
-        let mut sin_host_bytes = vec![0u8; max_pos * half * T::SIZE_BYTES];
+        let mut cos_host = vec![T::write_f64(0.0); max_pos * half];
+        let mut sin_host = vec![T::write_f64(0.0); max_pos * half];
         let theta = cfg.rope_theta as f64;
         let freqs: Vec<f64> = (0..half)
             .map(|i| 1.0 / theta.powf(2.0 * i as f64 / cfg.head_dim as f64))
@@ -198,40 +197,15 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         for p in 0..max_pos {
             for i in 0..half {
                 let arg = p as f64 * freqs[i];
-                let c = arg.cos() as f32;
-                let s = arg.sin() as f32;
-                let off = (p * half + i) * T::SIZE_BYTES;
-                match T::DATA_TYPE {
-                    crate::domain::types::DataType::F32 => {
-                        cos_host_bytes[off..off + 4].copy_from_slice(&c.to_le_bytes());
-                        sin_host_bytes[off..off + 4].copy_from_slice(&s.to_le_bytes());
-                    }
-                    crate::domain::types::DataType::BF16 => {
-                        cos_host_bytes[off..off + 2]
-                            .copy_from_slice(&half::bf16::from_f32(c).to_le_bytes());
-                        sin_host_bytes[off..off + 2]
-                            .copy_from_slice(&half::bf16::from_f32(s).to_le_bytes());
-                    }
-                    crate::domain::types::DataType::F16 => {
-                        cos_host_bytes[off..off + 2]
-                            .copy_from_slice(&half::f16::from_f32(c).to_le_bytes());
-                        sin_host_bytes[off..off + 2]
-                            .copy_from_slice(&half::f16::from_f32(s).to_le_bytes());
-                    }
-                    other => {
-                        return Err(OpError::Kernel(format!(
-                            "Qwen3TextEncoder: unsupported dtype {:?}",
-                            other,
-                        )));
-                    }
-                }
+                let off = p * half + i;
+                cos_host[off] = T::write_f64(arg.cos());
+                sin_host[off] = T::write_f64(arg.sin());
             }
         }
-        let _ = sin_host; // unused
         let cos_cache: Tensor<T, Cuda> =
-            Tensor::from_host_bytes(&cos_host_bytes, Shape::from_slice(&[max_pos, half]), device)?;
+            Tensor::from_host_slice(&cos_host, Shape::from_slice(&[max_pos, half]), device)?;
         let sin_cache: Tensor<T, Cuda> =
-            Tensor::from_host_bytes(&sin_host_bytes, Shape::from_slice(&[max_pos, half]), device)?;
+            Tensor::from_host_slice(&sin_host, Shape::from_slice(&[max_pos, half]), device)?;
 
         Ok(Self {
             output_layer_count: cfg.n_layers.saturating_sub(1),
@@ -298,7 +272,7 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
         // -3.3895e+38 is bf16's minimum finite value (avoids -inf in softmax
         // overflow paths). We cast to T (f32 / bf16 / f16) when uploading.
         let mask_neg_inf: f32 = -3.3895313892515355e+38_f32;
-        let mut mask_host_bytes = vec![0u8; seq_len * seq_len * T::SIZE_BYTES];
+        let mut mask_host = vec![T::write_f64(0.0); seq_len * seq_len];
         for i in 0..seq_len {
             for j in 0..seq_len {
                 // Causal: j > i is masked. Padding: attention_mask[j]==0 is
@@ -306,30 +280,11 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                 // diffusers/transformers convention.)
                 let allow = j <= i && attention_mask[j] != 0;
                 let v = if allow { 0.0_f32 } else { mask_neg_inf };
-                let off = (i * seq_len + j) * T::SIZE_BYTES;
-                match T::DATA_TYPE {
-                    crate::domain::types::DataType::F32 => {
-                        mask_host_bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
-                    }
-                    crate::domain::types::DataType::BF16 => {
-                        mask_host_bytes[off..off + 2]
-                            .copy_from_slice(&half::bf16::from_f32(v).to_le_bytes());
-                    }
-                    crate::domain::types::DataType::F16 => {
-                        mask_host_bytes[off..off + 2]
-                            .copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
-                    }
-                    other => {
-                        return Err(OpError::Kernel(format!(
-                            "Qwen3TextEncoder: unsupported dtype {:?}",
-                            other,
-                        )));
-                    }
-                }
+                mask_host[i * seq_len + j] = T::write_f64(f64::from(v));
             }
         }
-        let mask_dev: Tensor<T, Cuda> = Tensor::from_host_bytes(
-            &mask_host_bytes,
+        let mask_dev: Tensor<T, Cuda> = Tensor::from_host_slice(
+            &mask_host,
             Shape::from_slice(&[seq_len, seq_len]),
             dev,
         )?;

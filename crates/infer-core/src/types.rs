@@ -1,8 +1,11 @@
 //! Domain value types — pure math, zero dependencies.
 
 use half::{bf16, f16};
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 // ─── Dims ────────────────────────────────────────────────────────────────────
 
@@ -196,6 +199,70 @@ impl fmt::Debug for Strides {
 
 // ─── DataType / Dtype ────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DTypeId(pub u16);
+
+impl DTypeId {
+    pub const F32: DTypeId = DTypeId(0);
+    pub const F16: DTypeId = DTypeId(1);
+    pub const BF16: DTypeId = DTypeId(2);
+    pub const I32: DTypeId = DTypeId(3);
+    pub const I8: DTypeId = DTypeId(4);
+    pub const F8E4M3: DTypeId = DTypeId(5);
+    pub const F8E5M2: DTypeId = DTypeId(6);
+    pub const U8: DTypeId = DTypeId(7);
+    pub const U32: DTypeId = DTypeId(8);
+
+    pub fn register(spec: DTypeSpec) -> DTypeId {
+        static NEXT_ID: AtomicU16 = AtomicU16::new(1024);
+        let id = DTypeId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        dtype_registry()
+            .write()
+            .expect("dtype registry poisoned")
+            .insert(id.0, spec);
+        id
+    }
+
+    pub fn size_bytes(self) -> usize {
+        match self {
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F16 | Self::BF16 => 2,
+            Self::I8 | Self::F8E4M3 | Self::F8E5M2 | Self::U8 => 1,
+            id => dtype_registry()
+                .read()
+                .expect("dtype registry poisoned")
+                .get(&id.0)
+                .map(|spec| spec.size_bytes)
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn is_float(self) -> bool {
+        match self {
+            Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2 => true,
+            Self::I32 | Self::I8 | Self::U8 | Self::U32 => false,
+            id => dtype_registry()
+                .read()
+                .expect("dtype registry poisoned")
+                .get(&id.0)
+                .map(|spec| spec.is_float)
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DTypeSpec {
+    pub size_bytes: usize,
+    pub is_float: bool,
+    pub name: &'static str,
+}
+
+fn dtype_registry() -> &'static RwLock<HashMap<u16, DTypeSpec>> {
+    static REGISTRY: OnceLock<RwLock<HashMap<u16, DTypeSpec>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     F32,
@@ -214,31 +281,91 @@ impl DataType {
             DataType::F8E4M3 | DataType::I8 => 1,
         }
     }
+
+    #[inline]
+    pub const fn is_float(self) -> bool {
+        matches!(
+            self,
+            DataType::F32 | DataType::F16 | DataType::BF16 | DataType::F8E4M3
+        )
+    }
 }
 
 pub trait Dtype: Copy + Send + Sync + 'static + fmt::Debug {
     const DATA_TYPE: DataType;
     const SIZE_BYTES: usize;
+    const ID: DTypeId;
+
+    /// Convert one host scalar to the backend-independent reference format.
+    fn read_f64(raw: &Self) -> f64;
+
+    /// Convert a backend-independent reference scalar to this dtype.
+    fn write_f64(v: f64) -> Self;
 }
 impl Dtype for f32 {
     const DATA_TYPE: DataType = DataType::F32;
     const SIZE_BYTES: usize = 4;
+    const ID: DTypeId = DTypeId::F32;
+
+    fn read_f64(raw: &Self) -> f64 {
+        f64::from(*raw)
+    }
+
+    fn write_f64(v: f64) -> Self {
+        v as f32
+    }
 }
 impl Dtype for f16 {
     const DATA_TYPE: DataType = DataType::F16;
     const SIZE_BYTES: usize = 2;
+    const ID: DTypeId = DTypeId::F16;
+
+    fn read_f64(raw: &Self) -> f64 {
+        f64::from(raw.to_f32())
+    }
+
+    fn write_f64(v: f64) -> Self {
+        f16::from_f32(v as f32)
+    }
 }
 impl Dtype for bf16 {
     const DATA_TYPE: DataType = DataType::BF16;
     const SIZE_BYTES: usize = 2;
+    const ID: DTypeId = DTypeId::BF16;
+
+    fn read_f64(raw: &Self) -> f64 {
+        f64::from(raw.to_f32())
+    }
+
+    fn write_f64(v: f64) -> Self {
+        bf16::from_f32(v as f32)
+    }
 }
 impl Dtype for i32 {
     const DATA_TYPE: DataType = DataType::I32;
     const SIZE_BYTES: usize = 4;
+    const ID: DTypeId = DTypeId::I32;
+
+    fn read_f64(raw: &Self) -> f64 {
+        f64::from(*raw)
+    }
+
+    fn write_f64(v: f64) -> Self {
+        v as i32
+    }
 }
 impl Dtype for i8 {
     const DATA_TYPE: DataType = DataType::I8;
     const SIZE_BYTES: usize = 1;
+    const ID: DTypeId = DTypeId::I8;
+
+    fn read_f64(raw: &Self) -> f64 {
+        f64::from(*raw)
+    }
+
+    fn write_f64(v: f64) -> Self {
+        v as i8
+    }
 }
 
 /// Marker: floating-point dtypes only.
