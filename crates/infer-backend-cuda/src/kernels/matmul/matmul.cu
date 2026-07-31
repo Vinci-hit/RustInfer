@@ -1286,13 +1286,13 @@ extern "C" void kpack_gemm_cu(
 //  Scratch is supplied by CudaConfig's address-stable workspace. The first
 //  kernel quantizes every 1x128 BF16 activation block to E4M3 and writes its
 //  dequant scale. Decode uses the quantized data in a warp GEMV; prefill first
-//  attempts the SM90a CUTLASS blockwise Tensor Core kernel and retains a tiled
-//  W8A8 CUDA fallback for unsupported build/runtime configurations.
+//  attempts the architecture-accelerated CUTLASS blockwise Tensor Core kernel
+//  and retains a tiled W8A8 CUDA fallback for unsupported configurations.
 // ============================================================================
 
-#ifdef RUSTINFER_HAS_FP8_BLOCK_SM90
-extern "C" int fp8_block_cutlass_sm90_init(int device_id);
-extern "C" int fp8_block_cutlass_sm90_bf16(
+#ifdef RUSTINFER_HAS_FP8_BLOCK_ACCELERATED
+extern "C" int fp8_block_accelerated_init(int device_id);
+extern "C" int fp8_block_accelerated_bf16(
     const void* activation_fp8, const void* weight_fp8,
     const float* activation_scale_inv, const float* weight_scale_inv,
     void* output_bf16, int M, int N, int K, int device_id,
@@ -1300,8 +1300,8 @@ extern "C" int fp8_block_cutlass_sm90_bf16(
 #endif
 
 extern "C" int fp8_block_matmul_init_cu(int device_id) {
-#ifdef RUSTINFER_HAS_FP8_BLOCK_SM90
-    return fp8_block_cutlass_sm90_init(device_id);
+#ifdef RUSTINFER_HAS_FP8_BLOCK_ACCELERATED
+    return fp8_block_accelerated_init(device_id);
 #else
     (void)device_id;
     return 0;
@@ -1516,8 +1516,8 @@ extern "C" int fp8_block_matmul_bf16_cu(
         return 1;  // dynamic W8A8 warp GEMV
     }
 
-#ifdef RUSTINFER_HAS_FP8_BLOCK_SM90
-    const int cutlass_status = fp8_block_cutlass_sm90_bf16(
+#ifdef RUSTINFER_HAS_FP8_BLOCK_ACCELERATED
+    const int cutlass_status = fp8_block_accelerated_bf16(
         activation_fp8, weight, activation_scale_inv,
         static_cast<const float*>(weight_scale_inv), output,
         M, N, K, device_id, cutlass_workspace, cutlass_workspace_size, stream);

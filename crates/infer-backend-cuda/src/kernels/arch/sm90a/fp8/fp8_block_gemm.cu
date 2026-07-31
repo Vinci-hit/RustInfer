@@ -100,7 +100,7 @@ std::atomic<int> max_cluster_cache[kMaxCachedDevices]{};
 
 }  // namespace rustinfer_fp8_sm90
 
-extern "C" int fp8_block_cutlass_sm90_init(int device_id) {
+extern "C" int fp8_block_accelerated_init(int device_id) {
   using namespace rustinfer_fp8_sm90;
   if (device_id < 0 || device_id >= kMaxCachedDevices) {
     return static_cast<int>(cudaErrorInvalidDevice);
@@ -124,7 +124,7 @@ extern "C" int fp8_block_cutlass_sm90_init(int device_id) {
   return 0;
 }
 
-extern "C" int fp8_block_cutlass_sm90_bf16(
+extern "C" int fp8_block_accelerated_bf16(
     const void* activation_fp8,
     const void* weight_fp8,
     const float* activation_scale_inv,

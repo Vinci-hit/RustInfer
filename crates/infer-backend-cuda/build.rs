@@ -1,6 +1,52 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+struct CudaArchiveSpec {
+    name: &'static str,
+    arch_family: u32,
+    codegen_arch: &'static str,
+    source_dir: &'static str,
+    extra_flags: &'static [&'static str],
+    generic_define: Option<&'static str>,
+    rust_cfg: Option<&'static str>,
+}
+
+const FP8_SM90_FLAGS: &[&str] = &[
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+];
+
+const FA3_SM90_FLAGS: &[&str] = &[
+    "--use_fast_math",
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+    "-DFLASHATTENTION_DISABLE_LOCAL",
+    "-DFLASHATTENTION_DISABLE_APPENDKV",
+    "-DFLASHATTENTION_DISABLE_CLUSTER",
+    "-DFLASHATTENTION_DISABLE_SM8x",
+];
+
+const CUDA_ARCHIVES: &[CudaArchiveSpec] = &[
+    CudaArchiveSpec {
+        name: "rustinfer_fp8_sm90",
+        arch_family: 90,
+        codegen_arch: "sm_90a",
+        source_dir: "src/kernels/arch/sm90a/fp8",
+        extra_flags: FP8_SM90_FLAGS,
+        generic_define: Some("RUSTINFER_HAS_FP8_BLOCK_ACCELERATED"),
+        rust_cfg: None,
+    },
+    CudaArchiveSpec {
+        name: "rustinfer_fa3",
+        arch_family: 90,
+        codegen_arch: "sm_90a",
+        source_dir: "src/kernels/third_party/fa3",
+        extra_flags: FA3_SM90_FLAGS,
+        generic_define: None,
+        rust_cfg: Some("rustinfer_fa3"),
+    },
+];
+
 fn main() {
     {
         // 1. 自动处理 libclang 环境变量 (彻底免去手动 export LIBCLANG_PATH)
@@ -30,19 +76,6 @@ fn main() {
         if std::env::var("SKIP_BUILD_KERNELS").is_ok() {
             return;
         }
-        // Hopper FP8 blockwise GEMM uses WGMMA/TMA and must be compiled as
-        // sm_90a in a whole-program TU below. Keep it out of cc-rs's generic
-        // sm_XX --device-c archive to avoid duplicate symbols and serialized
-        // WGMMA code generation.
-        let mut kernel_paths = find_files("src/kernels", "cu");
-        kernel_paths.retain(|path| {
-            path.file_name().and_then(|name| name.to_str()) != Some("fp8_block_gemm_sm90.cu")
-        });
-
-        if kernel_paths.is_empty() {
-            println!("cargo:warning=No CUDA kernel files (.cu) found in src/kernels/");
-        }
-
         // 配置 Rust 链接搜索路径 (加入动态识别的 Conda lib 路径)
         for lib_path in &cuda_lib_paths {
             println!("cargo:rustc-link-search=native={}", lib_path.display());
@@ -88,6 +121,22 @@ fn main() {
         println!("cargo:rustc-env=RUSTINFER_CUDA_ARCH={}", cuda_arch);
         eprintln!("RustInfer build: detected CUDA arch {}", cuda_arch);
 
+        // Directory convention is the classification boundary:
+        //   src/kernels/**             -> generic cc-rs device archive
+        //   src/kernels/arch/**        -> architecture-specific whole-program archive
+        //   src/kernels/third_party/** -> explicitly declared third-party archive
+        // Adding another source to an existing specialized group requires no
+        // build-script change; a new GPU family adds one CudaArchiveSpec.
+        let kernel_paths = find_generic_kernel_files("src/kernels", "cu");
+        if kernel_paths.is_empty() {
+            println!("cargo:warning=No generic CUDA kernel files (.cu) found in src/kernels/");
+        }
+        for spec in CUDA_ARCHIVES {
+            if let Some(cfg) = spec.rust_cfg {
+                println!("cargo:rustc-check-cfg=cfg({cfg})");
+            }
+        }
+
         // 2. 配置 cc 编译器
         let mut build = cc::Build::new();
         build
@@ -100,8 +149,13 @@ fn main() {
             .include(&cudnn_frontend_include)
             .flag("-std=c++17")
             .flag(format!("-arch={}", cuda_arch));
-        if cuda_arch.starts_with("sm_90") {
-            build.define("RUSTINFER_HAS_FP8_BLOCK_SM90", None);
+        for spec in CUDA_ARCHIVES
+            .iter()
+            .filter(|spec| spec.supports(&cuda_arch))
+        {
+            if let Some(define) = spec.generic_define {
+                build.define(define, None);
+            }
         }
 
         // 把所有检测到的 CUDA include 路径都喂给 cc
@@ -113,7 +167,7 @@ fn main() {
             build.file(path);
             println!("cargo:rerun-if-changed={}", path.display());
         }
-        for path in find_files("src/kernels", "cuh") {
+        for path in find_generic_kernel_files("src/kernels", "cuh") {
             println!("cargo:rerun-if-changed={}", path.display());
         }
 
@@ -121,142 +175,13 @@ fn main() {
         println!("cargo:rustc-link-lib=static=infer_kernels");
         println!("cargo:rustc-link-lib=cudart");
 
-        // CUTLASS Hopper blockwise FP8 GEMM. As with FA3 below, direct nvcc
-        // whole-program compilation preserves warp-specialization register
-        // reallocation and permits the architecture-accelerated sm_90a ISA.
-        let fp8_sm90_src = root.join("src/kernels/matmul/fp8_block_gemm_sm90.cu");
-        println!("cargo:rerun-if-changed={}", fp8_sm90_src.display());
-        if cuda_arch.starts_with("sm_90") {
-            let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-            let obj = out_dir.join("fp8_block_gemm_sm90.o");
-            let nvcc = cuda_path.join("bin/nvcc");
-            let mut command = std::process::Command::new(&nvcc);
-            command
-                .args([
-                    "-O3",
-                    "-std=c++17",
-                    "-arch=sm_90a",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "-w",
-                    "-DNDEBUG",
-                    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-                    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-                    "-Xcompiler",
-                    "-fPIC",
-                ])
-                .arg("-I")
-                .arg(&cutlass_include);
-            for inc in &cuda_includes {
-                command.arg("-I").arg(inc);
-            }
-            let status = command
-                .arg("-c")
-                .arg(&fp8_sm90_src)
-                .arg("-o")
-                .arg(&obj)
-                .status()
-                .expect("failed to spawn nvcc for fp8_block_gemm_sm90.cu");
-            if !status.success() {
-                panic!("nvcc failed for fp8_block_gemm_sm90.cu ({})", status);
-            }
-
-            let lib = out_dir.join("librustinfer_fp8_sm90.a");
-            let _ = std::fs::remove_file(&lib);
-            let status = std::process::Command::new("ar")
-                .arg("crs")
-                .arg(&lib)
-                .arg(&obj)
-                .status()
-                .expect("failed to run ar for librustinfer_fp8_sm90.a");
-            if !status.success() {
-                panic!("ar failed for librustinfer_fp8_sm90.a ({})", status);
-            }
-            println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=rustinfer_fp8_sm90");
-        }
-
-        // FA3 (flash-attention v2.8.3 hopper) prefill kernels need sm_90a for
-        // wgmma/TMA, so they get their own translation units; every other arch
-        // keeps the CuTe ragged prefill path.
-        //
-        // Compiled via direct nvcc, NOT cc: cc's cuda mode hardcodes
-        // `--device-c` (relocatable device code), and ptxas then ignores
-        // FA3's setmaxnreg warp-specialization hints (C7504) leaving the
-        // consumer warps register-starved — wgmma goes fully serialized
-        // (C7512). Whole-program `-c` per TU keeps the register reallocation.
-        // NDEBUG matters too: device assert() leaves __assertfail extern
-        // calls that also serialize wgmma (C7509).
-        println!("cargo:rustc-check-cfg=cfg(rustinfer_fa3)");
-        if cuda_arch.starts_with("sm_90") {
-            let fa3_dir = root.join("src/kernels/third_party/fa3");
-            let fa3_files = [
-                "flash_fwd_hdim128_bf16_paged_sm90.cu",
-                "flash_prepare_scheduler.cu",
-                "rustinfer_fa3_api.cu",
-            ];
-            let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-            let nvcc = cuda_path.join("bin/nvcc");
-            let mut children = Vec::new();
-            let mut objs = Vec::new();
-            for f in fa3_files {
-                let src = fa3_dir.join(f);
-                let obj = out_dir.join(format!("{}.o", f.replace('.', "_")));
-                let child = std::process::Command::new(&nvcc)
-                    .args([
-                        "-O3",
-                        "-std=c++17",
-                        "-arch=sm_90a",
-                        "--expt-relaxed-constexpr",
-                        "--expt-extended-lambda",
-                        "--use_fast_math",
-                        "-w",
-                        "-DNDEBUG",
-                        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-                        "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-                        "-DFLASHATTENTION_DISABLE_LOCAL",
-                        "-DFLASHATTENTION_DISABLE_APPENDKV",
-                        "-DFLASHATTENTION_DISABLE_CLUSTER",
-                        "-DFLASHATTENTION_DISABLE_SM8x",
-                        "-Xcompiler",
-                        "-fPIC",
-                    ])
-                    .arg("-I")
-                    .arg(&fa3_dir)
-                    .arg("-I")
-                    .arg(&cutlass_include)
-                    .arg("-c")
-                    .arg(&src)
-                    .arg("-o")
-                    .arg(&obj)
-                    .spawn()
-                    .unwrap_or_else(|e| panic!("failed to spawn nvcc for {}: {}", f, e));
-                children.push((f, child));
-                objs.push(obj);
-                println!("cargo:rerun-if-changed={}", src.display());
-            }
-            for (f, mut child) in children {
-                let status = child
-                    .wait()
-                    .unwrap_or_else(|e| panic!("nvcc wait failed for {}: {}", f, e));
-                if !status.success() {
-                    panic!("nvcc failed for {} ({})", f, status);
-                }
-            }
-            let lib = out_dir.join("librustinfer_fa3.a");
-            let _ = std::fs::remove_file(&lib);
-            let status = std::process::Command::new("ar")
-                .arg("crs")
-                .arg(&lib)
-                .args(&objs)
-                .status()
-                .expect("failed to run ar for librustinfer_fa3.a");
-            if !status.success() {
-                panic!("ar failed for librustinfer_fa3.a ({})", status);
-            }
-            println!("cargo:rustc-link-search=native={}", out_dir.display());
-            println!("cargo:rustc-link-lib=static=rustinfer_fa3");
-            println!("cargo:rustc-cfg=rustinfer_fa3");
+        // Whole-program compilation preserves architecture-specific WGMMA/TMA
+        // codegen and register reallocation that cc-rs's --device-c path loses.
+        for spec in CUDA_ARCHIVES
+            .iter()
+            .filter(|spec| spec.supports(&cuda_arch))
+        {
+            compile_cuda_archive(spec, &root, &cuda_path, &cuda_includes, &cutlass_include);
         }
 
         let target = env::var("TARGET").expect("TARGET environment variable not set");
@@ -379,6 +304,108 @@ fn main() {
         bindings
             .write_to_file(out_path.join("bindings.rs"))
             .expect("Couldn't write bindings!");
+    }
+}
+
+impl CudaArchiveSpec {
+    fn supports(&self, cuda_arch: &str) -> bool {
+        cuda_arch_family(cuda_arch) == Some(self.arch_family)
+    }
+}
+
+fn cuda_arch_family(cuda_arch: &str) -> Option<u32> {
+    let digits: String = cuda_arch
+        .strip_prefix("sm_")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn compile_cuda_archive(
+    spec: &CudaArchiveSpec,
+    root: &Path,
+    cuda_path: &Path,
+    cuda_includes: &[PathBuf],
+    cutlass_include: &Path,
+) {
+    let source_dir = root.join(spec.source_dir);
+    let sources = find_all_files(&source_dir, "cu");
+    if sources.is_empty() {
+        panic!(
+            "CUDA archive '{}' has no .cu sources under {}",
+            spec.name,
+            source_dir.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", source_dir.display());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let nvcc = cuda_path.join("bin/nvcc");
+    let mut children = Vec::with_capacity(sources.len());
+    let mut objects = Vec::with_capacity(sources.len());
+
+    for (index, source) in sources.into_iter().enumerate() {
+        let object = out_dir.join(format!("{}_{}.o", spec.name, index));
+        let mut command = std::process::Command::new(&nvcc);
+        command
+            .args([
+                "-O3",
+                "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "-w",
+                "-DNDEBUG",
+                "-Xcompiler",
+                "-fPIC",
+            ])
+            .arg(format!("-arch={}", spec.codegen_arch))
+            .args(spec.extra_flags)
+            .arg("-I")
+            .arg(&source_dir)
+            .arg("-I")
+            .arg(cutlass_include);
+        for include in cuda_includes {
+            command.arg("-I").arg(include);
+        }
+        let child = command
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .spawn()
+            .unwrap_or_else(|error| {
+                panic!("failed to spawn nvcc for {}: {}", source.display(), error)
+            });
+        children.push((source, child));
+        objects.push(object);
+    }
+
+    for (source, mut child) in children {
+        let status = child
+            .wait()
+            .unwrap_or_else(|error| panic!("nvcc wait failed for {}: {}", source.display(), error));
+        if !status.success() {
+            panic!("nvcc failed for {} ({})", source.display(), status);
+        }
+    }
+
+    let archive = out_dir.join(format!("lib{}.a", spec.name));
+    let _ = std::fs::remove_file(&archive);
+    let status = std::process::Command::new("ar")
+        .arg("crs")
+        .arg(&archive)
+        .args(&objects)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run ar for '{}': {}", spec.name, error));
+    if !status.success() {
+        panic!("ar failed for '{}' ({})", spec.name, status);
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static={}", spec.name);
+    if let Some(cfg) = spec.rust_cfg {
+        println!("cargo:rustc-cfg={cfg}");
     }
 }
 
@@ -586,13 +613,13 @@ fn find_cuda_path() -> PathBuf {
     panic!("CUDA not found. Set CUDA_PATH or CUDA_HOME environment variable");
 }
 
-fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
+fn find_generic_kernel_files(dir: &str, extension: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let walker = walkdir::WalkDir::new(dir).into_iter();
 
     let iter = walker.filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
-        name != "third_party"
+        name != "arch" && name != "third_party"
     });
 
     for entry in iter {
@@ -605,5 +632,17 @@ fn find_files(dir: &str, extension: &str) -> Vec<PathBuf> {
             paths.push(path.to_path_buf());
         }
     }
+    paths.sort();
+    paths
+}
+
+fn find_all_files(dir: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == extension))
+        .collect();
+    paths.sort();
     paths
 }

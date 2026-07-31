@@ -89,15 +89,15 @@ unsafe extern "C" {
     fn zimage_set_eager_prefill_gemm(on: i32);
 }
 
-/// Prepare the Hopper FP8 CUTLASS kernel before any CUDA stream capture.
-/// Non-Hopper builds expose the same symbol as a no-op.
+/// Prepare the accelerated FP8 kernel before any CUDA stream capture.
+/// Builds without an accelerated implementation expose the same symbol as a no-op.
 pub(crate) fn init_fp8_block_matmul(device_id: i32) -> OpResult<()> {
     let status = unsafe { fp8_block_matmul_init_cu(device_id) };
     if status == 0 {
         Ok(())
     } else {
         Err(OpError::Kernel(format!(
-            "fp8 block matmul SM90 initialization failed with CUDA status {status}"
+            "accelerated fp8 block matmul initialization failed with CUDA status {status}"
         )))
     }
 }
@@ -270,7 +270,7 @@ pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8BlockMatmulPath {
     DynamicW8A8Gemv,
-    HopperCutlass,
+    AcceleratedCutlass,
     CudaW8A8Fallback,
 }
 
@@ -385,7 +385,7 @@ pub(crate) fn matmul_fp8_block_with_path<T: Dtype>(
     };
     match status {
         1 => Ok(Fp8BlockMatmulPath::DynamicW8A8Gemv),
-        2 => Ok(Fp8BlockMatmulPath::HopperCutlass),
+        2 => Ok(Fp8BlockMatmulPath::AcceleratedCutlass),
         3 => Ok(Fp8BlockMatmulPath::CudaW8A8Fallback),
         other => Err(OpError::Kernel(format!(
             "matmul_fp8_block CUDA dispatch failed with status {other}"
@@ -616,7 +616,7 @@ mod fp8_block_tests {
     #[test]
     fn fp8_block_matmul_prefill_uses_cutlass_and_matches_reference() {
         let expected_path = if env!("RUSTINFER_CUDA_ARCH").starts_with("sm_90") {
-            Fp8BlockMatmulPath::HopperCutlass
+            Fp8BlockMatmulPath::AcceleratedCutlass
         } else {
             Fp8BlockMatmulPath::CudaW8A8Fallback
         };
