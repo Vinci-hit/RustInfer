@@ -1,0 +1,16 @@
+**
+
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!Dockerfile
+!docker/
+!docker/**
+!crates/
+!crates/**
+
+crates/infer-frontend/node_modules/
+crates/infer-frontend/target/
+**/*.pyc
+**/__pycache__/
