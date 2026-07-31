@@ -69,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate shell syntax
-        run: bash -n scripts/*.sh scripts/lib/*.sh bench/*.sh crates/infer-frontend/dev.sh
+        run: bash -n scripts/*.sh scripts/lib/*.sh docker/*.sh bench/*.sh crates/infer-frontend/dev.sh
       - name: Compile Python tools
         run: PYTHONPYCACHEPREFIX=/tmp/rustinfer-pyc python3 -m compileall -q bench scripts
       - name: Reject generated Python bytecode

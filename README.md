@@ -151,7 +151,61 @@ ZMQ (IPC) with MessagePack framing:
 
 ## Quick start
 
-### Prerequisites
+### Docker (H100 / H200)
+
+The runtime image contains the compiled CUDA kernels, CUDA 12 runtime, cuBLAS,
+and cuDNN. The host only needs a compatible NVIDIA driver, Docker, and the
+NVIDIA Container Toolkit; Rust, `nvcc`, libclang, and cuDNN headers are not
+required.
+
+Build the image once (the default `sm_90` target is for H100/H200):
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg CUDA_ARCH=sm_90 \
+  -t rustinfer:local .
+```
+
+Start the full scheduler + worker + server stack with one command. The mounted
+directory must be a Hugging Face model directory containing `config.json`,
+`tokenizer.json`, and the model weights:
+
+```bash
+docker run --rm --gpus all \
+  -p 8000:8000 \
+  -v /absolute/path/to/Qwen3:/models/model:ro \
+  rustinfer:local
+```
+
+Check readiness:
+
+```bash
+curl --fail http://127.0.0.1:8000/ready
+```
+
+The container also accepts explicit launch options:
+
+```bash
+docker run --rm --gpus all \
+  -p 8100:8100 \
+  -v /absolute/path/to/Qwen3:/models/qwen3:ro \
+  rustinfer:local \
+  serve --model /models/qwen3 --model-name Qwen3 --port 8100
+```
+
+Release tags publish the same image to
+`ghcr.io/vinci-hit/rustinfer:<version>`. Images are architecture-specific;
+build with `CUDA_ARCH=sm_80`, `sm_86`, or `sm_89` for other supported GPUs and
+tag the result accordingly.
+
+Useful container settings include `RUSTINFER_MAX_BATCH_TOKENS`,
+`RUSTINFER_MAX_BATCH_SEQS`, `RUSTINFER_MAX_MODEL_LEN`,
+`RUSTINFER_CHUNKED_PREFILL_SIZE`, and `RUST_LOG`. A complete custom config can
+instead be mounted and selected with `--config`.
+
+### Build from source
+
+#### Prerequisites
 
 - Rustup (the repository pins Rust 1.91.1), a CUDA-capable GPU, and the CUDA
   toolkit.
@@ -161,13 +215,13 @@ ZMQ (IPC) with MessagePack framing:
 export CUDNN_FRONTEND_INCLUDE_DIR=/path/to/site-packages/include
 ```
 
-### Build
+#### Build
 
 ```bash
 cargo build --release
 ```
 
-### Run (one-shot e2e smoke test)
+#### Run (one-shot e2e smoke test)
 
 Launches scheduler + worker + server for a config, sends one chat completion,
 prints the reply, and tears everything down:
@@ -180,7 +234,7 @@ The checked-in configs are portable templates. Set their `model` field to the
 local Hugging Face model directory before launching; they bind to
 `127.0.0.1` and use `cuda:0` by default.
 
-### Run (manual, three processes)
+#### Run (manual, three processes)
 
 Each binary takes the same `--config`:
 
@@ -202,7 +256,7 @@ curl http://127.0.0.1:8100/v1/chat/completions \
 Ready-to-use configs: `run_qwen3.toml`, `run_qwen3_awq.toml` (AWQ int4),
 `run_llama1b.toml`.
 
-### Python benchmark tools
+#### Python benchmark tools
 
 The Python project keeps benchmark dependencies optional so building RustInfer
 does not install another inference engine. Install only the group a script uses:
