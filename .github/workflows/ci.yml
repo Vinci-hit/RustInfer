@@ -25,7 +25,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Audit Rust dependencies
-        run: cargo install cargo-audit --locked && cargo audit --deny warnings
+        # Axum's disabled multipart feature retains yanked spin 0.9.8 in the
+        # lockfile. Keep security advisories fatal while ignoring yanked-only
+        # warnings for dependencies that are not in the compiled graph.
+        run: cargo install cargo-audit --locked && cargo audit --no-yanked --deny warnings
       - name: Lint GPU-independent crates
         run: |
           cargo clippy -p infer-core -p infer-backend-cpu -p infer-protocol \
