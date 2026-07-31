@@ -876,7 +876,7 @@ impl infer_core::ports::FusedOps for Cuda {
 impl Cuda {
     /// Create a new Cuda device (allocates stream + handles).
     pub fn new(device_id: i32) -> Result<Self, OpError> {
-        Self::with_memory_plan(device_id, config::CudaMemoryPlan::from_env()?)
+        Self::with_memory_plan(device_id, config::CudaMemoryPlan::default())
     }
 
     pub fn with_memory_plan(

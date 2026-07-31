@@ -62,3 +62,10 @@ log_level = "info"
 # Keep the default template modest; tune this list with `max_batch_seqs` for the
 # deployment GPU after validating its memory headroom.
 capture_sizes = [1, 2, 4, 8, 16, 24, 32]
+
+# CUDA scratch memory (MiB). The graph arena is allocated lazily on first use;
+# the recycling-pool value is a retention ceiling, not an eager allocation.
+[cuda_memory]
+kernel_workspace_mib = 256
+graph_arena_mib = 256
+pool_retain_mib = 256

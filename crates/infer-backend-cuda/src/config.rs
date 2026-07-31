@@ -52,8 +52,8 @@ const MIB: usize = 1024 * 1024;
 ///
 /// This is the single place that defines fixed CUDA scratch regions and cache
 /// limits. Add or remove a region here instead of scattering size constants and
-/// raw pointer/length pairs through `CudaConfig`. Values may be overridden by a
-/// builder or by the corresponding `RUSTINFER_CUDA_*_MIB` environment variable.
+/// raw pointer/length pairs through `CudaConfig`. Production callers pass the
+/// values read from the shared launch configuration to `Cuda::with_memory_plan`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CudaMemoryPlan {
     pub kernel_workspace_bytes: usize,
@@ -92,35 +92,6 @@ impl CudaMemoryPlan {
     pub fn with_pool_retain_bytes(mut self, bytes: usize) -> Self {
         self.pool_retain_bytes = bytes;
         self
-    }
-
-    pub fn from_env() -> OpResult<Self> {
-        let mut plan = Self::default();
-        for (name, target) in [
-            (
-                "RUSTINFER_CUDA_KERNEL_WORKSPACE_MIB",
-                &mut plan.kernel_workspace_bytes,
-            ),
-            (
-                "RUSTINFER_CUDA_GRAPH_ARENA_MIB",
-                &mut plan.graph_arena_bytes,
-            ),
-            (
-                "RUSTINFER_CUDA_POOL_RETAIN_MIB",
-                &mut plan.pool_retain_bytes,
-            ),
-        ] {
-            let Some(value) = std::env::var_os(name) else {
-                continue;
-            };
-            let mib = value.to_string_lossy().parse::<usize>().map_err(|_| {
-                OpError::Kernel(format!("{name} must be a non-negative integer in MiB"))
-            })?;
-            *target = mib.checked_mul(MIB).ok_or_else(|| {
-                OpError::Kernel(format!("{name} is too large to represent in bytes"))
-            })?;
-        }
-        Ok(plan)
     }
 }
 
@@ -283,7 +254,7 @@ pub struct CudaConfig {
 
 impl CudaConfig {
     pub fn new() -> OpResult<Self> {
-        Self::with_memory_plan(CudaMemoryPlan::from_env()?)
+        Self::with_memory_plan(CudaMemoryPlan::default())
     }
 
     pub fn with_memory_plan(memory_plan: CudaMemoryPlan) -> OpResult<Self> {

@@ -29,3 +29,8 @@ worker_id = "worker-0"
 log_level = "info"
 
 capture_sizes = [1, 2, 4, 8, 16, 24, 32]
+
+[cuda_memory]
+kernel_workspace_mib = 256
+graph_arena_mib = 256
+pool_retain_mib = 256

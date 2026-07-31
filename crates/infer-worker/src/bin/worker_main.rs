@@ -24,7 +24,7 @@ use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION
 
 use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
 use infer_worker::domain::dtype::quant::QuantScheme;
-use infer_worker::infrastructure::cuda::Cuda;
+use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan};
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
@@ -527,7 +527,19 @@ fn main() -> Result<(), String> {
 
     // ── 4. Load model ──
     let device_id = parse_device_id(&load.device)?;
-    let cuda = Cuda::new(device_id).map_err(|e| format!("Cuda::new: {:?}", e))?;
+    const MIB: usize = 1024 * 1024;
+    let cuda_memory = cfg.cuda_memory;
+    let memory_plan = CudaMemoryPlan {
+        kernel_workspace_bytes: cuda_memory.kernel_workspace_mib * MIB,
+        graph_arena_bytes: cuda_memory.graph_arena_mib * MIB,
+        pool_retain_bytes: cuda_memory.pool_retain_mib * MIB,
+    };
+    eprintln!(
+        "[bootstrap] cuda_memory: kernel={}MiB graph={}MiB pool={}MiB",
+        cuda_memory.kernel_workspace_mib, cuda_memory.graph_arena_mib, cuda_memory.pool_retain_mib,
+    );
+    let cuda = Cuda::with_memory_plan(device_id, memory_plan)
+        .map_err(|e| format!("Cuda::with_memory_plan: {:?}", e))?;
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
