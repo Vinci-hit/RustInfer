@@ -151,7 +151,69 @@ ZMQ (IPC) with MessagePack framing:
 
 ## Quick start
 
-### Prerequisites
+### Run the prebuilt Docker image (H100 / H200)
+
+The public image contains the compiled CUDA kernels, CUDA 12 runtime, cuBLAS,
+and cuDNN. The host only needs:
+
+- an NVIDIA H100 or H200 with a compatible driver;
+- Docker and the
+  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html);
+- a local Hugging Face model directory containing `config.json`,
+  `tokenizer.json`, and the model weights.
+
+Start the full scheduler + worker + OpenAI-compatible server stack with one
+command. Replace the host model path and exposed model name as needed:
+
+```bash
+docker run --rm --gpus all \
+  -p 8000:8000 \
+  -v /absolute/path/to/Qwen3:/models/model:ro \
+  ghcr.io/vinci-hit/rustinfer:1.0.1 \
+  serve --model-name Qwen3
+```
+
+Wait for the model to load, then check readiness:
+
+```bash
+curl --fail http://127.0.0.1:8000/ready
+```
+
+Send a chat completion:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3",
+       "messages":[{"role":"user","content":"What is the capital of France?"}],
+       "max_tokens":64}'
+```
+
+No Rust toolchain, CUDA Toolkit, `nvcc`, libclang, cuDNN headers, or local
+operator compilation is required. The `1.0.1` image is `linux/amd64` and
+compiled for CUDA architecture `sm_90`.
+
+Useful container settings include `RUSTINFER_MAX_BATCH_TOKENS`,
+`RUSTINFER_MAX_BATCH_SEQS`, `RUSTINFER_MAX_MODEL_LEN`,
+`RUSTINFER_CHUNKED_PREFILL_SIZE`, and `RUST_LOG`. A complete custom config can
+instead be mounted and selected with `--config`.
+
+### Build the Docker image locally
+
+To build from the current source instead of using the published image:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg CUDA_ARCH=sm_90 \
+  -t rustinfer:local .
+```
+
+Images are architecture-specific. Use `CUDA_ARCH=sm_80`, `sm_86`, or `sm_89`
+when building for another supported NVIDIA GPU architecture.
+
+### Build from source
+
+#### Prerequisites
 
 - Rustup (the repository pins Rust 1.91.1), a CUDA-capable GPU, and the CUDA
   toolkit.
@@ -161,13 +223,13 @@ ZMQ (IPC) with MessagePack framing:
 export CUDNN_FRONTEND_INCLUDE_DIR=/path/to/site-packages/include
 ```
 
-### Build
+#### Build
 
 ```bash
 cargo build --release
 ```
 
-### Run (one-shot e2e smoke test)
+#### Run (one-shot e2e smoke test)
 
 Launches scheduler + worker + server for a config, sends one chat completion,
 prints the reply, and tears everything down:
@@ -180,7 +242,7 @@ The checked-in configs are portable templates. Set their `model` field to the
 local Hugging Face model directory before launching; they bind to
 `127.0.0.1` and use `cuda:0` by default.
 
-### Run (manual, three processes)
+#### Run (manual, three processes)
 
 Each binary takes the same `--config`:
 
@@ -202,7 +264,7 @@ curl http://127.0.0.1:8100/v1/chat/completions \
 Ready-to-use configs: `run_qwen3.toml`, `run_qwen3_awq.toml` (AWQ int4),
 `run_llama1b.toml`.
 
-### Python benchmark tools
+#### Python benchmark tools
 
 The Python project keeps benchmark dependencies optional so building RustInfer
 does not install another inference engine. Install only the group a script uses:
