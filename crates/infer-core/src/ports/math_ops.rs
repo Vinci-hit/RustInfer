@@ -70,6 +70,20 @@ pub trait MathOps: Device {
         scheme: &QuantScheme,
     ) -> OpResult<()>;
 
+    fn matmul_fp8_block<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        _weight: &Tensor<infer_core::dtype::Fp8E4m3, Self>,
+        _output: &mut Tensor<T, Self>,
+        _weight_scale_inv: &Tensor<f32, Self>,
+        _block: [usize; 2],
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            input.device().name(),
+            "matmul_fp8_block",
+        ))
+    }
+
     fn rmsnorm<T: Dtype>(
         scope: &Self::Scope,
         input: &Tensor<T, Self>,
@@ -264,6 +278,24 @@ macro_rules! impl_math_ops_via_core_ops {
                 let _guard = infer_core::exec::ExecScope::enter(scope);
                 <Self as $crate::ports::CoreOps>::matmul_quant(
                     input, weight, output, scales, zeros, scheme,
+                )
+            }
+
+            fn matmul_fp8_block<T: infer_core::dtype::Dtype>(
+                scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+                input: &infer_core::tensor::Tensor<T, Self>,
+                weight: &infer_core::tensor::Tensor<infer_core::dtype::Fp8E4m3, Self>,
+                output: &mut infer_core::tensor::Tensor<T, Self>,
+                weight_scale_inv: &infer_core::tensor::Tensor<f32, Self>,
+                block: [usize; 2],
+            ) -> $crate::ports::OpResult<()> {
+                let _guard = infer_core::exec::ExecScope::enter(scope);
+                <Self as $crate::ports::CoreOps>::matmul_fp8_block(
+                    input,
+                    weight,
+                    output,
+                    weight_scale_inv,
+                    block,
                 )
             }
 

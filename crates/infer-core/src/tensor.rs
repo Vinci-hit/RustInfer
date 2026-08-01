@@ -553,17 +553,20 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
 impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
     /// Allocate a tensor on `device` filled with `randn` samples (Box-Muller).
     ///
-    /// Generated host-side as `f32`, optionally cast to `T` per element if
-    /// `T != f32`, then uploaded. `seed=None` selects an OS-entropy seed.
-    /// Currently supports `T ∈ {f32, bf16, f16}`; other dtypes return an
-    /// error.
+    /// Generated host-side and converted through the canonical `Dtype`
+    /// scalar API. `seed=None` selects an OS-entropy seed.
     pub fn randn(shape: impl Into<Shape>, device: &D, seed: Option<u64>) -> OpResult<Self>
     where
         D: MemoryPort,
     {
-        use half::{bf16, f16};
         let shape = shape.into();
         let n = shape.numel();
+        if !T::DATA_TYPE.is_float() {
+            return Err(OpError::Kernel(format!(
+                "Tensor::randn: unsupported dtype {:?}",
+                T::DATA_TYPE,
+            )));
+        }
         // Deterministic SplitMix64 + Box-Muller. Avoids extra deps.
         let mut state: u64 = seed.unwrap_or_else(|| {
             // OS-derived entropy seed; collisions across calls are not a
@@ -605,54 +608,11 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
                 i += 1;
             }
         }
-        // Allocate destination + cast.
-        let storage = Storage::alloc(device, n * T::SIZE_BYTES)?;
-        if n > 0 {
-            let bytes: Vec<u8> = match T::DATA_TYPE {
-                DataType::F32 => {
-                    let mut v = Vec::with_capacity(n * 4);
-                    for &x in &buf_f32 {
-                        v.extend_from_slice(&x.to_le_bytes());
-                    }
-                    v
-                }
-                DataType::BF16 => {
-                    let mut v = Vec::with_capacity(n * 2);
-                    for &x in &buf_f32 {
-                        v.extend_from_slice(&bf16::from_f32(x).to_le_bytes());
-                    }
-                    v
-                }
-                DataType::F16 => {
-                    let mut v = Vec::with_capacity(n * 2);
-                    for &x in &buf_f32 {
-                        v.extend_from_slice(&f16::from_f32(x).to_le_bytes());
-                    }
-                    v
-                }
-                _ => {
-                    return Err(OpError::Kernel(format!(
-                        "Tensor::randn: unsupported dtype {:?}",
-                        T::DATA_TYPE,
-                    )));
-                }
-            };
-            // SAFETY: storage holds exactly n * SIZE_BYTES bytes of writable memory.
-            unsafe {
-                let dst = std::ptr::NonNull::new_unchecked(storage.ptr());
-                device.upload(dst, bytes.as_ptr(), bytes.len())?;
-            }
-        }
-        let strides = shape.contiguous_strides();
-        Ok(Self {
-            storage,
-            shape,
-            strides,
-            offset_elems: 0,
-            numel: n,
-            is_contiguous: true,
-            _marker: PhantomData,
-        })
+        let values: Vec<T> = buf_f32
+            .into_iter()
+            .map(|value| T::write_f64(f64::from(value)))
+            .collect();
+        Self::from_host_slice(&values, shape, device)
     }
 }
 

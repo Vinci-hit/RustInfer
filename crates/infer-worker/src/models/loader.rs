@@ -11,6 +11,7 @@ use safetensors::tensor::TensorView;
 
 use super::layers::{Embedding, Linear, RMSNorm};
 use crate::components::Linear as CompLinear;
+use crate::domain::dtype::Fp8E4m3;
 use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
@@ -98,6 +99,11 @@ pub struct LoadConfig {
     /// (compressed-tensors `pack-quantized`) with this scheme; attention and
     /// the head stay full-precision. `None` → a fully dense model.
     pub mlp_quant: Option<QuantScheme>,
+    /// Block shape for a homogeneous FP8 checkpoint's `[N, K]` decoder linear
+    /// weights. The raw E4M3 weights and their inverse-scale grid stay quantized
+    /// on device; embeddings, norms, and the LM head remain in their stored
+    /// dtype. A non-FP8 decoder projection is treated as a config mismatch.
+    pub fp8_block: Option<[usize; 2]>,
     /// Number of head dims that receive RoPE. Equals `head_dim` for the usual
     /// full-rotary case; Qwen3.5 full-attn layers use partial rotary
     /// (`partial_rotary_factor = 0.25` → 64 of 256). Attribute, not a branch:
@@ -173,6 +179,56 @@ impl<'a> WeightLoader<'a> {
         Ok(Linear::new(weight, bias))
     }
 
+    /// Load a decoder Linear, preserving a configured block-FP8 weight and its
+    /// inverse-scale grid on device. Without `fp8_block`, this constructs the
+    /// same dense component as [`Self::load_linear`].
+    pub fn load_linear_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        weight_name: &str,
+        bias_name: Option<&str>,
+        fp8_block: Option<[usize; 2]>,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let Some(block) = fp8_block else {
+            let dense = self.load_linear::<T, D>(weight_name, bias_name, device)?;
+            return Ok(CompLinear::new(dense.weight, dense.bias));
+        };
+
+        let view = self
+            .reader
+            .read_view(weight_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}' not found: {}", weight_name, e)))?;
+        let scale_name = format!("{}_scale_inv", weight_name);
+        let scale_view = self.reader.read_view(&scale_name).map_err(|e| {
+            OpError::Kernel(format!(
+                "FP8 tensor '{}' is missing scale tensor '{}': {}",
+                weight_name, scale_name, e
+            ))
+        })?;
+        let parts = [Fp8ViewPart {
+            name: weight_name,
+            weight: view,
+            scale_inv: scale_view,
+        }];
+        let host = prepare_fp8_fused_host(&parts, block, weight_name)?;
+        let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
+            &host.weight,
+            Shape::from_slice(&host.weight_shape),
+            device,
+        )?;
+        let scales = Tensor::<f32, D>::from_host_bytes(
+            &host.scales,
+            Shape::from_slice(&host.scale_shape),
+            device,
+        )?;
+        let bias = if let Some(bn) = bias_name {
+            Some(self.load_tensor::<T, D>(bn, device)?)
+        } else {
+            None
+        };
+        Ok(CompLinear::from_fp8_block(weight, scales, block, bias))
+    }
+
     /// Load an RMSNorm layer.
     pub fn load_rmsnorm<T: Dtype, D: OpBackend>(
         &self,
@@ -213,77 +269,100 @@ impl<'a> WeightLoader<'a> {
         dim: usize,
         device: &D,
     ) -> OpResult<Linear<T, D>> {
-        let q_view = self
-            .reader
-            .read_view(&format!("{}.self_attn.q_proj.weight", prefix))
-            .map_err(|e| OpError::Kernel(format!("q_proj {}: {}", prefix, e)))?;
-        let k_view = self
-            .reader
-            .read_view(&format!("{}.self_attn.k_proj.weight", prefix))
-            .map_err(|e| OpError::Kernel(format!("k_proj {}: {}", prefix, e)))?;
-        let v_view = self
-            .reader
-            .read_view(&format!("{}.self_attn.v_proj.weight", prefix))
-            .map_err(|e| OpError::Kernel(format!("v_proj {}: {}", prefix, e)))?;
+        let q_name = format!("{}.self_attn.q_proj.weight", prefix);
+        let k_name = format!("{}.self_attn.k_proj.weight", prefix);
+        let v_name = format!("{}.self_attn.v_proj.weight", prefix);
+        let read = |name: &str| {
+            self.reader
+                .read_view(name)
+                .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))
+        };
+        let q_view = read(&q_name)?;
+        let k_view = read(&k_name)?;
+        let v_view = read(&v_name)?;
+
+        validate_matrix_shape(&q_name, &q_view, q_dim, dim)?;
+        validate_matrix_shape(&k_name, &k_view, kv_dim, dim)?;
+        validate_matrix_shape(&v_name, &v_view, kv_dim, dim)?;
 
         let total_rows = q_dim + 2 * kv_dim;
-        let elem = T::SIZE_BYTES;
-        let total_bytes = total_rows * dim * elem;
-        let mut host = vec![0u8; total_bytes];
-
-        // Helper: cast a single weight view into the host buffer at `row_offset`.
-        let mut cast_into = |view: &TensorView,
-                             row_offset: usize,
-                             expected_rows: usize|
-         -> OpResult<()> {
-            let shape: Vec<usize> = view.shape().to_vec();
-            if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
-                return Err(OpError::Shape(format!(
-                    "fused_qkv {}: expected [{}, {}], got {:?}",
-                    prefix, expected_rows, dim, shape,
-                )));
-            }
-            let src = view.data();
-            let src_dt = match view.dtype() {
-                safetensors::Dtype::F32 => DataType::F32,
-                safetensors::Dtype::F16 => DataType::F16,
-                safetensors::Dtype::BF16 => DataType::BF16,
-                safetensors::Dtype::I32 => DataType::I32,
-                safetensors::Dtype::I8 => DataType::I8,
-                other => return Err(OpError::Kernel(format!("unsupported dtype: {:?}", other))),
-            };
-            let numel = expected_rows * dim;
-            let dst = unsafe { host.as_mut_ptr().add(row_offset * dim * elem) };
-            if src_dt == T::DATA_TYPE {
-                let n = numel * elem;
-                if src.len() != n {
-                    return Err(OpError::Shape(format!(
-                        "fused_qkv {}: view byte length {} != expected {} for shape {:?} \
-                         (corrupt safetensors?)",
-                        prefix,
-                        src.len(),
-                        n,
-                        shape,
-                    )));
-                }
-                // SAFETY: host buffer has at least row_offset*dim*elem + n bytes
-                // by construction, and src has exactly n bytes (checked above).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
-                }
-            } else {
-                cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
-            }
-            Ok(())
-        };
-
-        cast_into(&q_view, 0, q_dim)?;
-        cast_into(&k_view, q_dim, kv_dim)?;
-        cast_into(&v_view, q_dim + kv_dim, kv_dim)?;
-
+        let mut host = Vec::with_capacity(total_rows * dim * T::SIZE_BYTES);
+        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&q_view)?);
+        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&k_view)?);
+        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&v_view)?);
         let fused =
             Tensor::<T, D>::from_host_bytes(&host, Shape::from_slice(&[total_rows, dim]), device)?;
         Ok(Linear::new(fused, None))
+    }
+
+    /// Decoder-component form of [`Self::load_fused_qkv`]. For block FP8, raw
+    /// E4M3 rows and scale-grid rows are fused independently without expanding
+    /// the weight to the activation dtype.
+    pub fn load_fused_qkv_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        prefix: &str,
+        q_dim: usize,
+        kv_dim: usize,
+        dim: usize,
+        fp8_block: Option<[usize; 2]>,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let Some(block) = fp8_block else {
+            let dense = self.load_fused_qkv::<T, D>(prefix, q_dim, kv_dim, dim, device)?;
+            return Ok(CompLinear::new(dense.weight, dense.bias));
+        };
+
+        let q_name = format!("{}.self_attn.q_proj.weight", prefix);
+        let k_name = format!("{}.self_attn.k_proj.weight", prefix);
+        let v_name = format!("{}.self_attn.v_proj.weight", prefix);
+        let read = |name: &str| {
+            self.reader
+                .read_view(name)
+                .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))
+        };
+        let q_view = read(&q_name)?;
+        let k_view = read(&k_name)?;
+        let v_view = read(&v_name)?;
+
+        validate_matrix_shape(&q_name, &q_view, q_dim, dim)?;
+        validate_matrix_shape(&k_name, &k_view, kv_dim, dim)?;
+        validate_matrix_shape(&v_name, &v_view, kv_dim, dim)?;
+
+        let q_scale_name = format!("{}_scale_inv", q_name);
+        let k_scale_name = format!("{}_scale_inv", k_name);
+        let v_scale_name = format!("{}_scale_inv", v_name);
+        let q_scale = read(&q_scale_name)?;
+        let k_scale = read(&k_scale_name)?;
+        let v_scale = read(&v_scale_name)?;
+        let parts = [
+            Fp8ViewPart {
+                name: &q_name,
+                weight: q_view,
+                scale_inv: q_scale,
+            },
+            Fp8ViewPart {
+                name: &k_name,
+                weight: k_view,
+                scale_inv: k_scale,
+            },
+            Fp8ViewPart {
+                name: &v_name,
+                weight: v_view,
+                scale_inv: v_scale,
+            },
+        ];
+        let host = prepare_fp8_fused_host(&parts, block, "fused_qkv")?;
+        let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
+            &host.weight,
+            Shape::from_slice(&host.weight_shape),
+            device,
+        )?;
+        let scales = Tensor::<f32, D>::from_host_bytes(
+            &host.scales,
+            Shape::from_slice(&host.scale_shape),
+            device,
+        )?;
+        Ok(CompLinear::from_fp8_block(weight, scales, block, None))
     }
 
     /// Load fused gate_up: concatenate gate_proj, up_proj along rows
@@ -298,69 +377,92 @@ impl<'a> WeightLoader<'a> {
         dim: usize,
         device: &D,
     ) -> OpResult<Linear<T, D>> {
-        let g_view = self
+        let gate_name = format!("{}.mlp.gate_proj.weight", prefix);
+        let up_name = format!("{}.mlp.up_proj.weight", prefix);
+        let gate_view = self
             .reader
-            .read_view(&format!("{}.mlp.gate_proj.weight", prefix))
-            .map_err(|e| OpError::Kernel(format!("gate_proj {}: {}", prefix, e)))?;
-        let u_view = self
+            .read_view(&gate_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", gate_name, e)))?;
+        let up_view = self
             .reader
-            .read_view(&format!("{}.mlp.up_proj.weight", prefix))
-            .map_err(|e| OpError::Kernel(format!("up_proj {}: {}", prefix, e)))?;
+            .read_view(&up_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", up_name, e)))?;
 
+        validate_matrix_shape(&gate_name, &gate_view, intermediate_size, dim)?;
+        validate_matrix_shape(&up_name, &up_view, intermediate_size, dim)?;
         let total_rows = 2 * intermediate_size;
-        let elem = T::SIZE_BYTES;
-        let total_bytes = total_rows * dim * elem;
-        let mut host = vec![0u8; total_bytes];
-
-        let mut cast_into = |view: &TensorView,
-                             row_offset: usize,
-                             expected_rows: usize|
-         -> OpResult<()> {
-            let shape: Vec<usize> = view.shape().to_vec();
-            if shape.len() != 2 || shape[0] != expected_rows || shape[1] != dim {
-                return Err(OpError::Shape(format!(
-                    "fused_gate_up {}: expected [{}, {}], got {:?}",
-                    prefix, expected_rows, dim, shape,
-                )));
-            }
-            let src = view.data();
-            let src_dt = match view.dtype() {
-                safetensors::Dtype::F32 => DataType::F32,
-                safetensors::Dtype::F16 => DataType::F16,
-                safetensors::Dtype::BF16 => DataType::BF16,
-                safetensors::Dtype::I32 => DataType::I32,
-                safetensors::Dtype::I8 => DataType::I8,
-                other => return Err(OpError::Kernel(format!("unsupported dtype: {:?}", other))),
-            };
-            let numel = expected_rows * dim;
-            let dst = unsafe { host.as_mut_ptr().add(row_offset * dim * elem) };
-            if src_dt == T::DATA_TYPE {
-                let n = numel * elem;
-                if src.len() != n {
-                    return Err(OpError::Shape(format!(
-                        "fused_gate_up {}: view byte length {} != expected {} for shape {:?} \
-                         (corrupt safetensors?)",
-                        prefix,
-                        src.len(),
-                        n,
-                        shape,
-                    )));
-                }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
-                }
-            } else {
-                cast_bytes(src, src_dt, dst, T::DATA_TYPE, numel);
-            }
-            Ok(())
-        };
-
-        cast_into(&g_view, 0, intermediate_size)?;
-        cast_into(&u_view, intermediate_size, intermediate_size)?;
-
+        let mut host = Vec::with_capacity(total_rows * dim * T::SIZE_BYTES);
+        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&gate_view)?);
+        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&up_view)?);
         let fused =
             Tensor::<T, D>::from_host_bytes(&host, Shape::from_slice(&[total_rows, dim]), device)?;
         Ok(Linear::new(fused, None))
+    }
+
+    /// Decoder-component form of [`Self::load_fused_gate_up`]. For block FP8,
+    /// raw E4M3 rows and scale-grid rows are fused independently without host
+    /// dequantization.
+    pub fn load_fused_gate_up_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        prefix: &str,
+        intermediate_size: usize,
+        dim: usize,
+        fp8_block: Option<[usize; 2]>,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let Some(block) = fp8_block else {
+            let dense = self.load_fused_gate_up::<T, D>(prefix, intermediate_size, dim, device)?;
+            return Ok(CompLinear::new(dense.weight, dense.bias));
+        };
+
+        let gate_name = format!("{}.mlp.gate_proj.weight", prefix);
+        let up_name = format!("{}.mlp.up_proj.weight", prefix);
+        let gate_view = self
+            .reader
+            .read_view(&gate_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", gate_name, e)))?;
+        let up_view = self
+            .reader
+            .read_view(&up_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", up_name, e)))?;
+
+        validate_matrix_shape(&gate_name, &gate_view, intermediate_size, dim)?;
+        validate_matrix_shape(&up_name, &up_view, intermediate_size, dim)?;
+
+        let gate_scale_name = format!("{}_scale_inv", gate_name);
+        let up_scale_name = format!("{}_scale_inv", up_name);
+        let gate_scale = self
+            .reader
+            .read_view(&gate_scale_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", gate_scale_name, e)))?;
+        let up_scale = self
+            .reader
+            .read_view(&up_scale_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", up_scale_name, e)))?;
+        let parts = [
+            Fp8ViewPart {
+                name: &gate_name,
+                weight: gate_view,
+                scale_inv: gate_scale,
+            },
+            Fp8ViewPart {
+                name: &up_name,
+                weight: up_view,
+                scale_inv: up_scale,
+            },
+        ];
+        let host = prepare_fp8_fused_host(&parts, block, "fused_gate_up")?;
+        let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
+            &host.weight,
+            Shape::from_slice(&host.weight_shape),
+            device,
+        )?;
+        let scales = Tensor::<f32, D>::from_host_bytes(
+            &host.scales,
+            Shape::from_slice(&host.scale_shape),
+            device,
+        )?;
+        Ok(CompLinear::from_fp8_block(weight, scales, block, None))
     }
 
     // ─── AWQ / compressed-tensors `pack-quantized` MLP loading ───────────────
@@ -407,10 +509,7 @@ impl<'a> WeightLoader<'a> {
     /// Load a single int4 (`pack-quantized`) projection — e.g. `down_proj` —
     /// into a quantized `Linear`. `prefix` is the tensor-name stem, e.g.
     /// `"model.layers.0.mlp.down_proj"`.
-    pub(crate) fn load_awq_linear<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub(crate) fn load_awq_linear<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         prefix: &str,
         scheme: QuantScheme,
@@ -425,10 +524,7 @@ impl<'a> WeightLoader<'a> {
     /// Load int4 `gate_proj` + `up_proj` fused along rows into one quantized
     /// `Linear` (`[2*inter, K/8]` packed), matching the dense fused layout.
     /// `mlp_prefix` is the caller-supplied MLP stem, e.g. `"model.layers.0.mlp"`.
-    pub(crate) fn load_fused_gate_up_awq<
-        T: Dtype + crate::domain::dtype::Dtype,
-        D: OpBackend + LlmBackend,
-    >(
+    pub(crate) fn load_fused_gate_up_awq<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         mlp_prefix: &str,
         scheme: QuantScheme,
@@ -470,6 +566,7 @@ fn st_dtype(view: &TensorView) -> OpResult<DataType> {
         safetensors::Dtype::F32 => DataType::F32,
         safetensors::Dtype::F16 => DataType::F16,
         safetensors::Dtype::BF16 => DataType::BF16,
+        safetensors::Dtype::F8_E4M3 => DataType::F8E4M3,
         safetensors::Dtype::I32 => DataType::I32,
         safetensors::Dtype::I8 => DataType::I8,
         other => {
@@ -481,38 +578,213 @@ fn st_dtype(view: &TensorView) -> OpResult<DataType> {
     })
 }
 
-fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
-    view: &TensorView,
-    device: &D,
-) -> OpResult<Tensor<T, D>> {
+fn validate_matrix_shape(
+    name: &str,
+    view: &TensorView<'_>,
+    expected_rows: usize,
+    expected_cols: usize,
+) -> OpResult<()> {
+    let shape = view.shape();
+    if shape != [expected_rows, expected_cols] {
+        return Err(OpError::Shape(format!(
+            "tensor '{}': expected [{}, {}], got {:?}",
+            name, expected_rows, expected_cols, shape
+        )));
+    }
+    Ok(())
+}
+
+struct Fp8ViewPart<'name, 'data> {
+    name: &'name str,
+    weight: TensorView<'data>,
+    scale_inv: TensorView<'data>,
+}
+
+#[derive(Debug)]
+struct Fp8FusedHost {
+    weight: Vec<u8>,
+    scales: Vec<u8>,
+    weight_shape: [usize; 2],
+    scale_shape: [usize; 2],
+}
+
+/// Validate and row-fuse block-FP8 weight segments without dequantizing them.
+///
+/// A scale row covers `block_n` consecutive output rows. Therefore every
+/// boundary *between* fused projections must land on a block-row boundary;
+/// otherwise a simple row concatenation would assign the wrong scale tile to
+/// the following projection. The final segment may contain a tail block.
+/// Scale tensors are normalized to f32 for the native backend contract.
+fn prepare_fp8_fused_host(
+    parts: &[Fp8ViewPart<'_, '_>],
+    [block_n, block_k]: [usize; 2],
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    if parts.is_empty() {
+        return Err(OpError::Shape(format!(
+            "{}: cannot fuse an empty FP8 projection list",
+            what
+        )));
+    }
+    if block_n == 0 || block_k == 0 {
+        return Err(OpError::Shape(format!(
+            "{}: FP8 block dimensions must be nonzero, got [{}, {}]",
+            what, block_n, block_k
+        )));
+    }
+
+    let mut cols = None;
+    let mut total_rows = 0usize;
+    let mut total_scale_rows = 0usize;
+    let mut weight_host = Vec::new();
+    let mut scale_host = Vec::new();
+
+    for (part_idx, part) in parts.iter().enumerate() {
+        if part.weight.dtype() != safetensors::Dtype::F8_E4M3 {
+            return Err(OpError::Kernel(format!(
+                "{}: tensor '{}' must be F8_E4M3, got {:?}",
+                what,
+                part.name,
+                part.weight.dtype()
+            )));
+        }
+        let shape = part.weight.shape();
+        if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
+            return Err(OpError::Shape(format!(
+                "{}: tensor '{}' must be a non-empty rank-2 matrix, got {:?}",
+                what, part.name, shape
+            )));
+        }
+        let (rows, part_cols) = (shape[0], shape[1]);
+        if let Some(expected_cols) = cols {
+            if part_cols != expected_cols {
+                return Err(OpError::Shape(format!(
+                    "{}: tensor '{}' has {} columns, expected {}",
+                    what, part.name, part_cols, expected_cols
+                )));
+            }
+        } else {
+            cols = Some(part_cols);
+        }
+
+        if part_idx + 1 < parts.len() && rows % block_n != 0 {
+            return Err(OpError::Shape(format!(
+                "{}: fusion boundary after '{}' is not aligned: rows {} is not divisible by block_n {}",
+                what, part.name, rows, block_n
+            )));
+        }
+
+        let expected_weight_bytes = rows.checked_mul(part_cols).ok_or_else(|| {
+            OpError::Shape(format!("{}: tensor '{}' shape overflows", what, part.name))
+        })?;
+        if part.weight.data().len() != expected_weight_bytes {
+            return Err(OpError::Shape(format!(
+                "{}: tensor '{}' has {} bytes, expected {} for shape {:?}",
+                what,
+                part.name,
+                part.weight.data().len(),
+                expected_weight_bytes,
+                shape
+            )));
+        }
+
+        let scale_rows = rows.div_ceil(block_n);
+        let scale_cols = part_cols.div_ceil(block_k);
+        if part.scale_inv.shape() != [scale_rows, scale_cols] {
+            return Err(OpError::Shape(format!(
+                "{}: tensor '{}_scale_inv' must have shape [{}, {}], got {:?}",
+                what,
+                part.name,
+                scale_rows,
+                scale_cols,
+                part.scale_inv.shape()
+            )));
+        }
+        if !matches!(
+            part.scale_inv.dtype(),
+            safetensors::Dtype::F32 | safetensors::Dtype::F16 | safetensors::Dtype::BF16
+        ) {
+            return Err(OpError::Kernel(format!(
+                "{}: tensor '{}_scale_inv' must be F32/F16/BF16, got {:?}",
+                what,
+                part.name,
+                part.scale_inv.dtype()
+            )));
+        }
+
+        if let Some(index) = part
+            .weight
+            .data()
+            .iter()
+            .position(|bits| bits & 0x7f == 0x7f)
+        {
+            return Err(OpError::Kernel(format!(
+                "{}: tensor '{}' contains an E4M3FN NaN encoding at flat index {}",
+                what, part.name, index
+            )));
+        }
+        weight_host.extend_from_slice(part.weight.data());
+
+        let part_scale_host = safetensor_view_to_host_bytes::<f32>(&part.scale_inv)?;
+        if let Some((index, value)) = part_scale_host
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32-sized chunk")))
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(OpError::Kernel(format!(
+                "{}: tensor '{}_scale_inv' contains non-finite value {} at flat index {}",
+                what, part.name, value, index
+            )));
+        }
+        scale_host.extend_from_slice(&part_scale_host);
+        total_rows = total_rows
+            .checked_add(rows)
+            .ok_or_else(|| OpError::Shape(format!("{}: fused weight row count overflows", what)))?;
+        total_scale_rows = total_scale_rows
+            .checked_add(scale_rows)
+            .ok_or_else(|| OpError::Shape(format!("{}: fused scale row count overflows", what)))?;
+    }
+
+    let cols = cols.expect("parts is non-empty");
+    let scale_cols = cols.div_ceil(block_k);
+    let expected_scale_rows = total_rows.div_ceil(block_n);
+    if total_scale_rows != expected_scale_rows {
+        return Err(OpError::Shape(format!(
+            "{}: fused scale rows {} do not match ceil({}/{})={}; projection boundaries must align to block_n",
+            what, total_scale_rows, total_rows, block_n, expected_scale_rows
+        )));
+    }
+    let expected_weight_len = total_rows
+        .checked_mul(cols)
+        .ok_or_else(|| OpError::Shape(format!("{}: fused weight byte count overflows", what)))?;
+    let expected_scale_len = total_scale_rows
+        .checked_mul(scale_cols)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| OpError::Shape(format!("{}: fused scale byte count overflows", what)))?;
+    debug_assert_eq!(weight_host.len(), expected_weight_len);
+    debug_assert_eq!(scale_host.len(), expected_scale_len);
+
+    Ok(Fp8FusedHost {
+        weight: weight_host,
+        scales: scale_host,
+        weight_shape: [total_rows, cols],
+        scale_shape: [total_scale_rows, scale_cols],
+    })
+}
+
+fn safetensor_view_to_host_bytes<T: Dtype>(view: &TensorView<'_>) -> OpResult<Vec<u8>> {
     let shape_vec: Vec<usize> = view.shape().to_vec();
     let numel: usize = shape_vec.iter().product();
     let src_bytes = view.data();
-    let src_dtype = match view.dtype() {
-        safetensors::Dtype::F32 => DataType::F32,
-        safetensors::Dtype::F16 => DataType::F16,
-        safetensors::Dtype::BF16 => DataType::BF16,
-        safetensors::Dtype::I32 => DataType::I32,
-        safetensors::Dtype::I8 => DataType::I8,
-        other => {
-            return Err(OpError::Kernel(format!(
-                "unsupported safetensor dtype: {:?}",
-                other
-            )));
-        }
-    };
-
-    let shape = Shape::from_slice(&shape_vec);
+    let src_dtype = st_dtype(view)?;
     let size_bytes = numel * T::SIZE_BYTES;
+    let mut host_buf = vec![0u8; size_bytes];
 
-    // Build a host buffer in target dtype, then upload to device in one shot.
-    let mut host_buf: Vec<u8> = vec![0u8; size_bytes];
     if src_dtype == T::DATA_TYPE {
-        // Direct byte copy — the view must carry exactly the bytes its shape
-        // implies, otherwise the weight would be silently zero-padded.
         if src_bytes.len() != size_bytes {
             return Err(OpError::Shape(format!(
-                "tensor_from_safetensor_view: view byte length {} != expected {} for shape {:?} \
+                "safetensor view byte length {} != expected {} for shape {:?} \
                  (corrupt safetensors?)",
                 src_bytes.len(),
                 size_bytes,
@@ -520,8 +792,13 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
             )));
         }
         host_buf.copy_from_slice(src_bytes);
+    } else if src_dtype == DataType::F8E4M3 || T::DATA_TYPE == DataType::F8E4M3 {
+        return Err(OpError::Kernel(format!(
+            "unsupported safetensor cast from {:?} to {:?}; FP8 weights must stay raw",
+            src_dtype,
+            T::DATA_TYPE
+        )));
     } else {
-        // Element-wise cast through f64 intermediate.
         cast_bytes(
             src_bytes,
             src_dtype,
@@ -530,7 +807,16 @@ fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
             numel,
         );
     }
+    Ok(host_buf)
+}
 
+fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
+    view: &TensorView,
+    device: &D,
+) -> OpResult<Tensor<T, D>> {
+    let shape_vec: Vec<usize> = view.shape().to_vec();
+    let shape = Shape::from_slice(&shape_vec);
+    let host_buf = safetensor_view_to_host_bytes::<T>(view)?;
     Tensor::<T, D>::from_host_bytes(&host_buf, shape, device)
 }
 
@@ -556,6 +842,9 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
                 i32::from_le_bytes(b.try_into().unwrap()) as f64
             }
             DataType::I8 => src[i] as i8 as f64,
+            DataType::F8E4M3 => {
+                <Fp8E4m3 as crate::domain::dtype::Dtype>::read_f64(&Fp8E4m3(src[i]))
+            }
         };
         unsafe {
             match dst_dt {
@@ -589,6 +878,9 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
                 }
                 DataType::I8 => {
                     *dst.add(i) = val as i8 as u8;
+                }
+                DataType::F8E4M3 => {
+                    *dst.add(i) = <Fp8E4m3 as crate::domain::dtype::Dtype>::write_f64(val).0;
                 }
             }
         }
@@ -650,52 +942,178 @@ pub(crate) fn compute_rope_cache<T: Dtype, D: OpBackend>(
         }
     }
 
-    // Build host buffers in target dtype, then upload.
-    let elem = T::SIZE_BYTES;
+    // Build typed host buffers through the canonical scalar conversion API.
     let n = max_seq_len * half_dim;
-    let mut sin_host = vec![0u8; n * elem];
-    let mut cos_host = vec![0u8; n * elem];
+    let mut sin_host = vec![T::write_f64(0.0); n];
+    let mut cos_host = vec![T::write_f64(0.0); n];
     for pos in 0..max_seq_len {
         for (i, &frequency) in freqs.iter().enumerate().take(half_dim) {
             let angle = pos as f64 * frequency;
-            let offset = (pos * half_dim + i) * elem;
-            // SAFETY: offset + elem <= n * elem by construction.
-            unsafe {
-                write_dtype_bytes(sin_host.as_mut_ptr().add(offset), angle.sin(), T::DATA_TYPE);
-                write_dtype_bytes(cos_host.as_mut_ptr().add(offset), angle.cos(), T::DATA_TYPE);
-            }
+            let offset = pos * half_dim + i;
+            sin_host[offset] = T::write_f64(angle.sin());
+            cos_host[offset] = T::write_f64(angle.cos());
         }
     }
 
     let shape = Shape::from_slice(&[max_seq_len, half_dim]);
-    let sin_tensor = Tensor::<T, D>::from_host_bytes(&sin_host, shape, device)?;
-    let cos_tensor = Tensor::<T, D>::from_host_bytes(&cos_host, shape, device)?;
+    let sin_tensor = Tensor::<T, D>::from_host_slice(&sin_host, shape, device)?;
+    let cos_tensor = Tensor::<T, D>::from_host_slice(&cos_host, shape, device)?;
     Ok((sin_tensor, cos_tensor))
 }
 
-/// Write an f64 value as the target dtype bytes.
-unsafe fn write_dtype_bytes(dst: *mut u8, val: f64, dt: DataType) {
-    unsafe {
-        match dt {
-            DataType::F32 => {
-                std::ptr::copy_nonoverlapping((val as f32).to_le_bytes().as_ptr(), dst, 4)
-            }
-            DataType::BF16 => std::ptr::copy_nonoverlapping(
-                half::bf16::from_f64(val).to_le_bytes().as_ptr(),
-                dst,
-                2,
-            ),
-            DataType::F16 => std::ptr::copy_nonoverlapping(
-                half::f16::from_f64(val).to_le_bytes().as_ptr(),
-                dst,
-                2,
-            ),
-            DataType::I32 => {
-                std::ptr::copy_nonoverlapping((val as i32).to_le_bytes().as_ptr(), dst, 4)
-            }
-            DataType::I8 => {
-                *dst = val as i8 as u8;
-            }
-        }
+#[cfg(test)]
+mod fp8_tests {
+    use super::{Fp8ViewPart, prepare_fp8_fused_host};
+    use crate::domain::dtype::Fp8E4m3;
+    use crate::domain::tensor::Tensor;
+    use crate::domain::types::Shape;
+    use crate::infrastructure::cpu::Cpu;
+    use half::bf16;
+    use safetensors::{Dtype, tensor::TensorView};
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&value| bf16::from_f32(value).to_le_bytes())
+            .collect()
+    }
+
+    fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn native_fp8_fusion_preserves_one_byte_weights_on_host_and_device() {
+        // block [2,2]. The first segment ends on a block_n boundary; the final
+        // segment deliberately has a tail block.
+        let q_bytes: Vec<u8> = (0..8).collect();
+        let k_bytes: Vec<u8> = (8..20).collect();
+        let q_scale_bytes = bf16_bytes(&[1.0, 2.0]);
+        let k_scale_bytes = bf16_bytes(&[3.0, 4.0, 5.0, 6.0]);
+        let q = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &q_bytes).unwrap();
+        let k = TensorView::new(Dtype::F8_E4M3, vec![3, 4], &k_bytes).unwrap();
+        let q_scales = TensorView::new(Dtype::BF16, vec![1, 2], &q_scale_bytes).unwrap();
+        let k_scales = TensorView::new(Dtype::BF16, vec![2, 2], &k_scale_bytes).unwrap();
+        let parts = [
+            Fp8ViewPart {
+                name: "q.weight",
+                weight: q,
+                scale_inv: q_scales,
+            },
+            Fp8ViewPart {
+                name: "k.weight",
+                weight: k,
+                scale_inv: k_scales,
+            },
+        ];
+
+        let host = prepare_fp8_fused_host(&parts, [2, 2], "test_qk").unwrap();
+        let expected_weight: Vec<u8> = q_bytes.into_iter().chain(k_bytes).collect();
+        assert_eq!(host.weight, expected_weight);
+        assert_eq!(host.weight_shape, [5, 4]);
+        assert_eq!(host.weight.len(), 5 * 4); // E4M3 stays one byte per element.
+        assert_eq!(host.scale_shape, [3, 2]);
+        assert_eq!(decode_f32(&host.scales), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let device_weight = Tensor::<Fp8E4m3, Cpu>::from_host_bytes(
+            &host.weight,
+            Shape::from_slice(&host.weight_shape),
+            &Cpu,
+        )
+        .unwrap();
+        assert_eq!(device_weight.storage().size(), 5 * 4);
+        assert_eq!(
+            device_weight
+                .to_host_vec()
+                .unwrap()
+                .into_iter()
+                .map(|value| value.0)
+                .collect::<Vec<_>>(),
+            host.weight
+        );
+    }
+
+    #[test]
+    fn native_fp8_fusion_rejects_unaligned_projection_boundary() {
+        let first_bytes = vec![0x38; 3 * 4];
+        let second_bytes = vec![0x38; 2 * 4];
+        let first_scale_bytes = bf16_bytes(&[1.0; 4]);
+        let second_scale_bytes = bf16_bytes(&[1.0; 2]);
+        let first = TensorView::new(Dtype::F8_E4M3, vec![3, 4], &first_bytes).unwrap();
+        let second = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &second_bytes).unwrap();
+        let first_scales = TensorView::new(Dtype::BF16, vec![2, 2], &first_scale_bytes).unwrap();
+        let second_scales = TensorView::new(Dtype::BF16, vec![1, 2], &second_scale_bytes).unwrap();
+        let parts = [
+            Fp8ViewPart {
+                name: "first.weight",
+                weight: first,
+                scale_inv: first_scales,
+            },
+            Fp8ViewPart {
+                name: "second.weight",
+                weight: second,
+                scale_inv: second_scales,
+            },
+        ];
+
+        let err = prepare_fp8_fused_host(&parts, [2, 2], "test_fusion")
+            .expect_err("unaligned first projection must fail");
+        assert!(format!("{err:?}").contains("fusion boundary"));
+    }
+
+    #[test]
+    fn native_fp8_single_linear_allows_tail_block() {
+        let weight_bytes = vec![0x38; 3 * 5];
+        let scale_bytes = bf16_bytes(&[1.0; 6]);
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![3, 5], &weight_bytes).unwrap();
+        let scales = TensorView::new(Dtype::BF16, vec![2, 3], &scale_bytes).unwrap();
+        let parts = [Fp8ViewPart {
+            name: "tail.weight",
+            weight,
+            scale_inv: scales,
+        }];
+
+        let host = prepare_fp8_fused_host(&parts, [2, 2], "tail").unwrap();
+        assert_eq!(host.weight.len(), 15);
+        assert_eq!(host.scale_shape, [2, 3]);
+    }
+
+    #[test]
+    fn native_fp8_rejects_non_finite_metadata() {
+        let nan_weight_bytes = vec![0x7f; 2 * 2];
+        let good_scale_bytes = 1.0f32.to_le_bytes();
+        let nan_weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &nan_weight_bytes).unwrap();
+        let good_scale = TensorView::new(Dtype::F32, vec![1, 1], &good_scale_bytes).unwrap();
+        let err = prepare_fp8_fused_host(
+            &[Fp8ViewPart {
+                name: "nan.weight",
+                weight: nan_weight,
+                scale_inv: good_scale,
+            }],
+            [2, 2],
+            "nan_weight",
+        )
+        .expect_err("E4M3FN NaN must be rejected");
+        assert!(format!("{err:?}").contains("NaN encoding"));
+
+        let good_weight_bytes = vec![0x38; 2 * 2];
+        let infinite_scale_bytes = f32::INFINITY.to_le_bytes();
+        let good_weight = TensorView::new(Dtype::F8_E4M3, vec![2, 2], &good_weight_bytes).unwrap();
+        let infinite_scale =
+            TensorView::new(Dtype::F32, vec![1, 1], &infinite_scale_bytes).unwrap();
+        let err = prepare_fp8_fused_host(
+            &[Fp8ViewPart {
+                name: "infinite.weight",
+                weight: good_weight,
+                scale_inv: infinite_scale,
+            }],
+            [2, 2],
+            "infinite_scale",
+        )
+        .expect_err("non-finite scale must be rejected");
+        assert!(format!("{err:?}").contains("non-finite"));
     }
 }

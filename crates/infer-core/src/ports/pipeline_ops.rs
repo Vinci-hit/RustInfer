@@ -395,6 +395,8 @@ pub trait DecodePipelineOps: ExecDevice + Sized {
 
     /// Route transient forward scratch through the capture-safe bump arena
     /// (zero device malloc/free). Host default: no-op.
-    fn pipeline_arena_begin(_scope: &Self::Scope) {}
+    fn pipeline_arena_begin(_scope: &Self::Scope) -> OpResult<()> {
+        Ok(())
+    }
     fn pipeline_arena_end(_scope: &Self::Scope) {}
 }

@@ -20,57 +20,48 @@ Math per linear: `out = (Xq⊙Sx) @ (Wq⊙Sw)ᵀ`, fp32 accum, bf16 out.
   is the chosen GEMM backend.
 - Linked cuBLASLt = **12.8** (miniconda `rust_env`) → lacks 128-block FP8 scaling (cuBLAS 12.9+),
   so cuBLASLt blockwise is OUT. CUTLASS it is.
-- `build.rs` emits `sm_90` from compute_cap "9.0"; CUTLASS Hopper FP8 needs **`sm_90a`** → build fix
-  required in Phase 1.
+- The generic CUDA translation units are built for `sm_90`; the Hopper FP8 CUTLASS translation
+  unit is compiled separately for **`sm_90a`**.
 
-## Decisions (locked)
-- Phase 0 dequant-on-load correctness baseline FIRST.
-- FP8 gemm for decode too (M=1) — halve weight mem; measure M=1 efficiency.
-- GEMM backend = vendored CUTLASS 4.3.3.
+## Implemented design (native only)
+- There is no FP8-to-BF16 weight expansion. Safetensors E4M3 bytes remain one byte per weight on
+  host and device; only the checkpoint's BF16 scale grid is normalized to FP32.
+- `LinearWeight::Fp8Block` carries `{weight, weight_scale_inv, block}`. `Linear::forward`
+  automatically dispatches it through `matmul_fp8_block`, matching the existing INT4 routing
+  model.
+- Q/K/V and gate/up fusion concatenates raw FP8 rows and scale-grid rows independently. Fusion
+  boundaries must be aligned to the 128-row scale block.
+- Runtime activation quantization is dynamic per token x 128 K values:
+  BF16 `[M,K]` -> E4M3 `[M,K]` plus FP32 scale `[M,K/128]`.
+- Decode (`M=1`) uses a W8A8 warp GEMV.
+- Prefill (`M>1`) uses a separate SM90a CUTLASS blockwise Tensor Core GEMM. A device-side W8A8
+  CUDA kernel is retained as a portable fallback; it still consumes raw FP8 weights.
+- The activation and CUTLASS scratch regions come from the address-stable CUDA scope workspace;
+  no allocation occurs inside forward or CUDA graph capture.
 
-## Existing scaffold to mirror (minimize new surface)
-- `Packing::Fp8` already in `infer-core/src/dtype/quant.rs` `QuantScheme`.
-- `QuantLinear<A,W,O,D>` component + `matmul_quant<A,W,O>` op-port = AWQ int4 precedent.
-- `Fp8E4m3` type in `DTypeId` (decodes bytes→f64); legacy `DataType` enum lacks it (add in Phase 1).
-- qkv & gate_up are fused **on host** into one bf16 tensor in `loader.rs`
-  (`load_fused_qkv` :131, `load_fused_gate_up` :215) → Phase-0 dequant slots in before fusion.
+## Dispatch and storage
+- `DataType::F8E4M3` and `Fp8E4m3: Dtype` make the one-byte storage dtype explicit.
+- The backend port is deliberately separate from AWQ: `matmul_fp8_block<T>` accepts BF16
+  activation/output, raw `Tensor<Fp8E4m3>`, FP32 scales, and `[128,128]` block metadata.
+- Dense and AWQ loading paths are unchanged. FP8 and AWQ metadata are rejected if enabled
+  simultaneously.
+- The target checkpoint has 252 quantized projections. All have complete finite scales and aligned
+  N/K dimensions; fused QKV is `[6144,2560]`, fused gate/up is `[19456,2560]`.
 
----
+## Verification completed
+- FP8 codec unit tests: known values, saturation, and distinct one-byte storage dtype.
+- Loader tests: raw-byte preservation, fusion layout, invalid boundaries, and non-finite metadata.
+- Component test: an FP8 weight automatically reaches the dedicated backend operation.
+- GPU numerical tests against a CPU reference that performs the same dynamic activation
+  quantization:
+  - `M=1`: explicit dynamic W8A8 GEMV path.
+  - `M=3, N=K=256`: explicit Hopper CUTLASS path (not fallback).
+- The CUTLASS path passes CUDA graph capture, instantiate, replay, and post-replay numerical
+  comparison.
+- Native model parameters are approximately 4.834 GiB, about 3.383 GiB below expanding the
+  projection weights to BF16.
 
-## Phase 0 — correctness baseline (dequant-on-load), NO kernels
-Contained to worker loader + config parse. Device sees bf16; existing path unchanged.
-
-1. `crates/infer-worker/src/bin/worker_main.rs` `HfConfig`: add
-   `quantization_config: Option<HfQuantConfig>` (`quant_method`, `weight_block_size:[usize;2]`,
-   `fmt`, `activation_scheme`). Thread `fp8_block: Option<[usize;2]>` into `LoadConfig`.
-2. `crates/infer-worker/src/models/loader.rs`:
-   - host helper `dequant_fp8_block(w_view, scale_inv_view, [bm,bn]) -> Vec<u8>` (bf16 bytes),
-     decoding e4m3 via core `Fp8E4m3::to_f64`, multiply by block scale_inv, write bf16.
-   - `load_linear` / `load_fused_qkv` / `load_fused_gate_up`: if `<name>.weight_scale_inv` present,
-     dequant→bf16 host buffer instead of `cast_bytes`; then existing fusion/concat path runs on bf16.
-   - returns `Linear<bf16>` unchanged.
-3. GATE: greedy logits / output match vLLM on a few prompts. Weights are bf16 → no mem/perf win yet.
-
-## Phase 1 — real FP8 GEMM (prefill / eager)
-1. dtype: add `DataType::F8E4M3` + `Dtype` impl for `Fp8E4m3` (SIZE_BYTES=1, DATA_TYPE=F8E4M3);
-   map `safetensors::Dtype::F8_E4M3` in `tensor_from_safetensor_view`.
-2. kernel `act_quant_1x128_e4m3`: bf16[M,K] → e4m3[M,K] + fp32 scales[M,K/128] (amax/448).
-3. kernel `gemm_fp8_blockwise_sm90`: wrap CUTLASS collective (A-scale gran M=1,K=128; B 128×128) →
-   C bf16. Preallocated workspace. Add TU to `cc` build with `-arch=sm_90a`.
-4. op-port `matmul_fp8_block` (or route `matmul_quant` when `packing==Fp8`).
-5. `Fp8BlockLinear<D>{weight:Tensor<Fp8E4m3>, scale_inv}` `forward(bf16→bf16)` = act-quant + gemm.
-6. block field swap: `Proj<T,D>{Dense(Linear), Fp8(Fp8BlockLinear)}` for
-   `Attention.qkv_proj/o_proj` + `DenseFfn.gate_up/down`. Fused qkv/gate_up = stack fp8 tiles +
-   concat scale rows (legal: scale blocks are per-128-output-row). Validate vs Phase 0.
-
-## Phase 2 — decode + CUDA graph capture
-Decode runs under graph capture. CUTLASS launch + act-quant capturable (no host sync / split-K probe).
-Reuse pad-to-captured-slot decode infra. Validate decode logits vs Phase 0.
-
-## Phase 3 — perf tune vs vLLM
-Fuse act-quant into prologue; M=1 path; threshold tuning; nsys vs vLLM qps sweep.
-
-## Open items to verify during impl
-- `weight_scale_inv` multiply convention (assume `w = q * scale_inv`; confirm vs vLLM Fp8 block).
-- CUTLASS sm90 fp8 blockwise collective compiles under nvcc 12.8 + `sm_90a`.
-- M=1 decode gemm efficiency on Hopper (else revisit decode dtype decision).
+## Remaining performance work
+- Benchmark M=1 GEMV and prefill throughput against vLLM on representative batch/prompt lengths.
+- Profile whether activation quantization should be fused into the GEMM prologue.
+- Tune any shape threshold only from measured H200 results; correctness does not depend on it.

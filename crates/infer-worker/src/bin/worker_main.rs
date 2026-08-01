@@ -24,7 +24,7 @@ use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION
 
 use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
 use infer_worker::domain::dtype::quant::QuantScheme;
-use infer_worker::infrastructure::cuda::Cuda;
+use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan};
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
@@ -130,14 +130,21 @@ struct HfRopeParameters {
     partial_rotary_factor: Option<f32>,
 }
 
-/// Subset of the HuggingFace `quantization_config` block we act on. Only the
-/// group size and bit width matter for wiring the `matmul_quant` kernel; the
-/// per-layer `ignore` list (attention, lm_head) is honored implicitly because
-/// the loader only reads packed tensors for the MLP projections.
+/// Subset of the HuggingFace `quantization_config` block we act on. This covers
+/// both compressed-tensors INT4 metadata and HuggingFace's blockwise FP8
+/// metadata. The per-layer INT4 `ignore` list (attention, lm_head) is honored
+/// implicitly because the loader only reads packed tensors for the MLP
+/// projections.
 #[derive(Debug, Deserialize)]
 struct HfQuantConfig {
     #[serde(default)]
     quant_method: Option<String>,
+    #[serde(default)]
+    weight_block_size: Option<[usize; 2]>,
+    #[serde(default)]
+    fmt: Option<String>,
+    #[serde(default)]
+    activation_scheme: Option<String>,
     #[serde(default)]
     config_groups: std::collections::HashMap<String, HfQuantGroup>,
 }
@@ -264,6 +271,48 @@ fn derive_mlp_quant(cfg: &HfConfig) -> Option<QuantScheme> {
     None
 }
 
+/// Validate HuggingFace blockwise-FP8 metadata and return the weight scale
+/// block shape. Other quantization methods are handled independently (for
+/// example compressed-tensors INT4 above), so they do not enable FP8.
+fn derive_fp8_block(cfg: &HfConfig) -> Result<Option<[usize; 2]>, String> {
+    let Some(qc) = cfg.quantization_config.as_ref() else {
+        return Ok(None);
+    };
+    if qc.quant_method.as_deref() != Some("fp8") {
+        return Ok(None);
+    }
+
+    if qc.fmt.as_deref() != Some("e4m3") {
+        return Err(format!(
+            "unsupported FP8 format {:?}; expected 'e4m3'",
+            qc.fmt.as_deref()
+        ));
+    }
+    if qc.activation_scheme.as_deref() != Some("dynamic") {
+        return Err(format!(
+            "unsupported FP8 activation_scheme {:?}; expected 'dynamic'",
+            qc.activation_scheme.as_deref()
+        ));
+    }
+
+    let block = qc
+        .weight_block_size
+        .ok_or_else(|| "FP8 quantization requires weight_block_size".to_string())?;
+    if block.contains(&0) {
+        return Err(format!(
+            "FP8 weight_block_size dimensions must be non-zero, got {:?}",
+            block
+        ));
+    }
+    if block != [128, 128] {
+        return Err(format!(
+            "unsupported FP8 weight_block_size {:?}; native CUDA kernels require [128, 128]",
+            block
+        ));
+    }
+    Ok(Some(block))
+}
+
 /// Resolve the stop-token ids for a checkpoint. EOS is an attribute of the
 /// model's config, not of its architecture family, so we read it rather than
 /// hardcoding per `model_type`:
@@ -332,7 +381,7 @@ struct HfRopeScaling {
     original_max_position_embeddings: Option<u32>,
 }
 
-fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
+fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> Result<LoadConfig, String> {
     let head_dim = cfg
         .head_dim
         .unwrap_or_else(|| cfg.hidden_size / cfg.num_attention_heads);
@@ -369,7 +418,7 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
 
     let linear_attn = build_linear_attn(cfg);
 
-    LoadConfig {
+    Ok(LoadConfig {
         dim: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
         layer_num: cfg.num_hidden_layers,
@@ -382,6 +431,7 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
         rope_theta,
         rope_scaling,
         mlp_quant: derive_mlp_quant(cfg),
+        fp8_block: derive_fp8_block(cfg)?,
         rotary_dim,
         attn_output_gate: cfg.attn_output_gate,
         linear_attn,
@@ -390,7 +440,7 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> LoadConfig {
         moe_intermediate_size: cfg.moe_intermediate_size,
         norm_topk_prob: cfg.norm_topk_prob,
         decoder_sparse_step: cfg.decoder_sparse_step,
-    }
+    })
 }
 
 fn parse_device_id(spec: &str) -> Result<i32, String> {
@@ -477,14 +527,27 @@ fn main() -> Result<(), String> {
 
     // ── 4. Load model ──
     let device_id = parse_device_id(&load.device)?;
-    let cuda = Cuda::new(device_id).map_err(|e| format!("Cuda::new: {:?}", e))?;
+    const MIB: usize = 1024 * 1024;
+    let cuda_memory = cfg.cuda_memory;
+    let memory_plan = CudaMemoryPlan {
+        kernel_workspace_bytes: cuda_memory.kernel_workspace_mib * MIB,
+        graph_arena_bytes: cuda_memory.graph_arena_mib * MIB,
+        pool_retain_bytes: cuda_memory.pool_retain_mib * MIB,
+    };
+    eprintln!(
+        "[bootstrap] cuda_memory: kernel={}MiB graph={}MiB pool={}MiB",
+        cuda_memory.kernel_workspace_mib, cuda_memory.graph_arena_mib, cuda_memory.pool_retain_mib,
+    );
+    let cuda = Cuda::with_memory_plan(device_id, memory_plan)
+        .map_err(|e| format!("Cuda::with_memory_plan: {:?}", e))?;
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
     let hf_cfg: HfConfig =
         parse_hf_config(&cfg_bytes).map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
     let max_seq_len = load.max_model_len;
-    let mut load_cfg = build_load_config(&hf_cfg, max_seq_len);
+    let mut load_cfg = build_load_config(&hf_cfg, max_seq_len)
+        .map_err(|e| format!("invalid quantization config: {}", e))?;
     eprintln!(
         "[bootstrap] arch={} layers={} dim={} heads={}/{} vocab={}",
         hf_cfg.architectures.first().cloned().unwrap_or_default(),
@@ -518,6 +581,31 @@ fn main() -> Result<(), String> {
             );
             load_cfg.mlp_quant = None;
         }
+    }
+
+    if let Some([block_n, block_k]) = load_cfg.fp8_block {
+        let probe_name = "model.layers.0.self_attn.q_proj.weight";
+        let probe = loader
+            .read_view(probe_name)
+            .map_err(|e| format!("FP8 checkpoint is missing '{}': {}", probe_name, e))?;
+        if probe.dtype() != safetensors::Dtype::F8_E4M3 {
+            return Err(format!(
+                "config declares block FP8 but '{}' has dtype {:?}, expected F8_E4M3",
+                probe_name,
+                probe.dtype()
+            ));
+        }
+        let scale_name = format!("{}_scale_inv", probe_name);
+        if !loader.has_tensor(&scale_name) {
+            return Err(format!(
+                "config declares block FP8 but scale tensor '{}' is missing",
+                scale_name
+            ));
+        }
+        eprintln!(
+            "[bootstrap] block FP8 checkpoint detected ({}x{}); keeping E4M3 linear weights quantized on device",
+            block_n, block_k
+        );
     }
 
     // Model type is derived from the model's config.json, NOT from
@@ -679,6 +767,29 @@ mod config_tests {
         "norm_topk_prob": true
     }"#;
 
+    /// Quantization-relevant fields and model dimensions copied from the
+    /// target Qwen3-4B-FP8 checkpoint's `config.json`.
+    const QWEN3_4B_FP8_JSON: &str = r#"{
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "hidden_size": 2560,
+        "intermediate_size": 9728,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "max_position_embeddings": 40960,
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        }
+    }"#;
+
     #[test]
     fn parses_nested_text_config() {
         let cfg = parse_hf_config(QWEN3_5_JSON.as_bytes()).expect("parse qwen3_5");
@@ -705,7 +816,7 @@ mod config_tests {
     #[test]
     fn hybrid_dims_and_partial_rope() {
         let cfg = parse_hf_config(QWEN3_5_JSON.as_bytes()).unwrap();
-        let lc = build_load_config(&cfg, 4096);
+        let lc = build_load_config(&cfg, 4096).expect("build qwen3_5 load config");
 
         // Nested rope_theta wins over the flat default.
         assert_eq!(lc.rope_theta, 10_000_000.0);
@@ -730,13 +841,14 @@ mod config_tests {
         let cfg = parse_hf_config(QWEN3_FLAT_JSON.as_bytes()).expect("parse flat qwen3");
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(cfg.num_hidden_layers, 28);
-        let lc = build_load_config(&cfg, 4096);
+        let lc = build_load_config(&cfg, 4096).expect("build flat qwen3 load config");
         // Homogeneous full-attention decoder: no hybrid stack, full rotary.
         assert!(lc.linear_attn.is_none());
         assert!(!lc.attn_output_gate);
         assert_eq!(lc.rotary_dim, lc.head_dim); // partial factor defaults to 1.0
         assert_eq!(lc.head_dim, 128);
         assert_eq!(lc.rope_theta, 1_000_000.0);
+        assert!(lc.fp8_block.is_none());
     }
 
     #[test]
@@ -748,7 +860,7 @@ mod config_tests {
         assert_eq!(cfg.decoder_sparse_step, 1);
         assert!(cfg.norm_topk_prob);
 
-        let lc = build_load_config(&cfg, 4096);
+        let lc = build_load_config(&cfg, 4096).expect("build qwen3_moe load config");
         assert_eq!(lc.num_experts, 128);
         assert_eq!(lc.experts_per_tok, 8);
         assert_eq!(lc.moe_intermediate_size, 768);
@@ -769,5 +881,73 @@ mod config_tests {
         let la = build_linear_attn(&cfg).expect("interval-derived hybrid");
         // interval=4, num_layers=4 → (i+1)%4==0 → only layer index 3 is full.
         assert_eq!(la.layer_is_full, vec![false, false, false, true]);
+    }
+
+    #[test]
+    fn qwen3_4b_fp8_config_maps_block_shape() {
+        let cfg = parse_hf_config(QWEN3_4B_FP8_JSON.as_bytes()).expect("parse qwen3-4b-fp8");
+        assert_eq!(cfg.hidden_size, 2560);
+        assert_eq!(cfg.intermediate_size, 9728);
+        assert_eq!(cfg.num_hidden_layers, 36);
+
+        let lc = build_load_config(&cfg, 4096).expect("supported FP8 config");
+        assert_eq!(lc.fp8_block, Some([128, 128]));
+        assert!(lc.mlp_quant.is_none());
+    }
+
+    #[test]
+    fn rejects_unsupported_fp8_variants() {
+        let cases = [
+            (
+                "format",
+                QWEN3_4B_FP8_JSON.replace(r#""fmt": "e4m3""#, r#""fmt": "e5m2""#),
+                "expected 'e4m3'",
+            ),
+            (
+                "activation scheme",
+                QWEN3_4B_FP8_JSON.replace(
+                    r#""activation_scheme": "dynamic""#,
+                    r#""activation_scheme": "static""#,
+                ),
+                "expected 'dynamic'",
+            ),
+            (
+                "zero block dimension",
+                QWEN3_4B_FP8_JSON.replace(
+                    r#""weight_block_size": [128, 128]"#,
+                    r#""weight_block_size": [0, 128]"#,
+                ),
+                "must be non-zero",
+            ),
+            (
+                "unsupported block shape",
+                QWEN3_4B_FP8_JSON.replace(
+                    r#""weight_block_size": [128, 128]"#,
+                    r#""weight_block_size": [64, 128]"#,
+                ),
+                "require [128, 128]",
+            ),
+            (
+                "missing block shape",
+                QWEN3_4B_FP8_JSON.replace(
+                    r#""weight_block_size": [128, 128]"#,
+                    r#""weight_block_size": null"#,
+                ),
+                "requires weight_block_size",
+            ),
+        ];
+
+        for (variant, json, expected) in cases {
+            let cfg = parse_hf_config(json.as_bytes())
+                .unwrap_or_else(|e| panic!("parse unsupported {variant} fixture: {e}"));
+            let err = match build_load_config(&cfg, 4096) {
+                Ok(_) => panic!("unsupported FP8 {variant} was accepted"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains(expected),
+                "unexpected error for {variant}: {err}"
+            );
+        }
     }
 }

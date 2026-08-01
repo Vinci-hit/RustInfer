@@ -6,9 +6,8 @@
 
 use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::{DataType, Dtype};
+use crate::domain::types::Dtype;
 use crate::models::layers::Linear;
-use half::{bf16, f16};
 
 pub struct TimestepEmbedder<T: Dtype, D: OpBackend> {
     pub mlp1: Linear<T, D>,
@@ -34,51 +33,16 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
         let half = dim / 2;
         let log_max_period = (10000.0_f64).ln();
 
-        // Build sinusoid on host, then upload via MemoryPort.
-        let bytes_per_elem = T::SIZE_BYTES;
-        let mut host: Vec<u8> = vec![0u8; dim * bytes_per_elem];
-        match T::DATA_TYPE {
-            DataType::F32 => {
-                let dst =
-                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f32, dim) };
-                for i in 0..half {
-                    let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
-                    let arg = t_value_scaled * freq;
-                    dst[i] = arg.cos();
-                    dst[half + i] = arg.sin();
-                }
-            }
-            DataType::BF16 => {
-                let dst =
-                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut bf16, dim) };
-                for i in 0..half {
-                    let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
-                    let arg = t_value_scaled * freq;
-                    dst[i] = bf16::from_f32(arg.cos());
-                    dst[half + i] = bf16::from_f32(arg.sin());
-                }
-            }
-            DataType::F16 => {
-                let dst =
-                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut f16, dim) };
-                for i in 0..half {
-                    let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
-                    let arg = t_value_scaled * freq;
-                    dst[i] = f16::from_f32(arg.cos());
-                    dst[half + i] = f16::from_f32(arg.sin());
-                }
-            }
-            other => {
-                return Err(OpError::Kernel(format!(
-                    "TimestepEmbedder: unsupported dtype {:?}",
-                    other,
-                )));
-            }
+        // Build typed host values through the canonical scalar conversion API.
+        let mut host = vec![T::write_f64(0.0); dim];
+        for i in 0..half {
+            let freq = (-log_max_period * i as f64 / half as f64).exp() as f32;
+            let arg = t_value_scaled * freq;
+            host[i] = T::write_f64(f64::from(arg.cos()));
+            host[half + i] = T::write_f64(f64::from(arg.sin()));
         }
 
         // Upload to device slot.
-        let dev = t_freq_slot.device().clone();
-        let dst_bytes = dim * bytes_per_elem;
         if t_freq_slot.numel() != dim {
             return Err(OpError::Shape(format!(
                 "TimestepEmbedder: t_freq_slot numel {} != dim {}",
@@ -86,10 +50,7 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
                 dim,
             )));
         }
-        unsafe {
-            let dn = std::ptr::NonNull::new_unchecked(t_freq_slot.data_ptr_mut() as *mut u8);
-            dev.upload(dn, host.as_ptr(), dst_bytes)?;
-        }
+        t_freq_slot.upload_from_host(&host)?;
 
         // mlp1 → silu → mlp2.
         self.mlp1.forward(t_freq_slot, t_hidden_slot)?;

@@ -27,7 +27,7 @@
 
 use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::{DataType, Dtype, Shape};
+use crate::domain::types::{Dtype, Shape};
 use crate::models::layers::{Linear, RMSNorm};
 
 // ─── Dump infrastructure for numerical comparison with the Python reference ──
@@ -60,27 +60,10 @@ pub fn dump_tensor<T: Dtype, D: OpBackend>(name: &str, t: &Tensor<T, D>) {
         }
     };
     let shape: Vec<usize> = t.shape().as_slice().to_vec();
-    let f32_data: Vec<f32> = match T::DATA_TYPE {
-        DataType::F32 => unsafe {
-            std::slice::from_raw_parts(host.as_ptr() as *const f32, host.len()).to_vec()
-        },
-        DataType::BF16 => unsafe {
-            std::slice::from_raw_parts(host.as_ptr() as *const half::bf16, host.len())
-                .iter()
-                .map(|v| v.to_f32())
-                .collect()
-        },
-        DataType::F16 => unsafe {
-            std::slice::from_raw_parts(host.as_ptr() as *const half::f16, host.len())
-                .iter()
-                .map(|v| v.to_f32())
-                .collect()
-        },
-        other => {
-            eprintln!("[dump] {}: unsupported dtype {:?}", name, other);
-            return;
-        }
-    };
+    let f32_data: Vec<f32> = host
+        .iter()
+        .map(|value| T::read_f64(value) as f32)
+        .collect();
     if let Err(e) = write_npy_f32(&path, &shape, &f32_data) {
         eprintln!("[dump] {}: write failed: {}", name, e);
     } else {

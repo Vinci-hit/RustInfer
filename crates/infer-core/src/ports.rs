@@ -14,14 +14,12 @@ pub mod math_ops;
 pub mod pipeline_ops;
 pub mod sampler;
 
-// Two op surfaces coexist intentionally (both load-bearing, not duplication):
-//   * `CoreOps`/`DiffusionOps`/`OpBackend` (op_ports) over `types::Dtype` — the
-//     scope-less surface used by the diffusion + model-layer path.
-//   * `MathOps`/`FusedOps`/`LlmBackend` (math_ops/fused_ops/backend) over the
-//     richer `dtype::Dtype` — the scope/stream-threaded surface used by the LLM
-//     decode path, which needs the scope for CUDA-graph/stream capture.
-// The two `Dtype`/`Float` trait pairs are the same seam: the old surface needs
-// only storage metadata, the new one needs read/write_f64 + a type id.
+// Two op surfaces coexist intentionally:
+//   * `CoreOps`/`DiffusionOps`/`OpBackend` is the scope-less diffusion surface.
+//   * `MathOps`/`FusedOps`/`LlmBackend` threads an execution scope through the
+//     LLM decode path for CUDA graph/stream capture.
+// Both surfaces share the single canonical `types::Dtype`; `dtype::Dtype`
+// re-exports that same trait for compatibility with the LLM module layout.
 pub use backend::LlmBackend;
 pub use collective::{CollectiveOps, CommAxis, ReduceOp, ShardSpec, ShardedLoad};
 pub use device::{AllocError, Allocator, Device, HostDevice, MemoryPort};

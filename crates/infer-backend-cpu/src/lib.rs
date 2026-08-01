@@ -6,13 +6,11 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 
-use half::{bf16, f16};
-
 use infer_core::ports::{
     AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpError, OpResult,
 };
 use infer_core::tensor::Tensor;
-use infer_core::types::{DataType, Dtype, Shape};
+use infer_core::types::{Dtype, Shape};
 
 // ─── Cpu Device ──────────────────────────────────────────────────────────────
 
@@ -976,36 +974,16 @@ impl DiffusionOps for Cpu {
 
 // ─── Generic numeric helpers ─────────────────────────────────────────────────
 
-// The f64 round-trip is a *capability of the dtype*, not of this backend:
-// `infer_core::dtype::Dtype` already defines correct `read_f64`/`write_f64` for
-// every concrete type (including i32/i8, which the old hand-rolled match here
-// silently zeroed with a `_ => 0.0` arm). So we only translate the runtime
-// `DataType` tag to the concrete type and delegate. The match is exhaustive over
-// `DataType` — adding a variant is a compile error, never a silent wrong value.
+// Scalar conversion is a capability of `Dtype`, so the CPU reference backend
+// stays generic and never reinterprets a `T` pointer through a runtime dtype tag.
 #[inline]
 unsafe fn read_f64<T: Dtype>(ptr: *const T) -> f64 {
-    use infer_core::dtype::Dtype as NumDtype;
-    // `ptr` points at a contiguous `T`, and `T::DATA_TYPE` fixes its layout, so
-    // reinterpreting to the matching concrete type is aligned and valid.
-    match T::DATA_TYPE {
-        DataType::F32 => NumDtype::read_f64(unsafe { &*(ptr as *const f32) }),
-        DataType::BF16 => NumDtype::read_f64(unsafe { &*(ptr as *const bf16) }),
-        DataType::F16 => NumDtype::read_f64(unsafe { &*(ptr as *const f16) }),
-        DataType::I32 => NumDtype::read_f64(unsafe { &*(ptr as *const i32) }),
-        DataType::I8 => NumDtype::read_f64(unsafe { &*(ptr as *const i8) }),
-    }
+    T::read_f64(unsafe { &*ptr })
 }
 
 #[inline]
 unsafe fn write_f64<T: Dtype>(ptr: *mut T, val: f64) {
-    use infer_core::dtype::Dtype as NumDtype;
-    match T::DATA_TYPE {
-        DataType::F32 => unsafe { *(ptr as *mut f32) = NumDtype::write_f64(val) },
-        DataType::BF16 => unsafe { *(ptr as *mut bf16) = NumDtype::write_f64(val) },
-        DataType::F16 => unsafe { *(ptr as *mut f16) = NumDtype::write_f64(val) },
-        DataType::I32 => unsafe { *(ptr as *mut i32) = NumDtype::write_f64(val) },
-        DataType::I8 => unsafe { *(ptr as *mut i8) = NumDtype::write_f64(val) },
-    }
+    unsafe { *ptr = T::write_f64(val) }
 }
 
 // ─── Validation helpers ──────────────────────────────────────────────────────
@@ -1135,9 +1113,8 @@ mod tests {
 
     #[test]
     fn read_write_f64_handles_integer_dtypes() {
-        // Regression: the old hand-rolled match had `_ => 0.0` / `_ => {}`, so
-        // i32/i8 round-tripped as 0. Delegating to `infer_core::dtype::Dtype`
-        // must preserve integer values (not silently zero them).
+        // Scalar conversion must preserve integer types without a backend-local
+        // dtype dispatch table.
         for v in [0i32, 7, -13, 12345] {
             let mut cell = v;
             let got = unsafe { read_f64(&cell as *const i32) };

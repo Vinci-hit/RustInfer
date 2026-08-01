@@ -640,6 +640,7 @@ unsafe fn try_cudnn_paged_decode<T: Dtype>(
         .first()
         .copied()
         .unwrap_or_default() as i32;
+    let kernel_workspace = device.config.kernel_workspace();
     let status = match T::DATA_TYPE {
         DataType::BF16 => unsafe {
             launch_cudnn_paged_decode_bf16(
@@ -658,8 +659,8 @@ unsafe fn try_cudnn_paged_decode<T: Dtype>(
                 plan.seq_lens_step.data_ptr(),
                 plan.kv_lens.data_ptr(),
                 num_blocks,
-                device.config.workspace,
-                device.config.workspace_size,
+                kernel_workspace.ptr(),
+                kernel_workspace.size(),
                 batch,
                 head_num as i32,
                 kv_head_num as i32,
@@ -685,8 +686,8 @@ unsafe fn try_cudnn_paged_decode<T: Dtype>(
                 plan.seq_lens_step.data_ptr(),
                 plan.kv_lens.data_ptr(),
                 num_blocks,
-                device.config.workspace,
-                device.config.workspace_size,
+                kernel_workspace.ptr(),
+                kernel_workspace.size(),
                 batch,
                 head_num as i32,
                 kv_head_num as i32,

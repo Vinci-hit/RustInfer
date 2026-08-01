@@ -3,7 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::device::MemoryPort;
-use super::error::OpResult;
+use super::error::{OpError, OpResult};
 use infer_core::dtype::quant::QuantScheme;
 use infer_core::tensor::Tensor;
 use infer_core::types::{Dtype, Shape};
@@ -75,6 +75,25 @@ pub trait CoreOps: MemoryPort {
         zeros: Option<&Tensor<W, Self>>,
         scheme: &QuantScheme,
     ) -> OpResult<()>;
+
+    /// Block-scaled E4M3 weight matmul:
+    /// `input[M,K] @ weight[N,K]^T -> output[M,N]`, with one inverse scale per
+    /// `[block_n, block_k]` weight tile. Scales are FP32 to match the CUTLASS
+    /// accumulator contract. The raw FP8 weight remains resident on the device;
+    /// implementations must not require a persistent dense copy.
+    fn matmul_fp8_block<T: Dtype>(
+        input: &Tensor<T, Self>,
+        weight: &Tensor<infer_core::dtype::Fp8E4m3, Self>,
+        output: &mut Tensor<T, Self>,
+        weight_scale_inv: &Tensor<f32, Self>,
+        block: [usize; 2],
+    ) -> OpResult<()> {
+        let _ = (weight, output, weight_scale_inv, block);
+        Err(OpError::unsupported(
+            input.device().name(),
+            "matmul_fp8_block",
+        ))
+    }
 
     // ─── Activations ─────────────────────────────────────────────────
     fn silu_inplace<T: Dtype>(x: &mut Tensor<T, Self>) -> OpResult<()>;

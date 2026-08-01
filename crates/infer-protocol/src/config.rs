@@ -11,6 +11,36 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// CUDA scratch-memory sizing from the shared launch TOML.
+///
+/// MiB keeps deployment configuration readable; the worker converts these
+/// values to backend byte capacities exactly once during startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CudaMemoryConfig {
+    /// Shared cuBLASLt/cuDNN/CUTLASS/FP8 kernel workspace.
+    #[serde(default = "default_cuda_kernel_workspace_mib")]
+    pub kernel_workspace_mib: usize,
+
+    /// Lazily allocated CUDA Graph transient arena. `0` disables graph capture.
+    #[serde(default = "default_cuda_graph_arena_mib")]
+    pub graph_arena_mib: usize,
+
+    /// Maximum freed allocation bytes retained by the eager recycling pool.
+    #[serde(default = "default_cuda_pool_retain_mib")]
+    pub pool_retain_mib: usize,
+}
+
+impl Default for CudaMemoryConfig {
+    fn default() -> Self {
+        Self {
+            kernel_workspace_mib: default_cuda_kernel_workspace_mib(),
+            graph_arena_mib: default_cuda_graph_arena_mib(),
+            pool_retain_mib: default_cuda_pool_retain_mib(),
+        }
+    }
+}
+
 /// Top-level launch config, deserialized from `rustinfer.toml`.
 ///
 /// Every field has a default so a minimal file containing only `model = "..."`
@@ -143,6 +173,10 @@ pub struct RustInferConfig {
     /// Determines which batch sizes have pre-captured CUDA graphs.
     #[serde(default = "default_capture_sizes")]
     pub capture_sizes: Vec<usize>,
+
+    /// CUDA scratch-memory plan. Read only from this shared launch config.
+    #[serde(default)]
+    pub cuda_memory: CudaMemoryConfig,
 }
 
 fn default_cluster_id() -> String {
@@ -193,6 +227,15 @@ fn default_log_level() -> String {
 fn default_capture_sizes() -> Vec<usize> {
     vec![1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
 }
+fn default_cuda_kernel_workspace_mib() -> usize {
+    256
+}
+fn default_cuda_graph_arena_mib() -> usize {
+    256
+}
+fn default_cuda_pool_retain_mib() -> usize {
+    256
+}
 
 impl RustInferConfig {
     /// Load and parse a TOML config file. Errors are returned as `String`
@@ -238,6 +281,25 @@ impl RustInferConfig {
         }
         if self.port == 0 {
             return Err("`port` must be > 0".into());
+        }
+        const MAX_MIB: usize = usize::MAX / (1024 * 1024);
+        for (name, value) in [
+            (
+                "cuda_memory.kernel_workspace_mib",
+                self.cuda_memory.kernel_workspace_mib,
+            ),
+            (
+                "cuda_memory.graph_arena_mib",
+                self.cuda_memory.graph_arena_mib,
+            ),
+            (
+                "cuda_memory.pool_retain_mib",
+                self.cuda_memory.pool_retain_mib,
+            ),
+        ] {
+            if value > MAX_MIB {
+                return Err(format!("`{name}` is too large to represent in bytes"));
+            }
         }
         if self.mode != "llm" {
             return Err(format!(
@@ -448,5 +510,27 @@ mod launch_config_tests {
         let error = config.validate().unwrap_err();
 
         assert!(error.contains("diffusion is disabled"));
+    }
+
+    #[test]
+    fn cuda_memory_defaults_and_explicit_values_parse() {
+        let defaults: RustInferConfig = toml::from_str("model = '/tmp/model'").unwrap();
+        assert_eq!(defaults.cuda_memory.kernel_workspace_mib, 256);
+        assert_eq!(defaults.cuda_memory.graph_arena_mib, 256);
+        assert_eq!(defaults.cuda_memory.pool_retain_mib, 256);
+
+        let configured: RustInferConfig = toml::from_str(
+            r#"
+                model = "/tmp/model"
+                [cuda_memory]
+                kernel_workspace_mib = 128
+                graph_arena_mib = 192
+                pool_retain_mib = 64
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.cuda_memory.kernel_workspace_mib, 128);
+        assert_eq!(configured.cuda_memory.graph_arena_mib, 192);
+        assert_eq!(configured.cuda_memory.pool_retain_mib, 64);
     }
 }

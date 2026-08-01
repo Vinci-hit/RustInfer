@@ -307,37 +307,12 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
 
         // Final layer. diffusers `LayerNorm(elementwise_affine=False)` →
         // no weight/bias on disk. We emulate with unit weight + zero bias.
-        let final_norm_w_host: Vec<u8> = vec![0u8; dim * T::SIZE_BYTES];
-        // Fill with 1.0 in T-dtype.
-        let mut final_norm_w_buf = final_norm_w_host;
-        for i in 0..dim {
-            let off = i * T::SIZE_BYTES;
-            match T::DATA_TYPE {
-                crate::domain::types::DataType::F32 => {
-                    final_norm_w_buf[off..off + 4].copy_from_slice(&1.0_f32.to_le_bytes());
-                }
-                crate::domain::types::DataType::BF16 => {
-                    final_norm_w_buf[off..off + 2]
-                        .copy_from_slice(&half::bf16::from_f32(1.0).to_le_bytes());
-                }
-                crate::domain::types::DataType::F16 => {
-                    final_norm_w_buf[off..off + 2]
-                        .copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
-                }
-                other => return Err(OpError::Kernel(format!("final_norm dtype {:?}", other))),
-            }
-        }
-        let final_norm_w = Tensor::<T, Cuda>::from_host_bytes(
-            &final_norm_w_buf,
-            Shape::from_slice(&[dim]),
-            device,
-        )?;
-        let final_norm_b_buf = vec![0u8; dim * T::SIZE_BYTES];
-        let final_norm_b = Tensor::<T, Cuda>::from_host_bytes(
-            &final_norm_b_buf,
-            Shape::from_slice(&[dim]),
-            device,
-        )?;
+        let final_norm_w_host = vec![T::write_f64(1.0); dim];
+        let final_norm_w =
+            Tensor::<T, Cuda>::from_host_slice(&final_norm_w_host, [dim], device)?;
+        let final_norm_b_host = vec![T::write_f64(0.0); dim];
+        let final_norm_b =
+            Tensor::<T, Cuda>::from_host_slice(&final_norm_b_host, [dim], device)?;
         let final_norm = LayerNorm::new(final_norm_w, final_norm_b, 1e-6);
         let final_adaln = loader.load_linear::<T, Cuda>(
             &format!("all_final_layer.{}.adaLN_modulation.1.weight", patch_key),

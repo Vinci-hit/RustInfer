@@ -64,6 +64,20 @@ void kpack_gemm_cu(
     int M, int N, int K, int group_size, cudaStream_t stream
 );
 
+// Initializes Hopper CUTLASS kernel attributes and hardware metadata outside
+// stream capture. A no-op on builds targeting a non-Hopper architecture.
+int fp8_block_matmul_init_cu(int device_id);
+
+// Dynamic block-scaled W8A8 matmul, BF16 activation/output. Weight is raw
+// row-major [N,K] bytes and float32 scale_inv is row-major [N/128,K/128].
+// Return path: 1=W8A8 GEMV, 2=accelerated CUTLASS, 3=W8A8 CUDA fallback; <0=error.
+int fp8_block_matmul_bf16_cu(
+    const void* input, const void* weight, const void* weight_scale_inv,
+    void* output, int M, int N, int K, int scale_cols,
+    int block_n, int block_k, int device_id,
+    void* workspace, size_t workspace_size, cudaStream_t stream
+);
+
 #ifdef __cplusplus
 }
 #endif

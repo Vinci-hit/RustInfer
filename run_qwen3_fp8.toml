@@ -1,13 +1,12 @@
-# RustInfer launch config for end-to-end smoke test of the int4-MLP AWQ
-# (compressed-tensors pack-quantized, W4A16) Qwen3-4B checkpoint.
-# Paths are resolved from the directory where the binaries are launched.
-model = "./models/qwen3-4b-instruct-AWQ-mlp3"
-model_name = "qwen3-4b-instruct-AWQ-mlp3"
-cluster_id = "rustinfer-qwen3awq"
+# RustInfer launch config for the block-FP8 Qwen3-4B checkpoint.
+# FP8 projections remain E4M3 on device and dispatch through the native block-FP8 Linear path.
+model = "/mnt/md2/liuwenqi/vllm_bench/qwen3-4b-fp8"
+model_name = "qwen3-4b-fp8"
+cluster_id = "rustinfer-qwen3-fp8"
 device = "cuda:0"
 
-host = "127.0.0.1"
-port = 8101
+host = "0.0.0.0"
+port = 8102
 request_timeout_secs = 600
 
 max_batch_tokens = 8192
