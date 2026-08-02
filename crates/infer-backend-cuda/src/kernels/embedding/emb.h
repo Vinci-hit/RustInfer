@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,24 @@ void embedding_kernel_cu_fp32x4(
     int dim,
     int vocab_size,
     cudaStream_t stream
+);
+
+void vocab_embedding_kernel_cu_bf16x8(
+    __nv_bfloat16* output, const int* input_token_ids,
+    const __nv_bfloat16* weight, int token_len, int dim,
+    int vocab_start, int local_vocab_size, cudaStream_t stream
+);
+
+void vocab_embedding_kernel_cu_fp16x8(
+    __half* output, const int* input_token_ids,
+    const __half* weight, int token_len, int dim,
+    int vocab_start, int local_vocab_size, cudaStream_t stream
+);
+
+void vocab_embedding_kernel_cu_fp32x4(
+    float* output, const int* input_token_ids,
+    const float* weight, int token_len, int dim,
+    int vocab_start, int local_vocab_size, cudaStream_t stream
 );
 
 

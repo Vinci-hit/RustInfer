@@ -28,7 +28,7 @@ use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
-use crate::models::layers::{Linear as LayerLinear, RMSNorm as LayerRmsNorm};
+use crate::models::layers::RMSNorm as LayerRmsNorm;
 use crate::models::loader::{LoadConfig, WeightLoader, compute_rope_cache};
 
 const STAGES: [StageKind; 3] = [StageKind::Embed, StageKind::DecoderBlock, StageKind::LmHead];
@@ -224,14 +224,43 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         ));
     }
 
-    let embed_table = loader
-        .load_embedding::<T, D>("model.embed_tokens.weight", device)?
-        .table;
+    let tp = loader.tensor_parallel();
+    if tp.size > 1 && (cfg.mlp_quant.is_some() || cfg.fp8_block.is_some()) {
+        return Err(OpError::Kernel(format!(
+            "TP{} currently supports dense decoder weights only; AWQ/FP8 sharding is not enabled",
+            tp.size
+        )));
+    }
+    let local_head_num = loader.local_shard_size("query head count", cfg.head_num)?;
+    let local_kv_head_num = loader.local_shard_size("KV head count", cfg.kv_head_num)?;
+    let local_intermediate =
+        loader.local_shard_size("MLP intermediate size", cfg.intermediate_size)?;
+
+    let embed = loader.load_vocab_parallel_embedding::<T, D>(
+        "model.embed_tokens.weight",
+        cfg.vocab_size,
+        cfg.dim,
+        device,
+    )?;
     let final_norm = loader.load_rmsnorm::<T, D>("model.norm.weight", device, cfg.rms_norm_eps)?;
+    let lm_head_bias = loader.has_tensor("lm_head.bias").then_some("lm_head.bias");
     let lm_head = if loader.has_tensor("lm_head.weight") {
-        loader.load_linear::<T, D>("lm_head.weight", None, device)?
+        loader.load_vocab_parallel_linear::<T, D>(
+            "lm_head.weight",
+            lm_head_bias,
+            cfg.vocab_size,
+            cfg.dim,
+            device,
+        )?
     } else {
-        LayerLinear::new(embed_table.clone(), None)
+        // Tied checkpoint: clone only the Tensor handle. Embedding and LM head
+        // retain the same rank-local storage rather than uploading a duplicate.
+        loader.vocab_parallel_linear_from_weight(
+            embed.table.clone(),
+            lm_head_bias,
+            cfg.vocab_size,
+            device,
+        )?
     };
 
     let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
@@ -242,8 +271,10 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         device,
     )?;
 
-    let q_dim = cfg.head_num * cfg.head_dim;
-    let kv_dim = cfg.kv_head_num * cfg.head_dim;
+    let global_q_dim = cfg.head_num * cfg.head_dim;
+    let global_kv_dim = cfg.kv_head_num * cfg.head_dim;
+    let q_dim = local_head_num * cfg.head_dim;
+    let kv_dim = local_kv_head_num * cfg.head_dim;
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
     let mut blocks = Vec::with_capacity(cfg.layer_num);
@@ -261,13 +292,13 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         )?;
         let qkv_proj = loader.load_fused_qkv_with_fp8::<T, D>(
             &lp,
-            q_dim,
-            kv_dim,
+            global_q_dim,
+            global_kv_dim,
             cfg.dim,
             cfg.fp8_block,
             device,
         )?;
-        let o_proj = loader.load_linear_with_fp8::<T, D>(
+        let o_proj = loader.load_row_parallel_linear_with_fp8::<T, D>(
             &format!("{}.self_attn.o_proj.weight", lp),
             None,
             cfg.fp8_block,
@@ -293,7 +324,7 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
                     cfg.fp8_block,
                     device,
                 )?,
-                loader.load_linear_with_fp8::<T, D>(
+                loader.load_row_parallel_linear_with_fp8::<T, D>(
                     &format!("{}.mlp.down_proj.weight", lp),
                     None,
                     cfg.fp8_block,
@@ -340,8 +371,8 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
                 k_norm,
                 sin: sin_cache.clone(),
                 cos: cos_cache.clone(),
-                head_num: cfg.head_num,
-                kv_head_num: cfg.kv_head_num,
+                head_num: local_head_num,
+                kv_head_num: local_kv_head_num,
                 head_dim: cfg.head_dim,
                 scale,
                 scratch: None,
@@ -356,22 +387,20 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
     }
 
     Ok(Decoder {
-        embed: Embed { table: embed_table },
+        embed,
         blocks,
         norm: comp_rms(final_norm),
-        lm_head: LmHead {
-            proj: comp_linear(lm_head),
-        },
+        lm_head: LmHead { proj: lm_head },
         dims: ModelDims {
             dim: cfg.dim,
             q_dim,
             kv_dim,
             qkv_dim: q_dim + 2 * kv_dim,
-            intermediate_size: cfg.intermediate_size,
+            intermediate_size: local_intermediate,
             vocab_size: cfg.vocab_size,
-            head_num: cfg.head_num,
+            head_num: local_head_num,
             head_dim: cfg.head_dim,
-            kv_head_num: cfg.kv_head_num,
+            kv_head_num: local_kv_head_num,
             num_layers: cfg.layer_num,
             num_experts: 0,
             experts_per_tok: 0,
@@ -380,11 +409,6 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         },
         scratch: None,
     })
-}
-
-/// `models::layers::Linear` → `components::Linear` (the runtime component type).
-fn comp_linear<T: Dtype, D: OpBackend + LlmBackend>(l: LayerLinear<T, D>) -> CompLinear<T, D> {
-    CompLinear::new(l.weight, l.bias)
 }
 
 /// `models::layers::RMSNorm` → `components::RmsNorm`.
@@ -471,9 +495,7 @@ mod tests {
             },
         };
         Decoder {
-            embed: Embed {
-                table: weight(VOCAB, DIM),
-            },
+            embed: Embed::new(weight(VOCAB, DIM)),
             blocks: vec![block],
             norm: rms(ones(DIM)),
             lm_head: LmHead {

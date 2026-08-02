@@ -1,4 +1,4 @@
-use crate::ports::{OpError, OpResult};
+use crate::ports::OpResult;
 use infer_core::dtype::Dtype;
 use infer_core::exec::ExecDevice as Device;
 use infer_core::tensor::Tensor;
@@ -76,94 +76,6 @@ pub trait CollectiveOps: Device {
     ) -> OpResult<()>;
 
     fn barrier(scope: &Self::Scope, axis: CommAxis) -> OpResult<()>;
-}
-
-impl<D: Device> CollectiveOps for D {
-    type Comm = SingleRankComm;
-
-    fn comm(_scope: &Self::Scope, _axis: CommAxis) -> Option<&Self::Comm> {
-        None
-    }
-
-    fn all_reduce<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        _op: ReduceOp,
-        _buf: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        Ok(())
-    }
-
-    fn all_gather<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        _dim: usize,
-        shard: &Tensor<T, Self>,
-        out: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        out.copy_from(shard)
-    }
-
-    fn reduce_scatter<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        _op: ReduceOp,
-        _dim: usize,
-        buf: &Tensor<T, Self>,
-        out: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        out.copy_from(buf)
-    }
-
-    fn broadcast<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        _root: usize,
-        _buf: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        Ok(())
-    }
-
-    fn send<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        _peer: usize,
-        buf: &Tensor<T, Self>,
-    ) -> OpResult<()> {
-        Err(OpError::unsupported(buf.device().name(), "send"))
-    }
-
-    fn recv<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        _peer: usize,
-        buf: &mut Tensor<T, Self>,
-    ) -> OpResult<()> {
-        Err(OpError::unsupported(buf.device().name(), "recv"))
-    }
-
-    fn all_to_all<T: Dtype>(
-        _scope: &Self::Scope,
-        _axis: CommAxis,
-        send_chunks: &[Tensor<T, Self>],
-        recv_chunks: &mut [Tensor<T, Self>],
-    ) -> OpResult<()> {
-        if send_chunks.len() != recv_chunks.len() {
-            return Err(OpError::Shape(format!(
-                "all_to_all: send_chunks={} recv_chunks={}",
-                send_chunks.len(),
-                recv_chunks.len()
-            )));
-        }
-        for (src, dst) in send_chunks.iter().zip(recv_chunks.iter_mut()) {
-            dst.copy_from(src)?;
-        }
-        Ok(())
-    }
-
-    fn barrier(_scope: &Self::Scope, _axis: CommAxis) -> OpResult<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

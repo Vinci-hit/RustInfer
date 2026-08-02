@@ -7,6 +7,7 @@ pub mod config;
 pub mod device_utils;
 pub mod error;
 pub mod ffi;
+mod nccl;
 // Raw kernel launch wrappers are an implementation detail. Keeping this module
 // private prevents external callers from manufacturing invalid CUDA streams or
 // device pointers; the safe backend traits below are the supported API.
@@ -14,6 +15,7 @@ mod kernels;
 
 pub use config::{CudaConfig, CudaMemoryPlan, CudaWorkspace, GraphSlot};
 pub use error::CudaError;
+pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclCommunicator, NcclUniqueId};
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -43,6 +45,7 @@ pub struct CudaScope {
     stream: CudaStream,
     rank: infer_core::exec::Rank,
     topology: infer_core::exec::TopologyShape,
+    tp_comm: Option<Arc<NcclCommunicator>>,
     quant_tier: infer_core::exec::QuantTier,
     workspace: infer_core::exec::Workspace<Cuda>,
 }
@@ -60,12 +63,24 @@ impl CudaScope {
             stream,
             rank: infer_core::exec::Rank::SINGLE,
             topology: infer_core::exec::TopologyShape::SINGLE,
+            tp_comm: None,
             quant_tier: infer_core::exec::QuantTier::None,
             workspace,
         }
     }
 
-    pub fn with_topology(mut self, topology: infer_core::exec::TopologyShape) -> Self {
+    pub fn with_topology(mut self, topology: infer_core::exec::TopologyShape) -> OpResult<Self> {
+        if let Some(comm) = &self.tp_comm
+            && comm.rank_pair() != topology.tp
+        {
+            return Err(OpError::Shape(format!(
+                "TP communicator rank {}/{} does not match requested topology {}/{}",
+                comm.rank_pair().rank,
+                comm.rank_pair().size,
+                topology.tp.rank,
+                topology.tp.size
+            )));
+        }
         self.rank = infer_core::exec::Rank {
             tp_rank: topology.tp.rank,
             pp_rank: topology.pp.rank,
@@ -74,7 +89,7 @@ impl CudaScope {
             world_rank: 0,
         };
         self.topology = topology;
-        self
+        Ok(self)
     }
 }
 
@@ -112,7 +127,11 @@ impl infer_core::exec::ExecScope for CudaScope {
     }
 
     fn supports_graphs(&self) -> bool {
-        self.device.config.arena_available()
+        // TP collectives are intentionally eager in the first NCCL release.
+        // Capturing them is only safe once every rank captures and replays the
+        // same collective sequence in lockstep, which the multi-worker control
+        // plane does not guarantee yet.
+        self.topology.tp.size == 1 && self.device.config.arena_available()
     }
 
     fn graph_capture_begin(&self) -> OpResult<()> {
@@ -160,7 +179,17 @@ impl infer_core::exec::ExecScope for CudaScope {
     }
 
     fn synchronize(&self) -> OpResult<()> {
-        self.device.config.synchronize()
+        let _guard = self.enter();
+        // A blocking stream sync cannot implement distributed failure timeout:
+        // production TP still needs nonblocking communicator init plus polling
+        // of both CUDA completion and ncclCommGetAsyncError. The post-sync
+        // check below makes completed NCCL failures fatal, but does not replace
+        // that control-plane watchdog.
+        self.device.config.synchronize()?;
+        if let Some(comm) = &self.tp_comm {
+            comm.check_async_error()?;
+        }
+        Ok(())
     }
 }
 
@@ -201,6 +230,23 @@ impl infer_core::exec::ExecDevice for Cuda {
 #[inline]
 fn scope_stream(scope: &CudaScope) -> ffi::cudaStream_t {
     infer_core::exec::ExecScope::stream(scope).0
+}
+
+pub(crate) fn require_scope_tensor<T: Dtype>(
+    scope: &CudaScope,
+    tensor: &Tensor<T, Cuda>,
+    what: &str,
+) -> OpResult<()> {
+    let tensor_device = tensor.device();
+    if tensor_device.device_id != scope.device.device_id
+        || !Arc::ptr_eq(&tensor_device.config, &scope.device.config)
+    {
+        return Err(OpError::Kernel(format!(
+            "{what} tensor belongs to CUDA device/config {}, but scope uses device {}",
+            tensor_device.device_id, scope.device.device_id
+        )));
+    }
+    Ok(())
 }
 
 impl infer_core::ports::MathOps for Cuda {
@@ -550,6 +596,75 @@ impl infer_core::ports::MathOps for Cuda {
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
         kernels::cast_dtype::cast_dtype(scope_stream(scope), src, dst)
+    }
+}
+
+impl infer_core::ports::VocabOps for Cuda {
+    fn vocab_embedding<T: Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        table: &Tensor<T, Self>,
+        global_indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+        vocab_start: usize,
+        global_vocab_size: usize,
+    ) -> OpResult<()> {
+        i32::try_from(global_vocab_size)
+            .map_err(|_| OpError::Shape("global vocabulary exceeds i32 token ids".into()))?;
+        require_scope_tensor(scope, table, "vocab_embedding table")?;
+        require_scope_tensor(scope, global_indices, "vocab_embedding indices")?;
+        require_scope_tensor(scope, output, "vocab_embedding output")?;
+        for (tensor_is_contiguous, what) in [
+            (table.is_contiguous(), "table"),
+            (global_indices.is_contiguous(), "indices"),
+            (output.is_contiguous(), "output"),
+        ] {
+            if !tensor_is_contiguous {
+                return Err(OpError::Shape(format!(
+                    "vocab_embedding {what} must be contiguous"
+                )));
+            }
+        }
+        let table_shape = table.shape().as_slice();
+        if table_shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding table must be rank 2, got {:?}",
+                table_shape
+            )));
+        }
+        if table_shape[0] == 0 || table_shape[1] == 0 {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding table dimensions must be non-zero, got {:?}",
+                table_shape
+            )));
+        }
+        let vocab_end = vocab_start
+            .checked_add(table_shape[0])
+            .ok_or_else(|| OpError::Shape("vocab_embedding shard range overflows".into()))?;
+        if vocab_end > global_vocab_size {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding shard [{vocab_start}, {vocab_end}) exceeds global vocabulary {global_vocab_size}"
+            )));
+        }
+        if output.shape().as_slice() != [global_indices.numel(), table_shape[1]] {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding output shape {:?} does not match {} tokens x dim {}",
+                output.shape().as_slice(),
+                global_indices.numel(),
+                table_shape[1]
+            )));
+        }
+
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        let stream = scope_stream(scope);
+        narrow_float!(T, "vocab_embedding", |F| {
+            kernels::embedding::vocab_embedding::<F>(
+                stream,
+                &table.reinterpret::<F>(),
+                global_indices,
+                &mut output.reinterpret::<F>(),
+                vocab_start,
+            )
+        })
     }
 }
 

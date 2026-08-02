@@ -7,7 +7,8 @@ use std::alloc::Layout;
 use std::ptr::NonNull;
 
 use infer_core::ports::{
-    AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpError, OpResult,
+    AllocError, Allocator, CollectiveOps, CommAxis, CoreOps, Device, DiffusionOps, HostDevice,
+    MemoryPort, OpError, OpResult, ReduceOp, VocabOps,
 };
 use infer_core::tensor::Tensor;
 use infer_core::types::{Dtype, Shape};
@@ -40,6 +41,183 @@ impl infer_core::ports::FusedOps for Cpu {}
 
 // Decode-pipeline port: the host reference defaults ARE the CPU implementation.
 impl infer_core::ports::DecodePipelineOps for Cpu {}
+
+fn require_single_rank(
+    scope: &infer_core::exec::HostScope<Cpu>,
+    axis: CommAxis,
+    op: &str,
+) -> OpResult<()> {
+    let size = infer_core::exec::ExecScope::topology(scope).group_size(axis);
+    if size != 1 {
+        return Err(OpError::Kernel(format!(
+            "CPU {op} requires a single-rank {axis:?} group, got size {size}"
+        )));
+    }
+    Ok(())
+}
+
+impl CollectiveOps for Cpu {
+    type Comm = infer_core::ports::collective::SingleRankComm;
+
+    fn comm(_scope: &Self::Scope, _axis: CommAxis) -> Option<&Self::Comm> {
+        None
+    }
+
+    fn all_reduce<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        _op: ReduceOp,
+        _buf: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "all_reduce")
+    }
+
+    fn all_gather<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        _dim: usize,
+        shard: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "all_gather")?;
+        out.copy_from(shard)
+    }
+
+    fn reduce_scatter<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        _op: ReduceOp,
+        _dim: usize,
+        buf: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "reduce_scatter")?;
+        out.copy_from(buf)
+    }
+
+    fn broadcast<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        root: usize,
+        _buf: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "broadcast")?;
+        if root != 0 {
+            return Err(OpError::Shape(format!(
+                "single-rank broadcast root must be 0, got {root}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn send<T: Dtype>(
+        _scope: &Self::Scope,
+        _axis: CommAxis,
+        _peer: usize,
+        buf: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(buf.device().name(), "send"))
+    }
+
+    fn recv<T: Dtype>(
+        _scope: &Self::Scope,
+        _axis: CommAxis,
+        _peer: usize,
+        buf: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(buf.device().name(), "recv"))
+    }
+
+    fn all_to_all<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        send_chunks: &[Tensor<T, Self>],
+        recv_chunks: &mut [Tensor<T, Self>],
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "all_to_all")?;
+        if send_chunks.len() != recv_chunks.len() {
+            return Err(OpError::Shape(format!(
+                "all_to_all: send_chunks={} recv_chunks={}",
+                send_chunks.len(),
+                recv_chunks.len()
+            )));
+        }
+        for (src, dst) in send_chunks.iter().zip(recv_chunks.iter_mut()) {
+            dst.copy_from(src)?;
+        }
+        Ok(())
+    }
+
+    fn barrier(scope: &Self::Scope, axis: CommAxis) -> OpResult<()> {
+        require_single_rank(scope, axis, "barrier")
+    }
+}
+
+impl VocabOps for Cpu {
+    fn vocab_embedding<T: Dtype>(
+        _scope: &Self::Scope,
+        table: &Tensor<T, Self>,
+        global_indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+        vocab_start: usize,
+        global_vocab_size: usize,
+    ) -> OpResult<()> {
+        let table_shape = table.shape().as_slice();
+        if table_shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding table must be rank 2, got {:?}",
+                table_shape
+            )));
+        }
+        let (local_vocab, dim) = (table_shape[0], table_shape[1]);
+        if local_vocab == 0 || dim == 0 {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding table dimensions must be non-zero, got {:?}",
+                table_shape
+            )));
+        }
+        let vocab_end = vocab_start
+            .checked_add(local_vocab)
+            .ok_or_else(|| OpError::Shape("vocab_embedding shard range overflows".into()))?;
+        if vocab_end > global_vocab_size {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding shard [{vocab_start}, {vocab_end}) exceeds global vocabulary {global_vocab_size}"
+            )));
+        }
+        if output.shape().as_slice() != [global_indices.numel(), dim] {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding output shape {:?}, expected [{}, {}]",
+                output.shape().as_slice(),
+                global_indices.numel(),
+                dim
+            )));
+        }
+
+        let indices = unsafe {
+            std::slice::from_raw_parts(global_indices.data_ptr(), global_indices.numel())
+        };
+        for (row, &raw) in indices.iter().enumerate() {
+            if raw < 0 || raw as usize >= global_vocab_size {
+                return Err(OpError::Shape(format!(
+                    "vocab_embedding token id {raw} at position {row} outside [0, {global_vocab_size})"
+                )));
+            }
+            let dst = unsafe { output.data_ptr_mut().add(row * dim) };
+            let token = raw as usize;
+            if (vocab_start..vocab_end).contains(&token) {
+                let local = token - vocab_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(table.data_ptr().add(local * dim), dst, dim);
+                }
+            } else {
+                unsafe {
+                    std::ptr::write_bytes(dst, 0, dim);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 // ─── Cpu MemoryPort ──────────────────────────────────────────────────────────
 
@@ -1137,6 +1315,22 @@ mod tests {
         Cpu::embedding(&table, &indices, &mut output).unwrap();
         assert_eq!(&output.as_slice()[..3], &[2.1, 2.2, 2.3]);
         assert_eq!(&output.as_slice()[3..6], &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn vocab_embedding_masks_tokens_owned_by_other_ranks() {
+        let scope = infer_core::exec::HostScope::new(Cpu);
+        let table =
+            Tensor::<f32, Cpu>::from_slice(&[20.0, 21.0, 30.0, 31.0], Shape::from_slice(&[2, 2]));
+        let indices = Tensor::<i32, Cpu>::from_slice(&[0, 2, 3, 1], [4]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([4, 2]);
+
+        <Cpu as VocabOps>::vocab_embedding(&scope, &table, &indices, &mut output, 2, 4).unwrap();
+
+        assert_eq!(
+            output.as_slice(),
+            &[0.0, 0.0, 20.0, 21.0, 30.0, 31.0, 0.0, 0.0]
+        );
     }
 
     #[test]

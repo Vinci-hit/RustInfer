@@ -195,9 +195,25 @@ struct PoolState {
 }
 
 #[derive(Debug)]
+struct CudaDeviceRestore {
+    previous: i32,
+}
+
+impl Drop for CudaDeviceRestore {
+    fn drop(&mut self) {
+        if self.previous >= 0 {
+            unsafe {
+                ffi::cudaSetDevice(self.previous);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct CudaConfig {
-    #[cfg(test)]
-    _test_lease: CudaTestLease,
+    /// Device on which every stream, handle, graph and allocation below was
+    /// created. Multi-GPU teardown must reactivate it before destroying them.
+    device_id: i32,
     pub stream: ffi::cudaStream_t,
     pub cublaslt_handle: ffi::cublasLtHandle_t,
     pub cublas_handle_v2: ffi::cublasHandle_t,
@@ -250,6 +266,11 @@ pub struct CudaConfig {
     // this size-keyed free list instead of round-tripping `cudaMalloc`/
     // `cudaFree` (the latter device-synchronizes). See `PoolState`.
     pool: std::sync::Mutex<PoolState>,
+    /// Armed at the beginning of `Drop`, then dropped after every device-owned
+    /// field so the caller's previously active CUDA device is restored last.
+    restore_device: CudaDeviceRestore,
+    #[cfg(test)]
+    _test_lease: CudaTestLease,
 }
 
 impl CudaConfig {
@@ -260,6 +281,10 @@ impl CudaConfig {
     pub fn with_memory_plan(memory_plan: CudaMemoryPlan) -> OpResult<Self> {
         #[cfg(test)]
         let test_lease = CudaTestLease::acquire();
+        let mut device_id = -1;
+        unsafe {
+            cuda_check!(ffi::cudaGetDevice(&mut device_id));
+        }
         let mut stream: ffi::cudaStream_t = std::ptr::null_mut();
         unsafe {
             cuda_check!(ffi::cudaStreamCreate(&mut stream));
@@ -306,8 +331,7 @@ impl CudaConfig {
             cuda_check!(ffi::cudaEventCreate(&mut ev_out));
         }
         Ok(Self {
-            #[cfg(test)]
-            _test_lease: test_lease,
+            device_id,
             stream,
             cublaslt_handle,
             cublas_handle_v2,
@@ -326,6 +350,9 @@ impl CudaConfig {
             arena_off: std::sync::atomic::AtomicUsize::new(0),
             arena_enabled: std::sync::atomic::AtomicBool::new(false),
             pool: std::sync::Mutex::new(PoolState::default()),
+            restore_device: CudaDeviceRestore { previous: -1 },
+            #[cfg(test)]
+            _test_lease: test_lease,
         })
     }
 
@@ -734,6 +761,21 @@ impl CudaConfig {
 impl Drop for CudaConfig {
     fn drop(&mut self) {
         unsafe {
+            // Fields such as graphs and DeviceRegion are dropped after this
+            // body. Arm the final restore field, then leave the owning device
+            // active until all of those device-local resources are gone.
+            let mut previous = -1;
+            if ffi::cudaGetDevice(&mut previous) == ffi::cudaError_cudaSuccess {
+                self.restore_device.previous = previous;
+            }
+            let set_device = ffi::cudaSetDevice(self.device_id);
+            if set_device != ffi::cudaError_cudaSuccess {
+                tracing::error!(
+                    device = self.device_id,
+                    error = ?set_device,
+                    "cudaSetDevice during CudaConfig teardown failed"
+                );
+            }
             if !self.ev_in.is_null() {
                 ffi::cudaEventDestroy(self.ev_in);
             }

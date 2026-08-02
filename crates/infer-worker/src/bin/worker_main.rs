@@ -521,9 +521,22 @@ fn main() -> Result<(), String> {
         }
     };
     eprintln!(
-        "[bootstrap] LoadModel: path={} max_seqs={} max_tokens={} max_model_len={}",
-        load.model_path, load.max_batch_seqs, load.max_batch_tokens, load.max_model_len,
+        "[bootstrap] LoadModel: path={} max_seqs={} max_tokens={} max_model_len={} tp={}/{} pp={}/{}",
+        load.model_path,
+        load.max_batch_seqs,
+        load.max_batch_tokens,
+        load.max_model_len,
+        load.tp_rank,
+        load.tp_size,
+        load.pp_rank,
+        load.pp_size,
     );
+    if load.pp_rank != 0 || load.pp_size != 1 {
+        return Err(format!(
+            "pipeline parallelism is not implemented; expected pp_rank/pp_size=0/1, got {}/{}",
+            load.pp_rank, load.pp_size
+        ));
+    }
 
     // ── 4. Load model ──
     let device_id = parse_device_id(&load.device)?;
@@ -560,7 +573,8 @@ fn main() -> Result<(), String> {
 
     let st_path = Path::new(&load.model_path);
     let reader = SafetensorsReader::open(st_path).map_err(|e| format!("open weights: {}", e))?;
-    let loader = WeightLoader::new(&reader);
+    let loader = WeightLoader::with_tensor_parallel(&reader, load.tp_rank, load.tp_size)
+        .map_err(|e| format!("invalid tensor-parallel topology: {}", e))?;
     let load_start = Instant::now();
 
     // Reconcile the config's quant claim with the actual weights: only enable

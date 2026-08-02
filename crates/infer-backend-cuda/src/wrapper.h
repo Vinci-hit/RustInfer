@@ -3,6 +3,7 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cudnn.h>
+#include <nccl.h>
 #include "kernels/total_head.h"
 
 #ifndef cublasCreate_v2

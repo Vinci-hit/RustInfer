@@ -13,6 +13,7 @@ pub mod fused_ops;
 pub mod math_ops;
 pub mod pipeline_ops;
 pub mod sampler;
+pub mod vocab_ops;
 
 // Two op surfaces coexist intentionally:
 //   * `CoreOps`/`DiffusionOps`/`OpBackend` is the scope-less diffusion surface.
@@ -31,3 +32,4 @@ pub use pipeline_ops::{
     CompactExtendControlArgs, DecodePipelineOps, MergeCompactDecodeArgs, MergeCompactMixedArgs,
 };
 pub use sampler::{AcceptReject, SampleBatch, SampledToken, Sampler, SamplingParams};
+pub use vocab_ops::VocabOps;

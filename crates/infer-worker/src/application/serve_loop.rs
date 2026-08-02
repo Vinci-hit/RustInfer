@@ -15,9 +15,10 @@ use crate::application::runtime::Runtime;
 use crate::application::sampler_stack::GreedySampler;
 use crate::application::worker_scheduler::handle_fused_step;
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
+use crate::domain::exec::{RankPair, TopologyShape};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
-use crate::domain::ports::OpError;
+use crate::domain::ports::{CollectiveOps, CommAxis, OpError};
 use crate::infrastructure::cuda::{Cuda, CudaScope, device_utils};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
@@ -112,9 +113,30 @@ where
         )
     };
 
+    let topology = TopologyShape {
+        tp: RankPair {
+            rank: bs.load.tp_rank,
+            size: bs.load.tp_size,
+        },
+        pp: RankPair {
+            rank: bs.load.pp_rank,
+            size: bs.load.pp_size,
+        },
+        dp: RankPair { rank: 0, size: 1 },
+        node: RankPair { rank: 0, size: 1 },
+    };
+    let scope = CudaScope::new(bs.cuda.clone())
+        .with_topology(topology)
+        .map_err(|error| format!("invalid CUDA execution topology: {error}"))?;
+    if topology.tp.size > 1 && <Cuda as CollectiveOps>::comm(&scope, CommAxis::Tp).is_none() {
+        return Err(format!(
+            "TP weights loaded for rank {}/{}, but no TP communicator is configured",
+            topology.tp.rank, topology.tp.size
+        ));
+    }
     let mut runner: Runtime<bf16, Cuda, M> = Runtime::new(
         model,
-        CudaScope::new(bs.cuda.clone()),
+        scope,
         Box::new(GreedySampler),
         bootstrap_pool_blocks,
         bs.block_size,
