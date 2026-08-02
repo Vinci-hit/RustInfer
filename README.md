@@ -288,8 +288,11 @@ Config is a single TOML shared by all three processes. Key fields:
 |-------------------------|---------|
 | `model`                 | Path to the HF model directory (config + safetensors + tokenizer). |
 | `model_name`            | Name reported by the `/v1` API. |
-| `device`                | e.g. `cuda:0`. |
+| `device`                | Rank-0 CUDA device, e.g. `cuda:0`; TP ranks use consecutive devices. |
+| `tensor_parallel_size`  | Number of GPUs in the single-process TP group (`1` = disabled). |
 | `port`                  | HTTP port for the server. |
+| `tp_operation_timeout_secs` | Fail-stop deadline for one mirrored TP inference operation. |
+| `tp_startup_timeout_secs` | Longer fail-stop deadline for NCCL and follower startup. |
 | `max_batch_tokens`      | Token budget per forward batch. |
 | `max_batch_seqs`        | Max concurrent sequences in a batch. |
 | `max_model_len`         | Max context length. |

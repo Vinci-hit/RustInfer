@@ -24,6 +24,7 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         ldc: i32,
+        handle: crate::ffi::cublasHandle_t,
         stream: cudaStream_t,
     );
     fn hgemv_bf16_cu(
@@ -43,7 +44,8 @@ unsafe extern "C" {
         k: i32,
         ldc: i32,
         stream: cudaStream_t,
-        handle: crate::ffi::cublasLtHandle_t,
+        lt_handle: crate::ffi::cublasLtHandle_t,
+        handle: crate::ffi::cublasHandle_t,
         workspace: *mut std::ffi::c_void,
         workspace_size: usize,
     );
@@ -110,7 +112,7 @@ pub(crate) fn init_fp8_block_matmul(device_id: i32) -> OpResult<()> {
 /// cold-shape build from every distinct-length prefill's TTFT. Decode (graph
 /// capture + its warmup) must leave this off so the cuBLASLt cache is built.
 pub fn set_eager_prefill_gemm(on: bool) {
-    // SAFETY: stores an int into a process-global atomic; no aliasing.
+    // SAFETY: updates only the calling rank thread's C++ thread-local flag.
     unsafe { zimage_set_eager_prefill_gemm(on as i32) };
 }
 
@@ -176,6 +178,7 @@ pub fn matmul<T: Dtype>(
                         n as i32,
                         k as i32,
                         ldc,
+                        cfg.cublas_handle_v2,
                         stream,
                     );
                 }
@@ -209,6 +212,7 @@ pub fn matmul<T: Dtype>(
                         ldc,
                         stream,
                         cfg.cublaslt_handle,
+                        cfg.cublas_handle_v2,
                         workspace.ptr(),
                         workspace.size(),
                     );

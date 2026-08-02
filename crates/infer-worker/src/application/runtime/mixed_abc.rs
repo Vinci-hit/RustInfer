@@ -432,6 +432,12 @@ where
     /// The ragged/varlen attention handles any per-row q distribution; the eager
     /// finalize samples one token per row in `req.seqs` order.
     pub fn step_fused_eager(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
+        if self.scope.topology().tp.size > 1 {
+            return Err(OpError::unsupported(
+                "tensor-parallel",
+                "legacy fused eager entrypoint",
+            ));
+        }
         // Eager fused forward. Route ALL transient scratch through the bump arena
         // (zero cudaMalloc/cudaFree) instead of the recycling pool, which churns
         // cudaMalloc on every new ragged shape and cudaFree (device-sync) once
@@ -473,7 +479,7 @@ where
         row_kind: &[RaggedRowKind],
         next_slots: Option<&[u32]>,
     ) -> OpResult<MixedStepTicket> {
-        self.issue_fused_abc_inner(req, row_kind, next_slots, 0, false)
+        self.issue_fused_abc_replicated(req, row_kind, next_slots, 0, false)
     }
 
     /// Overlapped issue for the drain-overlap fused path: the PRIOR decode
@@ -497,7 +503,72 @@ where
         next_slots: Option<&[u32]>,
         c_prefix_rows: usize,
     ) -> OpResult<MixedStepTicket> {
-        self.issue_fused_abc_inner(req, row_kind, next_slots, c_prefix_rows, true)
+        self.issue_fused_abc_replicated(req, row_kind, next_slots, c_prefix_rows, true)
+    }
+
+    fn issue_fused_abc_replicated(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_slots: Option<&[u32]>,
+        c_prefix_rows: usize,
+        overlapped: bool,
+    ) -> OpResult<MixedStepTicket> {
+        let tp = self.scope.topology().tp;
+        let total_started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "fused_issue_replicated_begin",
+            tp_rank = tp.rank,
+            tp_size = tp.size,
+            rows = req.seqs.len(),
+            c_prefix_rows,
+            overlapped,
+            next_slots = next_slots.map_or(0, <[u32]>::len),
+            "[tp-diag] runtime fused stage"
+        );
+        let dispatch_started = std::time::Instant::now();
+        let pending = self.dispatch_peer_command(super::RuntimePeerCommand::IssueFusedAbc {
+            req: Box::new(req.clone()),
+            row_kind: row_kind.to_vec(),
+            next_slots: next_slots.map(<[u32]>::to_vec),
+            c_prefix_rows,
+            overlapped,
+        })?;
+        tracing::debug!(
+            stage = "fused_issue_peer_dispatched",
+            tp_rank = tp.rank,
+            elapsed_us = dispatch_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        let local_started = std::time::Instant::now();
+        let local =
+            self.issue_fused_abc_inner(req, row_kind, next_slots, c_prefix_rows, overlapped);
+        tracing::debug!(
+            stage = "fused_issue_local_return",
+            tp_rank = tp.rank,
+            success = local.is_ok(),
+            elapsed_us = local_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        let peer_wait_started = std::time::Instant::now();
+        let followers = self.wait_peer_command(pending);
+        tracing::debug!(
+            stage = "fused_issue_peer_wait_return",
+            tp_rank = tp.rank,
+            success = followers.is_ok(),
+            elapsed_us = peer_wait_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        let result =
+            super::complete_replicated(&mut self.peers, "issue_fused_abc", local, followers);
+        tracing::debug!(
+            stage = "fused_issue_replicated_return",
+            tp_rank = tp.rank,
+            success = result.is_ok(),
+            total_elapsed_us = total_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        result
     }
 
     fn issue_fused_abc_inner(
@@ -508,6 +579,16 @@ where
         c_prefix_rows: usize,
         defer_copy_out: bool,
     ) -> OpResult<MixedStepTicket> {
+        let tp_rank = self.scope.topology().tp.rank;
+        let local_total = std::time::Instant::now();
+        tracing::debug!(
+            stage = "fused_local_begin",
+            tp_rank,
+            rows = req.seqs.len(),
+            c_prefix_rows,
+            defer_copy_out,
+            "[tp-diag] runtime fused local stage"
+        );
         let plan = self.validate_mixed_abc_request(req, row_kind)?;
         if c_prefix_rows > 0 {
             // The C-gathered prefix is an eager-only contract: the graph path
@@ -526,19 +607,69 @@ where
             }
         }
         if let Some(slots) = next_slots {
+            let upload_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_next_slots_upload_begin",
+                tp_rank,
+                slots = slots.len(),
+                "[tp-diag] runtime fused local stage"
+            );
             self.upload_mixed_next_slots(slots)?;
+            tracing::debug!(
+                stage = "fused_next_slots_upload_return",
+                tp_rank,
+                elapsed_us = upload_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
         }
 
         let trace = std::env::var_os("RUSTINFER_MIXED_TRACE").is_some();
         let t0 = std::time::Instant::now();
+        let graph_started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "fused_graph_attempt_begin",
+            tp_rank,
+            rows = plan.batch,
+            tokens = plan.num_tokens,
+            "[tp-diag] runtime fused local stage"
+        );
         let ran_graph = self.try_run_mixed_abc_graph(&plan, req, row_kind, next_slots.is_some())?;
+        tracing::debug!(
+            stage = "fused_graph_attempt_return",
+            tp_rank,
+            ran_graph,
+            elapsed_us = graph_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused local stage"
+        );
         if !ran_graph {
+            let index_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_index_upload_begin",
+                tp_rank,
+                rows = plan.batch,
+                tokens = plan.num_tokens,
+                "[tp-diag] runtime fused local stage"
+            );
             self.upload_index(&plan, req)?;
+            tracing::debug!(
+                stage = "fused_index_upload_return",
+                tp_rank,
+                elapsed_us = index_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
             let run_plan = self.eager_mixed_run_plan(&plan);
             let run_tokens = run_plan
                 .as_ref()
                 .map(|rp| rp.num_tokens)
                 .unwrap_or(plan.num_tokens);
+            let input_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_input_prepare_begin",
+                tp_rank,
+                c_prefix_rows,
+                run_tokens,
+                "[tp-diag] runtime fused local stage"
+            );
             let input_ids = if c_prefix_rows > 0 {
                 // q=1 decode rows lead the batch, so flat tape offset == row
                 // index: gather C[0..c] into the tape prefix on device and
@@ -559,14 +690,53 @@ where
             } else {
                 self.input_ids_tensor(req, &plan)?
             };
+            tracing::debug!(
+                stage = "fused_input_prepare_return",
+                tp_rank,
+                elapsed_us = input_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
+            let metadata_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_metadata_upload_begin",
+                tp_rank,
+                rows = plan.batch,
+                "[tp-diag] runtime fused local stage"
+            );
             self.upload_mixed_abc_metadata(req, row_kind, plan.batch)?;
+            tracing::debug!(
+                stage = "fused_metadata_upload_return",
+                tp_rank,
+                elapsed_us = metadata_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
             // WAR guard for the overlapped issue: the in-flight step's copy-out
             // (So) reads A + the merge side-bands; make compute wait its ev_out
             // before this region's merge rewrites them. No-op after a drain
             // (the sync already collected the copy-out).
             if self.abc.copy_out_recorded {
+                let wait_started = std::time::Instant::now();
+                tracing::debug!(
+                    stage = "fused_wait_prior_copy_out_begin",
+                    tp_rank,
+                    "[tp-diag] runtime fused local stage"
+                );
                 D::pipeline_compute_wait_copy_out(&self.scope)?;
+                tracing::debug!(
+                    stage = "fused_wait_prior_copy_out_return",
+                    tp_rank,
+                    elapsed_us = wait_started.elapsed().as_micros() as u64,
+                    "[tp-diag] runtime fused local stage"
+                );
             }
+            let region_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_eager_region_begin",
+                tp_rank,
+                rows = plan.batch,
+                tokens = run_tokens,
+                "[tp-diag] runtime fused local stage"
+            );
             D::pipeline_arena_begin(&self.scope)?;
             let result = self.run_mixed_abc_eager_region(
                 run_plan.as_ref().unwrap_or(&plan),
@@ -575,12 +745,40 @@ where
                 next_slots.is_some(),
             );
             D::pipeline_arena_end(&self.scope);
+            tracing::debug!(
+                stage = "fused_eager_region_return",
+                tp_rank,
+                success = result.is_ok(),
+                elapsed_us = region_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
             result?;
         }
         let copied_out = !defer_copy_out;
         if copied_out {
+            let copy_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_copy_out_enqueue_begin",
+                tp_rank,
+                rows = plan.batch,
+                "[tp-diag] runtime fused local stage"
+            );
             self.copy_out_mixed_abc(plan.batch)?;
+            tracing::debug!(
+                stage = "fused_copy_out_enqueue_return",
+                tp_rank,
+                elapsed_us = copy_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
         }
+        tracing::debug!(
+            stage = "fused_local_return",
+            tp_rank,
+            rows = plan.batch,
+            copied_out,
+            total_elapsed_us = local_total.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused local stage"
+        );
         Ok(MixedStepTicket {
             plan,
             ran_graph,
@@ -600,13 +798,93 @@ where
         req: &StepRequest,
         row_kind: &[RaggedRowKind],
     ) -> OpResult<StepOutput> {
+        let tp = self.scope.topology().tp;
+        let total_started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "fused_finalize_replicated_begin",
+            tp_rank = tp.rank,
+            tp_size = tp.size,
+            rows = req.seqs.len(),
+            "[tp-diag] runtime fused stage"
+        );
+        let pending = self.dispatch_peer_command(super::RuntimePeerCommand::FinalizeFusedAbc {
+            req: Box::new(req.clone()),
+            row_kind: row_kind.to_vec(),
+        })?;
+        let local_started = std::time::Instant::now();
+        let local = self.finalize_fused_abc_local(ticket, req, row_kind);
+        tracing::debug!(
+            stage = "fused_finalize_local_return",
+            tp_rank = tp.rank,
+            success = local.is_ok(),
+            elapsed_us = local_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        let peer_wait_started = std::time::Instant::now();
+        let followers = self.wait_peer_command(pending);
+        tracing::debug!(
+            stage = "fused_finalize_peer_wait_return",
+            tp_rank = tp.rank,
+            success = followers.is_ok(),
+            elapsed_us = peer_wait_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        let result =
+            super::complete_replicated(&mut self.peers, "finalize_fused_abc", local, followers);
+        tracing::debug!(
+            stage = "fused_finalize_replicated_return",
+            tp_rank = tp.rank,
+            success = result.is_ok(),
+            total_elapsed_us = total_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused stage"
+        );
+        result
+    }
+
+    fn finalize_fused_abc_local(
+        &mut self,
+        ticket: MixedStepTicket,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+    ) -> OpResult<StepOutput> {
+        let tp_rank = self.scope.topology().tp.rank;
+        let finalize_started = std::time::Instant::now();
         // Overlapped issue deferred the copy-out (the host mirrors belonged to
         // the then-in-flight decode step); by the time the caller finalizes
         // the fused step that step has been drained, so enqueue it now.
         if !ticket.copied_out {
+            let copy_started = std::time::Instant::now();
+            tracing::debug!(
+                stage = "fused_deferred_copy_out_begin",
+                tp_rank,
+                rows = ticket.plan.batch,
+                "[tp-diag] runtime fused local stage"
+            );
             self.copy_out_mixed_abc(ticket.plan.batch)?;
+            tracing::debug!(
+                stage = "fused_deferred_copy_out_return",
+                tp_rank,
+                elapsed_us = copy_started.elapsed().as_micros() as u64,
+                "[tp-diag] runtime fused local stage"
+            );
         }
-        D::pipeline_synchronize_copy_out(&self.scope)?;
+        let sync_started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "fused_copy_out_sync_begin",
+            tp_rank,
+            rows = ticket.plan.batch,
+            "[tp-diag] runtime fused local stage"
+        );
+        let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
+        tracing::debug!(
+            stage = "fused_copy_out_sync_return",
+            tp_rank,
+            rows = ticket.plan.batch,
+            success = sync_result.is_ok(),
+            elapsed_us = sync_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused local stage"
+        );
+        sync_result?;
         if ticket.trace {
             // `elapsed` spans issue→sync, so it includes any host work the
             // caller overlapped between the two halves.
@@ -619,7 +897,18 @@ where
                 ticket.t0.elapsed().as_secs_f64() * 1e3
             );
         }
-        self.finalize_mixed_abc(&ticket.plan, req, row_kind)
+        let parse_started = std::time::Instant::now();
+        let result = self.finalize_mixed_abc(&ticket.plan, req, row_kind);
+        tracing::debug!(
+            stage = "fused_host_parse_return",
+            tp_rank,
+            rows = ticket.plan.batch,
+            success = result.is_ok(),
+            elapsed_us = parse_started.elapsed().as_micros() as u64,
+            total_elapsed_us = finalize_started.elapsed().as_micros() as u64,
+            "[tp-diag] runtime fused local stage"
+        );
+        result
     }
 
     /// Synchronous mixed step: issue + finalize back-to-back. Used by the
@@ -965,6 +1254,11 @@ where
         next_control: bool,
         control_rows: usize,
     ) -> OpResult<()> {
+        // The merge consumes C to decide emitted, active, and finished rows.
+        // Rank 0's ids must be installed on every rank before those decisions
+        // mutate the replicated decode state.
+        self.broadcast_tp_argmax(plan.batch)?;
+
         let mut a_view = self.input_ids_buf.view_raw(
             Shape::from_slice(&[plan.batch]),
             Shape::from_slice(&[plan.batch.max(1)]).contiguous_strides(),

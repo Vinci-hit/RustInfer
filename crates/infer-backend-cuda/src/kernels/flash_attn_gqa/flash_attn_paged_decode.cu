@@ -11,6 +11,7 @@
 
 #include "flash_attn_gqa.h"
 #include "flash_attn_paged_common.cuh"
+#include "cuda_kernel_attr.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -20,7 +21,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <mutex>
 #include <type_traits>
 
 namespace flash_paged_decode {
@@ -336,18 +336,20 @@ __global__ void paged_decode_combine_kernel(
     }
 }
 
-// Number of SMs on the active device, queried once. Used to pick the KV-split
+// Number of SMs on the active device, cached by thread/device. Used to pick the KV-split
 // count by occupancy so we only split far enough to fill the GPU.
 static int device_sm_count() {
-    static int sm = 0;
-    static std::once_flag once;
-    std::call_once(once, [&]() {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { sm = 132; return; }
+    static thread_local int cached_device = -1;
+    static thread_local int sm = 132;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return sm;
+    if (dev != cached_device) {
         cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) { sm = 132; return; }
-        sm = prop.multiProcessorCount > 0 ? prop.multiProcessorCount : 132;
-    });
+        sm = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.multiProcessorCount > 0
+            ? prop.multiProcessorCount
+            : 132;
+        cached_device = dev;
+    }
     return sm;
 }
 
@@ -400,11 +402,9 @@ static cudaError_t launch_impl(
         static_cast<size_t>(kNumGroups) * HeadDim * sizeof(Elem);
 
     auto pass1 = paged_decode_pass1_kernel<Elem, HeadDim>;
-    static std::once_flag pass1_attr_once;
-    static cudaError_t pass1_attr_err = cudaSuccess;
-    std::call_once(pass1_attr_once, [&]() {
-        pass1_attr_err = cudaFuncSetAttribute(pass1, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size));
-    });
+    static rustinfer::cuda::PerDeviceKernelAttribute pass1_attr;
+    const cudaError_t pass1_attr_err = pass1_attr.set_max_dynamic_shared_memory(
+        reinterpret_cast<const void*>(pass1), static_cast<int>(smem_size));
     if (pass1_attr_err != cudaSuccess) return pass1_attr_err;
 
     pass1<<<grid1, block1, smem_size, stream>>>(

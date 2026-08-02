@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <mutex>  // RustInfer: once-per-instantiation cudaFuncSetAttribute
+#include "../../flash_attn_gqa/cuda_kernel_attr.cuh"
 
 #include "cute/tensor.hpp"
 
@@ -187,13 +187,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     } else {
         auto kernel = cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
-            // RustInfer: the attribute is sticky per kernel per process, and this
-            // launch path runs per layer per step — set it once per instantiation
-            // instead of paying ~2us on every call.
-            static std::once_flag smem_attr_once;
-            std::call_once(smem_attr_once, [&] {
-                CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-            });
+            // The attribute belongs to the current CUDA context.  Cache it per
+            // device so one process can safely drive multiple TP ranks.
+            static rustinfer::cuda::PerDeviceKernelAttribute smem_attr;
+            CHECK_CUDA(smem_attr.set_max_dynamic_shared_memory(
+                reinterpret_cast<const void*>(kernel), smem_size));
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,

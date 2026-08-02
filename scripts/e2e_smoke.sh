@@ -18,6 +18,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 CONFIG="$1"
 PORT="$2"
 PROMPT="${3:-Say hello in one short sentence.}"
+EXPECTED_CONTENT_PREFIX="${EXPECTED_CONTENT_PREFIX:-}"
 READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-180}"
 BIN_DIR="${BIN_DIR:-$REPO_ROOT/target/release}"
 
@@ -104,15 +105,21 @@ curl --fail-with-body --silent --show-error --max-time 120 \
     -H 'Content-Type: application/json' \
     --data-binary "$payload" >"$response"
 
-python3 - "$response" <<'PY'
+python3 - "$response" "$EXPECTED_CONTENT_PREFIX" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     response = json.load(handle)
 choices = response.get("choices") or []
-if not choices or not choices[0].get("message", {}).get("content"):
+content = choices[0].get("message", {}).get("content") if choices else None
+if not content:
     raise SystemExit(f"invalid completion response: {response}")
+expected_prefix = sys.argv[2]
+if expected_prefix and not content.startswith(expected_prefix):
+    raise SystemExit(
+        f"completion did not start with expected prefix {expected_prefix!r}: {content!r}"
+    )
 print(json.dumps(response, ensure_ascii=False))
 PY
 

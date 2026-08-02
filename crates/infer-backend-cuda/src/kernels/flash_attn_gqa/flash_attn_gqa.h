@@ -239,7 +239,7 @@ void launch_flash_attn_paged_ragged_fp16(
     float softmax_scale, int is_causal,
     cudaStream_t stream);
 
-void launch_flash_attn_paged_ragged_cute_bf16(
+int launch_flash_attn_paged_ragged_cute_bf16(
     const __nv_bfloat16* q, int64_t qss, int64_t qsh,
     const __nv_bfloat16* k_pool,
     const __nv_bfloat16* v_pool,
@@ -258,7 +258,7 @@ void launch_flash_attn_paged_ragged_cute_bf16(
     float softmax_scale, int is_causal,
     cudaStream_t stream);
 
-void launch_flash_attn_paged_ragged_cute_fp16(
+int launch_flash_attn_paged_ragged_cute_fp16(
     const __half* q, int64_t qss, int64_t qsh,
     const __half* k_pool,
     const __half* v_pool,

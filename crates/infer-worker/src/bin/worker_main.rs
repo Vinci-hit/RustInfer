@@ -13,7 +13,8 @@
 //! per-step decode commands.
 
 use std::path::Path;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use half::bf16;
@@ -22,9 +23,14 @@ use serde::Deserialize;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION;
 
-use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
+use infer_worker::application::runtime::RuntimePeerWatchdog;
+use infer_worker::application::serve_loop::{
+    Bootstrap, RuntimeFollowerFactory, RuntimeFollowerInit, run_with_model,
+};
 use infer_worker::domain::dtype::quant::QuantScheme;
-use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan};
+use infer_worker::domain::model::DecoderModel;
+use infer_worker::domain::ports::{OpError, OpResult};
+use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan, NcclCommunicator, device_utils};
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
@@ -452,6 +458,74 @@ fn parse_device_id(spec: &str) -> Result<i32, String> {
         .map_err(|e: std::num::ParseIntError| format!("invalid device id: {}", e))
 }
 
+struct TpFollowerResource {
+    rank: usize,
+    cuda: Cuda,
+    communicator: Arc<NcclCommunicator>,
+}
+
+/// Build one factory per non-zero TP rank. The factory is invoked inside that
+/// rank's long-lived Runtime thread, so neither the model nor its `Rc`-backed
+/// forward scratch ever crosses a thread boundary.
+fn make_follower_factories<M, F>(
+    devices: Vec<TpFollowerResource>,
+    model_path: String,
+    load_cfg: LoadConfig,
+    tp_size: usize,
+    build: F,
+) -> Vec<RuntimeFollowerFactory<M>>
+where
+    M: DecoderModel<bf16, Cuda> + 'static,
+    F: for<'a> Fn(&WeightLoader<'a>, &LoadConfig, &Cuda) -> OpResult<M> + Copy + Send + 'static,
+{
+    devices
+        .into_iter()
+        .map(|resource| {
+            let TpFollowerResource {
+                rank,
+                cuda,
+                communicator,
+            } = resource;
+            let model_path = model_path.clone();
+            let load_cfg = load_cfg.clone();
+            Box::new(move |init: RuntimeFollowerInit| {
+                if init.rank != rank || init.size != tp_size {
+                    return Err(OpError::Shape(format!(
+                        "TP follower factory rank {rank}/{tp_size} received init {}/{}",
+                        init.rank, init.size
+                    )));
+                }
+
+                // CUDA's current device is thread-local. The `Cuda` handles
+                // were created by the controller thread, so establish this
+                // rank's device before any allocator/model call on the new
+                // Runtime thread and keep it current for that thread's life.
+                device_utils::set_current_device(cuda.device_id).map_err(|error| {
+                    OpError::Kernel(format!(
+                        "set TP rank {rank} CUDA device {}: {error}",
+                        cuda.device_id
+                    ))
+                })?;
+
+                let scope = init.build_scope(cuda.clone(), communicator)?;
+                let reader = SafetensorsReader::open(Path::new(&model_path)).map_err(|error| {
+                    OpError::Kernel(format!("open TP rank {rank} weights: {error}"))
+                })?;
+                let loader = WeightLoader::with_tensor_parallel(&reader, rank, tp_size)?;
+                let started = Instant::now();
+                let model = build(&loader, &load_cfg, &cuda)?;
+                tracing::info!(
+                    rank,
+                    size = tp_size,
+                    elapsed_seconds = started.elapsed().as_secs_f32(),
+                    "TP follower weights loaded"
+                );
+                init.build_runtime(model, scope)
+            }) as RuntimeFollowerFactory<M>
+        })
+        .collect()
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let cfg = infer_protocol::RustInferConfig::load(&args.config)?;
@@ -537,6 +611,12 @@ fn main() -> Result<(), String> {
             load.pp_rank, load.pp_size
         ));
     }
+    if load.tp_rank != 0 || load.tp_size == 0 {
+        return Err(format!(
+            "the scheduler-facing worker requires tp_rank=0 and tp_size>0, got {}/{}",
+            load.tp_rank, load.tp_size
+        ));
+    }
 
     // ── 4. Load model ──
     let device_id = parse_device_id(&load.device)?;
@@ -551,8 +631,76 @@ fn main() -> Result<(), String> {
         "[bootstrap] cuda_memory: kernel={}MiB graph={}MiB pool={}MiB",
         cuda_memory.kernel_workspace_mib, cuda_memory.graph_arena_mib, cuda_memory.pool_retain_mib,
     );
-    let cuda = Cuda::with_memory_plan(device_id, memory_plan)
-        .map_err(|e| format!("Cuda::with_memory_plan: {:?}", e))?;
+    // A single worker process owns one CUDA Runtime rank per device. `device`
+    // names rank 0; higher TP ranks use consecutive device ids. Construct all
+    // devices up front so an invalid/missing GPU fails before the whole
+    // single-process NCCL group is created.
+    let mut rank_devices = Vec::with_capacity(load.tp_size);
+    for rank in 0..load.tp_size {
+        let offset = i32::try_from(rank)
+            .map_err(|_| format!("TP rank {rank} does not fit a CUDA device id"))?;
+        let rank_device_id = device_id
+            .checked_add(offset)
+            .ok_or_else(|| format!("CUDA device id overflow: base={device_id} TP rank={rank}"))?;
+        let cuda = Cuda::with_memory_plan(rank_device_id, memory_plan).map_err(|e| {
+            format!(
+                "Cuda::with_memory_plan for TP rank {rank}/{} on cuda:{rank_device_id}: {:?}",
+                load.tp_size, e
+            )
+        })?;
+        eprintln!(
+            "[bootstrap] TP rank {}/{} -> cuda:{}",
+            rank, load.tp_size, rank_device_id
+        );
+        rank_devices.push((rank, cuda));
+    }
+    // All TP ranks live in this process, so create the communicator group in
+    // one NCCL call. This cannot strand rank 0 waiting for a follower thread
+    // that failed before entering a per-rank rendezvous.
+    let all_devices: Vec<Cuda> = rank_devices.iter().map(|(_, cuda)| cuda.clone()).collect();
+    let mut communicators = if load.tp_size > 1 {
+        let watchdog = RuntimePeerWatchdog::fail_stop()
+            .map_err(|error| format!("start NCCL initialization watchdog: {error}"))?;
+        let timeout = Duration::from_secs(cfg.tp_startup_timeout_secs);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("NCCL initialization deadline overflowed Instant")?;
+        watchdog
+            .arm(0, "NCCL group initialization", deadline)
+            .map_err(|error| format!("arm NCCL initialization watchdog: {error}"))?;
+        let initialized = NcclCommunicator::init_all(&all_devices);
+        watchdog
+            .disarm(0)
+            .map_err(|error| format!("disarm NCCL initialization watchdog: {error}"))?;
+        drop(watchdog);
+        initialized.map_err(|error| format!("initialize TP{} NCCL group: {error}", load.tp_size))?
+    } else {
+        Vec::new()
+    };
+    let (_, cuda) = rank_devices.remove(0);
+    let leader_communicator = if communicators.is_empty() {
+        None
+    } else {
+        Some(communicators.remove(0))
+    };
+    let follower_devices: Vec<_> = rank_devices
+        .into_iter()
+        .zip(communicators)
+        .map(|((rank, cuda), communicator)| TpFollowerResource {
+            rank,
+            cuda,
+            communicator,
+        })
+        .collect();
+    if follower_devices.len() != load.tp_size.saturating_sub(1) {
+        return Err(format!(
+            "TP{} communicator/device mismatch: got {} followers",
+            load.tp_size,
+            follower_devices.len()
+        ));
+    }
+    device_utils::set_current_device(cuda.device_id)
+        .map_err(|error| format!("set TP rank 0 CUDA device {}: {error}", cuda.device_id))?;
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
@@ -644,12 +792,23 @@ fn main() -> Result<(), String> {
         server_heartbeat_ms,
         model_type: model_type.clone(),
         capture_sizes: cfg.capture_sizes.clone(),
+        peer_timeout: Duration::from_secs(cfg.tp_operation_timeout_secs),
+        peer_startup_timeout: Duration::from_secs(cfg.tp_startup_timeout_secs),
+        tp_communicator: leader_communicator.clone(),
+        tp_devices: &all_devices,
     };
 
     match model_type.as_str() {
         "llama3" => {
             let model = llama3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("llama3::build: {:?}", e))?;
+            let followers = make_follower_factories(
+                follower_devices,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                load.tp_size,
+                llama3::build::<bf16, Cuda>,
+            );
             eprintln!(
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
@@ -659,6 +818,7 @@ fn main() -> Result<(), String> {
                 &data,
                 model,
                 make_bootstrap(),
+                followers,
                 &eos_ids,
                 args.profile_cuda_steps,
             )?;
@@ -666,6 +826,13 @@ fn main() -> Result<(), String> {
         "qwen3" => {
             let model = qwen3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("qwen3::build: {:?}", e))?;
+            let followers = make_follower_factories(
+                follower_devices,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                load.tp_size,
+                qwen3::build::<bf16, Cuda>,
+            );
             eprintln!(
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
@@ -675,6 +842,7 @@ fn main() -> Result<(), String> {
                 &data,
                 model,
                 make_bootstrap(),
+                followers,
                 &eos_ids,
                 args.profile_cuda_steps,
             )?;
@@ -682,6 +850,13 @@ fn main() -> Result<(), String> {
         "qwen3_moe" => {
             let model = qwen3_moe::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("qwen3_moe::build: {:?}", e))?;
+            let followers = make_follower_factories(
+                follower_devices,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                load.tp_size,
+                qwen3_moe::build::<bf16, Cuda>,
+            );
             eprintln!(
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
@@ -691,6 +866,7 @@ fn main() -> Result<(), String> {
                 &data,
                 model,
                 make_bootstrap(),
+                followers,
                 &eos_ids,
                 args.profile_cuda_steps,
             )?;

@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
     tracing::info!("  max_batch_seqs: {}", cfg.max_batch_seqs);
     tracing::info!("  max_batch_tokens: {}", cfg.max_batch_tokens);
     tracing::info!("  max_model_len: {}", cfg.max_model_len);
+    tracing::info!("  tensor_parallel_size: {}", cfg.tensor_parallel_size);
     tracing::info!("  paged_block_size: {}", paged_block_size);
     tracing::info!("  chunked_prefill_size: {:?}", cfg.chunked_prefill());
     tracing::info!("  enable_prefix_caching: {}", cfg.enable_prefix_caching);
@@ -103,7 +104,7 @@ async fn main() -> Result<()> {
         max_model_len: cfg.max_model_len,
         mem_fraction_static: cfg.mem_fraction_static,
         tp_rank: 0,
-        tp_size: 1,
+        tp_size: cfg.tensor_parallel_size,
         pp_rank: 0,
         pp_size: 1,
         kv_cache_mode: Some(format!("paged:{}", paged_block_size.raw())),

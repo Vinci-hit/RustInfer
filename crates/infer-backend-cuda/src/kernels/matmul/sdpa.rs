@@ -13,7 +13,9 @@
 //! round-trips, no per-row D2D launches.
 
 use crate::Cuda;
-use crate::ffi::{cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t};
+use crate::ffi::{
+    cublasHandle_t, cudaError_cudaSuccess, cudaMemcpyAsync, cudaMemcpyKind, cudaStream_t,
+};
 use crate::narrow_float_no_f16;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
@@ -31,6 +33,7 @@ unsafe extern "C" {
         stride_b: i64,
         stride_c: i64,
         batch: i32,
+        handle: cublasHandle_t,
         stream: cudaStream_t,
     );
     fn gemm_strided_batched_f32_axbt(
@@ -44,6 +47,7 @@ unsafe extern "C" {
         stride_b: i64,
         stride_c: i64,
         batch: i32,
+        handle: cublasHandle_t,
         stream: cudaStream_t,
     );
 
@@ -273,6 +277,7 @@ pub fn sdpa<T: Dtype>(
                 stride_qkv,
                 stride_scores,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
@@ -286,6 +291,7 @@ pub fn sdpa<T: Dtype>(
                 stride_qkv,
                 stride_scores,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             _ => unreachable!(),
@@ -341,6 +347,7 @@ pub fn sdpa<T: Dtype>(
                 stride_v_hds,
                 stride_out,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
@@ -354,6 +361,7 @@ pub fn sdpa<T: Dtype>(
                 stride_v_hds,
                 stride_out,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             _ => unreachable!(),
@@ -534,6 +542,7 @@ pub fn sdpa_masked<T: Dtype>(
                 stride_qkv,
                 stride_scores,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
@@ -547,6 +556,7 @@ pub fn sdpa_masked<T: Dtype>(
                 stride_qkv,
                 stride_scores,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             _ => unreachable!(),
@@ -602,6 +612,7 @@ pub fn sdpa_masked<T: Dtype>(
                 stride_v_hds,
                 stride_out,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             DataType::F32 => gemm_strided_batched_f32_axbt(
@@ -615,6 +626,7 @@ pub fn sdpa_masked<T: Dtype>(
                 stride_v_hds,
                 stride_out,
                 num_heads as i32,
+                dev.config.cublas_handle_v2,
                 stream,
             ),
             _ => unreachable!(),
@@ -1009,6 +1021,7 @@ mod tests {
                 stride_b,
                 stride_c,
                 batch as i32,
+                cuda.config.cublas_handle_v2,
                 cuda.config.stream,
             );
         }

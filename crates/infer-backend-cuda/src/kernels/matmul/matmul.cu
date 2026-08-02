@@ -5,7 +5,6 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <chrono>
-#include <atomic>
 #define CHECK_CUBLAS(func) { \
     cublasStatus_t status = (func); \
     if (status != CUBLAS_STATUS_SUCCESS) { \
@@ -14,10 +13,6 @@
         exit(EXIT_FAILURE); \
     } \
 }
-// Forward declaration — defined later in this TU. Lazily creates a legacy
-// cuBLAS handle used by the graph-capturable bf16 matmul path.
-static cublasHandle_t get_cublas_handle();
-
 template <int THREAD_PER_BLOCK>
 __global__ void sgemv_kernel_cu_fp32x4(
     const float* input,
@@ -184,8 +179,9 @@ static std::mutex g_zimage_bf16_gemm_cache_mu;
 static std::unordered_map<ZimageBf16GemmKey, ZimageBf16GemmEntry, ZimageBf16GemmKeyHash>
     g_zimage_bf16_gemm_cache;
 
-// When set (by the Rust prefill path via `zimage_set_eager_prefill_gemm`), eager
-// bf16 GEMMs take the build-free `gemm_bf16_chunked_legacy` (cublasGemmEx) path
+// When set on a rank's execution thread (by the Rust prefill path via
+// `zimage_set_eager_prefill_gemm`), eager bf16 GEMMs take the build-free
+// `gemm_bf16_chunked_legacy` (cublasGemmEx) path
 // instead of the per-shape cuBLASLt heuristic+capturability-probe cache build.
 // Prefill M = num_tokens varies per request, so every distinct prompt length is
 // a cold shape that otherwise pays ~9-18ms of build (heuristic + graph-capture
@@ -193,10 +189,10 @@ static std::unordered_map<ZimageBf16GemmKey, ZimageBf16GemmEntry, ZimageBf16Gemm
 // captured into a graph and so needs neither a benchmarked nor a capturable algo.
 // Decode (graph capture + its eager warmup) leaves this 0 and keeps the cuBLASLt
 // cached path, where the per-(capture_size) build amortizes across many replays.
-static std::atomic<int> g_zimage_eager_prefill_gemm{0};
+static thread_local int g_zimage_eager_prefill_gemm = 0;
 extern "C" void zimage_set_eager_prefill_gemm(int on)
 {
-    g_zimage_eager_prefill_gemm.store(on, std::memory_order_relaxed);
+    g_zimage_eager_prefill_gemm = on;
 }
 
 // Eager-prefill algo cache keyed by (N,K,ldc) — NOT exact M. The cuBLASLt heuristic's
@@ -244,6 +240,7 @@ static std::unordered_map<ZimageNkKey, ZimageNkEntry, ZimageNkKeyHash> g_zimage_
 
 // Forward decl — defined later in this TU (the build-free chunked fallback).
 static void gemm_bf16_chunked_legacy(
+    cublasHandle_t handle,
     int M, int N, int K, int ldc,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream);
@@ -256,7 +253,8 @@ static void gemm_bf16_chunked_legacy(
 // it is used ONLY on the non-capturing eager-prefill path; decode graphs keep
 // the capturable cached algo. Recreates the (cheap, ~µs) descriptors per call.
 static void gemm_bf16_nullptr_runtime(
-    cublasLtHandle_t ltHandle, int M, int N, int K, int ldc,
+    cublasLtHandle_t ltHandle, cublasHandle_t handle,
+    int M, int N, int K, int ldc,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream)
 {
@@ -284,7 +282,8 @@ static void gemm_bf16_nullptr_runtime(
     cublasLtMatmulDescDestroy(op);
     if (status != CUBLAS_STATUS_SUCCESS) {
         gemm_bf16_chunked_legacy(
-            M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
+            handle, M, N, K, ldc, d_A, d_B, d_C,
+            workspace, workspaceSize, stream);
     }
 }
 
@@ -292,7 +291,8 @@ static void gemm_bf16_nullptr_runtime(
 // the chunked cublasGemmEx path on any cuBLASLt error (cold-build failure or an
 // algo the cached pick can't service at this M).
 [[maybe_unused]] static void gemm_bf16_eager_nk_cached(
-    cublasLtHandle_t ltHandle, int M, int N, int K, int ldc,
+    cublasLtHandle_t ltHandle, cublasHandle_t handle,
+    int M, int N, int K, int ldc,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream)
 {
@@ -334,7 +334,8 @@ static void gemm_bf16_nullptr_runtime(
             if (ret == 0) {
                 cublasLtMatmulDescDestroy(op);
                 gemm_bf16_chunked_legacy(
-                    M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
+                    handle, M, N, K, ldc, d_A, d_B, d_C,
+                    workspace, workspaceSize, stream);
                 return;
             }
             entry.op = op;
@@ -361,7 +362,8 @@ static void gemm_bf16_nullptr_runtime(
     cublasLtMatrixLayoutDestroy(C);
     if (st != CUBLAS_STATUS_SUCCESS) {
         gemm_bf16_chunked_legacy(
-            M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
+            handle, M, N, K, ldc, d_A, d_B, d_C,
+            workspace, workspaceSize, stream);
     }
 }
 
@@ -378,15 +380,17 @@ static void gemm_bf16_nullptr_runtime(
 // legacy RUSTINFER_DISABLE_CUBLASLT_BF16_BENCH still force-disables.
 static bool zimage_bf16_gemm_bench_disabled()
 {
-    static int cached = -1;
-    if (cached == -1) {
+    // Function-local static initialization is serialized by C++11. The GEMM
+    // cache build runs outside its map mutex so TP rank threads can reach this
+    // concurrently; a hand-rolled mutable sentinel would be a data race.
+    static const bool disabled = []() {
         const char* en = getenv("RUSTINFER_ENABLE_CUBLASLT_BF16_BENCH");
         const char* dis = getenv("RUSTINFER_DISABLE_CUBLASLT_BF16_BENCH");
         bool force_dis = (dis != nullptr && dis[0] != '\0' && dis[0] != '0');
         bool opt_in = (en != nullptr && en[0] != '\0' && en[0] != '0');
-        cached = (opt_in && !force_dis) ? 0 : 1; // disabled unless explicitly enabled
-    }
-    return cached == 1;
+        return !(opt_in && !force_dis); // disabled unless explicitly enabled
+    }();
+    return disabled;
 }
 
 // Returns true if `algo` can be recorded into a CUDA graph via stream capture.
@@ -619,6 +623,23 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
     return e;
 }
 
+// Destroy an entry that lost a concurrent cache insertion race. Cached entries
+// intentionally live for the process lifetime, but once builds happen outside
+// the cache mutex two TP rank threads may build the same cold shape together;
+// the losing descriptors are otherwise leaked.
+static void zimage_destroy_bf16_gemm_entry(ZimageBf16GemmEntry* e)
+{
+    if (e->C) cublasLtMatrixLayoutDestroy(e->C);
+    if (e->B) cublasLtMatrixLayoutDestroy(e->B);
+    if (e->A) cublasLtMatrixLayoutDestroy(e->A);
+    if (e->op) cublasLtMatmulDescDestroy(e->op);
+    e->C = nullptr;
+    e->B = nullptr;
+    e->A = nullptr;
+    e->op = nullptr;
+    e->valid = false;
+}
+
 // Fallback: legacy cuBLAS `cublasGemmEx` with K-chunked single-pass kernels.
 // Used only when the benchmarked-capturable cuBLASLt algo cache has no entry
 // for this shape AND we are mid graph-capture (so we cannot build one). With
@@ -630,6 +651,7 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
 // B^T (lda=K), A (ldb=K), and strided C (ldc>=N). K is tiled at K_CHUNK so cuBLAS keeps a
 // single-pass (graph-capturable) kernel and accumulates chunks with beta=1.
 static void gemm_bf16_chunked_legacy(
+    cublasHandle_t h,
     int M, int N, int K, int ldc,
     const __nv_bfloat16 *d_A,
     const __nv_bfloat16 *d_B,
@@ -637,7 +659,6 @@ static void gemm_bf16_chunked_legacy(
     void *workspace, size_t workspaceSize,
     cudaStream_t stream)
 {
-    cublasHandle_t h = get_cublas_handle();
     if (!h) {
         printf("cuBLAS bf16 matmul: null handle (M=%d N=%d K=%d)\n", M, N, K);
         exit(EXIT_FAILURE);
@@ -680,6 +701,7 @@ static void gemm_bf16_chunked_legacy(
 
 void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtHandle_t ltHandle,
+    cublasHandle_t handle,
     int M, int N, int K, int ldc,
     const __nv_bfloat16 *d_A, // shape: [M, K]
     const __nv_bfloat16 *d_B, // shape: [N, K]
@@ -703,49 +725,96 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     // distinct prompt length skips the per-(M,N,K) heuristic + capture probe
     // (~9-18ms of cold build off TTFT) while keeping the large-tile single-pass
     // kernel (no chunked K-tile launch storm).
-    if (!capturing && g_zimage_eager_prefill_gemm.load(std::memory_order_relaxed) != 0) {
+    if (!capturing && g_zimage_eager_prefill_gemm != 0) {
         // algo=nullptr runtime selection — faster than the heuristic/benchmarked
         // cached algos for small-M prefill (restores 532f5c forward speed).
         gemm_bf16_nullptr_runtime(
-            ltHandle, M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
+            ltHandle, handle, M, N, K, ldc, d_A, d_B, d_C,
+            workspace, workspaceSize, stream);
         return;
     }
 
-    const ZimageBf16GemmEntry* entry = nullptr;
+    // Never hold the process-wide cache mutex while calling CUDA/cuBLAS. In a
+    // single-process TP run, a cold GEMM build may synchronize its rank-local
+    // device while an earlier NCCL collective is waiting for another rank. If
+    // the other rank needs this same mutex to build the GEMM immediately before
+    // entering that collective, holding the mutex across the build creates a
+    // lock <-> NCCL deadlock.
+    //
+    // Copy the entry value out so no cache-owned pointer escapes the mutex and
+    // ownership stays explicit while concurrent insertions continue. On a miss,
+    // build outside the lock, then double-check and insert. Concurrent duplicate
+    // builds are safe (each rank uses its own device/stream/workspace); only one
+    // becomes cache-owned and the losing descriptors are destroyed.
+    ZimageBf16GemmEntry entry{};
+    bool have_entry = false;
+    bool should_build = false;
     ZimageBf16GemmKey key{M, N, K, ldc};
     {
         std::lock_guard<std::mutex> lk(g_zimage_bf16_gemm_cache_mu);
         auto it = g_zimage_bf16_gemm_cache.find(key);
-        if (it != g_zimage_bf16_gemm_cache.end()) {
-            if (it->second.valid) entry = &it->second;
+        if (it != g_zimage_bf16_gemm_cache.end() && it->second.valid) {
+            entry = it->second;
+            have_entry = true;
         } else if (!capturing) {
-            // Build (heuristic + benchmark + capturability probe) eagerly. This
-            // only runs while NOT capturing — the warmup pass before each graph
-            // capture exercises every decode shape, so capture always hits a
-            // populated cache. Reuse the caller's d_A/d_B/d_C/workspace as bench
-            // scratch (the real matmul below overwrites d_C with the answer).
-            ZimageBf16GemmEntry built = zimage_build_bf16_gemm_entry(
-                M, N, K, ldc, workspaceSize, d_A, d_B, d_C, workspace);
-            auto ins = g_zimage_bf16_gemm_cache.emplace(key, built);
-            if (ins.first->second.valid) entry = &ins.first->second;
+            should_build = true;
         }
     }
 
-    if (entry) {
+    if (!have_entry && should_build) {
+        // Build (heuristic + optional benchmark + capturability probe) eagerly,
+        // but critically without the process-wide cache mutex held.
+        ZimageBf16GemmEntry built = zimage_build_bf16_gemm_entry(
+            M, N, K, ldc, workspaceSize, d_A, d_B, d_C, workspace);
+        bool cache_owns_built = false;
+        bool replaced_invalid = false;
+        ZimageBf16GemmEntry invalid_entry{};
+        {
+            std::lock_guard<std::mutex> lk(g_zimage_bf16_gemm_cache_mu);
+            auto it = g_zimage_bf16_gemm_cache.find(key);
+            if (it != g_zimage_bf16_gemm_cache.end() && it->second.valid) {
+                entry = it->second;
+                have_entry = true;
+            } else if (built.valid && it == g_zimage_bf16_gemm_cache.end()) {
+                auto ins = g_zimage_bf16_gemm_cache.emplace(key, built);
+                entry = ins.first->second;
+                have_entry = true;
+                cache_owns_built = true;
+            } else if (built.valid) {
+                // Invalid entries are never useful: replace one left by an
+                // earlier failed build so a later eager call can recover.
+                invalid_entry = it->second;
+                it->second = built;
+                entry = built;
+                have_entry = true;
+                cache_owns_built = true;
+                replaced_invalid = true;
+            }
+        }
+        if (!cache_owns_built) {
+            zimage_destroy_bf16_gemm_entry(&built);
+        }
+        if (replaced_invalid) {
+            zimage_destroy_bf16_gemm_entry(&invalid_entry);
+        }
+    }
+
+    if (have_entry) {
         // Replay the cached capturable algo. Descriptors are handle-independent;
-        // `ltHandle` is the process-wide persistent cuBLASLt handle.
+        // `ltHandle` is the current rank/device's persistent cuBLASLt handle.
         float alpha = 1.0f, beta = 0.0f;
         cublasStatus_t status = cublasLtMatmul(
-            ltHandle, entry->op, &alpha,
-            d_B, entry->A, d_A, entry->B, &beta,
-            d_C, entry->C, d_C, entry->C,
-            &entry->algo, workspace, workspaceSize, stream);
+            ltHandle, entry.op, &alpha,
+            d_B, entry.A, d_A, entry.B, &beta,
+            d_C, entry.C, d_C, entry.C,
+            &entry.algo, workspace, workspaceSize, stream);
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("cuBLASLt bf16 cached matmul failed: status=%d M=%d N=%d K=%d "
                    "(capturing=%d) — falling back to chunked legacy\n",
                    status, M, N, K, (int)capturing);
             gemm_bf16_chunked_legacy(
-                M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
+                handle, M, N, K, ldc, d_A, d_B, d_C,
+                workspace, workspaceSize, stream);
         }
         return;
     }
@@ -753,7 +822,8 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     // Cache miss with no chance to build (cold shape first seen under capture):
     // use the capture-safe chunked legacy path so we stay correct.
     gemm_bf16_chunked_legacy(
-        M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
+        handle, M, N, K, ldc, d_A, d_B, d_C,
+        workspace, workspaceSize, stream);
 }
 // ============================================================================
 // BF16 GEMV kernel v3 for decode phase (M=1)
@@ -851,11 +921,13 @@ void gemm_cublaslt_bf16(
     int K,
     int ldc,
     cudaStream_t stream,
-    cublasLtHandle_t handle,
+    cublasLtHandle_t ltHandle,
+    cublasHandle_t handle,
     void* workspace, size_t workspaceSize
 ) {
     gemm_cublasLt_AxBT_RowMajor_bf16(
-        handle, M, N, K, ldc, A, B, C, workspace, workspaceSize, stream);
+        ltHandle, handle, M, N, K, ldc, A, B, C,
+        workspace, workspaceSize, stream);
 }
 
 // ============================================================================
@@ -1574,26 +1646,14 @@ extern "C" int fp8_block_matmul_bf16_cu(
 
 #include <cublas_v2.h>
 
-static cublasHandle_t s_cublas_handle = nullptr;
-static cublasHandle_t get_cublas_handle() {
-    if (!s_cublas_handle) {
-        cublasStatus_t s = cublasCreate(&s_cublas_handle);
-        if (s != CUBLAS_STATUS_SUCCESS) {
-            printf("cublasCreate failed: %d\n", s);
-            return nullptr;
-        }
-    }
-    return s_cublas_handle;
-}
-
 extern "C" void gemm_strided_batched_bf16_axbt(
     const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
     int M, int N, int K,
     long long strideA, long long strideB, long long strideC,
     int batch_count,
+    cublasHandle_t h,
     cudaStream_t stream
 ) {
-    cublasHandle_t h = get_cublas_handle();
     if (!h) return;
     cublasSetStream(h, stream);
     float alpha = 1.0f, beta = 0.0f;
@@ -1626,6 +1686,7 @@ extern "C" void gemm_strided_batched_bf16_axb(
     int M, int N, int K,
     long long strideA, long long strideB, long long strideC,
     int batch_count,
+    cublasHandle_t h,
     cudaStream_t stream
 ) {
     // Row-major C[M,N] = A[M,K] @ B[K,N]
@@ -1633,7 +1694,6 @@ extern "C" void gemm_strided_batched_bf16_axb(
     //   B_arg=B (row [K,N] = col [N,K]) → CUBLAS_OP_N to get [K,N]? No:
     //   col [N,K] needs transpose to become [K,N] for the gemm = OP_T.
     //   A_arg=A (row [M,K] = col [K,M]) → no transpose to get [K,M] = OP_N.
-    cublasHandle_t h = get_cublas_handle();
     if (!h) return;
     cublasSetStream(h, stream);
     float alpha = 1.0f, beta = 0.0f;
@@ -1662,9 +1722,9 @@ extern "C" void gemm_strided_batched_f32_axbt(
     int M, int N, int K,
     long long strideA, long long strideB, long long strideC,
     int batch_count,
+    cublasHandle_t h,
     cudaStream_t stream
 ) {
-    cublasHandle_t h = get_cublas_handle();
     if (!h) return;
     cublasSetStream(h, stream);
     float alpha = 1.0f, beta = 0.0f;
@@ -1692,9 +1752,9 @@ extern "C" void gemm_strided_batched_f32_axb(
     int M, int N, int K,
     long long strideA, long long strideB, long long strideC,
     int batch_count,
+    cublasHandle_t h,
     cudaStream_t stream
 ) {
-    cublasHandle_t h = get_cublas_handle();
     if (!h) return;
     cublasSetStream(h, stream);
     float alpha = 1.0f, beta = 0.0f;
@@ -1731,9 +1791,9 @@ extern "C" void gemm_strided_batched_f32_axb(
 extern "C" void gemm_cublas_f32_axbt(
     const float* A, const float* B, float* C,
     int M, int N, int K, int ldc,
+    cublasHandle_t h,
     cudaStream_t stream
 ) {
-    cublasHandle_t h = get_cublas_handle();
     if (!h) return;
     cublasSetStream(h, stream);
     // Enable TF32 (default on Hopper but make sure).

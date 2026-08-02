@@ -16,13 +16,14 @@
 namespace {
 
 int cached_num_sm() {
-    static int num_sm = [] {
-        int device = 0;
-        cudaGetDevice(&device);
-        int sm = 0;
-        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device);
-        return sm;
-    }();
+    static thread_local int cached_device = -1;
+    static thread_local int num_sm = 0;
+    int device = 0;
+    cudaGetDevice(&device);
+    if (device != cached_device) {
+        cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
+        cached_device = device;
+    }
     return num_sm;
 }
 

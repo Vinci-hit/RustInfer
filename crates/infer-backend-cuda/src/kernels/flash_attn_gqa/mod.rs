@@ -158,7 +158,7 @@ unsafe extern "C" {
         softmax_scale: f32,
         is_causal: i32,
         stream: cudaStream_t,
-    );
+    ) -> i32;
     fn launch_flash_attn_paged_ragged_cute_fp16(
         q: *const half::f16,
         qss: i64,
@@ -185,7 +185,7 @@ unsafe extern "C" {
         softmax_scale: f32,
         is_causal: i32,
         stream: cudaStream_t,
-    );
+    ) -> i32;
 }
 
 const DISABLE_CUDNN_ATTENTION_ENV: &str = "RUSTINFER_DISABLE_CUDNN_ATTENTION";
@@ -544,7 +544,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
     scale: f32,
     stream: cudaStream_t,
 ) -> OpResult<()> {
-    unsafe {
+    let rc = unsafe {
         match T::DATA_TYPE {
             DataType::BF16 => launch_flash_attn_paged_ragged_cute_bf16(
                 q_ptr as _,
@@ -607,6 +607,11 @@ unsafe fn launch_cute_ragged<T: Dtype>(
                 )));
             }
         }
+    };
+    if rc != 0 {
+        return Err(OpError::Kernel(format!(
+            "CuTe paged ragged attention failed: cudaError {rc}"
+        )));
     }
     Ok(())
 }

@@ -9,6 +9,7 @@
 
 #include "flash_attn_gqa.h"
 #include "flash_attn_paged_common.cuh"
+#include "cuda_kernel_attr.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -20,7 +21,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
-#include <mutex>
 
 namespace flash_attn_paged_prefill {
 
@@ -558,12 +558,9 @@ static cudaError_t launch_impl(
                                  typename Traits::SmemLayoutQ,
                                  typename Traits::SmemLayoutKV>));
     auto kernel = flash_attn_paged_ragged_kernel<Traits>;
-    static std::once_flag attr_once;
-    static cudaError_t attr_err = cudaSuccess;
-    std::call_once(attr_once, [&]() {
-        attr_err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    });
+    static rustinfer::cuda::PerDeviceKernelAttribute attr;
+    const cudaError_t attr_err = attr.set_max_dynamic_shared_memory(
+        reinterpret_cast<const void*>(kernel), smem_size);
     if (attr_err != cudaSuccess) return attr_err;
 
     kernel<<<grid, block, smem_size, stream>>>(
@@ -669,7 +666,7 @@ extern "C" void launch_flash_attn_paged_ragged_fp16(
     fprintf(stderr, "[flash_attn_paged_ragged_fp16] legacy ABI removed; use launch_flash_attn_paged_ragged_cute_fp16 with block2req/block2tile\n");
 }
 
-extern "C" void launch_flash_attn_paged_ragged_cute_bf16(
+extern "C" int launch_flash_attn_paged_ragged_cute_bf16(
     const __nv_bfloat16* q, int64_t qss, int64_t qsh,
     const __nv_bfloat16* k_pool,
     const __nv_bfloat16* v_pool,
@@ -694,12 +691,10 @@ extern "C" void launch_flash_attn_paged_ragged_cute_bf16(
         block2req, block2tile, valid_q_tiles, total_q_tiles,
         batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
         softmax_scale, is_causal, stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[flash_attn_paged_ragged_cute_bf16] launch error: %s\n", cudaGetErrorString(err));
-    }
+    return static_cast<int>(err);
 }
 
-extern "C" void launch_flash_attn_paged_ragged_cute_fp16(
+extern "C" int launch_flash_attn_paged_ragged_cute_fp16(
     const __half* q, int64_t qss, int64_t qsh,
     const __half* k_pool,
     const __half* v_pool,
@@ -724,7 +719,5 @@ extern "C" void launch_flash_attn_paged_ragged_cute_fp16(
         block2req, block2tile, valid_q_tiles, total_q_tiles,
         batch, total_q_tokens, num_q_heads, num_kv_heads, head_dim,
         softmax_scale, is_causal, stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[flash_attn_paged_ragged_cute_fp16] launch error: %s\n", cudaGetErrorString(err));
-    }
+    return static_cast<int>(err);
 }

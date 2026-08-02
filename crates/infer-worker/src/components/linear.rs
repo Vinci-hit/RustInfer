@@ -44,17 +44,12 @@ pub enum LinearParallelism {
     /// LM head may also remain replicated in a multi-rank model).
     Replicated { tp: RankPair },
     /// The output-feature (`N`) axis is split. Each rank produces a disjoint
-    /// output slice, so the forward itself needs no collective.
-    Column { tp: RankPair },
+    /// output slice. Most layers keep that slice local; consumers that require
+    /// the complete output can request an all-gather after the local GEMM.
+    Column { tp: RankPair, gather_output: bool },
     /// The input-feature (`K`) axis is split. Each rank produces a partial sum
     /// that must be all-reduced before adding bias.
     Row { tp: RankPair },
-    /// Vocabulary rows are split. Each rank computes local logits and gathers
-    /// them along the final dimension for the existing full-vocab sampler.
-    Vocab {
-        tp: RankPair,
-        global_out_features: usize,
-    },
 }
 
 impl LinearParallelism {
@@ -64,10 +59,7 @@ impl LinearParallelism {
 
     pub const fn tp(self) -> RankPair {
         match self {
-            Self::Replicated { tp }
-            | Self::Column { tp }
-            | Self::Row { tp }
-            | Self::Vocab { tp, .. } => tp,
+            Self::Replicated { tp } | Self::Column { tp, .. } | Self::Row { tp } => tp,
         }
     }
 }
@@ -186,18 +178,17 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         self.validate_execution_context(ctx)?;
 
         match self.parallelism {
-            LinearParallelism::Vocab {
+            LinearParallelism::Column {
                 tp,
-                global_out_features,
+                gather_output: true,
             } if tp.size > 1 => {
-                self.validate_vocab_shapes(input, output, tp, global_out_features, ctx)?;
+                self.validate_gathered_column_shapes(input, output, tp, ctx)?;
                 let local_features = self.out_features();
                 let local_start = tp.rank.checked_mul(local_features).ok_or_else(|| {
-                    OpError::Shape("vocab-parallel Linear rank offset overflows".into())
+                    OpError::Shape("column-parallel Linear rank offset overflows".into())
                 })?;
-                // Write directly into this rank's columns of the final logits.
-                // The view is `[rows, local_vocab]` with row stride
-                // `global_vocab`; GEMM/bias honor that stride, and NCCL then
+                // Write directly into this rank's columns of the gathered output.
+                // GEMM/bias honor the full-output row stride, and NCCL then
                 // uses the same view as its legal in-place AllGather send slot.
                 let mut local = output.narrow(1, local_start, local_features)?;
                 self.matmul_local(input, &mut local, ctx)?;
@@ -231,7 +222,10 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         }
         let collective = match self.parallelism {
             LinearParallelism::Row { tp } if tp.size > 1 => Some((tp, "row-parallel")),
-            LinearParallelism::Vocab { tp, .. } if tp.size > 1 => Some((tp, "vocab-parallel")),
+            LinearParallelism::Column {
+                tp,
+                gather_output: true,
+            } if tp.size > 1 => Some((tp, "gathered column-parallel")),
             _ => None,
         };
         if let Some((tp, kind)) = collective
@@ -245,34 +239,23 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         Ok(())
     }
 
-    fn validate_vocab_shapes(
+    fn validate_gathered_column_shapes(
         &self,
         input: &Tensor<T, D>,
         output: &Tensor<T, D>,
         tp: RankPair,
-        global_out_features: usize,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
-        let gathered_features = self
-            .out_features()
-            .checked_mul(tp.size)
-            .ok_or_else(|| OpError::Shape("vocab-parallel Linear output size overflows".into()))?;
-        if gathered_features != global_out_features {
-            return Err(OpError::Shape(format!(
-                "vocab-parallel Linear local output {} x TP{} produces {}, expected global output {}",
-                self.out_features(),
-                tp.size,
-                gathered_features,
-                global_out_features
-            )));
-        }
+        let gathered_features = self.out_features().checked_mul(tp.size).ok_or_else(|| {
+            OpError::Shape("gathered column-parallel Linear output size overflows".into())
+        })?;
         let input_shape = input.shape().as_slice();
         let output_shape = output.shape().as_slice();
-        if input_shape.len() != 2 || output_shape != [input_shape[0], global_out_features] {
+        if input_shape.len() != 2 || output_shape != [input_shape[0], gathered_features] {
             return Err(OpError::Shape(format!(
-                "vocab-parallel Linear expected output [{}, {}], got {:?}",
+                "gathered column-parallel Linear expected output [{}, {}], got {:?}",
                 input_shape.first().copied().unwrap_or(0),
-                global_out_features,
+                gathered_features,
                 output_shape
             )));
         }
@@ -280,14 +263,14 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         for (tensor, what) in [(input, "input"), (output, "output")] {
             if !tensor.is_contiguous() {
                 return Err(OpError::Shape(format!(
-                    "vocab-parallel Linear {what} must be contiguous, got shape {:?}",
+                    "gathered column-parallel Linear {what} must be contiguous, got shape {:?}",
                     tensor.shape().as_slice()
                 )));
             }
             let tensor_device = <D as ExecDevice>::device_id(tensor.device());
             if tensor_device != scope_device {
                 return Err(OpError::Shape(format!(
-                    "vocab-parallel Linear {what} belongs to device {}, but scope uses device {}",
+                    "gathered column-parallel Linear {what} belongs to device {}, but scope uses device {}",
                     tensor_device.0, scope_device.0
                 )));
             }

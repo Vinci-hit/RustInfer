@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use half::bf16;
@@ -11,15 +12,17 @@ use infer_protocol::worker_to_scheduler_control::{
 use infer_protocol::worker_to_scheduler_data::DiffusionBatchOutput;
 
 use crate::application::decode_engine::DecodeEngine;
-use crate::application::runtime::Runtime;
+use crate::application::runtime::{
+    Runtime, RuntimePeerGroup, RuntimePeerWatchdog, spawn_monitored_follower,
+};
 use crate::application::sampler_stack::GreedySampler;
 use crate::application::worker_scheduler::handle_fused_step;
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
-use crate::domain::exec::{RankPair, TopologyShape};
+use crate::domain::exec::{ExecScope, RankPair, TopologyShape};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
 use crate::domain::ports::{CollectiveOps, CommAxis, OpError};
-use crate::infrastructure::cuda::{Cuda, CudaScope, device_utils};
+use crate::infrastructure::cuda::{Cuda, CudaScope, NcclCommunicator, device_utils};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
 use crate::models::loader::LoadConfig;
@@ -53,6 +56,119 @@ pub struct Bootstrap<'a> {
     pub model_type: String,
     /// CUDA graph capture sizes for decode batches.
     pub capture_sizes: Vec<usize>,
+    /// Upper bound for one mirrored TP startup/command round.
+    pub peer_timeout: Duration,
+    /// Upper bound for NCCL/follower model and Runtime startup.
+    pub peer_startup_timeout: Duration,
+    /// Rank-0 member of the single-process TP communicator group.
+    pub tp_communicator: Option<Arc<NcclCommunicator>>,
+    /// CUDA devices in TP-rank order. Used for group-wide capacity probing.
+    pub tp_devices: &'a [Cuda],
+}
+
+/// Everything a non-zero TP rank needs to construct its thread-local Runtime.
+///
+/// The factory itself runs on the rank thread. This keeps the model's
+/// `Rc<ForwardScratch>` and all CUDA allocations on the thread that owns and
+/// executes them; only this small, owned bootstrap value crosses the boundary.
+#[derive(Debug, Clone)]
+pub struct RuntimeFollowerInit {
+    pub rank: usize,
+    pub size: usize,
+    pub pp_rank: usize,
+    pub pp_size: usize,
+    pub bootstrap_pool_blocks: usize,
+    pub block_size: usize,
+    pub max_blocks_per_seq: usize,
+    pub max_seq_len: usize,
+    pub cap_num_tokens: usize,
+    pub cap_batch: usize,
+    pub capture_sizes: Vec<usize>,
+}
+
+impl RuntimeFollowerInit {
+    /// Bind this rank's pre-created NCCL communicator to its execution scope.
+    /// The controller creates the whole single-process group atomically before
+    /// any rank thread starts loading weights.
+    pub fn build_scope(
+        &self,
+        cuda: Cuda,
+        communicator: Arc<NcclCommunicator>,
+    ) -> crate::domain::ports::OpResult<CudaScope> {
+        let topology = TopologyShape {
+            tp: RankPair {
+                rank: self.rank,
+                size: self.size,
+            },
+            pp: RankPair {
+                rank: self.pp_rank,
+                size: self.pp_size,
+            },
+            dp: RankPair { rank: 0, size: 1 },
+            node: RankPair { rank: 0, size: 1 },
+        };
+        CudaScope::new(cuda)
+            .with_topology(topology)?
+            .with_tp_communicator(communicator)
+    }
+
+    /// Finish Runtime construction after this rank's communicator and model
+    /// shard are ready.
+    pub fn build_runtime<M>(
+        self,
+        model: M,
+        scope: CudaScope,
+    ) -> crate::domain::ports::OpResult<Runtime<bf16, Cuda, M>>
+    where
+        M: DecoderModel<bf16, Cuda>,
+    {
+        Runtime::new(
+            model,
+            scope,
+            Box::new(GreedySampler),
+            self.bootstrap_pool_blocks,
+            self.block_size,
+            self.max_blocks_per_seq,
+            self.max_seq_len,
+            self.cap_num_tokens,
+            self.cap_batch,
+            self.capture_sizes,
+        )
+    }
+}
+
+/// Builds one non-zero rank entirely inside its long-lived Runtime thread.
+pub type RuntimeFollowerFactory<M> = Box<
+    dyn FnOnce(RuntimeFollowerInit) -> crate::domain::ports::OpResult<Runtime<bf16, Cuda, M>>
+        + Send,
+>;
+
+#[derive(Debug)]
+struct KvCapacityProbe {
+    rank: usize,
+    device_id: i32,
+    total: usize,
+    free_before: usize,
+    free_after: usize,
+    probed: usize,
+    capacity: usize,
+}
+
+fn tp_memory_info(devices: &[Cuda], stage: &str) -> Result<Vec<(usize, usize)>, String> {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(rank, cuda)| {
+            let scope = CudaScope::new(cuda.clone());
+            let _active_device = scope.enter();
+            device_utils::mem_get_info().map_err(|error| {
+                format!(
+                    "cudaMemGetInfo for TP rank {rank} on cuda:{} during {stage}: {error:?}",
+                    cuda.device_id
+                )
+            })
+        })
+        .collect()
 }
 
 pub fn run_with_model<M>(
@@ -60,11 +176,12 @@ pub fn run_with_model<M>(
     data: &DataPump,
     model: M,
     bs: Bootstrap<'_>,
+    follower_factories: Vec<RuntimeFollowerFactory<M>>,
     eos_ids: &[i32],
     profile_cuda_steps: Option<u32>,
 ) -> Result<(), String>
 where
-    M: DecoderModel<bf16, Cuda>,
+    M: DecoderModel<bf16, Cuda> + 'static,
 {
     let _ = bs.load_cfg;
     if bs.block_size != 1 {
@@ -81,6 +198,39 @@ where
 
     let cap_num_tokens = bs.load.max_batch_tokens;
     let cap_batch = bs.load.max_batch_seqs;
+
+    if bs.load.tp_rank != 0 {
+        return Err(format!(
+            "the scheduler-facing worker must own TP rank 0, got rank {}/{}",
+            bs.load.tp_rank, bs.load.tp_size
+        ));
+    }
+    let expected_followers = bs.load.tp_size.saturating_sub(1);
+    if follower_factories.len() != expected_followers {
+        return Err(format!(
+            "TP{} requires {} Runtime followers, got {}",
+            bs.load.tp_size,
+            expected_followers,
+            follower_factories.len()
+        ));
+    }
+    if bs.tp_devices.len() != bs.load.tp_size {
+        return Err(format!(
+            "TP{} requires {} CUDA devices for capacity probing, got {}",
+            bs.load.tp_size,
+            bs.load.tp_size,
+            bs.tp_devices.len()
+        ));
+    }
+    let rank0_device = bs.tp_devices.first().ok_or("TP device list is empty")?;
+    if rank0_device.device_id != bs.cuda.device_id
+        || !Arc::ptr_eq(&rank0_device.config, &bs.cuda.config)
+    {
+        return Err(format!(
+            "TP rank-0 device cuda:{} does not match bootstrap cuda:{}",
+            rank0_device.device_id, bs.cuda.device_id
+        ));
+    }
 
     // KV-pool sizing (auto path) is profile-driven: build the Runtime with a
     // small throwaway KV pool, run one worst-case eager forward so the fixed
@@ -125,9 +275,55 @@ where
         dp: RankPair { rank: 0, size: 1 },
         node: RankPair { rank: 0, size: 1 },
     };
-    let scope = CudaScope::new(bs.cuda.clone())
-        .with_topology(topology)
-        .map_err(|error| format!("invalid CUDA execution topology: {error}"))?;
+    let mut peer_handles = Vec::with_capacity(expected_followers);
+    let mut peer_watchdog = None;
+    let scope = if topology.tp.size > 1 {
+        let watchdog = RuntimePeerWatchdog::fail_stop()
+            .map_err(|error| format!("start TP fail-stop watchdog: {error}"))?;
+        let failure_notifier = watchdog.notifier();
+        for (offset, factory) in follower_factories.into_iter().enumerate() {
+            let rank = offset + 1;
+            let init = RuntimeFollowerInit {
+                rank,
+                size: topology.tp.size,
+                pp_rank: topology.pp.rank,
+                pp_size: topology.pp.size,
+                bootstrap_pool_blocks,
+                block_size: bs.block_size,
+                max_blocks_per_seq,
+                max_seq_len: bs.max_seq_len,
+                cap_num_tokens,
+                cap_batch,
+                capture_sizes: bs.capture_sizes.clone(),
+            };
+            let handle = spawn_monitored_follower::<bf16, Cuda, M, _, _>(
+                rank,
+                factory,
+                init,
+                failure_notifier.clone(),
+            )
+            .map_err(|error| format!("spawn TP Runtime rank {rank}: {error}"))?;
+            peer_handles.push(handle);
+        }
+        peer_watchdog = Some(watchdog);
+        let communicator = bs.tp_communicator.clone().ok_or_else(|| {
+            format!(
+                "TP{} requires a pre-created rank-0 NCCL communicator",
+                topology.tp.size
+            )
+        })?;
+        CudaScope::new(bs.cuda.clone())
+            .with_topology(topology)
+            .and_then(|scope| scope.with_tp_communicator(communicator))
+            .map_err(|error| format!("initialize rank-0 CUDA execution scope: {error}"))?
+    } else {
+        if bs.tp_communicator.is_some() {
+            return Err("TP1 must not receive an NCCL communicator".into());
+        }
+        CudaScope::new(bs.cuda.clone())
+            .with_topology(topology)
+            .map_err(|error| format!("invalid CUDA execution topology: {error}"))?
+    };
     if topology.tp.size > 1 && <Cuda as CollectiveOps>::comm(&scope, CommAxis::Tp).is_none() {
         return Err(format!(
             "TP weights loaded for rank {}/{}, but no TP communicator is configured",
@@ -147,6 +343,21 @@ where
         bs.capture_sizes.clone(),
     )
     .map_err(|e| format!("Runtime::new: {:?}", e))?;
+    if !peer_handles.is_empty() {
+        let watchdog = peer_watchdog
+            .take()
+            .ok_or("TP Runtime followers require a fail-stop watchdog")?;
+        let peers = RuntimePeerGroup::with_watchdog(
+            peer_handles,
+            bs.peer_startup_timeout,
+            bs.peer_timeout,
+            watchdog,
+        )
+        .map_err(|error| format!("create TP Runtime peer group: {error}"))?;
+        runner
+            .install_peer_group(peers)
+            .map_err(|error| format!("start TP Runtime followers: {error}"))?;
+    }
 
     let num_blocks = if bs.num_blocks_override != 0 {
         bs.num_blocks_override
@@ -159,8 +370,7 @@ where
         // workspace (the GiB-scale logits buffer that used to OOM), but before
         // the dummy forward. The delta against the post-dummy probe below is the
         // lazy library footprint (diagnostic only).
-        let (free_before, total) =
-            device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
+        let before = tp_memory_info(bs.tp_devices, "before profile forward")?;
         // Worst-case eager forward: exercises the activation workspace and forces
         // the lazy cuBLASLt/cuDNN/recycling-pool allocations the first live
         // forward would otherwise make. `graph` is still None ⇒ eager ⇒ no graph
@@ -170,17 +380,7 @@ where
             .map_err(|e| format!("profile_forward: {:?}", e))?;
         // This probe reflects weights + activation workspace + committed library
         // state — everything resident except the (throwaway) profiling KV pool.
-        let (free_after, _) =
-            device_utils::mem_get_info().map_err(|e| format!("cudaMemGetInfo: {:?}", e))?;
-        // Hold back a fixed reserve for the incremental allocations the prewarm
-        // pass makes after sizing (per-shape cuDNN plans, recycling-pool growth).
-        let usable = free_after.saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
-        let budget = (usable as f64 * fraction as f64) as usize;
-        let raw = budget / bytes_per_block.max(1);
-        // Small fragmentation slack on top of the fixed prewarm reserve: 1 block
-        // for the graph-scratch block (see `pool_blocks` below) + 0.5% of raw.
-        let reserve = 1 + (raw / 200).max(1);
-        let probed = raw.saturating_sub(reserve).max(1);
+        let after = tp_memory_info(bs.tp_devices, "after profile forward")?;
         // Cap the auto-sized pool at the working set the worker can ever hold in
         // use: at most `max_batch_seqs` sequences, each at most `max_seq_len`
         // tokens. The scheduler never admits more than `max_batch_seqs` running
@@ -193,29 +393,69 @@ where
         // extra blocks cache evicted prefixes, so keep the full probe; with it
         // OFF (real-time recycling) the live working set is the only thing that
         // can be allocated, so clamp to it.
-        let derived = if bs.load.enable_prefix_caching {
-            probed
-        } else {
-            let working_set = bs
-                .load
-                .max_batch_seqs
-                .saturating_mul(max_blocks_per_seq)
-                .max(1);
-            probed.min(working_set)
-        };
+        let working_set = bs
+            .load
+            .max_batch_seqs
+            .saturating_mul(max_blocks_per_seq)
+            .max(1);
+        let probes: Vec<KvCapacityProbe> = bs
+            .tp_devices
+            .iter()
+            .enumerate()
+            .zip(before.into_iter().zip(after))
+            .map(|((rank, cuda), ((free_before, total), (free_after, _)))| {
+                // Hold back a fixed reserve for incremental prewarm allocations,
+                // then add one graph-scratch block plus 0.5% fragmentation slack.
+                let usable =
+                    free_after.saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
+                let budget = (usable as f64 * fraction as f64) as usize;
+                let raw = budget / bytes_per_block.max(1);
+                let reserve = 1 + (raw / 200).max(1);
+                let probed = raw.saturating_sub(reserve).max(1);
+                let capacity = if bs.load.enable_prefix_caching {
+                    probed
+                } else {
+                    probed.min(working_set)
+                };
+                KvCapacityProbe {
+                    rank,
+                    device_id: cuda.device_id,
+                    total,
+                    free_before,
+                    free_after,
+                    probed,
+                    capacity,
+                }
+            })
+            .collect();
+        let limiting = probes
+            .iter()
+            .min_by_key(|probe| probe.capacity)
+            .ok_or("TP KV capacity probe produced no results")?;
+        let derived = limiting.capacity;
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        for probe in &probes {
+            tracing::info!(
+                rank = probe.rank,
+                device = probe.device_id,
+                total_gib = gib(probe.total),
+                free_after_workspace_gib = gib(probe.free_before),
+                free_after_dummy_gib = gib(probe.free_after),
+                lazy_libs_gib = gib(probe.free_before.saturating_sub(probe.free_after)),
+                probed_blocks = probe.probed,
+                capacity_blocks = probe.capacity,
+                "TP rank KV capacity probe"
+            );
+        }
         tracing::info!(
-            "[bootstrap] KV mem probe (profile-driven): total={:.2}GiB free_after_workspace={:.2}GiB free_after_dummy_fwd={:.2}GiB (dummy committed {:.2}GiB lazy libs) prewarm_reserve={:.2}GiB fraction={} bytes/block={} probed={} -> num_blocks={} (~{:.2}GiB KV pool)",
-            gib(total),
-            gib(free_before),
-            gib(free_after),
-            gib(free_before.saturating_sub(free_after)),
-            gib(crate::application::tuning::PREWARM_HEADROOM_BYTES),
+            limiting_rank = limiting.rank,
+            limiting_device = limiting.device_id,
             fraction,
             bytes_per_block,
-            probed,
-            derived,
-            gib(derived * bytes_per_block),
+            num_blocks = derived,
+            kv_pool_gib = gib(derived.saturating_mul(bytes_per_block)),
+            prewarm_reserve_gib = gib(crate::application::tuning::PREWARM_HEADROOM_BYTES),
+            "[bootstrap] group-wide KV capacity uses the minimum across TP ranks"
         );
         // Swap the throwaway profiling pool for the real one (frees the profile
         // pool first). Runs before `prime_graphs`, so no graph references the old
@@ -240,6 +480,9 @@ where
     // size matches a capture slot; on backends without graph support it is a
     // no-op and decode stays eager.
     if let Err(e) = runner.prime_graphs() {
+        if e.is_fatal() {
+            return Err(format!("fatal graph priming failure: {e}"));
+        }
         tracing::info!("[bootstrap] graph priming skipped, eager decode: {:?}", e);
     } else {
         // Capture every decode graph now, before serving, so no live decode
@@ -252,6 +495,9 @@ where
                 bs.capture_sizes.len(),
                 t_warm.elapsed().as_secs_f64(),
             ),
+            Err(e) if e.is_fatal() => {
+                return Err(format!("fatal decode graph prewarm failure: {e}"));
+            }
             Err(e) => tracing::info!("[bootstrap] decode graph prewarm skipped: {:?}", e),
         }
         // Warm the prefill path across a length grid so the first live prefill
@@ -272,6 +518,9 @@ where
                 prefill_grid.len(),
                 t_pf.elapsed().as_secs_f64(),
             ),
+            Err(e) if e.is_fatal() => {
+                return Err(format!("fatal prefill prewarm failure: {e}"));
+            }
             Err(e) => tracing::info!("[bootstrap] prefill prewarm skipped: {:?}", e),
         }
         let t_mixed = Instant::now();
@@ -285,6 +534,9 @@ where
                     n,
                     t_mixed.elapsed().as_secs_f64(),
                 ),
+                Err(e) if e.is_fatal() => {
+                    return Err(format!("fatal mixed eager prewarm failure: {e}"));
+                }
                 Err(e) => tracing::info!("[bootstrap] mixed eager prewarm skipped: {:?}", e),
             }
         } else {
@@ -300,6 +552,9 @@ where
                     attn,
                     t_mixed.elapsed().as_secs_f64(),
                 ),
+                Err(e) if e.is_fatal() => {
+                    return Err(format!("fatal mixed graph prewarm failure: {e}"));
+                }
                 Err(e) => tracing::info!("[bootstrap] mixed graph prewarm skipped: {:?}", e),
             }
         }
@@ -372,7 +627,7 @@ where
     let mut deferred_prefills: Vec<PrefillBatchCmd> = Vec::new();
 
     loop {
-        {
+        let drain_result = {
             let mut ctx = WorkerCtx {
                 active: &mut active,
                 prefilling: &mut prefilling,
@@ -380,9 +635,15 @@ where
                 kv_allocator: &mut kv_allocator,
                 enable_prefix_caching,
             };
-            if drain_control(control, &mut ctx) {
-                return Ok(());
+            drain_control(control, &mut runner, &mut ctx)
+        };
+        match drain_result {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.is_fatal() => {
+                escalate_fatal_and_exit(control, &active, &prefilling, &error)
             }
+            Err(error) => return Err(format!("handle worker control: {error}")),
         }
 
         // ── Wait policy: zero-latency event-driven scheduling ──
@@ -446,15 +707,23 @@ where
             // Control plane ready → handle it now (may be a cancel/shutdown
             // that voids the prefill we are about to run).
             if control_ready {
-                let mut ctx = WorkerCtx {
-                    active: &mut active,
-                    prefilling: &mut prefilling,
-                    decode_engine: &mut decode_engine,
-                    kv_allocator: &mut kv_allocator,
-                    enable_prefix_caching,
+                let drain_result = {
+                    let mut ctx = WorkerCtx {
+                        active: &mut active,
+                        prefilling: &mut prefilling,
+                        decode_engine: &mut decode_engine,
+                        kv_allocator: &mut kv_allocator,
+                        enable_prefix_caching,
+                    };
+                    drain_control(control, &mut runner, &mut ctx)
                 };
-                if drain_control(control, &mut ctx) {
-                    return Ok(());
+                match drain_result {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) if error.is_fatal() => {
+                        escalate_fatal_and_exit(control, &active, &prefilling, &error)
+                    }
+                    Err(error) => return Err(format!("handle worker control: {error}")),
                 }
             }
 
@@ -522,6 +791,14 @@ where
             ) {
                 if matches!(e, OpError::Shutdown) {
                     tracing::info!("[serve] fused step interrupted by shutdown.");
+                    finalize_for_clean_exit(
+                        &mut runner,
+                        &mut decode_engine,
+                        &mut kv_allocator,
+                        control,
+                        &active,
+                        &prefilling,
+                    )?;
                     return Ok(());
                 }
                 if e.is_fatal() {
@@ -571,6 +848,14 @@ where
             ) {
                 if matches!(e, OpError::Shutdown) {
                     tracing::info!("[serve] decode interrupted by shutdown.");
+                    finalize_for_clean_exit(
+                        &mut runner,
+                        &mut decode_engine,
+                        &mut kv_allocator,
+                        control,
+                        &active,
+                        &prefilling,
+                    )?;
                     return Ok(());
                 }
                 if e.is_fatal() {
@@ -596,6 +881,14 @@ where
                         "[profile] cudaProfilerStop after {} steps. Exiting.",
                         profile_step_count
                     );
+                    finalize_for_clean_exit(
+                        &mut runner,
+                        &mut decode_engine,
+                        &mut kv_allocator,
+                        control,
+                        &active,
+                        &prefilling,
+                    )?;
                     return Ok(());
                 }
             }
@@ -632,6 +925,31 @@ where
     }
 }
 
+/// Close an issued async step before a deliberate process exit. This keeps the
+/// TP peer group and its watchdog in the idle state required for deterministic
+/// follower shutdown and join.
+fn finalize_for_clean_exit<M>(
+    runner: &mut Runtime<bf16, Cuda, M>,
+    decode_engine: &mut DecodeEngine,
+    kv_allocator: &mut GlobalKvAllocator,
+    control: &ControlPump,
+    active: &ActiveSeqMap,
+    prefilling: &PrefillSeqMap,
+) -> Result<(), String>
+where
+    M: DecoderModel<bf16, Cuda>,
+{
+    match decode_engine.finalize_and_reclaim_pending(runner, kv_allocator) {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_fatal() => {
+            escalate_fatal_and_exit(control, active, prefilling, &error)
+        }
+        Err(error) => Err(format!(
+            "finalize pending TP work during clean worker exit: {error}"
+        )),
+    }
+}
+
 /// A poisoned device/context surfaced a fatal error. Notify the scheduler so it
 /// fails every in-flight sequence, then exit the process. We deliberately call
 /// `std::process::exit` rather than returning `Err` and unwinding: CUDA `Drop`
@@ -660,12 +978,21 @@ fn escalate_fatal_and_exit(
     std::process::exit(1);
 }
 
-fn drain_control(control: &ControlPump, ctx: &mut WorkerCtx<'_>) -> bool {
+fn drain_control<M>(
+    control: &ControlPump,
+    runner: &mut Runtime<bf16, Cuda, M>,
+    ctx: &mut WorkerCtx<'_>,
+) -> crate::domain::ports::OpResult<bool>
+where
+    M: DecoderModel<bf16, Cuda>,
+{
     while let Ok(Some((msg, req_id))) = control.try_recv(0) {
         match msg {
             SchedulerControlMessage::Shutdown => {
                 tracing::info!("[serve] Shutdown received, exiting.");
-                return true;
+                ctx.decode_engine
+                    .finalize_and_reclaim_pending(runner, ctx.kv_allocator)?;
+                return Ok(true);
             }
             SchedulerControlMessage::Cancel(c) => {
                 apply_cancel(control, ctx, c.sequence_id, req_id);
@@ -684,9 +1011,11 @@ fn drain_control(control: &ControlPump, ctx: &mut WorkerCtx<'_>) -> bool {
                 }
             }
             SchedulerControlMessage::Drain(d) => {
-                apply_drain(control, ctx, d.mode, req_id);
+                apply_drain(control, runner, ctx, d.mode, req_id)?;
             }
             SchedulerControlMessage::UnloadModel(u) => {
+                ctx.decode_engine
+                    .finalize_and_reclaim_pending(runner, ctx.kv_allocator)?;
                 if req_id.is_correlated()
                     && let Err(e) = control.send(
                         WorkerControlMessage::UnloadAck(UnloadAck {
@@ -698,12 +1027,12 @@ fn drain_control(control: &ControlPump, ctx: &mut WorkerCtx<'_>) -> bool {
                     tracing::info!("[serve] failed to send UnloadAck: {}", e);
                 }
                 tracing::info!("[serve] UnloadModel received, exiting.");
-                return true;
+                return Ok(true);
             }
             _ => {}
         }
     }
-    false
+    Ok(false)
 }
 
 /// Cancel one sequence: evict it from `active`/`prefilling`, release its KV,
@@ -764,8 +1093,21 @@ fn apply_preempt(ctx: &mut WorkerCtx<'_>, sequence_ids: &[u64], free_indices: &[
 
 /// Drain: on `Immediate`, evict every sequence and release all KV; always ack
 /// with the post-drain remaining-request count if correlated.
-fn apply_drain(control: &ControlPump, ctx: &mut WorkerCtx<'_>, mode: DrainMode, req_id: RequestId) {
+fn apply_drain<M>(
+    control: &ControlPump,
+    runner: &mut Runtime<bf16, Cuda, M>,
+    ctx: &mut WorkerCtx<'_>,
+    mode: DrainMode,
+    req_id: RequestId,
+) -> crate::domain::ports::OpResult<()>
+where
+    M: DecoderModel<bf16, Cuda>,
+{
     if matches!(mode, DrainMode::Immediate) {
+        // Close rank-local and peer-side async decode spans before any block
+        // can be returned to the allocator and reused.
+        ctx.decode_engine
+            .finalize_and_reclaim_pending(runner, ctx.kv_allocator)?;
         // P1: Iterate drain() directly instead of collecting into a Vec.
         for (_, seq) in ctx.active.drain() {
             ctx.kv_allocator
@@ -775,9 +1117,6 @@ fn apply_drain(control: &ControlPump, ctx: &mut WorkerCtx<'_>, mode: DrainMode, 
             ctx.kv_allocator
                 .release_owned(&seq.block_table, ctx.enable_prefix_caching);
         }
-        // Free the in-flight decode step's slots (not yet in any block table)
-        // before clearing, else they leak from the pool for the process life.
-        ctx.decode_engine.reclaim_pending(ctx.kv_allocator);
         ctx.decode_engine.clear();
     }
     if req_id.is_correlated()
@@ -790,6 +1129,7 @@ fn apply_drain(control: &ControlPump, ctx: &mut WorkerCtx<'_>, mode: DrainMode, 
     {
         tracing::info!("[serve] failed to send DrainAck: {}", e);
     }
+    Ok(())
 }
 
 fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {

@@ -187,9 +187,9 @@ fn two_gpu_tp_components_reconstruct_global_results() {
                         .expect("upload local vocabulary bias"),
                     ),
                 )
-                .with_parallelism(LinearParallelism::Vocab {
+                .with_parallelism(LinearParallelism::Column {
                     tp,
-                    global_out_features: 4,
+                    gather_output: true,
                 });
                 let vocab_input =
                     Tensor::from_host_slice(&bf16_array([1.0, 2.0, 3.0, 4.0]), [2, 2], &device)

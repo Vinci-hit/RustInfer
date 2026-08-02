@@ -71,10 +71,37 @@ impl DataPump {
 
     /// Send LLM step output.
     pub fn send_step_output(&self, output: &StepOutput) -> Result<(), String> {
+        let total_started = std::time::Instant::now();
+        let serialize_started = std::time::Instant::now();
         let bytes = rmp_serde::to_vec(output).map_err(|e| format!("serialize: {}", e))?;
-        self.send_socket
+        tracing::debug!(
+            stage = "data_output_serialized",
+            tokens = output.tokens.len(),
+            assigned = output.assigned_indices.len(),
+            prefill_done = output.prefill_done.len(),
+            bytes = bytes.len(),
+            elapsed_us = serialize_started.elapsed().as_micros() as u64,
+            "[tp-diag] data plane send stage"
+        );
+        let send_started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "data_output_socket_send_begin",
+            bytes = bytes.len(),
+            "[tp-diag] data plane send stage"
+        );
+        let result = self
+            .send_socket
             .send(&bytes, 0)
-            .map_err(|e| format!("send: {}", e))
+            .map_err(|e| format!("send: {}", e));
+        tracing::debug!(
+            stage = "data_output_socket_send_return",
+            success = result.is_ok(),
+            bytes = bytes.len(),
+            elapsed_us = send_started.elapsed().as_micros() as u64,
+            total_elapsed_us = total_started.elapsed().as_micros() as u64,
+            "[tp-diag] data plane send stage"
+        );
+        result
     }
 
     /// Send diffusion batch output.

@@ -153,9 +153,9 @@ impl NcclCommunicator {
         }))
     }
 
-    /// Single-process helper used by multi-GPU primitive tests. Production
-    /// workers use [`Self::init_rank`] with an id distributed by the control
-    /// plane.
+    /// Create a complete single-process communicator group in device-list
+    /// order. Production TP workers and multi-GPU primitive tests use this;
+    /// [`Self::init_rank`] remains available for future multi-process groups.
     pub fn init_all(devices: &[Cuda]) -> OpResult<Vec<Arc<Self>>> {
         require_nccl_version()?;
         if devices.is_empty() {

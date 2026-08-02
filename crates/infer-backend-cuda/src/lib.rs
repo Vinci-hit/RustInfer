@@ -70,6 +70,7 @@ impl CudaScope {
     }
 
     pub fn with_topology(mut self, topology: infer_core::exec::TopologyShape) -> OpResult<Self> {
+        let world_rank = topology.world_rank()?;
         if let Some(comm) = &self.tp_comm
             && comm.rank_pair() != topology.tp
         {
@@ -86,7 +87,7 @@ impl CudaScope {
             pp_rank: topology.pp.rank,
             dp_rank: topology.dp.rank,
             node_rank: topology.node.rank,
-            world_rank: 0,
+            world_rank,
         };
         self.topology = topology;
         Ok(self)
@@ -180,11 +181,11 @@ impl infer_core::exec::ExecScope for CudaScope {
 
     fn synchronize(&self) -> OpResult<()> {
         let _guard = self.enter();
-        // A blocking stream sync cannot implement distributed failure timeout:
-        // production TP still needs nonblocking communicator init plus polling
-        // of both CUDA completion and ncclCommGetAsyncError. The post-sync
-        // check below makes completed NCCL failures fatal, but does not replace
-        // that control-plane watchdog.
+        // A blocking stream sync cannot unwind itself on a distributed stall.
+        // Production TP therefore wraps each mirrored operation in a separate
+        // fail-stop watchdog; expiry terminates the worker without touching the
+        // communicator from another thread. This post-sync check still turns
+        // completed NCCL asynchronous failures into ordinary fatal errors.
         self.device.config.synchronize()?;
         if let Some(comm) = &self.tp_comm {
             comm.check_async_error()?;
@@ -1839,7 +1840,14 @@ impl infer_core::ports::DecodePipelineOps for Cuda {
     }
 
     fn pipeline_arena_begin(scope: &CudaScope) -> OpResult<()> {
-        scope.device.config.arena_begin()
+        if scope.device.config.arena_available() {
+            scope.device.config.arena_begin()
+        } else {
+            // Eager execution can always fall back to the recycling allocator.
+            // A zero-sized/failed graph arena only disables capture support; it
+            // must not make the eager mixed path unusable.
+            Ok(())
+        }
     }
     fn pipeline_arena_end(scope: &CudaScope) {
         scope.device.config.arena_end();

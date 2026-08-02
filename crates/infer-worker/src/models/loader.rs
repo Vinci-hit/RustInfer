@@ -83,6 +83,7 @@ impl LinearAttnConfig {
 }
 
 /// Configuration for model loading.
+#[derive(Debug, Clone)]
 pub struct LoadConfig {
     pub dim: usize,
     pub intermediate_size: usize,
@@ -461,8 +462,12 @@ impl<'a> WeightLoader<'a> {
     ) -> OpResult<CompLinear<T, D>> {
         let Some(block) = fp8_block else {
             let dense = self.load_fused_qkv::<T, D>(prefix, q_dim, kv_dim, dim, device)?;
-            return Ok(CompLinear::new(dense.weight, dense.bias)
-                .with_parallelism(LinearParallelism::Column { tp: self.tp }));
+            return Ok(CompLinear::new(dense.weight, dense.bias).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ));
         };
 
         self.require_tp1("block-FP8 column-parallel QKV")?;
@@ -517,8 +522,14 @@ impl<'a> WeightLoader<'a> {
             Shape::from_slice(&host.scale_shape),
             device,
         )?;
-        Ok(CompLinear::from_fp8_block(weight, scales, block, None)
-            .with_parallelism(LinearParallelism::Column { tp: self.tp }))
+        Ok(
+            CompLinear::from_fp8_block(weight, scales, block, None).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ),
+        )
     }
 
     /// Load fused gate_up: concatenate gate_proj, up_proj along rows
@@ -569,8 +580,12 @@ impl<'a> WeightLoader<'a> {
     ) -> OpResult<CompLinear<T, D>> {
         let Some(block) = fp8_block else {
             let dense = self.load_fused_gate_up::<T, D>(prefix, intermediate_size, dim, device)?;
-            return Ok(CompLinear::new(dense.weight, dense.bias)
-                .with_parallelism(LinearParallelism::Column { tp: self.tp }));
+            return Ok(CompLinear::new(dense.weight, dense.bias).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ));
         };
 
         self.require_tp1("block-FP8 column-parallel gate/up")?;
@@ -622,8 +637,14 @@ impl<'a> WeightLoader<'a> {
             Shape::from_slice(&host.scale_shape),
             device,
         )?;
-        Ok(CompLinear::from_fp8_block(weight, scales, block, None)
-            .with_parallelism(LinearParallelism::Column { tp: self.tp }))
+        Ok(
+            CompLinear::from_fp8_block(weight, scales, block, None).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ),
+        )
     }
 
     // ─── AWQ / compressed-tensors `pack-quantized` MLP loading ───────────────
@@ -718,8 +739,14 @@ impl<'a> WeightLoader<'a> {
             "fused_gate_up_awq scales",
             device,
         )?;
-        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None)
-            .with_parallelism(LinearParallelism::Column { tp: self.tp }))
+        Ok(
+            CompLinear::from_awq(packed, zeros, scales, scheme, None).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ),
+        )
     }
 }
 
@@ -753,9 +780,9 @@ fn make_vocab_parallel_linear<T: Dtype, D: LlmBackend>(
     let parallelism = if tp.size == 1 {
         LinearParallelism::Replicated { tp }
     } else {
-        LinearParallelism::Vocab {
+        LinearParallelism::Column {
             tp,
-            global_out_features: global_vocab_size,
+            gather_output: true,
         }
     };
     Ok(CompLinear::new(weight, bias).with_parallelism(parallelism))
@@ -1532,9 +1559,9 @@ mod tp_tests {
         ));
         assert_eq!(
             lm_head.parallelism(),
-            LinearParallelism::Vocab {
+            LinearParallelism::Column {
                 tp,
-                global_out_features: 6,
+                gather_output: true,
             }
         );
     }

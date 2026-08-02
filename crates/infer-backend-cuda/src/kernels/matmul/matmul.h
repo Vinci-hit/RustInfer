@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublasLt.h>
+#include <cublas_v2.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,7 +36,8 @@ void gemm_cublaslt_bf16(
     int K,
     int ldc,
     cudaStream_t stream,
-    cublasLtHandle_t handle,
+    cublasLtHandle_t ltHandle,
+    cublasHandle_t handle,
     void* workspace, size_t workspaceSize
 );
 
