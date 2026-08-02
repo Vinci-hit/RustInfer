@@ -33,6 +33,7 @@ void gemm_cublaslt_bf16(
     int M,
     int N,
     int K,
+    int ldc,
     cudaStream_t stream,
     cublasLtHandle_t handle,
     void* workspace, size_t workspaceSize

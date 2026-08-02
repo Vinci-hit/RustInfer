@@ -379,19 +379,51 @@ impl CoreOps for Cpu {
         weight: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        let m = input.shape().as_slice()[0];
-        let k = input.shape().as_slice()[1];
-        let n = weight.shape().as_slice()[0];
+        let input_shape = input.shape().as_slice();
+        let weight_shape = weight.shape().as_slice();
+        let output_shape = output.shape().as_slice();
+        if input_shape.len() != 2 || weight_shape.len() != 2 || output_shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "matmul: expected rank-2 input/weight/output, got {:?}/{:?}/{:?}",
+                input_shape, weight_shape, output_shape
+            )));
+        }
+        let m = input_shape[0];
+        let k = input_shape[1];
+        let n = weight_shape[0];
+        if weight_shape[1] != k || output_shape != [m, n] {
+            return Err(OpError::Shape(format!(
+                "matmul: incompatible input {:?}, weight {:?}, output {:?}",
+                input_shape, weight_shape, output_shape
+            )));
+        }
+        let input_strides = input.strides().as_slice();
+        let weight_strides = weight.strides().as_slice();
+        let output_strides = output.strides().as_slice();
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for p in 0..k {
                     unsafe {
-                        sum += read_f64(input.data_ptr().add(i * k + p))
-                            * read_f64(weight.data_ptr().add(j * k + p));
+                        sum += read_f64(
+                            input
+                                .data_ptr()
+                                .add(i * input_strides[0] + p * input_strides[1]),
+                        ) * read_f64(
+                            weight
+                                .data_ptr()
+                                .add(j * weight_strides[0] + p * weight_strides[1]),
+                        );
                     }
                 }
-                unsafe { write_f64(output.data_ptr_mut().add(i * n + j), sum) };
+                unsafe {
+                    write_f64(
+                        output
+                            .data_ptr_mut()
+                            .add(i * output_strides[0] + j * output_strides[1]),
+                        sum,
+                    )
+                };
             }
         }
         Ok(())
@@ -566,10 +598,43 @@ impl CoreOps for Cpu {
     }
 
     fn broadcast_add_inplace<T: Dtype>(
-        _x: &mut Tensor<T, Self>,
-        _bias: &Tensor<T, Self>,
+        x: &mut Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
     ) -> OpResult<()> {
-        Err(OpError::unsupported("cpu", "broadcast_add_inplace"))
+        let dim = bias.numel();
+        if dim == 0 || !x.numel().is_multiple_of(dim) {
+            return Err(OpError::Shape(format!(
+                "broadcast_add_inplace: x.numel()={} not a multiple of bias.numel()={}",
+                x.numel(),
+                dim
+            )));
+        }
+        if !bias.is_contiguous() {
+            return Err(OpError::NotContiguous(*bias.shape()));
+        }
+        let rows = x.numel() / dim;
+        let (row_stride, col_stride) = if x.is_contiguous() {
+            (dim, 1)
+        } else {
+            let shape = x.shape().as_slice();
+            let strides = x.strides().as_slice();
+            if shape.len() != 2 || shape != [rows, dim] {
+                return Err(OpError::Shape(format!(
+                    "broadcast_add_inplace: non-contiguous x must have shape [rows, dim], got {:?}",
+                    shape
+                )));
+            }
+            (strides[0], strides[1])
+        };
+        for row in 0..rows {
+            for col in 0..dim {
+                unsafe {
+                    let dst = x.data_ptr_mut().add(row * row_stride + col * col_stride);
+                    write_f64(dst, read_f64(dst) + read_f64(bias.data_ptr().add(col)));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn split_cols<T: Dtype>(
@@ -1269,6 +1334,45 @@ mod tests {
         let mut output = Tensor::<f32, Cpu>::zeros_cpu([2, 2]);
         Cpu::matmul(&input, &weight, &mut output).unwrap();
         assert_eq!(output.as_slice(), &[1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn op_matmul_writes_strided_output_view() {
+        let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        let weight = Tensor::<f32, Cpu>::from_slice(&[1.0, 0.0, 0.0, 1.0], [2, 2]);
+        let output = Tensor::<f32, Cpu>::from_slice(&[-1.0; 10], [2, 5]);
+        let mut shard = output.narrow(1, 1, 2).unwrap();
+
+        Cpu::matmul(&input, &weight, &mut shard).unwrap();
+
+        assert_eq!(
+            output.as_slice(),
+            &[-1.0, 1.0, 2.0, -1.0, -1.0, -1.0, 3.0, 4.0, -1.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn op_broadcast_add_updates_strided_rows_only() {
+        let output = Tensor::<f32, Cpu>::from_slice(&[-1.0; 10], [2, 5]);
+        let mut shard = output.narrow(1, 1, 2).unwrap();
+        let bias = Tensor::<f32, Cpu>::from_slice(&[10.0, 20.0], [2]);
+
+        Cpu::broadcast_add_inplace(&mut shard, &bias).unwrap();
+
+        assert_eq!(
+            output.as_slice(),
+            &[-1.0, 9.0, 19.0, -1.0, -1.0, -1.0, 9.0, 19.0, -1.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn op_broadcast_add_contiguous() {
+        let mut output = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        let bias = Tensor::<f32, Cpu>::from_slice(&[10.0, 20.0], [2]);
+
+        Cpu::broadcast_add_inplace(&mut output, &bias).unwrap();
+
+        assert_eq!(output.as_slice(), &[11.0, 22.0, 13.0, 24.0]);
     }
 
     #[test]

@@ -361,8 +361,12 @@ impl CollectiveOps for Cuda {
             return out.copy_from(shard);
         };
         let (outer, local_count) = validate_gather_shape(shard, out, dim, comm.size)?;
-        require_contiguous(shard, "all_gather shard")?;
         require_contiguous(out, "all_gather output")?;
+        require_gather_inner_contiguous(shard, dim)?;
+        validate_gather_alias(shard, out, dim, outer, local_count, comm.rank, comm.size)?;
+        if outer == 0 || local_count == 0 {
+            return Ok(());
+        }
         let _guard = scope.enter();
         let _issue = comm.lock()?;
         let dtype = nccl_dtype::<T>()?;
@@ -374,7 +378,11 @@ impl CollectiveOps for Cuda {
         }
         let mut first_error = None;
         for outer_index in 0..outer {
-            let send = unsafe { shard.data_ptr().add(outer_index * local_count) };
+            // The validation pass above evaluated every offset with the same
+            // checked arithmetic before the NCCL group began.
+            let send_offset = gather_outer_offset(shard, dim, outer_index)
+                .expect("all_gather send offset was validated before ncclGroupStart");
+            let send = unsafe { shard.data_ptr().add(send_offset) };
             let recv = unsafe {
                 out.data_ptr_mut()
                     .add(outer_index * local_count * comm.size)
@@ -661,7 +669,177 @@ fn validate_gather_shape<T: Dtype>(
             )));
         }
     }
-    let outer = shard_shape[..dim].iter().product();
-    let local_count = shard_shape[dim..].iter().product();
+    let outer = checked_shape_product(&shard_shape[..dim], "all_gather outer size")?;
+    let local_count = checked_shape_product(&shard_shape[dim..], "all_gather send count")?;
     Ok((outer, local_count))
+}
+
+/// NCCL receives one packed block per call. Dimensions at and after the gather
+/// axis must therefore form a contiguous block, while dimensions before it may
+/// carry gaps. The latter is what permits a `[rows, local_vocab]` column view
+/// into a packed `[rows, global_vocab]` logits tensor.
+fn require_gather_inner_contiguous<T: Dtype>(shard: &Tensor<T, Cuda>, dim: usize) -> OpResult<()> {
+    if shard.numel() == 0 {
+        return Ok(());
+    }
+    let shape = shard.shape().as_slice();
+    let strides = shard.strides().as_slice();
+    let mut expected = 1usize;
+    for axis in (dim..shape.len()).rev() {
+        let extent = shape[axis];
+        if extent > 1 && strides[axis] != expected {
+            return Err(OpError::Shape(format!(
+                "all_gather shard dimensions {dim}.. must be contiguous, got shape {:?} strides {:?}",
+                shape, strides
+            )));
+        }
+        expected = expected
+            .checked_mul(extent)
+            .ok_or_else(|| OpError::Shape("all_gather shard contiguous span overflows".into()))?;
+    }
+    Ok(())
+}
+
+/// Element offset for one NCCL send block. A contiguous shard naturally
+/// produces `row * local_count`; a column view uses its real outer stride (for
+/// example `row * global_vocab`).
+fn gather_outer_offset<T: Dtype>(
+    shard: &Tensor<T, Cuda>,
+    dim: usize,
+    flat_index: usize,
+) -> OpResult<usize> {
+    let shape = shard.shape().as_slice();
+    let strides = shard.strides().as_slice();
+    let mut remainder = flat_index;
+    let mut offset = 0usize;
+    for axis in (0..dim).rev() {
+        let extent = shape[axis];
+        if extent == 0 {
+            return Err(OpError::Shape(
+                "all_gather outer index addresses an empty dimension".into(),
+            ));
+        }
+        let index = remainder % extent;
+        remainder /= extent;
+        let term = index
+            .checked_mul(strides[axis])
+            .ok_or_else(|| OpError::Shape("all_gather shard outer offset overflows".into()))?;
+        offset = offset
+            .checked_add(term)
+            .ok_or_else(|| OpError::Shape("all_gather shard outer offset overflows".into()))?;
+    }
+    Ok(offset)
+}
+
+/// NCCL permits an in-place AllGather only when the send block is exactly the
+/// calling rank's slot inside the receive block. Tensor views can alias through
+/// their shared `Storage`, so reject every other overlap before entering the
+/// collective.
+fn validate_gather_alias<T: Dtype>(
+    shard: &Tensor<T, Cuda>,
+    out: &Tensor<T, Cuda>,
+    dim: usize,
+    outer: usize,
+    local_count: usize,
+    rank: usize,
+    size: usize,
+) -> OpResult<()> {
+    let aliases_output = Arc::ptr_eq(shard.storage(), out.storage()) && local_count != 0;
+    for outer_index in 0..outer {
+        let send_offset = gather_outer_offset(shard, dim, outer_index)?;
+        if aliases_output {
+            validate_gather_alias_offset(
+                shard.offset_elems(),
+                out.offset_elems(),
+                out.numel(),
+                send_offset,
+                local_count,
+                rank,
+                size,
+                outer_index,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_gather_alias_offset(
+    shard_offset: usize,
+    out_offset: usize,
+    out_numel: usize,
+    send_offset: usize,
+    local_count: usize,
+    rank: usize,
+    size: usize,
+    outer_index: usize,
+) -> OpResult<()> {
+    let global_count = local_count
+        .checked_mul(size)
+        .ok_or_else(|| OpError::Shape("all_gather receive count overflows".into()))?;
+    let out_end = out_offset
+        .checked_add(out_numel)
+        .ok_or_else(|| OpError::Shape("all_gather output range overflows".into()))?;
+
+    let send_start = shard_offset
+        .checked_add(send_offset)
+        .ok_or_else(|| OpError::Shape("all_gather send range overflows".into()))?;
+    let send_end = send_start
+        .checked_add(local_count)
+        .ok_or_else(|| OpError::Shape("all_gather send range overflows".into()))?;
+    let overlaps_output = send_start < out_end && out_offset < send_end;
+    if !overlaps_output {
+        return Ok(());
+    }
+
+    let expected = outer_index
+        .checked_mul(global_count)
+        .and_then(|offset| {
+            rank.checked_mul(local_count)
+                .and_then(|slot| offset.checked_add(slot))
+        })
+        .and_then(|offset| out_offset.checked_add(offset))
+        .ok_or_else(|| OpError::Shape("all_gather in-place offset overflows".into()))?;
+    if send_start != expected {
+        return Err(OpError::Shape(format!(
+            "all_gather shard overlaps its output at outer index {outer_index}; NCCL in-place requires rank {rank}/{size} send data to start at element {expected}, got {send_start}"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_shape_product(shape: &[usize], what: &str) -> OpResult<usize> {
+    shape.iter().try_fold(1usize, |product, &extent| {
+        product
+            .checked_mul(extent)
+            .ok_or_else(|| OpError::Shape(format!("{what} overflows")))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_gather_alias_offset;
+
+    #[test]
+    fn gather_alias_accepts_exact_rank_slots_for_strided_rows() {
+        for (outer_index, send_offset) in [0, 4, 8].into_iter().enumerate() {
+            validate_gather_alias_offset(2, 0, 12, send_offset, 2, 1, 2, outer_index).unwrap();
+        }
+    }
+
+    #[test]
+    fn gather_alias_rejects_any_other_output_overlap() {
+        let error = validate_gather_alias_offset(0, 0, 12, 0, 2, 1, 2, 0)
+            .expect_err("rank 1 may not send from rank 0's receive slot");
+        assert!(
+            error
+                .to_string()
+                .contains("NCCL in-place requires rank 1/2")
+        );
+    }
+
+    #[test]
+    fn gather_alias_allows_non_overlapping_storage_regions() {
+        validate_gather_alias_offset(32, 0, 12, 0, 2, 1, 2, 0).unwrap();
+    }
 }

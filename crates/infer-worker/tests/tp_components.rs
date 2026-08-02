@@ -163,8 +163,9 @@ fn two_gpu_tp_components_reconstruct_global_results() {
                     .map(|value| value.to_f32())
                     .collect();
 
-                // Two local vocabulary columns from each rank are gathered on
-                // dim 1. The expected layout interleaves neither ranks nor rows.
+                // Each rank writes two local vocabulary columns (including its
+                // local bias) directly into the corresponding columns of the
+                // final row-major output, then gathers those slots in place.
                 let vocab_weight = if rank == 0 {
                     bf16_array([1.0, 0.0, 0.0, 1.0])
                 } else {
@@ -173,7 +174,18 @@ fn two_gpu_tp_components_reconstruct_global_results() {
                 let vocab_linear = Linear::new(
                     Tensor::from_host_slice(&vocab_weight, [2, 2], &device)
                         .expect("upload local vocabulary weight"),
-                    None,
+                    Some(
+                        Tensor::from_host_slice(
+                            &if rank == 0 {
+                                bf16_array([0.5, -1.0])
+                            } else {
+                                bf16_array([2.0, 3.0])
+                            },
+                            [2],
+                            &device,
+                        )
+                        .expect("upload local vocabulary bias"),
+                    ),
                 )
                 .with_parallelism(LinearParallelism::Vocab {
                     tp,
@@ -190,6 +202,10 @@ fn two_gpu_tp_components_reconstruct_global_results() {
                 vocab_linear
                     .forward(&vocab_input, &mut vocab_output, &linear_ctx)
                     .expect("vocab-parallel linear forward");
+                rendezvous.wait();
+                vocab_linear
+                    .forward(&vocab_input, &mut vocab_output, &linear_ctx)
+                    .expect("reuse in-place vocabulary output");
                 scope
                     .synchronize()
                     .expect("synchronize vocabulary all-gather");
@@ -279,8 +295,8 @@ fn two_gpu_tp_components_reconstruct_global_results() {
         );
         assert_eq!(
             result.vocab_logits,
-            [1.0, 2.0, 3.0, 0.0, 3.0, 4.0, 7.0, 2.0],
-            "rank {rank} vocab-parallel logits layout"
+            [1.5, 1.0, 5.0, 3.0, 3.5, 3.0, 9.0, 5.0],
+            "rank {rank} in-place vocab-parallel logits and bias"
         );
         assert_eq!(
             result.row_output,

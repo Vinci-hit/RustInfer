@@ -21,6 +21,7 @@ struct RankResult {
     f32_sum: Vec<f32>,
     bf16_sum: Vec<f32>,
     gathered_rows: Vec<f32>,
+    inplace_gathered_rows: Vec<f32>,
 }
 
 #[test]
@@ -136,10 +137,49 @@ fn two_gpu_collectives_preserve_values_and_dim1_layout() {
                 scope.synchronize().expect("synchronize all-gather");
                 let gathered_rows = gathered.to_host_vec().expect("download gathered rows");
 
+                // The local shard is a non-contiguous column view into the
+                // final output itself. NCCL's in-place contract permits this
+                // exact rank slot; each outer row must use the view's real
+                // full-output stride rather than a packed local-row stride.
+                let inplace_host = if rank == 0 {
+                    vec![
+                        1.0f32, 2.0, -1.0, -1.0, 3.0, 4.0, -1.0, -1.0, 5.0, 6.0, -1.0, -1.0,
+                    ]
+                } else {
+                    vec![
+                        -1.0f32, -1.0, 10.0, 20.0, -1.0, -1.0, 30.0, 40.0, -1.0, -1.0, 50.0, 60.0,
+                    ]
+                };
+                let mut inplace = Tensor::from_host_slice(&inplace_host, [3, 4], &device)
+                    .expect("upload in-place gather output");
+                let local_columns = inplace
+                    .narrow(1, rank * 2, 2)
+                    .expect("view local rank columns");
+                assert!(
+                    !local_columns.is_contiguous(),
+                    "multi-row rank columns must retain the full-output row stride"
+                );
+                rendezvous.wait();
+                <Cuda as CollectiveOps>::all_gather(
+                    &scope,
+                    CommAxis::Tp,
+                    1,
+                    &local_columns,
+                    &mut inplace,
+                )
+                .expect("in-place dim=1 NCCL all-gather");
+                scope
+                    .synchronize()
+                    .expect("synchronize in-place all-gather");
+                let inplace_gathered_rows = inplace
+                    .to_host_vec()
+                    .expect("download in-place gathered rows");
+
                 RankResult {
                     f32_sum,
                     bf16_sum,
                     gathered_rows,
+                    inplace_gathered_rows,
                 }
             })
         })
@@ -170,6 +210,13 @@ fn two_gpu_collectives_preserve_values_and_dim1_layout() {
             result.gathered_rows,
             [1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0],
             "rank {rank} dim=1 all-gather"
+        );
+        assert_eq!(
+            result.inplace_gathered_rows,
+            [
+                1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0, 5.0, 6.0, 50.0, 60.0,
+            ],
+            "rank {rank} in-place dim=1 all-gather"
         );
     }
 }

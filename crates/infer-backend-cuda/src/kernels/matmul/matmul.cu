@@ -136,9 +136,10 @@ extern "C" void sgemm_naive_f32_cu(
 // ============================================================================
 // gemm_cublasLt_AxBT_RowMajor_bf16
 //
-// Row-major `C = A @ B^T` where A is [M, K], B is [N, K], C is [M, N].
+// Row-major `C = A @ B^T` where A is [M, K], B is [N, K], C is [M, N]
+// with row stride ldc (ldc >= N).
 //
-// Per (M, N, K) we cache:
+// Per (M, N, K, ldc) we cache:
 //   - operationDesc / Adesc / Bdesc / Cdesc       (layout, stateless)
 //   - selected cublasLtMatmulAlgo_t               (stateless handle)
 //
@@ -158,14 +159,15 @@ extern "C" void sgemm_naive_f32_cu(
 #include <vector>
 
 struct ZimageBf16GemmKey {
-    int M, N, K;
+    int M, N, K, ldc;
     bool operator==(const ZimageBf16GemmKey& o) const noexcept {
-        return M == o.M && N == o.N && K == o.K;
+        return M == o.M && N == o.N && K == o.K && ldc == o.ldc;
     }
 };
 struct ZimageBf16GemmKeyHash {
     size_t operator()(const ZimageBf16GemmKey& k) const noexcept {
-        return (size_t(k.M) * 1315423911u) ^ (size_t(k.N) * 2654435761u) ^ (size_t(k.K) * 40503u);
+        return (size_t(k.M) * 1315423911u) ^ (size_t(k.N) * 2654435761u)
+            ^ (size_t(k.K) * 40503u) ^ (size_t(k.ldc) * 2246822519u);
     }
 };
 struct ZimageBf16GemmEntry {
@@ -197,9 +199,9 @@ extern "C" void zimage_set_eager_prefill_gemm(int on)
     g_zimage_eager_prefill_gemm.store(on, std::memory_order_relaxed);
 }
 
-// Eager-prefill algo cache keyed by (N,K) only — NOT M. The cuBLASLt heuristic's
+// Eager-prefill algo cache keyed by (N,K,ldc) — NOT exact M. The cuBLASLt heuristic's
 // algo pick is robust across M for a fixed (N,K), so we run the heuristic once
-// per (N,K) and reuse the (M-independent) op descriptor + algo for every prompt
+// per (N,K,ldc) and reuse the (M-independent) op descriptor + algo for every prompt
 // length. The cheap M-dependent matrix layouts are recreated per call. This
 // gives prefill the single-pass cuBLASLt kernel (no chunked K-tile launch storm)
 // with zero per-length build cost — unlike the (M,N,K)-keyed decode cache, which
@@ -219,13 +221,16 @@ static inline int zimage_m_bucket(int M)
     return ((M + 1023) / 1024) * 1024;
 }
 struct ZimageNkKey {
-    int N, K, Mb;
-    bool operator==(const ZimageNkKey& o) const { return N == o.N && K == o.K && Mb == o.Mb; }
+    int N, K, Mb, ldc;
+    bool operator==(const ZimageNkKey& o) const {
+        return N == o.N && K == o.K && Mb == o.Mb && ldc == o.ldc;
+    }
 };
 struct ZimageNkKeyHash {
     size_t operator()(const ZimageNkKey& k) const {
         size_t h = std::hash<long long>()(((long long)k.N << 32) ^ (unsigned)k.K);
-        return h * 1000003u ^ std::hash<int>()(k.Mb);
+        return h * 1000003u ^ std::hash<int>()(k.Mb)
+            ^ (std::hash<int>()(k.ldc) * 2246822519u);
     }
 };
 struct ZimageNkEntry {
@@ -239,7 +244,7 @@ static std::unordered_map<ZimageNkKey, ZimageNkEntry, ZimageNkKeyHash> g_zimage_
 
 // Forward decl — defined later in this TU (the build-free chunked fallback).
 static void gemm_bf16_chunked_legacy(
-    int M, int N, int K,
+    int M, int N, int K, int ldc,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream);
 
@@ -251,7 +256,7 @@ static void gemm_bf16_chunked_legacy(
 // it is used ONLY on the non-capturing eager-prefill path; decode graphs keep
 // the capturable cached algo. Recreates the (cheap, ~µs) descriptors per call.
 static void gemm_bf16_nullptr_runtime(
-    cublasLtHandle_t ltHandle, int M, int N, int K,
+    cublasLtHandle_t ltHandle, int M, int N, int K, int ldc,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream)
 {
@@ -266,7 +271,7 @@ static void gemm_bf16_nullptr_runtime(
     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
     cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
     cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
-    cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g);
+    cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, ldc);
     float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t status = cublasLtMatmul(
         ltHandle, op, &alpha,
@@ -278,7 +283,8 @@ static void gemm_bf16_nullptr_runtime(
     cublasLtMatrixLayoutDestroy(A);
     cublasLtMatmulDescDestroy(op);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+        gemm_bf16_chunked_legacy(
+            M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
     }
 }
 
@@ -286,14 +292,14 @@ static void gemm_bf16_nullptr_runtime(
 // the chunked cublasGemmEx path on any cuBLASLt error (cold-build failure or an
 // algo the cached pick can't service at this M).
 [[maybe_unused]] static void gemm_bf16_eager_nk_cached(
-    cublasLtHandle_t ltHandle, int M, int N, int K,
+    cublasLtHandle_t ltHandle, int M, int N, int K, int ldc,
     const __nv_bfloat16* d_A, const __nv_bfloat16* d_B, __nv_bfloat16* d_C,
     void* workspace, size_t workspaceSize, cudaStream_t stream)
 {
     // Row-major C[M,N]=A[M,K]·B[N,K]^T  ->  col-major [N,M]=[N,K]·[K,M] with
     // transA=T, transB=N and swapped operands (mirrors the decode-cache build).
     const int m_g = N, n_g = M, k_g = K;
-    const ZimageNkKey nk_key{N, K, zimage_m_bucket(M)};
+    const ZimageNkKey nk_key{N, K, zimage_m_bucket(M), ldc};
 
     ZimageNkEntry entry;
     {
@@ -311,7 +317,7 @@ static void gemm_bf16_nullptr_runtime(
             cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
             cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
             cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
-            cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g);
+            cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, ldc);
             cublasLtMatmulPreferenceCreate(&pref);
             cublasLtMatmulPreferenceSetAttribute(
                 pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize));
@@ -327,7 +333,8 @@ static void gemm_bf16_nullptr_runtime(
             cublasLtMatrixLayoutDestroy(C);
             if (ret == 0) {
                 cublasLtMatmulDescDestroy(op);
-                gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+                gemm_bf16_chunked_legacy(
+                    M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
                 return;
             }
             entry.op = op;
@@ -342,7 +349,7 @@ static void gemm_bf16_nullptr_runtime(
     cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
     cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
     cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
-    cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, m_g);
+    cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, ldc);
     float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t st = cublasLtMatmul(
         ltHandle, entry.op, &alpha,
@@ -353,7 +360,8 @@ static void gemm_bf16_nullptr_runtime(
     cublasLtMatrixLayoutDestroy(B);
     cublasLtMatrixLayoutDestroy(C);
     if (st != CUBLAS_STATUS_SUCCESS) {
-        gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+        gemm_bf16_chunked_legacy(
+            M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
     }
 }
 
@@ -423,7 +431,7 @@ static bool zimage_algo_is_capturable(
 }
 
 static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
-    int M, int N, int K, size_t workspaceSize,
+    int M, int N, int K, int ldc, size_t workspaceSize,
     // scratch buffers from the caller — we reuse these for the benchmark
     // to avoid a costly cudaMalloc of up to ~300 MiB on large FFN shapes
     // (which can race with the text encoder's allocations).
@@ -447,7 +455,7 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
 
     CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.A, CUDA_R_16BF, k_g, m_g, k_g));
     CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.B, CUDA_R_16BF, k_g, n_g, k_g));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.C, CUDA_R_16BF, m_g, n_g, m_g));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&e.C, CUDA_R_16BF, m_g, n_g, ldc));
 
     cublasLtMatmulPreference_t pref = nullptr;
     CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
@@ -619,10 +627,10 @@ static ZimageBf16GemmEntry zimage_build_bf16_gemm_entry(
 // capture still produces a correct (if slower) result instead of crashing.
 //
 // Row-major C[M,N] = A[M,K] @ B[N,K]^T -> column-major m=N, n=M, k=K with
-// B^T (lda=K), A (ldb=K), C (ldc=N). K is tiled at K_CHUNK so cuBLAS keeps a
+// B^T (lda=K), A (ldb=K), and strided C (ldc>=N). K is tiled at K_CHUNK so cuBLAS keeps a
 // single-pass (graph-capturable) kernel and accumulates chunks with beta=1.
 static void gemm_bf16_chunked_legacy(
-    int M, int N, int K,
+    int M, int N, int K, int ldc,
     const __nv_bfloat16 *d_A,
     const __nv_bfloat16 *d_B,
     __nv_bfloat16 *d_C,
@@ -659,7 +667,7 @@ static void gemm_bf16_chunked_legacy(
             d_B + k0, CUDA_R_16BF, K,
             d_A + k0, CUDA_R_16BF, K,
             &beta,
-            d_C, CUDA_R_16BF, N,
+            d_C, CUDA_R_16BF, ldc,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("cuBLAS bf16 GemmEx fallback failed: status=%d M=%d N=%d K=%d "
@@ -672,7 +680,7 @@ static void gemm_bf16_chunked_legacy(
 
 void gemm_cublasLt_AxBT_RowMajor_bf16(
     cublasLtHandle_t ltHandle,
-    int M, int N, int K,
+    int M, int N, int K, int ldc,
     const __nv_bfloat16 *d_A, // shape: [M, K]
     const __nv_bfloat16 *d_B, // shape: [N, K]
     __nv_bfloat16 *d_C,       // shape: [M, N]
@@ -698,12 +706,13 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
     if (!capturing && g_zimage_eager_prefill_gemm.load(std::memory_order_relaxed) != 0) {
         // algo=nullptr runtime selection — faster than the heuristic/benchmarked
         // cached algos for small-M prefill (restores 532f5c forward speed).
-        gemm_bf16_nullptr_runtime(ltHandle, M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+        gemm_bf16_nullptr_runtime(
+            ltHandle, M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
         return;
     }
 
     const ZimageBf16GemmEntry* entry = nullptr;
-    ZimageBf16GemmKey key{M, N, K};
+    ZimageBf16GemmKey key{M, N, K, ldc};
     {
         std::lock_guard<std::mutex> lk(g_zimage_bf16_gemm_cache_mu);
         auto it = g_zimage_bf16_gemm_cache.find(key);
@@ -716,7 +725,7 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
             // populated cache. Reuse the caller's d_A/d_B/d_C/workspace as bench
             // scratch (the real matmul below overwrites d_C with the answer).
             ZimageBf16GemmEntry built = zimage_build_bf16_gemm_entry(
-                M, N, K, workspaceSize, d_A, d_B, d_C, workspace);
+                M, N, K, ldc, workspaceSize, d_A, d_B, d_C, workspace);
             auto ins = g_zimage_bf16_gemm_cache.emplace(key, built);
             if (ins.first->second.valid) entry = &ins.first->second;
         }
@@ -735,14 +744,16 @@ void gemm_cublasLt_AxBT_RowMajor_bf16(
             printf("cuBLASLt bf16 cached matmul failed: status=%d M=%d N=%d K=%d "
                    "(capturing=%d) — falling back to chunked legacy\n",
                    status, M, N, K, (int)capturing);
-            gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+            gemm_bf16_chunked_legacy(
+                M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
         }
         return;
     }
 
     // Cache miss with no chance to build (cold shape first seen under capture):
     // use the capture-safe chunked legacy path so we stay correct.
-    gemm_bf16_chunked_legacy(M, N, K, d_A, d_B, d_C, workspace, workspaceSize, stream);
+    gemm_bf16_chunked_legacy(
+        M, N, K, ldc, d_A, d_B, d_C, workspace, workspaceSize, stream);
 }
 // ============================================================================
 // BF16 GEMV kernel v3 for decode phase (M=1)
@@ -838,11 +849,13 @@ void gemm_cublaslt_bf16(
     int M,
     int N,
     int K,
+    int ldc,
     cudaStream_t stream,
     cublasLtHandle_t handle,
     void* workspace, size_t workspaceSize
 ) {
-    gemm_cublasLt_AxBT_RowMajor_bf16(handle, M, N, K, A, B, C, workspace, workspaceSize,stream);
+    gemm_cublasLt_AxBT_RowMajor_bf16(
+        handle, M, N, K, ldc, A, B, C, workspace, workspaceSize, stream);
 }
 
 // ============================================================================
@@ -1717,7 +1730,7 @@ extern "C" void gemm_strided_batched_f32_axb(
 
 extern "C" void gemm_cublas_f32_axbt(
     const float* A, const float* B, float* C,
-    int M, int N, int K,
+    int M, int N, int K, int ldc,
     cudaStream_t stream
 ) {
     cublasHandle_t h = get_cublas_handle();
@@ -1734,7 +1747,7 @@ extern "C" void gemm_cublas_f32_axbt(
         B, CUDA_R_32F, K,
         A, CUDA_R_32F, K,
         &beta,
-        C, CUDA_R_32F, N,
+        C, CUDA_R_32F, ldc,
         CUBLAS_COMPUTE_32F_FAST_TF32,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
     );

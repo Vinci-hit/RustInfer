@@ -30,6 +30,9 @@ pub trait CollectiveOps: Device {
         buf: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
+    /// Gather rank shards along `dim`. `shard` may be an inner-contiguous,
+    /// outer-strided view into the calling rank's slot of `out`; backends must
+    /// preserve this legal in-place collective layout.
     fn all_gather<T: Dtype>(
         scope: &Self::Scope,
         axis: CommAxis,

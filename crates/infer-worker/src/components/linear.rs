@@ -1,10 +1,9 @@
 use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::dtype::{Dtype, Fp8E4m3};
-use crate::domain::exec::{ExecScope, RankPair, StepCtx};
+use crate::domain::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp};
 use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
 
 /// A linear layer's weight: dense, int4 group-quantized, or block-scaled FP8.
 ///
@@ -184,6 +183,44 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         output: &mut Tensor<T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
+        self.validate_execution_context(ctx)?;
+
+        match self.parallelism {
+            LinearParallelism::Vocab {
+                tp,
+                global_out_features,
+            } if tp.size > 1 => {
+                self.validate_vocab_shapes(input, output, tp, global_out_features, ctx)?;
+                let local_features = self.out_features();
+                let local_start = tp.rank.checked_mul(local_features).ok_or_else(|| {
+                    OpError::Shape("vocab-parallel Linear rank offset overflows".into())
+                })?;
+                // Write directly into this rank's columns of the final logits.
+                // The view is `[rows, local_vocab]` with row stride
+                // `global_vocab`; GEMM/bias honor that stride, and NCCL then
+                // uses the same view as its legal in-place AllGather send slot.
+                let mut local = output.narrow(1, local_start, local_features)?;
+                self.matmul_local(input, &mut local, ctx)?;
+                self.add_bias(&mut local, ctx)?;
+                <D as CollectiveOps>::all_gather(ctx.scope(), CommAxis::Tp, 1, &local, output)?;
+            }
+            _ => {
+                self.matmul_local(input, output, ctx)?;
+                if matches!(self.parallelism, LinearParallelism::Row { tp } if tp.size > 1) {
+                    <D as CollectiveOps>::all_reduce(
+                        ctx.scope(),
+                        CommAxis::Tp,
+                        ReduceOp::Sum,
+                        output,
+                    )?;
+                }
+                self.add_bias(output, ctx)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_execution_context(&self, ctx: &StepCtx<'_, D>) -> OpResult<()> {
         let linear_tp = self.parallelism.tp();
         let scope_tp = ctx.scope().topology().tp;
         if linear_tp != scope_tp {
@@ -205,51 +242,57 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
                 tp.rank, tp.size,
             )));
         }
+        Ok(())
+    }
 
-        if let LinearParallelism::Vocab {
-            tp,
-            global_out_features,
-        } = self.parallelism
-            && tp.size > 1
-        {
-            let gathered_features = self.out_features().checked_mul(tp.size).ok_or_else(|| {
-                OpError::Shape("vocab-parallel Linear output size overflows".into())
-            })?;
-            if gathered_features != global_out_features {
+    fn validate_vocab_shapes(
+        &self,
+        input: &Tensor<T, D>,
+        output: &Tensor<T, D>,
+        tp: RankPair,
+        global_out_features: usize,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        let gathered_features = self
+            .out_features()
+            .checked_mul(tp.size)
+            .ok_or_else(|| OpError::Shape("vocab-parallel Linear output size overflows".into()))?;
+        if gathered_features != global_out_features {
+            return Err(OpError::Shape(format!(
+                "vocab-parallel Linear local output {} x TP{} produces {}, expected global output {}",
+                self.out_features(),
+                tp.size,
+                gathered_features,
+                global_out_features
+            )));
+        }
+        let input_shape = input.shape().as_slice();
+        let output_shape = output.shape().as_slice();
+        if input_shape.len() != 2 || output_shape != [input_shape[0], global_out_features] {
+            return Err(OpError::Shape(format!(
+                "vocab-parallel Linear expected output [{}, {}], got {:?}",
+                input_shape.first().copied().unwrap_or(0),
+                global_out_features,
+                output_shape
+            )));
+        }
+        let scope_device = <D as ExecDevice>::device_id(ctx.scope().device());
+        for (tensor, what) in [(input, "input"), (output, "output")] {
+            if !tensor.is_contiguous() {
                 return Err(OpError::Shape(format!(
-                    "vocab-parallel Linear local output {} x TP{} produces {}, expected global output {}",
-                    self.out_features(),
-                    tp.size,
-                    gathered_features,
-                    global_out_features
+                    "vocab-parallel Linear {what} must be contiguous, got shape {:?}",
+                    tensor.shape().as_slice()
                 )));
             }
-            let input_shape = input.shape().as_slice();
-            let output_shape = output.shape().as_slice();
-            if input_shape.len() != 2 || output_shape != [input_shape[0], global_out_features] {
+            let tensor_device = <D as ExecDevice>::device_id(tensor.device());
+            if tensor_device != scope_device {
                 return Err(OpError::Shape(format!(
-                    "vocab-parallel Linear expected output [{}, {}], got {:?}",
-                    input_shape.first().copied().unwrap_or(0),
-                    global_out_features,
-                    output_shape
+                    "vocab-parallel Linear {what} belongs to device {}, but scope uses device {}",
+                    tensor_device.0, scope_device.0
                 )));
             }
-            let mut local = D::alloc_tensor(
-                Shape::from_slice(&[input_shape[0], self.out_features()]),
-                input.device(),
-            )?;
-            self.matmul_local(input, &mut local, ctx)?;
-            self.add_bias(&mut local, ctx)?;
-            <D as CollectiveOps>::all_gather(ctx.scope(), CommAxis::Tp, 1, &local, output)?;
-            return Ok(());
         }
-
-        self.matmul_local(input, output, ctx)?;
-
-        if matches!(self.parallelism, LinearParallelism::Row { tp } if tp.size > 1) {
-            <D as CollectiveOps>::all_reduce(ctx.scope(), CommAxis::Tp, ReduceOp::Sum, output)?;
-        }
-        self.add_bias(output, ctx)
+        Ok(())
     }
 
     fn matmul_local(

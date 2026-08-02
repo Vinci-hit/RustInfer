@@ -43,6 +43,7 @@ unsafe extern "C" {
         b: *const f32,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
     fn broadcast_add_inplace_bf16_forward(
@@ -50,6 +51,7 @@ unsafe extern "C" {
         b: *const half::bf16,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
     fn broadcast_add_inplace_f16_forward(
@@ -57,6 +59,7 @@ unsafe extern "C" {
         b: *const half::f16,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
 }
@@ -84,6 +87,7 @@ pub trait BroadcastMulKernel: CudaFloat {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
 }
@@ -106,9 +110,10 @@ impl BroadcastMulKernel for f32 {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     ) {
-        unsafe { broadcast_add_inplace_f32_forward(a, b, rows, d, stream) }
+        unsafe { broadcast_add_inplace_f32_forward(a, b, rows, d, row_stride, stream) }
     }
 }
 
@@ -130,9 +135,10 @@ impl BroadcastMulKernel for half::bf16 {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     ) {
-        unsafe { broadcast_add_inplace_bf16_forward(a, b, rows, d, stream) }
+        unsafe { broadcast_add_inplace_bf16_forward(a, b, rows, d, row_stride, stream) }
     }
 }
 
@@ -154,9 +160,10 @@ impl BroadcastMulKernel for half::f16 {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     ) {
-        unsafe { broadcast_add_inplace_f16_forward(a, b, rows, d, stream) }
+        unsafe { broadcast_add_inplace_f16_forward(a, b, rows, d, row_stride, stream) }
     }
 }
 
@@ -203,10 +210,39 @@ pub fn broadcast_add_inplace<T: BroadcastMulKernel>(
             dim
         )));
     }
-    let rows = (x.numel() / dim) as i32;
-    let dim = dim as i32;
+    if !bias.is_contiguous() {
+        return Err(OpError::NotContiguous(*bias.shape()));
+    }
+    let rows = x.numel() / dim;
+    let row_stride = if x.is_contiguous() {
+        dim
+    } else {
+        let shape = x.shape().as_slice();
+        let strides = x.strides().as_slice();
+        if shape.len() != 2 || shape != [rows, dim] || strides[1] != 1 {
+            return Err(OpError::Shape(format!(
+                "broadcast_add_inplace: non-contiguous x must be row-strided [rows, dim], got shape {:?}, strides {:?}",
+                shape, strides
+            )));
+        }
+        strides[0]
+    };
+    let rows = i32::try_from(rows)
+        .map_err(|_| OpError::Shape("broadcast_add_inplace: rows exceed CUDA i32 range".into()))?;
+    let dim = i32::try_from(dim)
+        .map_err(|_| OpError::Shape("broadcast_add_inplace: dim exceeds CUDA i32 range".into()))?;
+    let row_stride = i32::try_from(row_stride).map_err(|_| {
+        OpError::Shape("broadcast_add_inplace: row stride exceeds CUDA i32 range".into())
+    })?;
     unsafe {
-        T::broadcast_add_inplace(x.data_ptr_mut(), bias.data_ptr(), rows, dim, stream);
+        T::broadcast_add_inplace(
+            x.data_ptr_mut(),
+            bias.data_ptr(),
+            rows,
+            dim,
+            row_stride,
+            stream,
+        );
     }
     Ok(())
 }
@@ -252,6 +288,62 @@ mod tests {
             for c in 0..dim {
                 let expected = x_host[r * dim + c] + bias_host[c];
                 assert!((got[r * dim + c] - expected).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn broadcast_add_inplace_f32_strided_rows() {
+        let cuda = Cuda::new(0).unwrap();
+        let rows = 3usize;
+        let full_dim = 7usize;
+        let dim = 4usize;
+        let x_host = vec![-1.0f32; rows * full_dim];
+        let bias_host = vec![10.0, 20.0, 30.0, 40.0];
+        let x: Tensor<f32, Cuda> =
+            Tensor::from_host_slice(&x_host, [rows, full_dim], &cuda).unwrap();
+        let mut shard = x.narrow(1, 2, dim).unwrap();
+        let bias: Tensor<f32, Cuda> = Tensor::from_host_slice(&bias_host, [dim], &cuda).unwrap();
+
+        broadcast_add_inplace(cuda.config.stream, &mut shard, &bias).unwrap();
+
+        let got = x.to_host_vec().unwrap();
+        for row in 0..rows {
+            for col in 0..full_dim {
+                let expected = if (2..2 + dim).contains(&col) {
+                    -1.0 + bias_host[col - 2]
+                } else {
+                    -1.0
+                };
+                assert_eq!(got[row * full_dim + col], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn broadcast_add_inplace_bf16_strided_rows() {
+        let cuda = Cuda::new(0).unwrap();
+        let rows = 2usize;
+        let full_dim = 6usize;
+        let dim = 3usize;
+        let x_host = vec![bf16::from_f32(-1.0); rows * full_dim];
+        let bias_host = [10.0f32, 20.0, 30.0].map(bf16::from_f32);
+        let x: Tensor<bf16, Cuda> =
+            Tensor::from_host_slice(&x_host, [rows, full_dim], &cuda).unwrap();
+        let mut shard = x.narrow(1, 1, dim).unwrap();
+        let bias: Tensor<bf16, Cuda> = Tensor::from_host_slice(&bias_host, [dim], &cuda).unwrap();
+
+        broadcast_add_inplace(cuda.config.stream, &mut shard, &bias).unwrap();
+
+        let got = x.to_host_vec().unwrap();
+        for row in 0..rows {
+            for col in 0..full_dim {
+                let expected = if (1..1 + dim).contains(&col) {
+                    -1.0 + bias_host[col - 1].to_f32()
+                } else {
+                    -1.0
+                };
+                assert_eq!(got[row * full_dim + col].to_f32(), expected);
             }
         }
     }

@@ -60,8 +60,8 @@ pub struct Decoder<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D> = DenseFfn<T, D>
     pub norm: RmsNorm<T, D>,
     pub lm_head: LmHead<T, D>,
     pub dims: ModelDims,
-    /// Shared per-forward scratch (installed by `Runtime::new`); used by
-    /// `finalize` for the norm + lm_head output. `None` → allocate (pooled).
+    /// Shared per-forward scratch installed by `Runtime::new`; standalone
+    /// models may fall back to pooled norm/logits allocations.
     pub scratch: Option<Rc<ForwardScratch<T, D>>>,
 }
 
@@ -182,10 +182,8 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         let src: &Tensor<T, D> = selected.as_ref().unwrap_or(&hidden.stream);
         let n_rows = src.shape().as_slice()[0];
 
-        // Reuse the address-stable scratch (norm buffer + preallocated logits)
-        // when installed; otherwise allocate (pooled). Keeps `finalize`
-        // allocation-free and keeps the large [rows, vocab] logits off the
-        // recycling pool (where ragged lengths would grow it unbounded).
+        // Runtime installs address-stable norm and full-logits space once;
+        // standalone models retain the pooled fallback used by component tests.
         let scratch = self.scratch.as_deref().filter(|s| s.fits(n_rows));
         let mut normed = match scratch {
             Some(s) => s.normed(n_rows),
