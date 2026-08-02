@@ -23,6 +23,7 @@ const MIB: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct RankResult {
+    replicated_embedding: Vec<f32>,
     embedding: Vec<f32>,
     vocab_logits: Vec<f32>,
     row_output: Vec<f32>,
@@ -88,6 +89,40 @@ fn two_gpu_tp_components_reconstruct_global_results() {
                 // Allocations, uploads, downloads, and destruction all happen
                 // while this rank's CUDA device is current on its thread.
                 let _active_device = scope.enter();
+
+                // Replicated embedding is the vocab_start=0 specialization of
+                // the same kernel. An 8-wide BF16 row exercises its float4
+                // vectorized path independently on both ranks.
+                let replicated_table: Vec<bf16> = (1..=4)
+                    .flat_map(|value| std::iter::repeat_n(bf16::from_f32(value as f32), 8))
+                    .collect();
+                let replicated_embed = Embed::new(
+                    Tensor::from_host_slice(&replicated_table, [4, 8], &device)
+                        .expect("upload replicated embedding table"),
+                )
+                .with_parallelism(EmbeddingParallelism::Replicated { tp });
+                let replicated_ids = Tensor::from_host_slice(&[3_i32, 0], [2], &device)
+                    .expect("upload replicated embedding token ids");
+                let mut replicated_hidden = Hidden {
+                    stream: Tensor::<bf16, Cuda>::zeros([2, 8], &device)
+                        .expect("allocate replicated embedding output"),
+                    pending: None,
+                };
+                let replicated_plan = batch_plan(2);
+                let replicated_ctx = StepCtx::new(&scope, &replicated_plan);
+                replicated_embed
+                    .forward(&replicated_ids, &mut replicated_hidden, &replicated_ctx)
+                    .expect("replicated embedding forward");
+                scope
+                    .synchronize()
+                    .expect("synchronize replicated embedding");
+                let replicated_embedding = replicated_hidden
+                    .stream
+                    .to_host_vec()
+                    .expect("download replicated embedding")
+                    .into_iter()
+                    .map(|value| value.to_f32())
+                    .collect();
 
                 // Rank 0 owns tokens [0, 2), rank 1 owns [2, 4). Each local
                 // lookup masks the other rank's tokens; the all-reduce restores
@@ -208,6 +243,7 @@ fn two_gpu_tp_components_reconstruct_global_results() {
                 rendezvous.wait();
 
                 RankResult {
+                    replicated_embedding,
                     embedding,
                     vocab_logits,
                     row_output,
@@ -227,6 +263,13 @@ fn two_gpu_tp_components_reconstruct_global_results() {
         .collect();
 
     for (rank, result) in results.iter().enumerate() {
+        assert_eq!(
+            result.replicated_embedding,
+            [
+                4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+            ],
+            "rank {rank} replicated embedding"
+        );
         assert_eq!(
             result.embedding,
             [
