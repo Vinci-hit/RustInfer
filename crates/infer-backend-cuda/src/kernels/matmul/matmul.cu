@@ -302,47 +302,63 @@ static void gemm_bf16_nullptr_runtime(
     const ZimageNkKey nk_key{N, K, zimage_m_bucket(M), ldc};
 
     ZimageNkEntry entry;
+    bool cached = false;
     {
         std::lock_guard<std::mutex> lk(g_zimage_nk_mu);
         auto it = g_zimage_nk_cache.find(nk_key);
         if (it != g_zimage_nk_cache.end() && it->second.valid) {
             entry = it->second;
-        } else {
-            cublasOperation_t opA = CUBLAS_OP_T, opB = CUBLAS_OP_N;
-            cublasLtMatmulDesc_t op = nullptr;
-            cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
-            cublasLtMatmulPreference_t pref = nullptr;
-            cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
-            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
-            cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
-            cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
-            cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, ldc);
-            cublasLtMatmulPreferenceCreate(&pref);
-            cublasLtMatmulPreferenceSetAttribute(
-                pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize));
-            cublasLtMatmulHeuristicResult_t res{};
-            int ret = 0;
-            cublasLtHandle_t tmp_h = nullptr;
-            cublasLtCreate(&tmp_h);
-            cublasLtMatmulAlgoGetHeuristic(tmp_h, op, A, B, C, C, pref, 1, &res, &ret);
-            cublasLtDestroy(tmp_h);
-            cublasLtMatmulPreferenceDestroy(pref);
-            cublasLtMatrixLayoutDestroy(A);
-            cublasLtMatrixLayoutDestroy(B);
-            cublasLtMatrixLayoutDestroy(C);
-            if (ret == 0) {
-                cublasLtMatmulDescDestroy(op);
-                gemm_bf16_chunked_legacy(
-                    handle, M, N, K, ldc, d_A, d_B, d_C,
-                    workspace, workspaceSize, stream);
-                return;
+            cached = true;
+        }
+    }
+    if (!cached) {
+        // Shape discovery enters cuBLAS/CUDA. Build without the process-wide
+        // cache mutex, then publish with a short double-checked insertion.
+        cublasOperation_t opA = CUBLAS_OP_T, opB = CUBLAS_OP_N;
+        cublasLtMatmulDesc_t op = nullptr;
+        cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
+        cublasLtMatmulPreference_t pref = nullptr;
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
+        cublasLtMatrixLayoutCreate(&A, CUDA_R_16BF, k_g, m_g, k_g);
+        cublasLtMatrixLayoutCreate(&B, CUDA_R_16BF, k_g, n_g, k_g);
+        cublasLtMatrixLayoutCreate(&C, CUDA_R_16BF, m_g, n_g, ldc);
+        cublasLtMatmulPreferenceCreate(&pref);
+        cublasLtMatmulPreferenceSetAttribute(
+            pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize));
+        cublasLtMatmulHeuristicResult_t res{};
+        int ret = 0;
+        cublasLtHandle_t tmp_h = nullptr;
+        cublasLtCreate(&tmp_h);
+        cublasLtMatmulAlgoGetHeuristic(tmp_h, op, A, B, C, C, pref, 1, &res, &ret);
+        cublasLtDestroy(tmp_h);
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatrixLayoutDestroy(A);
+        cublasLtMatrixLayoutDestroy(B);
+        cublasLtMatrixLayoutDestroy(C);
+        if (ret == 0) {
+            cublasLtMatmulDescDestroy(op);
+            gemm_bf16_chunked_legacy(
+                handle, M, N, K, ldc, d_A, d_B, d_C,
+                workspace, workspaceSize, stream);
+            return;
+        }
+
+        ZimageNkEntry built{op, res.algo, res.workspaceSize, true};
+        cublasLtMatmulDesc_t redundant_op = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_zimage_nk_mu);
+            auto [it, inserted] = g_zimage_nk_cache.emplace(nk_key, built);
+            if (inserted) {
+                entry = built;
+            } else {
+                entry = it->second;
+                redundant_op = built.op;
             }
-            entry.op = op;
-            entry.algo = res.algo;
-            entry.algo_ws = res.workspaceSize;
-            entry.valid = true;
-            g_zimage_nk_cache.emplace(nk_key, entry);
+        }
+        if (redundant_op != nullptr) {
+            cublasLtMatmulDescDestroy(redundant_op);
         }
     }
 

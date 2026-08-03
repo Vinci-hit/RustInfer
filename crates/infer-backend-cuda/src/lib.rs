@@ -927,14 +927,11 @@ impl infer_core::ports::FusedOps for Cuda {
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
         let (k_pool, v_pool) = kv.layer(0);
-        // The flash kernel only reads `workspace` on the DecodeOnly path; on
-        // Ragged/prefill it touches nothing, so a 1-elem placeholder is safe.
-        // Caller-owned scratch is the hot path here — every layer of every
-        // step used to allocate + memset a fresh `[B*H*HD*… f32]` buffer here
-        // (≈18µs × num_layers / token of TTOT, plus prefill TTFT bloat). The
-        // address-stable buffer also bakes cleanly into captured decode
-        // graphs; the previous per-call alloc made graph capture see a
-        // different scratch address every replay (illegal).
+        // Decode uses this region for split-K partials; FA3 ragged attention
+        // uses it for LSE plus its scheduler semaphore. Caller-owned scratch is
+        // the hot path here — every layer of every step used to allocate and
+        // memset fresh storage. Its stable address also bakes cleanly into
+        // captured graphs.
         match workspace {
             Some(ws) => kernels::flash_attn_gqa::attention_paged(
                 scope_stream(ctx.scope()),
@@ -952,16 +949,14 @@ impl infer_core::ports::FusedOps for Cuda {
             None => {
                 // Legacy fallback: still works (and graph-captures correctly
                 // through the capture arena), but pays the per-call alloc.
-                let workspace_elems = if ctx.plan().is_decode_only() {
-                    kernels::flash_attn_gqa::flash_decode_workspace_capacity_f32(
+                let workspace_elems =
+                    kernels::flash_attn_gqa::flash_attention_workspace_capacity_f32(
                         ctx.plan().batch,
+                        q.shape().as_slice()[0],
                         head_num,
                         head_dim,
                     )
-                    .max(1)
-                } else {
-                    1
-                };
+                    .max(1);
                 let mut owned = Tensor::<f32, Cuda>::zeros([workspace_elems], q.device())?;
                 kernels::flash_attn_gqa::attention_paged(
                     scope_stream(ctx.scope()),
@@ -980,12 +975,18 @@ impl infer_core::ports::FusedOps for Cuda {
         }
     }
 
-    fn flash_decode_workspace_capacity_f32(
+    fn flash_attention_workspace_capacity_f32(
         batch: usize,
+        num_tokens: usize,
         num_q_heads: usize,
         head_dim: usize,
     ) -> usize {
-        kernels::flash_attn_gqa::flash_decode_workspace_capacity_f32(batch, num_q_heads, head_dim)
+        kernels::flash_attn_gqa::flash_attention_workspace_capacity_f32(
+            batch,
+            num_tokens,
+            num_q_heads,
+            head_dim,
+        )
     }
 }
 
@@ -1005,7 +1006,7 @@ impl Cuda {
             CudaConfig::with_memory_plan(memory_plan)
                 .map_err(|e| OpError::Kernel(format!("CudaConfig creation failed: {}", e)))?,
         );
-        kernels::matmul::init_fp8_block_matmul(device_id)?;
+        kernels::initialize_device(config.device_info())?;
         Ok(Self { device_id, config })
     }
 

@@ -239,16 +239,35 @@ static CudnnPlan* build_plan(const PlanKey& key, cudnnHandle_t handle, float sof
 }
 
 static CudnnPlan* get_or_build_plan(const PlanKey& key, cudnnHandle_t handle, float softmax_scale) {
-    std::lock_guard<std::mutex> guard(g_plan_mutex);
-    auto it = g_plan_cache.find(key);
-    if (it != g_plan_cache.end()) {
-        return it->second;
+    {
+        std::lock_guard<std::mutex> guard(g_plan_mutex);
+        auto it = g_plan_cache.find(key);
+        if (it != g_plan_cache.end()) {
+            return it->second;
+        }
     }
-    CudnnPlan* plan = build_plan(key, handle, softmax_scale);
-    if (plan != nullptr) {
-        g_plan_cache.emplace(key, plan);
+
+    // Building a cuDNN graph enters the CUDA runtime. Never hold the
+    // process-wide cache mutex across that work: TP ranks build plans on
+    // different devices, and serializing CUDA calls behind a host mutex can
+    // form a mutex <-> device-progress cycle with collectives.
+    CudnnPlan* built = build_plan(key, handle, softmax_scale);
+    if (built == nullptr) {
+        return nullptr;
     }
-    return plan;
+
+    CudnnPlan* result = built;
+    {
+        std::lock_guard<std::mutex> guard(g_plan_mutex);
+        auto [it, inserted] = g_plan_cache.emplace(key, built);
+        if (!inserted) {
+            result = it->second;
+        }
+    }
+    if (result != built) {
+        delete built;
+    }
+    return result;
 }
 
 static CudnnPlan* get_cached_plan(const PlanKey& key) {

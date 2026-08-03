@@ -2,6 +2,7 @@
 //! Also provides AWQ int4 quantized matmul (kpack_gemv/kpack_gemm).
 
 use crate::Cuda;
+use crate::config::CudaDeviceInfo;
 use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
@@ -95,8 +96,8 @@ unsafe extern "C" {
 
 /// Prepare the accelerated FP8 kernel before any CUDA stream capture.
 /// Builds without an accelerated implementation expose the same symbol as a no-op.
-pub(crate) fn init_fp8_block_matmul(device_id: i32) -> OpResult<()> {
-    let status = unsafe { fp8_block_matmul_init_cu(device_id) };
+pub(crate) fn init_device(info: CudaDeviceInfo) -> OpResult<()> {
+    let status = unsafe { fp8_block_matmul_init_cu(info.device_id) };
     if status == 0 {
         Ok(())
     } else {

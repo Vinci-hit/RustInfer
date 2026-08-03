@@ -145,14 +145,22 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
             }
         }
 
-        // Flash-attention decode workspace: prefer the preallocated buffer in
+        // Flash-attention decode/FA3 workspace: prefer the preallocated buffer in
         // `ForwardScratch` (address-stable across all layers and across CUDA
         // graph capture/replay, zero per-layer alloc+memset). Fall back to
         // backend self-allocation only when scratch is absent (CPU reference;
         // tests). Each layer takes a fresh full-buffer view — layers run
         // serially on one stream so the kernel's stream-ordered reads/writes
         // do not race.
-        let mut flash_ws = self.scratch.as_deref().map(|s| s.flash_workspace_mut());
+        let flash_ws_required = D::flash_attention_workspace_capacity_f32(
+            ctx.plan().batch,
+            num_tokens,
+            self.head_num,
+            self.head_dim,
+        );
+        let mut flash_ws = scratch
+            .filter(|s| s.flash_workspace_elems() >= flash_ws_required)
+            .map(ForwardScratch::flash_workspace_mut);
         D::attention_paged(
             ctx,
             &q,

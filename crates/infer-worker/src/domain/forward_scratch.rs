@@ -22,10 +22,11 @@
 //! whole forward (prefill or decode) ALLOCATES nothing per step on CUDA.
 //! The slot containing `logits [cap_num_tokens, vocab]` is the large buffer; it
 //! is also reused by earlier, non-overlapping stages rather than allocating
-//! separate buffers. `flash_ws [flash_ws_elems]` is the attention kernel's
-//! batched-decode scratch, sized once per `Runtime` to the worst-case
-//! `(cap_batch, head_num, head_dim)`; backends that don't need it (CPU
-//! reference) get a 0-elem placeholder via `D::flash_decode_workspace_capacity_f32`.
+//! separate buffers. `flash_ws [flash_ws_elems]` is the decode/FA3 attention
+//! scratch, sized once per `Runtime` from both `cap_batch` and
+//! `cap_num_tokens`; backends that don't need it (CPU reference) get a 0-elem
+//! placeholder via
+//! `D::flash_attention_workspace_capacity_f32`.
 
 use std::cell::UnsafeCell;
 use std::rc::Rc;
@@ -44,7 +45,7 @@ pub struct ForwardScratch<T: Dtype, D: FusedOps> {
     /// `define_forward_buffers!`. Fields in the same slot have disjoint
     /// lifetimes and reuse the slot's contiguous prefix.
     buffers: Vec<Tensor<T, D>>,
-    /// Flash-attention decode workspace, `[flash_ws_elems] f32`. Held in
+    /// Flash-attention workspace, `[flash_ws_elems] f32`. Held in
     /// `UnsafeCell` so per-call `Attention::run` can hand the kernel a `&mut`
     /// view via `flash_workspace_mut`. Concurrent layers are NOT possible (the
     /// decoder runs layers serially on a single stream), and inside one layer
@@ -125,9 +126,8 @@ impl<T: Dtype, D: FusedOps + MemoryPort> ForwardScratch<T, D> {
     /// Plan and allocate every physical slot once at worst-case capacity.
     /// Returned behind an `Rc` so it can be cloned into each decoder block.
     ///
-    /// `cap_batch` sizes the flash-attention decode workspace (the kernel's
-    /// scratch grows with batch, not token count); CPU returns 0 and the
-    /// placeholder is unused.
+    /// `cap_batch` and `cap_num_tokens` size the largest decode/FA3 attention
+    /// workspace; CPU returns 0 and the placeholder is unused.
     pub fn new(
         device: &D,
         dims: ModelDims,
@@ -139,8 +139,13 @@ impl<T: Dtype, D: FusedOps + MemoryPort> ForwardScratch<T, D> {
             .into_iter()
             .map(|cols| Tensor::<T, D>::zeros(Shape::from_slice(&[cap, cols.max(1)]), device))
             .collect::<OpResult<Vec<_>>>()?;
-        let flash_ws_elems =
-            D::flash_decode_workspace_capacity_f32(cap_batch, dims.head_num, dims.head_dim).max(1);
+        let flash_ws_elems = D::flash_attention_workspace_capacity_f32(
+            cap_batch,
+            cap_num_tokens,
+            dims.head_num,
+            dims.head_dim,
+        )
+        .max(1);
         let flash_ws = Tensor::<f32, D>::zeros(Shape::from_slice(&[flash_ws_elems]), device)?;
         Ok(Rc::new(Self {
             cap_num_tokens: cap,
@@ -176,7 +181,7 @@ impl<T: Dtype, D: FusedOps + MemoryPort> ForwardScratch<T, D> {
         num_tokens <= self.cap_num_tokens && gate_cols == (gate_up.columns)(self.dims)
     }
 
-    /// Borrow the flash-attention decode workspace mutably for one
+    /// Borrow the flash-attention workspace mutably for one
     /// kernel call. Single-threaded, layers run serially on the same stream,
     /// so handing the same buffer to each layer in turn is safe (the kernel's
     /// reads-and-writes are stream-ordered).

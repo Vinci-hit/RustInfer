@@ -11,7 +11,7 @@
 
 #include "flash_attn_gqa.h"
 #include "flash_attn_paged_common.cuh"
-#include "cuda_kernel_attr.cuh"
+#include "../common/cuda_kernel_init.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -336,35 +336,28 @@ __global__ void paged_decode_combine_kernel(
     }
 }
 
-// Number of SMs on the active device, cached by thread/device. Used to pick the KV-split
-// count by occupancy so we only split far enough to fill the GPU.
-static int device_sm_count() {
-    static thread_local int cached_device = -1;
-    static thread_local int sm = 132;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return sm;
-    if (dev != cached_device) {
-        cudaDeviceProp prop;
-        sm = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.multiProcessorCount > 0
-            ? prop.multiProcessorCount
-            : 132;
-        cached_device = dev;
-    }
-    return sm;
-}
-
 // Pick the KV-split cap: the minimum number of splits whose grid
 // (batch*q_heads*splits) still covers ~2 waves of the GPU, clamped to
 // [1, kMaxSplits]. At high batch this returns 1 (grid already full → no
 // FP32 partial-O round-trip); at batch 1 it returns kMaxSplits.
-static int compute_splits_cap(int batch, int num_q_heads) {
-    const long target = 2L * device_sm_count();
+static int compute_splits_cap(int batch, int num_q_heads, int num_sm) {
+    const long target = 2L * num_sm;
     const long base = static_cast<long>(batch) * num_q_heads;
     if (base <= 0) return 1;
     long cap = (target + base - 1) / base;  // ceil(target / base)
     if (cap < 1) cap = 1;
     if (cap > kMaxSplits) cap = kMaxSplits;
     return static_cast<int>(cap);
+}
+
+template <class Elem, int HeadDim>
+static constexpr int pass1_dynamic_smem_bytes()
+{
+    return static_cast<int>(
+        static_cast<size_t>(HeadDim) * sizeof(Elem) +
+        static_cast<size_t>(2) * kBN * HeadDim * sizeof(Elem) * 2 +
+        static_cast<size_t>(kNumGroups) * 2 * sizeof(float) +
+        static_cast<size_t>(kNumGroups) * HeadDim * sizeof(Elem));
 }
 
 template <class Elem, int HeadDim>
@@ -378,7 +371,7 @@ static cudaError_t launch_impl(
     int block_size,
     const int32_t* kv_lens,
     float* workspace,
-    int batch, int num_q_heads, int num_kv_heads,
+    int batch, int num_q_heads, int num_kv_heads, int num_sm,
     float softmax_scale,
     cudaStream_t stream)
 {
@@ -391,22 +384,13 @@ static cudaError_t launch_impl(
 
     constexpr int kThreadsPerKey = HeadDim / kElemPerLane;
     constexpr int kBlockThreads = kNumGroups * kThreadsPerKey;
-    const int splits_cap = compute_splits_cap(batch, num_q_heads);
+    const int splits_cap = compute_splits_cap(batch, num_q_heads, num_sm);
     dim3 grid1(num_q_heads, splits_cap, batch);
     dim3 block1(kBlockThreads);
 
-    const size_t smem_size =
-        static_cast<size_t>(HeadDim) * sizeof(Elem) +
-        static_cast<size_t>(2) * kBN * HeadDim * sizeof(Elem) * 2 +
-        static_cast<size_t>(kNumGroups) * 2 * sizeof(float) +
-        static_cast<size_t>(kNumGroups) * HeadDim * sizeof(Elem);
+    constexpr int smem_size = pass1_dynamic_smem_bytes<Elem, HeadDim>();
 
     auto pass1 = paged_decode_pass1_kernel<Elem, HeadDim>;
-    static rustinfer::cuda::PerDeviceKernelAttribute pass1_attr;
-    const cudaError_t pass1_attr_err = pass1_attr.set_max_dynamic_shared_memory(
-        reinterpret_cast<const void*>(pass1), static_cast<int>(smem_size));
-    if (pass1_attr_err != cudaSuccess) return pass1_attr_err;
-
     pass1<<<grid1, block1, smem_size, stream>>>(
         q, qsb, qsh, k_pool, v_pool, o, osb, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens,
@@ -439,24 +423,60 @@ static cudaError_t launch_dispatch(
     int batch,
     int num_q_heads,
     int num_kv_heads,
+    int num_sm,
     int head_dim,
     float softmax_scale,
     cudaStream_t stream)
 {
     switch (head_dim) {
-    case 64:  return launch_impl<Elem,  64>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,softmax_scale,stream);
-    case 128: return launch_impl<Elem, 128>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,softmax_scale,stream);
-    case 192: return launch_impl<Elem, 192>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,softmax_scale,stream);
-    case 256: return launch_impl<Elem, 256>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,softmax_scale,stream);
+    case 64:  return launch_impl<Elem,  64>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,num_sm,softmax_scale,stream);
+    case 128: return launch_impl<Elem, 128>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,num_sm,softmax_scale,stream);
+    case 192: return launch_impl<Elem, 192>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,num_sm,softmax_scale,stream);
+    case 256: return launch_impl<Elem, 256>(q,qsb,qsh,k_pool,v_pool,o,osb,osh,block_tables,max_blocks_per_seq,block_size,kv_lens,workspace,batch,num_q_heads,num_kv_heads,num_sm,softmax_scale,stream);
     default:
         fprintf(stderr, "[flash_attn_paged_decode] unsupported head_dim=%d (supported: 64, 128, 192, 256)\n", head_dim);
         return cudaErrorInvalidValue;
     }
 }
 
+template <class Elem, int HeadDim>
+static cudaError_t configure_pass1_kernel(int max_dynamic_smem)
+{
+    return rustinfer::cuda::configure_dynamic_shared_memory(
+        reinterpret_cast<const void*>(paged_decode_pass1_kernel<Elem, HeadDim>),
+        pass1_dynamic_smem_bytes<Elem, HeadDim>(),
+        max_dynamic_smem);
+}
+
+template <class Elem>
+static cudaError_t configure_pass1_kernels(int max_dynamic_smem)
+{
+    cudaError_t err = configure_pass1_kernel<Elem, 64>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    err = configure_pass1_kernel<Elem, 128>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    err = configure_pass1_kernel<Elem, 192>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return configure_pass1_kernel<Elem, 256>(max_dynamic_smem);
+}
+
+static cudaError_t init_kernel_attributes(int max_dynamic_smem)
+{
+    cudaError_t err = configure_pass1_kernels<__nv_bfloat16>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return configure_pass1_kernels<__half>(max_dynamic_smem);
+}
+
 }  // namespace flash_paged_decode
 
-extern "C" void launch_flash_attn_paged_decode_bf16(
+extern "C" int rustinfer_flash_attn_paged_decode_init_kernel_attributes(
+    int max_dynamic_smem)
+{
+    return static_cast<int>(
+        flash_paged_decode::init_kernel_attributes(max_dynamic_smem));
+}
+
+extern "C" int launch_flash_attn_paged_decode_bf16(
     const __nv_bfloat16* q, int64_t qsb, int64_t qsh,
     const __nv_bfloat16* k_pool,
     const __nv_bfloat16* v_pool,
@@ -466,20 +486,18 @@ extern "C" void launch_flash_attn_paged_decode_bf16(
     int block_size,
     const int32_t* kv_lens,
     float* workspace,
-    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    int batch, int num_q_heads, int num_kv_heads, int num_sm, int head_dim,
     float softmax_scale,
     cudaStream_t stream)
 {
     cudaError_t err = flash_paged_decode::launch_dispatch<__nv_bfloat16>(
         q, qsb, qsh, k_pool, v_pool, o, osb, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens, workspace,
-        batch, num_q_heads, num_kv_heads, head_dim, softmax_scale, stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[flash_attn_paged_decode_bf16] launch error: %s\n", cudaGetErrorString(err));
-    }
+        batch, num_q_heads, num_kv_heads, num_sm, head_dim, softmax_scale, stream);
+    return static_cast<int>(err);
 }
 
-extern "C" void launch_flash_attn_paged_decode_fp16(
+extern "C" int launch_flash_attn_paged_decode_fp16(
     const __half* q, int64_t qsb, int64_t qsh,
     const __half* k_pool,
     const __half* v_pool,
@@ -489,15 +507,13 @@ extern "C" void launch_flash_attn_paged_decode_fp16(
     int block_size,
     const int32_t* kv_lens,
     float* workspace,
-    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    int batch, int num_q_heads, int num_kv_heads, int num_sm, int head_dim,
     float softmax_scale,
     cudaStream_t stream)
 {
     cudaError_t err = flash_paged_decode::launch_dispatch<__half>(
         q, qsb, qsh, k_pool, v_pool, o, osb, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens, workspace,
-        batch, num_q_heads, num_kv_heads, head_dim, softmax_scale, stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[flash_attn_paged_decode_fp16] launch error: %s\n", cudaGetErrorString(err));
-    }
+        batch, num_q_heads, num_kv_heads, num_sm, head_dim, softmax_scale, stream);
+    return static_cast<int>(err);
 }

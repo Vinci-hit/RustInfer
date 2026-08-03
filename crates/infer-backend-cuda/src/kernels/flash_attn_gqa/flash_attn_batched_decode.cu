@@ -30,7 +30,7 @@
 // -----------------------------------------------------------------------------
 
 #include "flash_attn_gqa.h"
-#include "cuda_kernel_attr.cuh"
+#include "../common/cuda_kernel_init.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -393,6 +393,16 @@ __global__ void pass2_kernel(
 // Launcher
 // ============================================================================
 template <class Elem, int HeadDim>
+static constexpr int pass1_dynamic_smem_bytes()
+{
+    return static_cast<int>(
+        static_cast<size_t>(HeadDim) * sizeof(Elem) +
+        static_cast<size_t>(2) * kBN * HeadDim * sizeof(Elem) * 2 +
+        static_cast<size_t>(kNumGroups) * 2 * sizeof(float) +
+        static_cast<size_t>(kNumGroups) * HeadDim * sizeof(Elem));
+}
+
+template <class Elem, int HeadDim>
 static cudaError_t launch_impl(
     const Elem*  q_ptr,      int64_t qsb, int64_t qsh,
     const Elem* const* k_ptrs,
@@ -424,16 +434,8 @@ static cudaError_t launch_impl(
         //   s_m   : kNumGroups * 4
         //   s_s   : kNumGroups * 4
         //   s_acc : kNumGroups * HeadDim * sizeof(Elem)
-        const size_t smem_size =
-            (size_t)HeadDim * sizeof(Elem) +
-            (size_t)2 * kBN * HeadDim * sizeof(Elem) * 2 +     // s_k + s_v
-            (size_t)kNumGroups * 2 * sizeof(float) +
-            (size_t)kNumGroups * HeadDim * sizeof(Elem);
+        constexpr int smem_size = pass1_dynamic_smem_bytes<Elem, HeadDim>();
         auto kernel = pass1_kernel<Elem, HeadDim>;
-        static rustinfer::cuda::PerDeviceKernelAttribute pass1_attr;
-        const cudaError_t pass1_attr_err = pass1_attr.set_max_dynamic_shared_memory(
-            reinterpret_cast<const void*>(kernel), static_cast<int>(smem_size));
-        if (pass1_attr_err != cudaSuccess) return pass1_attr_err;
         kernel<<<grid, block, smem_size, stream>>>(
             q_ptr, qsb, qsh,
             k_ptrs, v_ptrs, kv_stride_s, kv_stride_h,
@@ -495,12 +497,46 @@ static cudaError_t launch_dispatch(
     }
 }
 
+template <class Elem, int HeadDim>
+static cudaError_t configure_pass1_kernel(int max_dynamic_smem)
+{
+    return rustinfer::cuda::configure_dynamic_shared_memory(
+        reinterpret_cast<const void*>(pass1_kernel<Elem, HeadDim>),
+        pass1_dynamic_smem_bytes<Elem, HeadDim>(),
+        max_dynamic_smem);
+}
+
+template <class Elem>
+static cudaError_t configure_pass1_kernels(int max_dynamic_smem)
+{
+    cudaError_t err = configure_pass1_kernel<Elem, 64>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    err = configure_pass1_kernel<Elem, 128>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    err = configure_pass1_kernel<Elem, 192>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return configure_pass1_kernel<Elem, 256>(max_dynamic_smem);
+}
+
+static cudaError_t init_kernel_attributes(int max_dynamic_smem)
+{
+    cudaError_t err = configure_pass1_kernels<__nv_bfloat16>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return configure_pass1_kernels<__half>(max_dynamic_smem);
+}
+
 }  // namespace flash_batched_decode
 
 // ============================================================================
 // Public C ABI
 // ============================================================================
 extern "C" {
+
+int rustinfer_flash_attn_batched_decode_init_kernel_attributes(int max_dynamic_smem)
+{
+    return static_cast<int>(
+        flash_batched_decode::init_kernel_attributes(max_dynamic_smem));
+}
 
 // Required workspace size (in bytes) for a given (batch, num_q_heads, head_dim).
 int64_t flash_attn_batched_decode_workspace_bytes(
@@ -778,6 +814,15 @@ bool run_case(int B, int Hq, int Hkv, int HD, std::vector<int> kv_lens_host, std
 }
 
 int main() {
+    int device = 0;
+    int max_dynamic_smem = 0;
+    CUDA_MUST(cudaGetDevice(&device));
+    CUDA_MUST(cudaDeviceGetAttribute(
+        &max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    CUDA_MUST(static_cast<cudaError_t>(
+        rustinfer_flash_attn_batched_decode_init_kernel_attributes(
+            max_dynamic_smem)));
+
     std::mt19937 rng(0xBEEF);
     bool ok = true;
 

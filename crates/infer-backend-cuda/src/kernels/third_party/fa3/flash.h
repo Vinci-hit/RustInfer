@@ -158,6 +158,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool skip_scheduler_metadata_computation;
 
     int arch;
+    int device_id;
     int num_sm;
 };
 

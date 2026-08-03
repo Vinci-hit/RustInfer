@@ -40,7 +40,7 @@
 // -----------------------------------------------------------------------------
 
 #include "flash_attn_gqa.h"
-#include "cuda_kernel_attr.cuh"
+#include "../common/cuda_kernel_init.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -141,6 +141,15 @@ struct SharedStorage {
     array_aligned<Elem, cosize_v<LayoutKV>> smem_k;
     array_aligned<Elem, cosize_v<LayoutKV>> smem_v;
 };
+
+template <class Elem, int HeadDim>
+static constexpr int dynamic_smem_bytes()
+{
+    using Traits = KTraits<Elem, HeadDim>;
+    return int(sizeof(SharedStorage<Elem,
+                      typename Traits::SmemLayoutQ,
+                      typename Traits::SmemLayoutKV>));
+}
 
 // =============================================================================
 // Device helpers: reductions, layout conversions, mask, softmax scaling.
@@ -646,16 +655,9 @@ static cudaError_t launch_impl(
     dim3 grid(m_blocks, num_q_heads, batch);
     dim3 block(Traits::NumThreads);
 
-    const int smem_size = int(sizeof(SharedStorage<Elem,
-                                 typename Traits::SmemLayoutQ,
-                                 typename Traits::SmemLayoutKV>));
+    constexpr int smem_size = dynamic_smem_bytes<Elem, HD>();
 
     auto kernel = flash_attn_prefill_kernel<Traits>;
-    static rustinfer::cuda::PerDeviceKernelAttribute prefill_attr;
-    const cudaError_t prefill_attr_err = prefill_attr.set_max_dynamic_shared_memory(
-        reinterpret_cast<const void*>(kernel), smem_size);
-    if (prefill_attr_err != cudaSuccess) return prefill_attr_err;
-
     kernel<<<grid, block, smem_size, stream>>>(
         q, qsb, qss, qsh,
         k, ksb, kss, ksh,
@@ -1009,15 +1011,8 @@ static cudaError_t launch_ragged_impl(
     dim3 grid(total_q_tiles, num_q_heads, 1);
     dim3 block(Traits::NumThreads);
 
-    const int smem_size = int(sizeof(SharedStorage<Elem,
-                                 typename Traits::SmemLayoutQ,
-                                 typename Traits::SmemLayoutKV>));
+    constexpr int smem_size = dynamic_smem_bytes<Elem, HD>();
     auto kernel = flash_attn_ragged_kernel<Traits>;
-    static rustinfer::cuda::PerDeviceKernelAttribute ragged_attr;
-    const cudaError_t ragged_attr_err = ragged_attr.set_max_dynamic_shared_memory(
-        reinterpret_cast<const void*>(kernel), smem_size);
-    if (ragged_attr_err != cudaSuccess) return ragged_attr_err;
-
     kernel<<<grid, block, smem_size, stream>>>(
         q, qss, qsh,
         k_cache_ptrs, v_cache_ptrs, kv_stride_s, kv_stride_h,
@@ -1081,12 +1076,53 @@ static cudaError_t launch_ragged_dispatch(
     }
 }
 
+template <class Elem, int HeadDim>
+static cudaError_t configure_kernel_pair(int max_dynamic_smem)
+{
+    using Traits = KTraits<Elem, HeadDim>;
+    const int smem_size = dynamic_smem_bytes<Elem, HeadDim>();
+    cudaError_t err = rustinfer::cuda::configure_dynamic_shared_memory(
+        reinterpret_cast<const void*>(flash_attn_prefill_kernel<Traits>),
+        smem_size,
+        max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return rustinfer::cuda::configure_dynamic_shared_memory(
+        reinterpret_cast<const void*>(flash_attn_ragged_kernel<Traits>),
+        smem_size,
+        max_dynamic_smem);
+}
+
+template <class Elem>
+static cudaError_t configure_kernels(int max_dynamic_smem)
+{
+    cudaError_t err = configure_kernel_pair<Elem, 64>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    err = configure_kernel_pair<Elem, 128>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    err = configure_kernel_pair<Elem, 192>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return configure_kernel_pair<Elem, 256>(max_dynamic_smem);
+}
+
+static cudaError_t init_kernel_attributes(int max_dynamic_smem)
+{
+    cudaError_t err = configure_kernels<__nv_bfloat16>(max_dynamic_smem);
+    if (err != cudaSuccess) return err;
+    return configure_kernels<__half>(max_dynamic_smem);
+}
+
 } // namespace flash_attn_prefill
 
 // =============================================================================
 // Public C ABI
 // =============================================================================
 extern "C" {
+
+int rustinfer_flash_attn_gqa_prefill_init_kernel_attributes(int max_dynamic_smem)
+{
+    return static_cast<int>(
+        flash_attn_prefill::init_kernel_attributes(max_dynamic_smem));
+}
 
 void launch_flash_attn_prefill_bf16(
     const __nv_bfloat16* q, int64_t qsb, int64_t qss, int64_t qsh,
@@ -1451,6 +1487,15 @@ bool run_case(const Case& c, std::mt19937& rng) {
 } // namespace test
 
 int main() {
+    int device = 0;
+    int max_dynamic_smem = 0;
+    CUDA_MUST(cudaGetDevice(&device));
+    CUDA_MUST(cudaDeviceGetAttribute(
+        &max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    CUDA_MUST(static_cast<cudaError_t>(
+        rustinfer_flash_attn_gqa_prefill_init_kernel_attributes(
+            max_dynamic_smem)));
+
     std::mt19937 rng(0xC0DEBEEFu);
 
     // Matrix of cases: batch, heads, head_dim, seq lengths, causal, stride padding.

@@ -30,6 +30,13 @@ extern "C" {
 // F32 is *not* supported on CUDA; run F32 attention on CPU.
 // ======================================================================
 
+// Fixed device initialization. The CUDA backend calls these after selecting
+// the device and before NCCL setup, graph capture, or any launch.
+int rustinfer_flash_attn_batched_decode_init_kernel_attributes(int max_dynamic_smem);
+int rustinfer_flash_attn_gqa_prefill_init_kernel_attributes(int max_dynamic_smem);
+int rustinfer_flash_attn_paged_decode_init_kernel_attributes(int max_dynamic_smem);
+int rustinfer_flash_attn_paged_prefill_init_kernel_attributes(int max_dynamic_smem);
+
 // --- Prefill ---------------------------------------------------------------
 void launch_flash_attn_prefill_bf16(
     const __nv_bfloat16* q, int64_t qsb, int64_t qss, int64_t qsh,
@@ -145,7 +152,7 @@ void launch_flash_attn_batched_decode_fp16(
     float softmax_scale,
     cudaStream_t stream);
 
-void launch_flash_attn_paged_decode_bf16(
+int launch_flash_attn_paged_decode_bf16(
     const __nv_bfloat16* q, int64_t qsb, int64_t qsh,
     const __nv_bfloat16* k_pool,
     const __nv_bfloat16* v_pool,
@@ -155,11 +162,11 @@ void launch_flash_attn_paged_decode_bf16(
     int block_size,
     const int32_t* kv_lens,
     float* workspace,
-    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    int batch, int num_q_heads, int num_kv_heads, int num_sm, int head_dim,
     float softmax_scale,
     cudaStream_t stream);
 
-void launch_flash_attn_paged_decode_fp16(
+int launch_flash_attn_paged_decode_fp16(
     const __half* q, int64_t qsb, int64_t qsh,
     const __half* k_pool,
     const __half* v_pool,
@@ -169,7 +176,7 @@ void launch_flash_attn_paged_decode_fp16(
     int block_size,
     const int32_t* kv_lens,
     float* workspace,
-    int batch, int num_q_heads, int num_kv_heads, int head_dim,
+    int batch, int num_q_heads, int num_kv_heads, int num_sm, int head_dim,
     float softmax_scale,
     cudaStream_t stream);
 

@@ -95,6 +95,49 @@ impl CudaMemoryPlan {
     }
 }
 
+/// Immutable capabilities of one CUDA device.
+///
+/// Query these once when the backend is constructed. Kernel launchers consume
+/// this value instead of issuing `cudaGetDevice*` calls in their hot paths, and
+/// device initializers use the same source of truth when deciding which kernel
+/// variants the hardware can support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CudaDeviceInfo {
+    pub(crate) device_id: i32,
+    pub(crate) sm_count: i32,
+    pub(crate) max_dynamic_shared_memory: i32,
+}
+
+impl CudaDeviceInfo {
+    fn query(device_id: i32) -> OpResult<Self> {
+        let mut sm_count = 0;
+        let mut max_dynamic_shared_memory = 0;
+        unsafe {
+            cuda_check!(ffi::cudaDeviceGetAttribute(
+                &mut sm_count,
+                ffi::cudaDeviceAttr_cudaDevAttrMultiProcessorCount,
+                device_id,
+            ));
+            cuda_check!(ffi::cudaDeviceGetAttribute(
+                &mut max_dynamic_shared_memory,
+                ffi::cudaDeviceAttr_cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                device_id,
+            ));
+        }
+        if sm_count <= 0 || max_dynamic_shared_memory <= 0 {
+            return Err(OpError::Kernel(format!(
+                "invalid CUDA device capabilities for cuda:{device_id}: sm_count={sm_count}, \
+                 max_dynamic_shared_memory={max_dynamic_shared_memory}"
+            )));
+        }
+        Ok(Self {
+            device_id,
+            sm_count,
+            max_dynamic_shared_memory,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct DeviceRegion {
     ptr: *mut c_void,
@@ -214,6 +257,7 @@ pub struct CudaConfig {
     /// Device on which every stream, handle, graph and allocation below was
     /// created. Multi-GPU teardown must reactivate it before destroying them.
     device_id: i32,
+    device_info: CudaDeviceInfo,
     pub stream: ffi::cudaStream_t,
     pub cublaslt_handle: ffi::cublasLtHandle_t,
     pub cublas_handle_v2: ffi::cublasHandle_t,
@@ -285,6 +329,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaGetDevice(&mut device_id));
         }
+        let device_info = CudaDeviceInfo::query(device_id)?;
         let mut stream: ffi::cudaStream_t = std::ptr::null_mut();
         unsafe {
             cuda_check!(ffi::cudaStreamCreate(&mut stream));
@@ -332,6 +377,7 @@ impl CudaConfig {
         }
         Ok(Self {
             device_id,
+            device_info,
             stream,
             cublaslt_handle,
             cublas_handle_v2,
@@ -358,6 +404,10 @@ impl CudaConfig {
 
     pub fn memory_plan(&self) -> CudaMemoryPlan {
         self.memory_plan
+    }
+
+    pub(crate) fn device_info(&self) -> CudaDeviceInfo {
+        self.device_info
     }
 
     pub fn kernel_workspace(&self) -> CudaWorkspace {

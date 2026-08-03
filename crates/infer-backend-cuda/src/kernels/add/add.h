@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -10,6 +11,7 @@ void add_kernel_float2_forward(
     const float* a,
     const float* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 );
 
@@ -17,6 +19,7 @@ void add_inplace_kernel_float2_forward(
     float* a_and_c,
     const float* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 );
 
@@ -25,6 +28,7 @@ void add_kernel_bf16x8(
     const __nv_bfloat16* a,
     const __nv_bfloat16* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 );
 
@@ -32,6 +36,24 @@ void add_inplace_kernel_bf16x8(
     __nv_bfloat16* a_and_c,
     const __nv_bfloat16* b,
     int num_elements,
+    int num_sm,
+    cudaStream_t stream
+);
+
+void add_kernel_fp16x8(
+    __half* c,
+    const __half* a,
+    const __half* b,
+    int num_elements,
+    int num_sm,
+    cudaStream_t stream
+);
+
+void add_inplace_kernel_fp16x8(
+    __half* a_and_c,
+    const __half* b,
+    int num_elements,
+    int num_sm,
     cudaStream_t stream
 );
 
