@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::device::MemoryPort;
 use crate::error::{OpError, OpResult};
 
-/// Communication axis for tensor/pipeline/data/expert parallelism. Lives here
+/// Communication axis for tensor, pipeline, and data parallelism. Lives here
 /// (next to `TopologyShape`, its only structural user) rather than with the
 /// `CollectiveOps` trait, so the exec vocabulary has no upward dependency on the
 /// op-port layer. The `CollectiveOps` trait re-exports it.
@@ -14,7 +14,6 @@ pub enum CommAxis {
     Tp,
     Pp,
     Dp,
-    Ep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -279,7 +278,6 @@ impl TopologyShape {
             CommAxis::Tp => self.tp.rank,
             CommAxis::Pp => self.pp.rank,
             CommAxis::Dp => self.dp.rank,
-            CommAxis::Ep => self.tp.rank,
         }
     }
 
@@ -288,7 +286,6 @@ impl TopologyShape {
             CommAxis::Tp => self.tp.size,
             CommAxis::Pp => self.pp.size,
             CommAxis::Dp => self.dp.size,
-            CommAxis::Ep => self.tp.size,
         }
     }
 

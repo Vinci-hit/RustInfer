@@ -238,7 +238,8 @@ impl RuntimePeerFailureNotifier {
 
 impl RuntimePeerWatchdog {
     pub fn fail_stop() -> OpResult<Self> {
-        Self::spawn_with_action(|_| {
+        Self::spawn_with_action(|message| {
+            tracing::error!(reason = %message, "TP watchdog terminating worker");
             std::process::exit(1);
         })
     }
@@ -579,13 +580,6 @@ fn run_follower<T, D, M>(
     let mut mixed_ticket: Option<MixedStepTicket> = None;
     while let Ok(envelope) = command_rx.recv() {
         let operation = envelope.command.name();
-        let command_started = Instant::now();
-        tracing::debug!(
-            rank,
-            sequence = envelope.sequence,
-            operation,
-            "TP follower command started"
-        );
         let result = match envelope.command {
             RuntimePeerCommand::Step(req) => runtime.step(&req).map(|_| ()),
             RuntimePeerCommand::ProfileForward => runtime.profile_forward(),
@@ -647,14 +641,6 @@ fn run_follower<T, D, M>(
             },
             RuntimePeerCommand::Shutdown => break,
         };
-        tracing::debug!(
-            rank,
-            sequence = envelope.sequence,
-            operation,
-            success = result.is_ok(),
-            elapsed_us = command_started.elapsed().as_micros() as u64,
-            "TP follower command completed"
-        );
         let fatal = result.as_ref().is_err_and(|error| error.is_fatal());
         if let Err(error) = &result {
             tracing::error!(
@@ -691,7 +677,6 @@ pub(crate) struct PendingPeerCall {
     deadline: Instant,
     watchdog_sequence: u64,
     phase: PeerCommandPhase,
-    operation: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -962,40 +947,16 @@ impl RuntimePeerGroup {
                 return Err(error);
             }
         }
-        tracing::debug!(
-            sequence,
-            operation,
-            phase = ?phase,
-            pending_pipelines = ?self.pending_pipelines,
-            watchdog_sequence,
-            deadline_remaining_ms = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64,
-            "TP leader command dispatched"
-        );
         self.in_flight = Some(sequence);
         Ok(PendingPeerCall {
             sequence,
             deadline,
             watchdog_sequence,
             phase,
-            operation,
         })
     }
 
     pub(crate) fn wait(&mut self, pending: PendingPeerCall) -> OpResult<()> {
-        let wait_started = Instant::now();
-        tracing::debug!(
-            sequence = pending.sequence,
-            phase = ?pending.phase,
-            operation = pending.operation,
-            watchdog_sequence = pending.watchdog_sequence,
-            deadline_remaining_ms = pending
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64,
-            "TP leader waiting for follower command"
-        );
         if self.in_flight != Some(pending.sequence) {
             let error = OpError::Fatal(format!(
                 "TP runtime peer completion {} does not match in-flight {:?}",
@@ -1025,27 +986,7 @@ impl RuntimePeerGroup {
                 }
                 break;
             }
-            let recv_started = Instant::now();
-            tracing::debug!(
-                sequence = pending.sequence,
-                operation = pending.operation,
-                peer_rank = peer.rank,
-                remaining_ms = remaining.as_millis() as u64,
-                "[tp-diag] TP peer receive begin"
-            );
             let recv_result = peer.recv(remaining);
-            tracing::debug!(
-                sequence = pending.sequence,
-                operation = pending.operation,
-                peer_rank = peer.rank,
-                transport_success = recv_result.is_ok(),
-                command_success = recv_result
-                    .as_ref()
-                    .ok()
-                    .is_some_and(|completion| completion.outcome.is_ok()),
-                elapsed_us = recv_started.elapsed().as_micros() as u64,
-                "[tp-diag] TP peer receive return"
-            );
             match recv_result {
                 Ok(completion) if completion.sequence == pending.sequence => {
                     if let Err(error) = completion.outcome
@@ -1110,14 +1051,6 @@ impl RuntimePeerGroup {
             self.poisoned = Some(error.to_string());
             Err(error)
         } else {
-            tracing::debug!(
-                sequence = pending.sequence,
-                phase = ?pending.phase,
-                operation = pending.operation,
-                pending_pipelines = ?self.pending_pipelines,
-                elapsed_us = wait_started.elapsed().as_micros() as u64,
-                "TP follower command completed on every rank"
-            );
             Ok(())
         }
     }

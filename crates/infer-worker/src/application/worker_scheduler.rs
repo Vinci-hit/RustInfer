@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use half::bf16;
 
 use infer_protocol::scheduler_to_worker_data::{
@@ -403,15 +401,6 @@ pub fn handle_fused_step<M>(
 where
     M: DecoderModel<bf16, Cuda>,
 {
-    let diag_total = Instant::now();
-    tracing::debug!(
-        stage = "fused_step_begin",
-        active = active.len(),
-        prefilling = prefilling.len(),
-        pending_prefills = pending_prefills.len(),
-        decode_pending = decode_engine.has_pending(),
-        "[tp-diag] fused scheduler stage"
-    );
     // 1. Drain OR overlap the in-flight ABC decode step. Overlap (eager-mixed
     //    mode): leave it in flight, build this step's decode rows
     //    OPTIMISTICALLY from its row set (every row assumed to survive; input
@@ -442,13 +431,6 @@ where
     }
     let optimistic_decode = overlap_prior.is_some();
     let mut overlap_active = optimistic_decode;
-    tracing::debug!(
-        stage = "overlap_selected",
-        overlap_enabled,
-        optimistic_decode,
-        active = active.len(),
-        "[tp-diag] fused scheduler stage"
-    );
 
     let mut prior_output = if overlap_active {
         None
@@ -641,17 +623,6 @@ where
             });
         }
     }
-    tracing::debug!(
-        stage = "groups_planned",
-        optimistic_decode,
-        overlap_active,
-        decode_count,
-        groups = groups.len(),
-        admitted_prefills = admitted_cmds.len(),
-        deferred_prefills = deferred_out.len(),
-        elapsed_us = diag_total.elapsed().as_micros() as u64,
-        "[tp-diag] fused scheduler stage"
-    );
 
     // Overlap is single-group only: the fused issue must precede the prior
     // step's finalize, and the deferred copy-out interleave assumes exactly
@@ -776,24 +747,6 @@ where
             seqs,
         };
         let stochastic_group = req.sampling.iter().any(|params| !params.is_greedy());
-        let first_sid = req.seqs.first().map(|seq| seq.sequence_id);
-        tracing::debug!(
-            stage = "group_ready",
-            optimistic_decode,
-            overlap_active,
-            has_decode,
-            decode_count,
-            rows = req.seqs.len(),
-            tokens = req
-                .seqs
-                .iter()
-                .map(|seq| seq.input_ids.len())
-                .sum::<usize>(),
-            first_sid,
-            stochastic_group,
-            "[tp-diag] fused scheduler stage"
-        );
-
         let mut mixed_lease = KvLease::empty();
         let mut mixed_device_prepared = false;
         if can_record_abc_rows && !stochastic_group {
@@ -834,38 +787,14 @@ where
             // real tokens (the prior step's argmax) are gathered from buffer C
             // on device, so any group holding them must use the overlapped
             // issue even after a fallback drain (C is untouched by finalize).
-            let issue_started = Instant::now();
-            tracing::debug!(
-                stage = "fused_issue_begin",
-                optimistic_decode,
-                overlap_active,
-                has_decode,
-                decode_count,
-                rows = req.seqs.len(),
-                first_sid,
-                "[tp-diag] fused scheduler stage"
-            );
             let issue_res = if optimistic_decode && has_decode {
                 runner.issue_fused_abc_overlapped(&req, &row_kinds, group_next_slots, decode_count)
             } else {
                 runner.issue_fused_abc(&req, &row_kinds, group_next_slots)
             };
-            let issue_ok = issue_res.is_ok();
-            tracing::debug!(
-                stage = "fused_issue_return",
-                success = issue_ok,
-                elapsed_us = issue_started.elapsed().as_micros() as u64,
-                "[tp-diag] fused scheduler stage"
-            );
             // Drain the prior step only after the fused issue so its GPU tail
             // overlaps planning and issue. The failure path also drains it.
             if overlap_active {
-                let finalize_decode_started = Instant::now();
-                tracing::debug!(
-                    stage = "prior_decode_finalize_begin",
-                    decode_count,
-                    "[tp-diag] fused scheduler stage"
-                );
                 match decode_engine.finalize_pending(
                     runner,
                     active,
@@ -886,32 +815,13 @@ where
                         break 'groups;
                     }
                 }
-                tracing::debug!(
-                    stage = "prior_decode_finalize_return",
-                    elapsed_us = finalize_decode_started.elapsed().as_micros() as u64,
-                    prior_output = prior_output.is_some(),
-                    "[tp-diag] fused scheduler stage"
-                );
                 overlap_active = false;
             }
             // The fused forward is on the GPU now: send the prior decode tokens
             // while it runs, but propagate a send failure only after commit.
             let sent = send_prior_output(data, &mut prior_output);
-            let finalize_fused_started = Instant::now();
-            tracing::debug!(
-                stage = "fused_finalize_begin",
-                issue_ok,
-                rows = req.seqs.len(),
-                "[tp-diag] fused scheduler stage"
-            );
             let out =
                 issue_res.and_then(|ticket| runner.finalize_fused_abc(ticket, &req, &row_kinds));
-            tracing::debug!(
-                stage = "fused_finalize_return",
-                success = out.is_ok(),
-                elapsed_us = finalize_fused_started.elapsed().as_micros() as u64,
-                "[tp-diag] fused scheduler stage"
-            );
             (out, sent)
         };
         let out = match out_res {
@@ -1046,21 +956,7 @@ where
         } else {
             mixed_lease.release(kv_allocator);
         }
-        let output_send_started = Instant::now();
-        tracing::debug!(
-            stage = "fused_output_send_begin",
-            tokens = output.tokens.len(),
-            assigned = output.assigned_indices.len(),
-            prefill_done = output.prefill_done.len(),
-            "[tp-diag] fused scheduler stage"
-        );
         let output_send = data.send_step_output(&output);
-        tracing::debug!(
-            stage = "fused_output_send_return",
-            success = output_send.is_ok(),
-            elapsed_us = output_send_started.elapsed().as_micros() as u64,
-            "[tp-diag] fused scheduler stage"
-        );
         if let Err(e) = output_send {
             hard_err = Some(OpError::Kernel(format!(
                 "data plane send_step_output failed: {}",
@@ -1105,12 +1001,6 @@ where
     // leave it pending for the next `run_step` call to finalize. Also removes
     // the cold-start 0-deep restart the pipeline used to pay after every
     // fused step.
-    let tail_issue_started = Instant::now();
-    tracing::debug!(
-        stage = "tail_decode_issue_begin",
-        active = active.len(),
-        "[tp-diag] fused scheduler stage"
-    );
     let tail_issue = decode_engine.issue_if_idle(
         runner,
         active,
@@ -1119,14 +1009,6 @@ where
         control,
         eos_ids,
         enable_prefix_caching,
-    );
-    tracing::debug!(
-        stage = "tail_decode_issue_return",
-        success = tail_issue.is_ok(),
-        decode_pending = decode_engine.has_pending(),
-        elapsed_us = tail_issue_started.elapsed().as_micros() as u64,
-        total_elapsed_us = diag_total.elapsed().as_micros() as u64,
-        "[tp-diag] fused scheduler stage"
     );
     tail_issue?;
     Ok(())
@@ -1190,22 +1072,7 @@ fn patch_overlap_assigned_tokens(
 /// compute; the early-return paths call it too so the tokens are never lost.
 fn send_prior_output(data: &DataPump, prior: &mut Option<StepOutput>) -> OpResult<()> {
     if let Some(out) = prior.take() {
-        let send_started = Instant::now();
-        tracing::debug!(
-            stage = "prior_output_send_begin",
-            tokens = out.tokens.len(),
-            assigned = out.assigned_indices.len(),
-            prefill_done = out.prefill_done.len(),
-            first_sid = out.tokens.first().map(|token| token.sequence_id),
-            "[tp-diag] fused scheduler stage"
-        );
         let send_result = data.send_step_output(&out);
-        tracing::debug!(
-            stage = "prior_output_send_return",
-            success = send_result.is_ok(),
-            elapsed_us = send_started.elapsed().as_micros() as u64,
-            "[tp-diag] fused scheduler stage"
-        );
         send_result.map_err(|e| {
             OpError::Kernel(format!(
                 "data plane send_step_output (fused prior) failed: {}",

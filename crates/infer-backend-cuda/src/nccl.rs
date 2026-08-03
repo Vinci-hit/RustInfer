@@ -314,7 +314,7 @@ impl CollectiveOps for Cuda {
     fn comm(scope: &Self::Scope, axis: CommAxis) -> Option<&Self::Comm> {
         match axis {
             CommAxis::Tp => scope.tp_comm.as_deref(),
-            CommAxis::Pp | CommAxis::Dp | CommAxis::Ep => None,
+            CommAxis::Pp | CommAxis::Dp => None,
         }
     }
 

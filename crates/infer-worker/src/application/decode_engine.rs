@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use half::bf16;
 
 use infer_protocol::worker_to_scheduler_data::{AssignedIndices, GeneratedToken, StepOutput};
@@ -639,36 +637,11 @@ impl DecodeEngine {
         M: DecoderModel<bf16, Cuda>,
     {
         let Some(p) = self.pending.take() else {
-            tracing::debug!(
-                stage = "decode_finalize_no_pending",
-                "[tp-diag] decode engine stage"
-            );
             return Ok(None);
         };
-        let total_started = Instant::now();
-        let first_sid = p.order.first().copied();
-        tracing::debug!(
-            stage = "decode_finalize_begin",
-            batch = p.batch,
-            first_sid,
-            device_prepared = p.device_prepared,
-            "[tp-diag] decode engine stage"
-        );
-        let runtime_started = Instant::now();
         let runtime_result = runner.finalize_decode_abc(p.batch);
-        tracing::debug!(
-            stage = "decode_runtime_finalize_return",
-            batch = p.batch,
-            first_sid,
-            success = runtime_result.is_ok(),
-            elapsed_us = runtime_started.elapsed().as_micros() as u64,
-            "[tp-diag] decode engine stage"
-        );
         match runtime_result {
             Ok(compact) => {
-                let active_rows = compact.active.len();
-                let finished_rows = compact.finished.len();
-                let commit_started = Instant::now();
                 let output = self.commit_results(
                     active,
                     kv_allocator,
@@ -682,26 +655,9 @@ impl DecodeEngine {
                 // A now holds the surviving tokens compacted to the front in
                 // `rows` order (commit_results just set `rows` to the survivors).
                 self.prev_a_rows = self.rows.as_slice().to_vec();
-                tracing::debug!(
-                    stage = "decode_finalize_committed",
-                    batch = p.batch,
-                    active_rows,
-                    finished_rows,
-                    commit_us = commit_started.elapsed().as_micros() as u64,
-                    total_elapsed_us = total_started.elapsed().as_micros() as u64,
-                    "[tp-diag] decode engine stage"
-                );
                 Ok(Some(output))
             }
             Err(e) => {
-                tracing::debug!(
-                    stage = "decode_finalize_failed",
-                    batch = p.batch,
-                    first_sid,
-                    error = %e,
-                    total_elapsed_us = total_started.elapsed().as_micros() as u64,
-                    "[tp-diag] decode engine stage"
-                );
                 p.new_indices.release(kv_allocator);
                 fail_decode_seqs(
                     control,
@@ -738,8 +694,6 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
-        let total_started = Instant::now();
-        let prepare_started = Instant::now();
         let (order, new_indices) = match self.prepare_step(
             active,
             prefilling,
@@ -749,16 +703,9 @@ impl DecodeEngine {
         )? {
             Some(ready) => ready,
             None => {
-                tracing::debug!(
-                    stage = "decode_issue_no_work",
-                    elapsed_us = total_started.elapsed().as_micros() as u64,
-                    "[tp-diag] decode engine stage"
-                );
                 return Ok(());
             }
         };
-        let prepare_us = prepare_started.elapsed().as_micros() as u64;
-
         // Reserve the NEXT step's KV slots before issuing. In the async path the
         // device control builder (`compact_extend`) appends these to each
         // survivor on-device; in the proven path they become the next step's
@@ -793,19 +740,6 @@ impl DecodeEngine {
         let a_valid_prefix = common_prefix_len(&order, &self.prev_a_rows);
 
         let batch = order.len();
-        let first_sid = order.first().copied();
-        let issue_started = Instant::now();
-        tracing::debug!(
-            stage = "decode_runtime_issue_begin",
-            batch,
-            first_sid,
-            a_valid_prefix,
-            device_ctrl_ok,
-            reuse_device_control,
-            next_slots = next_slots.as_ref().map_or(0, Vec::len),
-            prepare_us,
-            "[tp-diag] decode engine stage"
-        );
         let issue_result = runner.issue_decode_abc(
             &req.req,
             a_valid_prefix,
@@ -816,14 +750,6 @@ impl DecodeEngine {
             next_slots.as_deref(),
             reuse_device_control,
         );
-        tracing::debug!(
-            stage = "decode_runtime_issue_return",
-            batch,
-            first_sid,
-            success = issue_result.is_ok(),
-            elapsed_us = issue_started.elapsed().as_micros() as u64,
-            "[tp-diag] decode engine stage"
-        );
         match issue_result {
             Ok(()) => {
                 self.pending = Some(PendingDecode {
@@ -833,26 +759,9 @@ impl DecodeEngine {
                     batch,
                     device_prepared: device_ctrl_ok,
                 });
-                tracing::debug!(
-                    stage = "decode_pending_stored",
-                    batch,
-                    first_sid,
-                    device_ctrl_ok,
-                    reuse_device_control,
-                    total_elapsed_us = total_started.elapsed().as_micros() as u64,
-                    "[tp-diag] decode pending stored"
-                );
                 Ok(())
             }
             Err(e) => {
-                tracing::debug!(
-                    stage = "decode_issue_failed",
-                    batch,
-                    first_sid,
-                    error = %e,
-                    total_elapsed_us = total_started.elapsed().as_micros() as u64,
-                    "[tp-diag] decode engine stage"
-                );
                 new_indices.release(kv_allocator);
                 fail_decode_seqs(
                     control,

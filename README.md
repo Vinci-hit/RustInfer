@@ -303,6 +303,28 @@ Config is a single TOML shared by all three processes. Key fields:
 | `capture_sizes`         | Batch sizes to capture CUDA graphs for, e.g. `[1,2,4,8,16,24,32]`. |
 | `ignore_eos`            | Ignore EOS (useful for fixed-length benchmarking). |
 
+### Tensor parallelism
+
+Tensor parallelism is disabled by default. To shard a dense BF16 model over two
+GPUs, set the shared configuration to:
+
+```toml
+device = "cuda:0"
+tensor_parallel_size = 2
+```
+
+One worker process owns the complete TP group. Rank 0 uses `device`; the other
+ranks use consecutive CUDA device IDs, so this example uses `cuda:0` and
+`cuda:1`. The CUDA backend requires NCCL 2.24.3 or newer; the Docker image
+already includes the matching development and runtime packages.
+
+The initial implementation supports single-node dense BF16 Llama/Qwen decoders.
+Vocabulary size, query/KV head counts, and MLP intermediate size must be evenly
+divisible by `tensor_parallel_size`. TP with AWQ or block FP8 weights,
+speculative decoding, pipeline parallelism, data parallelism, and expert
+parallelism are not implemented yet; unsupported combinations fail during
+startup instead of silently falling back to replicated execution.
+
 ---
 
 ## Status

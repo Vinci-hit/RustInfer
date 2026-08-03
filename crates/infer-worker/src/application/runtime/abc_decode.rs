@@ -125,19 +125,6 @@ where
         async_next_slots: Option<&[u32]>,
         reuse_device_control: bool,
     ) -> OpResult<()> {
-        let tp = self.scope.topology().tp;
-        let total_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_issue_replicated_begin",
-            tp_rank = tp.rank,
-            tp_size = tp.size,
-            batch = req.seqs.len(),
-            a_valid_prefix,
-            reuse_device_control,
-            next_slots = async_next_slots.map_or(0, <[u32]>::len),
-            "[tp-diag] runtime decode stage"
-        );
-        let dispatch_started = std::time::Instant::now();
         let pending = self.dispatch_peer_command(super::RuntimePeerCommand::IssueDecodeAbc {
             req: Box::new(req.clone()),
             a_valid_prefix,
@@ -148,13 +135,6 @@ where
             async_next_slots: async_next_slots.map(<[u32]>::to_vec),
             reuse_device_control,
         })?;
-        tracing::debug!(
-            stage = "decode_issue_peer_dispatched",
-            tp_rank = tp.rank,
-            elapsed_us = dispatch_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        let local_started = std::time::Instant::now();
         let local = self.issue_decode_abc_local(
             req,
             a_valid_prefix,
@@ -165,32 +145,8 @@ where
             async_next_slots,
             reuse_device_control,
         );
-        tracing::debug!(
-            stage = "decode_issue_local_return",
-            tp_rank = tp.rank,
-            success = local.is_ok(),
-            elapsed_us = local_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        let peer_wait_started = std::time::Instant::now();
         let followers = self.wait_peer_command(pending);
-        tracing::debug!(
-            stage = "decode_issue_peer_wait_return",
-            tp_rank = tp.rank,
-            success = followers.is_ok(),
-            elapsed_us = peer_wait_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        let result =
-            super::complete_replicated(&mut self.peers, "issue_decode_abc", local, followers);
-        tracing::debug!(
-            stage = "decode_issue_replicated_return",
-            tp_rank = tp.rank,
-            success = result.is_ok(),
-            total_elapsed_us = total_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        result
+        super::complete_replicated(&mut self.peers, "issue_decode_abc", local, followers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -205,15 +161,6 @@ where
         async_next_slots: Option<&[u32]>,
         reuse_device_control: bool,
     ) -> OpResult<()> {
-        let tp_rank = self.scope.topology().tp.rank;
-        let local_total = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_local_begin",
-            tp_rank,
-            batch = req.seqs.len(),
-            reuse_device_control,
-            "[tp-diag] runtime decode local stage"
-        );
         let plan = self.build_plan(req)?;
         let batch = plan.batch;
         if plan.num_tokens != batch || plan.q_lens.iter().any(|&q| q != 1) {
@@ -241,14 +188,6 @@ where
 
         // Lazily page-lock the host staging on the first step so the Si/So
         // copies are truly async (pageable memory makes them host-synchronous).
-        let upload_control_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_control_upload_begin",
-            tp_rank,
-            batch,
-            reuse_device_control,
-            "[tp-diag] runtime decode local stage"
-        );
         self.ensure_abc_pinned()?;
 
         // Async path: when reusing the device-resident control plane, this
@@ -261,13 +200,6 @@ where
         } else {
             self.upload_index(&plan, req)?;
         }
-        tracing::debug!(
-            stage = "decode_control_upload_return",
-            tp_rank,
-            batch,
-            elapsed_us = upload_control_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
 
         // Guard A against this step's append/merge overwriting it before the
         // prior step's copy-out (So) finished reading A_{n-1}. (ev_out)
@@ -343,14 +275,6 @@ where
             // decision never reaches here; treat it as eager for exhaustiveness.
             GraphDecision::PrefillGraph(_) | GraphDecision::Eager => None,
         };
-        let forward_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_forward_begin",
-            tp_rank,
-            batch,
-            slot_batch,
-            "[tp-diag] runtime decode local stage"
-        );
         match slot_batch {
             Some(sb) if self.scope.graph_ready(sb as u64) => {
                 // Hot path: pure replay of the (>= batch) captured graph.
@@ -367,32 +291,11 @@ where
                 self.forward_finalize_argmax(&plan, &input_ids)?;
             }
         }
-        tracing::debug!(
-            stage = "decode_forward_return",
-            tp_rank,
-            batch,
-            elapsed_us = forward_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
 
         // C feeds both stop evaluation and row compaction below. Synchronize
         // the sampled ids first so every rank takes the same active/finished
         // branches and enters subsequent collectives with identical row state.
-        let broadcast_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_argmax_broadcast_begin",
-            tp_rank,
-            batch,
-            "[tp-diag] runtime decode local stage"
-        );
         self.broadcast_tp_argmax(batch)?;
-        tracing::debug!(
-            stage = "decode_argmax_broadcast_return",
-            tp_rank,
-            batch,
-            elapsed_us = broadcast_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
 
         // ── upload stop metadata + run the compact merge (C → A) ──
         let gen_i32: Vec<i32> = generated_counts
@@ -404,13 +307,6 @@ where
             .map(|&x| u32_to_i32_saturating(x))
             .collect();
         let ign_i32: Vec<i32> = ignore_eos.iter().map(|&b| i32::from(b)).collect();
-        let metadata_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_metadata_upload_begin",
-            tp_rank,
-            batch,
-            "[tp-diag] runtime decode local stage"
-        );
         let device = self.scope.device();
         unsafe {
             upload_i32_prefix(device, &self.abc.generated_counts_dev, &gen_i32)?;
@@ -420,20 +316,6 @@ where
                 upload_i32_prefix(device, &self.abc.eos_ids_dev, eos_ids)?;
             }
         }
-        tracing::debug!(
-            stage = "decode_metadata_upload_return",
-            tp_rank,
-            batch,
-            elapsed_us = metadata_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
-        let merge_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_merge_begin",
-            tp_rank,
-            batch,
-            "[tp-diag] runtime decode local stage"
-        );
         {
             let _guard = self.scope.enter();
             let mut a = self.input_ids_buf.view_raw(
@@ -460,13 +342,6 @@ where
                 },
             )?;
         }
-        tracing::debug!(
-            stage = "decode_merge_return",
-            tp_rank,
-            batch,
-            elapsed_us = merge_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
 
         // ── Async path: build NEXT step's device control plane on-device ──
         // After the merge has produced `active_src_rows` + `counts`, gather the
@@ -477,14 +352,6 @@ where
         // merge; the next step's forward (after the finalize sync) reads the
         // result. `new_slots` are the Stage-1 speculative reservations.
         if let Some(next_slots) = async_next_slots {
-            let next_control_started = std::time::Instant::now();
-            tracing::debug!(
-                stage = "decode_next_control_begin",
-                tp_rank,
-                batch,
-                slots = next_slots.len(),
-                "[tp-diag] runtime decode local stage"
-            );
             self.ensure_async_ctrl()?;
             let device = self.scope.device();
             // Upload the next-step slots (O(batch)); the kernel uses the first
@@ -520,13 +387,6 @@ where
                     cap_batch,
                 },
             )?;
-            tracing::debug!(
-                stage = "decode_next_control_return",
-                tp_rank,
-                batch,
-                elapsed_us = next_control_started.elapsed().as_micros() as u64,
-                "[tp-diag] runtime decode local stage"
-            );
         }
 
         // A now holds the committed/compacted tokens (compute). Mark it so the
@@ -575,13 +435,6 @@ where
         }
         D::pipeline_record_copy_out(&self.scope)?; // ev_out on So
         self.abc.copy_out_recorded = true;
-        tracing::debug!(
-            stage = "decode_local_return",
-            tp_rank,
-            batch,
-            total_elapsed_us = local_total.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
         // NOTE: no synchronize here — the So download runs asynchronously and is
         // collected by `finalize_decode_abc`, which the caller invokes one step
         // later so the next step's compute overlaps this step's host commit.
@@ -598,65 +451,15 @@ where
     /// desync before it can corrupt host row bookkeeping. `batch` must be the
     /// `order.len()` the matching `issue_decode_abc` ran with.
     pub fn finalize_decode_abc(&mut self, batch: usize) -> OpResult<DecodeCompactOutput> {
-        let tp = self.scope.topology().tp;
-        let total_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_finalize_replicated_begin",
-            tp_rank = tp.rank,
-            tp_size = tp.size,
-            batch,
-            "[tp-diag] runtime decode stage"
-        );
         let pending =
             self.dispatch_peer_command(super::RuntimePeerCommand::FinalizeDecodeAbc { batch })?;
-        let local_started = std::time::Instant::now();
         let local = self.finalize_decode_abc_local(batch);
-        tracing::debug!(
-            stage = "decode_finalize_local_return",
-            tp_rank = tp.rank,
-            success = local.is_ok(),
-            elapsed_us = local_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        let peer_wait_started = std::time::Instant::now();
         let followers = self.wait_peer_command(pending);
-        tracing::debug!(
-            stage = "decode_finalize_peer_wait_return",
-            tp_rank = tp.rank,
-            success = followers.is_ok(),
-            elapsed_us = peer_wait_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        let result =
-            super::complete_replicated(&mut self.peers, "finalize_decode_abc", local, followers);
-        tracing::debug!(
-            stage = "decode_finalize_replicated_return",
-            tp_rank = tp.rank,
-            success = result.is_ok(),
-            total_elapsed_us = total_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode stage"
-        );
-        result
+        super::complete_replicated(&mut self.peers, "finalize_decode_abc", local, followers)
     }
 
     fn finalize_decode_abc_local(&mut self, batch: usize) -> OpResult<DecodeCompactOutput> {
-        let tp_rank = self.scope.topology().tp.rank;
-        let sync_started = std::time::Instant::now();
-        tracing::debug!(
-            stage = "decode_copy_out_sync_begin",
-            tp_rank,
-            batch,
-            "[tp-diag] runtime decode local stage"
-        );
         let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
-        tracing::debug!(
-            stage = "decode_copy_out_sync_return",
-            tp_rank,
-            batch,
-            success = sync_result.is_ok(),
-            elapsed_us = sync_started.elapsed().as_micros() as u64,
-            "[tp-diag] runtime decode local stage"
-        );
         sync_result?; // host mirrors valid before we read them
 
         let active_n = self.abc.counts_host[0].max(0) as usize;
@@ -707,15 +510,6 @@ where
                 "step_decode_abc: compaction did not cover every row".into(),
             ));
         }
-
-        tracing::debug!(
-            stage = "decode_compact_parsed",
-            tp_rank,
-            batch,
-            active_n,
-            finished_n,
-            "[tp-diag] runtime decode local stage"
-        );
 
         Ok(DecodeCompactOutput { active, finished })
     }
