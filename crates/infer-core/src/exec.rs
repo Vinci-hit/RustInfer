@@ -371,6 +371,47 @@ impl<D: ExecDevice> HostScope<D> {
     }
 }
 
+impl<D> ExecScope for HostScope<D>
+where
+    D: ExecDevice<Scope = HostScope<D>>,
+{
+    type Device = D;
+    type Stream = HostStream;
+
+    fn device(&self) -> &Self::Device {
+        &self.device
+    }
+
+    fn enter(&self) -> ActiveGuard<'_, Self::Device> {
+        let previous = self.device.enter_device();
+        ActiveGuard::new(self, previous)
+    }
+
+    fn stream(&self) -> &Self::Stream {
+        &self.stream
+    }
+
+    fn rank(&self) -> Rank {
+        self.rank
+    }
+
+    fn topology(&self) -> TopologyShape {
+        self.topology
+    }
+
+    fn quant_tier(&self) -> QuantTier {
+        self.quant_tier
+    }
+
+    fn workspace(&self) -> &Workspace<Self::Device> {
+        &self.workspace
+    }
+
+    fn synchronize(&self) -> OpResult<()> {
+        self.device.synchronize()
+    }
+}
+
 #[cfg(test)]
 mod topology_tests {
     use super::{RankPair, TopologyShape};
@@ -445,46 +486,5 @@ mod topology_tests {
                 .to_string()
                 .contains("world size overflows")
         );
-    }
-}
-
-impl<D> ExecScope for HostScope<D>
-where
-    D: ExecDevice<Scope = HostScope<D>>,
-{
-    type Device = D;
-    type Stream = HostStream;
-
-    fn device(&self) -> &Self::Device {
-        &self.device
-    }
-
-    fn enter(&self) -> ActiveGuard<'_, Self::Device> {
-        let previous = self.device.enter_device();
-        ActiveGuard::new(self, previous)
-    }
-
-    fn stream(&self) -> &Self::Stream {
-        &self.stream
-    }
-
-    fn rank(&self) -> Rank {
-        self.rank
-    }
-
-    fn topology(&self) -> TopologyShape {
-        self.topology
-    }
-
-    fn quant_tier(&self) -> QuantTier {
-        self.quant_tier
-    }
-
-    fn workspace(&self) -> &Workspace<Self::Device> {
-        &self.workspace
-    }
-
-    fn synchronize(&self) -> OpResult<()> {
-        self.device.synchronize()
     }
 }

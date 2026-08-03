@@ -34,6 +34,7 @@ mod plan;
 pub use graph_exec::{GraphDecision, GraphRunner, GraphSlotId};
 pub use mixed_abc::MixedStepTicket;
 use peer::PendingPeerCall;
+#[cfg(feature = "cuda")]
 pub(crate) use peer::spawn_monitored_follower;
 pub use peer::{
     RuntimePeerCommand, RuntimePeerGroup, RuntimePeerHandle, RuntimePeerWatchdog, spawn_follower,

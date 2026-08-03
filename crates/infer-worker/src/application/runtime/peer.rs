@@ -259,6 +259,7 @@ impl RuntimePeerWatchdog {
         })
     }
 
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn notifier(&self) -> RuntimePeerFailureNotifier {
         RuntimePeerFailureNotifier {
             command_tx: self.command_tx.clone(),
@@ -493,6 +494,7 @@ where
 
 /// Production variant that trips the group watchdog as soon as a follower
 /// fails, even if rank 0 is blocked inside its matching CUDA/NCCL operation.
+#[cfg(feature = "cuda")]
 pub(crate) fn spawn_monitored_follower<T, D, M, I, F>(
     rank: usize,
     factory: F,
