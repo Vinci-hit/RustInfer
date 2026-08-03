@@ -223,9 +223,9 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
     }
 
     let tp = loader.tensor_parallel();
-    if tp.size > 1 && (cfg.mlp_quant.is_some() || cfg.fp8_block.is_some()) {
+    if tp.size > 1 && cfg.mlp_quant.is_some() {
         return Err(OpError::Kernel(format!(
-            "TP{} currently supports dense decoder weights only; AWQ/FP8 sharding is not enabled",
+            "TP{} currently does not support AWQ decoder sharding",
             tp.size
         )));
     }

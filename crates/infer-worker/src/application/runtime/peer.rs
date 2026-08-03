@@ -18,7 +18,7 @@ use crate::domain::dtype::Dtype;
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::StepRequest;
 use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
+use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult};
 
 use super::{MixedStepTicket, RaggedRowKind, Runtime};
 
@@ -31,6 +31,8 @@ use super::{MixedStepTicket, RaggedRowKind, Runtime};
 pub enum RuntimePeerCommand {
     Step(Box<StepRequest>),
     ProfileForward,
+    PrimeGraphs,
+    ShutdownTpComm,
     ResizeKvPool {
         num_blocks: usize,
     },
@@ -66,6 +68,8 @@ impl RuntimePeerCommand {
         match self {
             Self::Step(_) => "step",
             Self::ProfileForward => "profile_forward",
+            Self::PrimeGraphs => "prime_graphs",
+            Self::ShutdownTpComm => "shutdown_tp_comm",
             Self::ResizeKvPool { .. } => "resize_kv_pool",
             Self::IssueDecodeAbc { .. } => "issue_decode_abc",
             Self::FinalizeDecodeAbc { .. } => "finalize_decode_abc",
@@ -86,9 +90,12 @@ impl RuntimePeerCommand {
             Self::FinalizeDecodeAbc { .. } => PeerCommandPhase::End(PeerPipelineKind::DecodeAbc),
             Self::IssueFusedAbc { .. } => PeerCommandPhase::Begin(PeerPipelineKind::FusedAbc),
             Self::FinalizeFusedAbc { .. } => PeerCommandPhase::End(PeerPipelineKind::FusedAbc),
-            Self::Step(_) | Self::ProfileForward | Self::ResizeKvPool { .. } | Self::Shutdown => {
-                PeerCommandPhase::Standalone
-            }
+            Self::Step(_)
+            | Self::ProfileForward
+            | Self::PrimeGraphs
+            | Self::ShutdownTpComm
+            | Self::ResizeKvPool { .. }
+            | Self::Shutdown => PeerCommandPhase::Standalone,
         }
     }
 
@@ -102,7 +109,14 @@ impl RuntimePeerCommand {
 
     fn valid_pipeline_transition(&self, pending: &[PeerPipelineKind]) -> bool {
         match (pending, self) {
-            ([], Self::Step(_) | Self::ProfileForward | Self::ResizeKvPool { .. }) => true,
+            (
+                [],
+                Self::Step(_)
+                | Self::ProfileForward
+                | Self::PrimeGraphs
+                | Self::ShutdownTpComm
+                | Self::ResizeKvPool { .. },
+            ) => true,
             ([], Self::IssueDecodeAbc { .. } | Self::IssueFusedAbc { .. }) => true,
             ([PeerPipelineKind::DecodeAbc], Self::FinalizeDecodeAbc { .. }) => true,
             (
@@ -583,6 +597,10 @@ fn run_follower<T, D, M>(
         let result = match envelope.command {
             RuntimePeerCommand::Step(req) => runtime.step(&req).map(|_| ()),
             RuntimePeerCommand::ProfileForward => runtime.profile_forward(),
+            RuntimePeerCommand::PrimeGraphs => runtime.prime_graphs(),
+            RuntimePeerCommand::ShutdownTpComm => {
+                <D as CollectiveOps>::shutdown_comm(&runtime.scope, CommAxis::Tp)
+            }
             RuntimePeerCommand::ResizeKvPool { num_blocks } => runtime.resize_kv_pool(num_blocks),
             RuntimePeerCommand::IssueDecodeAbc {
                 req,

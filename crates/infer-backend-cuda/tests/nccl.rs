@@ -63,7 +63,7 @@ fn two_gpu_collectives_preserve_values_and_dim1_layout() {
                     .expect("attach TP communicator to CUDA scope");
                 assert!(
                     !scope.supports_graphs(),
-                    "TP collectives must stay eager until rank-synchronized graph capture exists"
+                    "a zero-sized graph arena must disable graph capture"
                 );
                 let device = scope.device().clone();
                 // Tensor allocation/upload and teardown must happen with this
@@ -217,6 +217,89 @@ fn two_gpu_collectives_preserve_values_and_dim1_layout() {
                 1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0, 5.0, 6.0, 50.0, 60.0,
             ],
             "rank {rank} in-place dim=1 all-gather"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires two visible CUDA GPUs and a working NCCL installation"]
+fn two_gpu_all_reduce_captures_and_replays_in_lockstep() {
+    let memory_plan = CudaMemoryPlan {
+        kernel_workspace_bytes: MIB,
+        graph_arena_bytes: MIB,
+        pool_retain_bytes: MIB,
+    };
+    let devices: Vec<Cuda> = (0..WORLD_SIZE)
+        .map(|device_id| {
+            Cuda::with_memory_plan(device_id as i32, memory_plan)
+                .unwrap_or_else(|error| panic!("create CUDA device {device_id}: {error:?}"))
+        })
+        .collect();
+    let communicators =
+        NcclCommunicator::init_all(&devices).expect("initialize two-rank NCCL communicator");
+    let rendezvous = Arc::new(Barrier::new(WORLD_SIZE));
+
+    let handles: Vec<_> = devices
+        .into_iter()
+        .zip(communicators)
+        .enumerate()
+        .map(|(rank, (device, communicator))| {
+            let rendezvous = Arc::clone(&rendezvous);
+            thread::spawn(move || {
+                let topology = TopologyShape {
+                    tp: RankPair {
+                        rank,
+                        size: WORLD_SIZE,
+                    },
+                    ..TopologyShape::SINGLE
+                };
+                let scope = CudaScope::new(device)
+                    .with_topology(topology)
+                    .expect("configure CUDA scope topology")
+                    .with_tp_communicator(communicator)
+                    .expect("attach TP communicator to CUDA scope");
+                assert!(scope.supports_graphs());
+                let device = scope.device().clone();
+                let _active_device = scope.enter();
+                let input = if rank == 0 {
+                    [1.0f32, 2.0, 3.0, 4.0]
+                } else {
+                    [10.0f32, 20.0, 30.0, 40.0]
+                };
+                let mut tensor =
+                    Tensor::from_host_slice(&input, [2, 2], &device).expect("upload graph input");
+
+                rendezvous.wait();
+                scope.graph_capture_begin().expect("begin graph capture");
+                <Cuda as CollectiveOps>::all_reduce(
+                    &scope,
+                    CommAxis::Tp,
+                    ReduceOp::Sum,
+                    &mut tensor,
+                )
+                .expect("capture all-reduce");
+                rendezvous.wait();
+                scope.graph_capture_end(1).expect("end graph capture");
+                rendezvous.wait();
+                scope.graph_launch(1).expect("launch captured all-reduce");
+                scope.synchronize().expect("synchronize graph replay");
+                let result = tensor.to_host_vec().expect("download graph result");
+                rendezvous.wait();
+                <Cuda as CollectiveOps>::shutdown_comm(&scope, CommAxis::Tp)
+                    .expect("collectively shut down graph communicator");
+                result
+            })
+        })
+        .collect();
+
+    for (rank, handle) in handles.into_iter().enumerate() {
+        let result = handle
+            .join()
+            .unwrap_or_else(|_| panic!("NCCL graph rank thread {rank} panicked"));
+        assert_eq!(
+            result,
+            [11.0, 22.0, 33.0, 44.0],
+            "rank {rank} captured all-reduce"
         );
     }
 }

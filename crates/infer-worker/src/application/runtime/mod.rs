@@ -140,12 +140,20 @@ where
     M: DecoderModel<T, D>,
 {
     fn drop(&mut self) {
-        // `scope` is declared before `peers`, so ordinary field destruction
-        // would abort/destroy rank 0's NCCL communicator before followers are
-        // told to stop. Tear the group down explicitly while every leader
-        // device/communicator field is still alive; follower Drop then releases
-        // its own Runtime on the rank thread, and only afterwards do Rust's
-        // normal field drops dismantle rank 0.
+        // NCCL communicator shutdown is collective across active local ranks.
+        // Mirror it while every rank thread and scope is still alive, then send
+        // the ordinary thread Shutdown/join from RuntimePeerGroup::drop.
+        let shutdown = match self.dispatch_peer_command(RuntimePeerCommand::ShutdownTpComm) {
+            Ok(pending) => {
+                let local = <D as CollectiveOps>::shutdown_comm(&self.scope, CommAxis::Tp);
+                let followers = self.wait_peer_command(pending);
+                complete_replicated(&mut self.peers, "shutdown_tp_comm", local, followers)
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = shutdown {
+            tracing::error!(error = %error, "TP communicator shutdown failed");
+        }
         drop(self.peers.take());
     }
 }
@@ -419,11 +427,14 @@ where
         //   RUSTINFER_MIXED_GRAPH=0     -> eager unified-FA3, uncaptured
         //   RUSTINFER_MIXED_FA3_GRAPH=0 -> eager (opt out of FA3 capture)
         let fa3_avail = D::unified_mixed_attention_available::<T>(dims.head_dim);
-        let (mixed_eager, mixed_fa3_graph) = if !scope.supports_graphs() {
+        let (mixed_eager, mixed_fa3_graph) = if !scope.supports_graphs()
+            || scope.topology().tp.size > 1
+        {
             // A zero-sized graph arena and TP both deliberately disable graph
-            // capture. Never select a graph-backed mixed path in that state;
-            // TP ranks must issue their NCCL collectives eagerly and in the
-            // exact command order enforced by RuntimePeerGroup.
+            // capture for mixed/ragged batches. Decode and single-sequence
+            // prefill graphs are rank-synchronized by the ordinary Step peer
+            // command; mixed graph bootstrap has a separate shape lifecycle
+            // and remains eager until that lifecycle is group-owned too.
             (fa3_avail, false)
         } else {
             match std::env::var("RUSTINFER_MIXED_GRAPH").ok().as_deref() {

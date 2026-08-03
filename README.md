@@ -318,12 +318,17 @@ ranks use consecutive CUDA device IDs, so this example uses `cuda:0` and
 `cuda:1`. The CUDA backend requires NCCL 2.24.3 or newer; the Docker image
 already includes the matching development and runtime packages.
 
-The initial implementation supports single-node dense BF16 Llama/Qwen decoders.
-Vocabulary size, query/KV head counts, and MLP intermediate size must be evenly
-divisible by `tensor_parallel_size`. TP with AWQ or block FP8 weights,
-speculative decoding, pipeline parallelism, data parallelism, and expert
-parallelism are not implemented yet; unsupported combinations fail during
-startup instead of silently falling back to replicated execution.
+The implementation supports single-node dense BF16 and block-FP8 Llama/Qwen
+decoders. Vocabulary size, query/KV head counts, MLP intermediate size, and FP8
+weight/scale block boundaries must be evenly divisible by
+`tensor_parallel_size`.
+
+CUDA Graph capture is enabled for TP decode and single-sequence prefill. Every
+rank captures its own device graph and replays the same NCCL collective sequence
+in lockstep. Mixed prefill+decode batches currently stay eager. TP with AWQ
+weights, speculative decoding, pipeline parallelism, data parallelism, and
+expert parallelism are not implemented yet; unsupported combinations fail
+during startup instead of silently falling back to replicated execution.
 
 ---
 

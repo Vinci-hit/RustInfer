@@ -2,7 +2,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use infer_core::exec::{ExecScope, RankPair};
@@ -73,14 +73,13 @@ impl NcclUniqueId {
 }
 
 pub struct NcclCommunicator {
-    raw: ffi::ncclComm_t,
+    raw: AtomicPtr<ffi::ncclComm>,
     rank: usize,
     size: usize,
     device_id: i32,
     _config: Arc<CudaConfig>,
     issue_lock: Mutex<()>,
     failed: AtomicBool,
-    restore_device: NcclDeviceRestore,
 }
 
 struct NcclDeviceRestore {
@@ -142,14 +141,13 @@ impl NcclCommunicator {
             ));
         }
         Ok(Arc::new(Self {
-            raw,
+            raw: AtomicPtr::new(raw),
             rank,
             size,
             device_id: device.device_id,
             _config: device.config.clone(),
             issue_lock: Mutex::new(()),
             failed: AtomicBool::new(false),
-            restore_device: NcclDeviceRestore { previous: -1 },
         }))
     }
 
@@ -193,14 +191,13 @@ impl NcclCommunicator {
             .enumerate()
             .map(|(rank, (raw, device))| {
                 Arc::new(Self {
-                    raw,
+                    raw: AtomicPtr::new(raw),
                     rank,
                     size: devices.len(),
                     device_id: device.device_id,
                     _config: device.config.clone(),
                     issue_lock: Mutex::new(()),
                     failed: AtomicBool::new(false),
-                    restore_device: NcclDeviceRestore { previous: -1 },
                 })
             })
             .collect())
@@ -252,35 +249,54 @@ impl NcclCommunicator {
         let _issue = self.lock()?;
         let mut async_error = ffi::ncclResult_t::ncclSuccess;
         self.check(
-            unsafe { ffi::ncclCommGetAsyncError(self.raw, &mut async_error) },
+            unsafe {
+                ffi::ncclCommGetAsyncError(self.raw.load(Ordering::Acquire), &mut async_error)
+            },
             "ncclCommGetAsyncError",
         )?;
         self.check(async_error, "NCCL asynchronous operation")
+    }
+
+    fn abort(&self) -> OpResult<()> {
+        if self.raw.load(Ordering::Acquire).is_null() {
+            return Ok(());
+        }
+        let _restore = NcclDeviceRestore {
+            previous: device_utils::current_device().unwrap_or(-1),
+        };
+        device_utils::set_current_device(self.device_id).map_err(|error| {
+            OpError::Kernel(format!(
+                "set CUDA device {} during NCCL shutdown: {error}",
+                self.device_id
+            ))
+        })?;
+        let raw = self.raw.swap(ptr::null_mut(), Ordering::AcqRel);
+        if raw.is_null() {
+            return Ok(());
+        }
+        self.failed.store(true, Ordering::Release);
+        // Captured graphs retain NCCL execution plans. They must be destroyed
+        // before every rank collectively tears down its communicator.
+        self._config.invalidate_all_graphs();
+        nccl_check(unsafe { ffi::ncclCommAbort(raw) }, "ncclCommAbort")
     }
 }
 
 impl Drop for NcclCommunicator {
     fn drop(&mut self) {
-        if self.raw.is_null() {
-            return;
-        }
-        self.restore_device.previous = device_utils::current_device().unwrap_or(-1);
-        let _ = device_utils::set_current_device(self.device_id);
         // Drop is also the failure-path cleanup, so abort outstanding device
         // work instead of entering the normal quiescent destroy path. Worker
-        // teardown still needs to invoke this on every active rank. A future
-        // coordinated shutdown can expose an explicit finalize/destroy path.
-        let result = unsafe { ffi::ncclCommAbort(self.raw) };
-        if result != ffi::ncclResult_t::ncclSuccess {
+        // normal teardown calls `shutdown_comm` collectively before rank
+        // threads are joined; this is only the idempotent fallback.
+        if let Err(error) = self.abort() {
             tracing::error!(
                 rank = self.rank,
                 size = self.size,
                 device = self.device_id,
-                error = %nccl_error_string(result),
+                error = %error,
                 "ncclCommAbort failed"
             );
         }
-        self.raw = ptr::null_mut();
     }
 }
 
@@ -340,7 +356,7 @@ impl CollectiveOps for Cuda {
                     buf.numel(),
                     dtype,
                     nccl_reduce_op(op),
-                    comm.raw,
+                    comm.raw.load(Ordering::Acquire),
                     scope.stream.0,
                 )
             },
@@ -394,7 +410,7 @@ impl CollectiveOps for Cuda {
                         recv.cast(),
                         local_count,
                         dtype,
-                        comm.raw,
+                        comm.raw.load(Ordering::Acquire),
                         scope.stream.0,
                     )
                 },
@@ -467,7 +483,7 @@ impl CollectiveOps for Cuda {
                     buf.numel(),
                     dtype,
                     root,
-                    comm.raw,
+                    comm.raw.load(Ordering::Acquire),
                     scope.stream.0,
                 )
             },
@@ -523,6 +539,13 @@ impl CollectiveOps for Cuda {
         } else {
             Err(OpError::unsupported("cuda", "NCCL barrier"))
         }
+    }
+
+    fn shutdown_comm(scope: &Self::Scope, axis: CommAxis) -> OpResult<()> {
+        let Some(comm) = Self::comm(scope, axis) else {
+            return Ok(());
+        };
+        comm.abort()
     }
 }
 

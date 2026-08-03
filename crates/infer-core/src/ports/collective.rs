@@ -79,6 +79,14 @@ pub trait CollectiveOps: Device {
     ) -> OpResult<()>;
 
     fn barrier(scope: &Self::Scope, axis: CommAxis) -> OpResult<()>;
+
+    /// Release one communication axis after all in-flight operations have
+    /// completed. Multi-rank runtimes call this collectively before rank
+    /// threads are joined; single-rank/backends without a communicator need no
+    /// action.
+    fn shutdown_comm(_scope: &Self::Scope, _axis: CommAxis) -> OpResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -217,8 +217,9 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// Load a row-parallel decoder Linear by sharding the input-feature axis.
-    /// A configured block-FP8 weight stays quantized on device; FP8 TP>1 is
-    /// rejected until its scale-grid sharding is implemented.
+    /// A configured block-FP8 weight stays quantized on device; its weight
+    /// columns and inverse-scale columns are sharded on identical block
+    /// boundaries.
     pub fn load_row_parallel_linear_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         weight_name: &str,
@@ -250,8 +251,6 @@ impl<'a> WeightLoader<'a> {
                 .with_parallelism(LinearParallelism::Row { tp: self.tp }));
         };
 
-        self.require_tp1("block-FP8 row-parallel Linear")?;
-
         let view = self
             .reader
             .read_view(weight_name)
@@ -268,7 +267,13 @@ impl<'a> WeightLoader<'a> {
             weight: view,
             scale_inv: scale_view,
         }];
-        let host = prepare_fp8_fused_host(&parts, block, weight_name)?;
+        let host = prepare_fp8_fused_shard(
+            &parts,
+            block,
+            MatrixShardAxis::InputColumns,
+            self.tp,
+            weight_name,
+        )?;
         let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
             &host.weight,
             Shape::from_slice(&host.weight_shape),
@@ -470,8 +475,6 @@ impl<'a> WeightLoader<'a> {
             ));
         };
 
-        self.require_tp1("block-FP8 column-parallel QKV")?;
-
         let q_name = format!("{}.self_attn.q_proj.weight", prefix);
         let k_name = format!("{}.self_attn.k_proj.weight", prefix);
         let v_name = format!("{}.self_attn.v_proj.weight", prefix);
@@ -511,7 +514,7 @@ impl<'a> WeightLoader<'a> {
                 scale_inv: v_scale,
             },
         ];
-        let host = prepare_fp8_fused_host(&parts, block, "fused_qkv")?;
+        let host = prepare_fp8_fused_output_shards(&parts, block, self.tp, "fused_qkv")?;
         let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
             &host.weight,
             Shape::from_slice(&host.weight_shape),
@@ -588,8 +591,6 @@ impl<'a> WeightLoader<'a> {
             ));
         };
 
-        self.require_tp1("block-FP8 column-parallel gate/up")?;
-
         let gate_name = format!("{}.mlp.gate_proj.weight", prefix);
         let up_name = format!("{}.mlp.up_proj.weight", prefix);
         let gate_view = self
@@ -626,7 +627,7 @@ impl<'a> WeightLoader<'a> {
                 scale_inv: up_scale,
             },
         ];
-        let host = prepare_fp8_fused_host(&parts, block, "fused_gate_up")?;
+        let host = prepare_fp8_fused_output_shards(&parts, block, self.tp, "fused_gate_up")?;
         let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
             &host.weight,
             Shape::from_slice(&host.weight_shape),
@@ -1050,6 +1051,7 @@ fn validate_matrix_shape(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Fp8ViewPart<'name, 'data> {
     name: &'name str,
     weight: TensorView<'data>,
@@ -1226,6 +1228,163 @@ fn prepare_fp8_fused_host(
         scales: scale_host,
         weight_shape: [total_rows, cols],
         scale_shape: [total_scale_rows, scale_cols],
+    })
+}
+
+/// Shard an already validated FP8 matrix and its f32 inverse-scale grid on the
+/// same block boundary. FP8 weights are one byte per element; scale elements
+/// are normalized to f32 by [`prepare_fp8_fused_host`].
+fn shard_fp8_host(
+    host: Fp8FusedHost,
+    [block_n, block_k]: [usize; 2],
+    axis: MatrixShardAxis,
+    tp: RankPair,
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    if tp.size == 1 {
+        return Ok(host);
+    }
+    let [rows, cols] = host.weight_shape;
+    let [scale_rows, scale_cols] = host.scale_shape;
+    match axis {
+        MatrixShardAxis::OutputRows => {
+            let (row_start, local_rows) = even_shard_range(what, rows, tp)?;
+            if !row_start.is_multiple_of(block_n) || !local_rows.is_multiple_of(block_n) {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 output-row shard {row_start}..{} must align to block_n {block_n}",
+                    row_start + local_rows
+                )));
+            }
+            let weight_start = row_start
+                .checked_mul(cols)
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 shard offset overflows")))?;
+            let weight_len = local_rows
+                .checked_mul(cols)
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 shard size overflows")))?;
+            let scale_row_start = row_start / block_n;
+            let local_scale_rows = local_rows / block_n;
+            let scale_start = scale_row_start
+                .checked_mul(scale_cols)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 scale offset overflows")))?;
+            let scale_len = local_scale_rows
+                .checked_mul(scale_cols)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 scale size overflows")))?;
+            Ok(Fp8FusedHost {
+                weight: host.weight[weight_start..weight_start + weight_len].to_vec(),
+                scales: host.scales[scale_start..scale_start + scale_len].to_vec(),
+                weight_shape: [local_rows, cols],
+                scale_shape: [local_scale_rows, scale_cols],
+            })
+        }
+        MatrixShardAxis::InputColumns => {
+            let (col_start, local_cols) = even_shard_range(what, cols, tp)?;
+            if !col_start.is_multiple_of(block_k) || !local_cols.is_multiple_of(block_k) {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 input-column shard {col_start}..{} must align to block_k {block_k}",
+                    col_start + local_cols
+                )));
+            }
+            let mut weight = Vec::with_capacity(rows * local_cols);
+            for row in 0..rows {
+                let start = row * cols + col_start;
+                weight.extend_from_slice(&host.weight[start..start + local_cols]);
+            }
+
+            let scale_col_start = col_start / block_k;
+            let local_scale_cols = local_cols / block_k;
+            let scale_elem_bytes = std::mem::size_of::<f32>();
+            let mut scales = Vec::with_capacity(scale_rows * local_scale_cols * scale_elem_bytes);
+            for row in 0..scale_rows {
+                let start = (row * scale_cols + scale_col_start) * scale_elem_bytes;
+                let len = local_scale_cols * scale_elem_bytes;
+                scales.extend_from_slice(&host.scales[start..start + len]);
+            }
+            Ok(Fp8FusedHost {
+                weight,
+                scales,
+                weight_shape: [rows, local_cols],
+                scale_shape: [scale_rows, local_scale_cols],
+            })
+        }
+    }
+}
+
+fn prepare_fp8_fused_shard(
+    parts: &[Fp8ViewPart<'_, '_>],
+    block: [usize; 2],
+    axis: MatrixShardAxis,
+    tp: RankPair,
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    let host = prepare_fp8_fused_host(parts, block, what)?;
+    shard_fp8_host(host, block, axis, tp, what)
+}
+
+/// Column-parallel fused projections must shard every logical projection
+/// independently before concatenating their local pieces. Otherwise a shard of
+/// `[Q; K; V]` could contain all of Q and none of K/V.
+fn prepare_fp8_fused_output_shards(
+    parts: &[Fp8ViewPart<'_, '_>],
+    block: [usize; 2],
+    tp: RankPair,
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    if parts.is_empty() {
+        return Err(OpError::Shape(format!(
+            "{what}: cannot fuse an empty FP8 projection list"
+        )));
+    }
+    if tp.size == 1 {
+        return prepare_fp8_fused_host(parts, block, what);
+    }
+
+    let mut weight = Vec::new();
+    let mut scales = Vec::new();
+    let mut total_rows = 0usize;
+    let mut total_scale_rows = 0usize;
+    let mut cols = None;
+    let mut scale_cols = None;
+    for part in parts {
+        let single = [part.clone()];
+        let shard =
+            prepare_fp8_fused_shard(&single, block, MatrixShardAxis::OutputRows, tp, part.name)?;
+        if let Some(expected) = cols {
+            if shard.weight_shape[1] != expected {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 tensor '{}' has {} columns, expected {expected}",
+                    part.name, shard.weight_shape[1]
+                )));
+            }
+        } else {
+            cols = Some(shard.weight_shape[1]);
+        }
+        if let Some(expected) = scale_cols {
+            if shard.scale_shape[1] != expected {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 tensor '{}' has {} scale columns, expected {expected}",
+                    part.name, shard.scale_shape[1]
+                )));
+            }
+        } else {
+            scale_cols = Some(shard.scale_shape[1]);
+        }
+        total_rows = total_rows
+            .checked_add(shard.weight_shape[0])
+            .ok_or_else(|| OpError::Shape(format!("{what}: fused FP8 row count overflows")))?;
+        total_scale_rows = total_scale_rows
+            .checked_add(shard.scale_shape[0])
+            .ok_or_else(|| OpError::Shape(format!("{what}: fused FP8 scale rows overflow")))?;
+        weight.extend_from_slice(&shard.weight);
+        scales.extend_from_slice(&shard.scales);
+    }
+
+    Ok(Fp8FusedHost {
+        weight,
+        scales,
+        weight_shape: [total_rows, cols.expect("parts is non-empty")],
+        scale_shape: [total_scale_rows, scale_cols.expect("parts is non-empty")],
     })
 }
 
@@ -1645,8 +1804,12 @@ mod tp_tests {
 
 #[cfg(test)]
 mod fp8_tests {
-    use super::{Fp8ViewPart, prepare_fp8_fused_host};
+    use super::{
+        Fp8ViewPart, MatrixShardAxis, prepare_fp8_fused_host, prepare_fp8_fused_output_shards,
+        prepare_fp8_fused_shard,
+    };
     use crate::domain::dtype::Fp8E4m3;
+    use crate::domain::exec::RankPair;
     use crate::domain::tensor::Tensor;
     use crate::domain::types::Shape;
     use crate::infrastructure::cpu::Cpu;
@@ -1761,6 +1924,94 @@ mod fp8_tests {
         let host = prepare_fp8_fused_host(&parts, [2, 2], "tail").unwrap();
         assert_eq!(host.weight.len(), 15);
         assert_eq!(host.scale_shape, [2, 3]);
+    }
+
+    #[test]
+    fn fp8_row_parallel_shards_weight_and_scale_columns_together() {
+        let weight_bytes: Vec<u8> = (0..8).collect();
+        let scale_bytes = bf16_bytes(&[10.0, 20.0]);
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &weight_bytes).unwrap();
+        let scale = TensorView::new(Dtype::BF16, vec![1, 2], &scale_bytes).unwrap();
+        let parts = [Fp8ViewPart {
+            name: "down.weight",
+            weight,
+            scale_inv: scale,
+        }];
+
+        let rank1 = prepare_fp8_fused_shard(
+            &parts,
+            [2, 2],
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 1, size: 2 },
+            "down.weight",
+        )
+        .unwrap();
+
+        assert_eq!(rank1.weight_shape, [2, 2]);
+        assert_eq!(rank1.weight, vec![2, 3, 6, 7]);
+        assert_eq!(rank1.scale_shape, [1, 1]);
+        assert_eq!(decode_f32(&rank1.scales), vec![20.0]);
+    }
+
+    #[test]
+    fn fp8_column_parallel_shards_each_projection_before_fusion() {
+        let q_bytes: Vec<u8> = (0..16).collect();
+        let k_bytes: Vec<u8> = (100..116).collect();
+        let q_scale_bytes = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        let k_scale_bytes = bf16_bytes(&[5.0, 6.0, 7.0, 8.0]);
+        let q = TensorView::new(Dtype::F8_E4M3, vec![4, 4], &q_bytes).unwrap();
+        let k = TensorView::new(Dtype::F8_E4M3, vec![4, 4], &k_bytes).unwrap();
+        let q_scale = TensorView::new(Dtype::BF16, vec![2, 2], &q_scale_bytes).unwrap();
+        let k_scale = TensorView::new(Dtype::BF16, vec![2, 2], &k_scale_bytes).unwrap();
+        let parts = [
+            Fp8ViewPart {
+                name: "q.weight",
+                weight: q,
+                scale_inv: q_scale,
+            },
+            Fp8ViewPart {
+                name: "k.weight",
+                weight: k,
+                scale_inv: k_scale,
+            },
+        ];
+
+        let rank1 =
+            prepare_fp8_fused_output_shards(&parts, [2, 2], RankPair { rank: 1, size: 2 }, "qk")
+                .unwrap();
+
+        assert_eq!(rank1.weight_shape, [4, 4]);
+        assert_eq!(
+            rank1.weight,
+            vec![
+                8, 9, 10, 11, 12, 13, 14, 15, 108, 109, 110, 111, 112, 113, 114, 115
+            ]
+        );
+        assert_eq!(rank1.scale_shape, [2, 2]);
+        assert_eq!(decode_f32(&rank1.scales), vec![3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn fp8_tp_rejects_shards_that_split_scale_blocks() {
+        let weight_bytes = vec![0x38; 2 * 6];
+        let scale_bytes = bf16_bytes(&[1.0; 3]);
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![2, 6], &weight_bytes).unwrap();
+        let scale = TensorView::new(Dtype::BF16, vec![1, 3], &scale_bytes).unwrap();
+        let parts = [Fp8ViewPart {
+            name: "bad.weight",
+            weight,
+            scale_inv: scale,
+        }];
+
+        let error = prepare_fp8_fused_shard(
+            &parts,
+            [2, 2],
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 0, size: 2 },
+            "bad.weight",
+        )
+        .expect_err("three-column shards split a two-column scale block");
+        assert!(error.to_string().contains("block_k"));
     }
 
     #[test]

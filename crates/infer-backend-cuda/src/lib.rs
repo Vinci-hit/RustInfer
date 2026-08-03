@@ -128,11 +128,12 @@ impl infer_core::exec::ExecScope for CudaScope {
     }
 
     fn supports_graphs(&self) -> bool {
-        // TP collectives are intentionally eager in the first NCCL release.
-        // Capturing them is only safe once every rank captures and replays the
-        // same collective sequence in lockstep, which the multi-worker control
-        // plane does not guarantee yet.
-        self.topology.tp.size == 1 && self.device.config.arena_available()
+        // A TP graph is rank-local, but every rank records and replays the same
+        // logical step. RuntimePeerGroup mirrors graph priming and all graphable
+        // Step operations, so NCCL sees an identical collective sequence on
+        // every captured stream.
+        self.device.config.arena_available()
+            && (self.topology.tp.size == 1 || self.tp_comm.is_some())
     }
 
     fn graph_capture_begin(&self) -> OpResult<()> {
