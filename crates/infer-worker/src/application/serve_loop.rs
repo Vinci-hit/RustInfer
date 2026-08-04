@@ -18,6 +18,7 @@ use crate::application::runtime::{
 use crate::application::sampler_stack::GreedySampler;
 use crate::application::worker_scheduler::handle_fused_step;
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
+use crate::domain::TensorParallelPlacement;
 use crate::domain::exec::{ExecScope, RankPair, TopologyShape};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
@@ -46,6 +47,8 @@ struct WorkerCtx<'a> {
 /// Bundle of bootstrap parameters that do not depend on the concrete model type.
 pub struct Bootstrap<'a> {
     pub load: &'a LoadModel,
+    /// Global TP group plus the contiguous rank slice owned by this process.
+    pub tp_placement: TensorParallelPlacement,
     pub cuda: &'a Cuda,
     pub load_cfg: &'a LoadConfig,
     pub max_seq_len: usize,
@@ -60,9 +63,9 @@ pub struct Bootstrap<'a> {
     pub peer_timeout: Duration,
     /// Upper bound for NCCL/follower model and Runtime startup.
     pub peer_startup_timeout: Duration,
-    /// Rank-0 member of the single-process TP communicator group.
+    /// Process-local leader's member of the TP communicator group.
     pub tp_communicator: Option<Arc<NcclCommunicator>>,
-    /// CUDA devices in TP-rank order. Used for group-wide capacity probing.
+    /// Process-local CUDA devices in global TP-rank order.
     pub tp_devices: &'a [Cuda],
 }
 
@@ -137,7 +140,7 @@ impl RuntimeFollowerInit {
     }
 }
 
-/// Builds one non-zero rank entirely inside its long-lived Runtime thread.
+/// Builds one process-local follower rank inside its long-lived Runtime thread.
 pub type RuntimeFollowerFactory<M> = Box<
     dyn FnOnce(RuntimeFollowerInit) -> crate::domain::ports::OpResult<Runtime<bf16, Cuda, M>>
         + Send,
@@ -154,16 +157,23 @@ struct KvCapacityProbe {
     capacity: usize,
 }
 
-fn tp_memory_info(devices: &[Cuda], stage: &str) -> Result<Vec<(usize, usize)>, String> {
+fn tp_memory_info(
+    placement: TensorParallelPlacement,
+    devices: &[Cuda],
+    stage: &str,
+) -> Result<Vec<(usize, usize)>, String> {
     devices
         .iter()
         .enumerate()
-        .map(|(rank, cuda)| {
+        .map(|(local_rank, cuda)| {
+            let global_rank = placement
+                .global_rank(local_rank)
+                .map_err(|error| error.to_string())?;
             let scope = CudaScope::new(cuda.clone());
             let _active_device = scope.enter();
             device_utils::mem_get_info().map_err(|error| {
                 format!(
-                    "cudaMemGetInfo for TP rank {rank} on cuda:{} during {stage}: {error:?}",
+                    "cudaMemGetInfo for TP rank {global_rank} on cuda:{} during {stage}: {error:?}",
                     cuda.device_id
                 )
             })
@@ -199,13 +209,28 @@ where
     let cap_num_tokens = bs.load.max_batch_tokens;
     let cap_batch = bs.load.max_batch_seqs;
 
-    if bs.load.tp_rank != 0 {
+    if bs.load.tp_rank != bs.tp_placement.local_rank_start() {
         return Err(format!(
-            "the scheduler-facing worker must own TP rank 0, got rank {}/{}",
-            bs.load.tp_rank, bs.load.tp_size
+            "worker leader rank {}/{} does not match process-local TP rank start {}",
+            bs.load.tp_rank,
+            bs.load.tp_size,
+            bs.tp_placement.local_rank_start()
         ));
     }
-    let expected_followers = bs.load.tp_size.saturating_sub(1);
+    if bs.load.tp_size != bs.tp_placement.global_size() {
+        return Err(format!(
+            "LoadModel TP size {} does not match placement global size {}",
+            bs.load.tp_size,
+            bs.tp_placement.global_size()
+        ));
+    }
+    if !bs.tp_placement.owns_global_root() {
+        return Err(format!(
+            "the scheduler-facing worker must own global TP rank 0, placement starts at {}",
+            bs.tp_placement.local_rank_start()
+        ));
+    }
+    let expected_followers = bs.tp_placement.local_rank_count().saturating_sub(1);
     if follower_factories.len() != expected_followers {
         return Err(format!(
             "TP{} requires {} Runtime followers, got {}",
@@ -214,11 +239,11 @@ where
             follower_factories.len()
         ));
     }
-    if bs.tp_devices.len() != bs.load.tp_size {
+    if bs.tp_devices.len() != bs.tp_placement.local_rank_count() {
         return Err(format!(
-            "TP{} requires {} CUDA devices for capacity probing, got {}",
+            "TP{} process placement requires {} local CUDA devices for capacity probing, got {}",
             bs.load.tp_size,
-            bs.load.tp_size,
+            bs.tp_placement.local_rank_count(),
             bs.tp_devices.len()
         ));
     }
@@ -281,8 +306,12 @@ where
         let watchdog = RuntimePeerWatchdog::fail_stop()
             .map_err(|error| format!("start TP fail-stop watchdog: {error}"))?;
         let failure_notifier = watchdog.notifier();
-        for (offset, factory) in follower_factories.into_iter().enumerate() {
-            let rank = offset + 1;
+        for (rank, factory) in bs
+            .tp_placement
+            .owned_global_ranks()
+            .skip(1)
+            .zip(follower_factories)
+        {
             let init = RuntimeFollowerInit {
                 rank,
                 size: topology.tp.size,
@@ -370,7 +399,7 @@ where
         // workspace (the GiB-scale logits buffer that used to OOM), but before
         // the dummy forward. The delta against the post-dummy probe below is the
         // lazy library footprint (diagnostic only).
-        let before = tp_memory_info(bs.tp_devices, "before profile forward")?;
+        let before = tp_memory_info(bs.tp_placement, bs.tp_devices, "before profile forward")?;
         // Worst-case eager forward: exercises the activation workspace and forces
         // the lazy cuBLASLt/cuDNN/recycling-pool allocations the first live
         // forward would otherwise make. `graph` is still None ⇒ eager ⇒ no graph
@@ -380,7 +409,7 @@ where
             .map_err(|e| format!("profile_forward: {:?}", e))?;
         // This probe reflects weights + activation workspace + committed library
         // state — everything resident except the (throwaway) profiling KV pool.
-        let after = tp_memory_info(bs.tp_devices, "after profile forward")?;
+        let after = tp_memory_info(bs.tp_placement, bs.tp_devices, "after profile forward")?;
         // Cap the auto-sized pool at the working set the worker can ever hold in
         // use: at most `max_batch_seqs` sequences, each at most `max_seq_len`
         // tokens. The scheduler never admits more than `max_batch_seqs` running
@@ -403,30 +432,35 @@ where
             .iter()
             .enumerate()
             .zip(before.into_iter().zip(after))
-            .map(|((rank, cuda), ((free_before, total), (free_after, _)))| {
-                // Hold back a fixed reserve for incremental prewarm allocations,
-                // then add one graph-scratch block plus 0.5% fragmentation slack.
-                let usable =
-                    free_after.saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
-                let budget = (usable as f64 * fraction as f64) as usize;
-                let raw = budget / bytes_per_block.max(1);
-                let reserve = 1 + (raw / 200).max(1);
-                let probed = raw.saturating_sub(reserve).max(1);
-                let capacity = if bs.load.enable_prefix_caching {
-                    probed
-                } else {
-                    probed.min(working_set)
-                };
-                KvCapacityProbe {
-                    rank,
-                    device_id: cuda.device_id,
-                    total,
-                    free_before,
-                    free_after,
-                    probed,
-                    capacity,
-                }
-            })
+            .map(
+                |((local_rank, cuda), ((free_before, total), (free_after, _)))| {
+                    // Hold back a fixed reserve for incremental prewarm allocations,
+                    // then add one graph-scratch block plus 0.5% fragmentation slack.
+                    let usable = free_after
+                        .saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
+                    let budget = (usable as f64 * fraction as f64) as usize;
+                    let raw = budget / bytes_per_block.max(1);
+                    let reserve = 1 + (raw / 200).max(1);
+                    let probed = raw.saturating_sub(reserve).max(1);
+                    let capacity = if bs.load.enable_prefix_caching {
+                        probed
+                    } else {
+                        probed.min(working_set)
+                    };
+                    KvCapacityProbe {
+                        rank: bs
+                            .tp_placement
+                            .global_rank(local_rank)
+                            .expect("validated process-local TP device index"),
+                        device_id: cuda.device_id,
+                        total,
+                        free_before,
+                        free_after,
+                        probed,
+                        capacity,
+                    }
+                },
+            )
             .collect();
         let limiting = probes
             .iter()

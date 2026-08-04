@@ -1,4 +1,4 @@
-//! Rank-local runtime peers for single-process tensor parallelism.
+//! Rank-local runtime peers for process-local tensor parallelism.
 //!
 //! A model owns `Rc`-backed forward scratch and is therefore intentionally not
 //! `Send`.  A follower is consequently constructed *inside* its worker thread
