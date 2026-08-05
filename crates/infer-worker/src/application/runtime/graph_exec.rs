@@ -147,6 +147,13 @@ where
     }
 
     pub fn prime_graphs(&mut self) -> OpResult<()> {
+        let pending = self.dispatch_peer_command(super::RuntimePeerCommand::PrimeGraphs)?;
+        let local = self.prime_graphs_local();
+        let followers = self.wait_peer_command(pending);
+        super::complete_replicated(&mut self.peers, "prime_graphs", local, followers)
+    }
+
+    fn prime_graphs_local(&mut self) -> OpResult<()> {
         self.graph = None;
         if self.capture_sizes.is_empty() || !self.scope.supports_graphs() {
             return Ok(());
@@ -226,6 +233,14 @@ where
             };
             // Drives the `step_graph` cold path for this exact size → capture.
             self.step(&req)?;
+            if self.scope.topology().tp.size > 1 {
+                // NCCL treats graph launch as a collective. The mirrored cold
+                // Step above must finish capture/instantiate on every rank
+                // before any rank launches the graph. Returning from that peer
+                // command is the group barrier; this second Step validates and
+                // warms the synchronized replay before the worker becomes Ready.
+                self.step(&req)?;
+            }
         }
         self.scope.synchronize()?;
         Ok(())
@@ -276,6 +291,12 @@ where
                 draft_tokens: Vec::new(),
             };
             self.step(&req)?;
+            if self.scope.topology().tp.size > 1 && self.scope.supports_graphs() {
+                // Separate first replay from capture for the same reason as
+                // decode graph prewarm: a captured NCCL sequence may launch
+                // only after every rank has finished graph instantiation.
+                self.step(&req)?;
+            }
         }
         self.scope.synchronize()?;
         Ok(())
@@ -354,7 +375,9 @@ where
                 "[graph] captured decode graph (forward+argmax) for batch={}",
                 plan.batch
             );
-            self.scope.graph_launch(key)?;
+            if self.scope.topology().tp.size == 1 {
+                self.scope.graph_launch(key)?;
+            }
         } else {
             // Padded slot whose graph is not yet captured (boot prewarm off):
             // can't capture a `slot_batch` graph from a `batch`-sized plan, so
@@ -435,7 +458,9 @@ where
                 self.prefill_graphs_captured,
                 PREFILL_GRAPH_BUDGET
             );
-            self.scope.graph_launch(key)?;
+            if self.scope.topology().tp.size == 1 {
+                self.scope.graph_launch(key)?;
+            }
         }
         // `hidden` now holds the replayed forward output; finalize + sample eager.
         self.sample_tail(plan, req)

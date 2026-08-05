@@ -3,9 +3,9 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::device::MemoryPort;
-use crate::error::OpResult;
+use crate::error::{OpError, OpResult};
 
-/// Communication axis for tensor/pipeline/data/expert parallelism. Lives here
+/// Communication axis for tensor, pipeline, and data parallelism. Lives here
 /// (next to `TopologyShape`, its only structural user) rather than with the
 /// `CollectiveOps` trait, so the exec vocabulary has no upward dependency on the
 /// op-port layer. The `CollectiveOps` trait re-exports it.
@@ -14,7 +14,6 @@ pub enum CommAxis {
     Tp,
     Pp,
     Dp,
-    Ep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -207,8 +206,71 @@ impl TopologyShape {
         node: RankPair { rank: 0, size: 1 },
     };
 
+    /// Total number of ranks across every parallel axis.
+    ///
+    /// Prefer [`Self::checked_world_size`] when the topology comes from an
+    /// external configuration. This convenience method preserves the original
+    /// infallible API for already-validated topology values.
     pub fn world_size(&self) -> usize {
-        self.tp.size * self.pp.size * self.dp.size * self.node.size
+        self.checked_world_size()
+            .expect("invalid topology passed to TopologyShape::world_size")
+    }
+
+    /// Validate every axis and compute the global rank count without overflow.
+    pub fn checked_world_size(&self) -> OpResult<usize> {
+        self.validate()?;
+        [self.node.size, self.dp.size, self.pp.size, self.tp.size]
+            .into_iter()
+            .try_fold(1usize, |world_size, axis_size| {
+                world_size
+                    .checked_mul(axis_size)
+                    .ok_or_else(|| OpError::Shape("topology world size overflows usize".into()))
+            })
+    }
+
+    /// Compute the global rank using row-major `[node, dp, pp, tp]` order.
+    ///
+    /// `tp` is the innermost (fastest-varying) axis, followed by `pp`, `dp`,
+    /// and finally `node`. Equivalently:
+    ///
+    /// `(((node_rank * dp_size + dp_rank) * pp_size + pp_rank) * tp_size + tp_rank)`.
+    pub fn world_rank(&self) -> OpResult<usize> {
+        // Besides validating rank bounds, computing the full size first rejects
+        // a topology whose cardinality overflows even when this particular
+        // rank's flattened index happens to remain small.
+        let world_size = self.checked_world_size()?;
+        let rank = checked_flatten_axis(self.node.rank, self.dp, "dp")?;
+        let rank = checked_flatten_axis(rank, self.pp, "pp")?;
+        let rank = checked_flatten_axis(rank, self.tp, "tp")?;
+        if rank >= world_size {
+            return Err(OpError::Shape(format!(
+                "computed world rank {rank} outside world size {world_size}"
+            )));
+        }
+        Ok(rank)
+    }
+
+    /// Validate that every axis has a non-zero size and an in-range rank.
+    pub fn validate(&self) -> OpResult<()> {
+        for (name, axis) in [
+            ("node", self.node),
+            ("dp", self.dp),
+            ("pp", self.pp),
+            ("tp", self.tp),
+        ] {
+            if axis.size == 0 {
+                return Err(OpError::Shape(format!(
+                    "topology {name} size must be greater than zero"
+                )));
+            }
+            if axis.rank >= axis.size {
+                return Err(OpError::Shape(format!(
+                    "topology {name} rank {} outside group size {}",
+                    axis.rank, axis.size
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn rank_in(&self, axis: CommAxis) -> usize {
@@ -216,7 +278,6 @@ impl TopologyShape {
             CommAxis::Tp => self.tp.rank,
             CommAxis::Pp => self.pp.rank,
             CommAxis::Dp => self.dp.rank,
-            CommAxis::Ep => self.tp.rank,
         }
     }
 
@@ -225,7 +286,6 @@ impl TopologyShape {
             CommAxis::Tp => self.tp.size,
             CommAxis::Pp => self.pp.size,
             CommAxis::Dp => self.dp.size,
-            CommAxis::Ep => self.tp.size,
         }
     }
 
@@ -236,6 +296,13 @@ impl TopologyShape {
     pub fn is_pp_last(&self) -> bool {
         self.pp.rank + 1 == self.pp.size
     }
+}
+
+fn checked_flatten_axis(outer_rank: usize, axis: RankPair, name: &str) -> OpResult<usize> {
+    outer_rank
+        .checked_mul(axis.size)
+        .and_then(|base| base.checked_add(axis.rank))
+        .ok_or_else(|| OpError::Shape(format!("topology world rank overflows at {name} axis")))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -273,16 +340,27 @@ impl<D: ExecDevice> HostScope<D> {
         }
     }
 
-    pub fn with_topology(mut self, topology: TopologyShape) -> Self {
+    pub fn try_with_topology(mut self, topology: TopologyShape) -> OpResult<Self> {
+        let world_rank = topology.world_rank()?;
         self.rank = Rank {
             tp_rank: topology.tp.rank,
             pp_rank: topology.pp.rank,
             dp_rank: topology.dp.rank,
             node_rank: topology.node.rank,
-            world_rank: 0,
+            world_rank,
         };
         self.topology = topology;
-        self
+        Ok(self)
+    }
+
+    /// Install an already-valid topology on a host scope.
+    ///
+    /// Host scopes historically exposed an infallible builder. Keep that API
+    /// for test and CPU call sites while routing the work through the validated
+    /// [`Self::try_with_topology`] implementation.
+    pub fn with_topology(self, topology: TopologyShape) -> Self {
+        self.try_with_topology(topology)
+            .expect("invalid host execution topology")
     }
 
     pub fn device(&self) -> &D {
@@ -328,5 +406,82 @@ where
 
     fn synchronize(&self) -> OpResult<()> {
         self.device.synchronize()
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::{RankPair, TopologyShape};
+
+    #[test]
+    fn pure_tp_world_rank_matches_tp_rank() {
+        for tp_rank in 0..4 {
+            let topology = TopologyShape {
+                tp: RankPair {
+                    rank: tp_rank,
+                    size: 4,
+                },
+                ..TopologyShape::SINGLE
+            };
+
+            assert_eq!(topology.world_size(), 4);
+            assert_eq!(topology.world_rank().unwrap(), tp_rank);
+        }
+    }
+
+    #[test]
+    fn multi_axis_world_rank_uses_node_dp_pp_tp_row_major_order() {
+        let topology = TopologyShape {
+            node: RankPair { rank: 1, size: 2 },
+            dp: RankPair { rank: 1, size: 3 },
+            pp: RankPair { rank: 2, size: 5 },
+            tp: RankPair { rank: 3, size: 7 },
+        };
+
+        assert_eq!(topology.world_size(), 210);
+        assert_eq!(topology.world_rank().unwrap(), 157);
+    }
+
+    #[test]
+    fn world_rank_rejects_invalid_or_overflowing_topologies() {
+        let zero_size = TopologyShape {
+            tp: RankPair { rank: 0, size: 0 },
+            ..TopologyShape::SINGLE
+        };
+        assert!(
+            zero_size
+                .world_rank()
+                .unwrap_err()
+                .to_string()
+                .contains("tp size")
+        );
+
+        let out_of_range = TopologyShape {
+            pp: RankPair { rank: 2, size: 2 },
+            ..TopologyShape::SINGLE
+        };
+        assert!(
+            out_of_range
+                .world_rank()
+                .unwrap_err()
+                .to_string()
+                .contains("pp rank 2")
+        );
+
+        let overflowing = TopologyShape {
+            dp: RankPair {
+                rank: 0,
+                size: usize::MAX,
+            },
+            pp: RankPair { rank: 0, size: 2 },
+            ..TopologyShape::SINGLE
+        };
+        assert!(
+            overflowing
+                .world_rank()
+                .unwrap_err()
+                .to_string()
+                .contains("world size overflows")
+        );
     }
 }

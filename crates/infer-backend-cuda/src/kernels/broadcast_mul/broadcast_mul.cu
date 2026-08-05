@@ -105,53 +105,61 @@ void broadcast_mul_f16_forward(__half* dst, const __half* a, const __half* b, in
     broadcast_mul_f16_kernel<<<blocks, threads, 0, stream>>>(dst, a, b, rows, D);
 }
 
-__global__ void broadcast_add_inplace_f32_kernel(float* a, const float* b, int rows, int D) {
+__global__ void broadcast_add_inplace_f32_kernel(float* a, const float* b, int rows, int D, int row_stride) {
     int total = rows * D;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
     for (int i = idx; i < total; i += stride) {
-        a[i] += b[i % D];
+        int row = i / D;
+        int col = i % D;
+        a[row * row_stride + col] += b[col];
     }
 }
 
-void broadcast_add_inplace_f32_forward(float* a, const float* b, int rows, int D, cudaStream_t stream) {
+void broadcast_add_inplace_f32_forward(float* a, const float* b, int rows, int D, int row_stride, cudaStream_t stream) {
     int total = rows * D;
     constexpr int threads = 256;
     int blocks = (total + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    broadcast_add_inplace_f32_kernel<<<blocks, threads, 0, stream>>>(a, b, rows, D);
+    broadcast_add_inplace_f32_kernel<<<blocks, threads, 0, stream>>>(a, b, rows, D, row_stride);
 }
 
-__global__ void broadcast_add_inplace_bf16_kernel(__nv_bfloat16* a, const __nv_bfloat16* b, int rows, int D) {
+__global__ void broadcast_add_inplace_bf16_kernel(__nv_bfloat16* a, const __nv_bfloat16* b, int rows, int D, int row_stride) {
     int total = rows * D;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
     for (int i = idx; i < total; i += stride) {
-        a[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i % D]));
+        int row = i / D;
+        int col = i % D;
+        int offset = row * row_stride + col;
+        a[offset] = __float2bfloat16(__bfloat162float(a[offset]) + __bfloat162float(b[col]));
     }
 }
 
-void broadcast_add_inplace_bf16_forward(__nv_bfloat16* a, const __nv_bfloat16* b, int rows, int D, cudaStream_t stream) {
+void broadcast_add_inplace_bf16_forward(__nv_bfloat16* a, const __nv_bfloat16* b, int rows, int D, int row_stride, cudaStream_t stream) {
     int total = rows * D;
     constexpr int threads = 256;
     int blocks = (total + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    broadcast_add_inplace_bf16_kernel<<<blocks, threads, 0, stream>>>(a, b, rows, D);
+    broadcast_add_inplace_bf16_kernel<<<blocks, threads, 0, stream>>>(a, b, rows, D, row_stride);
 }
 
-__global__ void broadcast_add_inplace_f16_kernel(__half* a, const __half* b, int rows, int D) {
+__global__ void broadcast_add_inplace_f16_kernel(__half* a, const __half* b, int rows, int D, int row_stride) {
     int total = rows * D;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
     for (int i = idx; i < total; i += stride) {
-        a[i] = __hadd(a[i], b[i % D]);
+        int row = i / D;
+        int col = i % D;
+        int offset = row * row_stride + col;
+        a[offset] = __hadd(a[offset], b[col]);
     }
 }
 
-void broadcast_add_inplace_f16_forward(__half* a, const __half* b, int rows, int D, cudaStream_t stream) {
+void broadcast_add_inplace_f16_forward(__half* a, const __half* b, int rows, int D, int row_stride, cudaStream_t stream) {
     int total = rows * D;
     constexpr int threads = 256;
     int blocks = (total + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    broadcast_add_inplace_f16_kernel<<<blocks, threads, 0, stream>>>(a, b, rows, D);
+    broadcast_add_inplace_f16_kernel<<<blocks, threads, 0, stream>>>(a, b, rows, D, row_stride);
 }

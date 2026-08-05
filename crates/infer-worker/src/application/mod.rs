@@ -11,6 +11,8 @@ pub mod runtime;
 pub mod sampler_stack;
 #[cfg(feature = "cuda")]
 pub mod serve_loop;
+#[cfg(feature = "cuda")]
+pub mod tensor_parallel;
 pub mod tuning;
 #[cfg(feature = "cuda")]
 pub mod worker_scheduler;

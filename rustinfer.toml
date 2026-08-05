@@ -18,13 +18,16 @@ model_name = ""
 # run multiple independent instances on the same host.
 cluster_id = "rustinfer"
 
-# CUDA device.
+# CUDA device and tensor-parallel group size (`1` disables TP).
 device = "cuda:0"
+tensor_parallel_size = 1
 
 # HTTP API server.
 host = "127.0.0.1"
 port = 8000
 request_timeout_secs = 600
+tp_operation_timeout_secs = 120
+tp_startup_timeout_secs = 600
 
 # Batching / capacity.
 max_batch_tokens = 4096

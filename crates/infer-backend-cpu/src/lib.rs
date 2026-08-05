@@ -7,7 +7,8 @@ use std::alloc::Layout;
 use std::ptr::NonNull;
 
 use infer_core::ports::{
-    AllocError, Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpError, OpResult,
+    AllocError, Allocator, CollectiveOps, CommAxis, CoreOps, Device, DiffusionOps, HostDevice,
+    MemoryPort, OpError, OpResult, ReduceOp, VocabOps,
 };
 use infer_core::tensor::Tensor;
 use infer_core::types::{Dtype, Shape};
@@ -40,6 +41,183 @@ impl infer_core::ports::FusedOps for Cpu {}
 
 // Decode-pipeline port: the host reference defaults ARE the CPU implementation.
 impl infer_core::ports::DecodePipelineOps for Cpu {}
+
+fn require_single_rank(
+    scope: &infer_core::exec::HostScope<Cpu>,
+    axis: CommAxis,
+    op: &str,
+) -> OpResult<()> {
+    let size = infer_core::exec::ExecScope::topology(scope).group_size(axis);
+    if size != 1 {
+        return Err(OpError::Kernel(format!(
+            "CPU {op} requires a single-rank {axis:?} group, got size {size}"
+        )));
+    }
+    Ok(())
+}
+
+impl CollectiveOps for Cpu {
+    type Comm = infer_core::ports::collective::SingleRankComm;
+
+    fn comm(_scope: &Self::Scope, _axis: CommAxis) -> Option<&Self::Comm> {
+        None
+    }
+
+    fn all_reduce<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        _op: ReduceOp,
+        _buf: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "all_reduce")
+    }
+
+    fn all_gather<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        _dim: usize,
+        shard: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "all_gather")?;
+        out.copy_from(shard)
+    }
+
+    fn reduce_scatter<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        _op: ReduceOp,
+        _dim: usize,
+        buf: &Tensor<T, Self>,
+        out: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "reduce_scatter")?;
+        out.copy_from(buf)
+    }
+
+    fn broadcast<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        root: usize,
+        _buf: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "broadcast")?;
+        if root != 0 {
+            return Err(OpError::Shape(format!(
+                "single-rank broadcast root must be 0, got {root}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn send<T: Dtype>(
+        _scope: &Self::Scope,
+        _axis: CommAxis,
+        _peer: usize,
+        buf: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(buf.device().name(), "send"))
+    }
+
+    fn recv<T: Dtype>(
+        _scope: &Self::Scope,
+        _axis: CommAxis,
+        _peer: usize,
+        buf: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(buf.device().name(), "recv"))
+    }
+
+    fn all_to_all<T: Dtype>(
+        scope: &Self::Scope,
+        axis: CommAxis,
+        send_chunks: &[Tensor<T, Self>],
+        recv_chunks: &mut [Tensor<T, Self>],
+    ) -> OpResult<()> {
+        require_single_rank(scope, axis, "all_to_all")?;
+        if send_chunks.len() != recv_chunks.len() {
+            return Err(OpError::Shape(format!(
+                "all_to_all: send_chunks={} recv_chunks={}",
+                send_chunks.len(),
+                recv_chunks.len()
+            )));
+        }
+        for (src, dst) in send_chunks.iter().zip(recv_chunks.iter_mut()) {
+            dst.copy_from(src)?;
+        }
+        Ok(())
+    }
+
+    fn barrier(scope: &Self::Scope, axis: CommAxis) -> OpResult<()> {
+        require_single_rank(scope, axis, "barrier")
+    }
+}
+
+impl VocabOps for Cpu {
+    fn vocab_embedding<T: Dtype>(
+        _scope: &Self::Scope,
+        table: &Tensor<T, Self>,
+        global_indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+        vocab_start: usize,
+        global_vocab_size: usize,
+    ) -> OpResult<()> {
+        let table_shape = table.shape().as_slice();
+        if table_shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding table must be rank 2, got {:?}",
+                table_shape
+            )));
+        }
+        let (local_vocab, dim) = (table_shape[0], table_shape[1]);
+        if local_vocab == 0 || dim == 0 {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding table dimensions must be non-zero, got {:?}",
+                table_shape
+            )));
+        }
+        let vocab_end = vocab_start
+            .checked_add(local_vocab)
+            .ok_or_else(|| OpError::Shape("vocab_embedding shard range overflows".into()))?;
+        if vocab_end > global_vocab_size {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding shard [{vocab_start}, {vocab_end}) exceeds global vocabulary {global_vocab_size}"
+            )));
+        }
+        if output.shape().as_slice() != [global_indices.numel(), dim] {
+            return Err(OpError::Shape(format!(
+                "vocab_embedding output shape {:?}, expected [{}, {}]",
+                output.shape().as_slice(),
+                global_indices.numel(),
+                dim
+            )));
+        }
+
+        let indices = unsafe {
+            std::slice::from_raw_parts(global_indices.data_ptr(), global_indices.numel())
+        };
+        for (row, &raw) in indices.iter().enumerate() {
+            if raw < 0 || raw as usize >= global_vocab_size {
+                return Err(OpError::Shape(format!(
+                    "vocab_embedding token id {raw} at position {row} outside [0, {global_vocab_size})"
+                )));
+            }
+            let dst = unsafe { output.data_ptr_mut().add(row * dim) };
+            let token = raw as usize;
+            if (vocab_start..vocab_end).contains(&token) {
+                let local = token - vocab_start;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(table.data_ptr().add(local * dim), dst, dim);
+                }
+            } else {
+                unsafe {
+                    std::ptr::write_bytes(dst, 0, dim);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 // ─── Cpu MemoryPort ──────────────────────────────────────────────────────────
 
@@ -201,19 +379,51 @@ impl CoreOps for Cpu {
         weight: &Tensor<T, Self>,
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()> {
-        let m = input.shape().as_slice()[0];
-        let k = input.shape().as_slice()[1];
-        let n = weight.shape().as_slice()[0];
+        let input_shape = input.shape().as_slice();
+        let weight_shape = weight.shape().as_slice();
+        let output_shape = output.shape().as_slice();
+        if input_shape.len() != 2 || weight_shape.len() != 2 || output_shape.len() != 2 {
+            return Err(OpError::Shape(format!(
+                "matmul: expected rank-2 input/weight/output, got {:?}/{:?}/{:?}",
+                input_shape, weight_shape, output_shape
+            )));
+        }
+        let m = input_shape[0];
+        let k = input_shape[1];
+        let n = weight_shape[0];
+        if weight_shape[1] != k || output_shape != [m, n] {
+            return Err(OpError::Shape(format!(
+                "matmul: incompatible input {:?}, weight {:?}, output {:?}",
+                input_shape, weight_shape, output_shape
+            )));
+        }
+        let input_strides = input.strides().as_slice();
+        let weight_strides = weight.strides().as_slice();
+        let output_strides = output.strides().as_slice();
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for p in 0..k {
                     unsafe {
-                        sum += read_f64(input.data_ptr().add(i * k + p))
-                            * read_f64(weight.data_ptr().add(j * k + p));
+                        sum += read_f64(
+                            input
+                                .data_ptr()
+                                .add(i * input_strides[0] + p * input_strides[1]),
+                        ) * read_f64(
+                            weight
+                                .data_ptr()
+                                .add(j * weight_strides[0] + p * weight_strides[1]),
+                        );
                     }
                 }
-                unsafe { write_f64(output.data_ptr_mut().add(i * n + j), sum) };
+                unsafe {
+                    write_f64(
+                        output
+                            .data_ptr_mut()
+                            .add(i * output_strides[0] + j * output_strides[1]),
+                        sum,
+                    )
+                };
             }
         }
         Ok(())
@@ -388,10 +598,43 @@ impl CoreOps for Cpu {
     }
 
     fn broadcast_add_inplace<T: Dtype>(
-        _x: &mut Tensor<T, Self>,
-        _bias: &Tensor<T, Self>,
+        x: &mut Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
     ) -> OpResult<()> {
-        Err(OpError::unsupported("cpu", "broadcast_add_inplace"))
+        let dim = bias.numel();
+        if dim == 0 || !x.numel().is_multiple_of(dim) {
+            return Err(OpError::Shape(format!(
+                "broadcast_add_inplace: x.numel()={} not a multiple of bias.numel()={}",
+                x.numel(),
+                dim
+            )));
+        }
+        if !bias.is_contiguous() {
+            return Err(OpError::NotContiguous(*bias.shape()));
+        }
+        let rows = x.numel() / dim;
+        let (row_stride, col_stride) = if x.is_contiguous() {
+            (dim, 1)
+        } else {
+            let shape = x.shape().as_slice();
+            let strides = x.strides().as_slice();
+            if shape.len() != 2 || shape != [rows, dim] {
+                return Err(OpError::Shape(format!(
+                    "broadcast_add_inplace: non-contiguous x must have shape [rows, dim], got {:?}",
+                    shape
+                )));
+            }
+            (strides[0], strides[1])
+        };
+        for row in 0..rows {
+            for col in 0..dim {
+                unsafe {
+                    let dst = x.data_ptr_mut().add(row * row_stride + col * col_stride);
+                    write_f64(dst, read_f64(dst) + read_f64(bias.data_ptr().add(col)));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn split_cols<T: Dtype>(
@@ -1094,6 +1337,45 @@ mod tests {
     }
 
     #[test]
+    fn op_matmul_writes_strided_output_view() {
+        let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        let weight = Tensor::<f32, Cpu>::from_slice(&[1.0, 0.0, 0.0, 1.0], [2, 2]);
+        let output = Tensor::<f32, Cpu>::from_slice(&[-1.0; 10], [2, 5]);
+        let mut shard = output.narrow(1, 1, 2).unwrap();
+
+        Cpu::matmul(&input, &weight, &mut shard).unwrap();
+
+        assert_eq!(
+            output.as_slice(),
+            &[-1.0, 1.0, 2.0, -1.0, -1.0, -1.0, 3.0, 4.0, -1.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn op_broadcast_add_updates_strided_rows_only() {
+        let output = Tensor::<f32, Cpu>::from_slice(&[-1.0; 10], [2, 5]);
+        let mut shard = output.narrow(1, 1, 2).unwrap();
+        let bias = Tensor::<f32, Cpu>::from_slice(&[10.0, 20.0], [2]);
+
+        Cpu::broadcast_add_inplace(&mut shard, &bias).unwrap();
+
+        assert_eq!(
+            output.as_slice(),
+            &[-1.0, 9.0, 19.0, -1.0, -1.0, -1.0, 9.0, 19.0, -1.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn op_broadcast_add_contiguous() {
+        let mut output = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [2, 2]);
+        let bias = Tensor::<f32, Cpu>::from_slice(&[10.0, 20.0], [2]);
+
+        Cpu::broadcast_add_inplace(&mut output, &bias).unwrap();
+
+        assert_eq!(output.as_slice(), &[11.0, 22.0, 13.0, 24.0]);
+    }
+
+    #[test]
     fn op_softmax_sums_to_one() {
         let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0], [1, 4]);
         let mut output = Tensor::<f32, Cpu>::zeros_cpu([1, 4]);
@@ -1137,6 +1419,22 @@ mod tests {
         Cpu::embedding(&table, &indices, &mut output).unwrap();
         assert_eq!(&output.as_slice()[..3], &[2.1, 2.2, 2.3]);
         assert_eq!(&output.as_slice()[3..6], &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn vocab_embedding_masks_tokens_owned_by_other_ranks() {
+        let scope = infer_core::exec::HostScope::new(Cpu);
+        let table =
+            Tensor::<f32, Cpu>::from_slice(&[20.0, 21.0, 30.0, 31.0], Shape::from_slice(&[2, 2]));
+        let indices = Tensor::<i32, Cpu>::from_slice(&[0, 2, 3, 1], [4]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([4, 2]);
+
+        <Cpu as VocabOps>::vocab_embedding(&scope, &table, &indices, &mut output, 2, 4).unwrap();
+
+        assert_eq!(
+            output.as_slice(),
+            &[0.0, 0.0, 20.0, 21.0, 30.0, 31.0, 0.0, 0.0]
+        );
     }
 
     #[test]

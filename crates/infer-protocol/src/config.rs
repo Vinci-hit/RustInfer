@@ -69,6 +69,10 @@ pub struct RustInferConfig {
     #[serde(default = "default_device")]
     pub device: String,
 
+    /// Number of ranks in the tensor-parallel group. `1` disables TP.
+    #[serde(default = "default_tensor_parallel_size")]
+    pub tensor_parallel_size: usize,
+
     /// HTTP server host.
     #[serde(default = "default_host")]
     pub host: String,
@@ -80,6 +84,17 @@ pub struct RustInferConfig {
     /// Per-request timeout (seconds).
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    /// Hard deadline for one mirrored TP startup/operation. A timeout exits
+    /// the worker because blocking CUDA/NCCL calls cannot be safely unwound.
+    #[serde(default = "default_tp_operation_timeout_secs")]
+    pub tp_operation_timeout_secs: u64,
+
+    /// Deadline for NCCL group creation and follower model/runtime startup.
+    /// Kept separate because loading large shards can legitimately take much
+    /// longer than one inference operation.
+    #[serde(default = "default_tp_startup_timeout_secs")]
+    pub tp_startup_timeout_secs: u64,
 
     /// Worker-liveness timeout (seconds). The scheduler declares a worker lost
     /// if no heartbeat arrives within this window. Decoupled from
@@ -185,6 +200,9 @@ fn default_cluster_id() -> String {
 fn default_device() -> String {
     "cuda:0".to_string()
 }
+fn default_tensor_parallel_size() -> usize {
+    1
+}
 fn default_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -193,6 +211,12 @@ fn default_port() -> u16 {
 }
 fn default_request_timeout_secs() -> u64 {
     120
+}
+fn default_tp_operation_timeout_secs() -> u64 {
+    120
+}
+fn default_tp_startup_timeout_secs() -> u64 {
+    900
 }
 fn default_worker_heartbeat_timeout_secs() -> u64 {
     15
@@ -258,6 +282,9 @@ impl RustInferConfig {
         if self.model.trim().is_empty() {
             return Err("`model` is required".into());
         }
+        if self.tensor_parallel_size == 0 {
+            return Err("`tensor_parallel_size` must be > 0".into());
+        }
         if !(self.mem_fraction_static > 0.0 && self.mem_fraction_static <= 1.0) {
             return Err(format!(
                 "`mem_fraction_static` must be in (0, 1], got {}",
@@ -278,6 +305,12 @@ impl RustInferConfig {
         }
         if self.request_timeout_secs == 0 {
             return Err("`request_timeout_secs` must be > 0".into());
+        }
+        if self.tp_operation_timeout_secs == 0 {
+            return Err("`tp_operation_timeout_secs` must be > 0".into());
+        }
+        if self.tp_startup_timeout_secs == 0 {
+            return Err("`tp_startup_timeout_secs` must be > 0".into());
         }
         if self.port == 0 {
             return Err("`port` must be > 0".into());
@@ -496,6 +529,37 @@ mod model_type_tests {
 #[cfg(test)]
 mod launch_config_tests {
     use super::RustInferConfig;
+
+    #[test]
+    fn tensor_parallel_size_defaults_to_one_and_accepts_explicit_value() {
+        let defaults: RustInferConfig = toml::from_str("model = '/tmp/model'").unwrap();
+        assert_eq!(defaults.tensor_parallel_size, 1);
+
+        let configured: RustInferConfig = toml::from_str(
+            r#"
+                model = "/tmp/model"
+                tensor_parallel_size = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.tensor_parallel_size, 4);
+        configured.validate().unwrap();
+    }
+
+    #[test]
+    fn zero_tensor_parallel_size_is_rejected() {
+        let config: RustInferConfig = toml::from_str(
+            r#"
+                model = "/tmp/model"
+                tensor_parallel_size = 0
+            "#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.contains("`tensor_parallel_size` must be > 0"));
+    }
 
     #[test]
     fn diffusion_mode_is_rejected() {

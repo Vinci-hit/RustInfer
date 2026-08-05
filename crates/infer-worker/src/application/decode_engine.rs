@@ -80,9 +80,8 @@ impl DecodeEngine {
         }
     }
 
-    /// Hard reset. Drops any in-flight step WITHOUT finalizing it (its tokens
-    /// are lost) — only call on drain/shutdown, never mid-stream. `prealloc` is
-    /// reclaimed separately by `reclaim_pending` (it needs the allocator).
+    /// Hard reset after any in-flight device work has been finalized/discarded.
+    /// `prealloc` is reclaimed separately because it needs the allocator.
     pub fn clear(&mut self) {
         self.rows.clear();
         self.prev_a_rows.clear();
@@ -116,6 +115,28 @@ impl DecodeEngine {
             p.new_indices.release(kv_allocator);
         }
         self.release_prealloc(kv_allocator);
+    }
+
+    /// Synchronize and discard an in-flight decode result, then reclaim every
+    /// transient KV slot. Immediate drain uses this before releasing live
+    /// sequence blocks so all TP ranks close the matching issue/finalize span.
+    pub fn finalize_and_reclaim_pending<M>(
+        &mut self,
+        runner: &mut Runtime<bf16, Cuda, M>,
+        kv_allocator: &mut GlobalKvAllocator,
+    ) -> OpResult<()>
+    where
+        M: DecoderModel<bf16, Cuda>,
+    {
+        let finalize = if let Some(pending) = self.pending.take() {
+            let result = runner.finalize_decode_abc(pending.batch).map(|_| ());
+            pending.new_indices.release(kv_allocator);
+            result
+        } else {
+            Ok(())
+        };
+        self.release_prealloc(kv_allocator);
+        finalize
     }
 
     /// Return any speculatively-reserved next-step slots to the pool. Called
@@ -618,7 +639,8 @@ impl DecodeEngine {
         let Some(p) = self.pending.take() else {
             return Ok(None);
         };
-        match runner.finalize_decode_abc(p.batch) {
+        let runtime_result = runner.finalize_decode_abc(p.batch);
+        match runtime_result {
             Ok(compact) => {
                 let output = self.commit_results(
                     active,
@@ -680,9 +702,10 @@ impl DecodeEngine {
             enable_prefix_caching,
         )? {
             Some(ready) => ready,
-            None => return Ok(()),
+            None => {
+                return Ok(());
+            }
         };
-
         // Reserve the NEXT step's KV slots before issuing. In the async path the
         // device control builder (`compact_extend`) appends these to each
         // survivor on-device; in the proven path they become the next step's
@@ -716,7 +739,8 @@ impl DecodeEngine {
         // last step's compact merge), so only the divergent suffix re-uploads.
         let a_valid_prefix = common_prefix_len(&order, &self.prev_a_rows);
 
-        match runner.issue_decode_abc(
+        let batch = order.len();
+        let issue_result = runner.issue_decode_abc(
             &req.req,
             a_valid_prefix,
             &req.generated_counts,
@@ -725,9 +749,9 @@ impl DecodeEngine {
             eos_ids,
             next_slots.as_deref(),
             reuse_device_control,
-        ) {
+        );
+        match issue_result {
             Ok(()) => {
-                let batch = order.len();
                 self.pending = Some(PendingDecode {
                     order,
                     new_indices,

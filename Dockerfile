@@ -22,6 +22,7 @@ RUN apt-get update \
         cmake \
         curl \
         libclang-dev \
+        libnccl-dev \
         pkg-config \
         python3 \
         python3-pip \
@@ -90,6 +91,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         curl \
+        libnccl2 \
         libstdc++6 \
         tini \
     && rm -rf /var/lib/apt/lists/* \

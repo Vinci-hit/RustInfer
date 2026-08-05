@@ -556,6 +556,12 @@ where
         if rows == 0 {
             continue;
         }
+        // KNOWN RISK(tp-overlap-kv-relief): while `overlap_active`, the prior
+        // decode ticket can still be reading/writing KV owned by `active`.
+        // `alloc_with_relief` may process a Preempt, release one of those rows,
+        // and immediately lease its slots to this prefill before the ticket is
+        // finalized. Fix by pinning/excluding the overlap snapshot during
+        // relief, or by draining the ticket before relief is allowed.
         let base_indices = match alloc_with_relief(
             kv_allocator,
             control,
@@ -741,7 +747,6 @@ where
             seqs,
         };
         let stochastic_group = req.sampling.iter().any(|params| !params.is_greedy());
-
         let mut mixed_lease = KvLease::empty();
         let mut mixed_device_prepared = false;
         if can_record_abc_rows && !stochastic_group {
@@ -951,7 +956,8 @@ where
         } else {
             mixed_lease.release(kv_allocator);
         }
-        if let Err(e) = data.send_step_output(&output) {
+        let output_send = data.send_step_output(&output);
+        if let Err(e) = output_send {
             hard_err = Some(OpError::Kernel(format!(
                 "data plane send_step_output failed: {}",
                 e
@@ -995,7 +1001,7 @@ where
     // leave it pending for the next `run_step` call to finalize. Also removes
     // the cold-start 0-deep restart the pipeline used to pay after every
     // fused step.
-    decode_engine.issue_if_idle(
+    let tail_issue = decode_engine.issue_if_idle(
         runner,
         active,
         prefilling,
@@ -1003,7 +1009,8 @@ where
         control,
         eos_ids,
         enable_prefix_caching,
-    )?;
+    );
+    tail_issue?;
     Ok(())
 }
 
@@ -1065,7 +1072,8 @@ fn patch_overlap_assigned_tokens(
 /// compute; the early-return paths call it too so the tokens are never lost.
 fn send_prior_output(data: &DataPump, prior: &mut Option<StepOutput>) -> OpResult<()> {
     if let Some(out) = prior.take() {
-        data.send_step_output(&out).map_err(|e| {
+        let send_result = data.send_step_output(&out);
+        send_result.map_err(|e| {
             OpError::Kernel(format!(
                 "data plane send_step_output (fused prior) failed: {}",
                 e

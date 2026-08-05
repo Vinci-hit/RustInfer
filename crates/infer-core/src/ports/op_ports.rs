@@ -51,8 +51,10 @@ pub trait CoreOps: MemoryPort {
     ) -> OpResult<()>;
 
     // ─── Linear algebra ──────────────────────────────────────────────
-    /// Standard matmul: input [M,K] × weight [N,K]^T → output [M,N]
-    /// Same dtype for input, weight, output.
+    /// Standard matmul: input `[M,K]` × weight `[N,K]^T` → output `[M,N]`.
+    /// The output may be an inner-contiguous view with a larger row stride;
+    /// implementations must honor its tensor strides rather than assuming
+    /// `row_stride == N`. Same dtype for input, weight, and output.
     fn matmul<T: Dtype>(
         input: &Tensor<T, Self>,
         weight: &Tensor<T, Self>,

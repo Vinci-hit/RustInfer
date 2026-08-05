@@ -7,7 +7,7 @@ use crate::domain::model::DecoderModel;
 use crate::domain::plan::StepRequest;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::pipeline_ops::{CompactExtendControlArgs, MergeCompactDecodeArgs};
-use crate::domain::ports::{OpError, OpResult};
+use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
@@ -22,6 +22,32 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
+    /// Make rank 0's sampled ids authoritative before any rank applies stop
+    /// criteria or compacts its decode rows. Every TP rank owns a full logits
+    /// tensor after the LM-head all-gather, but stochastic sampling (and any
+    /// future rank-local sampling implementation) may still choose different
+    /// ids. Broadcasting the live prefix of C keeps the replicated worker
+    /// state in lockstep. TP1 deliberately stays on the zero-overhead path.
+    pub(super) fn broadcast_tp_argmax(&self, rows: usize) -> OpResult<()> {
+        if self.scope.topology().tp.size <= 1 || rows == 0 {
+            return Ok(());
+        }
+        if rows > self.abc.argmax_out_dev.numel() {
+            return Err(OpError::Shape(format!(
+                "broadcast_tp_argmax: rows {} exceeds C capacity {}",
+                rows,
+                self.abc.argmax_out_dev.numel()
+            )));
+        }
+
+        let shape = Shape::from_slice(&[rows]);
+        let mut tokens =
+            self.abc
+                .argmax_out_dev
+                .view_raw(shape, shape.contiguous_strides(), 0, true);
+        <D as CollectiveOps>::broadcast(&self.scope, CommAxis::Tp, 0, &mut tokens)
+    }
+
     pub(super) fn ensure_abc_pinned(&mut self) -> OpResult<()> {
         if self.abc.pinned {
             return Ok(());
@@ -96,6 +122,42 @@ where
         // `upload_index` because the previous step's `compact_extend` already
         // left this step's control on device; false on the first async step or
         // after any admission/eviction re-seeds it from the host request.
+        async_next_slots: Option<&[u32]>,
+        reuse_device_control: bool,
+    ) -> OpResult<()> {
+        let pending = self.dispatch_peer_command(super::RuntimePeerCommand::IssueDecodeAbc {
+            req: Box::new(req.clone()),
+            a_valid_prefix,
+            generated_counts: generated_counts.to_vec(),
+            max_tokens: max_tokens.to_vec(),
+            ignore_eos: ignore_eos.to_vec(),
+            eos_ids: eos_ids.to_vec(),
+            async_next_slots: async_next_slots.map(<[u32]>::to_vec),
+            reuse_device_control,
+        })?;
+        let local = self.issue_decode_abc_local(
+            req,
+            a_valid_prefix,
+            generated_counts,
+            max_tokens,
+            ignore_eos,
+            eos_ids,
+            async_next_slots,
+            reuse_device_control,
+        );
+        let followers = self.wait_peer_command(pending);
+        super::complete_replicated(&mut self.peers, "issue_decode_abc", local, followers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_decode_abc_local(
+        &mut self,
+        req: &StepRequest,
+        a_valid_prefix: usize,
+        generated_counts: &[u32],
+        max_tokens: &[u32],
+        ignore_eos: &[bool],
+        eos_ids: &[i32],
         async_next_slots: Option<&[u32]>,
         reuse_device_control: bool,
     ) -> OpResult<()> {
@@ -229,6 +291,11 @@ where
                 self.forward_finalize_argmax(&plan, &input_ids)?;
             }
         }
+
+        // C feeds both stop evaluation and row compaction below. Synchronize
+        // the sampled ids first so every rank takes the same active/finished
+        // branches and enters subsequent collectives with identical row state.
+        self.broadcast_tp_argmax(batch)?;
 
         // ── upload stop metadata + run the compact merge (C → A) ──
         let gen_i32: Vec<i32> = generated_counts
@@ -384,7 +451,16 @@ where
     /// desync before it can corrupt host row bookkeeping. `batch` must be the
     /// `order.len()` the matching `issue_decode_abc` ran with.
     pub fn finalize_decode_abc(&mut self, batch: usize) -> OpResult<DecodeCompactOutput> {
-        D::pipeline_synchronize_copy_out(&self.scope)?; // host mirrors valid before we read them
+        let pending =
+            self.dispatch_peer_command(super::RuntimePeerCommand::FinalizeDecodeAbc { batch })?;
+        let local = self.finalize_decode_abc_local(batch);
+        let followers = self.wait_peer_command(pending);
+        super::complete_replicated(&mut self.peers, "finalize_decode_abc", local, followers)
+    }
+
+    fn finalize_decode_abc_local(&mut self, batch: usize) -> OpResult<DecodeCompactOutput> {
+        let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
+        sync_result?; // host mirrors valid before we read them
 
         let active_n = self.abc.counts_host[0].max(0) as usize;
         let finished_n = self.abc.counts_host[1].max(0) as usize;

@@ -57,6 +57,7 @@ fn main() {
         // 收集所有可能存在 CUDA 头文件和库文件的路径 (应对 Conda 的特殊目录结构)
         let cuda_includes = get_cuda_include_paths(&cuda_path);
         let cuda_lib_paths = get_cuda_lib_paths(&cuda_path);
+        let (nccl_include, nccl_lib) = find_nccl(&cuda_path);
 
         // 尽早设置环境变量，供 cc-rs 查找 nvcc
         unsafe {
@@ -87,6 +88,7 @@ fn main() {
         println!("cargo:rustc-link-lib=cublasLt");
         println!("cargo:rustc-link-lib=cudnn");
         println!("cargo:rustc-link-lib=nvrtc");
+        configure_nccl_link(&nccl_lib);
 
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
         let root = PathBuf::from(manifest_dir);
@@ -203,6 +205,7 @@ fn main() {
         for inc in &cuda_includes {
             bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", inc.display()));
         }
+        bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", nccl_include.display()));
 
         let bindings = bindgen_builder
             .enable_cxx_namespaces()
@@ -224,6 +227,7 @@ fn main() {
             .allowlist_function("cudaGetErrorString")
             .allowlist_function("cudaGetErrorName")
             .allowlist_function("cudaGetDevice")
+            .allowlist_function("cudaDeviceGetAttribute")
             .allowlist_function("cudaSetDevice")
             .allowlist_function("cudaStreamCreate")
             .allowlist_function("cudaStreamCreateWithFlags")
@@ -238,6 +242,7 @@ fn main() {
             .allowlist_function("cudaEventElapsedTime")
             .allowlist_function("cudaEventDestroy")
             .allowlist_type("cudaEvent_t")
+            .allowlist_type("cudaDeviceAttr")
             .allowlist_type("cudaError_t")
             .allowlist_type("cudaMemcpyKind")
             .allowlist_type("cudaStream_t")
@@ -257,6 +262,29 @@ fn main() {
             .allowlist_function("cudaGraphDestroy")
             .allowlist_function("cudaGraphLaunch")
             .allowlist_function("cudaGraphExecDestroy")
+            // NCCL types/functions. Communicator ownership and error handling
+            // stay inside the CUDA backend; higher layers only see CollectiveOps.
+            .allowlist_type("ncclComm_t")
+            .allowlist_type("ncclUniqueId")
+            .allowlist_type("ncclResult_t")
+            .allowlist_type("ncclDataType_t")
+            .allowlist_type("ncclRedOp_t")
+            .allowlist_function("ncclGetVersion")
+            .allowlist_function("ncclGetUniqueId")
+            .allowlist_function("ncclCommInitRank")
+            .allowlist_function("ncclCommInitAll")
+            .allowlist_function("ncclCommDestroy")
+            .allowlist_function("ncclCommAbort")
+            .allowlist_function("ncclCommGetAsyncError")
+            .allowlist_function("ncclGetErrorString")
+            .allowlist_function("ncclAllReduce")
+            .allowlist_function("ncclAllGather")
+            .allowlist_function("ncclReduceScatter")
+            .allowlist_function("ncclBroadcast")
+            .allowlist_function("ncclSend")
+            .allowlist_function("ncclRecv")
+            .allowlist_function("ncclGroupStart")
+            .allowlist_function("ncclGroupEnd")
             // cuDNN types
             .allowlist_type("cudnnHandle_t")
             .allowlist_type("cudnnStatus_t")
@@ -297,6 +325,9 @@ fn main() {
             .rustified_enum("cudnnConvolutionMode_t")
             .rustified_enum("cudnnConvolutionFwdAlgo_t")
             .rustified_enum("cudnnMathType_t")
+            .rustified_enum("ncclResult_t")
+            .rustified_enum("ncclDataType_t")
+            .rustified_enum("ncclRedOp_t")
             .generate()
             .expect("Unable to generate bindings");
 
@@ -412,6 +443,85 @@ fn compile_cuda_archive(
 // ---------------------------------------------------------
 // 以下是为你新增和优化的辅助工具函数
 // ---------------------------------------------------------
+
+fn find_nccl(cuda_path: &Path) -> (PathBuf, PathBuf) {
+    let mut roots = vec![
+        cuda_path.to_path_buf(),
+        PathBuf::from("/usr"),
+        PathBuf::from("/usr/local"),
+    ];
+    if let Ok(prefix) = env::var("CONDA_PREFIX") {
+        roots.push(PathBuf::from(prefix));
+    }
+
+    // NVIDIA's pip/Conda NCCL package installs under
+    // `lib/python*/site-packages/nvidia/nccl` without requiring sudo.
+    let mut python_roots = Vec::new();
+    for root in roots.clone() {
+        for lib_dir in [root.join("lib"), root.join("lib64")] {
+            if let Ok(entries) = std::fs::read_dir(lib_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with("python") {
+                        python_roots.push(entry.path().join("site-packages/nvidia/nccl"));
+                    }
+                }
+            }
+        }
+    }
+    roots.extend(python_roots);
+
+    for root in roots {
+        let include_candidates = [root.join("include"), root.clone()];
+        let lib_candidates = [
+            root.join("lib"),
+            root.join("lib64"),
+            root.join("lib/x86_64-linux-gnu"),
+        ];
+        for include in &include_candidates {
+            if !include.join("nccl.h").is_file() {
+                continue;
+            }
+            for lib in &lib_candidates {
+                if lib.join("libnccl.so").is_file() || lib.join("libnccl.so.2").is_file() {
+                    eprintln!(
+                        "RustInfer build: using NCCL headers={} library={}",
+                        include.display(),
+                        lib.display()
+                    );
+                    println!(
+                        "cargo:rerun-if-changed={}",
+                        include.join("nccl.h").display()
+                    );
+                    return (include.clone(), lib.clone());
+                }
+            }
+        }
+    }
+
+    panic!(
+        "NCCL not found. Install libnccl development files or the nvidia-nccl-cu12 Python package"
+    );
+}
+
+fn configure_nccl_link(lib_dir: &Path) {
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+
+    if !lib_dir.join("libnccl.so").is_file() {
+        let versioned = lib_dir.join("libnccl.so.2");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is not set"));
+        let link = out_dir.join("libnccl.so");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&versioned, &link)
+            .unwrap_or_else(|error| panic!("create NCCL linker symlink: {error}"));
+        #[cfg(not(unix))]
+        std::fs::copy(&versioned, &link)
+            .unwrap_or_else(|error| panic!("copy NCCL linker library: {error}"));
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    }
+    println!("cargo:rustc-link-lib=dylib=nccl");
+}
 
 /// 自动配置 libclang，消除找不到 shared libraries 的问题
 fn auto_configure_libclang() {

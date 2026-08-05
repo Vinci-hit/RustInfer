@@ -11,29 +11,36 @@
 //! tensor (`[batch, max_blocks_per_seq]` u32).
 
 use crate::Cuda;
+use crate::config::CudaDeviceInfo;
 use crate::ffi::{cudaStream_t, cudnnHandle_t};
 use infer_core::kv::KvIndexTensors;
 use infer_core::plan;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
+use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// When set, FA3 is allowed to launch under CUDA graph capture. The runtime
-/// raises this only around the mixed FA3-graph capture region (where the bucket
-/// plan bakes `max_q`/`b` to proven upper bounds over every replay composition)
-/// and lowers it immediately after. Replay does not re-enter this dispatch — the
-/// captured FA3 node runs directly — so the flag matters only during capture.
-static FA3_CAPTURE_ALLOWED: AtomicBool = AtomicBool::new(false);
+// When set, FA3 is allowed to launch under CUDA graph capture. The runtime
+// raises this only around the mixed FA3-graph capture region (where the bucket
+// plan bakes `max_q`/`b` to proven upper bounds over every replay composition)
+// and lowers it immediately after. Replay does not re-enter this dispatch — the
+// captured FA3 node runs directly — so the flag matters only during capture.
+thread_local! {
+    static FA3_CAPTURE_ALLOWED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Toggle FA3-under-capture (see `FA3_CAPTURE_ALLOWED`). Called from the Cuda
 /// `FusedOps::set_unified_mixed_capture` impl.
 pub fn set_fa3_capture_allowed(on: bool) {
-    FA3_CAPTURE_ALLOWED.store(on, Ordering::Relaxed);
+    FA3_CAPTURE_ALLOWED.set(on);
 }
 
 unsafe extern "C" {
+    fn rustinfer_flash_attn_batched_decode_init_kernel_attributes(max_dynamic_smem: i32) -> i32;
+    fn rustinfer_flash_attn_gqa_prefill_init_kernel_attributes(max_dynamic_smem: i32) -> i32;
+    fn rustinfer_flash_attn_paged_decode_init_kernel_attributes(max_dynamic_smem: i32) -> i32;
+    fn rustinfer_flash_attn_paged_prefill_init_kernel_attributes(max_dynamic_smem: i32) -> i32;
     fn launch_flash_attn_paged_decode_bf16(
         q: *const half::bf16,
         qsb: i64,
@@ -51,10 +58,11 @@ unsafe extern "C" {
         batch: i32,
         num_q_heads: i32,
         num_kv_heads: i32,
+        num_sm: i32,
         head_dim: i32,
         softmax_scale: f32,
         stream: cudaStream_t,
-    );
+    ) -> i32;
     fn launch_flash_attn_paged_decode_fp16(
         q: *const half::f16,
         qsb: i64,
@@ -72,10 +80,11 @@ unsafe extern "C" {
         batch: i32,
         num_q_heads: i32,
         num_kv_heads: i32,
+        num_sm: i32,
         head_dim: i32,
         softmax_scale: f32,
         stream: cudaStream_t,
-    );
+    ) -> i32;
     fn flash_attn_batched_decode_workspace_bytes(
         batch: i32,
         num_q_heads: i32,
@@ -158,7 +167,7 @@ unsafe extern "C" {
         softmax_scale: f32,
         is_causal: i32,
         stream: cudaStream_t,
-    );
+    ) -> i32;
     fn launch_flash_attn_paged_ragged_cute_fp16(
         q: *const half::f16,
         qss: i64,
@@ -185,7 +194,55 @@ unsafe extern "C" {
         softmax_scale: f32,
         is_causal: i32,
         stream: cudaStream_t,
-    );
+    ) -> i32;
+}
+
+#[cfg(rustinfer_fa3)]
+unsafe extern "C" {
+    fn rustinfer_fa3_init_kernel_attributes(max_dynamic_smem: i32) -> i32;
+}
+
+pub(crate) fn init_device(info: CudaDeviceInfo) -> OpResult<()> {
+    let initializers: &[(&str, unsafe extern "C" fn(i32) -> i32)] = &[
+        (
+            "batched_decode",
+            rustinfer_flash_attn_batched_decode_init_kernel_attributes,
+        ),
+        (
+            "gqa_prefill",
+            rustinfer_flash_attn_gqa_prefill_init_kernel_attributes,
+        ),
+        (
+            "paged_decode",
+            rustinfer_flash_attn_paged_decode_init_kernel_attributes,
+        ),
+        (
+            "paged_prefill",
+            rustinfer_flash_attn_paged_prefill_init_kernel_attributes,
+        ),
+    ];
+    for &(name, initialize) in initializers {
+        let status = unsafe { initialize(info.max_dynamic_shared_memory) };
+        if status != 0 {
+            return Err(OpError::Kernel(format!(
+                "FlashAttention {name} initialization failed on cuda:{} with CUDA status {status}",
+                info.device_id
+            )));
+        }
+    }
+
+    #[cfg(rustinfer_fa3)]
+    {
+        let status =
+            unsafe { rustinfer_fa3_init_kernel_attributes(info.max_dynamic_shared_memory) };
+        if status != 0 {
+            return Err(OpError::Kernel(format!(
+                "FA3 initialization failed on cuda:{} with CUDA status {status}",
+                info.device_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 const DISABLE_CUDNN_ATTENTION_ENV: &str = "RUSTINFER_DISABLE_CUDNN_ATTENTION";
@@ -213,6 +270,8 @@ unsafe extern "C" {
         q_extent: i32,
         h: i32,
         h_k: i32,
+        device_id: i32,
+        num_sm: i32,
         q_row_stride: i64,
         q_head_stride: i64,
         k_row_stride: i64,
@@ -226,78 +285,6 @@ unsafe extern "C" {
         softmax_scale: f32,
         stream: cudaStream_t,
     ) -> i32;
-}
-
-/// Process-lifetime, per-device FA3 scratch: softmax LSE
-/// (`head_num * q_extent` f32) and the tile-count semaphore. Grow-only, so
-/// steady state issues zero allocations (a per-step `cudaMalloc` is the known
-/// TTFT-regression shape).
-///
-/// A captured CUDA graph stores the LSE address passed to its FA3 node. Old
-/// allocations therefore remain alive when a larger eager request grows the
-/// current scratch; freeing them would leave every graph captured with the old
-/// address holding a dangling pointer. Growth is rare and geometric in normal
-/// workloads, so retaining those allocations until process exit is a small,
-/// bounded trade for address stability.
-#[cfg(rustinfer_fa3)]
-struct Fa3Scratch {
-    lse: *mut f32,
-    lse_cap: usize,
-    semaphore: *mut i32,
-    retired_lse: Vec<*mut f32>,
-}
-
-#[cfg(rustinfer_fa3)]
-unsafe impl Send for Fa3Scratch {}
-
-#[cfg(rustinfer_fa3)]
-static FA3_SCRATCH: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<i32, Fa3Scratch>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(rustinfer_fa3)]
-fn fa3_scratch(head_num: usize, q_extent: usize) -> OpResult<(*mut f32, *mut i32)> {
-    use crate::ffi;
-    let device = crate::device_utils::current_device()?;
-    let mut all_scratch = FA3_SCRATCH
-        .lock()
-        .map_err(|_| OpError::Kernel("FA3 scratch lock poisoned".into()))?;
-    let scratch = all_scratch.entry(device).or_insert_with(|| Fa3Scratch {
-        lse: std::ptr::null_mut(),
-        lse_cap: 0,
-        semaphore: std::ptr::null_mut(),
-        retired_lse: Vec::new(),
-    });
-    if scratch.semaphore.is_null() {
-        let mut p: *mut c_void = std::ptr::null_mut();
-        let err = unsafe { ffi::cudaMalloc(&mut p, std::mem::size_of::<i32>()) };
-        if err != ffi::cudaError_cudaSuccess {
-            return Err(OpError::Kernel(format!(
-                "FA3 semaphore cudaMalloc failed: {:?}",
-                err
-            )));
-        }
-        scratch.semaphore = p as *mut i32;
-    }
-    // Floor at 8192 rows so the common config allocates exactly once.
-    let need = head_num * q_extent;
-    if scratch.lse_cap < need {
-        let want = need.max(head_num * 8192);
-        let mut p: *mut c_void = std::ptr::null_mut();
-        let err = unsafe { ffi::cudaMalloc(&mut p, want * std::mem::size_of::<f32>()) };
-        if err != ffi::cudaError_cudaSuccess {
-            return Err(OpError::Kernel(format!(
-                "FA3 LSE scratch cudaMalloc({} f32) failed: {:?}",
-                want, err
-            )));
-        }
-        if !scratch.lse.is_null() {
-            scratch.retired_lse.push(scratch.lse);
-        }
-        scratch.lse = p as *mut f32;
-        scratch.lse_cap = want;
-    }
-    Ok((scratch.lse, scratch.semaphore))
 }
 
 /// FA3 serves ragged prefill launches outside CUDA graph capture unconditionally;
@@ -321,7 +308,7 @@ fn fa3_ragged_eligible<T: Dtype>(head_dim: usize, stream: cudaStream_t) -> bool 
     }
     // 0 == cudaStreamCaptureStatusNone. When capturing, only the opted-in mixed
     // FA3-graph region (bounded max_q/b) may launch FA3.
-    status as u32 == 0 || FA3_CAPTURE_ALLOWED.load(Ordering::Relaxed)
+    status as u32 == 0 || FA3_CAPTURE_ALLOWED.get()
 }
 
 #[cfg(not(rustinfer_fa3))]
@@ -355,6 +342,7 @@ unsafe fn launch_fa3_ragged<T: Dtype>(
     k_pool: &Tensor<T, Cuda>,
     v_pool: &Tensor<T, Cuda>,
     output: &mut Tensor<T, Cuda>,
+    workspace: &mut Tensor<f32, Cuda>,
     plan: &PagedAttentionPlan<'_>,
     q_stride_seq: i64,
     q_stride_head: i64,
@@ -372,7 +360,23 @@ unsafe fn launch_fa3_ragged<T: Dtype>(
     }
     let q_extent = q.shape().as_slice()[0];
     let num_pages = k_pool.shape().as_slice()[0];
-    let (lse, semaphore) = fa3_scratch(head_num, q_extent)?;
+    let lse_elems = head_num
+        .checked_mul(q_extent)
+        .ok_or_else(|| OpError::Kernel("FA3 scratch size overflow".into()))?;
+    let required = lse_elems
+        .checked_add(1)
+        .ok_or_else(|| OpError::Kernel("FA3 scratch size overflow".into()))?;
+    if workspace.numel() < required {
+        return Err(OpError::Kernel(format!(
+            "FA3 workspace too small: have {} f32, need {} f32",
+            workspace.numel(),
+            required
+        )));
+    }
+    // ForwardScratch owns this address-stable region for the model lifetime.
+    // The f32 slot after LSE is naturally aligned for the i32 semaphore.
+    let lse = workspace.data_ptr_mut();
+    let semaphore = unsafe { lse.add(lse_elems).cast::<i32>() };
     let kv_row = (kv_head_num * head_dim) as i64;
     let page_stride = plan.block_size as i64 * kv_row;
     let rc = unsafe {
@@ -395,6 +399,8 @@ unsafe fn launch_fa3_ragged<T: Dtype>(
             q_extent as i32,
             head_num as i32,
             kv_head_num as i32,
+            q.device().device_id,
+            q.device().config.device_info().sm_count,
             q_stride_seq,
             q_stride_head,
             kv_row,
@@ -424,6 +430,7 @@ unsafe fn launch_fa3_ragged<T: Dtype>(
     _k_pool: &Tensor<T, Cuda>,
     _v_pool: &Tensor<T, Cuda>,
     _output: &mut Tensor<T, Cuda>,
+    _workspace: &mut Tensor<f32, Cuda>,
     _plan: &PagedAttentionPlan<'_>,
     _q_stride_seq: i64,
     _q_stride_head: i64,
@@ -499,15 +506,22 @@ impl<'a> PagedAttentionPlan<'a> {
 /// f32 element count needed by the paged-decode flash attention kernel for
 /// a worst-case `(batch, num_q_heads, head_dim)`. Callers (`ForwardWorkspace`)
 /// use this to size the long-lived attention scratch.
-pub fn flash_decode_workspace_capacity_f32(
+pub fn flash_attention_workspace_capacity_f32(
     batch: usize,
+    num_tokens: usize,
     num_q_heads: usize,
     head_dim: usize,
 ) -> usize {
     let bytes = unsafe {
         flash_attn_batched_decode_workspace_bytes(batch as i32, num_q_heads as i32, head_dim as i32)
     } as usize;
-    bytes.div_ceil(4)
+    let decode = bytes.div_ceil(4);
+    let ragged = if cfg!(rustinfer_fa3) {
+        num_q_heads.saturating_mul(num_tokens).saturating_add(1)
+    } else {
+        0
+    };
+    decode.max(ragged)
 }
 
 /// Launch the CuTe paged ragged Flash kernel over a (sub)set of q tiles. The
@@ -544,7 +558,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
     scale: f32,
     stream: cudaStream_t,
 ) -> OpResult<()> {
-    unsafe {
+    let rc = unsafe {
         match T::DATA_TYPE {
             DataType::BF16 => launch_flash_attn_paged_ragged_cute_bf16(
                 q_ptr as _,
@@ -607,6 +621,11 @@ unsafe fn launch_cute_ragged<T: Dtype>(
                 )));
             }
         }
+    };
+    if rc != 0 {
+        return Err(OpError::Kernel(format!(
+            "CuTe paged ragged attention failed: cudaError {rc}"
+        )));
     }
     Ok(())
 }
@@ -798,7 +817,8 @@ pub fn attention_paged<T: Dtype>(
                 }
             }
 
-            unsafe {
+            let num_sm = device.config.device_info().sm_count;
+            let status = unsafe {
                 match T::DATA_TYPE {
                     DataType::BF16 => launch_flash_attn_paged_decode_bf16(
                         q.data_ptr() as _,
@@ -817,6 +837,7 @@ pub fn attention_paged<T: Dtype>(
                         batch,
                         head_num as i32,
                         kv_head_num as i32,
+                        num_sm,
                         head_dim as i32,
                         scale,
                         stream,
@@ -838,6 +859,7 @@ pub fn attention_paged<T: Dtype>(
                         batch,
                         head_num as i32,
                         kv_head_num as i32,
+                        num_sm,
                         head_dim as i32,
                         scale,
                         stream,
@@ -849,6 +871,12 @@ pub fn attention_paged<T: Dtype>(
                         )));
                     }
                 }
+            };
+            if status != 0 {
+                return Err(OpError::Kernel(format!(
+                    "flash paged decode attention failed on cuda:{} with CUDA status {status}",
+                    device.device_id
+                )));
             }
         }
         PagedAttentionKind::Ragged => {
@@ -864,6 +892,7 @@ pub fn attention_paged<T: Dtype>(
                         k_pool,
                         v_pool,
                         output,
+                        workspace,
                         &plan,
                         q_stride_seq,
                         q_stride_head,

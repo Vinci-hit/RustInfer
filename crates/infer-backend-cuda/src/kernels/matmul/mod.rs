@@ -2,6 +2,7 @@
 //! Also provides AWQ int4 quantized matmul (kpack_gemv/kpack_gemm).
 
 use crate::Cuda;
+use crate::config::CudaDeviceInfo;
 use crate::ffi::cudaStream_t;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
@@ -23,6 +24,8 @@ unsafe extern "C" {
         m: i32,
         n: i32,
         k: i32,
+        ldc: i32,
+        handle: crate::ffi::cublasHandle_t,
         stream: cudaStream_t,
     );
     fn hgemv_bf16_cu(
@@ -40,8 +43,10 @@ unsafe extern "C" {
         m: i32,
         n: i32,
         k: i32,
+        ldc: i32,
         stream: cudaStream_t,
-        handle: crate::ffi::cublasLtHandle_t,
+        lt_handle: crate::ffi::cublasLtHandle_t,
+        handle: crate::ffi::cublasHandle_t,
         workspace: *mut std::ffi::c_void,
         workspace_size: usize,
     );
@@ -91,8 +96,8 @@ unsafe extern "C" {
 
 /// Prepare the accelerated FP8 kernel before any CUDA stream capture.
 /// Builds without an accelerated implementation expose the same symbol as a no-op.
-pub(crate) fn init_fp8_block_matmul(device_id: i32) -> OpResult<()> {
-    let status = unsafe { fp8_block_matmul_init_cu(device_id) };
+pub(crate) fn init_device(info: CudaDeviceInfo) -> OpResult<()> {
+    let status = unsafe { fp8_block_matmul_init_cu(info.device_id) };
     if status == 0 {
         Ok(())
     } else {
@@ -108,7 +113,7 @@ pub(crate) fn init_fp8_block_matmul(device_id: i32) -> OpResult<()> {
 /// cold-shape build from every distinct-length prefill's TTFT. Decode (graph
 /// capture + its warmup) must leave this off so the cuBLASLt cache is built.
 pub fn set_eager_prefill_gemm(on: bool) {
-    // SAFETY: stores an int into a process-global atomic; no aliasing.
+    // SAFETY: updates only the calling rank thread's C++ thread-local flag.
     unsafe { zimage_set_eager_prefill_gemm(on as i32) };
 }
 
@@ -121,12 +126,32 @@ pub fn matmul<T: Dtype>(
 ) -> OpResult<()> {
     let in_shape = input.shape().as_slice();
     let w_shape = weight.shape().as_slice();
-    if in_shape.len() < 2 || w_shape.len() < 2 {
+    let out_shape = output.shape().as_slice();
+    if in_shape.len() != 2 || w_shape.len() != 2 || out_shape.len() != 2 {
         return Err(OpError::Shape("matmul: need 2D".into()));
     }
     let m = in_shape[0];
     let k = in_shape[1];
     let n = w_shape[0];
+    if w_shape[1] != k || out_shape != [m, n] {
+        return Err(OpError::Shape(format!(
+            "matmul: incompatible input {:?}, weight {:?}, output {:?}",
+            in_shape, w_shape, out_shape
+        )));
+    }
+    let out_strides = output.strides().as_slice();
+    if out_strides[1] != 1 || out_strides[0] < n {
+        return Err(OpError::Shape(format!(
+            "matmul: output must have row-major strides [ldc, 1] with ldc >= {n}, got {:?}",
+            out_strides
+        )));
+    }
+    let ldc = i32::try_from(out_strides[0]).map_err(|_| {
+        OpError::Shape(format!(
+            "matmul: output row stride too large: {}",
+            out_strides[0]
+        ))
+    })?;
 
     let cfg = &input.device().config;
 
@@ -138,8 +163,8 @@ pub fn matmul<T: Dtype>(
                         input.data_ptr() as _,
                         weight.data_ptr() as _,
                         output.data_ptr_mut() as _,
-                        n as i32,
                         k as i32,
+                        n as i32,
                         stream,
                     );
                 } else {
@@ -153,6 +178,8 @@ pub fn matmul<T: Dtype>(
                         m as i32,
                         n as i32,
                         k as i32,
+                        ldc,
+                        cfg.cublas_handle_v2,
                         stream,
                     );
                 }
@@ -183,8 +210,10 @@ pub fn matmul<T: Dtype>(
                         m as i32,
                         n as i32,
                         k as i32,
+                        ldc,
                         stream,
                         cfg.cublaslt_handle,
+                        cfg.cublas_handle_v2,
                         workspace.ptr(),
                         workspace.size(),
                     );
@@ -234,6 +263,20 @@ pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
     let n = wp_shape[0];
     let k = wp_shape[1] * per_word;
     let m = input.shape().as_slice()[0];
+    let out_shape = output.shape().as_slice();
+    if out_shape != [m, n] {
+        return Err(OpError::Shape(format!(
+            "matmul_quant: expected output [{m}, {n}], got {:?}",
+            out_shape
+        )));
+    }
+    let out_strides = output.strides().as_slice();
+    if out_strides[1] != 1 || (m > 1 && out_strides[0] != n) {
+        return Err(OpError::Shape(format!(
+            "matmul_quant: strided output is unsupported for M={m}, got strides {:?}",
+            out_strides
+        )));
+    }
 
     let zeros_ptr = zeros.map_or(std::ptr::null(), |z| z.data_ptr() as *const _);
 
@@ -420,6 +463,103 @@ pub(crate) fn matmul_fp8_block<T: Dtype>(
 #[cfg(test)]
 mod xemb_tests {
     use super::*;
+
+    const STRIDED_INPUT: [f32; 16] = [
+        1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, 0.0, 0.5, -1.0, 2.0, 1.0, 3.0, -2.0, 0.25, 4.0,
+    ];
+    const STRIDED_WEIGHT: [f32; 24] = [
+        1.0, 0.0, -1.0, 2.0, 0.5, 1.0, 0.0, -1.0, 2.0, -2.0, 1.0, 0.25, 1.0, 0.5, -0.5, 2.0, -1.0,
+        1.0, 0.25, 0.0, 2.0, -0.5, 1.0, 0.5,
+    ];
+
+    fn strided_reference(m: usize, n: usize, k: usize) -> Vec<f32> {
+        let mut result = vec![0.0; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                result[row * n + col] = (0..k)
+                    .map(|inner| STRIDED_INPUT[row * k + inner] * STRIDED_WEIGHT[col * k + inner])
+                    .sum();
+            }
+        }
+        result
+    }
+
+    fn assert_strided_storage(
+        storage: &[f32],
+        expected: &[f32],
+        m: usize,
+        n: usize,
+        ldc: usize,
+        offset: usize,
+        tolerance: f32,
+    ) {
+        for row in 0..m {
+            for col in 0..ldc {
+                let got = storage[row * ldc + col];
+                if (offset..offset + n).contains(&col) {
+                    let want = expected[row * n + col - offset];
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "strided matmul mismatch at [{row}, {col}]: got {got}, expected {want}"
+                    );
+                } else {
+                    assert_eq!(got, -77.0, "matmul overwrote padding at [{row}, {col}]");
+                }
+            }
+        }
+    }
+
+    fn run_strided_f32(cuda: &Cuda, m: usize) {
+        let (n, k, ldc, offset) = (3, 8, 8, 2);
+        let input = Tensor::from_host_slice(&STRIDED_INPUT[..m * k], [m, k], cuda).unwrap();
+        let weight = Tensor::from_host_slice(&STRIDED_WEIGHT, [n, k], cuda).unwrap();
+        let storage = Tensor::from_host_slice(&vec![-77.0_f32; m * ldc], [m, ldc], cuda).unwrap();
+        let mut output = storage.narrow(1, offset, n).unwrap();
+
+        matmul(cuda.config.stream, &input, &weight, &mut output).unwrap();
+
+        let got = storage.to_host_vec().unwrap();
+        assert_strided_storage(&got, &strided_reference(m, n, k), m, n, ldc, offset, 1e-4);
+    }
+
+    fn run_strided_bf16(cuda: &Cuda, m: usize) {
+        let (n, k, ldc, offset) = (3, 8, 8, 2);
+        let input_values: Vec<half::bf16> = STRIDED_INPUT[..m * k]
+            .iter()
+            .map(|&value| half::bf16::from_f32(value))
+            .collect();
+        let weight_values: Vec<half::bf16> = STRIDED_WEIGHT
+            .iter()
+            .map(|&value| half::bf16::from_f32(value))
+            .collect();
+        let storage_values = vec![half::bf16::from_f32(-77.0); m * ldc];
+        let input = Tensor::from_host_slice(&input_values, [m, k], cuda).unwrap();
+        let weight = Tensor::from_host_slice(&weight_values, [n, k], cuda).unwrap();
+        let storage = Tensor::from_host_slice(&storage_values, [m, ldc], cuda).unwrap();
+        let mut output = storage.narrow(1, offset, n).unwrap();
+
+        matmul(cuda.config.stream, &input, &weight, &mut output).unwrap();
+
+        let got: Vec<f32> = storage
+            .to_host_vec()
+            .unwrap()
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect();
+        assert_strided_storage(&got, &strided_reference(m, n, k), m, n, ldc, offset, 0.05);
+    }
+
+    #[test]
+    fn dense_matmul_writes_strided_output_without_touching_padding() {
+        let cuda = Cuda::new(0).unwrap();
+        // M=1 covers both hand-written GEMV paths; M=2 covers F32 cuBLAS and
+        // BF16 cuBLASLt. The cuBLAS BF16 fallback consumes the same ldc.
+        for m in [1, 2] {
+            run_strided_f32(&cuda, m);
+            run_strided_bf16(&cuda, m);
+        }
+    }
+
     #[test]
     fn matmul_bf16_x_embedder_shape_no_explosion() {
         let cuda = Cuda::new(0).unwrap();

@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <mutex>  // RustInfer: once-per-instantiation cudaFuncSetAttribute
+#include "../../common/cuda_kernel_init.cuh"
 
 #include "cute/tensor.hpp"
 
@@ -29,7 +29,7 @@ using namespace cute;
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
           bool PackGQA, bool Split, bool V_colmajor>
-void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+struct FlashFwdKernelSpec {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
@@ -38,8 +38,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
     // Can't use structured binding since it's not compatible with constexpr
-    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap);
-    static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
+    inline static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap);
+    inline static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
@@ -78,6 +78,39 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
+};
+
+template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
+          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
+          bool PackGQA, bool Split, bool V_colmajor>
+cudaError_t configure_flash_fwd_kernel(int max_dynamic_smem) {
+    using Spec = FlashFwdKernelSpec<
+        Arch, kHeadDim, kHeadDimV, ClusterM, Element, ElementOut,
+        Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv,
+        PackGQA, Split, V_colmajor>;
+    using AttnKernel = typename Spec::AttnKernel;
+    auto kernel = cutlass::device_kernel<AttnKernel>;
+    return rustinfer::cuda::configure_dynamic_shared_memory(
+        reinterpret_cast<const void*>(kernel),
+        AttnKernel::SharedStorageSize,
+        max_dynamic_smem);
+}
+
+template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
+          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
+          bool PackGQA, bool Split, bool V_colmajor>
+void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    using Spec = FlashFwdKernelSpec<
+        Arch, kHeadDim, kHeadDimV, ClusterM, Element, ElementOut,
+        Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv,
+        PackGQA, Split, V_colmajor>;
+    static constexpr int kBlockM = Spec::kBlockM;
+    static constexpr int kBlockN = Spec::kBlockN;
+    using TileShape_MNK = typename Spec::TileShape_MNK;
+    using ClusterShape = typename Spec::ClusterShape;
+    using CollectiveMainloop = typename Spec::CollectiveMainloop;
+    using CollectiveEpilogue = typename Spec::CollectiveEpilogue;
+    using AttnKernel = typename Spec::AttnKernel;
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -162,10 +195,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 
-    int device;
-    CHECK_CUDA(cudaGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
-        mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
+        mainloop_args, epilogue_args, {params.device_id, params.num_sm}, scheduler_args
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
@@ -178,23 +209,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
-        if (smem_size >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
         cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
         cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
     } else {
         auto kernel = cutlass::device_kernel<AttnKernel>;
-        if (smem_size >= 48 * 1024) {
-            // RustInfer: the attribute is sticky per kernel per process, and this
-            // launch path runs per layer per step — set it once per instantiation
-            // instead of paying ~2us on every call.
-            static std::once_flag smem_attr_once;
-            std::call_once(smem_attr_once, [&] {
-                CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-            });
-        }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation /*launch_with_pdl*/);

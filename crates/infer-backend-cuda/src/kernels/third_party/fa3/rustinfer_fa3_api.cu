@@ -12,21 +12,7 @@
 
 #include "cutlass/numeric_types.h"
 #include "flash.h"
-
-namespace {
-
-int cached_num_sm() {
-    static int num_sm = [] {
-        int device = 0;
-        cudaGetDevice(&device);
-        int sm = 0;
-        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device);
-        return sm;
-    }();
-    return num_sm;
-}
-
-}  // namespace
+#include "rustinfer_fa3_api.h"
 
 extern "C" int rustinfer_fa3_varlen_paged_bf16_hd128(
     const void* q,                    // [q_extent, h, 128] bf16, full-batch base
@@ -47,6 +33,8 @@ extern "C" int rustinfer_fa3_varlen_paged_bf16_hd128(
     int q_extent,
     int h,
     int h_k,
+    int device_id,
+    int num_sm,
     int64_t q_row_stride, int64_t q_head_stride,
     int64_t k_row_stride, int64_t k_head_stride, int64_t k_page_stride,
     int64_t v_row_stride, int64_t v_head_stride, int64_t v_page_stride,
@@ -124,7 +112,8 @@ extern "C" int rustinfer_fa3_varlen_paged_bf16_hd128(
     params.skip_scheduler_metadata_computation = true;
 
     params.arch = 90;
-    params.num_sm = cached_num_sm();
+    params.device_id = device_id;
+    params.num_sm = num_sm;
 
     cudaError_t err = cudaMemsetAsync(tile_count_semaphore, 0, sizeof(int32_t), stream);
     if (err != cudaSuccess) {

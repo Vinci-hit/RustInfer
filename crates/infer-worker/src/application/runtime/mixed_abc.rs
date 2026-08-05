@@ -432,6 +432,12 @@ where
     /// The ragged/varlen attention handles any per-row q distribution; the eager
     /// finalize samples one token per row in `req.seqs` order.
     pub fn step_fused_eager(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
+        if self.scope.topology().tp.size > 1 {
+            return Err(OpError::unsupported(
+                "tensor-parallel",
+                "legacy fused eager entrypoint",
+            ));
+        }
         // Eager fused forward. Route ALL transient scratch through the bump arena
         // (zero cudaMalloc/cudaFree) instead of the recycling pool, which churns
         // cudaMalloc on every new ragged shape and cudaFree (device-sync) once
@@ -473,7 +479,7 @@ where
         row_kind: &[RaggedRowKind],
         next_slots: Option<&[u32]>,
     ) -> OpResult<MixedStepTicket> {
-        self.issue_fused_abc_inner(req, row_kind, next_slots, 0, false)
+        self.issue_fused_abc_replicated(req, row_kind, next_slots, 0, false)
     }
 
     /// Overlapped issue for the drain-overlap fused path: the PRIOR decode
@@ -497,7 +503,28 @@ where
         next_slots: Option<&[u32]>,
         c_prefix_rows: usize,
     ) -> OpResult<MixedStepTicket> {
-        self.issue_fused_abc_inner(req, row_kind, next_slots, c_prefix_rows, true)
+        self.issue_fused_abc_replicated(req, row_kind, next_slots, c_prefix_rows, true)
+    }
+
+    fn issue_fused_abc_replicated(
+        &mut self,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+        next_slots: Option<&[u32]>,
+        c_prefix_rows: usize,
+        overlapped: bool,
+    ) -> OpResult<MixedStepTicket> {
+        let pending = self.dispatch_peer_command(super::RuntimePeerCommand::IssueFusedAbc {
+            req: Box::new(req.clone()),
+            row_kind: row_kind.to_vec(),
+            next_slots: next_slots.map(<[u32]>::to_vec),
+            c_prefix_rows,
+            overlapped,
+        })?;
+        let local =
+            self.issue_fused_abc_inner(req, row_kind, next_slots, c_prefix_rows, overlapped);
+        let followers = self.wait_peer_command(pending);
+        super::complete_replicated(&mut self.peers, "issue_fused_abc", local, followers)
     }
 
     fn issue_fused_abc_inner(
@@ -600,13 +627,29 @@ where
         req: &StepRequest,
         row_kind: &[RaggedRowKind],
     ) -> OpResult<StepOutput> {
+        let pending = self.dispatch_peer_command(super::RuntimePeerCommand::FinalizeFusedAbc {
+            req: Box::new(req.clone()),
+            row_kind: row_kind.to_vec(),
+        })?;
+        let local = self.finalize_fused_abc_local(ticket, req, row_kind);
+        let followers = self.wait_peer_command(pending);
+        super::complete_replicated(&mut self.peers, "finalize_fused_abc", local, followers)
+    }
+
+    fn finalize_fused_abc_local(
+        &mut self,
+        ticket: MixedStepTicket,
+        req: &StepRequest,
+        row_kind: &[RaggedRowKind],
+    ) -> OpResult<StepOutput> {
         // Overlapped issue deferred the copy-out (the host mirrors belonged to
         // the then-in-flight decode step); by the time the caller finalizes
         // the fused step that step has been drained, so enqueue it now.
         if !ticket.copied_out {
             self.copy_out_mixed_abc(ticket.plan.batch)?;
         }
-        D::pipeline_synchronize_copy_out(&self.scope)?;
+        let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
+        sync_result?;
         if ticket.trace {
             // `elapsed` spans issue→sync, so it includes any host work the
             // caller overlapped between the two halves.
@@ -965,6 +1008,11 @@ where
         next_control: bool,
         control_rows: usize,
     ) -> OpResult<()> {
+        // The merge consumes C to decide emitted, active, and finished rows.
+        // Rank 0's ids must be installed on every rank before those decisions
+        // mutate the replicated decode state.
+        self.broadcast_tp_argmax(plan.batch)?;
+
         let mut a_view = self.input_ids_buf.view_raw(
             Shape::from_slice(&[plan.batch]),
             Shape::from_slice(&[plan.batch.max(1)]).contiguous_strides(),

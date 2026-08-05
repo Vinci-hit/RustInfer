@@ -122,7 +122,8 @@ pub trait FusedOps: MathOps {
         head_dim: usize,
         scale: f32,
         // `Some(ws)` → backend reuses the caller-provided `[f32; >=
-        // flash_decode_workspace_capacity_f32(batch, head_num, head_dim)]`
+        // flash_attention_workspace_capacity_f32(batch, num_tokens,
+        // head_num, head_dim)]`
         // scratch (zero alloc, capturable). `None` → backend self-allocates
         // (legacy path). The CPU reference ignores this parameter.
         workspace: Option<&mut Tensor<f32, Self>>,
@@ -131,11 +132,11 @@ pub trait FusedOps: MathOps {
         attention_paged_reference(ctx, q, kv, output, head_num, kv_head_num, head_dim, scale)
     }
 
-    /// f32 element count required by `attention_paged`'s decode workspace for
-    /// the given dims. Backends that do not need a workspace (CPU reference)
-    /// return 0. CUDA returns the flash-decode kernel's batched scratch size.
-    fn flash_decode_workspace_capacity_f32(
+    /// f32 element count required by `attention_paged` for the largest planned
+    /// decode or ragged batch. Backends that do not need scratch return 0.
+    fn flash_attention_workspace_capacity_f32(
         _batch: usize,
+        _num_tokens: usize,
         _num_q_heads: usize,
         _head_dim: usize,
     ) -> usize {

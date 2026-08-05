@@ -1,8 +1,8 @@
 use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::dtype::{Dtype, Fp8E4m3};
-use crate::domain::exec::StepCtx;
-use crate::domain::ports::OpResult;
+use crate::domain::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
 use crate::domain::ports::backend::LlmBackend;
+use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp};
 use crate::domain::tensor::Tensor;
 
 /// A linear layer's weight: dense, int4 group-quantized, or block-scaled FP8.
@@ -31,6 +31,43 @@ pub enum LinearWeight<T: Dtype, D: LlmBackend> {
         weight_scale_inv: Tensor<f32, D>,
         block: [usize; 2],
     },
+}
+
+/// How this linear's logical `[N, K]` weight is laid out across TP ranks.
+///
+/// The default is a complete, single-rank weight.  The model keeps using one
+/// `Linear` type; the loader only changes this metadata and the physical weight
+/// shape when tensor parallelism is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearParallelism {
+    /// Every rank owns the complete weight (TP1 by default; embeddings and the
+    /// LM head may also remain replicated in a multi-rank model).
+    Replicated { tp: RankPair },
+    /// The output-feature (`N`) axis is split. Each rank produces a disjoint
+    /// output slice. Most layers keep that slice local; consumers that require
+    /// the complete output can request an all-gather after the local GEMM.
+    Column { tp: RankPair, gather_output: bool },
+    /// The input-feature (`K`) axis is split. Each rank produces a partial sum
+    /// that must be all-reduced before adding bias.
+    Row { tp: RankPair },
+}
+
+impl LinearParallelism {
+    pub const SINGLE: Self = Self::Replicated {
+        tp: RankPair { rank: 0, size: 1 },
+    };
+
+    pub const fn tp(self) -> RankPair {
+        match self {
+            Self::Replicated { tp } | Self::Column { tp, .. } | Self::Row { tp } => tp,
+        }
+    }
+}
+
+impl Default for LinearParallelism {
+    fn default() -> Self {
+        Self::SINGLE
+    }
 }
 
 impl<T: Dtype, D: LlmBackend> LinearWeight<T, D> {
@@ -64,6 +101,7 @@ impl<T: Dtype, D: LlmBackend> LinearWeight<T, D> {
 pub struct Linear<T: Dtype, D: LlmBackend> {
     pub weight: LinearWeight<T, D>,
     pub bias: Option<Tensor<T, D>>,
+    parallelism: LinearParallelism,
 }
 
 impl<T: Dtype, D: LlmBackend> Linear<T, D> {
@@ -72,6 +110,7 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         Self {
             weight: LinearWeight::Dense(weight),
             bias,
+            parallelism: LinearParallelism::default(),
         }
     }
 
@@ -92,6 +131,7 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
                 scheme,
             },
             bias,
+            parallelism: LinearParallelism::default(),
         }
     }
 
@@ -110,7 +150,18 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
                 block,
             },
             bias,
+            parallelism: LinearParallelism::default(),
         }
+    }
+
+    /// Attach the sharding semantics chosen by the weight loader.
+    pub fn with_parallelism(mut self, parallelism: LinearParallelism) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+
+    pub fn parallelism(&self) -> LinearParallelism {
+        self.parallelism
     }
 
     /// Output feature count `N` (logical weight rows).
@@ -119,6 +170,115 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
     }
 
     pub fn forward(
+        &self,
+        input: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        self.validate_execution_context(ctx)?;
+
+        match self.parallelism {
+            LinearParallelism::Column {
+                tp,
+                gather_output: true,
+            } if tp.size > 1 => {
+                self.validate_gathered_column_shapes(input, output, tp, ctx)?;
+                let local_features = self.out_features();
+                let local_start = tp.rank.checked_mul(local_features).ok_or_else(|| {
+                    OpError::Shape("column-parallel Linear rank offset overflows".into())
+                })?;
+                // Write directly into this rank's columns of the gathered output.
+                // GEMM/bias honor the full-output row stride, and NCCL then
+                // uses the same view as its legal in-place AllGather send slot.
+                let mut local = output.narrow(1, local_start, local_features)?;
+                self.matmul_local(input, &mut local, ctx)?;
+                self.add_bias(&mut local, ctx)?;
+                <D as CollectiveOps>::all_gather(ctx.scope(), CommAxis::Tp, 1, &local, output)?;
+            }
+            _ => {
+                self.matmul_local(input, output, ctx)?;
+                if matches!(self.parallelism, LinearParallelism::Row { tp } if tp.size > 1) {
+                    <D as CollectiveOps>::all_reduce(
+                        ctx.scope(),
+                        CommAxis::Tp,
+                        ReduceOp::Sum,
+                        output,
+                    )?;
+                }
+                self.add_bias(output, ctx)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_execution_context(&self, ctx: &StepCtx<'_, D>) -> OpResult<()> {
+        let linear_tp = self.parallelism.tp();
+        let scope_tp = ctx.scope().topology().tp;
+        if linear_tp != scope_tp {
+            return Err(OpError::Shape(format!(
+                "Linear TP rank {}/{} does not match execution scope rank {}/{}",
+                linear_tp.rank, linear_tp.size, scope_tp.rank, scope_tp.size
+            )));
+        }
+        let collective = match self.parallelism {
+            LinearParallelism::Row { tp } if tp.size > 1 => Some((tp, "row-parallel")),
+            LinearParallelism::Column {
+                tp,
+                gather_output: true,
+            } if tp.size > 1 => Some((tp, "gathered column-parallel")),
+            _ => None,
+        };
+        if let Some((tp, kind)) = collective
+            && <D as CollectiveOps>::comm(ctx.scope(), CommAxis::Tp).is_none()
+        {
+            return Err(OpError::Kernel(format!(
+                "{kind} Linear rank {}/{} requires a TP communicator",
+                tp.rank, tp.size,
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_gathered_column_shapes(
+        &self,
+        input: &Tensor<T, D>,
+        output: &Tensor<T, D>,
+        tp: RankPair,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        let gathered_features = self.out_features().checked_mul(tp.size).ok_or_else(|| {
+            OpError::Shape("gathered column-parallel Linear output size overflows".into())
+        })?;
+        let input_shape = input.shape().as_slice();
+        let output_shape = output.shape().as_slice();
+        if input_shape.len() != 2 || output_shape != [input_shape[0], gathered_features] {
+            return Err(OpError::Shape(format!(
+                "gathered column-parallel Linear expected output [{}, {}], got {:?}",
+                input_shape.first().copied().unwrap_or(0),
+                gathered_features,
+                output_shape
+            )));
+        }
+        let scope_device = <D as ExecDevice>::device_id(ctx.scope().device());
+        for (tensor, what) in [(input, "input"), (output, "output")] {
+            if !tensor.is_contiguous() {
+                return Err(OpError::Shape(format!(
+                    "gathered column-parallel Linear {what} must be contiguous, got shape {:?}",
+                    tensor.shape().as_slice()
+                )));
+            }
+            let tensor_device = <D as ExecDevice>::device_id(tensor.device());
+            if tensor_device != scope_device {
+                return Err(OpError::Shape(format!(
+                    "gathered column-parallel Linear {what} belongs to device {}, but scope uses device {}",
+                    tensor_device.0, scope_device.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn matmul_local(
         &self,
         input: &Tensor<T, D>,
         output: &mut Tensor<T, D>,
@@ -146,6 +306,10 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
                 block,
             } => D::matmul_fp8_block(ctx.scope(), input, weight, output, weight_scale_inv, *block)?,
         }
+        Ok(())
+    }
+
+    fn add_bias(&self, output: &mut Tensor<T, D>, ctx: &StepCtx<'_, D>) -> OpResult<()> {
         if let Some(bias) = &self.bias {
             D::broadcast_add_inplace(ctx.scope(), output, bias)?;
         }
@@ -156,10 +320,53 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::exec::{HostScope, StepCtx};
+    use crate::domain::exec::{HostScope, StepCtx, TopologyShape};
     use crate::domain::plan::{BatchKind, BatchPlan};
     use crate::domain::ports::OpError;
     use crate::infrastructure::cpu::Cpu;
+
+    #[test]
+    fn linear_defaults_to_replicated_tp1() {
+        let weight = Tensor::from_host_slice(&[1.0f32], [1, 1], &Cpu).unwrap();
+        let linear = Linear::new(weight, None);
+
+        assert_eq!(linear.parallelism(), LinearParallelism::SINGLE);
+        assert_eq!(linear.parallelism().tp(), RankPair { rank: 0, size: 1 });
+    }
+
+    #[test]
+    fn row_parallel_tp2_fails_before_compute_without_a_communicator() {
+        let linear = Linear::new(
+            Tensor::from_host_slice(&[2.0f32], [1, 1], &Cpu).unwrap(),
+            None,
+        )
+        .with_parallelism(LinearParallelism::Row {
+            tp: RankPair { rank: 0, size: 2 },
+        });
+        let input = Tensor::from_host_slice(&[3.0f32], [1, 1], &Cpu).unwrap();
+        let mut output = Tensor::from_host_slice(&[0.0f32], [1, 1], &Cpu).unwrap();
+        let scope = HostScope::new(Cpu).with_topology(TopologyShape {
+            tp: RankPair { rank: 0, size: 2 },
+            ..TopologyShape::SINGLE
+        });
+        let plan = BatchPlan {
+            kind: BatchKind::DecodeOnly,
+            num_tokens: 1,
+            batch: 1,
+            q_lens: vec![1],
+            kv_lens: vec![1],
+            seq_positions: vec![0],
+            rope_positions: vec![0],
+            max_blocks_per_seq: 1,
+            block_size: 1,
+            total_q_tiles: 0,
+        };
+        let ctx = StepCtx::new(&scope, &plan);
+
+        let err = linear.forward(&input, &mut output, &ctx).unwrap_err();
+        assert!(err.to_string().contains("requires a TP communicator"));
+        assert_eq!(output.to_host_vec().unwrap(), vec![0.0]);
+    }
 
     #[test]
     fn fp8_block_weight_dispatches_to_dedicated_op() {

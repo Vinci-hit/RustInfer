@@ -21,17 +21,24 @@ use crate::domain::plan::{
 };
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::sampler::Sampler;
-use crate::domain::ports::{OpError, OpResult};
+use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
 mod abc_decode;
 mod graph_exec;
 mod mixed_abc;
+mod peer;
 mod plan;
 
 pub use graph_exec::{GraphDecision, GraphRunner, GraphSlotId};
 pub use mixed_abc::MixedStepTicket;
+use peer::PendingPeerCall;
+#[cfg(feature = "cuda")]
+pub(crate) use peer::spawn_monitored_follower;
+pub use peer::{
+    RuntimePeerCommand, RuntimePeerGroup, RuntimePeerHandle, RuntimePeerWatchdog, spawn_follower,
+};
 
 pub struct Runtime<T, D, M>
 where
@@ -120,6 +127,35 @@ where
     /// proven upper bound over every replay composition), which is what makes
     /// FA3 safe to capture. See `mixed_graph_bucket_plan` / `try_run_mixed_abc_graph`.
     mixed_fa3_graph: bool,
+    /// Thread-local TP runtimes driven by this rank-0 runtime. The concrete
+    /// follower models never cross a thread boundary; only owned logical
+    /// commands flow through this non-generic group.
+    peers: Option<RuntimePeerGroup>,
+}
+
+impl<T, D, M> Drop for Runtime<T, D, M>
+where
+    T: Dtype,
+    D: LlmBackend,
+    M: DecoderModel<T, D>,
+{
+    fn drop(&mut self) {
+        // NCCL communicator shutdown is collective across active local ranks.
+        // Mirror it while every rank thread and scope is still alive, then send
+        // the ordinary thread Shutdown/join from RuntimePeerGroup::drop.
+        let shutdown = match self.dispatch_peer_command(RuntimePeerCommand::ShutdownTpComm) {
+            Ok(pending) => {
+                let local = <D as CollectiveOps>::shutdown_comm(&self.scope, CommAxis::Tp);
+                let followers = self.wait_peer_command(pending);
+                complete_replicated(&mut self.peers, "shutdown_tp_comm", local, followers)
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = shutdown {
+            tracing::error!(error = %error, "TP communicator shutdown failed");
+        }
+        drop(self.peers.take());
+    }
 }
 
 /// Address-stable buffers for the ABC GPU-resident decode pipeline.
@@ -391,7 +427,16 @@ where
         //   RUSTINFER_MIXED_GRAPH=0     -> eager unified-FA3, uncaptured
         //   RUSTINFER_MIXED_FA3_GRAPH=0 -> eager (opt out of FA3 capture)
         let fa3_avail = D::unified_mixed_attention_available::<T>(dims.head_dim);
-        let (mixed_eager, mixed_fa3_graph) =
+        let (mixed_eager, mixed_fa3_graph) = if !scope.supports_graphs()
+            || scope.topology().tp.size > 1
+        {
+            // A zero-sized graph arena and TP both deliberately disable graph
+            // capture for mixed/ragged batches. Decode and single-sequence
+            // prefill graphs are rank-synchronized by the ordinary Step peer
+            // command; mixed graph bootstrap has a separate shape lifecycle
+            // and remains eager until that lifecycle is group-owned too.
+            (fa3_avail, false)
+        } else {
             match std::env::var("RUSTINFER_MIXED_GRAPH").ok().as_deref() {
                 Some("1") => (false, false),
                 Some("0") => (true, false),
@@ -404,7 +449,8 @@ where
                         (fa3_avail, false)
                     }
                 }
-            };
+            }
+        };
 
         Ok(Self {
             model,
@@ -433,7 +479,71 @@ where
             mixed_graph_capture_enabled: false,
             mixed_eager,
             mixed_fa3_graph,
+            peers: None,
         })
+    }
+
+    /// Attach every non-zero TP rank to this rank-0 runtime.
+    ///
+    /// Communicators are already initialized as one single-process group.
+    /// Installation waits for every follower's model/runtime construction and
+    /// checks that their rank set matches the leader topology.
+    pub fn install_peer_group(&mut self, mut peers: RuntimePeerGroup) -> OpResult<()> {
+        if self.peers.is_some() {
+            return Err(OpError::Shape(
+                "Runtime already has a TP peer group installed".into(),
+            ));
+        }
+        let tp = self.scope.topology().tp;
+        if tp.rank != 0 {
+            return Err(OpError::Shape(format!(
+                "only TP rank 0 can own runtime peers, got rank {}/{}",
+                tp.rank, tp.size
+            )));
+        }
+        if peers.len() + 1 != tp.size {
+            return Err(OpError::Shape(format!(
+                "TP topology size {} requires {} followers, got {}",
+                tp.size,
+                tp.size.saturating_sub(1),
+                peers.len()
+            )));
+        }
+        let expected: Vec<usize> = (1..tp.size).collect();
+        let actual = peers.follower_ranks();
+        if actual != expected {
+            return Err(OpError::Shape(format!(
+                "TP follower ranks must be {:?}, got {:?}",
+                expected, actual
+            )));
+        }
+        peers.wait_ready()?;
+        self.peers = Some(peers);
+        Ok(())
+    }
+
+    pub fn has_peer_group(&self) -> bool {
+        self.peers.is_some()
+    }
+
+    fn dispatch_peer_command(
+        &mut self,
+        command: RuntimePeerCommand,
+    ) -> OpResult<Option<PendingPeerCall>> {
+        self.peers
+            .as_mut()
+            .map(|peers| peers.dispatch(command))
+            .transpose()
+    }
+
+    fn wait_peer_command(&mut self, pending: Option<PendingPeerCall>) -> OpResult<()> {
+        match (self.peers.as_mut(), pending) {
+            (Some(peers), Some(pending)) => peers.wait(pending),
+            (None, None) => Ok(()),
+            _ => Err(OpError::Fatal(
+                "Runtime TP peer group changed while a command was in flight".into(),
+            )),
+        }
     }
 
     /// True when fused mixed steps default to the eager unified-attention path
@@ -449,6 +559,20 @@ where
     }
 
     pub fn step(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
+        if self.scope.topology().tp.size > 1 && !req.draft_tokens.is_empty() {
+            return Err(OpError::unsupported(
+                "tensor-parallel",
+                "speculative decoding",
+            ));
+        }
+        let pending =
+            self.dispatch_peer_command(RuntimePeerCommand::Step(Box::new(req.clone())))?;
+        let local = self.step_local(req);
+        let followers = self.wait_peer_command(pending);
+        complete_replicated(&mut self.peers, "step", local, followers)
+    }
+
+    fn step_local(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
         let plan = self.build_plan(req)?;
         self.upload_index(&plan, req)?;
         let decision = if req.sampling.iter().any(|params| !params.is_greedy()) {
@@ -468,7 +592,7 @@ where
         }
     }
 
-    pub fn step_eager(
+    fn step_eager(
         &mut self,
         plan: &crate::domain::plan::BatchPlan,
         req: &StepRequest,
@@ -569,7 +693,7 @@ where
         };
         let logits = self.model.finalize(&hidden, sample_rows, &ctx)?;
         let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
-        let (tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
+        let (mut tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
             let mut tokens: Vec<Vec<SampledToken>> =
                 if req.sampling.iter().any(|params| !params.is_greedy()) {
                     let sampled = self.sampler.sample(&logits.0, &req.sampling, &ctx)?;
@@ -681,6 +805,7 @@ where
             }
             (tokens, verify.accepted_count, speculative_len)
         };
+        synchronize_tp_sampled_tokens::<D>(&self.scope, &self.abc.argmax_out_dev, &mut tokens)?;
         // Non-speculative steps do NOT touch the pool's per-seq length map: the
         // worker (`ActiveSeq`) owns the length for ordinary decode/prefill, and
         // `build_plan` trusts the caller-provided `kv_write_start`. Only the
@@ -816,6 +941,13 @@ where
     /// throwaway profiling KV pool can hold), mirroring `prewarm_prefill_shapes`.
     /// Blocks `0..profile_len` are scratch — this runs before any admission.
     pub fn profile_forward(&mut self) -> OpResult<()> {
+        let pending = self.dispatch_peer_command(RuntimePeerCommand::ProfileForward)?;
+        let local = self.profile_forward_local();
+        let followers = self.wait_peer_command(pending);
+        complete_replicated(&mut self.peers, "profile_forward", local, followers)
+    }
+
+    fn profile_forward_local(&mut self) -> OpResult<()> {
         debug_assert!(
             self.graph.is_none(),
             "profile_forward must run before prime_graphs (eager only)"
@@ -847,7 +979,9 @@ where
             },
             draft_tokens: Vec::new(),
         };
-        self.step(&req)?;
+        // Do not call the mirrored public `step`: followers are already
+        // executing the enclosing ProfileForward command.
+        self.step_local(&req)?;
         self.scope.synchronize()?;
         Ok(())
     }
@@ -860,6 +994,14 @@ where
     /// the new ones returns the profiling pool's bytes to the device so the
     /// (typically larger) real pool can reuse them.
     pub fn resize_kv_pool(&mut self, num_blocks: usize) -> OpResult<()> {
+        let pending =
+            self.dispatch_peer_command(RuntimePeerCommand::ResizeKvPool { num_blocks })?;
+        let local = self.resize_kv_pool_local(num_blocks);
+        let followers = self.wait_peer_command(pending);
+        complete_replicated(&mut self.peers, "resize_kv_pool", local, followers)
+    }
+
+    fn resize_kv_pool_local(&mut self, num_blocks: usize) -> OpResult<()> {
         debug_assert!(
             self.graph.is_none(),
             "resize_kv_pool must run before prime_graphs (no graph may reference the old KV base)"
@@ -882,6 +1024,24 @@ where
         self.kv_pool.num_blocks = num_blocks;
         self.kv_pool.seq_kv_len.clear();
         Ok(())
+    }
+}
+
+fn complete_replicated<R>(
+    peers: &mut Option<RuntimePeerGroup>,
+    operation: &'static str,
+    local: OpResult<R>,
+    followers: OpResult<()>,
+) -> OpResult<R> {
+    match (local, followers) {
+        (Ok(value), Ok(())) => Ok(value),
+        // A follower failure poisons the collective sequence and must win over
+        // a merely local/recoverable error classification.
+        (_, Err(error)) => Err(error),
+        (Err(error), Ok(())) => match peers {
+            Some(peers) => Err(peers.poison_leader(operation, &error)),
+            None => Err(error),
+        },
     }
 }
 
@@ -984,6 +1144,57 @@ fn spec_tokens(
     Ok(out)
 }
 
+/// Install rank 0's sampled ids on every TP rank before any rank derives stop
+/// flags or commits rank-local runtime state from them.
+///
+/// Ordinary eager sampling emits exactly one token per sequence. Speculative
+/// decoding can emit a variable number per row and also needs synchronized
+/// accepted counts, so [`Runtime::step`] rejects that mode for TP before
+/// dispatching peers.
+fn synchronize_tp_sampled_tokens<D: LlmBackend>(
+    scope: &D::Scope,
+    scratch: &Tensor<i32, D>,
+    tokens: &mut [Vec<SampledToken>],
+) -> OpResult<()> {
+    let tp = scope.topology().tp;
+    if tp.size <= 1 {
+        return Ok(());
+    }
+
+    if tokens.iter().any(|row| row.len() != 1) {
+        return Err(OpError::Shape(format!(
+            "TP eager token synchronization requires one sampled token per row, got row lengths {:?}",
+            tokens.iter().map(Vec::len).collect::<Vec<_>>()
+        )));
+    }
+    let rows = tokens.len();
+    if rows > scratch.numel() {
+        return Err(OpError::Shape(format!(
+            "TP eager token synchronization rows {} exceed scratch capacity {}",
+            rows,
+            scratch.numel()
+        )));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+
+    let shape = Shape::from_slice(&[rows]);
+    let mut device_ids = scratch.view_raw(shape, shape.contiguous_strides(), 0, true);
+    if tp.rank == 0 {
+        let root_ids = tokens.iter().map(|row| row[0].token_id).collect::<Vec<_>>();
+        // Synchronous upload: `root_ids` is step-local and must remain alive
+        // until the H2D transfer has consumed it.
+        device_ids.upload_from_host(&root_ids)?;
+    }
+    <D as CollectiveOps>::broadcast(scope, CommAxis::Tp, 0, &mut device_ids)?;
+    let authoritative_ids = device_ids.to_host_vec()?;
+    for (row, token_id) in tokens.iter_mut().zip(authoritative_ids) {
+        row[0].token_id = token_id;
+    }
+    Ok(())
+}
+
 pub(super) fn finished_flags(req: &StepRequest, tokens: &[Vec<SampledToken>]) -> Vec<bool> {
     tokens
         .iter()
@@ -1020,6 +1231,12 @@ fn validate_optional_batch_len(name: &str, len: usize, batch: usize) -> OpResult
     Ok(())
 }
 
+/// KNOWN RISK(tp-async-host-lifetime): `upload_async` only enqueues the H2D
+/// copy; it does not retain `host`. Several callers pass step-local `Vec`s, and
+/// `upload_i32_full_zeropad` below creates one internally, so those allocations
+/// may be dropped before the CUDA stream consumes them. Keep this path on the
+/// safety backlog until every source uses persistent/pinned staging or an
+/// explicit completion fence.
 pub(super) unsafe fn upload_i32_prefix<D: Device>(
     device: &D,
     dst: &Tensor<i32, D>,
@@ -1100,6 +1317,12 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
+    if runtime.scope.topology().tp.size > 1 {
+        return Err(OpError::unsupported(
+            "tensor-parallel",
+            "partial hidden-state taps",
+        ));
+    }
     let plan = runtime.build_plan(req)?;
     runtime.upload_index(&plan, req)?;
     let input_ids = runtime.input_ids_tensor(req, &plan)?;
@@ -1126,16 +1349,42 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
     use super::*;
     use crate::application::sampler_stack::GreedySampler;
     use crate::domain::component::{Hidden, LayerRange, StageKind};
-    use crate::domain::exec::{HostScope, StepCtx};
+    use crate::domain::exec::{HostScope, RankPair, StepCtx, TopologyShape};
     use crate::domain::kv::KvView;
     use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
     use crate::domain::plan::{SeqStep, StopCriteria};
     use crate::infrastructure::cpu::Cpu;
 
-    struct TinyDecoder;
+    struct TinyDecoder {
+        on_drop: Option<Box<dyn FnOnce()>>,
+    }
+
+    impl TinyDecoder {
+        fn plain() -> Self {
+            Self { on_drop: None }
+        }
+
+        fn with_drop(callback: impl FnOnce() + 'static) -> Self {
+            Self {
+                on_drop: Some(Box::new(callback)),
+            }
+        }
+    }
+
+    impl Drop for TinyDecoder {
+        fn drop(&mut self) {
+            if let Some(callback) = self.on_drop.take() {
+                callback();
+            }
+        }
+    }
 
     impl DecoderModel<f32, Cpu> for TinyDecoder {
         fn dims(&self) -> ModelDims {
@@ -1281,7 +1530,7 @@ mod tests {
         let cpu = Cpu;
         let scope = HostScope::new(cpu);
         let mut runtime = Runtime::new(
-            TinyDecoder,
+            TinyDecoder::plain(),
             scope,
             Box::new(GreedySampler),
             4,
@@ -1307,7 +1556,7 @@ mod tests {
         let cpu = Cpu;
         let scope = HostScope::new(cpu);
         let mut runtime = Runtime::new(
-            TinyDecoder,
+            TinyDecoder::plain(),
             scope,
             Box::new(GreedySampler),
             4,
@@ -1358,6 +1607,158 @@ mod tests {
         assert!(runtime.kv_pool.seq_kv_len.is_empty());
     }
 
+    #[test]
+    fn runtime_peer_constructs_non_send_runtime_in_rank_thread() {
+        let topology = |rank| TopologyShape {
+            tp: RankPair { rank, size: 2 },
+            ..TopologyShape::SINGLE
+        };
+        let follower_dropped = Arc::new(AtomicBool::new(false));
+        let follower_drop_signal = Arc::clone(&follower_dropped);
+        let follower = spawn_follower::<f32, Cpu, TinyDecoder, _, _>(
+            1,
+            move |()| {
+                Runtime::new(
+                    TinyDecoder::with_drop(move || {
+                        follower_drop_signal.store(true, Ordering::Release);
+                    }),
+                    HostScope::new(Cpu).with_topology(topology(1)),
+                    Box::new(GreedySampler),
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    2,
+                    Vec::new(),
+                )
+            },
+            (),
+        )
+        .unwrap();
+
+        let leader_observed_follower = Arc::new(AtomicBool::new(false));
+        let leader_observation = Arc::clone(&leader_observed_follower);
+        let follower_state = Arc::clone(&follower_dropped);
+        let mut leader = Runtime::new(
+            TinyDecoder::with_drop(move || {
+                leader_observation.store(follower_state.load(Ordering::Acquire), Ordering::Release);
+            }),
+            HostScope::new(Cpu).with_topology(topology(0)),
+            Box::new(GreedySampler),
+            4,
+            1,
+            4,
+            4,
+            2,
+            2,
+            Vec::new(),
+        )
+        .unwrap();
+        leader
+            .install_peer_group(RuntimePeerGroup::new(vec![follower]).unwrap())
+            .unwrap();
+
+        // Speculative TP is rejected by the leader before peer dispatch. If
+        // the request reached the follower, its Unsupported result would
+        // poison the group and the resize below would fail.
+        let mut speculative = req_for_batch(2);
+        speculative.draft_tokens = vec![vec![1], vec![2]];
+        let error = leader.step(&speculative).unwrap_err();
+        assert!(matches!(
+            error,
+            OpError::Unsupported {
+                backend: "tensor-parallel",
+                op: "speculative decoding"
+            }
+        ));
+        leader.resize_kv_pool(6).unwrap();
+        assert_eq!(leader.kv_pool.num_blocks, 6);
+        drop(leader);
+        assert!(follower_dropped.load(Ordering::Acquire));
+        assert!(
+            leader_observed_follower.load(Ordering::Acquire),
+            "leader model dropped before its follower Runtime"
+        );
+    }
+
+    #[test]
+    fn runtime_peer_startup_timeout_is_fatal() {
+        let follower = spawn_follower::<f32, Cpu, TinyDecoder, _, _>(
+            1,
+            move |()| {
+                std::thread::sleep(Duration::from_millis(100));
+                Runtime::new(
+                    TinyDecoder::plain(),
+                    HostScope::new(Cpu).with_topology(TopologyShape {
+                        tp: RankPair { rank: 1, size: 2 },
+                        ..TopologyShape::SINGLE
+                    }),
+                    Box::new(GreedySampler),
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    2,
+                    Vec::new(),
+                )
+            },
+            (),
+        )
+        .unwrap();
+        let mut peers =
+            RuntimePeerGroup::with_timeout(vec![follower], Duration::from_millis(10)).unwrap();
+
+        let error = peers.wait_ready().unwrap_err();
+        assert!(error.is_fatal());
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn replicated_leader_error_poisons_peer_group() {
+        let follower = spawn_follower::<f32, Cpu, TinyDecoder, _, _>(
+            1,
+            move |()| {
+                Runtime::new(
+                    TinyDecoder::plain(),
+                    HostScope::new(Cpu).with_topology(TopologyShape {
+                        tp: RankPair { rank: 1, size: 2 },
+                        ..TopologyShape::SINGLE
+                    }),
+                    Box::new(GreedySampler),
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    2,
+                    Vec::new(),
+                )
+            },
+            (),
+        )
+        .unwrap();
+        let mut group = RuntimePeerGroup::new(vec![follower]).unwrap();
+        group.wait_ready().unwrap();
+        let mut peers = Some(group);
+
+        let result: OpResult<()> = complete_replicated(
+            &mut peers,
+            "test_operation",
+            Err(OpError::Shape("leader-only failure".into())),
+            Ok(()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.is_fatal());
+        assert!(error.to_string().contains("TP leader rank 0"));
+        let dispatch = peers
+            .as_mut()
+            .unwrap()
+            .dispatch(RuntimePeerCommand::ResizeKvPool { num_blocks: 4 });
+        assert!(dispatch.unwrap_err().is_fatal());
+    }
+
     /// The PRODUCTION serving path — the ABC pipelined decode issue/finalize
     /// halves — runs end-to-end on the CPU backend through the
     /// `DecodePipelineOps` host reference implementation. Before the port,
@@ -1367,7 +1768,7 @@ mod tests {
         let cpu = Cpu;
         let scope = HostScope::new(cpu);
         let mut runtime = Runtime::new(
-            TinyDecoder,
+            TinyDecoder::plain(),
             scope,
             Box::new(GreedySampler),
             8,

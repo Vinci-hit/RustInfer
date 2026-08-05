@@ -13,7 +13,7 @@
 //! per-step decode commands.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use half::bf16;
@@ -22,9 +22,14 @@ use serde::Deserialize;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION;
 
-use infer_worker::application::serve_loop::{Bootstrap, run_with_model};
+use infer_worker::application::serve_loop::{
+    Bootstrap, RuntimeFollowerFactory, RuntimeFollowerInit, run_with_model,
+};
+use infer_worker::application::tensor_parallel::{LocalTpBootstrap, TpRankResource};
 use infer_worker::domain::dtype::quant::QuantScheme;
-use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan};
+use infer_worker::domain::model::DecoderModel;
+use infer_worker::domain::ports::{OpError, OpResult};
+use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan, device_utils};
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
@@ -452,6 +457,76 @@ fn parse_device_id(spec: &str) -> Result<i32, String> {
         .map_err(|e: std::num::ParseIntError| format!("invalid device id: {}", e))
 }
 
+/// Build one factory per process-local TP follower. The factory is invoked
+/// inside that rank's long-lived Runtime thread, so neither the model nor its
+/// `Rc`-backed forward scratch ever crosses a thread boundary.
+fn make_follower_factories<M, F>(
+    ranks: Vec<TpRankResource>,
+    model_path: String,
+    load_cfg: LoadConfig,
+    build: F,
+) -> Vec<RuntimeFollowerFactory<M>>
+where
+    M: DecoderModel<bf16, Cuda> + 'static,
+    F: for<'a> Fn(&WeightLoader<'a>, &LoadConfig, &Cuda) -> OpResult<M> + Copy + Send + 'static,
+{
+    ranks
+        .into_iter()
+        .map(|resource| {
+            let TpRankResource {
+                global_rank,
+                global_size,
+                local_rank,
+                cuda,
+                communicator,
+            } = resource;
+            let model_path = model_path.clone();
+            let load_cfg = load_cfg.clone();
+            Box::new(move |init: RuntimeFollowerInit| {
+                if init.rank != global_rank || init.size != global_size {
+                    return Err(OpError::Shape(format!(
+                        "TP follower factory rank {global_rank}/{global_size} received init {}/{}",
+                        init.rank, init.size
+                    )));
+                }
+
+                // CUDA's current device is thread-local. The `Cuda` handles
+                // were created by the controller thread, so establish this
+                // rank's device before any allocator/model call on the new
+                // Runtime thread and keep it current for that thread's life.
+                device_utils::set_current_device(cuda.device_id).map_err(|error| {
+                    OpError::Kernel(format!(
+                        "set TP rank {global_rank} CUDA device {}: {error}",
+                        cuda.device_id
+                    ))
+                })?;
+
+                let communicator = communicator.ok_or_else(|| {
+                    OpError::Shape(format!(
+                        "TP follower rank {global_rank}/{} has no NCCL communicator",
+                        global_size
+                    ))
+                })?;
+                let scope = init.build_scope(cuda.clone(), communicator)?;
+                let reader = SafetensorsReader::open(Path::new(&model_path)).map_err(|error| {
+                    OpError::Kernel(format!("open TP rank {global_rank} weights: {error}"))
+                })?;
+                let loader = WeightLoader::with_tensor_parallel(&reader, global_rank, global_size)?;
+                let started = Instant::now();
+                let model = build(&loader, &load_cfg, &cuda)?;
+                tracing::info!(
+                    rank = global_rank,
+                    local_rank,
+                    size = global_size,
+                    elapsed_seconds = started.elapsed().as_secs_f32(),
+                    "TP follower weights loaded"
+                );
+                init.build_runtime(model, scope)
+            }) as RuntimeFollowerFactory<M>
+        })
+        .collect()
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let cfg = infer_protocol::RustInferConfig::load(&args.config)?;
@@ -521,9 +596,28 @@ fn main() -> Result<(), String> {
         }
     };
     eprintln!(
-        "[bootstrap] LoadModel: path={} max_seqs={} max_tokens={} max_model_len={}",
-        load.model_path, load.max_batch_seqs, load.max_batch_tokens, load.max_model_len,
+        "[bootstrap] LoadModel: path={} max_seqs={} max_tokens={} max_model_len={} tp={}/{} pp={}/{}",
+        load.model_path,
+        load.max_batch_seqs,
+        load.max_batch_tokens,
+        load.max_model_len,
+        load.tp_rank,
+        load.tp_size,
+        load.pp_rank,
+        load.pp_size,
     );
+    if load.pp_rank != 0 || load.pp_size != 1 {
+        return Err(format!(
+            "pipeline parallelism is not implemented; expected pp_rank/pp_size=0/1, got {}/{}",
+            load.pp_rank, load.pp_size
+        ));
+    }
+    if load.tp_rank != 0 || load.tp_size == 0 {
+        return Err(format!(
+            "single-process TP requires tp_rank=0 and tp_size>0, got tp_rank/tp_size={}/{}",
+            load.tp_rank, load.tp_size
+        ));
+    }
 
     // ── 4. Load model ──
     let device_id = parse_device_id(&load.device)?;
@@ -538,8 +632,51 @@ fn main() -> Result<(), String> {
         "[bootstrap] cuda_memory: kernel={}MiB graph={}MiB pool={}MiB",
         cuda_memory.kernel_workspace_mib, cuda_memory.graph_arena_mib, cuda_memory.pool_retain_mib,
     );
-    let cuda = Cuda::with_memory_plan(device_id, memory_plan)
-        .map_err(|e| format!("Cuda::with_memory_plan: {:?}", e))?;
+    // Deployment placement and CUDA/NCCL creation live behind one bootstrap
+    // boundary. Today the worker owns the whole global group; a future
+    // one-process-per-node path can provide a distributed constructor without
+    // changing model loading or the process-local Runtime peer loop.
+    let tp_bootstrap = LocalTpBootstrap::single_process(
+        load.tp_size,
+        device_id,
+        memory_plan,
+        Duration::from_secs(cfg.tp_startup_timeout_secs),
+    )
+    .map_err(|error| format!("initialize local TP ranks: {error}"))?;
+    let tp_placement = tp_bootstrap.placement();
+    if load.tp_rank != tp_placement.local_rank_start() {
+        return Err(format!(
+            "LoadModel leader rank {}/{} does not match process-local TP rank start {}",
+            load.tp_rank,
+            load.tp_size,
+            tp_placement.local_rank_start()
+        ));
+    }
+    let all_devices = tp_bootstrap.devices();
+    let mut rank_resources = tp_bootstrap.into_ranks();
+    for resource in &rank_resources {
+        eprintln!(
+            "[bootstrap] TP global rank {}/{} (local rank {}) -> cuda:{}",
+            resource.global_rank,
+            tp_placement.global_size(),
+            resource.local_rank,
+            resource.cuda.device_id
+        );
+    }
+    let leader = rank_resources.remove(0);
+    let cuda = leader.cuda;
+    let leader_communicator = leader.communicator;
+    let follower_ranks = rank_resources;
+    if follower_ranks.len() != tp_placement.local_rank_count().saturating_sub(1) {
+        return Err(format!(
+            "TP{} process placement requires {} followers, got {}",
+            tp_placement.global_size(),
+            tp_placement.local_rank_count().saturating_sub(1),
+            follower_ranks.len()
+        ));
+    }
+    device_utils::set_current_device(cuda.device_id)
+        .map_err(|error| format!("set TP rank 0 CUDA device {}: {error}", cuda.device_id))?;
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
@@ -560,7 +697,8 @@ fn main() -> Result<(), String> {
 
     let st_path = Path::new(&load.model_path);
     let reader = SafetensorsReader::open(st_path).map_err(|e| format!("open weights: {}", e))?;
-    let loader = WeightLoader::new(&reader);
+    let loader = WeightLoader::with_tensor_parallel(&reader, load.tp_rank, load.tp_size)
+        .map_err(|e| format!("invalid tensor-parallel topology: {}", e))?;
     let load_start = Instant::now();
 
     // Reconcile the config's quant claim with the actual weights: only enable
@@ -622,6 +760,7 @@ fn main() -> Result<(), String> {
 
     let make_bootstrap = || Bootstrap {
         load: &load,
+        tp_placement,
         cuda: &cuda,
         load_cfg: &load_cfg,
         max_seq_len,
@@ -630,12 +769,22 @@ fn main() -> Result<(), String> {
         server_heartbeat_ms,
         model_type: model_type.clone(),
         capture_sizes: cfg.capture_sizes.clone(),
+        peer_timeout: Duration::from_secs(cfg.tp_operation_timeout_secs),
+        peer_startup_timeout: Duration::from_secs(cfg.tp_startup_timeout_secs),
+        tp_communicator: leader_communicator.clone(),
+        tp_devices: &all_devices,
     };
 
     match model_type.as_str() {
         "llama3" => {
             let model = llama3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("llama3::build: {:?}", e))?;
+            let followers = make_follower_factories(
+                follower_ranks,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                llama3::build::<bf16, Cuda>,
+            );
             eprintln!(
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
@@ -645,6 +794,7 @@ fn main() -> Result<(), String> {
                 &data,
                 model,
                 make_bootstrap(),
+                followers,
                 &eos_ids,
                 args.profile_cuda_steps,
             )?;
@@ -652,6 +802,12 @@ fn main() -> Result<(), String> {
         "qwen3" => {
             let model = qwen3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("qwen3::build: {:?}", e))?;
+            let followers = make_follower_factories(
+                follower_ranks,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                qwen3::build::<bf16, Cuda>,
+            );
             eprintln!(
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
@@ -661,6 +817,7 @@ fn main() -> Result<(), String> {
                 &data,
                 model,
                 make_bootstrap(),
+                followers,
                 &eos_ids,
                 args.profile_cuda_steps,
             )?;
@@ -668,6 +825,12 @@ fn main() -> Result<(), String> {
         "qwen3_moe" => {
             let model = qwen3_moe::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("qwen3_moe::build: {:?}", e))?;
+            let followers = make_follower_factories(
+                follower_ranks,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                qwen3_moe::build::<bf16, Cuda>,
+            );
             eprintln!(
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
@@ -677,6 +840,7 @@ fn main() -> Result<(), String> {
                 &data,
                 model,
                 make_bootstrap(),
+                followers,
                 &eos_ids,
                 args.profile_cuda_steps,
             )?;

@@ -6,6 +6,9 @@
 // boundary without making the launches safer.
 #![allow(clippy::too_many_arguments)]
 
+use crate::config::CudaDeviceInfo;
+use infer_core::ports::{OpError, OpResult};
+
 // Zero-cost dtype dispatch: per-kernel binding traits (`CudaFloat` supertrait)
 // plus the single `narrow_float!` narrowing point used at the `MathOps for
 // Cuda` boundary. See `dtype_kernel.rs`.
@@ -45,3 +48,41 @@ pub mod sdpa;
 // --- no-cu (pure Rust / cudnn) modules, kept flat ---
 pub mod concat_seq;
 pub mod conv2d;
+
+/// One CUDA kernel family's fixed, per-device initialization hook.
+///
+/// Keep shape-dependent plan caches and request workspaces out of this table:
+/// entries here may depend only on immutable [`CudaDeviceInfo`] and must finish
+/// before NCCL setup, warmup, graph capture, or the first forward.
+struct DeviceInitializer {
+    name: &'static str,
+    run: fn(CudaDeviceInfo) -> OpResult<()>,
+}
+
+const DEVICE_INITIALIZERS: &[DeviceInitializer] = &[
+    DeviceInitializer {
+        name: "matmul",
+        run: matmul::init_device,
+    },
+    DeviceInitializer {
+        name: "flash_attn_gqa",
+        run: flash_attn_gqa::init_device,
+    },
+];
+
+/// Initialize every kernel family for the active CUDA device.
+///
+/// The caller owns device selection. Initializers are deliberately idempotent
+/// and lock-free so constructing two backend handles for one device is safe and
+/// a failed attempt can be retried without process-global state.
+pub(crate) fn initialize_device(info: CudaDeviceInfo) -> OpResult<()> {
+    for initializer in DEVICE_INITIALIZERS {
+        (initializer.run)(info).map_err(|error| {
+            OpError::Kernel(format!(
+                "CUDA device {} initializer '{}': {error}",
+                info.device_id, initializer.name
+            ))
+        })?;
+    }
+    Ok(())
+}

@@ -288,8 +288,11 @@ Config is a single TOML shared by all three processes. Key fields:
 |-------------------------|---------|
 | `model`                 | Path to the HF model directory (config + safetensors + tokenizer). |
 | `model_name`            | Name reported by the `/v1` API. |
-| `device`                | e.g. `cuda:0`. |
+| `device`                | Rank-0 CUDA device, e.g. `cuda:0`; TP ranks use consecutive devices. |
+| `tensor_parallel_size`  | Number of GPUs in the single-process TP group (`1` = disabled). |
 | `port`                  | HTTP port for the server. |
+| `tp_operation_timeout_secs` | Fail-stop deadline for one mirrored TP inference operation. |
+| `tp_startup_timeout_secs` | Longer fail-stop deadline for NCCL and follower startup. |
 | `max_batch_tokens`      | Token budget per forward batch. |
 | `max_batch_seqs`        | Max concurrent sequences in a batch. |
 | `max_model_len`         | Max context length. |
@@ -299,6 +302,33 @@ Config is a single TOML shared by all three processes. Key fields:
 | `num_blocks`            | KV-cache blocks (`0` = auto-size from a memory profile). |
 | `capture_sizes`         | Batch sizes to capture CUDA graphs for, e.g. `[1,2,4,8,16,24,32]`. |
 | `ignore_eos`            | Ignore EOS (useful for fixed-length benchmarking). |
+
+### Tensor parallelism
+
+Tensor parallelism is disabled by default. To shard a dense BF16 model over two
+GPUs, set the shared configuration to:
+
+```toml
+device = "cuda:0"
+tensor_parallel_size = 2
+```
+
+One worker process owns the complete TP group. Rank 0 uses `device`; the other
+ranks use consecutive CUDA device IDs, so this example uses `cuda:0` and
+`cuda:1`. The CUDA backend requires NCCL 2.24.3 or newer; the Docker image
+already includes the matching development and runtime packages.
+
+The implementation supports single-node dense BF16 and block-FP8 Llama/Qwen
+decoders. Vocabulary size, query/KV head counts, MLP intermediate size, and FP8
+weight/scale block boundaries must be evenly divisible by
+`tensor_parallel_size`.
+
+CUDA Graph capture is enabled for TP decode and single-sequence prefill. Every
+rank captures its own device graph and replays the same NCCL collective sequence
+in lockstep. Mixed prefill+decode batches currently stay eager. TP with AWQ
+weights, speculative decoding, pipeline parallelism, data parallelism, and
+expert parallelism are not implemented yet; unsupported combinations fail
+during startup instead of silently falling back to replicated execution.
 
 ---
 

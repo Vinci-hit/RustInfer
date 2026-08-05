@@ -25,14 +25,11 @@ void add_kernel_bf16x8(
     const __nv_bfloat16* a,
     const __nv_bfloat16* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 )
 {
     constexpr int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     auto* c_f4 = reinterpret_cast<float4*>(c);
     auto* a_f4 = reinterpret_cast<const float4*>(a);
@@ -60,14 +57,11 @@ void add_inplace_kernel_bf16x8(
     __nv_bfloat16* a_and_c,
     const __nv_bfloat16* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 )
 {
     constexpr int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     auto* a_and_c_f4 = reinterpret_cast<float4*>(a_and_c);
     auto* b_f4 = reinterpret_cast<const float4*>(b);
@@ -106,16 +100,13 @@ void add_kernel_float2_forward(
     const float* a,
     const float* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 ) {
     // 元素总数要除以 2，因为我们现在以 float2 为单位
     int num_float2_elements = num_elements / 2;
 
     const int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     float2* c_f2 = reinterpret_cast<float2*>(c);
     const float2* a_f2 = reinterpret_cast<const float2*>(a);
@@ -133,14 +124,11 @@ void add_inplace_kernel_float2_forward(
     float* a_and_c,
     const float* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 ) {
     int num_float2_elements = num_elements / 2;
     const int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
 
     float2* a_and_c_f2 = reinterpret_cast<float2*>(a_and_c);
@@ -182,14 +170,11 @@ extern "C" void add_kernel_fp16x8(
     const __half* a,
     const __half* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 )
 {
     constexpr int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     auto* c_f4 = reinterpret_cast<float4*>(c);
     auto* a_f4 = reinterpret_cast<const float4*>(a);
@@ -219,17 +204,13 @@ extern "C" void add_inplace_kernel_fp16x8(
     __half* a_and_c,
     const __half* b,
     int num_elements,
+    int num_sm,
     cudaStream_t stream
 )
 {
     constexpr int threads_per_block = 256;
-    int num_sm = 0;
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, device);
     const int blocks_per_grid = num_sm * 8;
     auto* a_and_c_f4 = reinterpret_cast<float4*>(a_and_c);
     auto* b_f4 = reinterpret_cast<const float4*>(b);
     fp16_inplace_vec8_add_kernel<<<blocks_per_grid, threads_per_block, 0, stream>>>(a_and_c_f4, b_f4, num_elements / 8);
 }
-

@@ -42,7 +42,7 @@ rustinfer_discover_cuda_libraries() {
 import importlib.util
 from pathlib import Path
 
-for module in ("nvidia.cublas", "nvidia.cuda_runtime", "nvidia.cudnn"):
+for module in ("nvidia.cublas", "nvidia.cuda_runtime", "nvidia.cudnn", "nvidia.nccl"):
     try:
         spec = importlib.util.find_spec(module)
     except (ImportError, AttributeError, ValueError):
@@ -63,7 +63,8 @@ PY
     for candidate in "${candidates[@]}"; do
         if compgen -G "${candidate}/libcublas.so*" >/dev/null \
             || compgen -G "${candidate}/libcudart.so*" >/dev/null \
-            || compgen -G "${candidate}/libcudnn.so*" >/dev/null; then
+            || compgen -G "${candidate}/libcudnn.so*" >/dev/null \
+            || compgen -G "${candidate}/libnccl.so*" >/dev/null; then
             rustinfer_prepend_library_path "$candidate"
         fi
     done

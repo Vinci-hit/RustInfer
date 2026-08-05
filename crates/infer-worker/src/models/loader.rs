@@ -10,9 +10,11 @@
 use safetensors::tensor::TensorView;
 
 use super::layers::{Embedding, Linear, RMSNorm};
-use crate::components::Linear as CompLinear;
+use crate::components::embed::{Embed as CompEmbed, EmbeddingParallelism};
+use crate::components::linear::{Linear as CompLinear, LinearParallelism};
 use crate::domain::dtype::Fp8E4m3;
 use crate::domain::dtype::quant::QuantScheme;
+use crate::domain::exec::RankPair;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
@@ -81,6 +83,7 @@ impl LinearAttnConfig {
 }
 
 /// Configuration for model loading.
+#[derive(Debug, Clone)]
 pub struct LoadConfig {
     pub dim: usize,
     pub intermediate_size: usize,
@@ -132,12 +135,46 @@ pub struct LoadConfig {
 /// typed model structs. The reader is borrowed (no copy until upload).
 pub struct WeightLoader<'a> {
     reader: &'a SafetensorsReader,
+    tp: RankPair,
 }
 
 impl<'a> WeightLoader<'a> {
-    /// Wrap a reader. The reader owns the mmap; the loader only borrows.
+    /// Wrap a reader for the default single-rank load. The reader owns the
+    /// mmap; the loader only borrows.
     pub fn new(reader: &'a SafetensorsReader) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            tp: RankPair { rank: 0, size: 1 },
+        }
+    }
+
+    /// Wrap a reader and select the shard uploaded by this TP worker.
+    pub fn with_tensor_parallel(
+        reader: &'a SafetensorsReader,
+        rank: usize,
+        size: usize,
+    ) -> OpResult<Self> {
+        let tp = validate_tp(RankPair { rank, size })?;
+        Ok(Self { reader, tp })
+    }
+
+    pub fn tensor_parallel(&self) -> RankPair {
+        self.tp
+    }
+
+    /// Convert a global dimension into this rank's even local shard size.
+    pub(crate) fn local_shard_size(&self, what: &str, global: usize) -> OpResult<usize> {
+        even_shard_range(what, global, self.tp).map(|(_, len)| len)
+    }
+
+    fn require_tp1(&self, what: &str) -> OpResult<()> {
+        if self.tp.size != 1 {
+            return Err(OpError::Kernel(format!(
+                "{} does not support TP{} yet; only dense BF16/F16/F32 weights can be sharded",
+                what, self.tp.size
+            )));
+        }
+        Ok(())
     }
 
     /// Whether a tensor with this name exists in the underlying file(s).
@@ -179,10 +216,11 @@ impl<'a> WeightLoader<'a> {
         Ok(Linear::new(weight, bias))
     }
 
-    /// Load a decoder Linear, preserving a configured block-FP8 weight and its
-    /// inverse-scale grid on device. Without `fp8_block`, this constructs the
-    /// same dense component as [`Self::load_linear`].
-    pub fn load_linear_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
+    /// Load a row-parallel decoder Linear by sharding the input-feature axis.
+    /// A configured block-FP8 weight stays quantized on device; its weight
+    /// columns and inverse-scale columns are sharded on identical block
+    /// boundaries.
+    pub fn load_row_parallel_linear_with_fp8<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
         weight_name: &str,
         bias_name: Option<&str>,
@@ -190,8 +228,27 @@ impl<'a> WeightLoader<'a> {
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
         let Some(block) = fp8_block else {
-            let dense = self.load_linear::<T, D>(weight_name, bias_name, device)?;
-            return Ok(CompLinear::new(dense.weight, dense.bias));
+            let view = self.reader.read_view(weight_name).map_err(|e| {
+                OpError::Kernel(format!("tensor '{}' not found: {}", weight_name, e))
+            })?;
+            let host = prepare_matrix_shard::<T>(
+                weight_name,
+                &view,
+                MatrixShardAxis::InputColumns,
+                self.tp,
+            )?;
+            let weight = Tensor::<T, D>::from_host_bytes(
+                &host.bytes,
+                Shape::from_slice(&host.shape),
+                device,
+            )?;
+            let bias = if let Some(bn) = bias_name {
+                Some(self.load_tensor::<T, D>(bn, device)?)
+            } else {
+                None
+            };
+            return Ok(CompLinear::new(weight, bias)
+                .with_parallelism(LinearParallelism::Row { tp: self.tp }));
         };
 
         let view = self
@@ -210,7 +267,13 @@ impl<'a> WeightLoader<'a> {
             weight: view,
             scale_inv: scale_view,
         }];
-        let host = prepare_fp8_fused_host(&parts, block, weight_name)?;
+        let host = prepare_fp8_fused_shard(
+            &parts,
+            block,
+            MatrixShardAxis::InputColumns,
+            self.tp,
+            weight_name,
+        )?;
         let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
             &host.weight,
             Shape::from_slice(&host.weight_shape),
@@ -226,7 +289,8 @@ impl<'a> WeightLoader<'a> {
         } else {
             None
         };
-        Ok(CompLinear::from_fp8_block(weight, scales, block, bias))
+        Ok(CompLinear::from_fp8_block(weight, scales, block, bias)
+            .with_parallelism(LinearParallelism::Row { tp: self.tp }))
     }
 
     /// Load an RMSNorm layer.
@@ -248,6 +312,97 @@ impl<'a> WeightLoader<'a> {
     ) -> OpResult<Embedding<T, D>> {
         let table = self.load_tensor::<T, D>(name, device)?;
         Ok(Embedding { table })
+    }
+
+    /// Load an LLM token embedding table sharded over vocabulary rows.
+    ///
+    /// The checkpoint tensor remains logically `[global_vocab_size, dim]`;
+    /// only this rank's contiguous row range is uploaded. The returned
+    /// component owns the corresponding global-id offset so its forward can
+    /// mask non-local token ids before the TP all-reduce.
+    pub fn load_vocab_parallel_embedding<T: Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        name: &str,
+        global_vocab_size: usize,
+        dim: usize,
+        device: &D,
+    ) -> OpResult<CompEmbed<T, D>> {
+        let view = self
+            .reader
+            .read_view(name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))?;
+        validate_matrix_shape(name, &view, global_vocab_size, dim)?;
+        let (vocab_start, _) = even_shard_range(name, global_vocab_size, self.tp)?;
+        let host = prepare_matrix_shard::<T>(name, &view, MatrixShardAxis::OutputRows, self.tp)?;
+        let table =
+            Tensor::<T, D>::from_host_bytes(&host.bytes, Shape::from_slice(&host.shape), device)?;
+        let parallelism = if self.tp.size == 1 {
+            EmbeddingParallelism::Replicated { tp: self.tp }
+        } else {
+            EmbeddingParallelism::Vocab {
+                tp: self.tp,
+                vocab_start,
+                global_vocab_size,
+            }
+        };
+        Ok(CompEmbed::new(table).with_parallelism(parallelism))
+    }
+
+    /// Load an LM-head weight sharded over its output/vocabulary rows.
+    /// An optional output bias is sliced over exactly the same row range.
+    pub fn load_vocab_parallel_linear<T: Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        weight_name: &str,
+        bias_name: Option<&str>,
+        global_vocab_size: usize,
+        dim: usize,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let view = self
+            .reader
+            .read_view(weight_name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", weight_name, e)))?;
+        validate_matrix_shape(weight_name, &view, global_vocab_size, dim)?;
+        let host =
+            prepare_matrix_shard::<T>(weight_name, &view, MatrixShardAxis::OutputRows, self.tp)?;
+        let weight =
+            Tensor::<T, D>::from_host_bytes(&host.bytes, Shape::from_slice(&host.shape), device)?;
+        self.vocab_parallel_linear_from_weight(weight, bias_name, global_vocab_size, device)
+    }
+
+    /// Wrap an already-loaded local vocabulary shard as an LM head.
+    ///
+    /// This is the tied-weight path: callers clone the local embedding tensor,
+    /// which shares its allocation, then this method only attaches the LM-head
+    /// parallel semantics and (when present) loads the matching local bias.
+    pub fn vocab_parallel_linear_from_weight<T: Dtype, D: OpBackend + LlmBackend>(
+        &self,
+        weight: Tensor<T, D>,
+        bias_name: Option<&str>,
+        global_vocab_size: usize,
+        device: &D,
+    ) -> OpResult<CompLinear<T, D>> {
+        let bias = match bias_name {
+            Some(name) => {
+                Some(self.load_vocab_parallel_bias::<T, D>(name, global_vocab_size, device)?)
+            }
+            None => None,
+        };
+        make_vocab_parallel_linear(weight, bias, self.tp, global_vocab_size)
+    }
+
+    fn load_vocab_parallel_bias<T: Dtype, D: MemoryPort>(
+        &self,
+        name: &str,
+        global_vocab_size: usize,
+        device: &D,
+    ) -> OpResult<Tensor<T, D>> {
+        let view = self
+            .reader
+            .read_view(name)
+            .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))?;
+        let host = prepare_vector_shard::<T>(name, &view, global_vocab_size, self.tp)?;
+        Tensor::<T, D>::from_host_bytes(&host.bytes, Shape::from_slice(&[host.len]), device)
     }
 
     /// Load fused QKV: concatenate q/k/v_proj along rows → [q_dim+2*kv_dim, dim].
@@ -285,13 +440,16 @@ impl<'a> WeightLoader<'a> {
         validate_matrix_shape(&k_name, &k_view, kv_dim, dim)?;
         validate_matrix_shape(&v_name, &v_view, kv_dim, dim)?;
 
-        let total_rows = q_dim + 2 * kv_dim;
-        let mut host = Vec::with_capacity(total_rows * dim * T::SIZE_BYTES);
-        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&q_view)?);
-        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&k_view)?);
-        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&v_view)?);
+        // Q/K/V must be sharded independently before fusion. Taking one
+        // contiguous slice from the globally fused [Q; K; V] matrix would mix
+        // projection boundaries for every rank after rank 0.
+        let host = prepare_fused_output_shards::<T>(
+            "fused QKV",
+            &[(&q_name, &q_view), (&k_name, &k_view), (&v_name, &v_view)],
+            self.tp,
+        )?;
         let fused =
-            Tensor::<T, D>::from_host_bytes(&host, Shape::from_slice(&[total_rows, dim]), device)?;
+            Tensor::<T, D>::from_host_bytes(&host.bytes, Shape::from_slice(&host.shape), device)?;
         Ok(Linear::new(fused, None))
     }
 
@@ -309,7 +467,12 @@ impl<'a> WeightLoader<'a> {
     ) -> OpResult<CompLinear<T, D>> {
         let Some(block) = fp8_block else {
             let dense = self.load_fused_qkv::<T, D>(prefix, q_dim, kv_dim, dim, device)?;
-            return Ok(CompLinear::new(dense.weight, dense.bias));
+            return Ok(CompLinear::new(dense.weight, dense.bias).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ));
         };
 
         let q_name = format!("{}.self_attn.q_proj.weight", prefix);
@@ -351,7 +514,7 @@ impl<'a> WeightLoader<'a> {
                 scale_inv: v_scale,
             },
         ];
-        let host = prepare_fp8_fused_host(&parts, block, "fused_qkv")?;
+        let host = prepare_fp8_fused_output_shards(&parts, block, self.tp, "fused_qkv")?;
         let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
             &host.weight,
             Shape::from_slice(&host.weight_shape),
@@ -362,7 +525,14 @@ impl<'a> WeightLoader<'a> {
             Shape::from_slice(&host.scale_shape),
             device,
         )?;
-        Ok(CompLinear::from_fp8_block(weight, scales, block, None))
+        Ok(
+            CompLinear::from_fp8_block(weight, scales, block, None).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ),
+        )
     }
 
     /// Load fused gate_up: concatenate gate_proj, up_proj along rows
@@ -390,12 +560,13 @@ impl<'a> WeightLoader<'a> {
 
         validate_matrix_shape(&gate_name, &gate_view, intermediate_size, dim)?;
         validate_matrix_shape(&up_name, &up_view, intermediate_size, dim)?;
-        let total_rows = 2 * intermediate_size;
-        let mut host = Vec::with_capacity(total_rows * dim * T::SIZE_BYTES);
-        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&gate_view)?);
-        host.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&up_view)?);
+        let host = prepare_fused_output_shards::<T>(
+            "fused gate/up",
+            &[(&gate_name, &gate_view), (&up_name, &up_view)],
+            self.tp,
+        )?;
         let fused =
-            Tensor::<T, D>::from_host_bytes(&host, Shape::from_slice(&[total_rows, dim]), device)?;
+            Tensor::<T, D>::from_host_bytes(&host.bytes, Shape::from_slice(&host.shape), device)?;
         Ok(Linear::new(fused, None))
     }
 
@@ -412,7 +583,12 @@ impl<'a> WeightLoader<'a> {
     ) -> OpResult<CompLinear<T, D>> {
         let Some(block) = fp8_block else {
             let dense = self.load_fused_gate_up::<T, D>(prefix, intermediate_size, dim, device)?;
-            return Ok(CompLinear::new(dense.weight, dense.bias));
+            return Ok(CompLinear::new(dense.weight, dense.bias).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ));
         };
 
         let gate_name = format!("{}.mlp.gate_proj.weight", prefix);
@@ -451,7 +627,7 @@ impl<'a> WeightLoader<'a> {
                 scale_inv: up_scale,
             },
         ];
-        let host = prepare_fp8_fused_host(&parts, block, "fused_gate_up")?;
+        let host = prepare_fp8_fused_output_shards(&parts, block, self.tp, "fused_gate_up")?;
         let weight = Tensor::<Fp8E4m3, D>::from_host_bytes(
             &host.weight,
             Shape::from_slice(&host.weight_shape),
@@ -462,7 +638,14 @@ impl<'a> WeightLoader<'a> {
             Shape::from_slice(&host.scale_shape),
             device,
         )?;
-        Ok(CompLinear::from_fp8_block(weight, scales, block, None))
+        Ok(
+            CompLinear::from_fp8_block(weight, scales, block, None).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ),
+        )
     }
 
     // ─── AWQ / compressed-tensors `pack-quantized` MLP loading ───────────────
@@ -515,10 +698,12 @@ impl<'a> WeightLoader<'a> {
         scheme: QuantScheme,
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
+        self.require_tp1("AWQ row-parallel Linear")?;
         let packed = self.load_tensor::<i32, D>(&format!("{}.weight_packed", prefix), device)?;
         let zeros = self.load_tensor::<i32, D>(&format!("{}.weight_zero_point", prefix), device)?;
         let scales = self.load_tensor::<T, D>(&format!("{}.weight_scale", prefix), device)?;
-        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None))
+        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None)
+            .with_parallelism(LinearParallelism::Row { tp: self.tp }))
     }
 
     /// Load int4 `gate_proj` + `up_proj` fused along rows into one quantized
@@ -530,6 +715,7 @@ impl<'a> WeightLoader<'a> {
         scheme: QuantScheme,
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
+        self.require_tp1("AWQ column-parallel gate/up")?;
         let view = |proj: &str, part: &str| -> OpResult<TensorView<'_>> {
             let name = format!("{}.{}.{}", mlp_prefix, proj, part);
             self.reader
@@ -554,11 +740,282 @@ impl<'a> WeightLoader<'a> {
             "fused_gate_up_awq scales",
             device,
         )?;
-        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None))
+        Ok(
+            CompLinear::from_awq(packed, zeros, scales, scheme, None).with_parallelism(
+                LinearParallelism::Column {
+                    tp: self.tp,
+                    gather_output: false,
+                },
+            ),
+        )
     }
 }
 
 // ─── Internal: convert safetensor view to Tensor<T, D> ───────────────────────
+
+fn make_vocab_parallel_linear<T: Dtype, D: LlmBackend>(
+    weight: Tensor<T, D>,
+    bias: Option<Tensor<T, D>>,
+    tp: RankPair,
+    global_vocab_size: usize,
+) -> OpResult<CompLinear<T, D>> {
+    let (_, expected_local) = even_shard_range("LM head vocabulary", global_vocab_size, tp)?;
+    let weight_shape = weight.shape().as_slice();
+    if weight_shape.len() != 2 || weight_shape[0] != expected_local {
+        return Err(OpError::Shape(format!(
+            "LM head local weight must have {} rows for rank {}/{}, got {:?}",
+            expected_local, tp.rank, tp.size, weight_shape
+        )));
+    }
+    if let Some(local_bias) = &bias
+        && local_bias.shape().as_slice() != [expected_local]
+    {
+        return Err(OpError::Shape(format!(
+            "LM head local bias must have shape [{}] for rank {}/{}, got {:?}",
+            expected_local,
+            tp.rank,
+            tp.size,
+            local_bias.shape().as_slice()
+        )));
+    }
+    let parallelism = if tp.size == 1 {
+        LinearParallelism::Replicated { tp }
+    } else {
+        LinearParallelism::Column {
+            tp,
+            gather_output: true,
+        }
+    };
+    Ok(CompLinear::new(weight, bias).with_parallelism(parallelism))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixShardAxis {
+    /// Column-parallel Linear: split logical `[N, K]` on `N`.
+    OutputRows,
+    /// Row-parallel Linear: split logical `[N, K]` on `K`.
+    InputColumns,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MatrixShardHost {
+    bytes: Vec<u8>,
+    shape: [usize; 2],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct VectorShardHost {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+fn validate_tp(tp: RankPair) -> OpResult<RankPair> {
+    if tp.size == 0 {
+        return Err(OpError::Shape(
+            "tensor parallel size must be nonzero".into(),
+        ));
+    }
+    if tp.rank >= tp.size {
+        return Err(OpError::Shape(format!(
+            "tensor parallel rank {} is outside size {}",
+            tp.rank, tp.size
+        )));
+    }
+    Ok(tp)
+}
+
+fn even_shard_range(what: &str, global: usize, tp: RankPair) -> OpResult<(usize, usize)> {
+    let tp = validate_tp(tp)?;
+    if global == 0 {
+        return Err(OpError::Shape(format!(
+            "{}: cannot shard an empty dimension",
+            what
+        )));
+    }
+    if !global.is_multiple_of(tp.size) {
+        return Err(OpError::Shape(format!(
+            "{}: dimension {} is not divisible by TP size {}",
+            what, global, tp.size
+        )));
+    }
+    let local = global / tp.size;
+    Ok((tp.rank * local, local))
+}
+
+/// Cast a rank-2 safetensor to `T`, then retain only this rank's matrix shard.
+/// The returned host buffer is contiguous and is the only data uploaded to the
+/// device. Row shards are contiguous; column shards are gathered row by row.
+fn prepare_matrix_shard<T: Dtype>(
+    name: &str,
+    view: &TensorView<'_>,
+    axis: MatrixShardAxis,
+    tp: RankPair,
+) -> OpResult<MatrixShardHost> {
+    let shape = view.shape();
+    if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
+        return Err(OpError::Shape(format!(
+            "tensor '{}': TP sharding requires a non-empty rank-2 matrix, got {:?}",
+            name, shape
+        )));
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    let src_dtype = st_dtype(view)?;
+    let src_elem_bytes = src_dtype.size_in_bytes();
+    let expected_src_bytes = rows
+        .checked_mul(cols)
+        .and_then(|numel| numel.checked_mul(src_elem_bytes))
+        .ok_or_else(|| OpError::Shape(format!("tensor '{}': byte size overflows", name)))?;
+    if view.data().len() != expected_src_bytes {
+        return Err(OpError::Shape(format!(
+            "tensor '{}': byte length {} does not match shape {:?} and dtype {:?}",
+            name,
+            view.data().len(),
+            shape,
+            view.dtype()
+        )));
+    }
+
+    match axis {
+        MatrixShardAxis::OutputRows => {
+            let (row_start, local_rows) = even_shard_range(name, rows, tp)?;
+            let src_row_bytes = cols.checked_mul(src_elem_bytes).ok_or_else(|| {
+                OpError::Shape(format!("tensor '{}': row byte size overflows", name))
+            })?;
+            let byte_start = row_start.checked_mul(src_row_bytes).ok_or_else(|| {
+                OpError::Shape(format!("tensor '{}': shard offset overflows", name))
+            })?;
+            let byte_len = local_rows.checked_mul(src_row_bytes).ok_or_else(|| {
+                OpError::Shape(format!("tensor '{}': shard byte size overflows", name))
+            })?;
+            Ok(MatrixShardHost {
+                bytes: convert_host_bytes::<T>(
+                    &view.data()[byte_start..byte_start + byte_len],
+                    src_dtype,
+                    local_rows * cols,
+                    name,
+                )?,
+                shape: [local_rows, cols],
+            })
+        }
+        MatrixShardAxis::InputColumns => {
+            let (col_start, local_cols) = even_shard_range(name, cols, tp)?;
+            let local_src_row_bytes = local_cols.checked_mul(src_elem_bytes).ok_or_else(|| {
+                OpError::Shape(format!("tensor '{}': local row byte size overflows", name))
+            })?;
+            let capacity = rows.checked_mul(local_src_row_bytes).ok_or_else(|| {
+                OpError::Shape(format!("tensor '{}': shard byte size overflows", name))
+            })?;
+            let mut src_shard = Vec::with_capacity(capacity);
+            for row in 0..rows {
+                let elem_start = row
+                    .checked_mul(cols)
+                    .and_then(|offset| offset.checked_add(col_start))
+                    .ok_or_else(|| {
+                        OpError::Shape(format!("tensor '{}': shard offset overflows", name))
+                    })?;
+                let byte_start = elem_start.checked_mul(src_elem_bytes).ok_or_else(|| {
+                    OpError::Shape(format!("tensor '{}': shard offset overflows", name))
+                })?;
+                src_shard
+                    .extend_from_slice(&view.data()[byte_start..byte_start + local_src_row_bytes]);
+            }
+            Ok(MatrixShardHost {
+                bytes: convert_host_bytes::<T>(&src_shard, src_dtype, rows * local_cols, name)?,
+                shape: [rows, local_cols],
+            })
+        }
+    }
+}
+
+/// Cast a rank-1 output bias to `T`, then retain the same even vocabulary
+/// range used by the corresponding row-sharded LM-head matrix.
+fn prepare_vector_shard<T: Dtype>(
+    name: &str,
+    view: &TensorView<'_>,
+    expected_len: usize,
+    tp: RankPair,
+) -> OpResult<VectorShardHost> {
+    if view.shape() != [expected_len] {
+        return Err(OpError::Shape(format!(
+            "tensor '{}': expected bias shape [{}], got {:?}",
+            name,
+            expected_len,
+            view.shape()
+        )));
+    }
+    let (start, len) = even_shard_range(name, expected_len, tp)?;
+    let src_dtype = st_dtype(view)?;
+    let src_elem_bytes = src_dtype.size_in_bytes();
+    let expected_bytes = expected_len
+        .checked_mul(src_elem_bytes)
+        .ok_or_else(|| OpError::Shape(format!("tensor '{}': byte size overflows", name)))?;
+    if view.data().len() != expected_bytes {
+        return Err(OpError::Shape(format!(
+            "tensor '{}': byte length {} does not match shape {:?} and dtype {:?}",
+            name,
+            view.data().len(),
+            view.shape(),
+            view.dtype()
+        )));
+    }
+    let byte_start = start
+        .checked_mul(src_elem_bytes)
+        .ok_or_else(|| OpError::Shape(format!("tensor '{}': shard offset overflows", name)))?;
+    let byte_len = len
+        .checked_mul(src_elem_bytes)
+        .ok_or_else(|| OpError::Shape(format!("tensor '{}': shard byte size overflows", name)))?;
+    Ok(VectorShardHost {
+        bytes: convert_host_bytes::<T>(
+            &view.data()[byte_start..byte_start + byte_len],
+            src_dtype,
+            len,
+            name,
+        )?,
+        len,
+    })
+}
+
+/// Shard each projection on output rows first, then concatenate the local
+/// pieces. This preserves layouts such as `[Q_rank; K_rank; V_rank]` and
+/// `[gate_rank; up_rank]`.
+fn prepare_fused_output_shards<T: Dtype>(
+    what: &str,
+    parts: &[(&str, &TensorView<'_>)],
+    tp: RankPair,
+) -> OpResult<MatrixShardHost> {
+    if parts.is_empty() {
+        return Err(OpError::Shape(format!(
+            "{}: cannot fuse an empty projection list",
+            what
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    let mut total_rows = 0usize;
+    let mut cols = None;
+    for &(name, view) in parts {
+        let shard = prepare_matrix_shard::<T>(name, view, MatrixShardAxis::OutputRows, tp)?;
+        if let Some(expected) = cols {
+            if shard.shape[1] != expected {
+                return Err(OpError::Shape(format!(
+                    "{}: tensor '{}' has {} columns, expected {}",
+                    what, name, shard.shape[1], expected
+                )));
+            }
+        } else {
+            cols = Some(shard.shape[1]);
+        }
+        total_rows = total_rows
+            .checked_add(shard.shape[0])
+            .ok_or_else(|| OpError::Shape(format!("{}: fused row count overflows", what)))?;
+        bytes.extend_from_slice(&shard.bytes);
+    }
+
+    Ok(MatrixShardHost {
+        bytes,
+        shape: [total_rows, cols.expect("parts is non-empty")],
+    })
+}
 
 /// Map a safetensors view's dtype to our `DataType`, erroring on unsupported.
 fn st_dtype(view: &TensorView) -> OpResult<DataType> {
@@ -594,6 +1051,7 @@ fn validate_matrix_shape(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Fp8ViewPart<'name, 'data> {
     name: &'name str,
     weight: TensorView<'data>,
@@ -773,40 +1231,210 @@ fn prepare_fp8_fused_host(
     })
 }
 
+/// Shard an already validated FP8 matrix and its f32 inverse-scale grid on the
+/// same block boundary. FP8 weights are one byte per element; scale elements
+/// are normalized to f32 by [`prepare_fp8_fused_host`].
+fn shard_fp8_host(
+    host: Fp8FusedHost,
+    [block_n, block_k]: [usize; 2],
+    axis: MatrixShardAxis,
+    tp: RankPair,
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    if tp.size == 1 {
+        return Ok(host);
+    }
+    let [rows, cols] = host.weight_shape;
+    let [scale_rows, scale_cols] = host.scale_shape;
+    match axis {
+        MatrixShardAxis::OutputRows => {
+            let (row_start, local_rows) = even_shard_range(what, rows, tp)?;
+            if !row_start.is_multiple_of(block_n) || !local_rows.is_multiple_of(block_n) {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 output-row shard {row_start}..{} must align to block_n {block_n}",
+                    row_start + local_rows
+                )));
+            }
+            let weight_start = row_start
+                .checked_mul(cols)
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 shard offset overflows")))?;
+            let weight_len = local_rows
+                .checked_mul(cols)
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 shard size overflows")))?;
+            let scale_row_start = row_start / block_n;
+            let local_scale_rows = local_rows / block_n;
+            let scale_start = scale_row_start
+                .checked_mul(scale_cols)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 scale offset overflows")))?;
+            let scale_len = local_scale_rows
+                .checked_mul(scale_cols)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| OpError::Shape(format!("{what}: FP8 scale size overflows")))?;
+            Ok(Fp8FusedHost {
+                weight: host.weight[weight_start..weight_start + weight_len].to_vec(),
+                scales: host.scales[scale_start..scale_start + scale_len].to_vec(),
+                weight_shape: [local_rows, cols],
+                scale_shape: [local_scale_rows, scale_cols],
+            })
+        }
+        MatrixShardAxis::InputColumns => {
+            let (col_start, local_cols) = even_shard_range(what, cols, tp)?;
+            if !col_start.is_multiple_of(block_k) || !local_cols.is_multiple_of(block_k) {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 input-column shard {col_start}..{} must align to block_k {block_k}",
+                    col_start + local_cols
+                )));
+            }
+            let mut weight = Vec::with_capacity(rows * local_cols);
+            for row in 0..rows {
+                let start = row * cols + col_start;
+                weight.extend_from_slice(&host.weight[start..start + local_cols]);
+            }
+
+            let scale_col_start = col_start / block_k;
+            let local_scale_cols = local_cols / block_k;
+            let scale_elem_bytes = std::mem::size_of::<f32>();
+            let mut scales = Vec::with_capacity(scale_rows * local_scale_cols * scale_elem_bytes);
+            for row in 0..scale_rows {
+                let start = (row * scale_cols + scale_col_start) * scale_elem_bytes;
+                let len = local_scale_cols * scale_elem_bytes;
+                scales.extend_from_slice(&host.scales[start..start + len]);
+            }
+            Ok(Fp8FusedHost {
+                weight,
+                scales,
+                weight_shape: [rows, local_cols],
+                scale_shape: [scale_rows, local_scale_cols],
+            })
+        }
+    }
+}
+
+fn prepare_fp8_fused_shard(
+    parts: &[Fp8ViewPart<'_, '_>],
+    block: [usize; 2],
+    axis: MatrixShardAxis,
+    tp: RankPair,
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    let host = prepare_fp8_fused_host(parts, block, what)?;
+    shard_fp8_host(host, block, axis, tp, what)
+}
+
+/// Column-parallel fused projections must shard every logical projection
+/// independently before concatenating their local pieces. Otherwise a shard of
+/// `[Q; K; V]` could contain all of Q and none of K/V.
+fn prepare_fp8_fused_output_shards(
+    parts: &[Fp8ViewPart<'_, '_>],
+    block: [usize; 2],
+    tp: RankPair,
+    what: &str,
+) -> OpResult<Fp8FusedHost> {
+    if parts.is_empty() {
+        return Err(OpError::Shape(format!(
+            "{what}: cannot fuse an empty FP8 projection list"
+        )));
+    }
+    if tp.size == 1 {
+        return prepare_fp8_fused_host(parts, block, what);
+    }
+
+    let mut weight = Vec::new();
+    let mut scales = Vec::new();
+    let mut total_rows = 0usize;
+    let mut total_scale_rows = 0usize;
+    let mut cols = None;
+    let mut scale_cols = None;
+    for part in parts {
+        let single = [part.clone()];
+        let shard =
+            prepare_fp8_fused_shard(&single, block, MatrixShardAxis::OutputRows, tp, part.name)?;
+        if let Some(expected) = cols {
+            if shard.weight_shape[1] != expected {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 tensor '{}' has {} columns, expected {expected}",
+                    part.name, shard.weight_shape[1]
+                )));
+            }
+        } else {
+            cols = Some(shard.weight_shape[1]);
+        }
+        if let Some(expected) = scale_cols {
+            if shard.scale_shape[1] != expected {
+                return Err(OpError::Shape(format!(
+                    "{what}: FP8 tensor '{}' has {} scale columns, expected {expected}",
+                    part.name, shard.scale_shape[1]
+                )));
+            }
+        } else {
+            scale_cols = Some(shard.scale_shape[1]);
+        }
+        total_rows = total_rows
+            .checked_add(shard.weight_shape[0])
+            .ok_or_else(|| OpError::Shape(format!("{what}: fused FP8 row count overflows")))?;
+        total_scale_rows = total_scale_rows
+            .checked_add(shard.scale_shape[0])
+            .ok_or_else(|| OpError::Shape(format!("{what}: fused FP8 scale rows overflow")))?;
+        weight.extend_from_slice(&shard.weight);
+        scales.extend_from_slice(&shard.scales);
+    }
+
+    Ok(Fp8FusedHost {
+        weight,
+        scales,
+        weight_shape: [total_rows, cols.expect("parts is non-empty")],
+        scale_shape: [total_scale_rows, scale_cols.expect("parts is non-empty")],
+    })
+}
+
 fn safetensor_view_to_host_bytes<T: Dtype>(view: &TensorView<'_>) -> OpResult<Vec<u8>> {
     let shape_vec: Vec<usize> = view.shape().to_vec();
     let numel: usize = shape_vec.iter().product();
-    let src_bytes = view.data();
     let src_dtype = st_dtype(view)?;
-    let size_bytes = numel * T::SIZE_BYTES;
-    let mut host_buf = vec![0u8; size_bytes];
+    convert_host_bytes::<T>(view.data(), src_dtype, numel, "safetensor view")
+}
 
+fn convert_host_bytes<T: Dtype>(
+    src_bytes: &[u8],
+    src_dtype: DataType,
+    numel: usize,
+    what: &str,
+) -> OpResult<Vec<u8>> {
+    let expected_src_bytes = numel
+        .checked_mul(src_dtype.size_in_bytes())
+        .ok_or_else(|| OpError::Shape(format!("{}: source byte size overflows", what)))?;
+    if src_bytes.len() != expected_src_bytes {
+        return Err(OpError::Shape(format!(
+            "{}: source byte length {} != expected {} for {} {:?} elements",
+            what,
+            src_bytes.len(),
+            expected_src_bytes,
+            numel,
+            src_dtype
+        )));
+    }
+    let size_bytes = numel
+        .checked_mul(T::SIZE_BYTES)
+        .ok_or_else(|| OpError::Shape(format!("{}: target byte size overflows", what)))?;
     if src_dtype == T::DATA_TYPE {
-        if src_bytes.len() != size_bytes {
-            return Err(OpError::Shape(format!(
-                "safetensor view byte length {} != expected {} for shape {:?} \
-                 (corrupt safetensors?)",
-                src_bytes.len(),
-                size_bytes,
-                shape_vec,
-            )));
-        }
-        host_buf.copy_from_slice(src_bytes);
-    } else if src_dtype == DataType::F8E4M3 || T::DATA_TYPE == DataType::F8E4M3 {
+        return Ok(src_bytes.to_vec());
+    }
+    if src_dtype == DataType::F8E4M3 || T::DATA_TYPE == DataType::F8E4M3 {
         return Err(OpError::Kernel(format!(
             "unsupported safetensor cast from {:?} to {:?}; FP8 weights must stay raw",
             src_dtype,
             T::DATA_TYPE
         )));
-    } else {
-        cast_bytes(
-            src_bytes,
-            src_dtype,
-            host_buf.as_mut_ptr(),
-            T::DATA_TYPE,
-            numel,
-        );
     }
+    let mut host_buf = vec![0u8; size_bytes];
+    cast_bytes(
+        src_bytes,
+        src_dtype,
+        host_buf.as_mut_ptr(),
+        T::DATA_TYPE,
+        numel,
+    );
     Ok(host_buf)
 }
 
@@ -962,9 +1590,226 @@ pub(crate) fn compute_rope_cache<T: Dtype, D: OpBackend>(
 }
 
 #[cfg(test)]
+mod tp_tests {
+    use super::{
+        MatrixShardAxis, even_shard_range, make_vocab_parallel_linear, prepare_fused_output_shards,
+        prepare_matrix_shard, prepare_vector_shard, validate_tp,
+    };
+    use crate::components::linear::LinearParallelism;
+    use crate::domain::exec::RankPair;
+    use crate::domain::tensor::Tensor;
+    use crate::domain::types::Shape;
+    use crate::infrastructure::cpu::Cpu;
+    use half::bf16;
+    use safetensors::{Dtype, tensor::TensorView};
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&value| bf16::from_f32(value).to_le_bytes())
+            .collect()
+    }
+
+    fn decode_bf16(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16::from_le_bytes(chunk.try_into().unwrap()).to_f32())
+            .collect()
+    }
+
+    #[test]
+    fn tp1_matrix_shards_preserve_the_complete_weight() {
+        let bytes = bf16_bytes(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let view = TensorView::new(Dtype::BF16, vec![2, 3], &bytes).unwrap();
+        let tp = RankPair { rank: 0, size: 1 };
+
+        for axis in [MatrixShardAxis::OutputRows, MatrixShardAxis::InputColumns] {
+            let shard = prepare_matrix_shard::<bf16>("weight", &view, axis, tp).unwrap();
+            assert_eq!(shard.shape, [2, 3]);
+            assert_eq!(shard.bytes, bytes);
+        }
+    }
+
+    #[test]
+    fn row_parallel_shards_each_matrix_row_on_input_columns() {
+        let bytes = bf16_bytes(&[
+            0.0, 1.0, 2.0, 3.0, // row 0
+            10.0, 11.0, 12.0, 13.0, // row 1
+            20.0, 21.0, 22.0, 23.0, // row 2
+        ]);
+        let view = TensorView::new(Dtype::BF16, vec![3, 4], &bytes).unwrap();
+
+        let rank0 = prepare_matrix_shard::<bf16>(
+            "o_proj.weight",
+            &view,
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 0, size: 2 },
+        )
+        .unwrap();
+        let rank1 = prepare_matrix_shard::<bf16>(
+            "o_proj.weight",
+            &view,
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 1, size: 2 },
+        )
+        .unwrap();
+
+        assert_eq!(rank0.shape, [3, 2]);
+        assert_eq!(
+            decode_bf16(&rank0.bytes),
+            vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0]
+        );
+        assert_eq!(rank1.shape, [3, 2]);
+        assert_eq!(
+            decode_bf16(&rank1.bytes),
+            vec![2.0, 3.0, 12.0, 13.0, 22.0, 23.0]
+        );
+    }
+
+    #[test]
+    fn vocab_weight_and_bias_use_the_identical_row_range() {
+        let weight_bytes = bf16_bytes(&[
+            0.0, 1.0, // vocab row 0
+            10.0, 11.0, // vocab row 1
+            20.0, 21.0, // vocab row 2
+            30.0, 31.0, // vocab row 3
+            40.0, 41.0, // vocab row 4
+            50.0, 51.0, // vocab row 5
+        ]);
+        let bias_bytes = bf16_bytes(&[100.0, 110.0, 120.0, 130.0, 140.0, 150.0]);
+        let weight = TensorView::new(Dtype::BF16, vec![6, 2], &weight_bytes).unwrap();
+        let bias = TensorView::new(Dtype::BF16, vec![6], &bias_bytes).unwrap();
+        let tp = RankPair { rank: 1, size: 2 };
+
+        let local_weight = prepare_matrix_shard::<bf16>(
+            "lm_head.weight",
+            &weight,
+            MatrixShardAxis::OutputRows,
+            tp,
+        )
+        .unwrap();
+        let local_bias = prepare_vector_shard::<bf16>("lm_head.bias", &bias, 6, tp).unwrap();
+
+        assert_eq!(local_weight.shape, [3, 2]);
+        assert_eq!(
+            decode_bf16(&local_weight.bytes),
+            vec![30.0, 31.0, 40.0, 41.0, 50.0, 51.0]
+        );
+        assert_eq!(local_bias.len, 3);
+        assert_eq!(decode_bf16(&local_bias.bytes), vec![130.0, 140.0, 150.0]);
+    }
+
+    #[test]
+    fn tied_vocab_linear_keeps_the_local_embedding_allocation() {
+        let tp = RankPair { rank: 1, size: 2 };
+        let local_table = Tensor::from_host_slice(
+            &[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0],
+            Shape::from_slice(&[3, 2]),
+            &Cpu,
+        )
+        .unwrap();
+
+        let lm_head = make_vocab_parallel_linear(local_table.clone(), None, tp, 6).unwrap();
+        let lm_weight = lm_head.weight.as_dense().unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(
+            local_table.storage(),
+            lm_weight.storage()
+        ));
+        assert_eq!(
+            lm_head.parallelism(),
+            LinearParallelism::Column {
+                tp,
+                gather_output: true,
+            }
+        );
+    }
+
+    #[test]
+    fn tp1_vocab_linear_remains_replicated() {
+        let tp = RankPair { rank: 0, size: 1 };
+        let weight =
+            Tensor::from_host_slice(&[0.0f32, 1.0, 2.0, 3.0], Shape::from_slice(&[2, 2]), &Cpu)
+                .unwrap();
+
+        let lm_head = make_vocab_parallel_linear(weight, None, tp, 2).unwrap();
+
+        assert_eq!(lm_head.parallelism(), LinearParallelism::Replicated { tp });
+    }
+
+    #[test]
+    fn qkv_column_parallel_shards_each_projection_before_fusion() {
+        let q_bytes = bf16_bytes(&[0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
+        let k_bytes = bf16_bytes(&[100.0, 101.0, 110.0, 111.0]);
+        let v_bytes = bf16_bytes(&[200.0, 201.0, 210.0, 211.0]);
+        let q = TensorView::new(Dtype::BF16, vec![4, 2], &q_bytes).unwrap();
+        let k = TensorView::new(Dtype::BF16, vec![2, 2], &k_bytes).unwrap();
+        let v = TensorView::new(Dtype::BF16, vec![2, 2], &v_bytes).unwrap();
+        let parts = [("q", &q), ("k", &k), ("v", &v)];
+
+        let rank0 =
+            prepare_fused_output_shards::<bf16>("qkv", &parts, RankPair { rank: 0, size: 2 })
+                .unwrap();
+        let rank1 =
+            prepare_fused_output_shards::<bf16>("qkv", &parts, RankPair { rank: 1, size: 2 })
+                .unwrap();
+
+        assert_eq!(rank0.shape, [4, 2]);
+        assert_eq!(
+            decode_bf16(&rank0.bytes),
+            vec![0.0, 1.0, 10.0, 11.0, 100.0, 101.0, 200.0, 201.0]
+        );
+        assert_eq!(rank1.shape, [4, 2]);
+        assert_eq!(
+            decode_bf16(&rank1.bytes),
+            vec![20.0, 21.0, 30.0, 31.0, 110.0, 111.0, 210.0, 211.0]
+        );
+    }
+
+    #[test]
+    fn gate_up_column_parallel_preserves_local_gate_then_up_layout() {
+        let gate_bytes = bf16_bytes(&[0.0, 1.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
+        let up_bytes = bf16_bytes(&[100.0, 101.0, 110.0, 111.0, 120.0, 121.0, 130.0, 131.0]);
+        let gate = TensorView::new(Dtype::BF16, vec![4, 2], &gate_bytes).unwrap();
+        let up = TensorView::new(Dtype::BF16, vec![4, 2], &up_bytes).unwrap();
+
+        let rank1 = prepare_fused_output_shards::<bf16>(
+            "gate_up",
+            &[("gate", &gate), ("up", &up)],
+            RankPair { rank: 1, size: 2 },
+        )
+        .unwrap();
+
+        assert_eq!(rank1.shape, [4, 2]);
+        assert_eq!(
+            decode_bf16(&rank1.bytes),
+            vec![20.0, 21.0, 30.0, 31.0, 120.0, 121.0, 130.0, 131.0]
+        );
+    }
+
+    #[test]
+    fn invalid_tp_rank_and_non_divisible_dimensions_fail_early() {
+        let rank_err = validate_tp(RankPair { rank: 2, size: 2 }).unwrap_err();
+        assert!(rank_err.to_string().contains("rank 2"));
+
+        let size_err = validate_tp(RankPair { rank: 0, size: 0 }).unwrap_err();
+        assert!(size_err.to_string().contains("nonzero"));
+
+        let dim_err =
+            even_shard_range("KV head count", 3, RankPair { rank: 0, size: 2 }).unwrap_err();
+        assert!(dim_err.to_string().contains("KV head count"));
+        assert!(dim_err.to_string().contains("not divisible"));
+    }
+}
+
+#[cfg(test)]
 mod fp8_tests {
-    use super::{Fp8ViewPart, prepare_fp8_fused_host};
+    use super::{
+        Fp8ViewPart, MatrixShardAxis, prepare_fp8_fused_host, prepare_fp8_fused_output_shards,
+        prepare_fp8_fused_shard,
+    };
     use crate::domain::dtype::Fp8E4m3;
+    use crate::domain::exec::RankPair;
     use crate::domain::tensor::Tensor;
     use crate::domain::types::Shape;
     use crate::infrastructure::cpu::Cpu;
@@ -1079,6 +1924,94 @@ mod fp8_tests {
         let host = prepare_fp8_fused_host(&parts, [2, 2], "tail").unwrap();
         assert_eq!(host.weight.len(), 15);
         assert_eq!(host.scale_shape, [2, 3]);
+    }
+
+    #[test]
+    fn fp8_row_parallel_shards_weight_and_scale_columns_together() {
+        let weight_bytes: Vec<u8> = (0..8).collect();
+        let scale_bytes = bf16_bytes(&[10.0, 20.0]);
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![2, 4], &weight_bytes).unwrap();
+        let scale = TensorView::new(Dtype::BF16, vec![1, 2], &scale_bytes).unwrap();
+        let parts = [Fp8ViewPart {
+            name: "down.weight",
+            weight,
+            scale_inv: scale,
+        }];
+
+        let rank1 = prepare_fp8_fused_shard(
+            &parts,
+            [2, 2],
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 1, size: 2 },
+            "down.weight",
+        )
+        .unwrap();
+
+        assert_eq!(rank1.weight_shape, [2, 2]);
+        assert_eq!(rank1.weight, vec![2, 3, 6, 7]);
+        assert_eq!(rank1.scale_shape, [1, 1]);
+        assert_eq!(decode_f32(&rank1.scales), vec![20.0]);
+    }
+
+    #[test]
+    fn fp8_column_parallel_shards_each_projection_before_fusion() {
+        let q_bytes: Vec<u8> = (0..16).collect();
+        let k_bytes: Vec<u8> = (100..116).collect();
+        let q_scale_bytes = bf16_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        let k_scale_bytes = bf16_bytes(&[5.0, 6.0, 7.0, 8.0]);
+        let q = TensorView::new(Dtype::F8_E4M3, vec![4, 4], &q_bytes).unwrap();
+        let k = TensorView::new(Dtype::F8_E4M3, vec![4, 4], &k_bytes).unwrap();
+        let q_scale = TensorView::new(Dtype::BF16, vec![2, 2], &q_scale_bytes).unwrap();
+        let k_scale = TensorView::new(Dtype::BF16, vec![2, 2], &k_scale_bytes).unwrap();
+        let parts = [
+            Fp8ViewPart {
+                name: "q.weight",
+                weight: q,
+                scale_inv: q_scale,
+            },
+            Fp8ViewPart {
+                name: "k.weight",
+                weight: k,
+                scale_inv: k_scale,
+            },
+        ];
+
+        let rank1 =
+            prepare_fp8_fused_output_shards(&parts, [2, 2], RankPair { rank: 1, size: 2 }, "qk")
+                .unwrap();
+
+        assert_eq!(rank1.weight_shape, [4, 4]);
+        assert_eq!(
+            rank1.weight,
+            vec![
+                8, 9, 10, 11, 12, 13, 14, 15, 108, 109, 110, 111, 112, 113, 114, 115
+            ]
+        );
+        assert_eq!(rank1.scale_shape, [2, 2]);
+        assert_eq!(decode_f32(&rank1.scales), vec![3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn fp8_tp_rejects_shards_that_split_scale_blocks() {
+        let weight_bytes = vec![0x38; 2 * 6];
+        let scale_bytes = bf16_bytes(&[1.0; 3]);
+        let weight = TensorView::new(Dtype::F8_E4M3, vec![2, 6], &weight_bytes).unwrap();
+        let scale = TensorView::new(Dtype::BF16, vec![1, 3], &scale_bytes).unwrap();
+        let parts = [Fp8ViewPart {
+            name: "bad.weight",
+            weight,
+            scale_inv: scale,
+        }];
+
+        let error = prepare_fp8_fused_shard(
+            &parts,
+            [2, 2],
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 0, size: 2 },
+            "bad.weight",
+        )
+        .expect_err("three-column shards split a two-column scale block");
+        assert!(error.to_string().contains("block_k"));
     }
 
     #[test]

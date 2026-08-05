@@ -72,6 +72,7 @@ unsafe extern "C" {
         b: *const f32,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
     fn broadcast_add_inplace_bf16_forward(
@@ -79,6 +80,7 @@ unsafe extern "C" {
         b: *const half::bf16,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
     fn broadcast_add_inplace_f16_forward(
@@ -86,6 +88,7 @@ unsafe extern "C" {
         b: *const half::f16,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
 }
@@ -123,6 +126,7 @@ pub trait LayerNormKernel: CudaFloat {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     );
 }
@@ -156,9 +160,10 @@ impl LayerNormKernel for f32 {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     ) {
-        unsafe { broadcast_add_inplace_f32_forward(a, b, rows, d, stream) }
+        unsafe { broadcast_add_inplace_f32_forward(a, b, rows, d, row_stride, stream) }
     }
 }
 
@@ -191,9 +196,10 @@ impl LayerNormKernel for half::bf16 {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     ) {
-        unsafe { broadcast_add_inplace_bf16_forward(a, b, rows, d, stream) }
+        unsafe { broadcast_add_inplace_bf16_forward(a, b, rows, d, row_stride, stream) }
     }
 }
 
@@ -226,9 +232,10 @@ impl LayerNormKernel for half::f16 {
         b: *const Self,
         rows: i32,
         d: i32,
+        row_stride: i32,
         stream: cudaStream_t,
     ) {
-        unsafe { broadcast_add_inplace_f16_forward(a, b, rows, d, stream) }
+        unsafe { broadcast_add_inplace_f16_forward(a, b, rows, d, row_stride, stream) }
     }
 }
 
@@ -267,7 +274,14 @@ pub fn layernorm<T: LayerNormKernel>(
         );
 
         // Step 3: output += bias (broadcast add)
-        T::broadcast_add_inplace(output.data_ptr_mut(), bias.data_ptr(), rows, cols, stream);
+        T::broadcast_add_inplace(
+            output.data_ptr_mut(),
+            bias.data_ptr(),
+            rows,
+            cols,
+            cols,
+            stream,
+        );
     }
     Ok(())
 }
