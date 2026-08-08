@@ -49,6 +49,10 @@ const CUDA_ARCHIVES: &[CudaArchiveSpec] = &[
 
 fn main() {
     {
+        // Re-run discovery when a kernel file or directory is added/removed,
+        // not only when an already-known source changes.
+        println!("cargo:rerun-if-changed=src/kernels");
+
         // 1. 自动处理 libclang 环境变量 (彻底免去手动 export LIBCLANG_PATH)
         auto_configure_libclang();
 

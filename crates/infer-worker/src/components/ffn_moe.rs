@@ -1,26 +1,60 @@
+use std::rc::Rc;
+
 use crate::components::ffn_dense::DenseFfn;
-use crate::components::linear::Linear;
+use crate::components::moe_local::MoeLocalPipeline;
 use crate::components::norm::RmsNorm;
 use crate::domain::component::{Component, Hidden, StageKind};
 use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
+use crate::domain::exec::{DeviceId, ExecDevice, ExecScope, StepCtx};
+use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::kv::KvView;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
-/// Pre-norm sparse MoE FFN sublayer. Same `Component` contract as `DenseFfn`,
-/// so swapping it into a `DecoderBlock` is the entire MoE model change. Owns its
-/// post-attention norm; routed experts and the optional shared expert both read
-/// the normalized input and accumulate into the residual.
+/// Pre-norm, single-device sparse MoE FFN sublayer.
+///
+/// The incoming deferred residual is fused with RMSNorm exactly like
+/// [`DenseFfn`]. The local routed result becomes the next deferred residual.
+/// Shared experts, quantized experts, and distributed routing remain disabled.
 pub struct MoeFfn<T: Dtype, D: LlmBackend> {
     pub post_attention_layernorm: RmsNorm<T, D>,
-    pub router: Linear<T, D>,
-    pub expert_gate_up: Tensor<T, D>,
-    pub expert_down: Tensor<T, D>,
+    pub routed: MoeLocalPipeline<T, D>,
     pub shared: Option<DenseFfn<T, D>>,
-    pub experts_per_tok: usize,
+    /// Shared dense-forward scratch supplies only `[tokens, hidden]` norm/output
+    /// views. Route-sized MoE scratch is allocated per invocation for now.
+    pub scratch: Option<Rc<ForwardScratch<T, D>>>,
+}
+
+impl<T: Dtype, D: LlmBackend> MoeFfn<T, D> {
+    pub fn new(
+        post_attention_layernorm: RmsNorm<T, D>,
+        routed: MoeLocalPipeline<T, D>,
+    ) -> OpResult<Self> {
+        let hidden_features = routed.hidden_features();
+        if post_attention_layernorm.weight.shape().as_slice() != [hidden_features] {
+            return Err(OpError::Shape(format!(
+                "MoeFfn norm weight must be [{}], got {:?}",
+                hidden_features,
+                post_attention_layernorm.weight.shape().as_slice()
+            )));
+        }
+        let norm_device = <D as ExecDevice>::device_id(post_attention_layernorm.weight.device());
+        if norm_device != routed.device_id() {
+            return Err(OpError::Shape(format!(
+                "MoeFfn norm belongs to device {}, but routed weights belong to device {}",
+                norm_device.0,
+                routed.device_id().0
+            )));
+        }
+        Ok(Self {
+            post_attention_layernorm,
+            routed,
+            shared: None,
+            scratch: None,
+        })
+    }
 }
 
 impl<T: Dtype, D: LlmBackend> Component<T, D> for MoeFfn<T, D> {
@@ -35,161 +69,354 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for MoeFfn<T, D> {
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
         let _ = kv;
-        let hidden_shape = hidden.stream.shape().as_slice();
-        let gate_shape = self.expert_gate_up.shape().as_slice();
-        let down_shape = self.expert_down.shape().as_slice();
-        let router_weight = self
-            .router
-            .weight
-            .as_dense()
-            .ok_or_else(|| OpError::Shape("MoeFfn::run: router weight must be dense".into()))?;
-        let router_shape = router_weight.shape().as_slice();
-        if hidden_shape.len() != 2 || gate_shape.len() != 3 || down_shape.len() != 3 {
+        let backend = hidden.stream.device().name();
+        if !D::local_moe_available::<T>() {
+            return Err(OpError::unsupported(backend, "moe_ffn"));
+        }
+        if self.shared.is_some() {
+            return Err(OpError::unsupported(backend, "moe_ffn.shared_expert"));
+        }
+
+        let stream_shape = hidden.stream.shape().as_slice();
+        if stream_shape.len() != 2
+            || stream_shape[0] == 0
+            || stream_shape[1] != self.routed.hidden_features()
+        {
             return Err(OpError::Shape(format!(
-                "MoeFfn::run: expected hidden [tokens,dim], gate [experts,2*inter,dim], down [experts,dim,inter], got {:?} {:?} {:?}",
-                hidden_shape, gate_shape, down_shape
+                "MoeFfn residual must be non-empty [tokens,{}], got {:?}",
+                self.routed.hidden_features(),
+                stream_shape
             )));
         }
-        let num_tokens = hidden_shape[0];
-        let dim = hidden_shape[1];
-        let num_experts = gate_shape[0];
-        let gate_cols = gate_shape[1];
-        let inter = gate_cols / 2;
-        if gate_cols == 0 || !gate_cols.is_multiple_of(2) || gate_shape[2] != dim {
+        let num_tokens = stream_shape[0];
+        let hidden_features = stream_shape[1];
+        if ctx.plan().num_tokens != num_tokens {
             return Err(OpError::Shape(format!(
-                "MoeFfn::run: invalid gate shape {:?} for dim {}",
-                gate_shape, dim
+                "MoeFfn residual tokens {} != execution plan tokens {}",
+                num_tokens,
+                ctx.plan().num_tokens
             )));
         }
-        if down_shape != [num_experts, dim, inter] {
+        if self.post_attention_layernorm.weight.shape().as_slice() != [hidden_features] {
             return Err(OpError::Shape(format!(
-                "MoeFfn::run: down shape {:?} != [{}, {}, {}]",
-                down_shape, num_experts, dim, inter
-            )));
-        }
-        if router_shape.len() != 2 || router_shape[0] != num_experts || router_shape[1] != dim {
-            return Err(OpError::Shape(format!(
-                "MoeFfn::run: router weight shape {:?} != [{}, {}]",
-                router_shape, num_experts, dim
-            )));
-        }
-        if self.experts_per_tok == 0 || self.experts_per_tok > num_experts {
-            return Err(OpError::Shape(format!(
-                "MoeFfn::run: experts_per_tok {} invalid for {} experts",
-                self.experts_per_tok, num_experts
+                "MoeFfn norm weight must be [{}], got {:?}",
+                hidden_features,
+                self.post_attention_layernorm.weight.shape().as_slice()
             )));
         }
 
-        let dev = hidden.stream.device().clone();
-        // Pre-FFN norm — residual stays intact in `hidden.stream`.
-        let mut normed = D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?;
-        self.post_attention_layernorm
-            .forward(&hidden.stream, &mut normed, ctx)?;
-        let normed_host = normed.to_host_vec()?;
-
-        let mut router_logits =
-            D::alloc_tensor(Shape::from_slice(&[num_tokens, num_experts]), &dev)?;
-        self.router.forward(&normed, &mut router_logits, ctx)?;
-        let router_host = router_logits.to_host_vec()?;
-
-        let mut by_expert: Vec<Vec<(usize, f64)>> = vec![Vec::new(); num_experts];
-        for token_idx in 0..num_tokens {
-            let row = &router_host[token_idx * num_experts..(token_idx + 1) * num_experts];
-            let mut ranked: Vec<(usize, f64)> = row
-                .iter()
-                .enumerate()
-                .map(|(expert, value)| (expert, T::read_f64(value)))
-                .collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top = &ranked[..self.experts_per_tok];
-            let max = top
-                .iter()
-                .map(|(_, score)| *score)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let denom = top
-                .iter()
-                .map(|(_, score)| (*score - max).exp())
-                .sum::<f64>();
-            for &(expert, score) in top {
-                let weight = if denom > 0.0 {
-                    (score - max).exp() / denom
-                } else {
-                    1.0 / self.experts_per_tok as f64
-                };
-                by_expert[expert].push((token_idx, weight));
-            }
+        let device_id = <D as ExecDevice>::device_id(hidden.stream.device());
+        let scope_device = <D as ExecDevice>::device_id(ctx.scope().device());
+        if scope_device != device_id {
+            return Err(OpError::Shape(format!(
+                "MoeFfn residual belongs to device {}, but scope uses device {}",
+                device_id.0, scope_device.0
+            )));
         }
-
-        let grouped_rows = num_tokens * self.experts_per_tok;
-        let mut offsets = Vec::with_capacity(num_experts + 1);
-        let mut routes = Vec::with_capacity(grouped_rows);
-        let mut grouped_input = Vec::with_capacity(grouped_rows * dim);
-        offsets.push(0i32);
-        for assignments in &by_expert {
-            for &(token_idx, weight) in assignments {
-                routes.push((token_idx, weight));
-                let start = token_idx * dim;
-                grouped_input.extend_from_slice(&normed_host[start..start + dim]);
-            }
-            offsets.push(routes.len() as i32);
-        }
-
-        let grouped_input = Tensor::from_host_slice(
-            &grouped_input,
-            Shape::from_slice(&[grouped_rows, dim]),
-            &dev,
+        validate_tensor(
+            &hidden.stream,
+            "residual",
+            &[num_tokens, hidden_features],
+            device_id,
         )?;
-        let expert_offsets =
-            Tensor::from_host_slice(&offsets, Shape::from_slice(&[num_experts + 1]), &dev)?;
-        let mut gate_up: Tensor<T, D> =
-            D::alloc_tensor(Shape::from_slice(&[grouped_rows, gate_cols]), &dev)?;
-        let mut swiglu: Tensor<T, D> =
-            D::alloc_tensor(Shape::from_slice(&[grouped_rows, inter]), &dev)?;
-        let mut expert_out: Tensor<T, D> =
-            D::alloc_tensor(Shape::from_slice(&[grouped_rows, dim]), &dev)?;
-
-        D::grouped_expert_gemm(
-            ctx,
-            &grouped_input,
-            &self.expert_gate_up,
-            &mut gate_up,
-            &expert_offsets,
-            None,
-            None,
-            None,
+        validate_tensor(
+            &self.post_attention_layernorm.weight,
+            "norm weight",
+            &[hidden_features],
+            device_id,
         )?;
-        D::swiglu_packed(ctx, &gate_up, &mut swiglu, grouped_rows, inter)?;
-        D::grouped_expert_gemm(
-            ctx,
-            &swiglu,
-            &self.expert_down,
-            &mut expert_out,
-            &expert_offsets,
-            None,
-            None,
-            None,
+        if let Some(delta) = &hidden.pending {
+            validate_tensor(
+                delta,
+                "incoming residual delta",
+                &[num_tokens, hidden_features],
+                device_id,
+            )?;
+        }
+
+        let device = hidden.stream.device().clone();
+        let dense_scratch = self.scratch.as_deref().filter(|s| s.fits(num_tokens));
+        let mut normed = match dense_scratch {
+            Some(scratch) => scratch.normed(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, hidden_features]), &device)?,
+        };
+        let mut ffn_out = match dense_scratch {
+            Some(scratch) => scratch.ffn_out(num_tokens),
+            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, hidden_features]), &device)?,
+        };
+        validate_tensor(
+            &normed,
+            "norm scratch",
+            &[num_tokens, hidden_features],
+            device_id,
         )?;
+        validate_tensor(
+            &ffn_out,
+            "output scratch",
+            &[num_tokens, hidden_features],
+            device_id,
+        )?;
+        let mut routed_scratch = self.routed.allocate_scratch(num_tokens, &device)?;
 
-        let expert_host = expert_out.to_host_vec()?;
-        let mut combined = vec![T::write_f64(0.0); num_tokens * dim];
-        for (row, &(token_idx, route_weight)) in routes.iter().enumerate() {
-            for col in 0..dim {
-                let dst = token_idx * dim + col;
-                let value = T::read_f64(&combined[dst])
-                    + route_weight * T::read_f64(&expert_host[row * dim + col]);
-                combined[dst] = T::write_f64(value);
-            }
+        match hidden.pending.take() {
+            Some(delta) => D::fused_add_rmsnorm(
+                ctx,
+                &mut normed,
+                &mut hidden.stream,
+                &delta,
+                &self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )?,
+            None => self
+                .post_attention_layernorm
+                .forward(&hidden.stream, &mut normed, ctx)?,
         }
-        let moe_out =
-            Tensor::from_host_slice(&combined, Shape::from_slice(&[num_tokens, dim]), &dev)?;
-        D::add_inplace(ctx.scope(), &mut hidden.stream, &moe_out)?;
-
-        // Shared expert reuses the already-normalized input (no second norm).
-        if let Some(shared) = &self.shared {
-            let mut shared_out = D::alloc_tensor(Shape::from_slice(&[num_tokens, dim]), &dev)?;
-            shared.project(&normed, &mut shared_out, ctx)?;
-            D::add_inplace(ctx.scope(), &mut hidden.stream, &shared_out)?;
-        }
+        self.routed
+            .forward(&normed, &mut ffn_out, &mut routed_scratch, ctx)?;
+        hidden.pending = Some(ffn_out);
         Ok(())
+    }
+}
+
+fn validate_tensor<T: Dtype, D: LlmBackend>(
+    tensor: &Tensor<T, D>,
+    name: &str,
+    expected_shape: &[usize],
+    expected_device: DeviceId,
+) -> OpResult<()> {
+    if tensor.shape().as_slice() != expected_shape {
+        return Err(OpError::Shape(format!(
+            "MoeFfn {name} must be {:?}, got {:?}",
+            expected_shape,
+            tensor.shape().as_slice()
+        )));
+    }
+    if !tensor.is_contiguous() {
+        return Err(OpError::Shape(format!(
+            "MoeFfn {name} must be contiguous, got {:?}",
+            tensor.shape().as_slice()
+        )));
+    }
+    let tensor_device = <D as ExecDevice>::device_id(tensor.device());
+    if tensor_device != expected_device {
+        return Err(OpError::Shape(format!(
+            "MoeFfn {name} belongs to device {}, expected device {}",
+            tensor_device.0, expected_device.0
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::{ExpertLinear, Linear, MoeExperts};
+    use crate::domain::exec::{HostScope, StepCtx};
+    use crate::domain::plan::{BatchKind, BatchPlan};
+    use crate::infrastructure::cpu::Cpu;
+
+    fn decode_plan(tokens: usize) -> BatchPlan {
+        BatchPlan {
+            kind: BatchKind::DecodeOnly,
+            num_tokens: tokens,
+            batch: tokens,
+            q_lens: vec![1; tokens],
+            kv_lens: vec![1; tokens],
+            seq_positions: vec![0; tokens],
+            rope_positions: vec![0; tokens],
+            max_blocks_per_seq: 1,
+            block_size: 1,
+            total_q_tiles: 0,
+        }
+    }
+
+    fn cpu_ffn() -> MoeFfn<f32, Cpu> {
+        let router = crate::components::MoeRouter::new(
+            Linear::new(
+                Tensor::from_host_slice(&[1.0f32, 0.0, 0.0, 1.0], [2, 2], &Cpu).unwrap(),
+                None,
+            ),
+            1,
+            true,
+        )
+        .unwrap();
+        let gate_up = ExpertLinear::new_dense(
+            Tensor::from_host_slice(&[1.0f32; 2 * 2 * 2], [2, 2, 2], &Cpu).unwrap(),
+        )
+        .unwrap();
+        let down = ExpertLinear::new_dense(
+            Tensor::from_host_slice(&[1.0f32; 2 * 2], [2, 2, 1], &Cpu).unwrap(),
+        )
+        .unwrap();
+        let routed =
+            MoeLocalPipeline::new(router, MoeExperts::new(gate_up, down).unwrap()).unwrap();
+        MoeFfn::new(
+            RmsNorm {
+                weight: Tensor::from_host_slice(&[1.0f32, 1.0], [2], &Cpu).unwrap(),
+                eps: 0.0,
+            },
+            routed,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cpu_moe_ffn_fails_before_consuming_pending_residual() {
+        let cpu = Cpu;
+        let ffn = cpu_ffn();
+        let mut hidden = Hidden {
+            stream: Tensor::from_host_slice(&[0.5f32, 0.25], [1, 2], &cpu).unwrap(),
+            pending: Some(Tensor::from_host_slice(&[0.5f32, 0.75], [1, 2], &cpu).unwrap()),
+        };
+        let scope = HostScope::new(cpu);
+        let plan = decode_plan(1);
+        let ctx = StepCtx::new(&scope, &plan);
+
+        let err = ffn.run(&mut hidden, None, &ctx).unwrap_err();
+
+        assert!(matches!(
+            err,
+            OpError::Unsupported {
+                backend: "cpu",
+                op: "moe_ffn"
+            }
+        ));
+        assert_eq!(hidden.stream.to_host_vec().unwrap(), vec![0.5, 0.25]);
+        assert_eq!(
+            hidden.pending.as_ref().unwrap().to_host_vec().unwrap(),
+            vec![0.5, 0.75]
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_moe_ffn_fuses_incoming_residual_and_defers_routed_output() {
+        use crate::domain::model::ModelDims;
+        use crate::infrastructure::cuda::{Cuda, CudaScope};
+        use half::bf16;
+
+        const EXPERTS: usize = 2;
+        const HIDDEN: usize = 8;
+        const INTERMEDIATE: usize = 8;
+        let cuda = Cuda::new(0).unwrap();
+        let bf16s = |values: &[f32]| {
+            values
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>()
+        };
+
+        let mut router_host = vec![0.0f32; EXPERTS * HIDDEN];
+        router_host[0] = 1.0;
+        let router = crate::components::MoeRouter::new(
+            Linear::new(
+                Tensor::from_host_slice(&bf16s(&router_host), [EXPERTS, HIDDEN], &cuda).unwrap(),
+                None,
+            ),
+            1,
+            true,
+        )
+        .unwrap();
+
+        let mut gate_up_host = vec![0.0f32; EXPERTS * 2 * INTERMEDIATE * HIDDEN];
+        let gate_up_index = |expert: usize, output: usize, input: usize| {
+            (expert * 2 * INTERMEDIATE + output) * HIDDEN + input
+        };
+        gate_up_host[gate_up_index(0, 0, 0)] = 1.0;
+        gate_up_host[gate_up_index(0, INTERMEDIATE, 1)] = 1.0;
+
+        let mut down_host = vec![0.0f32; EXPERTS * HIDDEN * INTERMEDIATE];
+        let down_index = |expert: usize, output: usize, input: usize| {
+            (expert * HIDDEN + output) * INTERMEDIATE + input
+        };
+        down_host[down_index(0, 0, 0)] = 1.0;
+        down_host[down_index(0, 1, 0)] = 2.0;
+
+        let gate_up = ExpertLinear::new_dense(
+            Tensor::from_host_slice(
+                &bf16s(&gate_up_host),
+                [EXPERTS, 2 * INTERMEDIATE, HIDDEN],
+                &cuda,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let down = ExpertLinear::new_dense(
+            Tensor::from_host_slice(&bf16s(&down_host), [EXPERTS, HIDDEN, INTERMEDIATE], &cuda)
+                .unwrap(),
+        )
+        .unwrap();
+        let routed =
+            MoeLocalPipeline::new(router, MoeExperts::new(gate_up, down).unwrap()).unwrap();
+        let mut ffn = MoeFfn::new(
+            RmsNorm {
+                weight: Tensor::from_host_slice(&bf16s(&[1.0; HIDDEN]), [HIDDEN], &cuda).unwrap(),
+                eps: 0.0,
+            },
+            routed,
+        )
+        .unwrap();
+        let forward_scratch = ForwardScratch::new(
+            &cuda,
+            ModelDims {
+                dim: HIDDEN,
+                q_dim: HIDDEN,
+                kv_dim: HIDDEN,
+                qkv_dim: 3 * HIDDEN,
+                intermediate_size: INTERMEDIATE,
+                vocab_size: 4,
+                head_num: 1,
+                head_dim: HIDDEN,
+                kv_head_num: 1,
+                ..ModelDims::default()
+            },
+            1,
+            1,
+        )
+        .unwrap();
+        let mut incoming_delta = forward_scratch.o_out(1);
+        incoming_delta
+            .copy_from(
+                &Tensor::from_host_slice(&bf16s(&[0.5; HIDDEN]), [1, HIDDEN], &cuda).unwrap(),
+            )
+            .unwrap();
+        ffn.scratch = Some(forward_scratch);
+
+        let mut hidden = Hidden {
+            stream: Tensor::from_host_slice(&bf16s(&[0.5; HIDDEN]), [1, HIDDEN], &cuda).unwrap(),
+            pending: Some(incoming_delta),
+        };
+        let scope = CudaScope::new(cuda.clone());
+        let plan = decode_plan(1);
+        let ctx = StepCtx::new(&scope, &plan);
+
+        ffn.run(&mut hidden, None, &ctx).unwrap();
+
+        let residual = hidden
+            .stream
+            .to_host_vec()
+            .unwrap()
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        assert_eq!(residual, vec![1.0; HIDDEN]);
+
+        let activation = bf16::from_f32(1.0 / (1.0 + (-1.0f32).exp())).to_f32();
+        let mut expected = vec![0.0; HIDDEN];
+        expected[0] = activation;
+        expected[1] = bf16::from_f32(2.0 * activation).to_f32();
+        let pending = hidden
+            .pending
+            .as_ref()
+            .unwrap()
+            .to_host_vec()
+            .unwrap()
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        for (actual, expected) in pending.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 0.02, "{actual} != {expected}");
+        }
     }
 }

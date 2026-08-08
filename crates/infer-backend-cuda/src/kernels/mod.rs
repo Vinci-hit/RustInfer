@@ -26,6 +26,10 @@ pub mod groupnorm;
 pub mod kv_cache; // was scatter_kv_paged
 pub mod layernorm;
 pub mod matmul;
+pub mod moe_combine;
+pub mod moe_grouped_gemm;
+pub mod moe_permute;
+pub mod moe_router;
 pub mod qkv_norm_rope_scatter;
 pub mod rmsnorm;
 pub mod rope;

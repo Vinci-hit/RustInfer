@@ -683,6 +683,10 @@ impl infer_core::ports::FusedOps for Cuda {
         kernels::flash_attn_gqa::fa3_unified_available::<T>(head_dim)
     }
 
+    fn local_moe_available<T: infer_core::dtype::Dtype>() -> bool {
+        T::DATA_TYPE == infer_core::types::DataType::BF16
+    }
+
     fn fused_add_rmsnorm<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         output: &mut Tensor<T, Self>,
@@ -723,6 +727,112 @@ impl infer_core::ports::FusedOps for Cuda {
                 inter,
             )
         })
+    }
+
+    fn moe_route_topk<T: infer_core::dtype::Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+        expert_ids: &mut Tensor<i32, Self>,
+        expert_weights: &mut Tensor<f32, Self>,
+        top_k: usize,
+        renormalize: bool,
+    ) -> OpResult<()> {
+        if T::DATA_TYPE != infer_core::types::DataType::BF16 {
+            return Err(OpError::unsupported("cuda", "moe_route_topk.dtype"));
+        }
+        let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        kernels::moe_router::route_topk_bf16(
+            scope_stream(ctx.scope()),
+            &logits.reinterpret::<half::bf16>(),
+            expert_ids,
+            expert_weights,
+            top_k,
+            renormalize,
+        )
+    }
+
+    fn moe_permute_tokens<T: infer_core::dtype::Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        expert_ids: &Tensor<i32, Self>,
+        expert_weights: &Tensor<f32, Self>,
+        permuted_input: &mut Tensor<T, Self>,
+        source_tokens: &mut Tensor<i32, Self>,
+        route_weights: &mut Tensor<f32, Self>,
+        expert_offsets: &mut Tensor<i32, Self>,
+    ) -> OpResult<()> {
+        if T::DATA_TYPE != infer_core::types::DataType::BF16 {
+            return Err(OpError::unsupported("cuda", "moe_permute_tokens.dtype"));
+        }
+        let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        kernels::moe_permute::permute_tokens_bf16(
+            scope_stream(ctx.scope()),
+            &input.reinterpret::<half::bf16>(),
+            expert_ids,
+            expert_weights,
+            &mut permuted_input.reinterpret::<half::bf16>(),
+            source_tokens,
+            route_weights,
+            expert_offsets,
+        )
+    }
+
+    fn grouped_expert_gemm<
+        A: infer_core::dtype::Dtype,
+        W: infer_core::dtype::Dtype,
+        O: infer_core::dtype::Dtype,
+    >(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        input: &Tensor<A, Self>,
+        weights: &Tensor<W, Self>,
+        output: &mut Tensor<O, Self>,
+        expert_offsets: &Tensor<i32, Self>,
+        scales: Option<&Tensor<A, Self>>,
+        zeros: Option<&Tensor<W, Self>>,
+        scheme: Option<&infer_core::dtype::quant::QuantScheme>,
+    ) -> OpResult<()> {
+        if scales.is_some() || zeros.is_some() || scheme.is_some() {
+            return Err(OpError::unsupported(
+                "cuda",
+                "grouped_expert_gemm.quantized",
+            ));
+        }
+        if A::DATA_TYPE != infer_core::types::DataType::BF16
+            || W::DATA_TYPE != infer_core::types::DataType::BF16
+            || O::DATA_TYPE != infer_core::types::DataType::BF16
+        {
+            return Err(OpError::unsupported("cuda", "grouped_expert_gemm.dtype"));
+        }
+        let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        kernels::moe_grouped_gemm::grouped_gemm_bf16(
+            scope_stream(ctx.scope()),
+            &input.reinterpret::<half::bf16>(),
+            &weights.reinterpret::<half::bf16>(),
+            &mut output.reinterpret::<half::bf16>(),
+            expert_offsets,
+        )
+    }
+
+    fn moe_combine<T: infer_core::dtype::Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        expert_output: &Tensor<T, Self>,
+        source_tokens: &Tensor<i32, Self>,
+        route_weights: &Tensor<f32, Self>,
+        output: &mut Tensor<T, Self>,
+        accumulator: &mut Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        if T::DATA_TYPE != infer_core::types::DataType::BF16 {
+            return Err(OpError::unsupported("cuda", "moe_combine.dtype"));
+        }
+        let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
+        kernels::moe_combine::combine_bf16(
+            scope_stream(ctx.scope()),
+            &expert_output.reinterpret::<half::bf16>(),
+            source_tokens,
+            route_weights,
+            &mut output.reinterpret::<half::bf16>(),
+            accumulator,
+        )
     }
 
     fn argmax<T: infer_core::dtype::Dtype>(
