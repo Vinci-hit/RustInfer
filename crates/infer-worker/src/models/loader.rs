@@ -11,7 +11,7 @@ use safetensors::tensor::TensorView;
 
 use super::layers::{Embedding, Linear, RMSNorm};
 use crate::components::embed::{Embed as CompEmbed, EmbeddingParallelism};
-use crate::components::linear::{Linear as CompLinear, LinearParallelism};
+use crate::components::linear::{ExpertLinear, Linear as CompLinear, LinearParallelism};
 use crate::domain::dtype::Fp8E4m3;
 use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::exec::RankPair;
@@ -131,6 +131,99 @@ pub struct LoadConfig {
     pub decoder_sparse_step: usize,
 }
 
+/// Model-supplied manifest for one dense expert projection.
+///
+/// The outer list is expert order; the inner list contains projections fused
+/// along the output-feature axis for that expert. For example, Qwen3 gate/up
+/// uses `projection_out_features = [intermediate, intermediate]`, while down
+/// uses `[hidden]`. The loader never infers expert order from shard or tensor
+/// name ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertLinearLoadSpec {
+    expert_projection_names: Vec<Vec<String>>,
+    projection_out_features: Vec<usize>,
+    input_features: usize,
+    output_features: usize,
+}
+
+impl ExpertLinearLoadSpec {
+    pub fn new(
+        expert_projection_names: Vec<Vec<String>>,
+        projection_out_features: Vec<usize>,
+        input_features: usize,
+    ) -> OpResult<Self> {
+        if expert_projection_names.is_empty() {
+            return Err(OpError::Shape(
+                "ExpertLinear load spec must contain at least one expert".into(),
+            ));
+        }
+        if projection_out_features.is_empty() || projection_out_features.contains(&0) {
+            return Err(OpError::Shape(format!(
+                "ExpertLinear projection widths must be non-empty and nonzero, got {:?}",
+                projection_out_features
+            )));
+        }
+        if input_features == 0 {
+            return Err(OpError::Shape(
+                "ExpertLinear input feature count must be nonzero".into(),
+            ));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for (expert, names) in expert_projection_names.iter().enumerate() {
+            if names.len() != projection_out_features.len() {
+                return Err(OpError::Shape(format!(
+                    "ExpertLinear expert {} has {} projection names, expected {}",
+                    expert,
+                    names.len(),
+                    projection_out_features.len()
+                )));
+            }
+            for name in names {
+                if name.is_empty() {
+                    return Err(OpError::Shape(format!(
+                        "ExpertLinear expert {} contains an empty tensor name",
+                        expert
+                    )));
+                }
+                if !seen.insert(name.as_str()) {
+                    return Err(OpError::Shape(format!(
+                        "ExpertLinear tensor '{}' appears more than once",
+                        name
+                    )));
+                }
+            }
+        }
+
+        let output_features = projection_out_features
+            .iter()
+            .try_fold(0usize, |sum, &rows| sum.checked_add(rows))
+            .ok_or_else(|| OpError::Shape("ExpertLinear output feature count overflows".into()))?;
+        Ok(Self {
+            expert_projection_names,
+            projection_out_features,
+            input_features,
+            output_features,
+        })
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.expert_projection_names.len()
+    }
+
+    pub fn input_features(&self) -> usize {
+        self.input_features
+    }
+
+    pub fn output_features(&self) -> usize {
+        self.output_features
+    }
+
+    pub fn expert_projection_names(&self) -> &[Vec<String>] {
+        &self.expert_projection_names
+    }
+}
+
 /// Weight loader — pulls tensors out of a `SafetensorsReader` and builds
 /// typed model structs. The reader is borrowed (no copy until upload).
 pub struct WeightLoader<'a> {
@@ -198,6 +291,38 @@ impl<'a> WeightLoader<'a> {
             .read_view(name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}' not found: {}", name, e)))?;
         tensor_from_safetensor_view::<T, D>(&view, device)
+    }
+
+    /// Load one dense expert projection into `[experts, out, in]`.
+    ///
+    /// Expert and projection ordering comes exclusively from `spec`; each
+    /// tensor is resolved independently through `SafetensorsReader`, so an
+    /// expert may span checkpoint shards. TP/EP and quantized expert weights
+    /// are intentionally deferred to later MoE components.
+    pub fn load_expert_linear<T: Dtype, D: LlmBackend>(
+        &self,
+        spec: &ExpertLinearLoadSpec,
+        device: &D,
+    ) -> OpResult<ExpertLinear<T, D>> {
+        self.require_tp1("dense ExpertLinear loading")?;
+        let views = spec
+            .expert_projection_names
+            .iter()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| {
+                        self.reader.read_view(name).map_err(|error| {
+                            OpError::Kernel(format!("tensor '{}': {}", name, error))
+                        })
+                    })
+                    .collect::<OpResult<Vec<_>>>()
+            })
+            .collect::<OpResult<Vec<_>>>()?;
+        let host = prepare_expert_linear_host::<T>(spec, &views)?;
+        let weight =
+            Tensor::<T, D>::from_host_bytes(&host.bytes, Shape::from_slice(&host.shape), device)?;
+        ExpertLinear::new_dense(weight)
     }
 
     /// Load a Linear layer (weight + optional bias).
@@ -1017,6 +1142,75 @@ fn prepare_fused_output_shards<T: Dtype>(
     })
 }
 
+#[derive(Debug)]
+struct ExpertLinearHost {
+    bytes: Vec<u8>,
+    shape: [usize; 3],
+}
+
+fn prepare_expert_linear_host<T: Dtype>(
+    spec: &ExpertLinearLoadSpec,
+    views: &[Vec<TensorView<'_>>],
+) -> OpResult<ExpertLinearHost> {
+    if views.len() != spec.num_experts() {
+        return Err(OpError::Shape(format!(
+            "ExpertLinear received {} expert view groups, expected {}",
+            views.len(),
+            spec.num_experts()
+        )));
+    }
+    let numel = spec
+        .num_experts()
+        .checked_mul(spec.output_features())
+        .and_then(|count| count.checked_mul(spec.input_features()))
+        .ok_or_else(|| OpError::Shape("ExpertLinear packed element count overflows".into()))?;
+    let byte_capacity = numel
+        .checked_mul(T::DATA_TYPE.size_in_bytes())
+        .ok_or_else(|| OpError::Shape("ExpertLinear packed byte count overflows".into()))?;
+    let mut bytes = Vec::with_capacity(byte_capacity);
+
+    for (expert, (names, expert_views)) in
+        spec.expert_projection_names.iter().zip(views).enumerate()
+    {
+        if expert_views.len() != spec.projection_out_features.len() {
+            return Err(OpError::Shape(format!(
+                "ExpertLinear expert {} has {} projection views, expected {}",
+                expert,
+                expert_views.len(),
+                spec.projection_out_features.len()
+            )));
+        }
+        for ((name, view), &rows) in names
+            .iter()
+            .zip(expert_views)
+            .zip(&spec.projection_out_features)
+        {
+            validate_matrix_shape(name, view, rows, spec.input_features())?;
+            if st_dtype(view)? == T::DATA_TYPE {
+                bytes.extend_from_slice(view.data());
+            } else {
+                bytes.extend_from_slice(&safetensor_view_to_host_bytes::<T>(view)?);
+            }
+        }
+    }
+    if bytes.len() != byte_capacity {
+        return Err(OpError::Shape(format!(
+            "ExpertLinear packed {} bytes, expected {}",
+            bytes.len(),
+            byte_capacity
+        )));
+    }
+
+    Ok(ExpertLinearHost {
+        bytes,
+        shape: [
+            spec.num_experts(),
+            spec.output_features(),
+            spec.input_features(),
+        ],
+    })
+}
+
 /// Map a safetensors view's dtype to our `DataType`, erroring on unsupported.
 fn st_dtype(view: &TensorView) -> OpResult<DataType> {
     Ok(match view.dtype() {
@@ -1799,6 +1993,94 @@ mod tp_tests {
             even_shard_range("KV head count", 3, RankPair { rank: 0, size: 2 }).unwrap_err();
         assert!(dim_err.to_string().contains("KV head count"));
         assert!(dim_err.to_string().contains("not divisible"));
+    }
+}
+
+#[cfg(test)]
+mod expert_linear_tests {
+    use super::{ExpertLinearLoadSpec, prepare_expert_linear_host};
+    use safetensors::{Dtype, tensor::TensorView};
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn expert_linear_pack_preserves_manifest_and_projection_order() {
+        let spec = ExpertLinearLoadSpec::new(
+            vec![
+                vec!["expert.0.gate".into(), "expert.0.up".into()],
+                vec!["expert.1.gate".into(), "expert.1.up".into()],
+            ],
+            vec![1, 1],
+            2,
+        )
+        .unwrap();
+        let e0_gate = f32_bytes(&[0.0, 1.0]);
+        let e0_up = f32_bytes(&[10.0, 11.0]);
+        let e1_gate = f32_bytes(&[100.0, 101.0]);
+        let e1_up = f32_bytes(&[110.0, 111.0]);
+        let views = vec![
+            vec![
+                TensorView::new(Dtype::F32, vec![1, 2], &e0_gate).unwrap(),
+                TensorView::new(Dtype::F32, vec![1, 2], &e0_up).unwrap(),
+            ],
+            vec![
+                TensorView::new(Dtype::F32, vec![1, 2], &e1_gate).unwrap(),
+                TensorView::new(Dtype::F32, vec![1, 2], &e1_up).unwrap(),
+            ],
+        ];
+
+        let host = prepare_expert_linear_host::<f32>(&spec, &views).unwrap();
+
+        assert_eq!(host.shape, [2, 2, 2]);
+        assert_eq!(
+            decode_f32(&host.bytes),
+            vec![0.0, 1.0, 10.0, 11.0, 100.0, 101.0, 110.0, 111.0]
+        );
+    }
+
+    #[test]
+    fn expert_linear_manifest_rejects_duplicate_tensor_names() {
+        let err = ExpertLinearLoadSpec::new(
+            vec![vec!["same.weight".into()], vec!["same.weight".into()]],
+            vec![2],
+            3,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("appears more than once"));
+    }
+
+    #[test]
+    fn expert_linear_pack_checks_every_projection_shape() {
+        let spec = ExpertLinearLoadSpec::new(
+            vec![vec!["expert.0.gate".into(), "expert.0.up".into()]],
+            vec![1, 1],
+            2,
+        )
+        .unwrap();
+        let gate = f32_bytes(&[0.0, 1.0]);
+        let bad_up = f32_bytes(&[10.0, 11.0, 12.0, 13.0]);
+        let views = vec![vec![
+            TensorView::new(Dtype::F32, vec![1, 2], &gate).unwrap(),
+            TensorView::new(Dtype::F32, vec![2, 2], &bad_up).unwrap(),
+        ]];
+
+        let err = prepare_expert_linear_host::<f32>(&spec, &views).unwrap_err();
+
+        assert!(err.to_string().contains("expert.0.up"));
+        assert!(err.to_string().contains("expected [1, 2]"));
     }
 }
 

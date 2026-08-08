@@ -39,6 +39,13 @@ pub trait FusedOps: MathOps {
     /// after the region. Default: no-op (only the CUDA backend implements it).
     fn set_unified_mixed_capture(_on: bool) {}
 
+    /// True when the backend can execute the complete single-device routed MoE
+    /// path for `T`. The default is false so host and newly added backends never
+    /// enter a partially supported MoE sublayer before returning `Unsupported`.
+    fn local_moe_available<T: Dtype>() -> bool {
+        false
+    }
+
     fn fused_add_rmsnorm<T: Dtype>(
         ctx: &StepCtx<'_, Self>,
         output: &mut Tensor<T, Self>,
@@ -192,6 +199,76 @@ pub trait FusedOps: MathOps {
         Self::scatter_kv_paged(ctx, k, v, layer, kv_dim)
     }
 
+    /// Select routed experts from dense router logits.
+    ///
+    /// `logits` is `[tokens, experts]`; `expert_ids` and `expert_weights` are
+    /// `[tokens, top_k]`. Weights are computed in FP32. When `renormalize` is
+    /// true, the selected weights sum to one; otherwise they retain their
+    /// probability mass from the full-expert softmax.
+    ///
+    /// There is deliberately no CPU fallback. Each accelerator backend must
+    /// opt in with an implementation before MoE routing is available.
+    fn moe_route_topk<T: Dtype>(
+        ctx: &StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+        expert_ids: &mut Tensor<i32, Self>,
+        expert_weights: &mut Tensor<f32, Self>,
+        top_k: usize,
+        renormalize: bool,
+    ) -> OpResult<()> {
+        let _ = (ctx, expert_ids, expert_weights, top_k, renormalize);
+        Err(OpError::unsupported(
+            logits.device().name(),
+            "moe_route_topk",
+        ))
+    }
+
+    /// Group routed token rows into stable expert-major order.
+    ///
+    /// `input` is `[tokens, hidden]`; IDs and weights are `[tokens, top_k]`.
+    /// The outputs contain exactly `tokens * top_k` routes:
+    ///
+    /// - `permuted_input`: `[routes, hidden]`, grouped by expert;
+    /// - `source_tokens`: `[routes]`, mapping each grouped row back to a token;
+    /// - `route_weights`: `[routes]`, reordered with the grouped rows;
+    /// - `expert_offsets`: `[experts + 1]`, delimiting each expert's rows.
+    ///
+    /// Ordering within one expert is stable with respect to flattened
+    /// token-major/route-major input order. Expert IDs must be in
+    /// `[0, experts)`, as guaranteed by `moe_route_topk`. There is deliberately
+    /// no CPU fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_permute_tokens<T: Dtype>(
+        ctx: &StepCtx<'_, Self>,
+        input: &Tensor<T, Self>,
+        expert_ids: &Tensor<i32, Self>,
+        expert_weights: &Tensor<f32, Self>,
+        permuted_input: &mut Tensor<T, Self>,
+        source_tokens: &mut Tensor<i32, Self>,
+        route_weights: &mut Tensor<f32, Self>,
+        expert_offsets: &mut Tensor<i32, Self>,
+    ) -> OpResult<()> {
+        let _ = (
+            ctx,
+            expert_ids,
+            expert_weights,
+            permuted_input,
+            source_tokens,
+            route_weights,
+            expert_offsets,
+        );
+        Err(OpError::unsupported(
+            input.device().name(),
+            "moe_permute_tokens",
+        ))
+    }
+
+    /// Apply one expert matrix to each contiguous group of input rows.
+    ///
+    /// `input` is `[rows, in]`, `weights` is `[experts, out, in]`, `output` is
+    /// `[rows, out]`, and `expert_offsets` is a monotonic `[experts + 1]`
+    /// partition spanning `0..rows`. Quantization tensors are backend-specific.
+    /// There is deliberately no CPU fallback.
     fn grouped_expert_gemm<A: Dtype, W: Dtype, O: Dtype>(
         ctx: &StepCtx<'_, Self>,
         input: &Tensor<A, Self>,
@@ -202,88 +279,36 @@ pub trait FusedOps: MathOps {
         zeros: Option<&Tensor<W, Self>>,
         scheme: Option<&QuantScheme>,
     ) -> OpResult<()> {
-        let _ = ctx;
-        if scheme.is_some() || scales.is_some() || zeros.is_some() {
-            return Err(OpError::unsupported(
-                input.device().name(),
-                "grouped_expert_gemm.quantized",
-            ));
-        }
+        let _ = (ctx, weights, output, expert_offsets, scales, zeros, scheme);
+        // MoE deliberately has no host reference fallback. A backend must opt
+        // in with a real implementation; otherwise CUDA could silently execute
+        // an entire expert layer on the CPU through this trait default.
+        Err(OpError::unsupported(
+            input.device().name(),
+            "grouped_expert_gemm",
+        ))
+    }
 
-        let input_shape = input.shape().as_slice();
-        let weight_shape = weights.shape().as_slice();
-        let output_shape = output.shape().as_slice();
-        if input_shape.len() != 2 || weight_shape.len() != 3 || output_shape.len() != 2 {
-            return Err(OpError::Shape(format!(
-                "grouped_expert_gemm: expected input [rows,in], weights [experts,out,in], output [rows,out], got {:?} {:?} {:?}",
-                input_shape, weight_shape, output_shape
-            )));
-        }
-
-        let rows = input_shape[0];
-        let in_dim = input_shape[1];
-        let num_experts = weight_shape[0];
-        let out_dim = weight_shape[1];
-        if weight_shape[2] != in_dim {
-            return Err(OpError::Shape(format!(
-                "grouped_expert_gemm: input dim {} != weight dim {}",
-                in_dim, weight_shape[2]
-            )));
-        }
-        if output_shape != [rows, out_dim] {
-            return Err(OpError::Shape(format!(
-                "grouped_expert_gemm: output shape {:?} != [{}, {}]",
-                output_shape, rows, out_dim
-            )));
-        }
-
-        let offsets = expert_offsets.to_host_vec()?;
-        if offsets.len() != num_experts + 1 {
-            return Err(OpError::Shape(format!(
-                "grouped_expert_gemm: offsets {} != experts+1 {}",
-                offsets.len(),
-                num_experts + 1
-            )));
-        }
-        if offsets.first().copied().unwrap_or_default() != 0
-            || offsets.last().copied().unwrap_or_default() as usize != rows
-        {
-            return Err(OpError::Shape(format!(
-                "grouped_expert_gemm: offsets must span [0, rows], got first={:?} last={:?} rows={}",
-                offsets.first(),
-                offsets.last(),
-                rows
-            )));
-        }
-        for pair in offsets.windows(2) {
-            if pair[0] > pair[1] || pair[0] < 0 {
-                return Err(OpError::Shape(format!(
-                    "grouped_expert_gemm: offsets are not monotonic non-negative: {:?}",
-                    offsets
-                )));
-            }
-        }
-
-        let input_host = input.to_host_vec()?;
-        let weight_host = weights.to_host_vec()?;
-        let mut output_host = vec![O::write_f64(0.0); rows * out_dim];
-        for expert in 0..num_experts {
-            let start = offsets[expert] as usize;
-            let end = offsets[expert + 1] as usize;
-            for row in start..end {
-                for out_col in 0..out_dim {
-                    let mut acc = 0.0f64;
-                    let weight_base = (expert * out_dim + out_col) * in_dim;
-                    let input_base = row * in_dim;
-                    for k in 0..in_dim {
-                        acc += A::read_f64(&input_host[input_base + k])
-                            * W::read_f64(&weight_host[weight_base + k]);
-                    }
-                    output_host[row * out_dim + out_col] = O::write_f64(acc);
-                }
-            }
-        }
-        output.upload_from_host(&output_host)
+    /// Weight expert-major route rows and accumulate them back to token order.
+    ///
+    /// `expert_output` is `[routes, hidden]`; `source_tokens` and
+    /// `route_weights` are `[routes]`; `output` and the FP32 `accumulator` are
+    /// `[tokens, hidden]`. Source token indices must be in `0..tokens`, as
+    /// guaranteed by `moe_permute_tokens`. There is deliberately no CPU
+    /// fallback.
+    fn moe_combine<T: Dtype>(
+        ctx: &StepCtx<'_, Self>,
+        expert_output: &Tensor<T, Self>,
+        source_tokens: &Tensor<i32, Self>,
+        route_weights: &Tensor<f32, Self>,
+        output: &mut Tensor<T, Self>,
+        accumulator: &mut Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        let _ = (ctx, source_tokens, route_weights, output, accumulator);
+        Err(OpError::unsupported(
+            expert_output.device().name(),
+            "moe_combine",
+        ))
     }
 
     /// Greedy argmax over the last (vocab) dimension. `logits` is `[rows, vocab]`;

@@ -104,6 +104,99 @@ pub struct Linear<T: Dtype, D: LlmBackend> {
     parallelism: LinearParallelism,
 }
 
+/// One projection replicated across a set of experts.
+///
+/// `weight` is dense `[num_experts, out_features, in_features]`. Routing and
+/// token permutation are deliberately outside this type: callers provide rows
+/// already grouped by expert plus an `[num_experts + 1]` offset table. This
+/// keeps expert-parallel placement, communication, quantization and combine as
+/// separate MoE-layer components that can be introduced independently.
+pub struct ExpertLinear<T: Dtype, D: LlmBackend> {
+    weight: Tensor<T, D>,
+}
+
+impl<T: Dtype, D: LlmBackend> ExpertLinear<T, D> {
+    pub fn new_dense(weight: Tensor<T, D>) -> OpResult<Self> {
+        let shape = weight.shape().as_slice();
+        if shape.len() != 3 || shape.contains(&0) {
+            return Err(OpError::Shape(format!(
+                "ExpertLinear dense weight must be non-empty [experts,out,in], got {:?}",
+                shape
+            )));
+        }
+        Ok(Self { weight })
+    }
+
+    pub fn weight(&self) -> &Tensor<T, D> {
+        &self.weight
+    }
+
+    pub fn num_experts(&self) -> usize {
+        self.weight.shape().as_slice()[0]
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.weight.shape().as_slice()[1]
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.weight.shape().as_slice()[2]
+    }
+
+    /// Apply the expert projection to rows that have already been permuted
+    /// into expert-major order.
+    ///
+    /// `expert_offsets` must be the monotonic, full-row partition produced by
+    /// the token permutation stage.
+    ///
+    /// No CPU implementation exists. Backends must explicitly implement
+    /// `grouped_expert_gemm`; otherwise this returns `Unsupported`.
+    pub fn forward_routed(
+        &self,
+        input: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        expert_offsets: &Tensor<i32, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        let input_shape = input.shape().as_slice();
+        let output_shape = output.shape().as_slice();
+        let offsets_shape = expert_offsets.shape().as_slice();
+        if input_shape.len() != 2 || input_shape[1] != self.in_features() {
+            return Err(OpError::Shape(format!(
+                "ExpertLinear input must be [rows,{}], got {:?}",
+                self.in_features(),
+                input_shape
+            )));
+        }
+        if output_shape != [input_shape[0], self.out_features()] {
+            return Err(OpError::Shape(format!(
+                "ExpertLinear output must be [{},{}], got {:?}",
+                input_shape[0],
+                self.out_features(),
+                output_shape
+            )));
+        }
+        if offsets_shape != [self.num_experts() + 1] {
+            return Err(OpError::Shape(format!(
+                "ExpertLinear offsets must be [{}], got {:?}",
+                self.num_experts() + 1,
+                offsets_shape
+            )));
+        }
+
+        D::grouped_expert_gemm(
+            ctx,
+            input,
+            &self.weight,
+            output,
+            expert_offsets,
+            None,
+            None,
+            None,
+        )
+    }
+}
+
 impl<T: Dtype, D: LlmBackend> Linear<T, D> {
     /// Full-precision linear from a dense `[N, K]` weight.
     pub fn new(weight: Tensor<T, D>, bias: Option<Tensor<T, D>>) -> Self {
@@ -417,5 +510,124 @@ mod tests {
                 op: "matmul_fp8_block"
             }
         ));
+    }
+
+    #[test]
+    fn expert_linear_exposes_dense_logical_shape() {
+        let weight = Tensor::from_host_slice(&[0.0f32; 2 * 3 * 4], [2, 3, 4], &Cpu).unwrap();
+        let linear = ExpertLinear::new_dense(weight).unwrap();
+
+        assert_eq!(linear.num_experts(), 2);
+        assert_eq!(linear.out_features(), 3);
+        assert_eq!(linear.in_features(), 4);
+        assert_eq!(linear.weight().shape().as_slice(), [2, 3, 4]);
+    }
+
+    #[test]
+    fn expert_linear_rejects_non_expert_weight_shape() {
+        let weight = Tensor::from_host_slice(&[0.0f32; 6], [2, 3], &Cpu).unwrap();
+        let err = ExpertLinear::new_dense(weight).err().unwrap();
+
+        assert!(err.to_string().contains("[experts,out,in]"));
+    }
+
+    #[test]
+    fn cpu_expert_linear_is_explicitly_unsupported() {
+        let cpu = Cpu;
+        let linear = ExpertLinear::new_dense(
+            Tensor::from_host_slice(&[1.0f32; 2 * 3 * 4], [2, 3, 4], &cpu).unwrap(),
+        )
+        .unwrap();
+        let input = Tensor::from_host_slice(&[1.0f32; 3 * 4], [3, 4], &cpu).unwrap();
+        let mut output = Tensor::from_host_slice(&[0.0f32; 3 * 3], [3, 3], &cpu).unwrap();
+        let offsets = Tensor::from_host_slice(&[0i32, 1, 3], [3], &cpu).unwrap();
+        let scope = HostScope::new(cpu);
+        let plan = BatchPlan {
+            kind: BatchKind::DecodeOnly,
+            num_tokens: 3,
+            batch: 3,
+            q_lens: vec![1, 1, 1],
+            kv_lens: vec![1, 1, 1],
+            seq_positions: vec![0, 0, 0],
+            rope_positions: vec![0, 0, 0],
+            max_blocks_per_seq: 1,
+            block_size: 1,
+            total_q_tiles: 0,
+        };
+        let ctx = StepCtx::new(&scope, &plan);
+
+        let err = linear
+            .forward_routed(&input, &mut output, &offsets, &ctx)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OpError::Unsupported {
+                backend: "cpu",
+                op: "grouped_expert_gemm"
+            }
+        ));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_expert_linear_runs_dense_grouped_gemm() {
+        use crate::infrastructure::cuda::{Cuda, CudaScope};
+        use half::bf16;
+
+        let cuda = Cuda::new(0).unwrap();
+        let bf16s = |values: &[f32]| {
+            values
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>()
+        };
+        let linear = ExpertLinear::new_dense(
+            Tensor::from_host_slice(
+                &bf16s(&[
+                    1.0, 0.0, 0.0, 1.0, // expert 0: identity
+                    9.0, 9.0, 9.0, 9.0, // expert 1: empty
+                    1.0, 1.0, 1.0, -1.0, // expert 2: sum/difference
+                ]),
+                [3, 2, 2],
+                &cuda,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let input = Tensor::from_host_slice(
+            &bf16s(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            [4, 2],
+            &cuda,
+        )
+        .unwrap();
+        let offsets = Tensor::from_host_slice(&[0i32, 2, 2, 4], [4], &cuda).unwrap();
+        let mut output = Tensor::<bf16, Cuda>::zeros([4, 2], &cuda).unwrap();
+        let scope = CudaScope::new(cuda);
+        let plan = BatchPlan {
+            kind: BatchKind::DecodeOnly,
+            num_tokens: 4,
+            batch: 4,
+            q_lens: vec![1; 4],
+            kv_lens: vec![1; 4],
+            seq_positions: vec![0; 4],
+            rope_positions: vec![0; 4],
+            max_blocks_per_seq: 1,
+            block_size: 1,
+            total_q_tiles: 0,
+        };
+        let ctx = StepCtx::new(&scope, &plan);
+
+        linear
+            .forward_routed(&input, &mut output, &offsets, &ctx)
+            .unwrap();
+
+        let got = output
+            .to_host_vec()
+            .unwrap()
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        assert_eq!(got, vec![1.0, 2.0, 3.0, 4.0, 11.0, -1.0, 15.0, -1.0]);
     }
 }

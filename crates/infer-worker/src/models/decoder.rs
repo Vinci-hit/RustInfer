@@ -46,6 +46,7 @@ impl<T: Dtype, D: LlmBackend> DecoderFfn<T, D> for DenseFfn<T, D> {
 
 impl<T: Dtype, D: LlmBackend> DecoderFfn<T, D> for MoeFfn<T, D> {
     fn install_scratch(&mut self, scratch: Rc<ForwardScratch<T, D>>) {
+        self.scratch = Some(scratch.clone());
         if let Some(shared) = &mut self.shared {
             shared.scratch = Some(scratch);
         }
