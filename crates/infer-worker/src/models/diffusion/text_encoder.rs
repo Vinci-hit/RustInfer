@@ -342,6 +342,7 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                 n_heads,
                 n_kv_heads,
                 head_dim,
+                head_dim,
             )?;
 
             // 2.5 SDPA (GQA-aware): SDPA gathers KV per query head via head/group.

@@ -459,14 +459,14 @@ mod tests {
         let kv_dim = HEAD_NUM * HEAD_DIM;
         let qkv_dim = q_dim + 2 * kv_dim;
         let sin = Tensor::from_host_slice(
-            &vec![0.0f32; MAX_SEQ * HEAD_DIM],
-            Shape::from_slice(&[MAX_SEQ, HEAD_DIM]),
+            &vec![0.0f32; MAX_SEQ * (HEAD_DIM / 2)],
+            Shape::from_slice(&[MAX_SEQ, HEAD_DIM / 2]),
             &Cpu,
         )
         .unwrap();
         let cos = Tensor::from_host_slice(
-            &vec![1.0f32; MAX_SEQ * HEAD_DIM],
-            Shape::from_slice(&[MAX_SEQ, HEAD_DIM]),
+            &vec![1.0f32; MAX_SEQ * (HEAD_DIM / 2)],
+            Shape::from_slice(&[MAX_SEQ, HEAD_DIM / 2]),
             &Cpu,
         )
         .unwrap();

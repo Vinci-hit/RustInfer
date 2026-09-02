@@ -24,6 +24,7 @@ void qkv_norm_rope_scatter_bf16(
     int head_num,
     int kv_head_num,
     int head_dim,
+    int rotary_dim,
     int kv_dim,
     long long q_row_stride,
     long long k_row_stride,

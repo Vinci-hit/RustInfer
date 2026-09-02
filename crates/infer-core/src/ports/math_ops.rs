@@ -117,6 +117,7 @@ pub trait MathOps: Device {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> OpResult<()>;
 
     fn sdpa<T: Dtype>(
@@ -347,6 +348,7 @@ macro_rules! impl_math_ops_via_core_ops {
                 head_num: usize,
                 kv_head_num: usize,
                 head_dim: usize,
+                rotary_dim: usize,
             ) -> $crate::ports::OpResult<()> {
                 let _guard = infer_core::exec::ExecScope::enter(scope);
                 <Self as $crate::ports::CoreOps>::rope_inplace(
@@ -358,6 +360,7 @@ macro_rules! impl_math_ops_via_core_ops {
                     head_num,
                     kv_head_num,
                     head_dim,
+                    rotary_dim,
                 )
             }
 

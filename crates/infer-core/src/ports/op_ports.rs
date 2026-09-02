@@ -177,7 +177,8 @@ pub trait CoreOps: MemoryPort {
         eps: f32,
     ) -> OpResult<()>;
 
-    /// Apply Rotary Position Embedding in-place to Q and K.
+    /// Apply Rotary Position Embedding in-place to the first `rotary_dim`
+    /// dimensions of every Q/K head. `rotary_dim == head_dim` is full RoPE.
     fn rope_inplace<T: Dtype>(
         q: &mut Tensor<T, Self>,
         k: &mut Tensor<T, Self>,
@@ -187,6 +188,7 @@ pub trait CoreOps: MemoryPort {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> OpResult<()>;
 
     /// Packed SwiGLU: `gate_up [rows, 2*inter]` → `out [rows, inter]`,

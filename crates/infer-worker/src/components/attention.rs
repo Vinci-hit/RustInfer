@@ -119,6 +119,7 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
                     self.head_num,
                     self.kv_head_num,
                     self.head_dim,
+                    self.head_dim,
                     kv_dim,
                 )?;
             }
@@ -133,6 +134,7 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for Attention<T, D> {
                     &kv.index.rope_positions,
                     self.head_num,
                     self.kv_head_num,
+                    self.head_dim,
                     self.head_dim,
                 )?;
                 let mut layer = kv.layer_mut(0);

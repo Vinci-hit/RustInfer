@@ -781,10 +781,17 @@ impl CoreOps for Cpu {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> OpResult<()> {
-        if head_num == 0 || kv_head_num == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
+        if head_num == 0
+            || kv_head_num == 0
+            || head_dim == 0
+            || rotary_dim == 0
+            || rotary_dim > head_dim
+            || !rotary_dim.is_multiple_of(2)
+        {
             return Err(OpError::Shape(format!(
-                "rope_inplace: invalid heads head_num={head_num} kv_head_num={kv_head_num} head_dim={head_dim}"
+                "rope_inplace: invalid heads head_num={head_num} kv_head_num={kv_head_num} head_dim={head_dim} rotary_dim={rotary_dim}"
             )));
         }
         let q_dim = head_num * head_dim;
@@ -820,11 +827,12 @@ impl CoreOps for Cpu {
         let cos_shape = cos.shape().as_slice();
         if sin_shape.len() != 2
             || cos_shape.len() != 2
-            || sin_shape[1] != head_dim
-            || cos_shape[1] != head_dim
+            || sin_shape != cos_shape
+            || sin_shape[1] != rotary_dim / 2
         {
             return Err(OpError::Shape(format!(
-                "rope_inplace: sin/cos shapes {sin_shape:?}/{cos_shape:?} must have width {head_dim}"
+                "rope_inplace: sin/cos shapes {sin_shape:?}/{cos_shape:?} must match with width {}",
+                rotary_dim / 2
             )));
         }
         let cache_rows = sin_shape[0].min(cos_shape[0]);
@@ -840,11 +848,12 @@ impl CoreOps for Cpu {
             }
             let pos = raw_pos as usize;
             for h in 0..head_num {
-                for i in 0..(head_dim / 2) {
-                    let sin_val = unsafe { read_f64(sin.data_ptr().add(pos * head_dim + i)) };
-                    let cos_val = unsafe { read_f64(cos.data_ptr().add(pos * head_dim + i)) };
-                    let idx0 = t * q_dim + h * head_dim + i * 2;
-                    let idx1 = idx0 + 1;
+                for i in 0..(rotary_dim / 2) {
+                    let cache_offset = pos * (rotary_dim / 2) + i;
+                    let sin_val = unsafe { read_f64(sin.data_ptr().add(cache_offset)) };
+                    let cos_val = unsafe { read_f64(cos.data_ptr().add(cache_offset)) };
+                    let idx0 = t * q_dim + h * head_dim + i;
+                    let idx1 = idx0 + rotary_dim / 2;
                     unsafe {
                         let q0 = read_f64(q.data_ptr().add(idx0));
                         let q1 = read_f64(q.data_ptr().add(idx1));
@@ -854,11 +863,12 @@ impl CoreOps for Cpu {
                 }
             }
             for h in 0..kv_head_num {
-                for i in 0..(head_dim / 2) {
-                    let sin_val = unsafe { read_f64(sin.data_ptr().add(pos * head_dim + i)) };
-                    let cos_val = unsafe { read_f64(cos.data_ptr().add(pos * head_dim + i)) };
-                    let idx0 = t * kv_dim + h * head_dim + i * 2;
-                    let idx1 = idx0 + 1;
+                for i in 0..(rotary_dim / 2) {
+                    let cache_offset = pos * (rotary_dim / 2) + i;
+                    let sin_val = unsafe { read_f64(sin.data_ptr().add(cache_offset)) };
+                    let cos_val = unsafe { read_f64(cos.data_ptr().add(cache_offset)) };
+                    let idx0 = t * kv_dim + h * head_dim + i;
+                    let idx1 = idx0 + rotary_dim / 2;
                     unsafe {
                         let k0 = read_f64(k.data_ptr().add(idx0));
                         let k1 = read_f64(k.data_ptr().add(idx1));
@@ -1263,6 +1273,7 @@ fn check_numel3<T: Dtype, D: MemoryPort>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infer_core::ports::FusedOps;
     use infer_core::storage::Storage;
 
     // Relocated from infer-core's storage.rs: these exercise Storage against a
@@ -1394,6 +1405,151 @@ mod tests {
     }
 
     #[test]
+    fn causal_conv1d_uses_and_updates_only_caller_owned_state() {
+        let scope = infer_core::exec::HostScope::new(Cpu);
+        let input = Tensor::<f32, Cpu>::from_slice(&[1.0, 10.0, 2.0, 20.0], [2, 2]);
+        let weight = Tensor::<f32, Cpu>::from_slice(
+            &[
+                1.0, 2.0, 3.0, // channel 0
+                -1.0, 0.5, 1.0, // channel 1
+            ],
+            [2, 1, 3],
+        );
+        let initial_state = [
+            90.0, 91.0, 92.0, 190.0, 191.0, 192.0, // unused slot 0
+            3.0, 4.0, 5.0, 30.0, 40.0, 50.0, // selected slot 1
+        ];
+        let mut state = Tensor::<f32, Cpu>::from_slice(&initial_state, [2, 2, 3]);
+        let slots = Tensor::<i32, Cpu>::from_slice(&[1], [1]);
+        let cu_seqlens = Tensor::<i32, Cpu>::from_slice(&[0, 2], [2]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([2, 2]);
+
+        <Cpu as FusedOps>::causal_conv1d_silu(
+            &scope,
+            &input,
+            &weight,
+            &mut state,
+            &slots,
+            &cu_seqlens,
+            &mut output,
+        )
+        .unwrap();
+
+        // First channel pre-activations are 4*1 + 5*2 + 1*3 = 17 and
+        // 5*1 + 1*2 + 2*3 = 13. The second channel follows the same causal
+        // indexing with its own depthwise filter.
+        let expected_pre = [17.0f32, -5.0, 13.0, -25.0];
+        for (&got, &pre) in output.as_slice().iter().zip(&expected_pre) {
+            let expected = pre / (1.0 + (-pre).exp());
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "got={got}, expected={expected}"
+            );
+        }
+        assert_eq!(&state.as_slice()[..6], &initial_state[..6]);
+        assert_eq!(&state.as_slice()[6..], &[5.0, 1.0, 2.0, 50.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn gated_delta_rule_uses_fp32_caller_owned_state() {
+        let scope = infer_core::exec::HostScope::new(Cpu);
+        let query = Tensor::<f32, Cpu>::from_slice(&[3.0, 4.0], [1, 2]);
+        let key = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0], [1, 2]);
+        let value = Tensor::<f32, Cpu>::from_slice(&[5.0, 6.0, 7.0, 8.0], [1, 4]);
+        let a = Tensor::<f32, Cpu>::from_slice(&[0.0, 0.0], [1, 2]);
+        let b = Tensor::<f32, Cpu>::from_slice(&[0.0, 0.0], [1, 2]);
+        let a_log = Tensor::<f32, Cpu>::from_slice(&[0.0, 0.0], [2]);
+        let dt_bias = Tensor::<f32, Cpu>::from_slice(&[0.0, 0.0], [2]);
+        let mut state = Tensor::<f32, Cpu>::zeros_cpu([2, 2, 2, 2]);
+        let slots = Tensor::<i32, Cpu>::from_slice(&[1], [1]);
+        let cu_seqlens = Tensor::<i32, Cpu>::from_slice(&[0, 1], [2]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([1, 4]);
+
+        <Cpu as FusedOps>::gated_delta_rule(
+            &scope,
+            &query,
+            &key,
+            &value,
+            &a,
+            &b,
+            &a_log,
+            &dt_bias,
+            &mut state,
+            &slots,
+            &cu_seqlens,
+            &mut output,
+        )
+        .unwrap();
+
+        let q_scale = 1.0 / ((25.0f32 + 1e-6).sqrt() * 2.0f32.sqrt());
+        let k_scale = 1.0 / (5.0f32 + 1e-6).sqrt();
+        let qk = (3.0 * q_scale) * (1.0 * k_scale) + (4.0 * q_scale) * (2.0 * k_scale);
+        let expected_output = [qk * 2.5, qk * 3.0, qk * 3.5, qk * 4.0];
+        for (&got, &expected) in output.as_slice().iter().zip(&expected_output) {
+            assert!((got - expected).abs() < 1e-6);
+        }
+
+        assert!(state.as_slice()[..8].iter().all(|&value| value == 0.0));
+        let expected_state = [
+            1.0 * k_scale * 2.5,
+            1.0 * k_scale * 3.0,
+            2.0 * k_scale * 2.5,
+            2.0 * k_scale * 3.0,
+            1.0 * k_scale * 3.5,
+            1.0 * k_scale * 4.0,
+            2.0 * k_scale * 3.5,
+            2.0 * k_scale * 4.0,
+        ];
+        for (&got, &expected) in state.as_slice()[8..].iter().zip(&expected_state) {
+            assert!((got - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn gated_rmsnorm_is_stateless_and_normalizes_each_head() {
+        let scope = infer_core::exec::HostScope::new(Cpu);
+        let input = Tensor::<f32, Cpu>::from_slice(
+            &[
+                1.0, 2.0, 3.0, // token 0, head 0
+                2.0, -1.0, 0.5, // token 0, head 1
+                -3.0, 4.0, 1.0, // token 1, head 0
+                0.25, -0.5, 2.0, // token 1, head 1
+            ],
+            [2, 2, 3],
+        );
+        let gate = Tensor::<f32, Cpu>::from_slice(
+            &[
+                0.0, 1.0, -1.0, 0.5, -0.5, 2.0, 1.5, -2.0, 0.25, -1.5, 0.75, 1.25,
+            ],
+            [2, 2, 3],
+        );
+        let weight = Tensor::<f32, Cpu>::from_slice(&[0.5, 1.0, 1.5], [3]);
+        let mut output = Tensor::<f32, Cpu>::zeros_cpu([2, 2, 3]);
+        let eps = 1e-6;
+
+        <Cpu as FusedOps>::gated_rmsnorm(&scope, &input, &gate, &weight, &mut output, eps).unwrap();
+
+        for row in 0..4 {
+            let base = row * 3;
+            let square_sum = input.as_slice()[base..base + 3]
+                .iter()
+                .fold(0.0f32, |sum, &value| value.mul_add(value, sum));
+            let inv_rms = (square_sum / 3.0 + eps).sqrt().recip();
+            for col in 0..3 {
+                let gate_value = gate.as_slice()[base + col];
+                let silu_gate = gate_value / (1.0 + (-gate_value).exp());
+                let expected =
+                    input.as_slice()[base + col] * inv_rms * weight.as_slice()[col] * silu_gate;
+                let got = output.as_slice()[base + col];
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "row={row} col={col}: got={got}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn read_write_f64_handles_integer_dtypes() {
         // Scalar conversion must preserve integer types without a backend-local
         // dtype dispatch table.
@@ -1442,16 +1598,31 @@ mod tests {
         let values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let mut q = Tensor::<f32, Cpu>::from_slice(&values, [2, 4]);
         let mut k = Tensor::<f32, Cpu>::from_slice(&values, [2, 4]);
-        let sin = Tensor::<f32, Cpu>::from_slice(&[0.0; 16], [4, 4]);
-        let cos = Tensor::<f32, Cpu>::from_slice(&[1.0; 16], [4, 4]);
+        let sin = Tensor::<f32, Cpu>::from_slice(&[0.0; 8], [4, 2]);
+        let cos = Tensor::<f32, Cpu>::from_slice(&[1.0; 8], [4, 2]);
         // Runtime index buffers are capacity-sized. Only the first q.shape()[0]
         // positions describe active rows in this step.
         let positions = Tensor::<i32, Cpu>::from_slice(&[0, 1, 3, 3, 3, 3], [6]);
 
-        Cpu::rope_inplace(&mut q, &mut k, &sin, &cos, &positions, 1, 1, 4).unwrap();
+        Cpu::rope_inplace(&mut q, &mut k, &sin, &cos, &positions, 1, 1, 4, 4).unwrap();
 
         assert_eq!(q.as_slice(), &values);
         assert_eq!(k.as_slice(), &values);
+    }
+
+    #[test]
+    fn partial_rope_rotates_only_prefix_with_half_split_pairs() {
+        let mut q = Tensor::<f32, Cpu>::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [1, 6]);
+        let mut k = Tensor::<f32, Cpu>::from_slice(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], [1, 6]);
+        // cos=0, sin=1 maps [a,b | c,d] -> [-c,-d | a,b].
+        let sin = Tensor::<f32, Cpu>::from_slice(&[1.0, 1.0], [1, 2]);
+        let cos = Tensor::<f32, Cpu>::from_slice(&[0.0, 0.0], [1, 2]);
+        let positions = Tensor::<i32, Cpu>::from_slice(&[0], [1]);
+
+        Cpu::rope_inplace(&mut q, &mut k, &sin, &cos, &positions, 1, 1, 6, 4).unwrap();
+
+        assert_eq!(q.as_slice(), &[-3.0, -4.0, 1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(k.as_slice(), &[-30.0, -40.0, 10.0, 20.0, 50.0, 60.0]);
     }
 
     // ─── Diffusion op tests ─────────────────────────────────────────
