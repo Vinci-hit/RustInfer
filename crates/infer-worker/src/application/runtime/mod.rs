@@ -294,6 +294,16 @@ where
     ) -> OpResult<Self> {
         let dims = model.dims();
         dims.validate()?;
+        // Recurrent slot lifecycle and graph replay are not wired into Runtime
+        // yet. Reject before allocating KV/scratch or attempting warmup.
+        if model.cache_layout().has_linear() {
+            return Err(OpError::unsupported("Runtime", "recurrent state lifecycle"));
+        }
+        if model.cache_layout().num_full_layers() != dims.num_layers {
+            return Err(OpError::Shape(
+                "Runtime model/cache layer count mismatch".into(),
+            ));
+        }
         if block_size == 0 {
             return Err(OpError::Shape("Runtime::new: block_size=0".into()));
         }
@@ -649,14 +659,13 @@ where
         };
         let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
-        let mut kv = self
-            .kv_pool
-            .view(LayerRange::all(self.dims.num_layers), &self.kv_index);
+        let mut cache =
+            crate::domain::cache::ModelCacheView::full(&mut self.kv_pool, &self.kv_index);
         self.model.embed(input_ids, &mut hidden, &ctx)?;
         self.model.decode_layers(
             LayerRange::all(self.dims.num_layers),
             &mut hidden,
-            &mut kv,
+            &mut cache,
             &ctx,
         )?;
         Ok(())
@@ -1337,11 +1346,12 @@ where
     };
     let ctx = crate::domain::exec::StepCtx::new(&runtime.scope, &plan);
     let _guard = runtime.scope.enter();
-    let mut kv = runtime.kv_pool.view(range, &runtime.kv_index);
+    let mut cache =
+        crate::domain::cache::ModelCacheView::full(&mut runtime.kv_pool, &runtime.kv_index);
     runtime.model.embed(&input_ids, &mut hidden, &ctx)?;
     runtime
         .model
-        .decode_layers(range, &mut hidden, &mut kv, &ctx)?;
+        .decode_layers(range, &mut hidden, &mut cache, &ctx)?;
     Ok(crate::domain::plan::HiddenTap {
         at_layer: range.end,
     })
@@ -1355,25 +1365,30 @@ mod tests {
 
     use super::*;
     use crate::application::sampler_stack::GreedySampler;
+    use crate::domain::cache::{CacheLayout, ModelCacheView};
     use crate::domain::component::{Hidden, LayerRange, StageKind};
     use crate::domain::exec::{HostScope, RankPair, StepCtx, TopologyShape};
-    use crate::domain::kv::KvView;
     use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
     use crate::domain::plan::{SeqStep, StopCriteria};
     use crate::infrastructure::cpu::Cpu;
 
     struct TinyDecoder {
         on_drop: Option<Box<dyn FnOnce()>>,
+        layout: CacheLayout,
     }
 
     impl TinyDecoder {
         fn plain() -> Self {
-            Self { on_drop: None }
+            Self {
+                on_drop: None,
+                layout: CacheLayout::default(),
+            }
         }
 
         fn with_drop(callback: impl FnOnce() + 'static) -> Self {
             Self {
                 on_drop: Some(Box::new(callback)),
+                layout: CacheLayout::default(),
             }
         }
     }
@@ -1387,6 +1402,10 @@ mod tests {
     }
 
     impl DecoderModel<f32, Cpu> for TinyDecoder {
+        fn cache_layout(&self) -> &CacheLayout {
+            &self.layout
+        }
+
         fn dims(&self) -> ModelDims {
             ModelDims {
                 dim: 1,
@@ -1428,7 +1447,7 @@ mod tests {
             &self,
             _range: LayerRange,
             _hidden: &mut Hidden<f32, Cpu>,
-            _kv: &mut KvView<'_, f32, Cpu>,
+            _cache: &mut ModelCacheView<'_, f32, Cpu>,
             _ctx: &StepCtx<'_, Cpu>,
         ) -> OpResult<()> {
             Ok(())
