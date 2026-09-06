@@ -144,6 +144,10 @@ impl<D: ExecDevice> Workspace<D> {
 pub struct StepCtx<'a, D: ExecDevice> {
     scope: &'a D::Scope,
     plan: &'a crate::plan::BatchPlan,
+    rotary_angles: Option<(
+        &'a crate::tensor::Tensor<f32, D>,
+        &'a crate::tensor::Tensor<f32, D>,
+    )>,
     _marker: PhantomData<D>,
 }
 
@@ -152,6 +156,7 @@ impl<'a, D: ExecDevice> StepCtx<'a, D> {
         Self {
             scope,
             plan,
+            rotary_angles: None,
             _marker: PhantomData,
         }
     }
@@ -162,6 +167,24 @@ impl<'a, D: ExecDevice> StepCtx<'a, D> {
 
     pub fn plan(&self) -> &crate::plan::BatchPlan {
         self.plan
+    }
+
+    pub fn with_rotary_angles(
+        mut self,
+        sin: &'a crate::tensor::Tensor<f32, D>,
+        cos: &'a crate::tensor::Tensor<f32, D>,
+    ) -> Self {
+        self.rotary_angles = Some((sin, cos));
+        self
+    }
+
+    pub fn rotary_angles(
+        &self,
+    ) -> Option<(
+        &crate::tensor::Tensor<f32, D>,
+        &crate::tensor::Tensor<f32, D>,
+    )> {
+        self.rotary_angles
     }
 }
 

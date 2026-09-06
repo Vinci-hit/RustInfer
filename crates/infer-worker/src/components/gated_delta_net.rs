@@ -13,7 +13,7 @@ use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
 /// The input norm is supplied by the model builder. Checkpoint-specific norm
-/// conventions are separate from the recurrent mixer and its gated output norm.
+/// conventions are separate from the recurrent attention and its gated output norm.
 pub struct GdnWeights<T: Dtype, D: LlmBackend> {
     pub input_layernorm: RmsNorm<T, D>,
     pub in_proj_qkv: Linear<T, D>,
@@ -28,7 +28,7 @@ pub struct GdnWeights<T: Dtype, D: LlmBackend> {
     pub out_proj: Linear<T, D>,
 }
 
-/// Stateful token mixer over an ordinary causal ragged tape. Weights and
+/// Stateful token attention over an ordinary causal ragged tape. Weights and
 /// scratch belong to the component; all persistent sequence state is borrowed.
 pub struct GatedDeltaNet<T: Dtype, D: LlmBackend> {
     weights: GdnWeights<T, D>,
@@ -177,14 +177,10 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
         let mut buf = scratch.buffers(tokens)?;
         let w = &self.weights;
         match hidden.pending.take() {
-            Some(delta) => D::fused_add_rmsnorm(
-                ctx,
-                &mut buf.normed,
-                &mut hidden.stream,
-                &delta,
-                &w.input_layernorm.weight,
-                w.input_layernorm.eps,
-            )?,
+            Some(delta) => {
+                w.input_layernorm
+                    .add_forward(&mut hidden.stream, &delta, &mut buf.normed, ctx)?
+            }
             None => w
                 .input_layernorm
                 .forward(&hidden.stream, &mut buf.normed, ctx)?,

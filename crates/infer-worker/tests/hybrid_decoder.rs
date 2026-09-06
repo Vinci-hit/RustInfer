@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use infer_worker::application::runtime::Runtime;
 use infer_worker::application::sampler_stack::GreedySampler;
 use infer_worker::components::{
-    Attention, DecoderBlock, DenseFfn, Embed, GatedDeltaNet, GdnWeights, Linear, LmHead, Mixer,
-    RmsNorm,
+    Attention, DecoderBlock, DenseFfn, Embed, FullAttention, GatedDeltaNet, GdnWeights, Linear,
+    LmHead, RmsNorm,
 };
 use infer_worker::domain::cache::{
     CacheLayout, LayerCacheId, LayerCacheSpec, LinearBatch, LinearDims, LinearLayerState,
@@ -52,6 +52,7 @@ fn weights(rows: usize, cols: usize, seed: f32) -> Tensor<f32, Cpu> {
 
 fn norm(dim: usize) -> RmsNorm<f32, Cpu> {
     RmsNorm {
+        zero_centered: false,
         weight: Tensor::from_host_slice(&vec![1.0; dim], [dim], &Cpu).unwrap(),
         eps: 1e-6,
     }
@@ -87,8 +88,8 @@ fn model(shared_scratch: bool) -> Decoder<f32, Cpu> {
     let mut blocks = Vec::new();
     for i in 0..8 {
         let seed = 0.3 + i as f32 * 0.31;
-        let mixer = if i % 4 == 3 {
-            Mixer::Full(Attention {
+        let attention = if i % 4 == 3 {
+            Attention::Full(FullAttention {
                 input_layernorm: norm(DIM),
                 qkv_proj: linear(DIM + 2 * KV_DIM, DIM, seed),
                 o_proj: linear(DIM, DIM, seed + 0.4),
@@ -113,14 +114,16 @@ fn model(shared_scratch: bool) -> Decoder<f32, Cpu> {
                 head_num: 2,
                 kv_head_num: 1,
                 head_dim: HEAD_DIM,
+                rotary_dim: HEAD_DIM,
+                attn_output_gate: false,
                 scale: 0.5,
                 scratch: None,
             })
         } else {
-            Mixer::Linear(gdn(seed))
+            Attention::Linear(gdn(seed))
         };
         blocks.push(DecoderBlock {
-            mixer,
+            attention,
             ffn: DenseFfn {
                 post_attention_layernorm: norm(DIM),
                 gate_up_proj: linear(2 * INTER, DIM, seed + 2.1),
@@ -580,23 +583,301 @@ fn full_cache_accepts_bucket_plan_with_device_owned_lengths() {
         .unwrap();
 }
 
-#[test]
-fn runtime_rejects_hybrid_before_attempting_allocation() {
-    let result = Runtime::new(
+fn hybrid_runtime(capacity: usize) -> Runtime<f32, Cpu, Decoder<f32, Cpu>> {
+    Runtime::new(
         model(false),
         HostScope::new(Cpu),
         Box::new(GreedySampler),
-        usize::MAX,
+        SLOTS * MAX_SEQ,
         1,
         MAX_SEQ,
         MAX_SEQ,
-        usize::MAX,
-        SLOTS,
-        Vec::new(),
+        32,
+        capacity,
+        vec![1, 2, 4],
+    )
+    .unwrap()
+}
+
+fn request(seqs: &[(u64, usize, usize, &[i32])]) -> infer_worker::domain::plan::StepRequest {
+    use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
+    StepRequest {
+        seqs: seqs
+            .iter()
+            .map(|&(id, slot, start, ids)| SeqStep {
+                sequence_id: id,
+                input_ids: ids.to_vec(),
+                positions: (start as i32..(start + ids.len()) as i32).collect(),
+                kv_write_start: start as i32,
+                kv_len_after: (start + ids.len()) as i32,
+                block_table: (slot * MAX_SEQ..(slot + 1) * MAX_SEQ)
+                    .map(|b| b as u32)
+                    .collect(),
+            })
+            .collect(),
+        sampling: vec![Default::default(); seqs.len()],
+        stop: StopCriteria {
+            eos_ids: vec![],
+            generated_counts: vec![0; seqs.len()],
+            max_tokens: vec![100; seqs.len()],
+            ignore_eos: vec![true; seqs.len()],
+        },
+        draft_tokens: vec![],
+    }
+}
+
+#[test]
+fn runtime_hybrid_tracks_reordered_chunks_and_recycles_cancelled_slots() {
+    let reference = model(false);
+    let mut expected = Fixture::new(&reference);
+    let mut runtime = hybrid_runtime(2);
+    assert_eq!(runtime.kv_pool.layers.len(), 2);
+    runtime.prime_graphs().unwrap();
+    assert!(runtime.graph.is_none());
+    assert_eq!(runtime.next_capture_slot(1), None);
+    for (req, seqs) in [
+        (
+            request(&[(10, 0, 0, &[1, 2]), (20, 1, 0, &[3])]),
+            vec![(0, vec![1, 2]), (1, vec![3])],
+        ),
+        (
+            request(&[(20, 1, 1, &[4]), (10, 0, 2, &[5, 6])]),
+            vec![(1, vec![4]), (0, vec![5, 6])],
+        ),
+    ] {
+        let seqs: Vec<_> = seqs
+            .iter()
+            .map(|(slot, ids)| (*slot, ids.as_slice()))
+            .collect();
+        let values = expected.run(&reference, &seqs, &ALL).concat();
+        runtime.step(&req).unwrap();
+        close(
+            &runtime.hidden.stream.to_host_vec().unwrap()[..values.len()],
+            &values,
+        );
+    }
+    // Missing history, duplicate ids, and exhaustion cannot mutate valid requests.
+    assert!(runtime.step(&request(&[(30, 2, 2, &[1])])).is_err());
+    assert!(
+        runtime
+            .step(&request(&[(10, 0, 4, &[1]), (10, 0, 4, &[1])]))
+            .is_err()
     );
-    let error = match result {
-        Err(error) => error,
-        Ok(_) => panic!("hybrid Runtime unexpectedly accepted"),
-    };
-    assert!(error.to_string().contains("recurrent state lifecycle"));
+    assert!(runtime.step(&request(&[(30, 2, 0, &[1])])).is_err());
+    runtime.release_sequence(10);
+    runtime.release_sequence(10); // idempotent cancellation
+    let mut fresh = Fixture::new(&reference);
+    let values = fresh.run(&reference, &[(2, &[7, 8])], &ALL).concat();
+    runtime.step(&request(&[(30, 2, 0, &[7, 8])])).unwrap();
+    close(
+        &runtime.hidden.stream.to_host_vec().unwrap()[..values.len()],
+        &values,
+    );
+    // Omitted requests retain their histories; releasing another slot cannot affect them.
+    let values = expected.run(&reference, &[(1, &[9])], &ALL).concat();
+    runtime.step(&request(&[(20, 1, 2, &[9])])).unwrap();
+    close(
+        &runtime.hidden.stream.to_host_vec().unwrap()[..values.len()],
+        &values,
+    );
+    runtime.retain_sequences([]);
+    runtime.step(&request(&[(10, 0, 0, &[1])])).unwrap();
+}
+
+#[test]
+fn runtime_hybrid_mixed_and_abc_use_the_same_request_history() {
+    use infer_worker::application::runtime::RaggedRowKind;
+    let mut runtime = hybrid_runtime(2);
+    let mut ordinary = hybrid_runtime(2);
+    let prefill = request(&[(10, 0, 0, &[1, 2]), (20, 1, 0, &[3])]);
+    ordinary.step(&prefill).unwrap();
+    runtime
+        .step_fused_abc_eager(
+            &prefill,
+            &[RaggedRowKind::PrefillFinal, RaggedRowKind::PrefillFinal],
+            None,
+        )
+        .unwrap();
+    let decode = request(&[(20, 1, 1, &[4]), (10, 0, 2, &[5])]);
+    let expected = ordinary.step(&decode).unwrap();
+    runtime
+        .issue_decode_abc(
+            &decode,
+            0,
+            &[0, 0],
+            &[100, 100],
+            &[true, true],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+    let out = runtime.finalize_decode_abc(2).unwrap();
+    for (i, token) in out.active.iter().enumerate() {
+        assert_eq!(token.token_id, expected.tokens[i][0].token_id);
+    }
+    close(
+        &runtime.hidden.stream.to_host_vec().unwrap()[..2 * DIM],
+        &ordinary.hidden.stream.to_host_vec().unwrap()[..2 * DIM],
+    );
+    let mut spec = request(&[(10, 0, 3, &[6])]);
+    spec.draft_tokens = vec![vec![6]];
+    assert!(runtime.step(&spec).is_err());
+    spec.draft_tokens.clear();
+    runtime.step(&spec).unwrap();
+}
+
+/// Independent scalar oracle: per-head Q/gate packing, partial rotation,
+/// causal GQA, then sigmoid gating before an identity output projection.
+#[test]
+fn full_attention_partial_rope_and_gate_match_scalar_reference() {
+    use infer_worker::domain::component::Component;
+    let input = [
+        [0.2, 0.4, -0.3, 0.7, 0.9, -0.1, 0.5, 0.8],
+        [0.8, -0.2, 0.6, 0.1, -0.4, 0.3, 0.7, -0.9],
+        [-0.5, 0.9, 0.2, -0.6, 0.4, 0.8, -0.7, 0.3],
+    ];
+    let queries = [[0.3, -0.7, 0.8, 0.2], [-0.4, 0.9, 0.1, -0.6]];
+    let gates: [[f32; 4]; 2] = [[-1.0, 0.0, 1.0, 2.0], [0.7, -0.8, 1.3, -2.0]];
+    let normalized: Vec<Vec<f32>> = input
+        .iter()
+        .map(|row| {
+            let scale = 1.0 / (row.iter().map(|x| x * x).sum::<f32>() / DIM as f32 + 1e-6).sqrt();
+            row.iter().map(|x| x * scale).collect()
+        })
+        .collect();
+    for qk_norm in [false, true] {
+        let normalize_head = |head: &[f32]| -> Vec<f32> {
+            let scale = if qk_norm {
+                1.0 / (head.iter().map(|x| x * x).sum::<f32>() / 4.0 + 1e-6).sqrt()
+            } else {
+                1.0
+            };
+            head.iter().map(|x| x * scale).collect()
+        };
+        let rotate = |mut head: Vec<f32>, pos: usize| {
+            let (sin, cos) = (pos as f32 * 0.37).sin_cos();
+            let (a, b) = (head[0], head[1]);
+            head[0] = a * cos - b * sin;
+            head[1] = b * cos + a * sin;
+            head
+        };
+        let keys: Vec<_> = normalized
+            .iter()
+            .enumerate()
+            .map(|(p, row)| rotate(normalize_head(&row[..4]), p))
+            .collect();
+        let mut expected = Vec::new();
+        for pos in 0..3 {
+            for head in 0..2 {
+                let query = rotate(normalize_head(&queries[head]), pos);
+                let scores: Vec<f32> = keys[..=pos]
+                    .iter()
+                    .map(|k| query.iter().zip(k).map(|(q, k)| q * k).sum::<f32>() * 0.5)
+                    .collect();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let probs: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+                let total: f32 = probs.iter().sum();
+                for col in 0..4 {
+                    let value = probs
+                        .iter()
+                        .enumerate()
+                        .map(|(p, prob)| prob / total * normalized[p][4 + col])
+                        .sum::<f32>();
+                    expected.push(value / (1.0 + (-gates[head][col]).exp()));
+                }
+            }
+        }
+        for shared in [false, true] {
+            let model = model(false);
+            let mut fixture = Fixture::new(&model);
+            let step = fixture.step(&[(0, &[1, 2, 3])]);
+            let mut projection = vec![0.0; 24 * DIM];
+            for col in 0..8 {
+                projection[(16 + col) * DIM + col] = 1.0;
+            }
+            let mut bias = Vec::new();
+            for head in 0..2 {
+                bias.extend(queries[head]);
+                bias.extend(gates[head]);
+            }
+            bias.extend([0.0; 8]);
+            let mut identity = vec![0.0; DIM * DIM];
+            for col in 0..DIM {
+                identity[col * DIM + col] = 1.0;
+            }
+            let attention = FullAttention {
+                input_layernorm: norm(DIM),
+                qkv_proj: Linear::new(
+                    Tensor::from_host_slice(&projection, [24, DIM], &Cpu).unwrap(),
+                    Some(Tensor::from_host_slice(&bias, [24], &Cpu).unwrap()),
+                ),
+                o_proj: Linear::new(
+                    Tensor::from_host_slice(&identity, [DIM, DIM], &Cpu).unwrap(),
+                    None,
+                ),
+                q_norm: qk_norm.then(|| norm(4)),
+                k_norm: qk_norm.then(|| norm(4)),
+                sin: Tensor::from_host_slice(
+                    &(0..MAX_SEQ)
+                        .map(|p| (p as f32 * 0.37).sin())
+                        .collect::<Vec<_>>(),
+                    [MAX_SEQ, 1],
+                    &Cpu,
+                )
+                .unwrap(),
+                cos: Tensor::from_host_slice(
+                    &(0..MAX_SEQ)
+                        .map(|p| (p as f32 * 0.37).cos())
+                        .collect::<Vec<_>>(),
+                    [MAX_SEQ, 1],
+                    &Cpu,
+                )
+                .unwrap(),
+                head_num: 2,
+                kv_head_num: 1,
+                head_dim: 4,
+                rotary_dim: 2,
+                scale: 0.5,
+                attn_output_gate: true,
+                scratch: shared.then(|| ForwardScratch::new(&Cpu, model.dims(), 8, SLOTS).unwrap()),
+            };
+            let scope = HostScope::new(Cpu);
+            let ctx = StepCtx::new(&scope, &step.plan);
+            let run = |attention: &FullAttention<f32, Cpu>, fixture: &mut Fixture| {
+                let mut hidden = Hidden {
+                    stream: Tensor::from_host_slice(&input.concat(), [3, DIM], &Cpu).unwrap(),
+                    pending: None,
+                };
+                let mut kv = fixture
+                    .kv
+                    .view(LayerRange { start: 0, end: 1 }, &step.index);
+                attention.run(&mut hidden, Some(&mut kv), &ctx).unwrap();
+                close(&hidden.pending.unwrap().to_host_vec().unwrap(), &expected);
+                close(&hidden.stream.to_host_vec().unwrap(), &input.concat());
+            };
+            run(&attention, &mut fixture);
+            // Repeat with the same scratch to expose lifetime/aliasing errors.
+            run(&attention, &mut fixture);
+            let stored_keys = fixture.kv.layers[0].k.to_host_vec().unwrap();
+            close(&stored_keys[..12], &keys.concat());
+            // Incremental decode must agree with the causal prefill oracle.
+            let mut decode = Fixture::new(&model);
+            for pos in 0..3 {
+                let step = decode.step(&[(0, &[1])]);
+                let ctx = StepCtx::new(&scope, &step.plan);
+                let mut hidden = Hidden {
+                    stream: Tensor::from_host_slice(&input[pos], [1, DIM], &Cpu).unwrap(),
+                    pending: None,
+                };
+                let mut kv = decode.kv.view(LayerRange { start: 0, end: 1 }, &step.index);
+                attention.run(&mut hidden, Some(&mut kv), &ctx).unwrap();
+                close(
+                    &hidden.pending.unwrap().to_host_vec().unwrap(),
+                    &expected[pos * DIM..(pos + 1) * DIM],
+                );
+                decode.positions[0] += 1;
+            }
+        }
+    }
 }

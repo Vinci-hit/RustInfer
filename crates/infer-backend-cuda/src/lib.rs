@@ -358,6 +358,17 @@ impl infer_core::ports::MathOps for Cuda {
         kernels::matmul::matmul(scope_stream(scope), input, weight, output)
     }
 
+    fn linear<T: Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::matmul::linear(scope_stream(scope), input, weight, bias, output)
+    }
+
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         input: &Tensor<A, Self>,
@@ -671,6 +682,37 @@ impl infer_core::ports::VocabOps for Cuda {
 }
 
 impl infer_core::ports::FusedOps for Cuda {
+    fn layer_norm<T: Dtype>(
+        scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::scalar::layer_norm(scope_stream(scope), input, weight, bias, output, eps)
+    }
+
+    fn gelu_inplace<T: Dtype>(
+        scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        tanh: bool,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::scalar::gelu(x.device().config.stream, x, tanh)
+    }
+
+    fn rope_with_angles<T: Dtype>(
+        scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        sin: &Tensor<f32, Self>,
+        cos: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::scalar::rope_with_angles(x.device().config.stream, x, sin, cos, head_dim)
+    }
     fn set_prefill_gemm_mode(on: bool) {
         kernels::matmul::set_eager_prefill_gemm(on);
     }
@@ -779,6 +821,40 @@ impl infer_core::ports::FusedOps for Cuda {
                 state_slots,
                 cu_seqlens,
                 &mut output.reinterpret::<F>(),
+            )
+        })
+    }
+
+    fn rmsnorm_zero_centered<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        narrow_float!(T, "rmsnorm_zero_centered", |F| {
+            kernels::scalar::rmsnorm_zero_centered::<F>(
+                scope_stream(scope),
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+                eps,
+            )
+        })
+    }
+
+    fn sigmoid_mul<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        output: &mut Tensor<T, Self>,
+        gate: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        narrow_float!(T, "sigmoid_mul", |F| {
+            kernels::scalar::sigmoid_mul::<F>(
+                scope_stream(scope),
+                &mut output.reinterpret::<F>(),
+                &gate.reinterpret::<F>(),
             )
         })
     }

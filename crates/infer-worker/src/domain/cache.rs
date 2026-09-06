@@ -73,7 +73,7 @@ pub enum LayerCacheSpec {
     Linear(LinearDims),
 }
 
-/// Built once from the actual mixer sequence, then kept immutable by Decoder.
+/// Built once from the actual attention sequence, then kept immutable by Decoder.
 #[derive(Debug, Clone, Default)]
 pub struct CacheLayout {
     layers: Vec<LayerCacheId>,
@@ -128,6 +128,8 @@ impl CacheLayout {
 /// avoids device-to-host validation inside each layer. Slot identity belongs to
 /// the caller and must survive batch reordering and prefill chunk boundaries.
 pub struct LinearBatch<D: LlmBackend> {
+    state_slots_buf: Tensor<i32, D>,
+    cu_seqlens_buf: Tensor<i32, D>,
     state_slots: Tensor<i32, D>,
     cu_seqlens: Tensor<i32, D>,
     q_lens: Vec<i32>,
@@ -137,9 +139,70 @@ pub struct LinearBatch<D: LlmBackend> {
 
 impl<D: LlmBackend> LinearBatch<D> {
     pub fn new(slots: &[i32], q_lens: &[i32], num_slots: usize, device: &D) -> OpResult<Self> {
+        Self::with_capacity(slots, q_lens, num_slots, slots.len(), device)
+    }
+
+    /// Reserve stable device addresses for all future batch sizes. Captured
+    /// decode graphs may read the padded tail; invalid slots make those rows
+    /// inert in both the convolution and delta-rule kernels.
+    pub fn with_capacity(
+        slots: &[i32],
+        q_lens: &[i32],
+        num_slots: usize,
+        capacity: usize,
+        device: &D,
+    ) -> OpResult<Self> {
+        Self::checked_cu(slots, q_lens, num_slots, capacity)?;
+        let state_slots_buf = Tensor::zeros([capacity], device)?;
+        let cu_capacity = capacity
+            .checked_add(1)
+            .ok_or_else(|| OpError::Shape("linear batch capacity overflows".into()))?;
+        let cu_seqlens_buf = Tensor::zeros([cu_capacity], device)?;
+        let mut batch = Self {
+            state_slots: state_slots_buf.narrow(0, 0, slots.len())?,
+            cu_seqlens: cu_seqlens_buf.narrow(0, 0, slots.len() + 1)?,
+            state_slots_buf,
+            cu_seqlens_buf,
+            q_lens: Vec::new(),
+            num_tokens: 0,
+            num_slots,
+        };
+        batch.update(slots, q_lens)?;
+        Ok(batch)
+    }
+
+    /// Update between forwards, after previous readers have completed. No
+    /// device allocation is replaced, including when batch rows are reordered.
+    pub fn update(&mut self, slots: &[i32], q_lens: &[i32]) -> OpResult<()> {
+        let capacity = self.state_slots_buf.numel();
+        let mut cu = Self::checked_cu(slots, q_lens, self.num_slots, capacity)?;
+        let num_tokens = *cu.last().unwrap();
+        cu.resize(capacity + 1, num_tokens);
+        let mut padded_slots = vec![-1; capacity];
+        padded_slots[..slots.len()].copy_from_slice(slots);
+        self.state_slots_buf.upload_from_host(&padded_slots)?;
+        self.cu_seqlens_buf.upload_from_host(&cu)?;
+        self.state_slots = self.state_slots_buf.narrow(0, 0, slots.len())?;
+        self.cu_seqlens = self.cu_seqlens_buf.narrow(0, 0, slots.len() + 1)?;
+        self.q_lens = q_lens.to_vec();
+        self.num_tokens = num_tokens as usize;
+        Ok(())
+    }
+
+    fn checked_cu(
+        slots: &[i32],
+        q_lens: &[i32],
+        num_slots: usize,
+        capacity: usize,
+    ) -> OpResult<Vec<i32>> {
         if slots.is_empty() || slots.len() != q_lens.len() || num_slots == 0 {
             return Err(OpError::Shape(
                 "linear batch requires slots and matching q_lens".into(),
+            ));
+        }
+        if slots.len() > capacity {
+            return Err(OpError::Shape(
+                "linear batch exceeds reserved capacity".into(),
             ));
         }
         let mut seen = HashSet::with_capacity(slots.len());
@@ -165,13 +228,7 @@ impl<D: LlmBackend> LinearBatch<D> {
         if num_tokens == 0 {
             return Err(OpError::Shape("linear batch must contain tokens".into()));
         }
-        Ok(Self {
-            state_slots: Tensor::from_host_slice(slots, [slots.len()], device)?,
-            cu_seqlens: Tensor::from_host_slice(&cu, [cu.len()], device)?,
-            q_lens: q_lens.to_vec(),
-            num_tokens,
-            num_slots,
-        })
+        Ok(cu)
     }
 
     pub fn validate_plan(&self, plan: &BatchPlan) -> OpResult<()> {
@@ -192,6 +249,32 @@ impl<D: LlmBackend> LinearBatch<D> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod linear_batch_tests {
+    use super::*;
+    use crate::infrastructure::cpu::Cpu;
+
+    #[test]
+    fn updates_preserve_captured_addresses_and_clear_inactive_rows() {
+        let mut batch = LinearBatch::with_capacity(&[0, 1, 2, 3], &[1; 4], 4, 4, &Cpu).unwrap();
+        // These views stand in for the pointers and shapes baked into a graph.
+        let captured_slots = batch.state_slots.clone();
+        let captured_cu = batch.cu_seqlens.clone();
+        batch.update(&[3, 1], &[1, 1]).unwrap();
+        assert_eq!(captured_slots.data_ptr(), batch.state_slots.data_ptr());
+        assert_eq!(captured_cu.data_ptr(), batch.cu_seqlens.data_ptr());
+        assert_eq!(captured_slots.to_host_vec().unwrap(), [3, 1, -1, -1]);
+        assert_eq!(captured_cu.to_host_vec().unwrap(), [0, 1, 2, 2, 2]);
+        // A rejected batch must leave the previous device control intact.
+        assert!(batch.update(&[2, 2], &[1, 1]).is_err());
+        assert!(batch.update(&[0, 1, 2, 3, 4], &[1; 5]).is_err());
+        assert_eq!(captured_slots.to_host_vec().unwrap(), [3, 1, -1, -1]);
+        batch.update(&[2, 0, 3], &[2, 1, 3]).unwrap();
+        assert_eq!(captured_slots.to_host_vec().unwrap(), [2, 0, 3, -1]);
+        assert_eq!(captured_cu.to_host_vec().unwrap(), [0, 2, 3, 6, 6]);
     }
 }
 
@@ -224,6 +307,14 @@ impl<T: Dtype, D: LlmBackend> LinearLayerState<T, D> {
                 device,
             )?,
         })
+    }
+
+    /// Reset both recurrent histories before assigning this slot to a new request.
+    pub fn reset_slot(&mut self, slot: usize) -> OpResult<()> {
+        let mut conv = self.conv.narrow(0, slot, 1)?;
+        let mut ssm = self.ssm.narrow(0, slot, 1)?;
+        conv.copy_from(&Tensor::zeros(*conv.shape(), conv.device())?)?;
+        ssm.copy_from(&Tensor::zeros(*ssm.shape(), ssm.device())?)
     }
 
     pub fn conv(&self) -> &Tensor<T, D> {

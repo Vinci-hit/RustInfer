@@ -38,6 +38,7 @@ fn run<D: LlmBackend>(scope: &D::Scope) -> Vec<Vec<f32>> {
     let mut model = GatedDeltaNet::new(
         GdnWeights {
             input_layernorm: RmsNorm {
+                zero_centered: false,
                 weight: Tensor::from_host_slice(&[bf16::from_f32(1.0); DIM], [DIM], device)
                     .unwrap(),
                 eps: 0.0,

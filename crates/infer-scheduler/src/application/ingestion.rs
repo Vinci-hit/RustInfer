@@ -51,12 +51,19 @@ pub enum IngestOutcome {
 pub enum RejectReason {
     /// LLM request had empty `input_ids`.
     EmptyPrompt,
+    InvalidMultimodal(String),
     /// LLM prompt longer than `config.max_model_len`.
-    PromptTooLong { len: usize, limit: usize },
+    PromptTooLong {
+        len: usize,
+        limit: usize,
+    },
     /// LLM max_tokens must be positive.
     MaxTokensZero,
     /// Prompt + generated tokens would exceed the model context window.
-    TotalTokensTooLong { requested: usize, limit: usize },
+    TotalTokensTooLong {
+        requested: usize,
+        limit: usize,
+    },
     /// Diffusion requests are disabled in this release.
     DiffusionDisabled,
     /// `RequestTable::insert_new` rejected the entry (duplicate id /
@@ -67,6 +74,7 @@ pub enum RejectReason {
 impl RejectReason {
     pub fn as_message(&self) -> String {
         match self {
+            Self::InvalidMultimodal(msg) => format!("invalid multimodal input: {msg}"),
             Self::EmptyPrompt => "empty input_ids".to_string(),
             Self::PromptTooLong { len, limit } => {
                 format!("prompt length {} exceeds max_model_len {}", len, limit)
@@ -138,10 +146,20 @@ impl IngestionSystem {
             };
         }
 
+        if let Some(mm) = &request.multimodal {
+            if let Err(error) = mm.validate_tokens(&request.input_ids) {
+                return IngestOutcome::Rejected {
+                    external_id,
+                    reason: RejectReason::InvalidMultimodal(error),
+                };
+            }
+        }
+
         let sequence_id = SequenceId(self.next_sequence_id);
         self.next_sequence_id += 1;
 
         let meta = Arc::new(RequestMeta {
+            multimodal: request.multimodal.clone(),
             id: RequestId::new_v4(),
             external_id: external_id.clone(),
             sequence_id,
@@ -226,6 +244,7 @@ mod tests {
 
     fn dummy_llm_request(id: &str, prompt_tokens: usize) -> InferenceRequest {
         InferenceRequest {
+            multimodal: None,
             request_id: id.to_string(),
             modality: InferenceModality::Llm,
             input_ids: (0..prompt_tokens as i32).collect(),
@@ -400,5 +419,51 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+    #[test]
+    fn preserves_prepared_images_and_rejects_placeholder_mismatch() {
+        use infer_protocol::multimodal::*;
+        let mm = Arc::new(MultimodalInput {
+            images: vec![ImageInput {
+                grid_thw: [1, 2, 2],
+                patches: vec![0; 4 * PATCH_WIDTH * 2],
+            }],
+            spans: vec![ImageSpan {
+                image_index: 0,
+                token_start: 1,
+                token_len: 1,
+            }],
+            original_prompt_len: 4,
+        });
+        let mut request = dummy_llm_request("image", 4);
+        request.input_ids = vec![VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 1];
+        request.multimodal = Some(mm.clone());
+        let mut system = IngestionSystem::new();
+        let mut sessions = RequestTable::new();
+        let cfg = config_llm(4096);
+        assert!(matches!(
+            system.ingest(ClientId::dummy(), request.clone(), &cfg, &mut sessions),
+            IngestOutcome::Admitted { .. }
+        ));
+        assert!(Arc::ptr_eq(
+            sessions
+                .waiting()
+                .front()
+                .unwrap()
+                .meta
+                .multimodal
+                .as_ref()
+                .unwrap(),
+            &mm
+        ));
+        request.request_id = "bad-image".into();
+        request.input_ids[1] = 7;
+        assert!(matches!(
+            system.ingest(ClientId::dummy(), request, &cfg, &mut sessions),
+            IngestOutcome::Rejected {
+                reason: RejectReason::InvalidMultimodal(_),
+                ..
+            }
+        ));
     }
 }

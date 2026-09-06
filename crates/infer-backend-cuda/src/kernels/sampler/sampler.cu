@@ -235,7 +235,9 @@ void argmax_update_hge(
     ArgMax& best,
     const ArgMax& cand
 ) {
-    uint32_t mask = __hge(cand.val, best.val) ? 0xffffffffu : 0u;
+    // PyTorch argmax chooses the lowest token index on equal logits.
+    uint32_t mask = (__hgt(cand.val, best.val) ||
+        (__heq(cand.val, best.val) && cand.idx < best.idx)) ? 0xffffffffu : 0u;
 
     uint32_t best_bits = bf16_as_u16(best.val);
     uint32_t cand_bits = bf16_as_u16(cand.val);
@@ -252,7 +254,11 @@ void argmax2_update_hge(
     const __nv_bfloat162 cand_val,
     const uint2 cand_idx
 ) {
-    uint32_t mask = __hge2_mask(cand_val, best.val);
+    uint32_t greater = __hgt2_mask(cand_val, best.val);
+    uint32_t equal = __heq2_mask(cand_val, best.val);
+    uint32_t lower_index = (cand_idx.x < best.idx.x ? 0x0000ffffu : 0u)
+                        | (cand_idx.y < best.idx.y ? 0xffff0000u : 0u);
+    uint32_t mask = greater | (equal & lower_index);
 
     uint32_t best_bits = bf162_as_u32(best.val);
     uint32_t cand_bits = bf162_as_u32(cand_val);

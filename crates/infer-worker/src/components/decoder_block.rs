@@ -1,4 +1,4 @@
-use crate::components::mixer::Mixer;
+use crate::components::attention::Attention;
 use crate::domain::cache::LayerCacheView;
 use crate::domain::component::{Component, Hidden};
 use crate::domain::dtype::Dtype;
@@ -11,7 +11,7 @@ use crate::domain::ports::backend::LlmBackend;
 /// sublayer owns its own input norm (inv 7), so the block is just their
 /// composition. `F` is the FFN — `DenseFfn` or `MoeFfn` (the dense↔MoE swap).
 pub struct DecoderBlock<T: Dtype, D: LlmBackend, F: Component<T, D>> {
-    pub mixer: Mixer<T, D>,
+    pub attention: Attention<T, D>,
     pub ffn: F,
 }
 
@@ -22,7 +22,7 @@ impl<T: Dtype, D: LlmBackend, F: Component<T, D>> DecoderBlock<T, D, F> {
         cache: LayerCacheView<'_, T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
-        self.mixer.run(hidden, cache, ctx)?;
+        self.attention.run(hidden, cache, ctx)?;
         self.ffn.run(hidden, None, ctx)
     }
 }

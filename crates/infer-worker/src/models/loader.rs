@@ -36,11 +36,11 @@ pub struct RopeScaling {
 
 /// Gated-DeltaNet (linear-attention) dimensions for the Qwen3.5 hybrid stack.
 ///
-/// These describe the *recurrent* mixer that replaces full attention in 24 of
+/// These describe the *recurrent* attention that replaces full attention in 24 of
 /// the 32 layers. They are attributes of the checkpoint, not a distinct config
 /// type: a dense Llama/Qwen3 model simply has `LoadConfig::linear_attn = None`
 /// and every layer is full attention. When `Some`, `layer_is_full[i]` selects
-/// per layer which mixer (full vs Gated-DeltaNet) layer `i` uses.
+/// per layer which attention (full vs Gated-DeltaNet) layer `i` uses.
 #[derive(Debug, Clone)]
 pub struct LinearAttnConfig {
     /// Number of key/query heads (query is L2-normed, shared GQA-style across
@@ -54,7 +54,7 @@ pub struct LinearAttnConfig {
     pub value_head_dim: usize,
     /// Causal depthwise conv kernel width over the concatenated qkv channels. 4.
     pub conv_kernel_dim: usize,
-    /// Per-layer mixer selector: `true` = full attention, `false` = Gated
+    /// Per-layer attention selector: `true` = full attention, `false` = Gated
     /// DeltaNet. Length == `LoadConfig::layer_num`.
     pub layer_is_full: Vec<bool>,
 }
@@ -112,7 +112,7 @@ pub struct LoadConfig {
     /// (`partial_rotary_factor = 0.25` → 64 of 256). Attribute, not a branch:
     /// the rope cache is simply built over `rotary_dim` columns.
     pub rotary_dim: usize,
-    /// Qwen3.5 full-attn `attn_output_gate`: `q_proj` emits `[gate | query]` and
+    /// Qwen3.5 full-attn `attn_output_gate`: `q_proj` emits per-head `[query | gate]` and
     /// the attention output is elementwise-gated by `sigmoid(gate)`. `false` for
     /// every model we ship today.
     pub attn_output_gate: bool,

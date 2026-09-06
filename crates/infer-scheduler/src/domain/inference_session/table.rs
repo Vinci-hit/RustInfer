@@ -1066,6 +1066,7 @@ mod tests {
         max_tokens: usize,
     ) -> Arc<RequestMeta> {
         Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: request_id.to_string(),
             sequence_id: SequenceId(sequence_id),

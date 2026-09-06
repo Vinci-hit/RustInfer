@@ -12,6 +12,187 @@ use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
 pub trait FusedOps: MathOps {
+    fn layer_norm<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let dim = weight.numel();
+        if dim == 0
+            || input.shape().len() != 2
+            || input.shape()[1] != dim
+            || bias.numel() != dim
+            || output.shape() != input.shape()
+            || !eps.is_finite()
+            || !input.is_contiguous()
+            || !output.is_contiguous()
+            || !weight.is_contiguous()
+            || !bias.is_contiguous()
+            || eps <= 0.0
+        {
+            return Err(OpError::Shape(
+                "layer_norm: invalid dimensions or epsilon".into(),
+            ));
+        }
+        let x = input.to_host_vec()?;
+        let w = weight.to_host_vec()?;
+        let b = bias.to_host_vec()?;
+        let mut out = Vec::with_capacity(x.len());
+        for row in x.chunks_exact(dim) {
+            let mean = row.iter().map(|v| T::read_f64(v) as f32).sum::<f32>() / dim as f32;
+            let var = row
+                .iter()
+                .map(|v| (T::read_f64(v) as f32 - mean).powi(2))
+                .sum::<f32>()
+                / dim as f32;
+            let inv = (var + eps).sqrt().recip();
+            for i in 0..dim {
+                out.push(T::write_f64(
+                    ((T::read_f64(&row[i]) as f32 - mean) * inv * T::read_f64(&w[i]) as f32
+                        + T::read_f64(&b[i]) as f32) as f64,
+                ));
+            }
+        }
+        output.upload_from_host(&out)
+    }
+
+    /// Exact (erf) and tanh GELU are different checkpoint operations.
+    fn gelu_inplace<T: Dtype>(
+        _scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        tanh: bool,
+    ) -> OpResult<()> {
+        if !x.is_contiguous() {
+            return Err(OpError::NotContiguous(*x.shape()));
+        }
+        let mut values = x.to_host_vec()?;
+        for v in &mut values {
+            let a = T::read_f64(v) as f32;
+            let c = if tanh {
+                (0.7978846 * (a + 0.044715 * a * a * a)).tanh()
+            } else {
+                libm::erff(a * std::f32::consts::FRAC_1_SQRT_2)
+            };
+            *v = T::write_f64((0.5 * a * (1.0 + c)) as f64);
+        }
+        x.upload_from_host(&values)
+    }
+
+    /// Half-split rotation with caller-prepared per-token FP32 angles.
+    /// Supports strided [tokens, heads * head_dim] Q/K views and partial RoPE.
+    fn rope_with_angles<T: Dtype>(
+        _scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        sin: &Tensor<f32, Self>,
+        cos: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let half = sin.shape().as_slice().get(1).copied().unwrap_or(0);
+        if x.shape().len() != 2
+            || sin.shape().len() != 2
+            || sin.shape() != cos.shape()
+            || head_dim == 0
+            || half == 0
+            || half * 2 > head_dim
+            || x.shape()[1] % head_dim != 0
+            || x.shape()[0] != sin.shape()[0]
+            || x.strides()[1] != 1
+        {
+            return Err(OpError::Shape(
+                "rope_with_angles: invalid dimensions".into(),
+            ));
+        }
+        let mut values = Vec::with_capacity(x.numel());
+        for row in 0..x.shape()[0] {
+            let shape = Shape::from_slice(&[1, x.shape()[1]]);
+            let row_view = x.view_raw(
+                shape,
+                shape.contiguous_strides(),
+                x.offset_elems() + row * x.strides()[0],
+                true,
+            );
+            values.extend(row_view.to_host_vec()?);
+        }
+        let s = sin.to_host_vec()?;
+        let c = cos.to_host_vec()?;
+        for (row, values) in values.chunks_exact_mut(x.shape()[1]).enumerate() {
+            for head in values.chunks_exact_mut(head_dim) {
+                for j in 0..half {
+                    let a = T::read_f64(&head[j]) as f32;
+                    let b = T::read_f64(&head[j + half]) as f32;
+                    head[j] = T::write_f64((a * c[row * half + j] - b * s[row * half + j]) as f64);
+                    head[j + half] =
+                        T::write_f64((a * s[row * half + j] + b * c[row * half + j]) as f64);
+                }
+            }
+        }
+        for (row, values) in values.chunks_exact(x.shape()[1]).enumerate() {
+            x.narrow(0, row, 1)?.upload_from_host(values)?;
+        }
+        Ok(())
+    }
+
+    /// Qwen3.5 RMSNorm: FP32 normalization and (1 + weight), one final cast.
+    /// Each contiguous group of weight.len() columns is an independent head.
+    fn rmsnorm_zero_centered<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let dim = weight.numel();
+        if dim == 0
+            || input.shape() != output.shape()
+            || input.shape().len() != 2
+            || input.shape()[1] % dim != 0
+            || !eps.is_finite()
+            || eps < 0.0
+        {
+            return Err(OpError::Shape(
+                "rmsnorm_zero_centered: invalid shapes or epsilon".into(),
+            ));
+        }
+        let mut values = input.to_host_vec()?;
+        let weights = weight.to_host_vec()?;
+        for row in values.chunks_mut(dim) {
+            let sum: f32 = row.iter().map(|v| (T::read_f64(v) as f32).powi(2)).sum();
+            let inv = (sum / dim as f32 + eps).sqrt().recip();
+            for (v, w) in row.iter_mut().zip(&weights) {
+                *v = T::write_f64(
+                    ((T::read_f64(v) as f32 * inv) * (1.0 + T::read_f64(w) as f32)) as f64,
+                );
+            }
+        }
+        output.upload_from_host(&values)
+    }
+
+    /// `output *= sigmoid(gate)`, with sigmoid rounded to the activation dtype.
+    /// Both tensors must have identical shapes and contiguous storage.
+    fn sigmoid_mul<T: Dtype>(
+        _scope: &Self::Scope,
+        output: &mut Tensor<T, Self>,
+        gate: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        if output.shape() != gate.shape() || !output.is_contiguous() || !gate.is_contiguous() {
+            return Err(OpError::Shape(
+                "sigmoid_mul: expected matching contiguous tensors".into(),
+            ));
+        }
+        let mut values = output.to_host_vec()?;
+        let gates = gate.to_host_vec()?;
+        for (value, gate) in values.iter_mut().zip(gates.iter()) {
+            let g = T::read_f64(gate) as f32;
+            let sigmoid = T::write_f64((1.0 / (1.0 + (-g).exp())) as f64);
+            *value =
+                T::write_f64(((T::read_f64(value) as f32) * (T::read_f64(&sigmoid) as f32)) as f64);
+        }
+        output.upload_from_host(&values)
+    }
+
     /// Toggle build-free eager-prefill GEMM mode. When `on`, eager (non-graph)
     /// bf16 GEMMs skip the per-shape cuBLASLt heuristic+probe cache build and use
     /// the build-free chunked path, removing ~9-18ms of cold-shape build from
@@ -388,7 +569,7 @@ pub trait FusedOps: MathOps {
 
     /// Greedy argmax over the last (vocab) dimension. `logits` is `[rows, vocab]`;
     /// returns the winning column index for every row as a host `Vec<i32>` of
-    /// length `rows`.
+    /// length `rows`. Equal maxima choose the lowest column index.
     ///
     /// Default is a host reference implementation (copies the full logits to
     /// host). The CUDA backend overrides this with an on-device two-phase argmax
@@ -414,7 +595,11 @@ pub trait FusedOps: MathOps {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| (i as i32, T::read_f64(v)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.0.cmp(&a.0))
+                })
                 .ok_or_else(|| OpError::Shape("argmax: empty vocab".into()))?;
             ids.push(idx);
         }

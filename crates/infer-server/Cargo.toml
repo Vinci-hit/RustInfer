@@ -45,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utils
 chrono = "0.4"
 uuid = { version = "1.19", features = ["v4", "serde"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+half = "2.7.1"
 
 # ZMQ (进程间通信)
 zmq = "0.10"

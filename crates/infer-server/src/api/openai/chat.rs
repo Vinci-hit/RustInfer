@@ -40,20 +40,58 @@ pub async fn chat_completions(
     validate_request(&req)?;
     let response_model = state.model_info.model_id.clone();
 
-    // 2. 应用 chat template → 生成 prompt 文本
-    //    模板必须基于服务端实际加载的 model_type，而不是客户端请求里的
-    //    req.model（客户端可能填任意名字，填错会套错模板导致输出乱码 + 不停止）。
-    let template = get_template(&state.model_type);
-    let prompt = template
-        .apply(&req.messages)
-        .map_err(|e| AppError::bad_request(format!("Template error: {}", e)))?;
-
-    // 3. Tokenize
-    let encoding = state
-        .tokenizer
-        .encode(prompt.as_str(), true)
-        .map_err(|e| AppError::internal(anyhow::anyhow!("Tokenize error: {}", e)))?;
-    let input_ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+    let mut image_permit = if req.messages.iter().any(InputChatMessage::has_image) {
+        Some(
+            state
+                .image_admission
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AppError::too_many("image request capacity exhausted"))?,
+        )
+    } else {
+        None
+    };
+    let (input_ids, multimodal) = if image_permit.is_some() {
+        let processor = state
+            .image_processor
+            .clone()
+            .ok_or_else(|| AppError::bad_request("model does not support images"))?;
+        let tokenizer = state.tokenizer.clone();
+        let messages = req.messages.clone();
+        // Keep the image capacity reserved even if the HTTP future is dropped
+        // while the non-cancellable CPU decoder is still running.
+        let processing_permit = image_permit.take();
+        let (prepared, returned_permit) = tokio::task::spawn_blocking(move || {
+            (processor.prepare(&messages, &tokenizer), processing_permit)
+        })
+        .await
+        .map_err(|e| AppError::internal(anyhow::anyhow!(e)))?;
+        image_permit = returned_permit;
+        prepared.map_err(|e| AppError::bad_request(e.to_string()))?
+    } else {
+        let messages = req
+            .messages
+            .iter()
+            .map(InputChatMessage::text_message)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AppError::bad_request)?;
+        let prompt = get_template(&state.model_type)
+            .apply(&messages)
+            .map_err(|e| AppError::bad_request(format!("Template error: {e}")))?;
+        let encoding = state
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| AppError::internal(anyhow::anyhow!(e.to_string())))?;
+        let ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+        if state.model_type == "qwen3_5"
+            && ids.contains(&infer_protocol::multimodal::IMAGE_TOKEN_ID)
+        {
+            return Err(AppError::bad_request(
+                "image placeholders require image data",
+            ));
+        }
+        (ids, None)
+    };
     let prompt_tokens = input_ids.len() as u32;
 
     // 4. 构建 InferenceRequest
@@ -73,6 +111,7 @@ pub async fn chat_completions(
         "TTFT_TRACE: server tokenized"
     );
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
+        multimodal,
         request_id: request_id.clone(),
         modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,
         input_ids,
@@ -115,7 +154,7 @@ pub async fn chat_completions(
             state.tokenizer.clone(),
             include_usage,
             request_start,
-            permit,
+            (permit, image_permit),
         );
 
         Ok(sse.into_response())

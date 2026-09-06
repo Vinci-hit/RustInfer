@@ -9,6 +9,18 @@ use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
+    fn gemm_bias_accumulate(
+        a: *const std::ffi::c_void,
+        b: *const std::ffi::c_void,
+        c: *mut std::ffi::c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        dtype: i32,
+        handle: crate::ffi::cublasHandle_t,
+        stream: cudaStream_t,
+    ) -> i32;
+
     fn sgemv_cu_fp32x4(
         input: *const f32,
         weight: *const f32,
@@ -763,4 +775,67 @@ mod fp8_block_tests {
         };
         run_case(3, expected_path, true);
     }
+}
+
+/// Preserve FP32 accumulation through the bias addition before one final cast.
+/// A temporary FP32 matrix avoids the BF16 intermediate used by some GEMM
+/// algorithms when both C and D are low precision.
+pub fn linear<T: Dtype>(
+    stream: cudaStream_t,
+    input: &Tensor<T, Cuda>,
+    weight: &Tensor<T, Cuda>,
+    bias: &Tensor<T, Cuda>,
+    output: &mut Tensor<T, Cuda>,
+) -> OpResult<()> {
+    let xs = input.shape().as_slice();
+    let ws = weight.shape().as_slice();
+    if xs.len() != 2
+        || ws.len() != 2
+        || xs[1] != ws[1]
+        || output.shape().as_slice() != [xs[0], ws[0]]
+        || bias.shape().as_slice() != [ws[0]]
+        || !input.is_contiguous()
+        || !weight.is_contiguous()
+        || !bias.is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Err(OpError::Shape("linear shape/stride mismatch".into()));
+    }
+    let (m, n, k) = (
+        i32::try_from(xs[0]),
+        i32::try_from(ws[0]),
+        i32::try_from(xs[1]),
+    );
+    let (m, n, k) = (
+        m.map_err(|_| OpError::Shape("linear size overflow".into()))?,
+        n.map_err(|_| OpError::Shape("linear size overflow".into()))?,
+        k.map_err(|_| OpError::Shape("linear size overflow".into()))?,
+    );
+    let dtype = match T::DATA_TYPE {
+        DataType::F32 => 0,
+        DataType::F16 => 1,
+        DataType::BF16 => 2,
+        _ => return Err(OpError::Shape("unsupported linear dtype".into())),
+    };
+    let mut accumulated = Tensor::<f32, Cuda>::zeros([m as usize, n as usize], input.device())?;
+    let mut bias_f32 = Tensor::<f32, Cuda>::zeros([n as usize], input.device())?;
+    super::cast_dtype::cast_dtype(stream, bias, &mut bias_f32)?;
+    super::broadcast_mul::broadcast_add_inplace(stream, &mut accumulated, &bias_f32)?;
+    let status = unsafe {
+        gemm_bias_accumulate(
+            input.data_ptr().cast(),
+            weight.data_ptr().cast(),
+            accumulated.data_ptr_mut().cast(),
+            m,
+            n,
+            k,
+            dtype,
+            input.device().config.cublas_handle_v2,
+            stream,
+        )
+    };
+    if status != 0 {
+        return Err(OpError::Kernel(format!("linear cuBLAS status {status}")));
+    }
+    super::cast_dtype::cast_dtype(stream, &accumulated, output)
 }

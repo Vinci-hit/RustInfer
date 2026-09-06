@@ -68,6 +68,9 @@ pub struct InferenceRequest {
     // ─── Diffusion fields ───
     #[serde(default)]
     pub diffusion: Option<DiffusionRequest>,
+    // Append wire fields to preserve legacy positional MessagePack frames.
+    #[serde(default)]
+    pub multimodal: Option<std::sync::Arc<crate::multimodal::MultimodalInput>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

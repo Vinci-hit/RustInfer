@@ -21,7 +21,8 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> anyh
         // OpenAI 兼容端点
         .route(
             "/v1/chat/completions",
-            post(api::openai::chat::chat_completions),
+            post(api::openai::chat::chat_completions)
+                .layer(axum::extract::DefaultBodyLimit::max(56 * 1024 * 1024)),
         )
         .route(
             "/v1/completions",

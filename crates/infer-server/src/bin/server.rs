@@ -99,7 +99,22 @@ async fn main() -> Result<()> {
     let admission = Arc::new(tokio::sync::Semaphore::new(permits));
     tracing::info!("  Max in-flight requests: {}", config.max_inflight_requests);
 
+    let image_processor = if model_type == "qwen3_5"
+        && std::path::Path::new(&config.model)
+            .join("preprocessor_config.json")
+            .exists()
+    {
+        Some(Arc::new(
+            infer_server::chat::multimodal::Qwen35Processor::load(std::path::Path::new(
+                &config.model,
+            ))?,
+        ))
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
+        image_processor,
+        image_admission: Arc::new(tokio::sync::Semaphore::new(4)),
         client,
         tokenizer: Arc::new(tokenizer),
         config,

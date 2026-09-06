@@ -1,0 +1,35 @@
+# Qwen3.5-4B text + PNG/JPEG data-URL images (TP=1).
+# Text decode uses CUDA Graph; requests containing images use eager execution.
+# Paths are resolved from the directory where the binaries are launched.
+model = "/mnt/md2/liuwenqi/vllm_bench/Qwen3.5-4B"
+model_name = "Qwen3.5-4B"
+cluster_id = "rustinfer-qwen35"
+device = "cuda:0"
+
+host = "127.0.0.1"
+port = 8100
+request_timeout_secs = 600
+
+max_batch_tokens = 256
+max_batch_seqs = 4
+max_model_len = 2048
+batch_wait_ms = 0
+
+paged_block_size = 1
+chunked_prefill_size = 32
+enable_prefix_caching = false
+mem_fraction_static = 0.9
+num_blocks = 8192
+
+ignore_eos = false
+
+mode = "llm"
+worker_id = "worker-0"
+log_level = "info"
+
+capture_sizes = [1, 2, 4]
+
+[cuda_memory]
+kernel_workspace_mib = 256
+graph_arena_mib = 256
+pool_retain_mib = 256

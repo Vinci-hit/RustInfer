@@ -161,6 +161,7 @@ where
         async_next_slots: Option<&[u32]>,
         reuse_device_control: bool,
     ) -> OpResult<()> {
+        self.prepare_text_abc(req)?;
         let plan = self.build_plan(req)?;
         let batch = plan.batch;
         if plan.num_tokens != batch || plan.q_lens.iter().any(|&q| q != 1) {
@@ -188,6 +189,7 @@ where
 
         // Lazily page-lock the host staging on the first step so the Si/So
         // copies are truly async (pageable memory makes them host-synchronous).
+        self.prepare_recurrent(req, &plan)?;
         self.ensure_abc_pinned()?;
 
         // Async path: when reusing the device-resident control plane, this
@@ -278,7 +280,7 @@ where
         match slot_batch {
             Some(sb) if self.scope.graph_ready(sb as u64) => {
                 // Hot path: pure replay of the (>= batch) captured graph.
-                self.scope.graph_launch(sb as u64)?;
+                self.launch_decode_graph(sb as u64)?;
             }
             // No ready graph for this shape (boot prewarm off/failed, or
             // batch > max capture size): run EAGER at the real batch. We never

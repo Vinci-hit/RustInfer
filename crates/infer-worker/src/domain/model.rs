@@ -62,6 +62,22 @@ pub enum SampleRows<'a> {
 }
 
 pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
+    /// (rotary dimensions, theta, interleaved T/H/W frequency counts).
+    fn multimodal_rope(&self) -> Option<(usize, f64, [usize; 3])> {
+        None
+    }
+
+    fn encode_image(
+        &self,
+        _image: &infer_protocol::multimodal::ImageInput,
+        _scope: &D::Scope,
+    ) -> OpResult<Tensor<T, D>> {
+        Err(crate::domain::ports::OpError::unsupported(
+            "model",
+            "image inputs",
+        ))
+    }
+
     fn dims(&self) -> ModelDims;
     fn cache_layout(&self) -> &CacheLayout;
     fn stages(&self) -> &[StageKind];
@@ -73,6 +89,13 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         &mut self,
         _scratch: std::rc::Rc<crate::domain::forward_scratch::ForwardScratch<T, D>>,
     ) {
+    }
+
+    fn install_gdn_scratch(
+        &mut self,
+        _scratch: std::rc::Rc<crate::domain::gdn_scratch::GdnScratch<T, D>>,
+    ) -> OpResult<()> {
+        Ok(())
     }
 
     fn embed(

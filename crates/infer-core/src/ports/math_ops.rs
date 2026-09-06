@@ -60,6 +60,50 @@ pub trait MathOps: Device {
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
+    /// Linear projection with bias included before rounding to the output dtype.
+    fn linear<T: Dtype>(
+        scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _ = scope;
+        if input.shape().as_slice().len() != 2
+            || weight.shape().as_slice().len() != 2
+            || output.shape().as_slice().len() != 2
+        {
+            return Err(OpError::Shape("linear requires matrices".into()));
+        }
+        let (m, k, n) = (input.shape()[0], input.shape()[1], weight.shape()[0]);
+        if !input.is_contiguous()
+            || !weight.is_contiguous()
+            || !bias.is_contiguous()
+            || !output.is_contiguous()
+            || weight.shape()[1] != k
+            || bias.numel() != n
+            || output.shape().as_slice() != [m, n]
+        {
+            return Err(OpError::Shape("linear shape mismatch".into()));
+        }
+        let (x, w, b) = (
+            input.to_host_vec()?,
+            weight.to_host_vec()?,
+            bias.to_host_vec()?,
+        );
+        let mut values = Vec::with_capacity(m * n);
+        for i in 0..m {
+            for j in 0..n {
+                let mut v = T::read_f64(&b[j]) as f32;
+                for z in 0..k {
+                    v += (T::read_f64(&x[i * k + z]) as f32) * (T::read_f64(&w[j * k + z]) as f32);
+                }
+                values.push(T::write_f64(v as f64));
+            }
+        }
+        output.upload_from_host(&values)
+    }
+
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         scope: &Self::Scope,
         input: &Tensor<A, Self>,

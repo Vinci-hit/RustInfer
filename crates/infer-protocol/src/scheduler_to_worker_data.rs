@@ -66,6 +66,11 @@ pub struct PrefillSegmentMeta {
     /// Defaults to `None` for compatibility with older builds.
     #[serde(default)]
     pub prefix_hint: Option<Vec<u32>>,
+    // Append wire fields to preserve legacy positional MessagePack frames.
+    #[serde(default)]
+    pub multimodal: Option<std::sync::Arc<crate::multimodal::MultimodalInput>>,
+    #[serde(default)]
+    pub has_multimodal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +143,27 @@ impl PrefillBatchCmd {
             }
 
             let segment = &self.segments[i];
+            if segment.multimodal.is_some()
+                != (segment.has_multimodal && segment.segment_start == 0)
+            {
+                return Err(ProtocolError::invalid_argument(
+                    "image payload is required exactly on the first multimodal segment",
+                ));
+            }
+            if segment.has_multimodal && segment.prefix_hint.as_ref().is_some_and(|v| !v.is_empty())
+            {
+                return Err(ProtocolError::invalid_argument(
+                    "multimodal prefix reuse is unsupported",
+                ));
+            }
+            if let Some(input) = &segment.multimodal {
+                input.validate().map_err(ProtocolError::invalid_argument)?;
+                if input.original_prompt_len > segment.prompt_len {
+                    return Err(ProtocolError::invalid_argument(
+                        "image prompt exceeds recompute prompt length",
+                    ));
+                }
+            }
             if segment.sequence_id == 0 {
                 return Err(ProtocolError::invalid_argument(format!(
                     "PrefillBatchCmd segment {} has sequence_id=0",
