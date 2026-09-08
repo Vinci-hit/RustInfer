@@ -19,6 +19,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--config', type=pathlib.Path, required=True)
 parser.add_argument('--reference', type=pathlib.Path, required=True)
 parser.add_argument('--bin-dir', type=pathlib.Path)
+parser.add_argument('--require-decode-graphs', action='store_true', help='Assert image decode replay in worker logs; set log_level="debug" in the config')
 args = parser.parse_args()
 config = tomllib.loads(args.config.read_text())
 base_url = f"http://{config.get('host', '127.0.0.1')}:{config.get('port', 8100)}"
@@ -74,6 +75,12 @@ try:
         with concurrent.futures.ThreadPoolExecutor(4) as pool:
             actual = list(pool.map(request, cases))
         assert actual == baseline, (actual, baseline)
+    # Unequal generation lengths force finished-row compaction while image
+    # and text requests continue decoding together, including streaming output.
+    varied = [dict(p, max_tokens=n, stream=(i % 2 == 0)) for i, (p, n) in enumerate(zip(cases[:4], [3, 17, 11, 7]))]
+    varied_baseline = [request(p) for p in varied]
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        assert list(pool.map(request, varied)) == varied_baseline
     for invalid in [[{'type': 'image_url', 'image_url': {'url': 'https://example.com/image.png'}}], [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}], 'what is <|image_pad|>', [image] * 5]:
         try:
             request(body(invalid))
@@ -85,6 +92,12 @@ try:
         r.readline()
     time.sleep(0.2)
     assert request(body([image, text])) == base
+    if args.require_decode_graphs:
+        import re
+        worker_log = re.sub(r'\x1b\[[0-9;]*m', '', (logs / 'worker.log').read_text())
+        replays = [line for line in worker_log.splitlines() if 'replaying decode CUDA graph' in line and 'multimodal=true' in line]
+        assert replays, 'No image decode graph replay found; check capture_sizes and debug logging'
+        print(f'image decode CUDA Graph replays: {len(replays)}', flush=True)
     print('PASS: image HF match; repeat/cache; SSE; two images; mixed concurrency; invalid inputs; cancellation', flush=True)
 finally:
     for p in processes:

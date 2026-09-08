@@ -52,7 +52,10 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for FullAttention<T, D> {
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
         let kv = kv.ok_or_else(|| OpError::Shape("FullAttention::run: missing KV view".into()))?;
-        if self.rotary_dim == 0 || self.rotary_dim > self.head_dim || self.rotary_dim % 2 != 0 {
+        if self.rotary_dim == 0
+            || self.rotary_dim > self.head_dim
+            || !self.rotary_dim.is_multiple_of(2)
+        {
             return Err(OpError::Shape(
                 "FullAttention: rotary_dim must be positive, even, and <= head_dim".into(),
             ));

@@ -1,5 +1,5 @@
 # Qwen3.5-4B text + PNG/JPEG data-URL images (TP=1).
-# Text decode uses CUDA Graph; requests containing images use eager execution.
+# Greedy text/image decode uses CUDA Graph; vision encoding and prefill use eager.
 # Paths are resolved from the directory where the binaries are launched.
 model = "/mnt/md2/liuwenqi/vllm_bench/Qwen3.5-4B"
 model_name = "Qwen3.5-4B"

@@ -614,7 +614,7 @@ where
         self.prepare_recurrent(req, &plan)?;
         self.upload_index(&plan, req)?;
         self.prepare_multimodal(req)?;
-        let decision = if self.request_is_multimodal(req)
+        let decision = if self.requires_multimodal_prefill(req)
             || req.sampling.iter().any(|params| !params.is_greedy())
         {
             // Captured decode and mixed ABC graphs include an argmax node and
@@ -722,7 +722,6 @@ where
                     &ctx,
                 )
             });
-        drop(cache);
         if let Some(state) = &mut self.recurrent {
             state.complete(result.is_ok());
         }

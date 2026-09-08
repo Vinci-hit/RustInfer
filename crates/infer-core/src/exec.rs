@@ -141,13 +141,16 @@ impl<D: ExecDevice> Workspace<D> {
     }
 }
 
+/// Per-token sine and cosine tensors for rotary position embeddings.
+pub type RotaryAngles<'a, D> = (
+    &'a crate::tensor::Tensor<f32, D>,
+    &'a crate::tensor::Tensor<f32, D>,
+);
+
 pub struct StepCtx<'a, D: ExecDevice> {
     scope: &'a D::Scope,
     plan: &'a crate::plan::BatchPlan,
-    rotary_angles: Option<(
-        &'a crate::tensor::Tensor<f32, D>,
-        &'a crate::tensor::Tensor<f32, D>,
-    )>,
+    rotary_angles: Option<RotaryAngles<'a, D>>,
     _marker: PhantomData<D>,
 }
 
@@ -178,12 +181,7 @@ impl<'a, D: ExecDevice> StepCtx<'a, D> {
         self
     }
 
-    pub fn rotary_angles(
-        &self,
-    ) -> Option<(
-        &crate::tensor::Tensor<f32, D>,
-        &crate::tensor::Tensor<f32, D>,
-    )> {
+    pub fn rotary_angles(&self) -> Option<RotaryAngles<'_, D>> {
         self.rotary_angles
     }
 }

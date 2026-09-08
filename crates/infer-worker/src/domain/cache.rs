@@ -252,32 +252,6 @@ impl<D: LlmBackend> LinearBatch<D> {
     }
 }
 
-#[cfg(test)]
-mod linear_batch_tests {
-    use super::*;
-    use crate::infrastructure::cpu::Cpu;
-
-    #[test]
-    fn updates_preserve_captured_addresses_and_clear_inactive_rows() {
-        let mut batch = LinearBatch::with_capacity(&[0, 1, 2, 3], &[1; 4], 4, 4, &Cpu).unwrap();
-        // These views stand in for the pointers and shapes baked into a graph.
-        let captured_slots = batch.state_slots.clone();
-        let captured_cu = batch.cu_seqlens.clone();
-        batch.update(&[3, 1], &[1, 1]).unwrap();
-        assert_eq!(captured_slots.data_ptr(), batch.state_slots.data_ptr());
-        assert_eq!(captured_cu.data_ptr(), batch.cu_seqlens.data_ptr());
-        assert_eq!(captured_slots.to_host_vec().unwrap(), [3, 1, -1, -1]);
-        assert_eq!(captured_cu.to_host_vec().unwrap(), [0, 1, 2, 2, 2]);
-        // A rejected batch must leave the previous device control intact.
-        assert!(batch.update(&[2, 2], &[1, 1]).is_err());
-        assert!(batch.update(&[0, 1, 2, 3, 4], &[1; 5]).is_err());
-        assert_eq!(captured_slots.to_host_vec().unwrap(), [3, 1, -1, -1]);
-        batch.update(&[2, 0, 3], &[2, 1, 3]).unwrap();
-        assert_eq!(captured_slots.to_host_vec().unwrap(), [2, 0, 3, -1]);
-        assert_eq!(captured_cu.to_host_vec().unwrap(), [0, 2, 3, 6, 6]);
-    }
-}
-
 pub struct LinearLayerState<T: Dtype, D: LlmBackend> {
     dims: LinearDims,
     conv: Tensor<T, D>,
@@ -580,4 +554,30 @@ fn validate_kv_plan<D: LlmBackend>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod linear_batch_tests {
+    use super::*;
+    use crate::infrastructure::cpu::Cpu;
+
+    #[test]
+    fn updates_preserve_captured_addresses_and_clear_inactive_rows() {
+        let mut batch = LinearBatch::with_capacity(&[0, 1, 2, 3], &[1; 4], 4, 4, &Cpu).unwrap();
+        // These views stand in for the pointers and shapes baked into a graph.
+        let captured_slots = batch.state_slots.clone();
+        let captured_cu = batch.cu_seqlens.clone();
+        batch.update(&[3, 1], &[1, 1]).unwrap();
+        assert_eq!(captured_slots.data_ptr(), batch.state_slots.data_ptr());
+        assert_eq!(captured_cu.data_ptr(), batch.cu_seqlens.data_ptr());
+        assert_eq!(captured_slots.to_host_vec().unwrap(), [3, 1, -1, -1]);
+        assert_eq!(captured_cu.to_host_vec().unwrap(), [0, 1, 2, 2, 2]);
+        // A rejected batch must leave the previous device control intact.
+        assert!(batch.update(&[2, 2], &[1, 1]).is_err());
+        assert!(batch.update(&[0, 1, 2, 3, 4], &[1; 5]).is_err());
+        assert_eq!(captured_slots.to_host_vec().unwrap(), [3, 1, -1, -1]);
+        batch.update(&[2, 0, 3], &[2, 1, 3]).unwrap();
+        assert_eq!(captured_slots.to_host_vec().unwrap(), [2, 0, 3, -1]);
+        assert_eq!(captured_cu.to_host_vec().unwrap(), [0, 2, 3, 6, 6]);
+    }
 }

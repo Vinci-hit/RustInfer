@@ -1700,6 +1700,7 @@ mod qwen35_checkpoint_tests {
         use infer_protocol::multimodal::{IMAGE_TOKEN_ID, ImageInput, ImageSpan, MultimodalInput};
         use infer_worker::application::runtime::Runtime;
         use infer_worker::application::sampler_stack::GreedySampler;
+        use infer_worker::domain::exec::ExecScope;
         use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
         let path = std::env::var("QWEN35_MODEL_PATH").unwrap();
         let reference = std::env::var("QWEN35_VISION_REFERENCE").unwrap();
@@ -1787,13 +1788,13 @@ mod qwen35_checkpoint_tests {
             model,
             cuda.scope(),
             Box::new(GreedySampler),
-            1025,
+            2049,
             1,
             512,
             512,
             128,
-            2,
-            vec![1, 2],
+            4,
+            vec![1, 2, 4],
         )
         .unwrap();
         let request = |tokens: Vec<i32>, start: usize| StepRequest {
@@ -1852,7 +1853,7 @@ mod qwen35_checkpoint_tests {
             assert!(dump_compare(name, &logits.0) < 0.06);
         };
         let mut all_outputs = Vec::new();
-        for chunk in [128, 31] {
+        for chunk in [128, 31, 26] {
             runtime.release_sequence(42);
             runtime.register_multimodal(42, input.clone()).unwrap();
             let mut last = 0;
@@ -1901,5 +1902,327 @@ mod qwen35_checkpoint_tests {
             .issue_decode_abc(&req, 0, &[0], &[100], &[true], &[], None, false)
             .unwrap();
         runtime.finalize_decode_abc(1).unwrap();
+
+        // Reuse text-captured graphs for image decode. Distinct image counts
+        // give distinct rope_delta values, even when physical positions match.
+        let mut twice = (*input).clone();
+        let mut second_span = twice.spans[0].clone();
+        second_span.image_index = 1;
+        second_span.token_start += ids.len() as u32;
+        twice.images.push(twice.images[0].clone());
+        twice.spans.push(second_span);
+        twice.original_prompt_len *= 2;
+        let twice = std::sync::Arc::new(twice);
+        let mut double_ids = ids.clone();
+        double_ids.extend_from_slice(&ids);
+        twice.validate_tokens(&double_ids).unwrap();
+        assert_ne!(
+            input.positions().unwrap().rope_delta,
+            twice.positions().unwrap().rope_delta
+        );
+        let rows = |rows: &[(u64, usize, usize, Vec<i32>)]| StepRequest {
+            seqs: rows
+                .iter()
+                .map(|(id, slot, start, tokens)| SeqStep {
+                    sequence_id: *id,
+                    input_ids: tokens.clone(),
+                    positions: (*start as i32..(*start + tokens.len()) as i32).collect(),
+                    kv_write_start: *start as i32,
+                    kv_len_after: (*start + tokens.len()) as i32,
+                    block_table: (*slot * 512..(*slot + 1) * 512).map(|b| b as u32).collect(),
+                })
+                .collect(),
+            sampling: vec![Default::default(); rows.len()],
+            stop: StopCriteria {
+                eos_ids: vec![],
+                generated_counts: vec![0; rows.len()],
+                max_tokens: vec![100; rows.len()],
+                ignore_eos: vec![true; rows.len()],
+            },
+            draft_tokens: vec![],
+        };
+        // release ids, request; start=0 re-registers durable image inputs.
+        let mut trace = Vec::new();
+        for (id, slot, prompt) in [(42, 0, &ids), (43, 1, &double_ids)] {
+            // Include q_len=1 inside the image span; its graph must stay eager.
+            let first_image = input.spans[0].token_start as usize;
+            let mut start = 0;
+            for end in [first_image, first_image + 1, prompt.len()] {
+                for part in prompt[start..end].chunks(31) {
+                    trace.push((vec![], rows(&[(id, slot, start, part.to_vec())])));
+                    start += part.len();
+                }
+            }
+        }
+        trace.push((vec![], rows(&[(44, 2, 0, vec![1, 2, 3])])));
+        let n = ids.len();
+        trace.push((
+            vec![],
+            rows(&[
+                (42, 0, n, vec![760]),
+                (43, 1, n * 2, vec![760]),
+                (44, 2, 3, vec![13]),
+            ]),
+        ));
+        trace.push((
+            vec![],
+            rows(&[
+                (44, 2, 4, vec![13]),
+                (43, 1, n * 2 + 1, vec![760]),
+                (42, 0, n + 1, vec![760]),
+            ]),
+        ));
+        let mut finish_middle = rows(&[
+            (44, 2, 5, vec![13]),
+            (43, 1, n * 2 + 2, vec![760]),
+            (42, 0, n + 2, vec![760]),
+        ]);
+        finish_middle.stop.max_tokens[1] = 1;
+        trace.push((vec![], finish_middle));
+        trace.push((
+            vec![43],
+            rows(&[(44, 2, 6, vec![13]), (42, 0, n + 3, vec![760])]),
+        ));
+        trace.push((
+            vec![],
+            rows(&[(42, 0, n + 4, vec![760]), (44, 2, 7, vec![13])]),
+        ));
+        // Cancel the text row, reuse its slots for a new image request.
+        for (i, part) in ids.chunks(31).enumerate() {
+            trace.push((
+                if i == 0 { vec![44] } else { vec![] },
+                rows(&[(45, 2, i * 31, part.to_vec())]),
+            ));
+        }
+        trace.push((
+            vec![],
+            rows(&[(45, 2, n, vec![760]), (42, 0, n + 5, vec![760])]),
+        ));
+        // Preempt 42 and reconstruct both KV and GDN history before replay.
+        let mut recompute = ids.clone();
+        recompute.extend_from_slice(&[760; 6]);
+        for (i, part) in recompute.chunks(31).enumerate() {
+            trace.push((
+                if i == 0 { vec![42] } else { vec![] },
+                rows(&[(42, 0, i * 31, part.to_vec())]),
+            ));
+        }
+        trace.push((
+            vec![],
+            rows(&[(42, 0, n + 6, vec![760]), (45, 2, n + 1, vec![760])]),
+        ));
+        trace.push((vec![45], rows(&[(42, 0, n + 7, vec![760])])));
+        trace.push((vec![42], rows(&[(42, 0, 0, vec![1, 2, 3])])));
+        trace.push((vec![], rows(&[(42, 0, 3, vec![13])])));
+
+        let mut baseline = Vec::new();
+        for mode in ["eager", "cold", "prewarmed", "abc"] {
+            runtime.retain_sequences([]);
+            runtime.graph = None;
+            cuda.config.invalidate_all_graphs();
+            if mode != "eager" {
+                runtime.prime_graphs().unwrap();
+                if mode != "cold" {
+                    runtime.prewarm_decode_graphs().unwrap();
+                }
+            }
+            let mut device_rows = Vec::new();
+            let mut device_tokens = Vec::new();
+            let mut max_l2 = 0.0f64;
+            let mut reused = 0;
+            for (step, (release, req)) in trace.iter().enumerate() {
+                for &id in release {
+                    runtime.release_sequence(id);
+                }
+                for seq in &req.seqs {
+                    if seq.kv_write_start == 0
+                        && (seq.sequence_id == 43
+                            || seq.sequence_id == 45
+                            || (seq.sequence_id == 42 && seq.input_ids != [1, 2, 3]))
+                    {
+                        runtime
+                            .register_multimodal(
+                                seq.sequence_id,
+                                if seq.sequence_id == 43 {
+                                    twice.clone()
+                                } else {
+                                    input.clone()
+                                },
+                            )
+                            .unwrap();
+                    }
+                }
+                let decode = req.seqs.iter().all(|s| {
+                    s.input_ids.len() == 1
+                        && (!runtime.has_multimodal_sequence(s.sequence_id)
+                            || s.kv_write_start as usize
+                                >= if s.sequence_id == 43 {
+                                    double_ids.len()
+                                } else {
+                                    ids.len()
+                                })
+                });
+                let q_lens: Vec<i32> = req.seqs.iter().map(|s| s.input_ids.len() as i32).collect();
+                let plan = BatchPlan {
+                    kind: if q_lens.iter().all(|&n| n == 1) {
+                        BatchKind::DecodeOnly
+                    } else {
+                        BatchKind::Ragged
+                    },
+                    num_tokens: q_lens.iter().map(|&n| n as usize).sum(),
+                    batch: req.seqs.len(),
+                    total_q_tiles: BatchPlan::plan_ragged_tiles(&q_lens).1.len() as i32,
+                    q_lens,
+                    kv_lens: req.seqs.iter().map(|s| s.kv_len_after).collect(),
+                    seq_positions: req.seqs.iter().map(|s| s.kv_write_start).collect(),
+                    rope_positions: req
+                        .seqs
+                        .iter()
+                        .flat_map(|s| s.positions.iter().copied())
+                        .collect(),
+                    max_blocks_per_seq: 512,
+                    block_size: 1,
+                };
+                let tokens = if mode == "abc" && decode {
+                    let order: Vec<_> = req.seqs.iter().map(|s| s.sequence_id).collect();
+                    let reuse = device_rows == order;
+                    let prefix = if reuse {
+                        // Reuse A only where it already contains this trace's
+                        // fixed input token; upload the divergent suffix.
+                        req.seqs
+                            .iter()
+                            .zip(&device_tokens)
+                            .take_while(|(s, t)| s.input_ids[0] == **t)
+                            .count()
+                    } else {
+                        0
+                    };
+                    let survivors: Vec<_> = req
+                        .seqs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| req.stop.max_tokens[*i] > 1)
+                        .collect();
+                    let next_slots: Vec<u32> = survivors
+                        .iter()
+                        .map(|(_, s)| s.block_table[s.kv_len_after as usize])
+                        .collect();
+                    runtime
+                        .issue_decode_abc(
+                            req,
+                            prefix,
+                            &req.stop.generated_counts,
+                            &req.stop.max_tokens,
+                            &req.stop.ignore_eos,
+                            &[],
+                            Some(&next_slots),
+                            reuse,
+                        )
+                        .unwrap();
+                    let out = runtime.finalize_decode_abc(req.seqs.len()).unwrap();
+                    device_rows = out
+                        .active
+                        .iter()
+                        .map(|r| req.seqs[r.src_row].sequence_id)
+                        .collect();
+                    device_tokens = out.active.iter().map(|r| r.token_id).collect();
+                    reused += usize::from(reuse);
+                    let mut tokens = vec![0; req.seqs.len()];
+                    for row in out.active.iter().chain(&out.finished) {
+                        tokens[row.src_row] = row.token_id;
+                    }
+                    tokens
+                } else {
+                    device_rows.clear();
+                    runtime
+                        .step(req)
+                        .unwrap()
+                        .tokens
+                        .iter()
+                        .map(|row| row[0].token_id)
+                        .collect::<Vec<_>>()
+                };
+                let hidden = Hidden {
+                    stream: runtime.hidden.stream.narrow(0, 0, plan.num_tokens).unwrap(),
+                    pending: None,
+                };
+                let logits = runtime
+                    .model
+                    .finalize(
+                        &hidden,
+                        SampleRows::LastPerSeq,
+                        &StepCtx::new(&runtime.scope, &plan),
+                    )
+                    .unwrap()
+                    .0
+                    .to_host_vec()
+                    .unwrap();
+                if mode == "eager" {
+                    baseline.push((tokens, logits));
+                } else {
+                    assert_eq!(tokens, baseline[step].0, "multimodal {mode} step={step}");
+                    let expected = &baseline[step].1;
+                    let l2 = (logits
+                        .iter()
+                        .zip(expected)
+                        .map(|(a, b)| (a.to_f64() - b.to_f64()).powi(2))
+                        .sum::<f64>()
+                        / expected.iter().map(|v| v.to_f64().powi(2)).sum::<f64>())
+                    .sqrt();
+                    assert!(
+                        l2.is_finite() && l2 < 0.005,
+                        "multimodal {mode} step={step}: L2={l2}"
+                    );
+                    max_l2 = max_l2.max(l2);
+                }
+            }
+            if mode == "abc" {
+                assert!(reused >= 2, "device control reuse was not exercised");
+            }
+            if mode == "prewarmed" || mode == "abc" {
+                for size in [1, 2, 4] {
+                    assert!(runtime.scope.graph_ready(size));
+                }
+            }
+            eprintln!(
+                "multimodal {mode}: {} steps matched; max logits L2={max_l2:.6}, device control reuse={reused}",
+                trace.len()
+            );
+        }
+        // Diagnostic latency comparison after both paths are warm. No timing
+        // assertion: this opt-in test can share the GPU with other workloads.
+        let mut timings = [Vec::new(), Vec::new()];
+        for round in 0..3 {
+            for graphed in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                runtime.retain_sequences([]);
+                let graph = if graphed { None } else { runtime.graph.take() };
+                runtime.register_multimodal(42, input.clone()).unwrap();
+                runtime.step(&request(ids.clone(), 0)).unwrap();
+                for i in 0..20 {
+                    let req = request(vec![760], ids.len() + i);
+                    let start = std::time::Instant::now();
+                    runtime.step(&req).unwrap();
+                    if i >= 4 {
+                        timings[usize::from(graphed)].push(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+                if let Some(graph) = graph {
+                    runtime.graph = Some(graph);
+                }
+            }
+        }
+        for (graphed, times) in timings.iter_mut().enumerate() {
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "multimodal decode batch=1 graph={}: median {:.3} ms ({} steps)",
+                graphed != 0,
+                times[times.len() / 2],
+                times.len()
+            );
+        }
     }
 }

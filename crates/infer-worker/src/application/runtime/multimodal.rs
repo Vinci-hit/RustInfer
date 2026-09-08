@@ -50,6 +50,26 @@ impl<T: Dtype, D: LlmBackend> Default for VisualState<T, D> {
 }
 
 impl<T: Dtype, D: LlmBackend> VisualState<T, D> {
+    /// Generated tokens have identical temporal/height/width coordinates, so
+    /// decode can use the ordinary RoPE cache with a request-specific position.
+    /// Prompt tokens (including a one-token prefill chunk) still need MRoPE.
+    fn decode_position(&self, id: u64, physical: usize) -> Option<i32> {
+        let state = self.requests.get(&id)?;
+        (physical >= state.input.original_prompt_len as usize)
+            .then(|| state.positions.at(physical)[0])
+    }
+
+    fn requires_prefill(&self, req: &StepRequest) -> bool {
+        req.seqs.iter().any(|seq| {
+            self.requests.contains_key(&seq.sequence_id)
+                && (seq.input_ids.len() != 1
+                    || seq.kv_write_start < 0
+                    || self
+                        .decode_position(seq.sequence_id, seq.kv_write_start as usize)
+                        .is_none())
+        })
+    }
+
     fn evict_for(&mut self, needed: usize, capacity: usize) -> OpResult<()> {
         if needed > capacity {
             return Err(OpError::Shape(
@@ -101,6 +121,14 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
         req.seqs
             .iter()
             .any(|s| self.has_multimodal_sequence(s.sequence_id))
+    }
+
+    pub(super) fn requires_multimodal_prefill(&self, req: &StepRequest) -> bool {
+        self.visual.requires_prefill(req)
+    }
+
+    pub(super) fn multimodal_decode_position(&self, id: u64, physical: usize) -> Option<i32> {
+        self.visual.decode_position(id, physical)
     }
     pub fn visual_cache_stats(&self) -> (usize, usize, usize) {
         (
@@ -172,6 +200,18 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
         Ok(())
     }
 
+    pub(super) fn prepare_decode_abc(&mut self, req: &StepRequest) -> OpResult<()> {
+        if self.requires_multimodal_prefill(req) || !req.draft_tokens.is_empty() {
+            return Err(OpError::unsupported(
+                "decode ABC",
+                "multimodal prefill or speculative decoding; use eager step",
+            ));
+        }
+        self.visual.overrides.clear();
+        self.visual.angles = None;
+        Ok(())
+    }
+
     pub(super) fn prepare_multimodal(&mut self, req: &StepRequest) -> OpResult<()> {
         self.visual.overrides.clear();
         self.visual.angles = None;
@@ -180,6 +220,12 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
         }
         if !req.draft_tokens.is_empty() {
             return Err(OpError::unsupported("multimodal", "speculative decoding"));
+        }
+        // Once every image request is decoding, build_plan has already put
+        // each request's scalar MRoPE position in the persistent RoPE index.
+        // This uses the same captured kernels and addresses as text decode.
+        if !self.requires_multimodal_prefill(req) {
+            return Ok(());
         }
         let (dim, theta, sections) = self
             .model
@@ -293,6 +339,78 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
 mod tests {
     use super::*;
     use crate::infrastructure::cpu::Cpu;
+
+    #[test]
+    fn decode_offsets_follow_requests_and_prompt_chunks_stay_eager() {
+        use crate::domain::plan::{SeqStep, StopCriteria};
+        use infer_protocol::multimodal::{ImageInput, ImageSpan, PATCH_WIDTH};
+        let mut state = VisualState::<f32, Cpu>::default();
+        for (id, grid) in [(10, [1, 4, 8]), (20, [1, 8, 8])] {
+            let image = ImageInput {
+                grid_thw: grid,
+                patches: vec![0; grid[1] as usize * grid[2] as usize * PATCH_WIDTH * 2],
+            };
+            let input = Arc::new(MultimodalInput {
+                spans: vec![ImageSpan {
+                    image_index: 0,
+                    token_start: 2,
+                    token_len: image.num_tokens() as u32,
+                }],
+                original_prompt_len: image.num_tokens() as u32 + 4,
+                images: vec![image],
+            });
+            state.requests.insert(
+                id,
+                VisualRequest {
+                    positions: input.positions().unwrap(),
+                    input,
+                    keys: vec![],
+                },
+            );
+        }
+        let row = |id, physical, len| SeqStep {
+            sequence_id: id,
+            input_ids: vec![1; len],
+            positions: (physical..physical + len as i32).collect(),
+            kv_write_start: physical,
+            kv_len_after: physical + len as i32,
+            block_table: vec![],
+        };
+        let mut req = StepRequest {
+            seqs: vec![row(20, 20, 1), row(99, 30, 1), row(10, 12, 1)],
+            sampling: vec![],
+            stop: StopCriteria {
+                eos_ids: vec![],
+                generated_counts: vec![],
+                max_tokens: vec![],
+                ignore_eos: vec![],
+            },
+            draft_tokens: vec![],
+        };
+        assert!(!state.requires_prefill(&req));
+        let positions = |state: &VisualState<f32, Cpu>, req: &StepRequest| {
+            req.seqs
+                .iter()
+                .map(|s| {
+                    state
+                        .decode_position(s.sequence_id, s.kv_write_start as usize)
+                        .unwrap_or(s.positions[0])
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(positions(&state, &req), [8, 30, 8]);
+        req.seqs.swap(0, 2);
+        req.seqs[0] = row(10, 13, 1);
+        assert_eq!(positions(&state, &req), [9, 30, 8]);
+        for (start, len) in [(2, 1), (11, 1), (12, 2)] {
+            req.seqs[0] = row(10, start, len);
+            assert!(state.requires_prefill(&req));
+        }
+        state.release(10);
+        assert_eq!(state.decode_position(10, 12), None);
+        assert!(!state.requires_prefill(&req));
+    }
+
     #[test]
     fn encoder_cache_evicts_old_unused_entries_and_unpins_on_release() {
         let mut state = VisualState::<f32, Cpu>::default();

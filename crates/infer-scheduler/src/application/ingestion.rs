@@ -146,13 +146,13 @@ impl IngestionSystem {
             };
         }
 
-        if let Some(mm) = &request.multimodal {
-            if let Err(error) = mm.validate_tokens(&request.input_ids) {
-                return IngestOutcome::Rejected {
-                    external_id,
-                    reason: RejectReason::InvalidMultimodal(error),
-                };
-            }
+        if let Some(mm) = &request.multimodal
+            && let Err(error) = mm.validate_tokens(&request.input_ids)
+        {
+            return IngestOutcome::Rejected {
+                external_id,
+                reason: RejectReason::InvalidMultimodal(error),
+            };
         }
 
         let sequence_id = SequenceId(self.next_sequence_id);

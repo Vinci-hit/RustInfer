@@ -97,7 +97,7 @@ pub trait FusedOps: MathOps {
             || head_dim == 0
             || half == 0
             || half * 2 > head_dim
-            || x.shape()[1] % head_dim != 0
+            || !x.shape()[1].is_multiple_of(head_dim)
             || x.shape()[0] != sin.shape()[0]
             || x.strides()[1] != 1
         {
@@ -148,7 +148,7 @@ pub trait FusedOps: MathOps {
         if dim == 0
             || input.shape() != output.shape()
             || input.shape().len() != 2
-            || input.shape()[1] % dim != 0
+            || !input.shape()[1].is_multiple_of(dim)
             || !eps.is_finite()
             || eps < 0.0
         {

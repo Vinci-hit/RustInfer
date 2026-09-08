@@ -189,7 +189,6 @@ impl DecodeEngine {
         if self.pending.is_some()
             || active.is_empty()
             || active.values().any(|seq| !seq.sampling.is_greedy())
-            || active.keys().any(|&id| runner.has_multimodal_sequence(id))
         {
             return Ok(());
         }
@@ -429,9 +428,7 @@ impl DecodeEngine {
     where
         M: DecoderModel<bf16, Cuda>,
     {
-        if active.values().any(|seq| !seq.sampling.is_greedy())
-            || active.keys().any(|&id| runner.has_multimodal_sequence(id))
-        {
+        if active.values().any(|seq| !seq.sampling.is_greedy()) {
             // A stochastic sequence cannot use the ABC pipeline because ABC
             // embeds argmax and never returns logits. Drain any older greedy
             // step first, then run the current mixed row set synchronously via

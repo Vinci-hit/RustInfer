@@ -516,12 +516,12 @@ mod tests {
         );
         // No weight upload should precede unsupported/configuration checks.
         let tp = WeightLoader::with_tensor_parallel(&reader, 0, 2).unwrap();
-        assert!(matches!(build::<f32, Cpu>(&tp, &cfg, &Cpu), Err(_)));
+        assert!(build::<f32, Cpu>(&tp, &cfg, &Cpu).is_err());
         let mut bad = cfg.clone();
         bad.linear_attn.as_mut().unwrap().layer_is_full.pop();
-        assert!(matches!(build::<f32, Cpu>(&loader, &bad, &Cpu), Err(_)));
+        assert!(build::<f32, Cpu>(&loader, &bad, &Cpu).is_err());
         let mut bad = cfg;
         bad.rotary_dim = 3;
-        assert!(matches!(build::<f32, Cpu>(&loader, &bad, &Cpu), Err(_)));
+        assert!(build::<f32, Cpu>(&loader, &bad, &Cpu).is_err());
     }
 }

@@ -21,6 +21,12 @@ pub struct VisionConfig {
     pub deepstack_visual_indexes: Vec<usize>,
 }
 
+struct PositionEmbeddings<T: Dtype, D: LlmBackend> {
+    positions: Tensor<T, D>,
+    sin: Tensor<f32, D>,
+    cos: Tensor<f32, D>,
+}
+
 struct Projection<T: Dtype, D: LlmBackend> {
     weight: Tensor<T, D>,
     bias: Tensor<T, D>,
@@ -77,8 +83,8 @@ impl<T: Dtype, D: OpBackend + LlmBackend> VisionEncoder<T, D> {
             || !c.deepstack_visual_indexes.is_empty()
             || c.depth == 0
             || c.num_heads == 0
-            || c.hidden_size % c.num_heads != 0
-            || (c.hidden_size / c.num_heads) % 4 != 0
+            || !c.hidden_size.is_multiple_of(c.num_heads)
+            || !(c.hidden_size / c.num_heads).is_multiple_of(4)
             || side * side != c.num_position_embeddings
             || side < 2
         {
@@ -199,8 +205,12 @@ impl<T: Dtype, D: LlmBackend> VisionEncoder<T, D> {
         D::matmul(scope, &input, &self.patch.weight, &mut x)?;
         D::broadcast_add_inplace(scope, &mut x, &self.patch.bias)?;
         trace("patch", &x)?;
-        let (pos, sin, cos) = self.position_embeddings(h as usize, w as usize, scope)?;
-        D::add_inplace(scope, &mut x, &pos)?;
+        let PositionEmbeddings {
+            positions,
+            sin,
+            cos,
+        } = self.position_embeddings(h as usize, w as usize, scope)?;
+        D::add_inplace(scope, &mut x, &positions)?;
         trace("position", &x)?;
         let hd = c.hidden_size / c.num_heads;
         for (i, block) in self.blocks.iter().enumerate() {
@@ -270,7 +280,7 @@ impl<T: Dtype, D: LlmBackend> VisionEncoder<T, D> {
         h: usize,
         w: usize,
         scope: &D::Scope,
-    ) -> OpResult<(Tensor<T, D>, Tensor<f32, D>, Tensor<f32, D>)> {
+    ) -> OpResult<PositionEmbeddings<T, D>> {
         let c = &self.config;
         let side = (c.num_position_embeddings as f64).sqrt() as usize;
         let quarter = c.hidden_size / c.num_heads / 4;
@@ -320,10 +330,10 @@ impl<T: Dtype, D: LlmBackend> VisionEncoder<T, D> {
                 }
             }
         }
-        Ok((
-            Tensor::from_host_slice(&positions, [h * w, c.hidden_size], scope.device())?,
-            Tensor::from_host_slice(&sin, [h * w, quarter * 2], scope.device())?,
-            Tensor::from_host_slice(&cos, [h * w, quarter * 2], scope.device())?,
-        ))
+        Ok(PositionEmbeddings {
+            positions: Tensor::from_host_slice(&positions, [h * w, c.hidden_size], scope.device())?,
+            sin: Tensor::from_host_slice(&sin, [h * w, quarter * 2], scope.device())?,
+            cos: Tensor::from_host_slice(&cos, [h * w, quarter * 2], scope.device())?,
+        })
     }
 }

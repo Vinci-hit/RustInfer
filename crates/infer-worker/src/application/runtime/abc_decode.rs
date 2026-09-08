@@ -161,7 +161,7 @@ where
         async_next_slots: Option<&[u32]>,
         reuse_device_control: bool,
     ) -> OpResult<()> {
-        self.prepare_text_abc(req)?;
+        self.prepare_decode_abc(req)?;
         let plan = self.build_plan(req)?;
         let batch = plan.batch;
         if plan.num_tokens != batch || plan.q_lens.iter().any(|&q| q != 1) {
@@ -198,7 +198,18 @@ where
         // upload entirely. Otherwise (proven path, or first/post-change async
         // step) seed the device control from the host request as usual.
         if async_next_slots.is_some() && reuse_device_control {
-            // Control already on device. Nothing to upload.
+            // compact_extend_control advances physical KV positions. Image
+            // decode has a separate RoPE offset; refresh only this O(batch)
+            // index from the current request order, retaining device KV reuse.
+            if self.request_is_multimodal(req) {
+                unsafe {
+                    upload_i32_prefix(
+                        self.scope.device(),
+                        &self.kv_index.rope_positions,
+                        &plan.rope_positions,
+                    )?;
+                }
+            }
         } else {
             self.upload_index(&plan, req)?;
         }
@@ -280,6 +291,12 @@ where
         match slot_batch {
             Some(sb) if self.scope.graph_ready(sb as u64) => {
                 // Hot path: pure replay of the (>= batch) captured graph.
+                tracing::debug!(
+                    batch,
+                    capture_batch = sb,
+                    multimodal = self.request_is_multimodal(req),
+                    "replaying decode CUDA graph"
+                );
                 self.launch_decode_graph(sb as u64)?;
             }
             // No ready graph for this shape (boot prewarm off/failed, or
