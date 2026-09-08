@@ -9,6 +9,8 @@
 !docker/**
 !crates/
 !crates/**
+!scripts/
+!scripts/**
 
 crates/infer-frontend/node_modules/
 crates/infer-frontend/target/

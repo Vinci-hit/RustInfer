@@ -1,0 +1,81 @@
+name: GPU validation
+
+# Run trusted master revisions automatically, or dispatch a trusted revision.
+# Do not execute untrusted pull requests on a persistent self-hosted runner.
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: Architecture of the runner GPU
+        type: choice
+        default: sm_90
+        options: [sm_90, sm_89, sm_86, sm_80]
+      vision_reference:
+        description: Run model/reference checks using prepared files on the runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-validation
+  cancel-in-progress: false
+
+jobs:
+  gpu:
+    # Set this after provisioning the trusted runner and local model directory.
+    # An unconfigured repository skips instead of waiting indefinitely for a GPU.
+    if: github.event_name == 'workflow_dispatch' || vars.GPU_CI_ENABLED == 'true'
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 120
+    env:
+      GPU_BUILD_ARCH: ${{ inputs.cuda_arch || vars.GPU_CUDA_ARCH || 'sm_90' }}
+      MODEL_PATH: ${{ vars.QWEN35_MODEL_PATH }}
+      ARTIFACT_DIR: ${{ runner.temp }}/rustinfer-gpu-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check runner provisioning
+        run: |
+          test -n "$MODEL_PATH" && test -f "$MODEL_PATH/config.json"
+          case "$GPU_BUILD_ARCH" in sm_80|sm_86|sm_89|sm_90) ;; *) exit 2 ;; esac
+          nvidia-smi
+          mkdir -p "$ARTIFACT_DIR"
+      - name: Build CUDA test environment
+        run: |
+          set -o pipefail
+          docker build --target builder --build-arg CUDA_ARCH="$GPU_BUILD_ARCH" \
+            -t rustinfer-gpu-test . 2>&1 | tee "$ARTIFACT_DIR/docker-build.log"
+      - name: Run kernel and Qwen3.5 service regressions
+        env:
+          RUSTINFER_REVISION: ${{ github.sha }}
+        run: |
+          docker run --rm --gpus all \
+            -v "$MODEL_PATH:/model:ro" -v "$ARTIFACT_DIR:/artifacts" \
+            -e MODEL_PATH=/model -e ARTIFACT_DIR=/artifacts -e RUSTINFER_REVISION \
+            rustinfer-gpu-test bash scripts/gpu_regression.sh
+      - name: Validate image preprocessing against reference fixtures
+        if: inputs.vision_reference
+        env:
+          MODEL_PATH: ${{ vars.QWEN35_MODEL_PATH }}
+          REFERENCE_PATH: ${{ vars.QWEN35_VISION_REFERENCE }}
+        run: |
+          test -n "$MODEL_PATH" && test -d "$MODEL_PATH"
+          test -n "$REFERENCE_PATH" && test -d "$REFERENCE_PATH"
+          docker run --rm \
+            -v "$MODEL_PATH:/model:ro" -v "$REFERENCE_PATH:/reference" \
+            -e QWEN35_MODEL_PATH=/model -e QWEN35_VISION_REFERENCE=/reference \
+            rustinfer-gpu-test cargo test --release --locked -p infer-server \
+            chat::multimodal::tests -- --ignored --test-threads=1
+      - name: Preserve validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14

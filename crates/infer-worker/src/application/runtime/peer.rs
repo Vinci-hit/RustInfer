@@ -32,6 +32,7 @@ pub enum RuntimePeerCommand {
     Step(Box<StepRequest>),
     ProfileForward,
     PrimeGraphs,
+    FinishStartupSelfCheck,
     ShutdownTpComm,
     ResizeKvPool {
         num_blocks: usize,
@@ -69,6 +70,7 @@ impl RuntimePeerCommand {
             Self::Step(_) => "step",
             Self::ProfileForward => "profile_forward",
             Self::PrimeGraphs => "prime_graphs",
+            Self::FinishStartupSelfCheck => "finish_startup_self_check",
             Self::ShutdownTpComm => "shutdown_tp_comm",
             Self::ResizeKvPool { .. } => "resize_kv_pool",
             Self::IssueDecodeAbc { .. } => "issue_decode_abc",
@@ -93,6 +95,7 @@ impl RuntimePeerCommand {
             Self::Step(_)
             | Self::ProfileForward
             | Self::PrimeGraphs
+            | Self::FinishStartupSelfCheck
             | Self::ShutdownTpComm
             | Self::ResizeKvPool { .. }
             | Self::Shutdown => PeerCommandPhase::Standalone,
@@ -114,6 +117,7 @@ impl RuntimePeerCommand {
                 Self::Step(_)
                 | Self::ProfileForward
                 | Self::PrimeGraphs
+                | Self::FinishStartupSelfCheck
                 | Self::ShutdownTpComm
                 | Self::ResizeKvPool { .. },
             ) => true,
@@ -598,6 +602,7 @@ fn run_follower<T, D, M>(
             RuntimePeerCommand::Step(req) => runtime.step(&req).map(|_| ()),
             RuntimePeerCommand::ProfileForward => runtime.profile_forward(),
             RuntimePeerCommand::PrimeGraphs => runtime.prime_graphs(),
+            RuntimePeerCommand::FinishStartupSelfCheck => runtime.finish_startup_self_check(),
             RuntimePeerCommand::ShutdownTpComm => {
                 <D as CollectiveOps>::shutdown_comm(&runtime.scope, CommAxis::Tp)
             }

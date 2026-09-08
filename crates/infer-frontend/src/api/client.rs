@@ -199,7 +199,7 @@ impl ApiClient {
 
     /// 获取系统 metrics
     pub async fn get_metrics(&self) -> Result<SystemMetrics> {
-        let url = format!("{}/metrics", self.base_url);
+        let url = format!("{}/metrics/system", self.base_url);
         let response = self.client.get(&url).send().await?.json().await?;
         Ok(response)
     }

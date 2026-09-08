@@ -45,6 +45,10 @@ template <class Elem_, int HeadDim_>
 struct KTraits {
     using Elem = Elem_;
     static constexpr int HeadDim = HeadDim_;
+    // HD256 with 128 query rows needs 128 KiB of shared memory, exceeding
+    // Ada's per-block limit. Split each scheduler tile into two 64-row CTAs
+    // (96 KiB each), preserving the scheduler's 128-row tile coordinates.
+    static constexpr int BlockM = HeadDim == 256 ? 64 : kBlockM;
     static_assert(HeadDim % 64 == 0, "HeadDim must be a multiple of 64");
 
     using SmemAtom = decltype(composition(
@@ -52,7 +56,7 @@ struct KTraits {
         Layout<Shape<_8, _64>, Stride<_64, _1>>{}));
 
     using SmemLayoutQ  = decltype(tile_to_shape(SmemAtom{},
-                                      Shape<Int<kBlockM>, Int<HeadDim>>{}));
+                                      Shape<Int<BlockM>, Int<HeadDim>>{}));
     using SmemLayoutKV = decltype(tile_to_shape(SmemAtom{},
                                       Shape<Int<kBlockN>, Int<HeadDim>>{}));
     using SmemLayoutO  = SmemLayoutQ;
@@ -337,18 +341,19 @@ __global__ void flash_attn_paged_ragged_kernel(
 {
     using Elem = typename Traits::Elem;
     constexpr int HD = Traits::HeadDim;
+    constexpr int kBlockM = Traits::BlockM;
 
     const int flat_tile  = blockIdx.x;
     const int q_head_idx = blockIdx.y;
     if (valid_q_tiles != nullptr && flat_tile >= valid_q_tiles[0]) return;
     const int req     = block2req[flat_tile];
-    const int block_m = block2tile[flat_tile];
+    const int block_m = block2tile[flat_tile] * (flash_attn_paged_prefill::kBlockM / kBlockM) + blockIdx.z;
 
     const int q_start = cu_q_lens[req];
     const int q_end   = cu_q_lens[req + 1];
     const int q_len   = q_end - q_start;
     const int kv_len  = kv_lens[req];
-    if (q_len <= 0) return;
+    if (q_len <= 0 || block_m * kBlockM >= q_len) return;
 
     const int kv_head_idx = q_head_idx / (num_q_heads / num_kv_heads);
     const uint32_t* req_block_table = block_tables + static_cast<int64_t>(req) * max_blocks_per_seq;
@@ -560,7 +565,7 @@ static cudaError_t launch_impl(
 {
     using Traits = KTraits<Elem, HD>;
     if (total_q_tiles <= 0) return cudaSuccess;
-    dim3 grid(total_q_tiles, num_q_heads, 1);
+    dim3 grid(total_q_tiles, num_q_heads, kBlockM / Traits::BlockM);
     dim3 block(Traits::NumThreads);
 
     constexpr int smem_size = dynamic_smem_bytes<Elem, HD>();

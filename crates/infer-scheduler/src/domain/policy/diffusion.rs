@@ -164,6 +164,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 9999,
+            max_kv_tokens: 9999,
             max_seqs: 99,
         };
 
@@ -178,6 +179,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 9999,
+            max_kv_tokens: 9999,
             max_seqs: 99,
         };
 
@@ -197,6 +199,7 @@ mod tests {
         };
         let budget = TokenBudget {
             max_tokens: 9999,
+            max_kv_tokens: 9999,
             max_seqs: 99,
         };
 
@@ -211,6 +214,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 9999,
+            max_kv_tokens: 9999,
             max_seqs: 99,
         };
 

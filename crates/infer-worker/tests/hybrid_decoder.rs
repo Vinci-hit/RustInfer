@@ -627,6 +627,54 @@ fn request(seqs: &[(u64, usize, usize, &[i32])]) -> infer_worker::domain::plan::
 }
 
 #[test]
+fn startup_self_check_releases_hybrid_history_before_serving() {
+    // With only one recurrent slot, a leaked bootstrap sequence prevents the
+    // first real request from running. Compare its hidden state against a
+    // fresh runtime as well, to catch synthetic history leaking into reuse.
+    let mut checked = hybrid_runtime(1);
+    let mut fresh = hybrid_runtime(1);
+    checked.startup_self_check().unwrap();
+    assert!(checked.kv_pool.seq_kv_len.is_empty());
+    let req = request(&[(42, 0, 0, &[3, 4])]);
+    let expected = fresh.step(&req).unwrap();
+    let actual = checked.step(&req).unwrap();
+    assert_eq!(actual.tokens[0][0].token_id, expected.tokens[0][0].token_id);
+    close(
+        &checked.hidden.stream.to_host_vec().unwrap()[..2 * DIM],
+        &fresh.hidden.stream.to_host_vec().unwrap()[..2 * DIM],
+    );
+}
+
+#[test]
+fn startup_self_check_releases_hybrid_history_after_failure() {
+    let mut runtime = hybrid_runtime(1);
+    // Fail finalization after recurrent layers have already advanced history.
+    let original = std::mem::replace(&mut runtime.model.lm_head.proj, linear(VOCAB, DIM + 1, 1.0));
+    assert!(runtime.startup_self_check().is_err());
+    assert!(runtime.kv_pool.seq_kv_len.is_empty());
+    runtime.model.lm_head.proj = original;
+    runtime.startup_self_check().unwrap();
+    runtime.step(&request(&[(42, 0, 0, &[3, 4])])).unwrap();
+}
+
+#[test]
+fn startup_self_check_respects_small_context_and_token_budgets() {
+    let mut runtime = hybrid_runtime(1);
+    runtime.cap_num_tokens = 1;
+    runtime.max_seq_len = 2;
+    runtime.startup_self_check().unwrap();
+    assert!(runtime.kv_pool.seq_kv_len.is_empty());
+    runtime.max_seq_len = 1;
+    assert!(
+        runtime
+            .startup_self_check()
+            .unwrap_err()
+            .to_string()
+            .contains("capacity for a prompt and a decode token")
+    );
+}
+
+#[test]
 fn runtime_hybrid_tracks_reordered_chunks_and_recycles_cancelled_slots() {
     let reference = model(false);
     let mut expected = Fixture::new(&reference);

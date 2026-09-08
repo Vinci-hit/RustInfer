@@ -17,22 +17,29 @@ use crate::state::SharedState;
 /// 构建完整的应用 Router
 pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> anyhow::Result<Router> {
     let cors = build_cors_layer(cors_allowed_origins)?;
+    let metrics = state.metrics.clone();
+    let admission = middleware::from_fn_with_state(
+        state.admission.clone(),
+        crate::middleware::admission::admit,
+    );
     let router = Router::new()
         // OpenAI 兼容端点
         .route(
             "/v1/chat/completions",
             post(api::openai::chat::chat_completions)
-                .layer(axum::extract::DefaultBodyLimit::max(56 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(56 * 1024 * 1024))
+                .layer(admission.clone()),
         )
         .route(
             "/v1/completions",
-            post(api::openai::completion::completions),
+            post(api::openai::completion::completions).layer(admission),
         )
         .route("/v1/models", get(api::openai::models::list_models))
         // 运维端点
         .route("/health", get(api::health::health_check))
         .route("/ready", get(api::health::ready_check))
-        .route("/metrics", get(api::metrics::get_system_metrics))
+        .route("/metrics", get(api::metrics::get_metrics))
+        .route("/metrics/system", get(api::metrics::get_system_metrics))
         // 共享状态
         .with_state(state)
         // Middleware 层（从下到上执行）
@@ -41,10 +48,14 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> anyh
 
     // No CORS layer means browsers enforce the normal same-origin policy.
     // Cross-origin access is opt-in through explicit origins only.
-    Ok(match cors {
+    let router = match cors {
         Some(cors) => router.layer(cors),
         None => router,
-    })
+    };
+    Ok(router.layer(middleware::from_fn_with_state(
+        metrics,
+        crate::middleware::metrics::observe,
+    )))
 }
 
 fn build_cors_layer(origins: &[String]) -> anyhow::Result<Option<CorsLayer>> {

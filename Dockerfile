@@ -72,6 +72,10 @@ RUN cargo build \
         target/release/rustinfer-scheduler \
         target/release/rustinfer-server
 
+# Keep regression tools in the development stage; script-only edits reuse the
+# compiled binaries above. The production image still copies only binaries.
+COPY scripts ./scripts
+
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
 ARG CUDA_ARCH=sm_90

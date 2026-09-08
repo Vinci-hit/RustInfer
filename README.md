@@ -144,8 +144,8 @@ ZMQ (IPC) with MessagePack framing:
 - **CUDA-graph decode** — captured graphs over a fixed set of batch sizes, with a
   persistent ABC buffer that eliminates per-step allocation in the hot loop.
 - **Quantization** — dense BF16 and AWQ int4 (W4A16) MLP.
-- **Models** — Llama-3.2, Qwen3, Qwen3 (AWQ). Qwen3.5 hybrid attention
-  (Gated DeltaNet + full attention) is in progress; see [Status](#status).
+- **Models** — Llama-3.2, Qwen3, Qwen3 (AWQ), and Qwen3.5-4B text/image
+  inference at TP=1; see [Status](#status).
 
 ---
 
@@ -336,10 +336,26 @@ during startup instead of silently falling back to replicated execution.
 
 RustInfer serves Llama-3.2, Qwen3, and Qwen3-AWQ end to end today.
 
-Qwen3.5 (hybrid Gated DeltaNet + full attention) is being brought up in phases:
-config parsing and the generic name-driven weight loader are done; the
-heterogeneous forward path (recurrent state cache + full-attention output gate +
-partial RoPE) is in progress.
+Qwen3.5-4B runs hybrid Gated DeltaNet/full attention, text and PNG/JPEG data-URL
+inputs, chunked prefill, and CUDA Graph decode at TP=1. The reproducible service
+regression covers mixed text/image concurrency and streaming. Hardware/model
+combinations still require GPU validation; a successful CUDA build alone does
+not establish inference correctness.
+
+Workers execute a bounded prefill/decode self-check before advertising ready.
+`/health` reports HTTP process liveness; `/ready` requires a loaded Worker group
+and a fresh scheduler engine heartbeat, and becomes unavailable during failure
+or shutdown. `/metrics` exports Prometheus text; `/metrics/system` retains the
+browser console's JSON uptime summary. See [metric semantics](docs/METRICS.md).
+
+Run the local GPU regression, or provision the automatic master/nightly GPU
+workflow using [the validation guide](docs/VALIDATION.md):
+
+```bash
+MODEL_PATH=/absolute/path/to/Qwen3.5-4B \
+ARTIFACT_DIR=/tmp/rustinfer-gpu-run-001 \
+bash scripts/gpu_regression.sh
+```
 
 ---
 

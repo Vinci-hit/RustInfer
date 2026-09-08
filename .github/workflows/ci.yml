@@ -77,3 +77,22 @@ jobs:
         run: PYTHONPYCACHEPREFIX=/tmp/rustinfer-pyc python3 -m compileall -q bench scripts
       - name: Reject generated Python bytecode
         run: test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -print -quit)"
+
+  cuda-build:
+    name: Compile production CUDA worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk space
+        run: sudo rm -rf /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android /usr/share/dotnet
+      - uses: docker/setup-buildx-action@v3
+      - name: Compile and link CUDA kernels and serving binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          push: false
+          build-args: CUDA_ARCH=sm_90
+          cache-from: type=gha,scope=cuda-ci
+          cache-to: type=gha,mode=max,scope=cuda-ci

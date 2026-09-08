@@ -4,6 +4,7 @@
 
 pub mod codec;
 pub mod control_plane;
+pub mod readiness;
 pub mod traits;
 pub mod zmq_transport;
 

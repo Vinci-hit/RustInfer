@@ -32,6 +32,7 @@ mod multimodal;
 mod peer;
 mod plan;
 mod recurrent;
+mod startup;
 
 pub use graph_exec::{GraphDecision, GraphRunner, GraphSlotId};
 pub use mixed_abc::MixedStepTicket;

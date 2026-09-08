@@ -105,6 +105,7 @@ impl EngineWorkflow for LlmWorkflow {
         }
         let token_budget = TokenBudget {
             max_tokens: ctx.config.max_batch_tokens.min(kv_limited_tokens),
+            max_kv_tokens: kv_limited_tokens,
             max_seqs: ctx.config.max_num_seqs,
         };
 

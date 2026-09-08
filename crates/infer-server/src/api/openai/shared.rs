@@ -12,6 +12,38 @@ use crate::error::AppError;
 
 use super::types::StopSequence;
 
+/// Bound CPU work independently of the larger image data-URL body limit.
+pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+pub fn validate_text_bytes(bytes: usize) -> Result<(), AppError> {
+    if bytes > MAX_TEXT_BYTES {
+        return Err(AppError::bad_request("request text exceeds 1 MiB"));
+    }
+    Ok(())
+}
+
+pub async fn prepare_stop_sequences(
+    tokenizer: std::sync::Arc<Tokenizer>,
+    stop: Option<StopSequence>,
+    permit: crate::middleware::admission::AdmissionPermit,
+) -> Result<Vec<Vec<i32>>, AppError> {
+    let bytes = match &stop {
+        None => return Ok(Vec::new()),
+        Some(StopSequence::Single(s)) => s.len(),
+        Some(StopSequence::Multiple(values)) => {
+            values.iter().fold(0usize, |n, s| n.saturating_add(s.len()))
+        }
+    };
+    validate_text_bytes(bytes)?;
+    tokio::task::spawn_blocking(move || {
+        let result = tokenize_stop_sequences(&tokenizer, stop.as_ref());
+        drop(permit);
+        result
+    })
+    .await
+    .map_err(|e| AppError::internal(anyhow::anyhow!(e)))?
+}
+
 /// Validate the sampling params common to both endpoints (`temperature`,
 /// `top_p`, `max_tokens`). Endpoint-specific checks (non-empty messages /
 /// prompt) stay in each handler's own `validate_request`.

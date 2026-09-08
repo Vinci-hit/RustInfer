@@ -606,6 +606,15 @@ where
         }
     }
 
+    let t_check = Instant::now();
+    runner.startup_self_check().map_err(|error| {
+        format!("startup inference self-check failed (prefill/decode): {error}")
+    })?;
+    tracing::info!(
+        elapsed_ms = t_check.elapsed().as_secs_f64() * 1e3,
+        "[bootstrap] startup inference self-check passed (prefill + decode)"
+    );
+
     let max_total_kv_tokens = num_blocks * bs.block_size;
     control.send_ready(
         bs.load.model_instance_id.clone(),

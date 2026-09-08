@@ -68,7 +68,8 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
     ) -> BatchPlan {
         // The scheduler does not schedule decoding — the worker's
         // sub-scheduler decides that. We only plan prefills here.
-        let mut kv_budget_remaining = budget.max_tokens;
+        let mut kv_budget_remaining = budget.max_kv_tokens;
+        let mut compute_remaining = budget.max_tokens;
         let mut tile_budget_remaining = prefill_tile_budget(budget);
         // Seq budget: continuation chunks don't consume new seq slots (already counted).
         let seq_budget = budget.max_seqs.saturating_sub(running.total());
@@ -78,12 +79,12 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
         // 1. Schedule continuation chunks for already-prefilling sequences.
         // These MUST run — they already have KV allocated. Priority over new requests.
         for (req_id, remaining) in &running.prefilling_continuations {
-            if kv_budget_remaining == 0 || tile_budget_remaining == 0 {
+            if compute_remaining == 0 || kv_budget_remaining == 0 || tile_budget_remaining == 0 {
                 break;
             }
 
             let chunk = fit_prefill_tokens(
-                self.chunk_tokens(*remaining),
+                self.chunk_tokens(*remaining).min(compute_remaining),
                 kv_budget_remaining,
                 tile_budget_remaining,
             );
@@ -99,13 +100,15 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 is_partial,
             });
 
+            compute_remaining -= chunk;
             kv_budget_remaining = kv_budget_remaining.saturating_sub(chunk);
             tile_budget_remaining =
                 tile_budget_remaining.saturating_sub(prefill_tiles_for_tokens(chunk));
         }
 
         // 2. Select new requests from waiting queue.
-        if kv_budget_remaining > 0
+        if compute_remaining > 0
+            && kv_budget_remaining > 0
             && tile_budget_remaining > 0
             && seq_budget > 0
             && !waiting.is_empty()
@@ -118,6 +121,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
 
                 for (seqs_used, seq) in candidates.into_iter().enumerate() {
                     if seqs_used >= seq_budget
+                        || compute_remaining == 0
                         || kv_budget_remaining == 0
                         || tile_budget_remaining == 0
                     {
@@ -133,7 +137,8 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                     let requested_tokens = match self.chunked_prefill_size {
                         Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
                         None => prompt_len.min(kv_budget_remaining),
-                    };
+                    }
+                    .min(compute_remaining);
                     let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
                     let tokens_to_prefill = fit_new_prefill_tokens(
                         requested_tokens,
@@ -151,6 +156,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                         token_range: 0..tokens_to_prefill,
                         is_partial,
                     });
+                    compute_remaining -= tokens_to_prefill;
                     kv_budget_remaining =
                         kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
                     tile_budget_remaining = tile_budget_remaining
@@ -160,6 +166,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                 // FCFS: iterate queue directly without collecting.
                 for (seqs_used, seq) in waiting.iter().enumerate() {
                     if seqs_used >= seq_budget
+                        || compute_remaining == 0
                         || kv_budget_remaining == 0
                         || tile_budget_remaining == 0
                     {
@@ -175,7 +182,8 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                     let requested_tokens = match self.chunked_prefill_size {
                         Some(_) => self.chunk_tokens(prompt_len).min(kv_budget_remaining),
                         None => prompt_len.min(kv_budget_remaining),
-                    };
+                    }
+                    .min(compute_remaining);
                     let decode_reserve = decode_reserve_for_new(seq.meta.max_tokens);
                     let tokens_to_prefill = fit_new_prefill_tokens(
                         requested_tokens,
@@ -193,6 +201,7 @@ impl SchedulingPolicy for ContinuousBatchingPolicy {
                         token_range: 0..tokens_to_prefill,
                         is_partial,
                     });
+                    compute_remaining -= tokens_to_prefill;
                     kv_budget_remaining =
                         kv_budget_remaining.saturating_sub(tokens_to_prefill + decode_reserve);
                     tile_budget_remaining = tile_budget_remaining
@@ -311,6 +320,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 512,
+            max_kv_tokens: 512,
             max_seqs: 4,
         };
 
@@ -325,6 +335,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 25,
+            max_kv_tokens: 25,
             max_seqs: 4,
         };
 
@@ -344,6 +355,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 512,
+            max_kv_tokens: 512,
             max_seqs: 2,
         };
 
@@ -358,6 +370,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 512,
+            max_kv_tokens: 512,
             max_seqs: 4,
         };
 
@@ -383,6 +396,7 @@ mod tests {
         };
         let budget = TokenBudget {
             max_tokens: 12,
+            max_kv_tokens: 12,
             max_seqs: 4,
         };
 
@@ -404,6 +418,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 512,
+            max_kv_tokens: 512,
             max_seqs: 4,
         };
 
@@ -420,6 +435,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 32,
+            max_kv_tokens: 32,
             max_seqs: 4,
         };
 
@@ -437,6 +453,7 @@ mod tests {
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 8192,
+            max_kv_tokens: 8192,
             max_seqs: 32,
         };
 
@@ -457,12 +474,39 @@ mod tests {
     }
 
     #[test]
+    fn long_generation_reserves_kv_without_consuming_prefill_compute() {
+        for sjf in [false, true] {
+            let policy = ContinuousBatchingPolicy::new(Some(32)).with_admission(0, sjf);
+            let waiting = make_waiting_with_max_tokens(&[("a", 100), ("b", 100)], 512);
+            let budget = TokenBudget {
+                max_tokens: 32,
+                max_kv_tokens: 8192,
+                max_seqs: 4,
+            };
+            let plan = policy.schedule(&waiting, &empty_running(), &budget);
+            assert_eq!(plan.prefill_batch.len(), 1);
+            assert_eq!(plan.total_tokens, 32);
+            assert!(plan.prefill_batch[0].is_partial);
+            let exhausted = TokenBudget {
+                max_kv_tokens: 511,
+                ..budget
+            };
+            assert!(
+                !policy
+                    .schedule(&waiting, &empty_running(), &exhausted)
+                    .has_work()
+            );
+        }
+    }
+
+    #[test]
     fn new_requests_reserve_future_decode_slots() {
         let policy = ContinuousBatchingPolicy::new(None);
         let waiting = make_waiting_with_max_tokens(&[("a", 100), ("b", 100), ("c", 100)], 33);
         let running = empty_running();
         let budget = TokenBudget {
             max_tokens: 264,
+            max_kv_tokens: 264,
             max_seqs: 32,
         };
 

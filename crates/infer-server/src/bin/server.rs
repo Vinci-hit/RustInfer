@@ -35,6 +35,7 @@ struct ServerArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let metrics = Arc::new(infer_server::metrics::HttpMetrics::new()?);
     let args = ServerArgs::parse();
     let config = RustInferConfig::load(&args.config).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
         None
     };
     let state = Arc::new(AppState {
+        metrics,
         image_processor,
         image_admission: Arc::new(tokio::sync::Semaphore::new(4)),
         client,
@@ -123,7 +125,7 @@ async fn main() -> Result<()> {
         admission,
     });
 
-    let app = build_router(state, &args.cors_allowed_origins)?;
+    let app = build_router(state.clone(), &args.cors_allowed_origins)?;
     tracing::info!("API Server listening on http://{}:{}", host, port);
 
     let listener = bind_listener(&host, port).await?;
@@ -151,6 +153,7 @@ async fn main() -> Result<()> {
     wait_for_shutdown_signal().await;
     tracing::info!("Shutdown signal received, initiating shutdown...");
 
+    state.client.begin_draining();
     let _ = shutdown_tx.send(()); // Signal Axum to shut down
     tracing::info!("Waiting for Axum server to exit...");
     let _ = server_task.await;

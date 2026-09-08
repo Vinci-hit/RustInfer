@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
 
     // Create transports.
     let frontend = ZmqFrontendTransport::new(&frontend_endpoint)?;
+    let readiness = frontend.readiness_handle();
+    let _readiness_guard = readiness.guard();
     let worker = ZmqWorkerTransport::new(&worker_push_endpoint, &worker_pull_endpoint)?;
 
     let load_model = Some(LoadModel {
@@ -170,7 +172,8 @@ async fn main() -> Result<()> {
         control_cmd,
         control_events,
         default_worker,
-    );
+    )
+    .with_readiness(readiness.clone());
 
     tracing::info!("Scheduler engine running...");
     // Run the engine until it exits on its own OR a shutdown signal arrives.
@@ -191,6 +194,7 @@ async fn main() -> Result<()> {
             res?;
         }
         sig = wait_for_shutdown_signal() => {
+            readiness.set(infer_protocol::scheduler_to_server::SchedulerReadiness::Draining);
             tracing::info!("Received {}; shutting down scheduler and notifying worker.", sig);
         }
     }

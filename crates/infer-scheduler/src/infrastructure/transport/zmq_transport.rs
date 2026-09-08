@@ -3,8 +3,7 @@
 
 use async_trait::async_trait;
 use infer_protocol::scheduler_to_server::{
-    ChunkType, FRONTEND_PROTOCOL_VERSION, InferenceMetrics, InferenceResponse, ResponseStatus,
-    SchedulerPong, SchedulerReply, StreamChunk,
+    ChunkType, InferenceMetrics, InferenceResponse, ResponseStatus, SchedulerReply, StreamChunk,
 };
 use infer_protocol::server_to_scheduler::ServerCommand;
 use tokio::sync::mpsc;
@@ -13,6 +12,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use crate::domain::inference_session::handle::ClientId;
 use crate::error::{Result, SchedulerError, TransportError};
 use crate::infrastructure::transport::codec::{Codec, MsgPackCodec};
+use crate::infrastructure::transport::readiness::ReadinessHandle;
 use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport, WorkerTransport};
 
 /// Bound on the scheduler → ZMQ-thread outbound queues (responses / chunks /
@@ -61,6 +61,7 @@ pub enum OutgoingResponse {
 /// ZMQ operations run in a dedicated std thread (ZMQ sockets are !Send).
 /// Communication with the async scheduler is via tokio mpsc channels.
 pub struct ZmqFrontendTransport {
+    readiness: ReadinessHandle,
     /// Receive channel: ZMQ thread sends incoming requests here.
     incoming_rx: mpsc::Receiver<FrontendEvent>,
     /// Send channel: scheduler sends responses here, ZMQ thread drains.
@@ -75,11 +76,16 @@ impl ZmqFrontendTransport {
         let (incoming_tx, incoming_rx) = frontend_ingress_channel();
         let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTBOUND_QUEUE_BOUND);
         let endpoint = endpoint.to_string();
+        let readiness = ReadinessHandle::default();
+        let thread_readiness = readiness.clone();
 
         std::thread::Builder::new()
             .name("zmq-frontend".to_string())
             .spawn(move || {
-                if let Err(e) = Self::zmq_thread(endpoint, incoming_tx, outgoing_rx) {
+                let _guard = thread_readiness.guard();
+                if let Err(e) =
+                    Self::zmq_thread(endpoint, incoming_tx, outgoing_rx, thread_readiness)
+                {
                     tracing::error!("ZMQ frontend thread exited: {:?}", e);
                 }
             })
@@ -91,9 +97,14 @@ impl ZmqFrontendTransport {
             })?;
 
         Ok(Self {
+            readiness,
             incoming_rx,
             outgoing_tx,
         })
+    }
+
+    pub fn readiness_handle(&self) -> ReadinessHandle {
+        self.readiness.clone()
     }
 
     /// ZMQ I/O thread — epoll-driven, zero-latency wakeup.
@@ -103,6 +114,7 @@ impl ZmqFrontendTransport {
         endpoint: String,
         incoming_tx: mpsc::Sender<FrontendEvent>,
         mut outgoing_rx: mpsc::Receiver<OutgoingResponse>,
+        readiness: ReadinessHandle,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ctx = zmq::Context::new();
         let socket = ctx.socket(zmq::ROUTER)?;
@@ -194,14 +206,9 @@ impl ZmqFrontendTransport {
                                     }
                                 }
                                 Ok(ServerCommand::Ping) => {
-                                    // Liveness probe: answer directly from this
-                                    // thread (no engine round-trip) so the
-                                    // server's `/ready` reflects this process
-                                    // being alive and its frontend thread
-                                    // responsive.
-                                    let pong = SchedulerReply::Pong(SchedulerPong {
-                                        protocol_version: FRONTEND_PROTOCOL_VERSION,
-                                    });
+                                    // Independent I/O responsiveness cannot
+                                    // establish model or engine readiness.
+                                    let pong = SchedulerReply::Pong(readiness.pong());
                                     if let Err(e) =
                                         Self::send_reply(&socket, &codec, &identity, &pong)
                                     {
