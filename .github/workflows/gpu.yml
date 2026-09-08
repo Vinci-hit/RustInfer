@@ -1,0 +1,52 @@
+name: GPU validation
+
+# Run trusted revisions manually on a provisioned NVIDIA runner.
+# Do not execute untrusted pull requests on a persistent self-hosted runner.
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: Architecture of the runner GPU
+        type: choice
+        default: sm_90
+        options: [sm_90, sm_89, sm_86, sm_80]
+      vision_reference:
+        description: Run model/reference checks using prepared files on the runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CUDA test environment
+        run: docker build --target builder --build-arg CUDA_ARCH="${{ inputs.cuda_arch }}" -t rustinfer-gpu-test .
+      - name: Validate 256-dimensional paged attention
+        run: >-
+          docker run --rm --gpus all rustinfer-gpu-test
+          cargo test --release --locked -p infer-backend-cuda --lib
+          hd256_paged_prefill_matches_causal_mean_across_split_tiles
+          -- --ignored --test-threads=1
+      - name: Compare CUDA recurrent attention against CPU
+        run: >-
+          docker run --rm --gpus all rustinfer-gpu-test
+          cargo test --release --locked -p infer-worker --test gdn_cuda
+          -- --ignored --test-threads=1
+      - name: Validate image preprocessing against reference fixtures
+        if: inputs.vision_reference
+        env:
+          MODEL_PATH: ${{ vars.QWEN35_MODEL_PATH }}
+          REFERENCE_PATH: ${{ vars.QWEN35_VISION_REFERENCE }}
+        run: |
+          test -n "$MODEL_PATH" && test -d "$MODEL_PATH"
+          test -n "$REFERENCE_PATH" && test -d "$REFERENCE_PATH"
+          docker run --rm \
+            -v "$MODEL_PATH:/model:ro" -v "$REFERENCE_PATH:/reference" \
+            -e QWEN35_MODEL_PATH=/model -e QWEN35_VISION_REFERENCE=/reference \
+            rustinfer-gpu-test cargo test --release --locked -p infer-server \
+            chat::multimodal::tests -- --ignored --test-threads=1

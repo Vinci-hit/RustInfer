@@ -1022,3 +1022,98 @@ pub fn attention_paged<T: Dtype>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CudaMemoryPlan, CudaScope};
+    use half::bf16;
+    use infer_core::exec::ExecScope;
+
+    #[test]
+    #[ignore = "requires a visible CUDA GPU"]
+    fn hd256_paged_prefill_matches_causal_mean_across_split_tiles() {
+        let device = Cuda::with_memory_plan(
+            0,
+            CudaMemoryPlan {
+                kernel_workspace_bytes: 8 * 1024 * 1024,
+                graph_arena_bytes: 0,
+                pool_retain_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let scope = CudaScope::new(device.clone());
+        let _guard = scope.enter();
+        // Cross the 64-row CTA and 128-row scheduler boundaries, including
+        // partial tiles, cached prefixes, and a padded (inactive) graph tile.
+        for q_len in [1usize, 32, 65, 129, 193] {
+            let prefix = 17;
+            let kv_len = prefix + q_len;
+            let ints = |v: &[i32]| Tensor::from_host_slice(v, [v.len()], &device).unwrap();
+            let tables = ints(&(0..kv_len as i32).rev().collect::<Vec<_>>());
+            let cu = ints(&[0, q_len as i32]);
+            let kv = ints(&[kv_len as i32]);
+            let lengths = ints(&[q_len as i32]);
+            let tiles = q_len.div_ceil(128);
+            let reqs = ints(&vec![0; tiles + 1]);
+            let tile_ids = ints(&(0..=tiles as i32).collect::<Vec<_>>());
+            let valid = ints(&[tiles as i32]);
+            let q = Tensor::<bf16, _>::zeros([q_len, 256], &device).unwrap();
+            let k = Tensor::<bf16, _>::zeros([kv_len, 256], &device).unwrap();
+            let value = |token: usize, d: usize| {
+                bf16::from_f32((token % 17) as f32 / 16.0 + d as f32 / 1024.0)
+            };
+            let host_v: Vec<_> = (0..kv_len)
+                .rev()
+                .flat_map(|t| (0..256).map(move |d| value(t, d)))
+                .collect();
+            let v = Tensor::from_host_slice(&host_v, [kv_len, 256], &device).unwrap();
+            let mut output = Tensor::<bf16, _>::zeros([q_len, 256], &device).unwrap();
+            let mut workspace = Tensor::<f32, _>::zeros([1], &device).unwrap();
+            attention_paged(
+                scope.stream().0,
+                &q,
+                &k,
+                &v,
+                &mut output,
+                PagedAttentionPlan {
+                    kind: PagedAttentionKind::Ragged,
+                    num_tokens: q_len,
+                    batch: 1,
+                    q_lens: &[q_len as i32],
+                    block_tables: &tables,
+                    cu_q_lens: &cu,
+                    kv_lens: &kv,
+                    seq_lens_step: &lengths,
+                    max_blocks_per_seq: kv_len,
+                    block_size: 1,
+                    block2req: &reqs,
+                    block2tile: &tile_ids,
+                    valid_q_tiles: &valid,
+                    valid_suffix_q_tiles: &valid,
+                    total_q_tiles: (tiles + 1) as i32,
+                },
+                &mut workspace,
+                1,
+                1,
+                256,
+                1.0 / 16.0,
+            )
+            .unwrap();
+            scope.synchronize().unwrap();
+            let actual = output.to_host_vec().unwrap();
+            for row in 0..q_len {
+                let count = prefix + row + 1;
+                for d in 0..256 {
+                    let expected =
+                        (0..count).map(|t| value(t, d).to_f32()).sum::<f32>() / count as f32;
+                    let got = actual[row * 256 + d].to_f32();
+                    assert!(
+                        got.is_finite() && (got - expected).abs() < 0.01,
+                        "q_len={q_len} row={row} dim={d}: {got} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}

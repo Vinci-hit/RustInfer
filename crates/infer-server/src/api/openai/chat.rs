@@ -3,7 +3,7 @@
 //! 支持流式 (SSE) 和非流式两种模式。
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::State,
     response::{IntoResponse, Response},
 };
@@ -22,19 +22,10 @@ use super::types::*;
 #[axum::debug_handler]
 pub async fn chat_completions(
     State(state): State<SharedState>,
+    Extension(permit): Extension<crate::middleware::admission::AdmissionPermit>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, AppError> {
     let request_start = Instant::now();
-
-    // 0. 准入控制：在 tokenize 和任何内部排队之前抢占一个并发名额。过载时立即
-    //    返回 429，而不是把请求压入无界队列。permit 的生命周期 == 请求生命周期：
-    //    非流式分支持有到响应构建完毕；流式分支把 permit move 进 SSE 流，随流结束
-    //    或客户端断开而释放。
-    let permit = state
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::too_many("server overloaded, please retry later"))?;
 
     // 1. 校验请求
     validate_request(&req)?;
@@ -58,38 +49,48 @@ pub async fn chat_completions(
             .ok_or_else(|| AppError::bad_request("model does not support images"))?;
         let tokenizer = state.tokenizer.clone();
         let messages = req.messages.clone();
+        let processing_admission = permit.clone();
         // Keep the image capacity reserved even if the HTTP future is dropped
         // while the non-cancellable CPU decoder is still running.
         let processing_permit = image_permit.take();
         let (prepared, returned_permit) = tokio::task::spawn_blocking(move || {
-            (processor.prepare(&messages, &tokenizer), processing_permit)
+            let result = processor.prepare(&messages, &tokenizer);
+            drop(processing_admission);
+            (result, processing_permit)
         })
         .await
         .map_err(|e| AppError::internal(anyhow::anyhow!(e)))?;
         image_permit = returned_permit;
         prepared.map_err(|e| AppError::bad_request(e.to_string()))?
     } else {
-        let messages = req
-            .messages
-            .iter()
-            .map(InputChatMessage::text_message)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(AppError::bad_request)?;
-        let prompt = get_template(&state.model_type)
-            .apply(&messages)
-            .map_err(|e| AppError::bad_request(format!("Template error: {e}")))?;
-        let encoding = state
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| AppError::internal(anyhow::anyhow!(e.to_string())))?;
-        let ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
-        if state.model_type == "qwen3_5"
-            && ids.contains(&infer_protocol::multimodal::IMAGE_TOKEN_ID)
-        {
-            return Err(AppError::bad_request(
-                "image placeholders require image data",
-            ));
-        }
+        let messages = req.messages.clone();
+        let tokenizer = state.tokenizer.clone();
+        let model_type = state.model_type.clone();
+        let processing_admission = permit.clone();
+        let ids = tokio::task::spawn_blocking(move || {
+            let messages = messages
+                .iter()
+                .map(InputChatMessage::text_message)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(AppError::bad_request)?;
+            let prompt = get_template(&model_type)
+                .apply(&messages)
+                .map_err(|e| AppError::bad_request(format!("Template error: {e}")))?;
+            let encoding = tokenizer
+                .encode(prompt, true)
+                .map_err(|e| AppError::internal(anyhow::anyhow!(e.to_string())))?;
+            let ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+            if model_type == "qwen3_5" && ids.contains(&infer_protocol::multimodal::IMAGE_TOKEN_ID)
+            {
+                return Err(AppError::bad_request(
+                    "image placeholders require image data",
+                ));
+            }
+            drop(processing_admission);
+            Ok::<_, AppError>(ids)
+        })
+        .await
+        .map_err(|e| AppError::internal(anyhow::anyhow!(e)))??;
         (ids, None)
     };
     let prompt_tokens = input_ids.len() as u32;
@@ -101,7 +102,9 @@ pub async fn chat_completions(
     // kv_len_after > max_seq_len 而中止。详见 shared::cap_max_tokens。
     let effective_max_tokens =
         shared::cap_max_tokens(prompt_tokens, req.max_tokens, state.config.max_model_len)?;
-    let stop_sequences = shared::tokenize_stop_sequences(&state.tokenizer, req.stop.as_ref())?;
+    let stop_sequences =
+        shared::prepare_stop_sequences(state.tokenizer.clone(), req.stop.clone(), permit.clone())
+            .await?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let tokenize_elapsed = request_start.elapsed();
     tracing::debug!(
@@ -204,7 +207,48 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
     if req.messages.is_empty() {
         return Err(AppError::bad_request("messages must not be empty"));
     }
+    let mut bytes = 0usize;
+    for message in &req.messages {
+        bytes = bytes.saturating_add(message.role.len());
+        match &message.content {
+            MessageContent::Text(text) => bytes = bytes.saturating_add(text.len()),
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        bytes = bytes.saturating_add(text.len());
+                    }
+                }
+            }
+        }
+    }
+    shared::validate_text_bytes(bytes)?;
     shared::validate_sampling(req.temperature, req.top_p, req.top_k, req.max_tokens)?;
     shared::reject_unsupported_sampling(req.frequency_penalty, req.presence_penalty, req.seed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_budget_is_aggregate_and_excludes_image_payloads() {
+        let half = "x".repeat(shared::MAX_TEXT_BYTES / 2);
+        let request = |messages| {
+            serde_json::from_value::<ChatCompletionRequest>(
+                serde_json::json!({"messages": messages}),
+            )
+            .unwrap()
+        };
+        let oversized = request(serde_json::json!([
+            {"role":"user", "content": half},
+            {"role":"user", "content":[{"type":"text", "text":half}]}
+        ]));
+        assert!(validate_request(&oversized).is_err());
+        let image = request(serde_json::json!([{"role":"user", "content":[
+            {"type":"text", "text":"describe"},
+            {"type":"image_url", "image_url":{"url":"x".repeat(shared::MAX_TEXT_BYTES + 1)}}
+        ]}]));
+        assert!(validate_request(&image).is_ok());
+    }
 }

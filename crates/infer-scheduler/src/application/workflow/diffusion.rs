@@ -125,6 +125,7 @@ fn running_set(requests: &RequestTable) -> RunningSet {
 fn token_budget(config: &crate::config::SchedulerConfig) -> TokenBudget {
     TokenBudget {
         max_tokens: config.max_batch_tokens,
+        max_kv_tokens: config.max_batch_tokens,
         max_seqs: config.max_num_seqs,
     }
 }

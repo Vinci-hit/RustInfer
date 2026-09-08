@@ -3,7 +3,7 @@
 //! Text completion 接口，接收 prompt 直接 tokenize 生成，不经过 chat template。
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::State,
     response::{IntoResponse, Response},
 };
@@ -20,16 +20,9 @@ use super::types::*;
 #[axum::debug_handler]
 pub async fn completions(
     State(state): State<SharedState>,
+    Extension(permit): Extension<crate::middleware::admission::AdmissionPermit>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, AppError> {
-    // 0. 准入控制：过载时在入口返回 429（详见 chat_completions）。permit move 进
-    //    流式 SSE 或随非流式响应构建结束而释放。
-    let permit = state
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::too_many("server overloaded, please retry later"))?;
-
     // 1. 校验
     validate_request(&req, state.tokenizer.get_vocab_size(true))?;
     let response_model = state.model_info.model_id.clone();
@@ -37,11 +30,18 @@ pub async fn completions(
     // 2. 获取 input_ids（直接 tokenize prompt，不经过 chat template）
     let (input_ids, prompt_tokens) = match &req.prompt {
         CompletionPrompt::Text(text) => {
-            let encoding = state
-                .tokenizer
-                .encode(text.as_str(), true)
-                .map_err(|e| AppError::internal(anyhow::anyhow!("Tokenize error: {}", e)))?;
-            let ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+            let tokenizer = state.tokenizer.clone();
+            let text = text.clone();
+            let processing_admission = permit.clone();
+            let ids: Vec<i32> = tokio::task::spawn_blocking(move || {
+                let encoding = tokenizer
+                    .encode(text, true)
+                    .map_err(|e| AppError::internal(anyhow::anyhow!("Tokenize error: {}", e)))?;
+                drop(processing_admission);
+                Ok::<_, AppError>(encoding.get_ids().iter().map(|&id| id as i32).collect())
+            })
+            .await
+            .map_err(|e| AppError::internal(anyhow::anyhow!(e)))??;
             let len = ids.len() as u32;
             (ids, len)
         }
@@ -57,7 +57,9 @@ pub async fn completions(
     // 详见 shared::cap_max_tokens。
     let effective_max_tokens =
         shared::cap_max_tokens(prompt_tokens, req.max_tokens, state.config.max_model_len)?;
-    let stop_sequences = shared::tokenize_stop_sequences(&state.tokenizer, req.stop.as_ref())?;
+    let stop_sequences =
+        shared::prepare_stop_sequences(state.tokenizer.clone(), req.stop.clone(), permit.clone())
+            .await?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
         multimodal: None,
@@ -132,6 +134,9 @@ pub async fn completions(
 }
 
 fn validate_request(req: &CompletionRequest, vocab_size: usize) -> Result<(), AppError> {
+    if let CompletionPrompt::Text(text) = &req.prompt {
+        shared::validate_text_bytes(text.len())?;
+    }
     match &req.prompt {
         CompletionPrompt::Text(text) if text.is_empty() => {
             return Err(AppError::bad_request("prompt must not be empty"));
@@ -168,6 +173,19 @@ mod tests {
 
     fn request(json: &str) -> CompletionRequest {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn text_budget_accepts_boundary_and_rejects_oversized_prompts() {
+        let make = |len| {
+            serde_json::from_value::<CompletionRequest>(serde_json::json!({
+                "prompt": "x".repeat(len)
+            }))
+            .unwrap()
+        };
+        let limit = super::shared::MAX_TEXT_BYTES;
+        assert!(validate_request(&make(limit), 100).is_ok());
+        assert!(validate_request(&make(limit + 1), 100).is_err());
     }
 
     #[test]

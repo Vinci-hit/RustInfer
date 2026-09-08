@@ -55,3 +55,6 @@ rmp-serde = "1.3"
 
 [features]
 default = []
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -199,7 +199,7 @@ fn run_stream<S, F>(
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
     permit: (
-        tokio::sync::OwnedSemaphorePermit,
+        crate::middleware::admission::AdmissionPermit,
         Option<tokio::sync::OwnedSemaphorePermit>,
     ),
     shape: S,
@@ -350,7 +350,7 @@ pub fn stream_chat_completion(
     include_usage: bool,
     request_start: Instant,
     permit: (
-        tokio::sync::OwnedSemaphorePermit,
+        crate::middleware::admission::AdmissionPermit,
         Option<tokio::sync::OwnedSemaphorePermit>,
     ),
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -388,7 +388,7 @@ pub fn stream_completion(
     stream_handle: StreamHandle,
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::middleware::admission::AdmissionPermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let shape = CompletionShape {
         chunk_id: format!("cmpl-{}", request_id),
