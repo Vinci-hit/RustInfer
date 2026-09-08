@@ -6,8 +6,8 @@
 //! model-agnostic.
 
 use crate::components::{
-    Attention, DecoderBlock, Embed, ExpertLinear, Linear, LmHead, MoeExperts, MoeFfn,
-    MoeLocalPipeline, MoeRouter, RmsNorm,
+    Attention, DecoderBlock, Embed, ExpertLinear, FullAttention, Linear, LmHead, MoeExperts,
+    MoeFfn, MoeLocalPipeline, MoeRouter, RmsNorm,
 };
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::{DeviceId, ExecDevice};
@@ -105,7 +105,7 @@ pub fn load_layer_attention<T, D>(
     cfg: &LoadConfig,
     layer_index: usize,
     device: &D,
-) -> OpResult<Attention<T, D>>
+) -> OpResult<FullAttention<T, D>>
 where
     T: Dtype,
     D: OpBackend + LlmBackend,
@@ -160,7 +160,7 @@ where
         device,
     )?;
 
-    let attention = Attention {
+    let attention = FullAttention {
         input_layernorm,
         qkv_proj,
         o_proj,
@@ -172,6 +172,8 @@ where
         kv_head_num: cfg.kv_head_num,
         head_dim: cfg.head_dim,
         scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+        rotary_dim: cfg.head_dim,
+        attn_output_gate: false,
         scratch: None,
     };
     validate_attention_geometry(&attention, cfg.dim, qkv_dim)?;
@@ -288,6 +290,7 @@ where
     let linears = load_layer_linears::<T, D>(loader, cfg, layer_index, device)?;
     assemble_layer_ffn(
         RmsNorm {
+            zero_centered: false,
             weight: layer_norm.weight,
             eps: layer_norm.eps,
         },
@@ -298,7 +301,7 @@ where
 /// Join already-loaded attention and routed FFN sublayers into one decoder
 /// block after checking their shared hidden width and device.
 pub fn assemble_layer_block<T, D>(
-    attention: Attention<T, D>,
+    attention: FullAttention<T, D>,
     ffn: MoeFfn<T, D>,
 ) -> OpResult<Qwen3MoeLayer<T, D>>
 where
@@ -332,7 +335,10 @@ where
         ));
     }
 
-    Ok(DecoderBlock { attention, ffn })
+    Ok(DecoderBlock {
+        attention: Attention::Full(attention),
+        ffn,
+    })
 }
 
 /// Load and assemble one complete Qwen3-MoE decoder block. This does not load
@@ -383,19 +389,21 @@ where
     let global_device = <D as ExecDevice>::device_id(global.embed.table.device());
     let mut checked_blocks = Vec::with_capacity(blocks.len());
     for (layer_index, block) in blocks.into_iter().enumerate() {
-        let block = assemble_layer_block(block.attention, block.ffn)?;
+        let Attention::Full(attention) = block.attention else {
+            return Err(OpError::Shape("qwen3_moe requires full attention".into()));
+        };
+        let block = assemble_layer_block(attention, block.ffn)?;
         validate_block_config(&block, cfg, layer_index, global_device)?;
         checked_blocks.push(block);
     }
 
-    Ok(Decoder {
-        embed: global.embed,
-        blocks: checked_blocks,
-        norm: global.norm,
-        lm_head: global.lm_head,
+    Decoder::new(
+        global.embed,
+        checked_blocks,
+        global.norm,
+        global.lm_head,
         dims,
-        scratch: None,
-    })
+    )
 }
 
 fn model_dims(cfg: &LoadConfig) -> OpResult<ModelDims> {
@@ -502,7 +510,9 @@ where
     T: Dtype,
     D: LlmBackend,
 {
-    let attention = &block.attention;
+    let Attention::Full(attention) = &block.attention else {
+        return Err(OpError::Shape("qwen3_moe requires full attention".into()));
+    };
     if attention.head_num != cfg.head_num
         || attention.kv_head_num != cfg.kv_head_num
         || attention.head_dim != cfg.head_dim
@@ -588,8 +598,7 @@ where
         cfg.rms_norm_eps,
     )?;
 
-    let block_device =
-        <D as ExecDevice>::device_id(block.attention.input_layernorm.weight.device());
+    let block_device = <D as ExecDevice>::device_id(attention.input_layernorm.weight.device());
     if block_device != expected_device {
         return Err(OpError::Shape(format!(
             "qwen3_moe layer {} belongs to device {}, expected global device {}",
@@ -614,6 +623,7 @@ where
     D: OpBackend + LlmBackend,
 {
     RmsNorm {
+        zero_centered: false,
         weight: norm.weight,
         eps: norm.eps,
     }
@@ -702,7 +712,7 @@ fn validate_attention_config(cfg: &LoadConfig) -> OpResult<()> {
 }
 
 fn validate_attention_geometry<T, D>(
-    attention: &Attention<T, D>,
+    attention: &FullAttention<T, D>,
     hidden_features: usize,
     qkv_features: usize,
 ) -> OpResult<()>
@@ -960,7 +970,8 @@ mod tests {
         build, expert_linear_spec, load_global_weights, load_layer_attention, load_layer_block,
         load_layer_ffn, post_attention_norm_name,
     };
-    use crate::components::{ExpertLinear, Linear, MoeRouter, RmsNorm};
+    use crate::components::{Attention, ExpertLinear, Linear, MoeRouter, RmsNorm};
+    use crate::domain::model::DecoderModel;
     use crate::domain::tensor::Tensor;
     use crate::infrastructure::cpu::Cpu;
     use crate::infrastructure::io::SafetensorsReader;
@@ -1205,6 +1216,7 @@ mod tests {
     fn assembles_loaded_linears_into_one_local_moe_ffn() {
         let ffn = assemble_layer_ffn(
             RmsNorm {
+                zero_centered: false,
                 weight: Tensor::from_host_slice(&[1.0f32; HIDDEN], [HIDDEN], &Cpu).unwrap(),
                 eps: 1e-6,
             },
@@ -1229,6 +1241,7 @@ mod tests {
     fn layer_assembly_rejects_wrong_norm_width() {
         let err = assemble_layer_ffn(
             RmsNorm {
+                zero_centered: false,
                 weight: Tensor::from_host_slice(&[1.0f32; HIDDEN - 1], [HIDDEN - 1], &Cpu).unwrap(),
                 eps: 1e-6,
             },
@@ -1305,8 +1318,10 @@ mod tests {
         let loader = WeightLoader::new(&reader);
         let block = load_layer_block::<bf16, Cpu>(&loader, &test_config(), 0, &Cpu).unwrap();
 
-        let input_norm = block
-            .attention
+        let Attention::Full(attention) = &block.attention else {
+            panic!("expected full attention")
+        };
+        let input_norm = attention
             .input_layernorm
             .weight
             .to_host_vec()
@@ -1315,13 +1330,12 @@ mod tests {
             .map(|value| value.to_f32())
             .collect::<Vec<_>>();
         assert_eq!(input_norm, vec![5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(block.attention.input_layernorm.eps, 1e-6);
-        assert_eq!(block.attention.head_num, HEADS);
-        assert_eq!(block.attention.kv_head_num, KV_HEADS);
-        assert_eq!(block.attention.head_dim, HEAD_DIM);
+        assert_eq!(attention.input_layernorm.eps, 1e-6);
+        assert_eq!(attention.head_num, HEADS);
+        assert_eq!(attention.kv_head_num, KV_HEADS);
+        assert_eq!(attention.head_dim, HEAD_DIM);
 
-        let qkv = block
-            .attention
+        let qkv = attention
             .qkv_proj
             .weight
             .as_dense()
@@ -1341,8 +1355,7 @@ mod tests {
             .concat()
         );
         assert_eq!(
-            block
-                .attention
+            attention
                 .o_proj
                 .weight
                 .as_dense()
@@ -1352,32 +1365,18 @@ mod tests {
             [HIDDEN, Q_DIM]
         );
         assert_eq!(
-            block
-                .attention
-                .q_norm
-                .as_ref()
-                .unwrap()
-                .weight
-                .shape()
-                .as_slice(),
+            attention.q_norm.as_ref().unwrap().weight.shape().as_slice(),
             [HEAD_DIM]
         );
         assert_eq!(
-            block
-                .attention
-                .k_norm
-                .as_ref()
-                .unwrap()
-                .weight
-                .shape()
-                .as_slice(),
+            attention.k_norm.as_ref().unwrap().weight.shape().as_slice(),
             [HEAD_DIM]
         );
-        assert_eq!(block.attention.sin.shape().as_slice(), [8, HEAD_DIM / 2]);
-        assert_eq!(block.attention.cos.shape().as_slice(), [8, HEAD_DIM / 2]);
+        assert_eq!(attention.sin.shape().as_slice(), [8, HEAD_DIM / 2]);
+        assert_eq!(attention.cos.shape().as_slice(), [8, HEAD_DIM / 2]);
         assert_eq!(block.ffn.routed.num_experts(), 2);
         assert_eq!(block.ffn.routed.top_k(), 1);
-        assert!(block.attention.scratch.is_none());
+        assert!(attention.scratch.is_none());
         assert!(block.ffn.scratch.is_none());
     }
 
@@ -1416,11 +1415,11 @@ mod tests {
         let loader = WeightLoader::new(&reader);
 
         let model = build::<bf16, Cpu>(&loader, &test_config(), &Cpu).unwrap();
-        assert_eq!(model.blocks.len(), 1);
-        assert_eq!(model.dims.num_layers, 1);
-        assert_eq!(model.dims.num_experts, 2);
-        assert_eq!(model.dims.experts_per_tok, 1);
-        assert!(model.dims.is_moe());
+        assert_eq!(model.cache_layout().layers().len(), 1);
+        assert_eq!(model.dims().num_layers, 1);
+        assert_eq!(model.dims().num_experts, 2);
+        assert_eq!(model.dims().experts_per_tok, 1);
+        assert!(model.dims().is_moe());
     }
 
     #[test]
@@ -1450,22 +1449,21 @@ mod tests {
         let block = load_layer_block::<bf16, Cpu>(&loader, &cfg, 0, &Cpu).unwrap();
         let model = assemble_decoder_shell(global, vec![block], &cfg).unwrap();
 
-        assert_eq!(model.blocks.len(), 1);
-        assert_eq!(model.dims.dim, HIDDEN);
-        assert_eq!(model.dims.q_dim, Q_DIM);
-        assert_eq!(model.dims.kv_dim, KV_DIM);
-        assert_eq!(model.dims.qkv_dim, Q_DIM + 2 * KV_DIM);
-        assert_eq!(model.dims.intermediate_size, 0);
-        assert_eq!(model.dims.vocab_size, 8);
-        assert_eq!(model.dims.num_layers, 1);
-        assert_eq!(model.dims.num_experts, 2);
-        assert_eq!(model.dims.experts_per_tok, 1);
-        assert_eq!(model.dims.moe_intermediate_size, INTERMEDIATE);
-        assert_eq!(model.dims.num_shared_experts, 0);
-        assert!(model.dims.is_moe());
+        assert_eq!(model.cache_layout().layers().len(), 1);
+        assert_eq!(model.dims().dim, HIDDEN);
+        assert_eq!(model.dims().q_dim, Q_DIM);
+        assert_eq!(model.dims().kv_dim, KV_DIM);
+        assert_eq!(model.dims().qkv_dim, Q_DIM + 2 * KV_DIM);
+        assert_eq!(model.dims().intermediate_size, 0);
+        assert_eq!(model.dims().vocab_size, 8);
+        assert_eq!(model.dims().num_layers, 1);
+        assert_eq!(model.dims().num_experts, 2);
+        assert_eq!(model.dims().experts_per_tok, 1);
+        assert_eq!(model.dims().moe_intermediate_size, INTERMEDIATE);
+        assert_eq!(model.dims().num_shared_experts, 0);
+        assert!(model.dims().is_moe());
         assert!(model.scratch.is_none());
-        assert!(model.blocks[0].attention.scratch.is_none());
-        assert!(model.blocks[0].ffn.scratch.is_none());
+        assert!(model.cache_layout().linear_dims().is_empty());
     }
 
     #[test]

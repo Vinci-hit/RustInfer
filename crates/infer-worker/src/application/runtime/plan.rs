@@ -95,7 +95,19 @@ where
             }
             kv_lens.push(expected_after as i32);
             seq_positions.push(start as i32);
-            rope_positions.extend_from_slice(&seq.positions);
+            if seq.input_ids.len() == 1
+                && let Some(position) =
+                    self.multimodal_decode_position(seq.sequence_id, start as usize)
+            {
+                if position < 0 || position as usize >= self.max_seq_len {
+                    return Err(OpError::Shape(format!(
+                        "Runtime::step: seq[{i}] multimodal RoPE position {position} outside cache"
+                    )));
+                }
+                rope_positions.push(position);
+            } else {
+                rope_positions.extend_from_slice(&seq.positions);
+            }
         }
         if total_tokens > self.cap_num_tokens {
             return Err(OpError::Shape(format!(

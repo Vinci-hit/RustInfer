@@ -12,6 +12,187 @@ use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
 pub trait FusedOps: MathOps {
+    fn layer_norm<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let dim = weight.numel();
+        if dim == 0
+            || input.shape().len() != 2
+            || input.shape()[1] != dim
+            || bias.numel() != dim
+            || output.shape() != input.shape()
+            || !eps.is_finite()
+            || !input.is_contiguous()
+            || !output.is_contiguous()
+            || !weight.is_contiguous()
+            || !bias.is_contiguous()
+            || eps <= 0.0
+        {
+            return Err(OpError::Shape(
+                "layer_norm: invalid dimensions or epsilon".into(),
+            ));
+        }
+        let x = input.to_host_vec()?;
+        let w = weight.to_host_vec()?;
+        let b = bias.to_host_vec()?;
+        let mut out = Vec::with_capacity(x.len());
+        for row in x.chunks_exact(dim) {
+            let mean = row.iter().map(|v| T::read_f64(v) as f32).sum::<f32>() / dim as f32;
+            let var = row
+                .iter()
+                .map(|v| (T::read_f64(v) as f32 - mean).powi(2))
+                .sum::<f32>()
+                / dim as f32;
+            let inv = (var + eps).sqrt().recip();
+            for i in 0..dim {
+                out.push(T::write_f64(
+                    ((T::read_f64(&row[i]) as f32 - mean) * inv * T::read_f64(&w[i]) as f32
+                        + T::read_f64(&b[i]) as f32) as f64,
+                ));
+            }
+        }
+        output.upload_from_host(&out)
+    }
+
+    /// Exact (erf) and tanh GELU are different checkpoint operations.
+    fn gelu_inplace<T: Dtype>(
+        _scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        tanh: bool,
+    ) -> OpResult<()> {
+        if !x.is_contiguous() {
+            return Err(OpError::NotContiguous(*x.shape()));
+        }
+        let mut values = x.to_host_vec()?;
+        for v in &mut values {
+            let a = T::read_f64(v) as f32;
+            let c = if tanh {
+                (0.7978846 * (a + 0.044715 * a * a * a)).tanh()
+            } else {
+                libm::erff(a * std::f32::consts::FRAC_1_SQRT_2)
+            };
+            *v = T::write_f64((0.5 * a * (1.0 + c)) as f64);
+        }
+        x.upload_from_host(&values)
+    }
+
+    /// Half-split rotation with caller-prepared per-token FP32 angles.
+    /// Supports strided [tokens, heads * head_dim] Q/K views and partial RoPE.
+    fn rope_with_angles<T: Dtype>(
+        _scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        sin: &Tensor<f32, Self>,
+        cos: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let half = sin.shape().as_slice().get(1).copied().unwrap_or(0);
+        if x.shape().len() != 2
+            || sin.shape().len() != 2
+            || sin.shape() != cos.shape()
+            || head_dim == 0
+            || half == 0
+            || half * 2 > head_dim
+            || !x.shape()[1].is_multiple_of(head_dim)
+            || x.shape()[0] != sin.shape()[0]
+            || x.strides()[1] != 1
+        {
+            return Err(OpError::Shape(
+                "rope_with_angles: invalid dimensions".into(),
+            ));
+        }
+        let mut values = Vec::with_capacity(x.numel());
+        for row in 0..x.shape()[0] {
+            let shape = Shape::from_slice(&[1, x.shape()[1]]);
+            let row_view = x.view_raw(
+                shape,
+                shape.contiguous_strides(),
+                x.offset_elems() + row * x.strides()[0],
+                true,
+            );
+            values.extend(row_view.to_host_vec()?);
+        }
+        let s = sin.to_host_vec()?;
+        let c = cos.to_host_vec()?;
+        for (row, values) in values.chunks_exact_mut(x.shape()[1]).enumerate() {
+            for head in values.chunks_exact_mut(head_dim) {
+                for j in 0..half {
+                    let a = T::read_f64(&head[j]) as f32;
+                    let b = T::read_f64(&head[j + half]) as f32;
+                    head[j] = T::write_f64((a * c[row * half + j] - b * s[row * half + j]) as f64);
+                    head[j + half] =
+                        T::write_f64((a * s[row * half + j] + b * c[row * half + j]) as f64);
+                }
+            }
+        }
+        for (row, values) in values.chunks_exact(x.shape()[1]).enumerate() {
+            x.narrow(0, row, 1)?.upload_from_host(values)?;
+        }
+        Ok(())
+    }
+
+    /// Qwen3.5 RMSNorm: FP32 normalization and (1 + weight), one final cast.
+    /// Each contiguous group of weight.len() columns is an independent head.
+    fn rmsnorm_zero_centered<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let dim = weight.numel();
+        if dim == 0
+            || input.shape() != output.shape()
+            || input.shape().len() != 2
+            || !input.shape()[1].is_multiple_of(dim)
+            || !eps.is_finite()
+            || eps < 0.0
+        {
+            return Err(OpError::Shape(
+                "rmsnorm_zero_centered: invalid shapes or epsilon".into(),
+            ));
+        }
+        let mut values = input.to_host_vec()?;
+        let weights = weight.to_host_vec()?;
+        for row in values.chunks_mut(dim) {
+            let sum: f32 = row.iter().map(|v| (T::read_f64(v) as f32).powi(2)).sum();
+            let inv = (sum / dim as f32 + eps).sqrt().recip();
+            for (v, w) in row.iter_mut().zip(&weights) {
+                *v = T::write_f64(
+                    ((T::read_f64(v) as f32 * inv) * (1.0 + T::read_f64(w) as f32)) as f64,
+                );
+            }
+        }
+        output.upload_from_host(&values)
+    }
+
+    /// `output *= sigmoid(gate)`, with sigmoid rounded to the activation dtype.
+    /// Both tensors must have identical shapes and contiguous storage.
+    fn sigmoid_mul<T: Dtype>(
+        _scope: &Self::Scope,
+        output: &mut Tensor<T, Self>,
+        gate: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        if output.shape() != gate.shape() || !output.is_contiguous() || !gate.is_contiguous() {
+            return Err(OpError::Shape(
+                "sigmoid_mul: expected matching contiguous tensors".into(),
+            ));
+        }
+        let mut values = output.to_host_vec()?;
+        let gates = gate.to_host_vec()?;
+        for (value, gate) in values.iter_mut().zip(gates.iter()) {
+            let g = T::read_f64(gate) as f32;
+            let sigmoid = T::write_f64((1.0 / (1.0 + (-g).exp())) as f64);
+            *value =
+                T::write_f64(((T::read_f64(value) as f32) * (T::read_f64(&sigmoid) as f32)) as f64);
+        }
+        output.upload_from_host(&values)
+    }
+
     /// Toggle build-free eager-prefill GEMM mode. When `on`, eager (non-graph)
     /// bf16 GEMMs skip the per-shape cuBLASLt heuristic+probe cache build and use
     /// the build-free chunked path, removing ~9-18ms of cold-shape build from
@@ -71,6 +252,104 @@ pub trait FusedOps: MathOps {
         Self::split_cols(ctx.scope(), gate_up, &mut up, rows, 2 * inter, inter, inter)?;
         Self::silu_inplace(ctx.scope(), &mut gate)?;
         Self::ewise_mul(ctx.scope(), &gate, &up, out)
+    }
+
+    /// Causal depthwise Conv1d followed by SiLU. The operator owns no state:
+    /// all persistent sequence state is supplied by the caller through
+    /// `conv_state` and updated in place.
+    ///
+    /// Layout:
+    /// - `input` / `output`: flattened ragged tape `[num_tokens, channels]`
+    /// - `weight`: depthwise weights `[channels, 1, kernel_size]`
+    /// - `conv_state`: caller-owned `[num_slots, channels, kernel_size]`
+    /// - `state_slots`: one distinct slot id per sequence, `[batch]`
+    /// - `cu_seqlens`: ragged row offsets, `[batch + 1]`
+    ///
+    /// A state row stores the latest `kernel_size` *pre-convolution* input
+    /// values. For each output only the latest `kernel_size - 1` cached values
+    /// plus the current input participate; retaining one full kernel matches
+    /// Qwen3.5 / causal-conv1d cache layout and makes single-token updates a
+    /// shift-and-append operation. Distinct sequences must not name the same
+    /// mutable slot in one call.
+    fn causal_conv1d_silu<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        conv_state: &mut Tensor<T, Self>,
+        state_slots: &Tensor<i32, Self>,
+        cu_seqlens: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        causal_conv1d_silu_reference(input, weight, conv_state, state_slots, cu_seqlens, output)
+    }
+
+    /// Sequential Gated DeltaNet recurrence for a flattened ragged batch.
+    /// The operator owns no recurrent state: `recurrent_state` is supplied by
+    /// the caller, read as the initial state, and updated in place.
+    ///
+    /// Layout:
+    /// - `query` / `key`: `[num_tokens, num_key_heads * key_head_dim]`
+    /// - `value` / `output`: `[num_tokens, num_value_heads * value_head_dim]`
+    /// - `a` / `b`: raw projections `[num_tokens, num_value_heads]`
+    /// - `a_log`: fp32 `[num_value_heads]`; `dt_bias`: `[num_value_heads]`
+    /// - `recurrent_state`: caller-owned fp32
+    ///   `[num_slots, num_value_heads, key_head_dim, value_head_dim]`
+    /// - `state_slots`: one distinct slot id per sequence, `[batch]`
+    /// - `cu_seqlens`: ragged row offsets, `[batch + 1]`
+    ///
+    /// The state shape determines the head dimensions. Value heads are mapped
+    /// to key/query heads in repeat-interleave order, so
+    /// `num_value_heads` must be divisible by `num_key_heads`.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_rule<T: Dtype>(
+        _scope: &Self::Scope,
+        query: &Tensor<T, Self>,
+        key: &Tensor<T, Self>,
+        value: &Tensor<T, Self>,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        a_log: &Tensor<f32, Self>,
+        dt_bias: &Tensor<T, Self>,
+        recurrent_state: &mut Tensor<f32, Self>,
+        state_slots: &Tensor<i32, Self>,
+        cu_seqlens: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        gated_delta_rule_reference(
+            query,
+            key,
+            value,
+            a,
+            b,
+            a_log,
+            dt_bias,
+            recurrent_state,
+            state_slots,
+            cu_seqlens,
+            output,
+        )
+    }
+
+    /// Per-head RMSNorm followed by a SiLU output gate.
+    ///
+    /// Layout:
+    /// - `input` / `gate` / `output`: the same `[..., head_dim]` shape
+    /// - `weight`: fp32 `[head_dim]`
+    ///
+    /// The operator owns no state and allocates no persistent storage. For
+    /// low-precision activations it follows Qwen3.5's numerical order: RMS
+    /// statistics are computed in fp32, the normalized activation is rounded
+    /// back to `T`, then the fp32 weight and fp32 SiLU gate are applied before
+    /// the final result is rounded to `T`.
+    fn gated_rmsnorm<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        gate: &Tensor<T, Self>,
+        weight: &Tensor<f32, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        gated_rmsnorm_reference(input, gate, weight, output, eps)
     }
 
     fn split_qkv<T: Dtype>(
@@ -177,6 +456,7 @@ pub trait FusedOps: MathOps {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
         kv_dim: usize,
     ) -> OpResult<()> {
         if let Some(weight) = q_weight {
@@ -195,6 +475,7 @@ pub trait FusedOps: MathOps {
             head_num,
             kv_head_num,
             head_dim,
+            rotary_dim,
         )?;
         Self::scatter_kv_paged(ctx, k, v, layer, kv_dim)
     }
@@ -313,7 +594,7 @@ pub trait FusedOps: MathOps {
 
     /// Greedy argmax over the last (vocab) dimension. `logits` is `[rows, vocab]`;
     /// returns the winning column index for every row as a host `Vec<i32>` of
-    /// length `rows`.
+    /// length `rows`. Equal maxima choose the lowest column index.
     ///
     /// Default is a host reference implementation (copies the full logits to
     /// host). The CUDA backend overrides this with an on-device two-phase argmax
@@ -339,7 +620,11 @@ pub trait FusedOps: MathOps {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| (i as i32, T::read_f64(v)))
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.0.cmp(&a.0))
+                })
                 .ok_or_else(|| OpError::Shape("argmax: empty vocab".into()))?;
             ids.push(idx);
         }
@@ -391,6 +676,552 @@ pub trait FusedOps: MathOps {
             }
         }
     }
+}
+
+fn causal_conv1d_silu_reference<T, D>(
+    input: &Tensor<T, D>,
+    weight: &Tensor<T, D>,
+    conv_state: &mut Tensor<T, D>,
+    state_slots: &Tensor<i32, D>,
+    cu_seqlens: &Tensor<i32, D>,
+    output: &mut Tensor<T, D>,
+) -> OpResult<()>
+where
+    T: Dtype,
+    D: MathOps,
+{
+    let input_shape = input.shape().as_slice();
+    if input_shape.len() != 2 {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: input must be [num_tokens, channels], got {:?}",
+            input_shape
+        )));
+    }
+    let num_tokens = input_shape[0];
+    let channels = input_shape[1];
+    if channels == 0 {
+        return Err(OpError::Shape(
+            "causal_conv1d_silu: channels must be non-zero".into(),
+        ));
+    }
+    if output.shape().as_slice() != input_shape {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: output shape {:?} != input shape {:?}",
+            output.shape().as_slice(),
+            input_shape
+        )));
+    }
+
+    let weight_shape = weight.shape().as_slice();
+    if weight_shape.len() != 3 || weight_shape[0] != channels || weight_shape[1] != 1 {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: weight must be [{channels}, 1, kernel_size], got {:?}",
+            weight_shape
+        )));
+    }
+    let kernel_size = weight_shape[2];
+    if kernel_size == 0 {
+        return Err(OpError::Shape(
+            "causal_conv1d_silu: kernel_size must be non-zero".into(),
+        ));
+    }
+
+    let state_shape = conv_state.shape().as_slice();
+    if state_shape.len() != 3
+        || state_shape[0] == 0
+        || state_shape[1] != channels
+        || state_shape[2] != kernel_size
+    {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: conv_state must be [num_slots, {channels}, {kernel_size}], got {:?}",
+            state_shape
+        )));
+    }
+    let num_slots = state_shape[0];
+
+    let slots_shape = state_slots.shape().as_slice();
+    let cu_shape = cu_seqlens.shape().as_slice();
+    if slots_shape.len() != 1 {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: state_slots must be rank 1, got {:?}",
+            slots_shape
+        )));
+    }
+    let batch = slots_shape[0];
+    if batch == 0 {
+        return Err(OpError::Shape(
+            "causal_conv1d_silu: batch must be non-zero".into(),
+        ));
+    }
+    let cu_len = batch
+        .checked_add(1)
+        .ok_or_else(|| OpError::Shape("causal_conv1d_silu: batch size overflows".into()))?;
+    if cu_shape != [cu_len] {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: cu_seqlens shape {:?} != [{}]",
+            cu_shape, cu_len
+        )));
+    }
+
+    for (shape, contiguous) in [
+        (*input.shape(), input.is_contiguous()),
+        (*weight.shape(), weight.is_contiguous()),
+        (*conv_state.shape(), conv_state.is_contiguous()),
+        (*state_slots.shape(), state_slots.is_contiguous()),
+        (*cu_seqlens.shape(), cu_seqlens.is_contiguous()),
+        (*output.shape(), output.is_contiguous()),
+    ] {
+        if !contiguous {
+            return Err(OpError::NotContiguous(shape));
+        }
+    }
+
+    let input_host = input.to_host_vec()?;
+    let weight_host = weight.to_host_vec()?;
+    let mut state_host = conv_state.to_host_vec()?;
+    let slots_host = state_slots.to_host_vec()?;
+    let cu_host = cu_seqlens.to_host_vec()?;
+
+    if cu_host.first().copied() != Some(0) {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: cu_seqlens must start at 0, got {:?}",
+            cu_host.first()
+        )));
+    }
+    let num_tokens_i32 = i32::try_from(num_tokens)
+        .map_err(|_| OpError::Shape("causal_conv1d_silu: num_tokens exceeds i32".into()))?;
+    if cu_host.last().copied() != Some(num_tokens_i32) {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: cu_seqlens must end at num_tokens {}, got {:?}",
+            num_tokens,
+            cu_host.last()
+        )));
+    }
+    if cu_host
+        .windows(2)
+        .any(|pair| pair[0] < 0 || pair[0] > pair[1])
+    {
+        return Err(OpError::Shape(format!(
+            "causal_conv1d_silu: cu_seqlens must be monotonic and non-negative, got {:?}",
+            cu_host
+        )));
+    }
+
+    let mut seen_slots = std::collections::HashSet::with_capacity(batch);
+    for (seq, &slot) in slots_host.iter().enumerate() {
+        if slot < 0 || slot as usize >= num_slots {
+            return Err(OpError::Shape(format!(
+                "causal_conv1d_silu: state slot {} for sequence {} outside [0, {})",
+                slot, seq, num_slots
+            )));
+        }
+        if !seen_slots.insert(slot) {
+            return Err(OpError::Shape(format!(
+                "causal_conv1d_silu: duplicate mutable state slot {}",
+                slot
+            )));
+        }
+    }
+
+    let mut output_host = vec![T::write_f64(0.0); num_tokens * channels];
+    for seq in 0..batch {
+        let start = cu_host[seq] as usize;
+        let end = cu_host[seq + 1] as usize;
+        let seq_len = end - start;
+        let slot = slots_host[seq] as usize;
+
+        for channel in 0..channels {
+            let state_base = (slot * channels + channel) * kernel_size;
+            let weight_base = channel * kernel_size;
+
+            for token in 0..seq_len {
+                let mut acc = 0.0f64;
+                for tap in 0..kernel_size {
+                    let relative = token as isize + tap as isize + 1 - kernel_size as isize;
+                    let value = if relative >= 0 {
+                        let row = start + relative as usize;
+                        T::read_f64(&input_host[row * channels + channel])
+                    } else {
+                        let state_col = (kernel_size as isize + relative) as usize;
+                        T::read_f64(&state_host[state_base + state_col])
+                    };
+                    acc += value * T::read_f64(&weight_host[weight_base + tap]);
+                }
+                let activated = acc / (1.0 + (-acc).exp());
+                output_host[(start + token) * channels + channel] = T::write_f64(activated);
+            }
+
+            // Keep the last `kernel_size` raw inputs from
+            // `[old_state, current_sequence]`. Iterate low-to-high: when the
+            // chunk is shorter than the kernel, every old-state read is from a
+            // strictly higher index than its write, so no temporary is needed.
+            for state_col in 0..kernel_size {
+                let concat_col = seq_len + state_col;
+                state_host[state_base + state_col] = if concat_col < kernel_size {
+                    state_host[state_base + concat_col]
+                } else {
+                    let input_row = start + concat_col - kernel_size;
+                    input_host[input_row * channels + channel]
+                };
+            }
+        }
+    }
+
+    output.upload_from_host(&output_host)?;
+    conv_state.upload_from_host(&state_host)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_rule_reference<T, D>(
+    query: &Tensor<T, D>,
+    key: &Tensor<T, D>,
+    value: &Tensor<T, D>,
+    a: &Tensor<T, D>,
+    b: &Tensor<T, D>,
+    a_log: &Tensor<f32, D>,
+    dt_bias: &Tensor<T, D>,
+    recurrent_state: &mut Tensor<f32, D>,
+    state_slots: &Tensor<i32, D>,
+    cu_seqlens: &Tensor<i32, D>,
+    output: &mut Tensor<T, D>,
+) -> OpResult<()>
+where
+    T: Dtype,
+    D: MathOps,
+{
+    let query_shape = query.shape().as_slice();
+    if query_shape.len() != 2 || query_shape[0] == 0 || query_shape[1] == 0 {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: query must be non-empty [num_tokens, key_width], got {:?}",
+            query_shape
+        )));
+    }
+    let (num_tokens, key_width) = (query_shape[0], query_shape[1]);
+    if key.shape().as_slice() != query_shape {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: key shape {:?} != query shape {:?}",
+            key.shape().as_slice(),
+            query_shape
+        )));
+    }
+
+    let value_shape = value.shape().as_slice();
+    if value_shape.len() != 2 || value_shape[0] != num_tokens || value_shape[1] == 0 {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: value must be [{num_tokens}, value_width], got {:?}",
+            value_shape
+        )));
+    }
+    if output.shape().as_slice() != value_shape {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: output shape {:?} != value shape {:?}",
+            output.shape().as_slice(),
+            value_shape
+        )));
+    }
+
+    let state_shape = recurrent_state.shape().as_slice();
+    if state_shape.len() != 4
+        || state_shape[0] == 0
+        || state_shape[1] == 0
+        || state_shape[2] == 0
+        || state_shape[3] == 0
+    {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: recurrent_state must be non-empty [num_slots, num_value_heads, key_head_dim, value_head_dim], got {:?}",
+            state_shape
+        )));
+    }
+    let (num_slots, num_value_heads, key_head_dim, value_head_dim) = (
+        state_shape[0],
+        state_shape[1],
+        state_shape[2],
+        state_shape[3],
+    );
+    let value_width = num_value_heads
+        .checked_mul(value_head_dim)
+        .ok_or_else(|| OpError::Shape("gated_delta_rule: value width overflows".into()))?;
+    if value_shape[1] != value_width {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: value width {} != num_value_heads {} * value_head_dim {}",
+            value_shape[1], num_value_heads, value_head_dim
+        )));
+    }
+    if !key_width.is_multiple_of(key_head_dim) {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: key width {key_width} is not divisible by key_head_dim {key_head_dim}"
+        )));
+    }
+    let num_key_heads = key_width / key_head_dim;
+    if num_key_heads == 0 || !num_value_heads.is_multiple_of(num_key_heads) {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: num_value_heads {num_value_heads} must be divisible by num_key_heads {num_key_heads}"
+        )));
+    }
+    let value_heads_per_key = num_value_heads / num_key_heads;
+
+    let head_projection_shape = [num_tokens, num_value_heads];
+    for (name, shape) in [("a", a.shape()), ("b", b.shape())] {
+        if shape.as_slice() != head_projection_shape {
+            return Err(OpError::Shape(format!(
+                "gated_delta_rule: {name} shape {:?} != {:?}",
+                shape.as_slice(),
+                head_projection_shape
+            )));
+        }
+    }
+    if a_log.shape().as_slice() != [num_value_heads]
+        || dt_bias.shape().as_slice() != [num_value_heads]
+    {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: a_log/dt_bias must both be [{num_value_heads}], got {:?}/{:?}",
+            a_log.shape().as_slice(),
+            dt_bias.shape().as_slice()
+        )));
+    }
+
+    let slots_shape = state_slots.shape().as_slice();
+    if slots_shape.len() != 1 || slots_shape[0] == 0 {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: state_slots must be non-empty rank 1, got {:?}",
+            slots_shape
+        )));
+    }
+    let batch = slots_shape[0];
+    let cu_len = batch
+        .checked_add(1)
+        .ok_or_else(|| OpError::Shape("gated_delta_rule: batch size overflows".into()))?;
+    if cu_seqlens.shape().as_slice() != [cu_len] {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: cu_seqlens shape {:?} != [{cu_len}]",
+            cu_seqlens.shape().as_slice()
+        )));
+    }
+
+    for (shape, contiguous) in [
+        (*query.shape(), query.is_contiguous()),
+        (*key.shape(), key.is_contiguous()),
+        (*value.shape(), value.is_contiguous()),
+        (*a.shape(), a.is_contiguous()),
+        (*b.shape(), b.is_contiguous()),
+        (*a_log.shape(), a_log.is_contiguous()),
+        (*dt_bias.shape(), dt_bias.is_contiguous()),
+        (*recurrent_state.shape(), recurrent_state.is_contiguous()),
+        (*state_slots.shape(), state_slots.is_contiguous()),
+        (*cu_seqlens.shape(), cu_seqlens.is_contiguous()),
+        (*output.shape(), output.is_contiguous()),
+    ] {
+        if !contiguous {
+            return Err(OpError::NotContiguous(shape));
+        }
+    }
+
+    let query_host = query.to_host_vec()?;
+    let key_host = key.to_host_vec()?;
+    let value_host = value.to_host_vec()?;
+    let a_host = a.to_host_vec()?;
+    let b_host = b.to_host_vec()?;
+    let a_log_host = a_log.to_host_vec()?;
+    let dt_bias_host = dt_bias.to_host_vec()?;
+    let mut state_host = recurrent_state.to_host_vec()?;
+    let slots_host = state_slots.to_host_vec()?;
+    let cu_host = cu_seqlens.to_host_vec()?;
+
+    if cu_host.first().copied() != Some(0) {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: cu_seqlens must start at 0, got {:?}",
+            cu_host.first()
+        )));
+    }
+    let num_tokens_i32 = i32::try_from(num_tokens)
+        .map_err(|_| OpError::Shape("gated_delta_rule: num_tokens exceeds i32".into()))?;
+    if cu_host.last().copied() != Some(num_tokens_i32) {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: cu_seqlens must end at num_tokens {num_tokens}, got {:?}",
+            cu_host.last()
+        )));
+    }
+    if cu_host
+        .windows(2)
+        .any(|pair| pair[0] < 0 || pair[0] > pair[1])
+    {
+        return Err(OpError::Shape(format!(
+            "gated_delta_rule: cu_seqlens must be monotonic and non-negative, got {:?}",
+            cu_host
+        )));
+    }
+    let mut seen_slots = std::collections::HashSet::with_capacity(batch);
+    for (seq, &slot) in slots_host.iter().enumerate() {
+        if slot < 0 || slot as usize >= num_slots {
+            return Err(OpError::Shape(format!(
+                "gated_delta_rule: state slot {slot} for sequence {seq} outside [0, {num_slots})"
+            )));
+        }
+        if !seen_slots.insert(slot) {
+            return Err(OpError::Shape(format!(
+                "gated_delta_rule: duplicate mutable state slot {slot}"
+            )));
+        }
+    }
+
+    #[inline]
+    fn sigmoid(x: f32) -> f32 {
+        if x >= 0.0 {
+            1.0 / (1.0 + (-x).exp())
+        } else {
+            let exp_x = x.exp();
+            exp_x / (1.0 + exp_x)
+        }
+    }
+    #[inline]
+    fn softplus(x: f32) -> f32 {
+        if x > 20.0 { x } else { x.exp().ln_1p() }
+    }
+
+    const QK_L2_EPS: f32 = 1e-6;
+    let mut output_host = vec![T::write_f64(0.0); num_tokens * value_width];
+    for seq in 0..batch {
+        let start = cu_host[seq] as usize;
+        let end = cu_host[seq + 1] as usize;
+        let slot = slots_host[seq] as usize;
+        for value_head in 0..num_value_heads {
+            let key_head = value_head / value_heads_per_key;
+            let state_base =
+                ((slot * num_value_heads + value_head) * key_head_dim) * value_head_dim;
+            let neg_a = -a_log_host[value_head].exp();
+            let dt = T::read_f64(&dt_bias_host[value_head]) as f32;
+
+            for token in start..end {
+                let query_base = token * key_width + key_head * key_head_dim;
+                let key_base = query_base;
+                let mut query_norm_sq = 0.0f32;
+                let mut key_norm_sq = 0.0f32;
+                for dim in 0..key_head_dim {
+                    let q = T::read_f64(&query_host[query_base + dim]) as f32;
+                    let k = T::read_f64(&key_host[key_base + dim]) as f32;
+                    query_norm_sq = q.mul_add(q, query_norm_sq);
+                    key_norm_sq = k.mul_add(k, key_norm_sq);
+                }
+                let query_scale =
+                    1.0 / ((query_norm_sq + QK_L2_EPS).sqrt() * (key_head_dim as f32).sqrt());
+                let key_scale = 1.0 / (key_norm_sq + QK_L2_EPS).sqrt();
+
+                let head_offset = token * num_value_heads + value_head;
+                let raw_b = T::read_f64(&b_host[head_offset]) as f32;
+                // HF computes sigmoid in the activation dtype before the
+                // recurrence promotes beta to fp32. Preserve that rounding.
+                let beta_t = T::write_f64(sigmoid(raw_b) as f64);
+                let beta = T::read_f64(&beta_t) as f32;
+                let raw_a = T::read_f64(&a_host[head_offset]) as f32;
+                let log_decay = neg_a * softplus(raw_a + dt);
+                let decay = log_decay.exp();
+                let value_base = token * value_width + value_head * value_head_dim;
+
+                for value_dim in 0..value_head_dim {
+                    let mut memory = 0.0f32;
+                    for key_dim in 0..key_head_dim {
+                        let state_index = state_base + key_dim * value_head_dim + value_dim;
+                        let decayed = state_host[state_index] * decay;
+                        state_host[state_index] = decayed;
+                        let k = T::read_f64(&key_host[key_base + key_dim]) as f32 * key_scale;
+                        memory = decayed.mul_add(k, memory);
+                    }
+                    let v = T::read_f64(&value_host[value_base + value_dim]) as f32;
+                    let delta = (v - memory) * beta;
+                    let mut out = 0.0f32;
+                    for key_dim in 0..key_head_dim {
+                        let state_index = state_base + key_dim * value_head_dim + value_dim;
+                        let k = T::read_f64(&key_host[key_base + key_dim]) as f32 * key_scale;
+                        let updated = k.mul_add(delta, state_host[state_index]);
+                        state_host[state_index] = updated;
+                        let q = T::read_f64(&query_host[query_base + key_dim]) as f32 * query_scale;
+                        out = updated.mul_add(q, out);
+                    }
+                    output_host[value_base + value_dim] = T::write_f64(out as f64);
+                }
+            }
+        }
+    }
+
+    output.upload_from_host(&output_host)?;
+    recurrent_state.upload_from_host(&state_host)
+}
+
+fn gated_rmsnorm_reference<T, D>(
+    input: &Tensor<T, D>,
+    gate: &Tensor<T, D>,
+    weight: &Tensor<f32, D>,
+    output: &mut Tensor<T, D>,
+    eps: f32,
+) -> OpResult<()>
+where
+    T: Dtype,
+    D: MathOps,
+{
+    let shape = input.shape().as_slice();
+    if shape.is_empty() || input.numel() == 0 {
+        return Err(OpError::Shape(format!(
+            "gated_rmsnorm: input must be non-empty [..., head_dim], got {:?}",
+            shape
+        )));
+    }
+    if gate.shape().as_slice() != shape || output.shape().as_slice() != shape {
+        return Err(OpError::Shape(format!(
+            "gated_rmsnorm: input/gate/output shapes must match, got {:?}/{:?}/{:?}",
+            shape,
+            gate.shape().as_slice(),
+            output.shape().as_slice()
+        )));
+    }
+    let head_dim = *shape.last().expect("non-empty shape checked above");
+    if head_dim == 0 || weight.shape().as_slice() != [head_dim] {
+        return Err(OpError::Shape(format!(
+            "gated_rmsnorm: weight must be fp32 [{head_dim}], got {:?}",
+            weight.shape().as_slice()
+        )));
+    }
+    if !eps.is_finite() || eps < 0.0 {
+        return Err(OpError::Shape(format!(
+            "gated_rmsnorm: eps must be finite and non-negative, got {eps}"
+        )));
+    }
+    for (tensor_shape, contiguous) in [
+        (*input.shape(), input.is_contiguous()),
+        (*gate.shape(), gate.is_contiguous()),
+        (*weight.shape(), weight.is_contiguous()),
+        (*output.shape(), output.is_contiguous()),
+    ] {
+        if !contiguous {
+            return Err(OpError::NotContiguous(tensor_shape));
+        }
+    }
+
+    let input_host = input.to_host_vec()?;
+    let gate_host = gate.to_host_vec()?;
+    let weight_host = weight.to_host_vec()?;
+    let rows = input.numel() / head_dim;
+    let mut output_host = vec![T::write_f64(0.0); input.numel()];
+    for row in 0..rows {
+        let base = row * head_dim;
+        let mut square_sum = 0.0f32;
+        for col in 0..head_dim {
+            let value = T::read_f64(&input_host[base + col]) as f32;
+            square_sum = value.mul_add(value, square_sum);
+        }
+        let inv_rms = (square_sum / head_dim as f32 + eps).sqrt().recip();
+        for col in 0..head_dim {
+            let value = T::read_f64(&input_host[base + col]) as f32;
+            // Qwen3.5 casts normalized values back to the activation dtype
+            // before multiplying by its fp32 norm weight.
+            let normalized_t = T::write_f64((value * inv_rms) as f64);
+            let normalized = T::read_f64(&normalized_t) as f32;
+            let gate_value = T::read_f64(&gate_host[base + col]) as f32;
+            let silu_gate = gate_value / (1.0 + (-gate_value).exp());
+            let result = normalized * weight_host[col] * silu_gate;
+            output_host[base + col] = T::write_f64(result as f64);
+        }
+    }
+    output.upload_from_host(&output_host)
 }
 
 fn scatter_kv_paged_reference<T, D>(

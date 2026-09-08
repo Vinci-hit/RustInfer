@@ -28,8 +28,10 @@ use crate::domain::types::Shape;
 mod abc_decode;
 mod graph_exec;
 mod mixed_abc;
+mod multimodal;
 mod peer;
 mod plan;
+mod recurrent;
 
 pub use graph_exec::{GraphDecision, GraphRunner, GraphSlotId};
 pub use mixed_abc::MixedStepTicket;
@@ -47,6 +49,8 @@ where
     M: DecoderModel<T, D>,
 {
     pub model: M,
+    recurrent: Option<recurrent::RecurrentState<T, D>>,
+    visual: multimodal::VisualState<T, D>,
     pub kv_pool: PagedKvPool<T, D>,
     pub kv_index: KvIndexTensors<D>,
     pub hidden: Hidden<T, D>,
@@ -294,6 +298,18 @@ where
     ) -> OpResult<Self> {
         let dims = model.dims();
         dims.validate()?;
+        let has_recurrent = model.cache_layout().has_linear();
+        if model.cache_layout().layers().len() != dims.num_layers {
+            return Err(OpError::Shape(
+                "Runtime model/cache layer count mismatch".into(),
+            ));
+        }
+        if has_recurrent && scope.topology().tp.size != 1 {
+            return Err(OpError::unsupported(
+                "linear attention",
+                "tensor parallelism",
+            ));
+        }
         if block_size == 0 {
             return Err(OpError::Shape("Runtime::new: block_size=0".into()));
         }
@@ -308,8 +324,8 @@ where
         }
 
         let device = scope.device();
-        let mut layers = Vec::with_capacity(dims.num_layers);
-        for _ in 0..dims.num_layers {
+        let mut layers = Vec::with_capacity(model.cache_layout().num_full_layers());
+        for _ in 0..model.cache_layout().num_full_layers() {
             layers.push(PagedKvLayer {
                 k: D::alloc_tensor(
                     Shape::from_slice(&[num_blocks, block_size, dims.kv_dim]),
@@ -342,7 +358,10 @@ where
         let cap_total_q_tiles = (cap_batch + cap_num_tokens.div_ceil(tile)).max(1);
         let alloc_i32 = |n: usize| D::alloc_tensor::<i32>(Shape::from_slice(&[n.max(1)]), device);
         let kv_index = KvIndexTensors {
-            block_tables: alloc_i32(cap_batch * max_blocks_per_seq)?,
+            block_tables: D::alloc_tensor::<i32>(
+                Shape::from_slice(&[cap_batch, max_blocks_per_seq]),
+                device,
+            )?,
             cu_q_lens: alloc_i32(cap_batch + 1)?,
             kv_lens: alloc_i32(cap_batch)?,
             seq_positions: alloc_i32(cap_batch)?,
@@ -418,6 +437,22 @@ where
             cb,
         )?;
         model.install_scratch(scratch);
+        let recurrent = if has_recurrent {
+            let linear_dims = model.cache_layout().linear_dims()[0];
+            model.install_gdn_scratch(crate::domain::gdn_scratch::GdnScratch::new(
+                device,
+                dims.dim,
+                linear_dims,
+                cap_num_tokens,
+            )?)?;
+            Some(recurrent::RecurrentState::new(
+                model.cache_layout(),
+                cap_batch,
+                device,
+            )?)
+        } else {
+            None
+        };
 
         // Mixed-step mode. FA3-graph (unified FA3 attention captured in a CUDA
         // graph — eager-FA3 speed + graph determinism) is the DEFAULT when the
@@ -453,6 +488,8 @@ where
         };
 
         Ok(Self {
+            recurrent,
+            visual: multimodal::VisualState::default(),
             model,
             kv_pool,
             kv_index,
@@ -477,8 +514,8 @@ where
             prefill_graphs_captured: 0,
             mixed_graphs_captured: 0,
             mixed_graph_capture_enabled: false,
-            mixed_eager,
-            mixed_fa3_graph,
+            mixed_eager: has_recurrent || mixed_eager,
+            mixed_fa3_graph: !has_recurrent && mixed_fa3_graph,
             peers: None,
         })
     }
@@ -574,8 +611,12 @@ where
 
     fn step_local(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
         let plan = self.build_plan(req)?;
+        self.prepare_recurrent(req, &plan)?;
         self.upload_index(&plan, req)?;
-        let decision = if req.sampling.iter().any(|params| !params.is_greedy()) {
+        self.prepare_multimodal(req)?;
+        let decision = if self.requires_multimodal_prefill(req)
+            || req.sampling.iter().any(|params| !params.is_greedy())
+        {
             // Captured decode and mixed ABC graphs include an argmax node and
             // expose no logits to the sampler. Stochastic requests therefore
             // use the eager tail, while deterministic traffic retains graphs.
@@ -647,19 +688,44 @@ where
             ),
             pending: None,
         };
-        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let mut ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        if let Some((sin, cos)) = &self.visual.angles {
+            ctx = ctx.with_rotary_angles(sin, cos);
+        }
         let _guard = self.scope.enter();
-        let mut kv = self
-            .kv_pool
-            .view(LayerRange::all(self.dims.num_layers), &self.kv_index);
-        self.model.embed(input_ids, &mut hidden, &ctx)?;
-        self.model.decode_layers(
-            LayerRange::all(self.dims.num_layers),
-            &mut hidden,
-            &mut kv,
-            &ctx,
-        )?;
-        Ok(())
+        let mut cache = match &mut self.recurrent {
+            Some(state) => crate::domain::cache::ModelCacheView::hybrid(
+                &mut self.kv_pool,
+                &self.kv_index,
+                &mut state.layers,
+                state
+                    .batch
+                    .as_ref()
+                    .ok_or_else(|| OpError::Shape("recurrent batch not prepared".into()))?,
+            ),
+            None => crate::domain::cache::ModelCacheView::full(&mut self.kv_pool, &self.kv_index),
+        };
+        let result = self
+            .model
+            .embed(input_ids, &mut hidden, &ctx)
+            .and_then(|()| {
+                for item in &self.visual.overrides {
+                    hidden
+                        .stream
+                        .narrow(0, item.start, item.embedding.shape()[0])?
+                        .copy_from(&item.embedding)?;
+                }
+                self.model.decode_layers(
+                    LayerRange::all(self.dims.num_layers),
+                    &mut hidden,
+                    &mut cache,
+                    &ctx,
+                )
+            });
+        if let Some(state) = &mut self.recurrent {
+            state.complete(result.is_ok());
+        }
+        result
     }
 
     /// Finalize (logits) + sample/verify + KV commit. Always eager: the capture
@@ -982,6 +1048,7 @@ where
         // Do not call the mirrored public `step`: followers are already
         // executing the enclosing ProfileForward command.
         self.step_local(&req)?;
+        self.release_sequence(0);
         self.scope.synchronize()?;
         Ok(())
     }
@@ -1317,6 +1384,12 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
+    if runtime.has_recurrent_state() {
+        return Err(OpError::unsupported(
+            "linear attention",
+            "partial hidden-state taps",
+        ));
+    }
     if runtime.scope.topology().tp.size > 1 {
         return Err(OpError::unsupported(
             "tensor-parallel",
@@ -1337,11 +1410,12 @@ where
     };
     let ctx = crate::domain::exec::StepCtx::new(&runtime.scope, &plan);
     let _guard = runtime.scope.enter();
-    let mut kv = runtime.kv_pool.view(range, &runtime.kv_index);
+    let mut cache =
+        crate::domain::cache::ModelCacheView::full(&mut runtime.kv_pool, &runtime.kv_index);
     runtime.model.embed(&input_ids, &mut hidden, &ctx)?;
     runtime
         .model
-        .decode_layers(range, &mut hidden, &mut kv, &ctx)?;
+        .decode_layers(range, &mut hidden, &mut cache, &ctx)?;
     Ok(crate::domain::plan::HiddenTap {
         at_layer: range.end,
     })
@@ -1355,25 +1429,30 @@ mod tests {
 
     use super::*;
     use crate::application::sampler_stack::GreedySampler;
+    use crate::domain::cache::{CacheLayout, ModelCacheView};
     use crate::domain::component::{Hidden, LayerRange, StageKind};
     use crate::domain::exec::{HostScope, RankPair, StepCtx, TopologyShape};
-    use crate::domain::kv::KvView;
     use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
     use crate::domain::plan::{SeqStep, StopCriteria};
     use crate::infrastructure::cpu::Cpu;
 
     struct TinyDecoder {
         on_drop: Option<Box<dyn FnOnce()>>,
+        layout: CacheLayout,
     }
 
     impl TinyDecoder {
         fn plain() -> Self {
-            Self { on_drop: None }
+            Self {
+                on_drop: None,
+                layout: CacheLayout::default(),
+            }
         }
 
         fn with_drop(callback: impl FnOnce() + 'static) -> Self {
             Self {
                 on_drop: Some(Box::new(callback)),
+                layout: CacheLayout::default(),
             }
         }
     }
@@ -1387,6 +1466,10 @@ mod tests {
     }
 
     impl DecoderModel<f32, Cpu> for TinyDecoder {
+        fn cache_layout(&self) -> &CacheLayout {
+            &self.layout
+        }
+
         fn dims(&self) -> ModelDims {
             ModelDims {
                 dim: 1,
@@ -1428,7 +1511,7 @@ mod tests {
             &self,
             _range: LayerRange,
             _hidden: &mut Hidden<f32, Cpu>,
-            _kv: &mut KvView<'_, f32, Cpu>,
+            _cache: &mut ModelCacheView<'_, f32, Cpu>,
             _ctx: &StepCtx<'_, Cpu>,
         ) -> OpResult<()> {
             Ok(())

@@ -60,6 +60,15 @@ pub trait MathOps: Device {
         output: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
+    /// Linear projection with bias included before rounding to the output dtype.
+    fn linear<T: Dtype>(
+        scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()>;
+
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         scope: &Self::Scope,
         input: &Tensor<A, Self>,
@@ -117,6 +126,7 @@ pub trait MathOps: Device {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> OpResult<()>;
 
     fn sdpa<T: Dtype>(
@@ -192,10 +202,13 @@ pub trait MathOps: Device {
     }
 }
 
+/// Forward legacy CoreOps methods; additional required ops are supplied by the backend.
 #[macro_export]
 macro_rules! impl_math_ops_via_core_ops {
-    ($backend:ty) => {
+    ($backend:ty, { $($backend_ops:item)* }) => {
         impl $crate::ports::MathOps for $backend {
+            $($backend_ops)*
+
             fn add<T: infer_core::dtype::Dtype>(
                 scope: &<Self as infer_core::exec::ExecDevice>::Scope,
                 a: &infer_core::tensor::Tensor<T, Self>,
@@ -347,6 +360,7 @@ macro_rules! impl_math_ops_via_core_ops {
                 head_num: usize,
                 kv_head_num: usize,
                 head_dim: usize,
+                rotary_dim: usize,
             ) -> $crate::ports::OpResult<()> {
                 let _guard = infer_core::exec::ExecScope::enter(scope);
                 <Self as $crate::ports::CoreOps>::rope_inplace(
@@ -358,6 +372,7 @@ macro_rules! impl_math_ops_via_core_ops {
                     head_num,
                     kv_head_num,
                     head_dim,
+                    rotary_dim,
                 )
             }
 

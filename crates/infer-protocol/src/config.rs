@@ -417,7 +417,7 @@ impl RustInferConfig {
     }
 }
 
-pub const SUPPORTED_MODEL_TYPES: &[&str] = &["llama3", "qwen3", "qwen3_moe"];
+pub const SUPPORTED_MODEL_TYPES: &[&str] = &["llama3", "qwen3", "qwen3_moe", "qwen3_5"];
 
 pub fn supported_model_types() -> &'static [&'static str] {
     SUPPORTED_MODEL_TYPES
@@ -476,10 +476,12 @@ pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
 /// so the caller can produce the visible unsupported-model error.
 ///
 /// Order matters: more specific Qwen variants must be tested before plain
-/// `qwen3`, and unsupported variants such as Qwen3.5 must not fall through.
+/// `qwen3`, and unsupported MoE variants must not fall through.
 fn classify_model_type(hint: &str) -> Option<&'static str> {
-    if hint.contains("qwen3_5") {
+    if hint.contains("qwen3_5_moe") || hint.contains("qwen3_5moe") {
         None
+    } else if hint.contains("qwen3_5") {
+        Some("qwen3_5")
     } else if hint.contains("qwen3_moe") || hint.contains("qwen3moe") {
         Some("qwen3_moe")
     } else if hint.contains("qwen3") {
@@ -496,14 +498,22 @@ mod model_type_tests {
     use super::classify_model_type;
 
     #[test]
-    fn unsupported_qwen3_5_does_not_fall_through() {
-        assert_eq!(classify_model_type("qwen3_5"), None);
-        assert_eq!(classify_model_type("qwen3_5forconditionalgeneration"), None);
-        assert_eq!(classify_model_type("qwen3_5_text"), None);
+    fn qwen3_5_is_distinct_from_qwen3() {
+        assert_eq!(classify_model_type("qwen3_5"), Some("qwen3_5"));
+        assert_eq!(
+            classify_model_type("qwen3_5forconditionalgeneration"),
+            Some("qwen3_5")
+        );
+        assert_eq!(classify_model_type("qwen3_5_text"), Some("qwen3_5"));
     }
 
     #[test]
     fn qwen3_moe_beats_plain_qwen3() {
+        assert_eq!(classify_model_type("qwen3_5_moe"), None);
+        assert_eq!(
+            classify_model_type("qwen3_5moeforconditionalgeneration"),
+            None
+        );
         assert_eq!(classify_model_type("qwen3_moe"), Some("qwen3_moe"));
         assert_eq!(
             classify_model_type("qwen3moeforcausallm"),

@@ -123,6 +123,7 @@ mod tests {
         let mut q = WaitingQueue::new();
         for id in ids {
             let meta = Arc::new(RequestMeta {
+                multimodal: None,
                 id: RequestId::new_v4(),
                 external_id: id.to_string(),
                 sequence_id: SequenceId(1),

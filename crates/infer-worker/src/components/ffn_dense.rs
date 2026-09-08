@@ -95,13 +95,11 @@ impl<T: Dtype, D: LlmBackend> Component<T, D> for DenseFfn<T, D> {
         // Pre-FFN norm, fusing the attention sublayer's deferred residual add
         // when present (stream += delta; normed = rmsnorm(stream)); else plain.
         match hidden.pending.take() {
-            Some(delta) => D::fused_add_rmsnorm(
-                ctx,
-                &mut normed,
+            Some(delta) => self.post_attention_layernorm.add_forward(
                 &mut hidden.stream,
                 &delta,
-                &self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.eps,
+                &mut normed,
+                ctx,
             )?,
             None => self
                 .post_attention_layernorm

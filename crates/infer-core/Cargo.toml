@@ -12,3 +12,4 @@ publish.workspace = true
 [dependencies]
 half = { version = "2.7.1", features = ["std", "num-traits"] }
 thiserror = "2.0.17"
+libm = "0.2"

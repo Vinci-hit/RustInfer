@@ -1842,3 +1842,14 @@ extern "C" void gemm_cublas_f32_axbt(
 //    Y = A (col [K,M]) → op_N → [K,M], ldb=K
 //    ldc = N
 // ============================================================================
+
+// FP32 C preserves the dot product and bias before the final activation cast.
+extern "C" int gemm_bias_accumulate(const void* A, const void* B, void* C,
+    int M, int N, int K, int dtype, cublasHandle_t h, cudaStream_t stream) {
+    cudaDataType_t type = dtype == 0 ? CUDA_R_32F : (dtype == 1 ? CUDA_R_16F : CUDA_R_16BF);
+    cublasStatus_t status = cublasSetStream(h, stream);
+    if (status != CUBLAS_STATUS_SUCCESS) return status;
+    float alpha=1.0f, beta=1.0f;
+    return cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&alpha,
+        B,type,K,A,type,K,&beta,C,CUDA_R_32F,N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+}

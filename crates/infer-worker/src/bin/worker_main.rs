@@ -34,7 +34,7 @@ use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
 use infer_worker::infrastructure::transport::data_pump::DataPump;
 use infer_worker::models::loader::{LinearAttnConfig, LoadConfig, RopeScaling, WeightLoader};
-use infer_worker::models::{llama3, qwen3, qwen3_moe};
+use infer_worker::models::{llama3, qwen3, qwen3_5, qwen3_moe};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustinfer-worker", version = "0.3.0")]
@@ -90,7 +90,7 @@ struct HfConfig {
     decoder_sparse_step: usize,
 
     // ── Qwen3.5 hybrid-stack fields (absent / defaulted for Llama3 & Qwen3) ──
-    /// Per-layer mixer selector, e.g. `["linear_attention", ..., "full_attention"]`.
+    /// Per-layer attention selector, e.g. `["linear_attention", ..., "full_attention"]`.
     /// Non-empty only for the hybrid Gated-DeltaNet stack.
     #[serde(default)]
     layer_types: Vec<String>,
@@ -204,7 +204,7 @@ fn parse_hf_config(bytes: &[u8]) -> Result<HfConfig, String> {
     serde_json::from_value(root).map_err(|e| format!("deserialize HfConfig: {}", e))
 }
 
-/// Build the per-layer full-vs-linear mixer selector for the hybrid stack.
+/// Build the per-layer full-vs-linear attention selector for the hybrid stack.
 ///
 /// Prefers the explicit `layer_types` list; falls back to
 /// `full_attention_interval` (every k-th layer is full, matching HF's
@@ -822,6 +822,41 @@ fn main() -> Result<(), String> {
                 args.profile_cuda_steps,
             )?;
         }
+        "qwen3_5" => {
+            let mut model = qwen3_5::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
+                .map_err(|e| format!("qwen3_5::build: {:?}", e))?;
+            let full_config: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(
+                    std::path::Path::new(&load.model_path).join("config.json"),
+                )
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if full_config.get("vision_config").is_some() {
+                model
+                    .load_vision(&loader, &full_config, &cuda)
+                    .map_err(|e| format!("vision load: {e:?}"))?;
+            }
+            let followers = make_follower_factories(
+                follower_ranks,
+                load.model_path.clone(),
+                load_cfg.clone(),
+                qwen3_5::build::<bf16, Cuda>,
+            );
+            eprintln!(
+                "[bootstrap] weights loaded in {:.2}s",
+                load_start.elapsed().as_secs_f32()
+            );
+            run_with_model(
+                &control,
+                &data,
+                model,
+                make_bootstrap(),
+                followers,
+                &eos_ids,
+                args.profile_cuda_steps,
+            )?;
+        }
         "qwen3_moe" => {
             let model = qwen3_moe::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
                 .map_err(|e| format!("qwen3_moe::build: {:?}", e))?;
@@ -862,7 +897,7 @@ mod config_tests {
     use super::*;
 
     /// Minimal qwen3_5 config with everything nested under `text_config`, plus a
-    /// sibling `vision_config` we must ignore in v1. Trimmed from the real
+    /// sibling `vision_config` parsed separately by the vision loader. Trimmed from the real
     /// Qwen3.5-4B config.json (layer_types cut to one [L,L,L,F] period).
     const QWEN3_5_JSON: &str = r#"{
         "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -1111,6 +1146,1082 @@ mod config_tests {
             assert!(
                 err.contains(expected),
                 "unexpected error for {variant}: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod qwen35_checkpoint_tests {
+    use super::*;
+    use infer_worker::domain::cache::{LinearBatch, LinearLayerState, ModelCacheView};
+    use infer_worker::domain::component::{Hidden, LayerRange};
+    use infer_worker::domain::exec::StepCtx;
+    use infer_worker::domain::forward_scratch::ForwardScratch;
+    use infer_worker::domain::gdn_scratch::GdnScratch;
+    use infer_worker::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+    use infer_worker::domain::model::SampleRows;
+    use infer_worker::domain::plan::{BatchKind, BatchPlan};
+    use infer_worker::domain::tensor::Tensor;
+    use std::collections::HashMap;
+
+    /// Opt-in checkpoint smoke test and fixed-token layer/logit diagnostic.
+    #[test]
+    #[ignore = "requires QWEN35_MODEL_PATH and a CUDA device with enough free memory"]
+    fn qwen35_checkpoint_load_and_forward() {
+        let path = std::env::var("QWEN35_MODEL_PATH").expect("QWEN35_MODEL_PATH");
+        let ordinal = std::env::var("QWEN35_DEVICE")
+            .unwrap_or_else(|_| "0".into())
+            .parse()
+            .unwrap();
+        let cfg =
+            parse_hf_config(&std::fs::read(Path::new(&path).join("config.json")).unwrap()).unwrap();
+        let dump_dir = std::env::var("QWEN35_DUMP_DIR").ok();
+        let steps: Vec<Vec<i32>> = if let Ok(path) = std::env::var("QWEN35_INPUT_JSON") {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        } else {
+            vec![vec![1, 2], vec![3]]
+        };
+        let capacity = steps.iter().map(Vec::len).max().unwrap();
+        let total: usize = steps.iter().map(Vec::len).sum();
+        let blocks = total.max(4);
+        let cfg = build_load_config(&cfg, blocks.max(16)).unwrap();
+        let dump = |name: String, values: Vec<bf16>| {
+            if let Some(dir) = &dump_dir {
+                std::fs::create_dir_all(dir).unwrap();
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|v| v.to_f32().to_le_bytes())
+                    .collect();
+                std::fs::write(Path::new(dir).join(name), bytes).unwrap();
+            }
+        };
+        let reader = SafetensorsReader::open(&path).unwrap();
+        let cuda = Cuda::new(ordinal).unwrap();
+        let loader = WeightLoader::new(&reader);
+        let mut model = qwen3_5::build::<bf16, Cuda>(&loader, &cfg, &cuda).unwrap();
+        let dims = model.dims();
+        assert_eq!(model.cache_layout().num_full_layers(), 8);
+        assert_eq!(model.cache_layout().linear_dims().len(), 24);
+        assert_eq!(
+            model.decoder.embed.table.data_ptr(),
+            model
+                .decoder
+                .lm_head
+                .proj
+                .weight
+                .as_dense()
+                .unwrap()
+                .data_ptr()
+        );
+        model.install_scratch(ForwardScratch::new(&cuda, dims, capacity, 1).unwrap());
+        model
+            .install_gdn_scratch(
+                GdnScratch::new(
+                    &cuda,
+                    dims.dim,
+                    model.cache_layout().linear_dims()[0],
+                    capacity,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut kv = PagedKvPool {
+            layers: (0..8)
+                .map(|_| PagedKvLayer {
+                    k: Tensor::zeros([blocks, 1, dims.kv_dim], &cuda).unwrap(),
+                    v: Tensor::zeros([blocks, 1, dims.kv_dim], &cuda).unwrap(),
+                })
+                .collect(),
+            num_blocks: blocks,
+            block_size: 1,
+            kv_dim: dims.kv_dim,
+            quant: KvQuantTier::None,
+            seq_kv_len: HashMap::new(),
+        };
+        let mut states: Vec<_> = model
+            .cache_layout()
+            .linear_dims()
+            .iter()
+            .map(|&d| LinearLayerState::new(d, 1, &cuda).unwrap())
+            .collect();
+        let ints = |v: &[i32]| Tensor::from_host_slice(v, [v.len()], &cuda).unwrap();
+        let scope = cuda.scope();
+        let mut direct_tokens = Vec::new();
+        let mut start = 0i32;
+        for (step, ids) in steps.iter().enumerate() {
+            let n = ids.len();
+            let positions: Vec<i32> = (start..start + n as i32).collect();
+            let (cu, req, tile) = BatchPlan::plan_ragged_tiles(&[n as i32]);
+            let plan = BatchPlan {
+                kind: if n == 1 {
+                    BatchKind::DecodeOnly
+                } else {
+                    BatchKind::Ragged
+                },
+                num_tokens: n,
+                batch: 1,
+                q_lens: vec![n as i32],
+                kv_lens: vec![start + n as i32],
+                seq_positions: vec![start],
+                rope_positions: positions.clone(),
+                max_blocks_per_seq: blocks,
+                block_size: 1,
+                total_q_tiles: req.len() as i32,
+            };
+            let index = KvIndexTensors {
+                block_tables: Tensor::from_host_slice(
+                    &(0..blocks as i32).collect::<Vec<_>>(),
+                    [1, blocks],
+                    &cuda,
+                )
+                .unwrap(),
+                cu_q_lens: ints(&cu),
+                kv_lens: ints(&plan.kv_lens),
+                seq_positions: ints(&[start]),
+                seq_lens_step: ints(&[n as i32]),
+                rope_positions: ints(&positions),
+                block2req: ints(&req),
+                block2tile: ints(&tile),
+                valid_q_tiles: ints(&[req.len() as i32]),
+                valid_suffix_q_tiles: ints(&[req.len() as i32]),
+            };
+            let linear = LinearBatch::new(&[0], &[n as i32], 1, &cuda).unwrap();
+            let mut cache = ModelCacheView::hybrid(&mut kv, &index, &mut states, &linear);
+            let ctx = StepCtx::new(&scope, &plan);
+            let mut hidden = Hidden {
+                stream: Tensor::zeros([n, dims.dim], &cuda).unwrap(),
+                pending: None,
+            };
+            model.embed(&ints(&ids), &mut hidden, &ctx).unwrap();
+            dump(
+                format!("step{step}_embed.f32"),
+                hidden.stream.to_host_vec().unwrap(),
+            );
+            if dump_dir.is_some() {
+                for layer in 0..dims.num_layers {
+                    model
+                        .decode_layers(
+                            LayerRange {
+                                start: layer,
+                                end: layer + 1,
+                            },
+                            &mut hidden,
+                            &mut cache,
+                            &ctx,
+                        )
+                        .unwrap();
+                    dump(
+                        format!("step{step}_layer{layer}.f32"),
+                        hidden.stream.to_host_vec().unwrap(),
+                    );
+                }
+            } else {
+                model
+                    .decode_layers(
+                        LayerRange {
+                            start: 0,
+                            end: dims.num_layers,
+                        },
+                        &mut hidden,
+                        &mut cache,
+                        &ctx,
+                    )
+                    .unwrap();
+            }
+            let logits_tensor = model
+                .finalize(&hidden, SampleRows::LastPerSeq, &ctx)
+                .unwrap()
+                .0;
+            let sampled =
+                <Cuda as infer_worker::domain::ports::FusedOps>::argmax(&ctx, &logits_tensor)
+                    .unwrap();
+            if let Some(dir) = &dump_dir {
+                std::fs::write(
+                    Path::new(dir).join(format!("step{step}_sampled.json")),
+                    serde_json::to_vec(&sampled).unwrap(),
+                )
+                .unwrap();
+            }
+            let logits = logits_tensor.to_host_vec().unwrap();
+            dump(format!("step{step}_logits.f32"), logits.clone());
+            direct_tokens.push(
+                logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| {
+                        a.1.to_f32()
+                            .total_cmp(&b.1.to_f32())
+                            .then_with(|| b.0.cmp(&a.0))
+                    })
+                    .unwrap()
+                    .0 as i32,
+            );
+            assert_eq!(
+                sampled[0],
+                *direct_tokens.last().unwrap(),
+                "device/host argmax mismatch at step {step}"
+            );
+            assert_eq!(logits.len(), dims.vocab_size);
+            assert!(logits.iter().all(|v| v.to_f32().is_finite()));
+            assert!(logits.windows(2).any(|v| v[0] != v[1]));
+            eprintln!(
+                "Qwen3.5 checkpoint: {n} tokens at position {start}, finite logits={}",
+                logits.len()
+            );
+            start += n as i32;
+        }
+
+        if dump_dir.is_some() {
+            return;
+        }
+
+        use infer_worker::application::runtime::Runtime;
+        use infer_worker::application::sampler_stack::GreedySampler;
+        use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
+        let mut runtime = Runtime::new(
+            model,
+            cuda.scope(),
+            Box::new(GreedySampler),
+            4,
+            1,
+            4,
+            16,
+            3,
+            2,
+            vec![1, 2],
+        )
+        .unwrap();
+        runtime.profile_forward().unwrap();
+        runtime.prime_graphs().unwrap();
+        assert!(runtime.graph.is_some());
+        for (i, (start, ids)) in [(0, vec![1, 2]), (2, vec![3])].into_iter().enumerate() {
+            let n = ids.len();
+            let req = StepRequest {
+                seqs: vec![SeqStep {
+                    sequence_id: 42,
+                    input_ids: ids,
+                    positions: (start..start + n as i32).collect(),
+                    kv_write_start: start,
+                    kv_len_after: start + n as i32,
+                    block_table: vec![0, 1, 2, 3],
+                }],
+                sampling: vec![Default::default()],
+                stop: StopCriteria {
+                    eos_ids: vec![],
+                    generated_counts: vec![0],
+                    max_tokens: vec![16],
+                    ignore_eos: vec![true],
+                },
+                draft_tokens: vec![],
+            };
+            let output = runtime.step(&req).unwrap();
+            assert_eq!(output.tokens[0][0].token_id, direct_tokens[i]);
+        }
+        runtime.release_sequence(42);
+        eprintln!("Qwen3.5 Runtime prefill/decode match direct-model greedy tokens");
+    }
+
+    /// Compare the real checkpoint through eager, cold capture and prewarmed
+    /// replay, including ABC serving, padded batches and recurrent slot reuse.
+    #[test]
+    #[ignore = "requires QWEN35_MODEL_PATH and a CUDA device with enough free memory"]
+    fn qwen35_decode_graph_matches_eager() {
+        use infer_worker::application::runtime::{GraphDecision, Runtime};
+        use infer_worker::application::sampler_stack::GreedySampler;
+        use infer_worker::domain::exec::ExecScope;
+        use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
+
+        let path = std::env::var("QWEN35_MODEL_PATH").expect("QWEN35_MODEL_PATH");
+        let ordinal = std::env::var("QWEN35_DEVICE")
+            .unwrap_or_else(|_| "0".into())
+            .parse()
+            .unwrap();
+        let cfg =
+            parse_hf_config(&std::fs::read(Path::new(&path).join("config.json")).unwrap()).unwrap();
+        let cfg = build_load_config(&cfg, 64).unwrap();
+        let reader = SafetensorsReader::open(&path).unwrap();
+        let cuda = Cuda::new(ordinal).unwrap();
+        let model = qwen3_5::build::<bf16, Cuda>(&WeightLoader::new(&reader), &cfg, &cuda).unwrap();
+        let mut runtime = Runtime::new(
+            model,
+            cuda.scope(),
+            Box::new(GreedySampler),
+            257,
+            1,
+            64,
+            64,
+            32,
+            4,
+            vec![1, 2, 4],
+        )
+        .unwrap();
+        let request = |rows: &[(u64, usize, i32, Vec<i32>)]| StepRequest {
+            seqs: rows
+                .iter()
+                .map(|(id, slot, start, ids)| SeqStep {
+                    sequence_id: *id,
+                    input_ids: ids.clone(),
+                    positions: (*start..*start + ids.len() as i32).collect(),
+                    kv_write_start: *start,
+                    kv_len_after: *start + ids.len() as i32,
+                    block_table: (*slot * 64..(*slot + 1) * 64).map(|b| b as u32).collect(),
+                })
+                .collect(),
+            sampling: vec![Default::default(); rows.len()],
+            stop: StopCriteria {
+                eos_ids: vec![],
+                generated_counts: vec![0; rows.len()],
+                max_tokens: vec![100; rows.len()],
+                ignore_eos: vec![true; rows.len()],
+            },
+            draft_tokens: vec![],
+        };
+        let trace = vec![
+            (
+                vec![],
+                request(&[
+                    (10, 0, 0, vec![1, 2, 3]),
+                    (20, 1, 0, vec![4, 5, 6]),
+                    (30, 2, 0, vec![7, 8, 9]),
+                    (40, 3, 0, vec![10, 11, 12]),
+                ]),
+            ),
+            (
+                vec![],
+                request(&[
+                    (10, 0, 3, vec![13]),
+                    (20, 1, 3, vec![14]),
+                    (30, 2, 3, vec![15]),
+                    (40, 3, 3, vec![16]),
+                ]),
+            ),
+            (
+                vec![],
+                request(&[
+                    (30, 2, 4, vec![17]),
+                    (10, 0, 4, vec![18]),
+                    (40, 3, 4, vec![19]),
+                ]),
+            ),
+            (vec![], request(&[(20, 1, 4, vec![20])])),
+            (
+                vec![],
+                request(&[(40, 3, 5, vec![21]), (20, 1, 5, vec![22])]),
+            ),
+            (
+                vec![10, 30],
+                request(&[(50, 0, 0, vec![23, 24, 25]), (40, 3, 6, vec![26])]),
+            ),
+            (
+                vec![],
+                request(&[
+                    (20, 1, 6, vec![27]),
+                    (50, 0, 3, vec![28]),
+                    (40, 3, 7, vec![29]),
+                ]),
+            ),
+            (
+                vec![20, 40, 50],
+                request(&[
+                    (0, 0, 0, vec![1, 2, 3]),
+                    (1, 1, 0, vec![4, 5, 6]),
+                    (2, 2, 0, vec![7, 8, 9]),
+                    (3, 3, 0, vec![10, 11, 12]),
+                ]),
+            ),
+            (
+                vec![],
+                request(&[
+                    (3, 3, 3, vec![16]),
+                    (2, 2, 3, vec![15]),
+                    (1, 1, 3, vec![14]),
+                    (0, 0, 3, vec![13]),
+                ]),
+            ),
+            (
+                vec![],
+                request(&[
+                    (0, 0, 4, vec![18]),
+                    (3, 3, 4, vec![19]),
+                    (2, 2, 4, vec![17]),
+                ]),
+            ),
+            (vec![], request(&[(1, 1, 4, vec![20])])),
+            (vec![], request(&[(1, 1, 5, vec![22]), (3, 3, 5, vec![21])])),
+        ];
+        let mut reference: Vec<(Vec<i32>, Vec<bf16>)> = Vec::new();
+        for mode in ["eager", "cold", "prewarmed", "abc"] {
+            runtime.retain_sequences([]);
+            runtime.kv_pool.seq_kv_len.clear();
+            if mode != "eager" {
+                cuda.config.invalidate_all_graphs();
+                runtime.prime_graphs().unwrap();
+                if mode != "cold" {
+                    runtime.prewarm_decode_graphs().unwrap();
+                    for size in [1, 2, 4] {
+                        assert!(runtime.scope.graph_ready(size));
+                    }
+                }
+            }
+            let mut max_relative_l2 = 0.0f64;
+            for (step, (release, req)) in trace.iter().enumerate() {
+                for &id in release {
+                    runtime.release_sequence(id);
+                }
+                let q_lens: Vec<i32> = req.seqs.iter().map(|s| s.input_ids.len() as i32).collect();
+                let (_, tiles, _) = BatchPlan::plan_ragged_tiles(&q_lens);
+                let plan = BatchPlan {
+                    kind: if q_lens.iter().all(|&n| n == 1) {
+                        BatchKind::DecodeOnly
+                    } else {
+                        BatchKind::Ragged
+                    },
+                    num_tokens: q_lens.iter().map(|&n| n as usize).sum(),
+                    batch: req.seqs.len(),
+                    q_lens,
+                    kv_lens: req.seqs.iter().map(|s| s.kv_len_after).collect(),
+                    seq_positions: req.seqs.iter().map(|s| s.kv_write_start).collect(),
+                    rope_positions: req
+                        .seqs
+                        .iter()
+                        .flat_map(|s| s.positions.iter().copied())
+                        .collect(),
+                    max_blocks_per_seq: 64,
+                    block_size: 1,
+                    total_q_tiles: tiles.len() as i32,
+                };
+                let decode = matches!(plan.kind, BatchKind::DecodeOnly);
+                if !decode {
+                    assert!(matches!(runtime.decide(&plan), GraphDecision::Eager));
+                }
+                let tokens: Vec<i32> = if mode == "abc" && decode {
+                    let n = req.seqs.len();
+                    runtime
+                        .issue_decode_abc(
+                            req,
+                            0,
+                            &vec![0; n],
+                            &vec![100; n],
+                            &vec![true; n],
+                            &[],
+                            None,
+                            false,
+                        )
+                        .unwrap();
+                    runtime
+                        .finalize_decode_abc(n)
+                        .unwrap()
+                        .active
+                        .iter()
+                        .map(|t| t.token_id)
+                        .collect()
+                } else {
+                    runtime
+                        .step(req)
+                        .unwrap()
+                        .tokens
+                        .iter()
+                        .map(|row| row[0].token_id)
+                        .collect()
+                };
+                let hidden = Hidden {
+                    stream: runtime.hidden.stream.narrow(0, 0, plan.num_tokens).unwrap(),
+                    pending: None,
+                };
+                let ctx = StepCtx::new(&runtime.scope, &plan);
+                let logits = runtime
+                    .model
+                    .finalize(&hidden, SampleRows::LastPerSeq, &ctx)
+                    .unwrap()
+                    .0
+                    .to_host_vec()
+                    .unwrap();
+                if mode == "eager" {
+                    reference.push((tokens, logits));
+                } else {
+                    let (expected_tokens, expected_logits) = &reference[step];
+                    assert_eq!(&tokens, expected_tokens, "{mode} step {step}");
+                    let error: f64 = logits
+                        .iter()
+                        .zip(expected_logits)
+                        .map(|(a, b)| (a.to_f64() - b.to_f64()).powi(2))
+                        .sum();
+                    let norm: f64 = expected_logits.iter().map(|v| v.to_f64().powi(2)).sum();
+                    let relative_l2 = (error / norm).sqrt();
+                    assert!(
+                        relative_l2.is_finite() && relative_l2 < 0.005,
+                        "{mode} step {step}: logits relative L2 {relative_l2}"
+                    );
+                    max_relative_l2 = max_relative_l2.max(relative_l2);
+                }
+            }
+            if mode != "eager" {
+                for size in [1, 2, 4] {
+                    assert!(runtime.scope.graph_ready(size));
+                }
+            }
+            eprintln!(
+                "Qwen3.5 {mode}: {} steps matched, max logits relative L2={max_relative_l2:.6}",
+                trace.len()
+            );
+        }
+        // Measure steady batch=1 decode without diagnostic downloads. Requests
+        // use fixed tokens so both modes execute the same length progression.
+        for graphed in [false, true] {
+            runtime.retain_sequences([]);
+            let runner = if graphed { None } else { runtime.graph.take() };
+            runtime
+                .step(&request(&[(99, 0, 0, vec![1, 2, 3])]))
+                .unwrap();
+            let mut times = Vec::new();
+            for start in 3..35 {
+                let req = request(&[(99, 0, start, vec![13])]);
+                let begin = std::time::Instant::now();
+                runtime.step(&req).unwrap();
+                if start >= 7 {
+                    times.push(begin.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "Qwen3.5 decode batch=1 graph={graphed}: median {:.3} ms ({} steps)",
+                times[times.len() / 2],
+                times.len()
+            );
+            if let Some(runner) = runner {
+                runtime.graph = Some(runner);
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires QWEN35_MODEL_PATH, QWEN35_VISION_REFERENCE and CUDA"]
+    fn qwen35_multimodal_precision_and_recompute() {
+        use infer_protocol::multimodal::{IMAGE_TOKEN_ID, ImageInput, ImageSpan, MultimodalInput};
+        use infer_worker::application::runtime::Runtime;
+        use infer_worker::application::sampler_stack::GreedySampler;
+        use infer_worker::domain::exec::ExecScope;
+        use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
+        let path = std::env::var("QWEN35_MODEL_PATH").unwrap();
+        let reference = std::env::var("QWEN35_VISION_REFERENCE").unwrap();
+        let reference = Path::new(&reference);
+        let ordinal = std::env::var("QWEN35_DEVICE")
+            .unwrap_or_else(|_| "7".into())
+            .parse()
+            .unwrap();
+        let config_bytes = std::fs::read(Path::new(&path).join("config.json")).unwrap();
+        let config_json: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
+        let cfg = build_load_config(&parse_hf_config(&config_bytes).unwrap(), 512).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reference.join("metadata.json")).unwrap())
+                .unwrap();
+        let ids: Vec<i32> = serde_json::from_value(meta["input_ids"].clone()).unwrap();
+        let expected: Vec<i32> = serde_json::from_value(meta["generated_ids"].clone()).unwrap();
+        let image = ImageInput {
+            grid_thw: serde_json::from_value(meta["grid_thw"].clone()).unwrap(),
+            patches: std::fs::read(reference.join("patches.bf16")).unwrap(),
+        };
+        let input = std::sync::Arc::new(MultimodalInput {
+            spans: vec![ImageSpan {
+                image_index: 0,
+                token_start: ids.iter().position(|&id| id == IMAGE_TOKEN_ID).unwrap() as u32,
+                token_len: image.num_tokens() as u32,
+            }],
+            images: vec![image],
+            original_prompt_len: ids.len() as u32,
+        });
+        input.validate_tokens(&ids).unwrap();
+        let reader = SafetensorsReader::open(&path).unwrap();
+        let cuda = Cuda::new(ordinal).unwrap();
+        let loader = WeightLoader::new(&reader);
+        let mut model = qwen3_5::build::<bf16, Cuda>(&loader, &cfg, &cuda).unwrap();
+        model.load_vision(&loader, &config_json, &cuda).unwrap();
+        let dump_compare = |name: &str, tensor: &Tensor<bf16, Cuda>| {
+            let actual: Vec<f32> = tensor
+                .to_host_vec()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_f32())
+                .collect();
+            std::fs::write(
+                reference.join(format!("rust-{name}.f32")),
+                actual
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let bytes = std::fs::read(reference.join(format!("{name}.f32"))).unwrap();
+            let reference: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            assert_eq!(actual.len(), reference.len());
+            assert!(actual.iter().all(|v| v.is_finite()));
+            let relative = (actual
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum::<f64>()
+                / reference
+                    .iter()
+                    .map(|b| (*b as f64).powi(2))
+                    .sum::<f64>()
+                    .max(1e-20))
+            .sqrt();
+            eprintln!("{name}: relative L2={relative:.6}");
+            if name == "vision_merger" {
+                assert!(relative < 0.08);
+            }
+            relative
+        };
+        model
+            .vision
+            .as_ref()
+            .unwrap()
+            .forward_with_trace(&input.images[0], &cuda.scope(), |name, t| {
+                dump_compare(&format!("vision_{name}"), t);
+                Ok(())
+            })
+            .unwrap();
+        let mut runtime = Runtime::new(
+            model,
+            cuda.scope(),
+            Box::new(GreedySampler),
+            2049,
+            1,
+            512,
+            512,
+            128,
+            4,
+            vec![1, 2, 4],
+        )
+        .unwrap();
+        let request = |tokens: Vec<i32>, start: usize| StepRequest {
+            seqs: vec![SeqStep {
+                sequence_id: 42,
+                positions: (start as i32..(start + tokens.len()) as i32).collect(),
+                kv_write_start: start as i32,
+                kv_len_after: (start + tokens.len()) as i32,
+                block_table: (0..512).collect(),
+                input_ids: tokens,
+            }],
+            sampling: vec![Default::default()],
+            stop: StopCriteria {
+                eos_ids: vec![],
+                generated_counts: vec![0],
+                max_tokens: vec![100],
+                ignore_eos: vec![true],
+            },
+            draft_tokens: vec![],
+        };
+        let measure = |runtime: &mut Runtime<bf16, Cuda, qwen3_5::Qwen3_5Model<bf16, Cuda>>,
+                       req: &StepRequest,
+                       name: &str| {
+            let seq = &req.seqs[0];
+            let n = seq.input_ids.len();
+            let plan = BatchPlan {
+                kind: if n == 1 {
+                    BatchKind::DecodeOnly
+                } else {
+                    BatchKind::Ragged
+                },
+                num_tokens: n,
+                batch: 1,
+                q_lens: vec![n as i32],
+                kv_lens: vec![seq.kv_len_after],
+                seq_positions: vec![seq.kv_write_start],
+                rope_positions: seq.positions.clone(),
+                max_blocks_per_seq: 512,
+                block_size: 1,
+                total_q_tiles: 1,
+            };
+            let hidden = Hidden {
+                stream: runtime.hidden.stream.narrow(0, 0, n).unwrap(),
+                pending: None,
+            };
+            let logits = runtime
+                .model
+                .finalize(
+                    &hidden,
+                    SampleRows::LastPerSeq,
+                    &StepCtx::new(&runtime.scope, &plan),
+                )
+                .unwrap();
+            // HF BF16 eager vs HF BF16 SDPA on this fixture differs by 3.59%
+            // relative L2. Keep a numerical bound plus exact greedy-token checks.
+            assert!(dump_compare(name, &logits.0) < 0.06);
+        };
+        let mut all_outputs = Vec::new();
+        for chunk in [128, 31, 26] {
+            runtime.release_sequence(42);
+            runtime.register_multimodal(42, input.clone()).unwrap();
+            let mut last = 0;
+            for (i, part) in ids.chunks(chunk).enumerate() {
+                let req = request(part.to_vec(), i * chunk);
+                last = runtime.step(&req).unwrap().tokens[0][0].token_id;
+                if (i + 1) * chunk >= ids.len() {
+                    measure(&mut runtime, &req, "step0_logits");
+                }
+            }
+            let mut generated = vec![last];
+            for i in 1..expected.len() {
+                let req = request(vec![last], ids.len() + i - 1);
+                last = runtime.step(&req).unwrap().tokens[0][0].token_id;
+                measure(&mut runtime, &req, &format!("step{i}_logits"));
+                generated.push(last);
+            }
+            eprintln!("multimodal chunk={chunk}: {generated:?}, expected={expected:?}");
+            all_outputs.push(generated);
+        }
+        // Recompute an evicted request including four already generated tokens.
+        runtime.release_sequence(42);
+        runtime.register_multimodal(42, input.clone()).unwrap();
+        let mut replay = ids.clone();
+        replay.extend_from_slice(&expected[..4]);
+        let mut token = 0;
+        for (i, part) in replay.chunks(31).enumerate() {
+            token = runtime
+                .step(&request(part.to_vec(), i * 31))
+                .unwrap()
+                .tokens[0][0]
+                .token_id;
+        }
+        assert_eq!(token, expected[4]);
+        let (runs, hits, bytes) = runtime.visual_cache_stats();
+        assert_eq!(runs, 1);
+        assert!(hits > 0 && bytes > 0);
+        eprintln!("vision cache: runs={runs}, hits={hits}, bytes={bytes}; recompute matched");
+        for output in all_outputs {
+            assert_eq!(output, expected);
+        }
+        runtime.release_sequence(42);
+        // Transition from image eager execution back to text ABC without stale overrides.
+        let req = request(vec![1], 0);
+        runtime
+            .issue_decode_abc(&req, 0, &[0], &[100], &[true], &[], None, false)
+            .unwrap();
+        runtime.finalize_decode_abc(1).unwrap();
+
+        // Reuse text-captured graphs for image decode. Distinct image counts
+        // give distinct rope_delta values, even when physical positions match.
+        let mut twice = (*input).clone();
+        let mut second_span = twice.spans[0].clone();
+        second_span.image_index = 1;
+        second_span.token_start += ids.len() as u32;
+        twice.images.push(twice.images[0].clone());
+        twice.spans.push(second_span);
+        twice.original_prompt_len *= 2;
+        let twice = std::sync::Arc::new(twice);
+        let mut double_ids = ids.clone();
+        double_ids.extend_from_slice(&ids);
+        twice.validate_tokens(&double_ids).unwrap();
+        assert_ne!(
+            input.positions().unwrap().rope_delta,
+            twice.positions().unwrap().rope_delta
+        );
+        let rows = |rows: &[(u64, usize, usize, Vec<i32>)]| StepRequest {
+            seqs: rows
+                .iter()
+                .map(|(id, slot, start, tokens)| SeqStep {
+                    sequence_id: *id,
+                    input_ids: tokens.clone(),
+                    positions: (*start as i32..(*start + tokens.len()) as i32).collect(),
+                    kv_write_start: *start as i32,
+                    kv_len_after: (*start + tokens.len()) as i32,
+                    block_table: (*slot * 512..(*slot + 1) * 512).map(|b| b as u32).collect(),
+                })
+                .collect(),
+            sampling: vec![Default::default(); rows.len()],
+            stop: StopCriteria {
+                eos_ids: vec![],
+                generated_counts: vec![0; rows.len()],
+                max_tokens: vec![100; rows.len()],
+                ignore_eos: vec![true; rows.len()],
+            },
+            draft_tokens: vec![],
+        };
+        // release ids, request; start=0 re-registers durable image inputs.
+        let mut trace = Vec::new();
+        for (id, slot, prompt) in [(42, 0, &ids), (43, 1, &double_ids)] {
+            // Include q_len=1 inside the image span; its graph must stay eager.
+            let first_image = input.spans[0].token_start as usize;
+            let mut start = 0;
+            for end in [first_image, first_image + 1, prompt.len()] {
+                for part in prompt[start..end].chunks(31) {
+                    trace.push((vec![], rows(&[(id, slot, start, part.to_vec())])));
+                    start += part.len();
+                }
+            }
+        }
+        trace.push((vec![], rows(&[(44, 2, 0, vec![1, 2, 3])])));
+        let n = ids.len();
+        trace.push((
+            vec![],
+            rows(&[
+                (42, 0, n, vec![760]),
+                (43, 1, n * 2, vec![760]),
+                (44, 2, 3, vec![13]),
+            ]),
+        ));
+        trace.push((
+            vec![],
+            rows(&[
+                (44, 2, 4, vec![13]),
+                (43, 1, n * 2 + 1, vec![760]),
+                (42, 0, n + 1, vec![760]),
+            ]),
+        ));
+        let mut finish_middle = rows(&[
+            (44, 2, 5, vec![13]),
+            (43, 1, n * 2 + 2, vec![760]),
+            (42, 0, n + 2, vec![760]),
+        ]);
+        finish_middle.stop.max_tokens[1] = 1;
+        trace.push((vec![], finish_middle));
+        trace.push((
+            vec![43],
+            rows(&[(44, 2, 6, vec![13]), (42, 0, n + 3, vec![760])]),
+        ));
+        trace.push((
+            vec![],
+            rows(&[(42, 0, n + 4, vec![760]), (44, 2, 7, vec![13])]),
+        ));
+        // Cancel the text row, reuse its slots for a new image request.
+        for (i, part) in ids.chunks(31).enumerate() {
+            trace.push((
+                if i == 0 { vec![44] } else { vec![] },
+                rows(&[(45, 2, i * 31, part.to_vec())]),
+            ));
+        }
+        trace.push((
+            vec![],
+            rows(&[(45, 2, n, vec![760]), (42, 0, n + 5, vec![760])]),
+        ));
+        // Preempt 42 and reconstruct both KV and GDN history before replay.
+        let mut recompute = ids.clone();
+        recompute.extend_from_slice(&[760; 6]);
+        for (i, part) in recompute.chunks(31).enumerate() {
+            trace.push((
+                if i == 0 { vec![42] } else { vec![] },
+                rows(&[(42, 0, i * 31, part.to_vec())]),
+            ));
+        }
+        trace.push((
+            vec![],
+            rows(&[(42, 0, n + 6, vec![760]), (45, 2, n + 1, vec![760])]),
+        ));
+        trace.push((vec![45], rows(&[(42, 0, n + 7, vec![760])])));
+        trace.push((vec![42], rows(&[(42, 0, 0, vec![1, 2, 3])])));
+        trace.push((vec![], rows(&[(42, 0, 3, vec![13])])));
+
+        let mut baseline = Vec::new();
+        for mode in ["eager", "cold", "prewarmed", "abc"] {
+            runtime.retain_sequences([]);
+            runtime.graph = None;
+            cuda.config.invalidate_all_graphs();
+            if mode != "eager" {
+                runtime.prime_graphs().unwrap();
+                if mode != "cold" {
+                    runtime.prewarm_decode_graphs().unwrap();
+                }
+            }
+            let mut device_rows = Vec::new();
+            let mut device_tokens = Vec::new();
+            let mut max_l2 = 0.0f64;
+            let mut reused = 0;
+            for (step, (release, req)) in trace.iter().enumerate() {
+                for &id in release {
+                    runtime.release_sequence(id);
+                }
+                for seq in &req.seqs {
+                    if seq.kv_write_start == 0
+                        && (seq.sequence_id == 43
+                            || seq.sequence_id == 45
+                            || (seq.sequence_id == 42 && seq.input_ids != [1, 2, 3]))
+                    {
+                        runtime
+                            .register_multimodal(
+                                seq.sequence_id,
+                                if seq.sequence_id == 43 {
+                                    twice.clone()
+                                } else {
+                                    input.clone()
+                                },
+                            )
+                            .unwrap();
+                    }
+                }
+                let decode = req.seqs.iter().all(|s| {
+                    s.input_ids.len() == 1
+                        && (!runtime.has_multimodal_sequence(s.sequence_id)
+                            || s.kv_write_start as usize
+                                >= if s.sequence_id == 43 {
+                                    double_ids.len()
+                                } else {
+                                    ids.len()
+                                })
+                });
+                let q_lens: Vec<i32> = req.seqs.iter().map(|s| s.input_ids.len() as i32).collect();
+                let plan = BatchPlan {
+                    kind: if q_lens.iter().all(|&n| n == 1) {
+                        BatchKind::DecodeOnly
+                    } else {
+                        BatchKind::Ragged
+                    },
+                    num_tokens: q_lens.iter().map(|&n| n as usize).sum(),
+                    batch: req.seqs.len(),
+                    total_q_tiles: BatchPlan::plan_ragged_tiles(&q_lens).1.len() as i32,
+                    q_lens,
+                    kv_lens: req.seqs.iter().map(|s| s.kv_len_after).collect(),
+                    seq_positions: req.seqs.iter().map(|s| s.kv_write_start).collect(),
+                    rope_positions: req
+                        .seqs
+                        .iter()
+                        .flat_map(|s| s.positions.iter().copied())
+                        .collect(),
+                    max_blocks_per_seq: 512,
+                    block_size: 1,
+                };
+                let tokens = if mode == "abc" && decode {
+                    let order: Vec<_> = req.seqs.iter().map(|s| s.sequence_id).collect();
+                    let reuse = device_rows == order;
+                    let prefix = if reuse {
+                        // Reuse A only where it already contains this trace's
+                        // fixed input token; upload the divergent suffix.
+                        req.seqs
+                            .iter()
+                            .zip(&device_tokens)
+                            .take_while(|(s, t)| s.input_ids[0] == **t)
+                            .count()
+                    } else {
+                        0
+                    };
+                    let survivors: Vec<_> = req
+                        .seqs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| req.stop.max_tokens[*i] > 1)
+                        .collect();
+                    let next_slots: Vec<u32> = survivors
+                        .iter()
+                        .map(|(_, s)| s.block_table[s.kv_len_after as usize])
+                        .collect();
+                    runtime
+                        .issue_decode_abc(
+                            req,
+                            prefix,
+                            &req.stop.generated_counts,
+                            &req.stop.max_tokens,
+                            &req.stop.ignore_eos,
+                            &[],
+                            Some(&next_slots),
+                            reuse,
+                        )
+                        .unwrap();
+                    let out = runtime.finalize_decode_abc(req.seqs.len()).unwrap();
+                    device_rows = out
+                        .active
+                        .iter()
+                        .map(|r| req.seqs[r.src_row].sequence_id)
+                        .collect();
+                    device_tokens = out.active.iter().map(|r| r.token_id).collect();
+                    reused += usize::from(reuse);
+                    let mut tokens = vec![0; req.seqs.len()];
+                    for row in out.active.iter().chain(&out.finished) {
+                        tokens[row.src_row] = row.token_id;
+                    }
+                    tokens
+                } else {
+                    device_rows.clear();
+                    runtime
+                        .step(req)
+                        .unwrap()
+                        .tokens
+                        .iter()
+                        .map(|row| row[0].token_id)
+                        .collect::<Vec<_>>()
+                };
+                let hidden = Hidden {
+                    stream: runtime.hidden.stream.narrow(0, 0, plan.num_tokens).unwrap(),
+                    pending: None,
+                };
+                let logits = runtime
+                    .model
+                    .finalize(
+                        &hidden,
+                        SampleRows::LastPerSeq,
+                        &StepCtx::new(&runtime.scope, &plan),
+                    )
+                    .unwrap()
+                    .0
+                    .to_host_vec()
+                    .unwrap();
+                if mode == "eager" {
+                    baseline.push((tokens, logits));
+                } else {
+                    assert_eq!(tokens, baseline[step].0, "multimodal {mode} step={step}");
+                    let expected = &baseline[step].1;
+                    let l2 = (logits
+                        .iter()
+                        .zip(expected)
+                        .map(|(a, b)| (a.to_f64() - b.to_f64()).powi(2))
+                        .sum::<f64>()
+                        / expected.iter().map(|v| v.to_f64().powi(2)).sum::<f64>())
+                    .sqrt();
+                    assert!(
+                        l2.is_finite() && l2 < 0.005,
+                        "multimodal {mode} step={step}: L2={l2}"
+                    );
+                    max_l2 = max_l2.max(l2);
+                }
+            }
+            if mode == "abc" {
+                assert!(reused >= 2, "device control reuse was not exercised");
+            }
+            if mode == "prewarmed" || mode == "abc" {
+                for size in [1, 2, 4] {
+                    assert!(runtime.scope.graph_ready(size));
+                }
+            }
+            eprintln!(
+                "multimodal {mode}: {} steps matched; max logits L2={max_l2:.6}, device control reuse={reused}",
+                trace.len()
+            );
+        }
+        // Diagnostic latency comparison after both paths are warm. No timing
+        // assertion: this opt-in test can share the GPU with other workloads.
+        let mut timings = [Vec::new(), Vec::new()];
+        for round in 0..3 {
+            for graphed in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                runtime.retain_sequences([]);
+                let graph = if graphed { None } else { runtime.graph.take() };
+                runtime.register_multimodal(42, input.clone()).unwrap();
+                runtime.step(&request(ids.clone(), 0)).unwrap();
+                for i in 0..20 {
+                    let req = request(vec![760], ids.len() + i);
+                    let start = std::time::Instant::now();
+                    runtime.step(&req).unwrap();
+                    if i >= 4 {
+                        timings[usize::from(graphed)].push(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+                if let Some(graph) = graph {
+                    runtime.graph = Some(graph);
+                }
+            }
+        }
+        for (graphed, times) in timings.iter_mut().enumerate() {
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "multimodal decode batch=1 graph={}: median {:.3} ms ({} steps)",
+                graphed != 0,
+                times[times.len() / 2],
+                times.len()
             );
         }
     }

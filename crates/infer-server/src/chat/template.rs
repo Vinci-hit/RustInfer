@@ -104,6 +104,17 @@ impl ChatTemplate for Qwen3Template {
     }
 }
 
+/// Qwen3.5 text chat uses an explicit thinking prefix by default.
+pub struct Qwen35Template;
+
+impl ChatTemplate for Qwen35Template {
+    fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
+        let mut prompt = Qwen3Template.apply(messages)?;
+        prompt.push_str("<think>\n");
+        Ok(prompt)
+    }
+}
+
 /// 根据服务器实际加载的 `model_type` 选择对应的 chat template。
 ///
 /// 必须基于服务端真实加载的模型类型（`ServerConfig::model_type`，取值
@@ -113,7 +124,29 @@ impl ChatTemplate for Qwen3Template {
 /// 终止 token（如 Qwen3 的 `<|im_end|>`），导致生成停不下来、跑满 max_tokens。
 pub fn get_template(model_type: &str) -> Box<dyn ChatTemplate + Send + Sync> {
     match model_type.to_lowercase().as_str() {
+        "qwen3_5" | "qwen3_5_text" => Box::new(Qwen35Template),
         t if t.contains("qwen") => Box::new(Qwen3Template),
         _ => Box::new(Llama3Template),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qwen35_generation_prefix_matches_checkpoint_default() {
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        let base = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n";
+        for model_type in ["qwen3_5", "qwen3_5_text"] {
+            assert_eq!(
+                get_template(model_type).apply(&messages).unwrap(),
+                format!("{base}<think>\n")
+            );
+        }
+        assert_eq!(get_template("qwen3").apply(&messages).unwrap(), base);
     }
 }

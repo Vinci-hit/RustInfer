@@ -198,7 +198,10 @@ fn run_stream<S, F>(
     mut stream_handle: StreamHandle,
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: (
+        tokio::sync::OwnedSemaphorePermit,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ),
     shape: S,
     mut on_first_content: F,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
@@ -346,7 +349,10 @@ pub fn stream_chat_completion(
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
     request_start: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: (
+        tokio::sync::OwnedSemaphorePermit,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ),
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let shape = ChatShape {
         chunk_id: format!("chatcmpl-{}", request_id),
@@ -395,7 +401,7 @@ pub fn stream_completion(
         stream_handle,
         tokenizer,
         include_usage,
-        permit,
+        (permit, None),
         shape,
         || {},
     )

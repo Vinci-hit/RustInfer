@@ -128,6 +128,7 @@ __device__ __forceinline__ void q_norm_rope_one_warp(
     const __nv_bfloat16* __restrict__ cos_cache,
     int pos,
     int head_dim,
+    int rotary_dim,
     float eps,
     int lane_id)
 {
@@ -140,14 +141,19 @@ __device__ __forceinline__ void q_norm_rope_one_warp(
     const float total = warp_reduce_sum(sum);
     const float inv_rms = rsqrtf(total / float(head_dim) + eps);
 
-    const int half_head = head_dim >> 1;
-    for (int i = lane_id; i < half_head; i += THREADS_PER_WARP) {
-        const float s = __bfloat162float(sin_cache[(long long)pos * half_head + i]);
-        const float c = __bfloat162float(cos_cache[(long long)pos * half_head + i]);
+    const int half_rotary = rotary_dim >> 1;
+    for (int i = lane_id; i < half_rotary; i += THREADS_PER_WARP) {
+        const float s = __bfloat162float(sin_cache[(long long)pos * half_rotary + i]);
+        const float c = __bfloat162float(cos_cache[(long long)pos * half_rotary + i]);
         const float n0 = __bfloat162float(__float2bfloat16(__bfloat162float(base[i]) * __bfloat162float(weight[i]) * inv_rms));
-        const float n1 = __bfloat162float(__float2bfloat16(__bfloat162float(base[i + half_head]) * __bfloat162float(weight[i + half_head]) * inv_rms));
+        const float n1 = __bfloat162float(__float2bfloat16(__bfloat162float(base[i + half_rotary]) * __bfloat162float(weight[i + half_rotary]) * inv_rms));
         base[i] = __float2bfloat16(n0 * c - n1 * s);
-        base[i + half_head] = __float2bfloat16(n0 * s + n1 * c);
+        base[i + half_rotary] = __float2bfloat16(n0 * s + n1 * c);
+    }
+    for (int i = rotary_dim + lane_id; i < head_dim; i += THREADS_PER_WARP) {
+        const float normalized =
+            __bfloat162float(base[i]) * __bfloat162float(weight[i]) * inv_rms;
+        base[i] = __float2bfloat16(normalized);
     }
 }
 
@@ -159,6 +165,7 @@ __device__ __forceinline__ void k_norm_rope_scatter_one_warp(
     const __nv_bfloat16* __restrict__ cos_cache,
     int pos,
     int head_dim,
+    int rotary_dim,
     float eps,
     int lane_id)
 {
@@ -171,14 +178,19 @@ __device__ __forceinline__ void k_norm_rope_scatter_one_warp(
     const float total = warp_reduce_sum(sum);
     const float inv_rms = rsqrtf(total / float(head_dim) + eps);
 
-    const int half_head = head_dim >> 1;
-    for (int i = lane_id; i < half_head; i += THREADS_PER_WARP) {
-        const float s = __bfloat162float(sin_cache[(long long)pos * half_head + i]);
-        const float c = __bfloat162float(cos_cache[(long long)pos * half_head + i]);
+    const int half_rotary = rotary_dim >> 1;
+    for (int i = lane_id; i < half_rotary; i += THREADS_PER_WARP) {
+        const float s = __bfloat162float(sin_cache[(long long)pos * half_rotary + i]);
+        const float c = __bfloat162float(cos_cache[(long long)pos * half_rotary + i]);
         const float n0 = __bfloat162float(__float2bfloat16(__bfloat162float(base[i]) * __bfloat162float(weight[i]) * inv_rms));
-        const float n1 = __bfloat162float(__float2bfloat16(__bfloat162float(base[i + half_head]) * __bfloat162float(weight[i + half_head]) * inv_rms));
+        const float n1 = __bfloat162float(__float2bfloat16(__bfloat162float(base[i + half_rotary]) * __bfloat162float(weight[i + half_rotary]) * inv_rms));
         dst[i] = __float2bfloat16(n0 * c - n1 * s);
-        dst[i + half_head] = __float2bfloat16(n0 * s + n1 * c);
+        dst[i + half_rotary] = __float2bfloat16(n0 * s + n1 * c);
+    }
+    for (int i = rotary_dim + lane_id; i < head_dim; i += THREADS_PER_WARP) {
+        const float normalized =
+            __bfloat162float(base[i]) * __bfloat162float(weight[i]) * inv_rms;
+        dst[i] = __float2bfloat16(normalized);
     }
 }
 
@@ -202,6 +214,7 @@ void qkv_norm_rope_scatter_kernel_bf16(
     int head_num,
     int kv_head_num,
     int head_dim,
+    int rotary_dim,
     int kv_dim,
     long long q_row_stride,
     long long k_row_stride,
@@ -237,20 +250,20 @@ void qkv_norm_rope_scatter_kernel_bf16(
             if (warp_id >= head_num) continue;
             const int pos = positions[row];
             __nv_bfloat16* q_head = q + (long long)row * q_row_stride + (long long)warp_id * head_dim;
-            if (head_dim == 128) {
+            if (head_dim == 128 && rotary_dim == 128) {
                 q_norm_rope_head128(q_head, q_weight, sin_cache, cos_cache, pos, q_eps, lane_id);
             } else {
-                q_norm_rope_one_warp(q_head, q_weight, sin_cache, cos_cache, pos, head_dim, q_eps, lane_id);
+                q_norm_rope_one_warp(q_head, q_weight, sin_cache, cos_cache, pos, head_dim, rotary_dim, q_eps, lane_id);
             }
         } else if (path == 1) {
             if (warp_id >= kv_head_num) continue;
             const int pos = positions[row];
             const __nv_bfloat16* k_head = k + (long long)row * k_row_stride + (long long)warp_id * head_dim;
             __nv_bfloat16* k_dst = k_pool + dst_offset + (long long)warp_id * head_dim;
-            if (head_dim == 128) {
+            if (head_dim == 128 && rotary_dim == 128) {
                 k_norm_rope_scatter_head128(k_head, k_dst, k_weight, sin_cache, cos_cache, pos, k_eps, lane_id);
             } else {
-                k_norm_rope_scatter_one_warp(k_head, k_dst, k_weight, sin_cache, cos_cache, pos, head_dim, k_eps, lane_id);
+                k_norm_rope_scatter_one_warp(k_head, k_dst, k_weight, sin_cache, cos_cache, pos, head_dim, rotary_dim, k_eps, lane_id);
             }
         } else {
             if (warp_id >= kv_head_num) continue;
@@ -289,6 +302,7 @@ extern "C" void qkv_norm_rope_scatter_bf16(
     int head_num,
     int kv_head_num,
     int head_dim,
+    int rotary_dim,
     int kv_dim,
     long long q_row_stride,
     long long k_row_stride,
@@ -322,7 +336,7 @@ extern "C" void qkv_norm_rope_scatter_bf16(
         k_pool, v_pool,
         block_tables, seq_positions, seq_starts, seq_lens,
         num_tokens,
-        head_num, kv_head_num, head_dim, kv_dim,
+        head_num, kv_head_num, head_dim, rotary_dim, kv_dim,
         q_row_stride, k_row_stride, v_row_stride,
         max_blocks_per_seq, block_size,
         q_eps, k_eps);

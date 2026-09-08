@@ -385,7 +385,7 @@ where
     /// the admission budget because a step's decode rows ride on top of it
     /// (budget bounds prefill admission, not total tokens).
     pub fn prewarm_mixed_eager_shapes(&mut self, eos_ids: &[i32]) -> OpResult<usize> {
-        if !self.mixed_eager {
+        if self.has_recurrent_state() || !self.mixed_eager {
             return Ok(0);
         }
         const EAGER_MIXED_PREWARM_MAX_TOKENS: usize = 768;
@@ -456,7 +456,9 @@ where
         D::pipeline_arena_begin(&self.scope)?;
         let result = (|| {
             let plan = self.build_plan(req)?;
+            self.prepare_recurrent(req, &plan)?;
             self.upload_index(&plan, req)?;
+            self.prepare_multimodal(req)?;
             self.step_eager(&plan, req)
         })();
         D::pipeline_arena_end(&self.scope);
@@ -535,6 +537,7 @@ where
         c_prefix_rows: usize,
         defer_copy_out: bool,
     ) -> OpResult<MixedStepTicket> {
+        self.prepare_text_abc(req)?;
         let plan = self.validate_mixed_abc_request(req, row_kind)?;
         if c_prefix_rows > 0 {
             // The C-gathered prefix is an eager-only contract: the graph path
@@ -552,6 +555,7 @@ where
                 )));
             }
         }
+        self.prepare_recurrent(req, &plan)?;
         if let Some(slots) = next_slots {
             self.upload_mixed_next_slots(slots)?;
         }
@@ -830,7 +834,7 @@ where
     /// them, so only `num_tokens` (and `rope_positions`, kept length-consistent)
     /// may be padded.
     fn eager_mixed_run_plan(&self, plan: &BatchPlan) -> Option<BatchPlan> {
-        if !self.mixed_eager {
+        if self.has_recurrent_state() || !self.mixed_eager {
             return None;
         }
         let padded =

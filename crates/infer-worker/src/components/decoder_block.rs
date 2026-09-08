@@ -1,8 +1,8 @@
 use crate::components::attention::Attention;
-use crate::domain::component::{Component, Hidden, StageKind};
+use crate::domain::cache::LayerCacheView;
+use crate::domain::component::{Component, Hidden};
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
-use crate::domain::kv::KvView;
 use crate::domain::ports::OpResult;
 use crate::domain::ports::backend::LlmBackend;
 
@@ -15,18 +15,14 @@ pub struct DecoderBlock<T: Dtype, D: LlmBackend, F: Component<T, D>> {
     pub ffn: F,
 }
 
-impl<T: Dtype, D: LlmBackend, F: Component<T, D>> Component<T, D> for DecoderBlock<T, D, F> {
-    fn kind(&self) -> StageKind {
-        StageKind::DecoderBlock
-    }
-
-    fn run(
+impl<T: Dtype, D: LlmBackend, F: Component<T, D>> DecoderBlock<T, D, F> {
+    pub fn run(
         &self,
         hidden: &mut Hidden<T, D>,
-        kv: Option<&mut KvView<'_, T, D>>,
+        cache: LayerCacheView<'_, T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
-        self.attention.run(hidden, kv, ctx)?;
+        self.attention.run(hidden, cache, ctx)?;
         self.ffn.run(hidden, None, ctx)
     }
 }

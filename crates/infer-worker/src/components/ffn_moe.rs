@@ -252,6 +252,7 @@ mod tests {
             MoeLocalPipeline::new(router, MoeExperts::new(gate_up, down).unwrap()).unwrap();
         MoeFfn::new(
             RmsNorm {
+                zero_centered: false,
                 weight: Tensor::from_host_slice(&[1.0f32, 1.0], [2], &Cpu).unwrap(),
                 eps: 0.0,
             },
@@ -351,6 +352,7 @@ mod tests {
             MoeLocalPipeline::new(router, MoeExperts::new(gate_up, down).unwrap()).unwrap();
         let mut ffn = MoeFfn::new(
             RmsNorm {
+                zero_centered: false,
                 weight: Tensor::from_host_slice(&bf16s(&[1.0; HIDDEN]), [HIDDEN], &cuda).unwrap(),
                 eps: 0.0,
             },

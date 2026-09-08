@@ -87,6 +87,7 @@ impl Default for SamplingParams {
 /// Shared immutable request metadata (Arc'd, never changes after creation).
 #[derive(Debug, Clone)]
 pub struct RequestMeta {
+    pub multimodal: Option<std::sync::Arc<infer_protocol::multimodal::MultimodalInput>>,
     /// Internal scheduler id (uuid). Used for hashing, scheduling, logging.
     pub id: RequestId,
     /// Client-supplied id from the HTTP request body (e.g. `request_id`
@@ -451,6 +452,7 @@ mod tests {
 
     fn make_meta(prompt_len: usize) -> Arc<RequestMeta> {
         Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: "test".into(),
             sequence_id: SequenceId(1),

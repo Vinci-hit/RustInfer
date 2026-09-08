@@ -104,7 +104,6 @@ __global__ void softmax_bf16_kernel(
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += nthreads) {
         float v = expf(__bfloat162float(in_row[i]) - row_max);
-        out_row[i] = __float2bfloat16(v);
         local_sum += v;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -122,7 +121,9 @@ __global__ void softmax_bf16_kernel(
 
     float inv_sum = 1.0f / row_sum;
     for (int i = tid; i < cols; i += nthreads) {
-        out_row[i] = __float2bfloat16(__bfloat162float(out_row[i]) * inv_sum);
+        // Keep exp and normalization in FP32; rounding exp to BF16 first
+        // amplifies attention error across vision transformer layers.
+        out_row[i] = __float2bfloat16(expf(__bfloat162float(in_row[i]) - row_max) * inv_sum);
     }
 }
 

@@ -184,3 +184,24 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+    #[test]
+    fn bf16_softmax_rounds_after_normalization() {
+        let cuda = Cuda::new(0).unwrap();
+        let values: Vec<half::bf16> = (0..352)
+            .map(|i| half::bf16::from_f32(((i * 37) % 101) as f32 * 0.03125 - 1.5))
+            .collect();
+        let input = Tensor::from_host_slice(&values, [1, 352], &cuda).unwrap();
+        let mut output = Tensor::zeros([1, 352], &cuda).unwrap();
+        softmax(cuda.config.stream, &input, &mut output).unwrap();
+        let sum: f64 = values.iter().map(|v| (v.to_f32() as f64).exp()).sum();
+        let expected: Vec<_> = values
+            .iter()
+            .map(|v| half::bf16::from_f64((v.to_f32() as f64).exp() / sum))
+            .collect();
+        assert_eq!(output.to_host_vec().unwrap(), expected);
+    }
+}

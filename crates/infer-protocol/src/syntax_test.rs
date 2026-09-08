@@ -5,6 +5,7 @@ use crate::*;
 #[allow(dead_code)]
 fn test_protocol_types() {
     let _req = InferenceRequest {
+        multimodal: None,
         request_id: "test".to_string(),
         modality: InferenceModality::Llm,
         input_ids: vec![1, 2, 3],
@@ -63,6 +64,8 @@ mod phase4_kv_protocol {
     #[test]
     fn prefill_segment_meta_round_trips_with_prefix_hint() {
         let seg = PrefillSegmentMeta {
+            multimodal: None,
+            has_multimodal: false,
             sequence_id: 7,
             block_table: vec![],
             block_size: 1,
@@ -207,6 +210,8 @@ mod phase4_kv_protocol {
             input_ids: vec![1, 2, 3],
             q_start_loc: vec![0],
             segments: vec![PrefillSegmentMeta {
+                multimodal: None,
+                has_multimodal: false,
                 sequence_id: 1,
                 block_table: vec![],
                 block_size: 1,

@@ -175,6 +175,12 @@ impl BatchBuilder {
                 .map(|(_, indices)| indices.clone());
 
             self.segments.push(PrefillSegmentMeta {
+                multimodal: if start == 0 {
+                    seq.meta.multimodal.clone()
+                } else {
+                    None
+                },
+                has_multimodal: seq.meta.multimodal.is_some(),
                 sequence_id: seq.meta.sequence_id.0,
                 block_table,
                 block_size,
@@ -242,6 +248,7 @@ mod tests {
 
     fn make_prefilling_with_blocks() -> InferenceSession<Prefilling> {
         let meta = Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: "req-paged".to_string(),
             sequence_id: SequenceId(42),

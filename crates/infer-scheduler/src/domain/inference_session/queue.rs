@@ -153,6 +153,7 @@ mod tests {
 
     fn make_seq(id: &str, priority: i32) -> InferenceSession<Queued> {
         let meta = Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: id.to_string(),
             sequence_id: crate::domain::inference_session::lifecycle::SequenceId(1),

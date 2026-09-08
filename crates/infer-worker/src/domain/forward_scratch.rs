@@ -46,7 +46,7 @@ pub struct ForwardScratch<T: Dtype, D: FusedOps> {
     /// lifetimes and reuse the slot's contiguous prefix.
     buffers: Vec<Tensor<T, D>>,
     /// Flash-attention workspace, `[flash_ws_elems] f32`. Held in
-    /// `UnsafeCell` so per-call `Attention::run` can hand the kernel a `&mut`
+    /// `UnsafeCell` so per-call `FullAttention::run` can hand the kernel a `&mut`
     /// view via `flash_workspace_mut`. Concurrent layers are NOT possible (the
     /// decoder runs layers serially on a single stream), and inside one layer
     /// the kernel reads/writes are stream-ordered — so the only thing the
@@ -99,6 +99,10 @@ macro_rules! define_forward_buffers {
 
 define_forward_buffers! {
     Normed => normed { slot: 0, columns: |d: ModelDims| d.dim },
+    GatedQkv => gated_qkv { slot: 1, columns: |d: ModelDims| 2 * d.q_dim + 2 * d.kv_dim },
+    QueryGate => query_gate { slot: 0, columns: |d: ModelDims| 2 * d.q_dim },
+    Query => query { slot: 2, columns: |d: ModelDims| d.q_dim },
+    AttentionGate => attention_gate { slot: 3, columns: |d: ModelDims| d.q_dim },
     Qkv => qkv { slot: 1, columns: |d: ModelDims| d.qkv_dim },
     AttnOut => attn_out { slot: 0, columns: |d: ModelDims| d.q_dim },
     OOut => o_out { slot: 1, columns: |d: ModelDims| d.dim },
@@ -213,7 +217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen3_4b_layout_reuses_two_physical_slots() {
+    fn qwen3_4b_layout_reserves_attention_gate_slots() {
         let dims = ModelDims {
             dim: 2560,
             q_dim: 4096,
@@ -224,12 +228,12 @@ mod tests {
             ..ModelDims::default()
         };
 
-        assert_eq!(forward_slot_columns(dims), vec![9728, 151_936]);
+        assert_eq!(forward_slot_columns(dims), vec![9728, 151_936, 4096, 4096]);
         let logical_columns: usize = ForwardBuffer::ALL
             .iter()
             .map(|field| (field.spec().columns)(dims))
             .sum();
-        assert_eq!(logical_columns, 199_040);
+        assert_eq!(logical_columns, 225_664);
         assert!(forward_slot_columns(dims).into_iter().sum::<usize>() < logical_columns);
     }
 }

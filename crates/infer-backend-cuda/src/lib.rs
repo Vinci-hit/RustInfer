@@ -358,6 +358,17 @@ impl infer_core::ports::MathOps for Cuda {
         kernels::matmul::matmul(scope_stream(scope), input, weight, output)
     }
 
+    fn linear<T: Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::matmul::linear(scope_stream(scope), input, weight, bias, output)
+    }
+
     fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         input: &Tensor<A, Self>,
@@ -478,9 +489,9 @@ impl infer_core::ports::MathOps for Cuda {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(scope);
-        let num_tokens = q.shape().as_slice()[0] as i32;
         let stream = scope_stream(scope);
         narrow_float!(T, "rope_inplace", |F| {
             kernels::rope::rope_inplace::<F>(
@@ -489,11 +500,11 @@ impl infer_core::ports::MathOps for Cuda {
                 &mut k.reinterpret::<F>(),
                 &sin.reinterpret::<F>(),
                 &cos.reinterpret::<F>(),
-                positions.data_ptr(),
-                num_tokens,
-                head_num as i32,
-                kv_head_num as i32,
-                head_dim as i32,
+                positions,
+                head_num,
+                kv_head_num,
+                head_dim,
+                rotary_dim,
             )
         })
     }
@@ -671,6 +682,37 @@ impl infer_core::ports::VocabOps for Cuda {
 }
 
 impl infer_core::ports::FusedOps for Cuda {
+    fn layer_norm<T: Dtype>(
+        scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        bias: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::scalar::layer_norm(scope_stream(scope), input, weight, bias, output, eps)
+    }
+
+    fn gelu_inplace<T: Dtype>(
+        scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        tanh: bool,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::scalar::gelu(x.device().config.stream, x, tanh)
+    }
+
+    fn rope_with_angles<T: Dtype>(
+        scope: &Self::Scope,
+        x: &mut Tensor<T, Self>,
+        sin: &Tensor<f32, Self>,
+        cos: &Tensor<f32, Self>,
+        head_dim: usize,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::scalar::rope_with_angles(x.device().config.stream, x, sin, cos, head_dim)
+    }
     fn set_prefill_gemm_mode(on: bool) {
         kernels::matmul::set_eager_prefill_gemm(on);
     }
@@ -835,6 +877,120 @@ impl infer_core::ports::FusedOps for Cuda {
         )
     }
 
+    fn causal_conv1d_silu<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        conv_state: &mut Tensor<T, Self>,
+        state_slots: &Tensor<i32, Self>,
+        cu_seqlens: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        let stream = scope_stream(scope);
+        narrow_float!(T, "causal_conv1d_silu", |F| {
+            kernels::causal_conv1d::causal_conv1d_silu::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                &mut conv_state.reinterpret::<F>(),
+                state_slots,
+                cu_seqlens,
+                &mut output.reinterpret::<F>(),
+            )
+        })
+    }
+
+    fn gated_delta_rule<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        query: &Tensor<T, Self>,
+        key: &Tensor<T, Self>,
+        value: &Tensor<T, Self>,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        a_log: &Tensor<f32, Self>,
+        dt_bias: &Tensor<T, Self>,
+        recurrent_state: &mut Tensor<f32, Self>,
+        state_slots: &Tensor<i32, Self>,
+        cu_seqlens: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        let stream = scope_stream(scope);
+        narrow_float!(T, "gated_delta_rule", |F| {
+            kernels::gated_delta_rule::gated_delta_rule::<F>(
+                stream,
+                &query.reinterpret::<F>(),
+                &key.reinterpret::<F>(),
+                &value.reinterpret::<F>(),
+                &a.reinterpret::<F>(),
+                &b.reinterpret::<F>(),
+                a_log,
+                &dt_bias.reinterpret::<F>(),
+                recurrent_state,
+                state_slots,
+                cu_seqlens,
+                &mut output.reinterpret::<F>(),
+            )
+        })
+    }
+
+    fn rmsnorm_zero_centered<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        weight: &Tensor<T, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        narrow_float!(T, "rmsnorm_zero_centered", |F| {
+            kernels::scalar::rmsnorm_zero_centered::<F>(
+                scope_stream(scope),
+                &input.reinterpret::<F>(),
+                &weight.reinterpret::<F>(),
+                &mut output.reinterpret::<F>(),
+                eps,
+            )
+        })
+    }
+
+    fn sigmoid_mul<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        output: &mut Tensor<T, Self>,
+        gate: &Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        narrow_float!(T, "sigmoid_mul", |F| {
+            kernels::scalar::sigmoid_mul::<F>(
+                scope_stream(scope),
+                &mut output.reinterpret::<F>(),
+                &gate.reinterpret::<F>(),
+            )
+        })
+    }
+
+    fn gated_rmsnorm<T: infer_core::dtype::Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        input: &Tensor<T, Self>,
+        gate: &Tensor<T, Self>,
+        weight: &Tensor<f32, Self>,
+        output: &mut Tensor<T, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        let stream = scope_stream(scope);
+        narrow_float!(T, "gated_rmsnorm", |F| {
+            kernels::gated_rmsnorm::gated_rmsnorm::<F>(
+                stream,
+                &input.reinterpret::<F>(),
+                &gate.reinterpret::<F>(),
+                weight,
+                &mut output.reinterpret::<F>(),
+                eps,
+            )
+        })
+    }
+
     fn argmax<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         logits: &Tensor<T, Self>,
@@ -938,6 +1094,7 @@ impl infer_core::ports::FusedOps for Cuda {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
         kv_dim: usize,
     ) -> OpResult<()> {
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
@@ -983,11 +1140,11 @@ impl infer_core::ports::FusedOps for Cuda {
                     head_num,
                     kv_head_num,
                     head_dim,
+                    rotary_dim,
                     kv_dim,
                 )
             }
             (None, None) => {
-                let num_tokens = q.shape().as_slice()[0] as i32;
                 let stream = scope_stream(ctx.scope());
                 narrow_float!(T, "rope_inplace", |F| {
                     kernels::rope::rope_inplace::<F>(
@@ -996,11 +1153,11 @@ impl infer_core::ports::FusedOps for Cuda {
                         &mut k.reinterpret::<F>(),
                         &sin.reinterpret::<F>(),
                         &cos.reinterpret::<F>(),
-                        positions.data_ptr(),
-                        num_tokens,
-                        head_num as i32,
-                        kv_head_num as i32,
-                        head_dim as i32,
+                        positions,
+                        head_num,
+                        kv_head_num,
+                        head_dim,
+                        rotary_dim,
                     )
                 })?;
                 kernels::kv_cache::scatter_kv_paged(
@@ -1598,8 +1755,8 @@ impl CoreOps for Cuda {
         head_num: usize,
         kv_head_num: usize,
         head_dim: usize,
+        rotary_dim: usize,
     ) -> OpResult<()> {
-        let num_tokens = q.shape().as_slice()[0] as i32;
         let stream = q.device().config.stream;
         narrow_float!(T, "rope_inplace", |F| {
             kernels::rope::rope_inplace::<F>(
@@ -1608,11 +1765,11 @@ impl CoreOps for Cuda {
                 &mut k.reinterpret::<F>(),
                 &sin.reinterpret::<F>(),
                 &cos.reinterpret::<F>(),
-                positions.data_ptr(),
-                num_tokens,
-                head_num as i32,
-                kv_head_num as i32,
-                head_dim as i32,
+                positions,
+                head_num,
+                kv_head_num,
+                head_dim,
+                rotary_dim,
             )
         })
     }

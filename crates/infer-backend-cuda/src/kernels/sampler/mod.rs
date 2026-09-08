@@ -100,3 +100,52 @@ pub fn argmax<T: Dtype>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::bf16;
+    use infer_core::exec::ExecScope;
+
+    #[test]
+    fn bf16_argmax_ties_choose_first_across_lanes_blocks_and_selected_rows() {
+        let cuda = Cuda::new(0).unwrap();
+        let scope = crate::CudaScope::new(cuda.clone());
+        let vocab = 248320;
+        let mut values = vec![bf16::from_f32(-1.0); 3 * vocab];
+        for (row, indices) in [
+            (0, vec![198, 271]),
+            (1, vec![2, 3, 2050, 200000]),
+            (2, vec![3501, 3502, 247999]),
+        ] {
+            for i in indices {
+                values[row * vocab + i] = bf16::from_f32(23.625);
+            }
+        }
+        let logits = Tensor::from_host_slice(&values, [3, vocab], &cuda).unwrap();
+        let workspace = Tensor::zeros([3, 256], &cuda).unwrap();
+        let mut output = Tensor::zeros([3], &cuda).unwrap();
+        argmax(
+            crate::scope_stream(&scope),
+            &logits,
+            &mut output,
+            &workspace,
+            None,
+        )
+        .unwrap();
+        scope.synchronize().unwrap();
+        assert_eq!(output.to_host_vec().unwrap(), vec![198, 2, 3501]);
+        let selected = Tensor::from_host_slice(&[2, 0], [2], &cuda).unwrap();
+        let mut picked = Tensor::zeros([2], &cuda).unwrap();
+        argmax(
+            crate::scope_stream(&scope),
+            &logits,
+            &mut picked,
+            &workspace,
+            Some(&selected),
+        )
+        .unwrap();
+        scope.synchronize().unwrap();
+        assert_eq!(picked.to_host_vec().unwrap(), vec![3501, 198]);
+    }
+}

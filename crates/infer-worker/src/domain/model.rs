@@ -1,9 +1,9 @@
 //! Decoder model trait — the sliceable embed / decode_layers / finalize
 //! contract every LLM the runtime drives implements.
 
+use super::cache::{CacheLayout, ModelCacheView};
 use super::component::{Hidden, LayerRange, StageKind};
 use super::dtype::Dtype as V2Dtype;
-use super::kv::KvView;
 use super::ports::OpResult;
 use super::ports::backend::LlmBackend;
 use super::tensor::Tensor;
@@ -62,7 +62,24 @@ pub enum SampleRows<'a> {
 }
 
 pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
+    /// (rotary dimensions, theta, interleaved T/H/W frequency counts).
+    fn multimodal_rope(&self) -> Option<(usize, f64, [usize; 3])> {
+        None
+    }
+
+    fn encode_image(
+        &self,
+        _image: &infer_protocol::multimodal::ImageInput,
+        _scope: &D::Scope,
+    ) -> OpResult<Tensor<T, D>> {
+        Err(crate::domain::ports::OpError::unsupported(
+            "model",
+            "image inputs",
+        ))
+    }
+
     fn dims(&self) -> ModelDims;
+    fn cache_layout(&self) -> &CacheLayout;
     fn stages(&self) -> &[StageKind];
 
     /// Install the shared, address-stable per-layer forward scratch into the
@@ -72,6 +89,13 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         &mut self,
         _scratch: std::rc::Rc<crate::domain::forward_scratch::ForwardScratch<T, D>>,
     ) {
+    }
+
+    fn install_gdn_scratch(
+        &mut self,
+        _scratch: std::rc::Rc<crate::domain::gdn_scratch::GdnScratch<T, D>>,
+    ) -> OpResult<()> {
+        Ok(())
     }
 
     fn embed(
@@ -85,7 +109,7 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         &self,
         range: LayerRange,
         hidden: &mut Hidden<T, D>,
-        kv: &mut KvView<'_, T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
         ctx: &crate::domain::exec::StepCtx<'_, D>,
     ) -> OpResult<()>;
 
@@ -100,12 +124,12 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         &self,
         input_ids: &Tensor<i32, D>,
         hidden: &mut Hidden<T, D>,
-        kv: &mut KvView<'_, T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
         rows: SampleRows<'_>,
         ctx: &crate::domain::exec::StepCtx<'_, D>,
     ) -> OpResult<Logits<T, D>> {
         self.embed(input_ids, hidden, ctx)?;
-        self.decode_layers(LayerRange::all(self.dims().num_layers), hidden, kv, ctx)?;
+        self.decode_layers(LayerRange::all(self.dims().num_layers), hidden, cache, ctx)?;
         self.finalize(hidden, rows, ctx)
     }
 }

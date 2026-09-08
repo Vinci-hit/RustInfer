@@ -143,6 +143,7 @@ fn worker_group() -> WorkerGroup {
 
 fn prefilling_sequence() -> InferenceSession<Prefilling> {
     let meta = Arc::new(RequestMeta {
+        multimodal: None,
         id: RequestId::new_v4(),
         external_id: "req-need-blocks".to_string(),
         sequence_id: SequenceId(7),
@@ -191,6 +192,7 @@ async fn rejected_ingestion_returns_an_immediate_error() -> Result<()> {
         WorkerId::from_identity(b"worker-test"),
     );
     let request = InferenceRequest {
+        multimodal: None,
         request_id: "invalid-empty-prompt".to_string(),
         modality: InferenceModality::Llm,
         input_ids: vec![],
@@ -429,6 +431,7 @@ async fn prefix_cache_prefill_proactively_evicts_lru_before_dispatch() -> Result
     assert_eq!(engine.radix.lru_total_indices(), 4);
 
     let meta = Arc::new(RequestMeta {
+        multimodal: None,
         id: RequestId::new_v4(),
         external_id: "prefill-needs-evict".to_string(),
         sequence_id: SequenceId(77),
@@ -499,6 +502,7 @@ async fn llm_prefill_admits_concurrently_when_kv_has_headroom() -> Result<()> {
 
     let make_meta = |external_id: &str, sequence_id: u64| {
         Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: external_id.to_string(),
             sequence_id: SequenceId(sequence_id),
@@ -574,6 +578,7 @@ fn make_engine() -> (
 
 fn insert_decoding_session(engine: &mut SchedulerEngine, sid: u64, input_len: usize) -> RequestId {
     let meta = Arc::new(RequestMeta {
+        multimodal: None,
         id: RequestId::new_v4(),
         external_id: format!("ext-{}", sid),
         sequence_id: SequenceId(sid),
@@ -1081,6 +1086,7 @@ async fn alloc_failed_round_1_preempts_decoding() -> Result<()> {
     //   seq 12: input=20, output=5   → second
     let mut build_decoding = |sid: u64, input_len: usize, output_n: usize| {
         let meta = Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: format!("ext-{}", sid),
             sequence_id: SequenceId(sid),

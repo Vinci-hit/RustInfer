@@ -1,8 +1,8 @@
 //! Assembled decoder model — a stage list of reusable components driven over
 //! the sliceable `embed` / `decode_layers(range)` / `finalize` contract.
 //!
-//! Llama3 and Qwen3 share this exact structure; the only difference is whether
-//! each block's `Attention` carries Qwen3-style Q/K norms (set at load time).
+//! Each block selects full attention or a recurrent GDN attention. Llama3 and
+//! Qwen3 use full attention throughout; mixed models supply their layer sequence.
 //!
 //! Concrete model files decide which FFN type and tensor convention to use.
 //! This module only provides the shared decoder shell plus a dense-decoder
@@ -13,16 +13,18 @@ use crate::components::decoder_block::DecoderBlock;
 use crate::components::embed::Embed;
 use crate::components::ffn_dense::DenseFfn;
 use crate::components::ffn_moe::MoeFfn;
+use crate::components::full_attention::FullAttention;
 use crate::components::linear::Linear as CompLinear;
 use crate::components::lm_head::LmHead;
 use crate::components::norm::RmsNorm;
 use std::rc::Rc;
 
+use crate::domain::cache::{CacheLayout, ModelCacheView};
 use crate::domain::component::{Component, Hidden, LayerRange, StageKind};
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
-use crate::domain::kv::KvView;
+use crate::domain::gdn_scratch::GdnScratch;
 use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpBackend, OpError, OpResult};
@@ -57,18 +59,88 @@ impl<T: Dtype, D: LlmBackend> DecoderFfn<T, D> for MoeFfn<T, D> {
 /// is supplied by the concrete model implementation file.
 pub struct Decoder<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D> = DenseFfn<T, D>> {
     pub embed: Embed<T, D>,
-    pub blocks: Vec<DecoderBlock<T, D, F>>,
+    blocks: Vec<DecoderBlock<T, D, F>>,
     pub norm: RmsNorm<T, D>,
     pub lm_head: LmHead<T, D>,
-    pub dims: ModelDims,
+    dims: ModelDims,
+    cache_layout: CacheLayout,
     /// Shared per-forward scratch installed by `Runtime::new`; standalone
     /// models may fall back to pooled norm/logits allocations.
     pub scratch: Option<Rc<ForwardScratch<T, D>>>,
 }
 
+impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> Decoder<T, D, F> {
+    pub fn new(
+        embed: Embed<T, D>,
+        blocks: Vec<DecoderBlock<T, D, F>>,
+        norm: RmsNorm<T, D>,
+        lm_head: LmHead<T, D>,
+        dims: ModelDims,
+    ) -> OpResult<Self> {
+        dims.validate()?;
+        if blocks.len() != dims.num_layers {
+            return Err(OpError::Shape(
+                "decoder block count does not match num_layers".into(),
+            ));
+        }
+        for block in &blocks {
+            match &block.attention {
+                Attention::Linear(gdn) if gdn.hidden_dim() != dims.dim => {
+                    return Err(OpError::Shape(
+                        "GDN hidden width does not match decoder".into(),
+                    ));
+                }
+                Attention::Full(attn)
+                    if attn.head_num != dims.head_num
+                        || attn.kv_head_num != dims.kv_head_num
+                        || attn.head_dim != dims.head_dim =>
+                {
+                    return Err(OpError::Shape(
+                        "attention geometry does not match decoder".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let cache_layout =
+            CacheLayout::new(blocks.iter().map(|block| block.attention.cache_spec()))?;
+        Ok(Self {
+            embed,
+            blocks,
+            norm,
+            lm_head,
+            dims,
+            cache_layout,
+            scratch: None,
+        })
+    }
+
+    /// Install a workspace shared by equally shaped GDN layers. Validate the
+    /// whole stack before replacing any component's workspace.
+    pub fn install_gdn_scratch(&mut self, scratch: Rc<GdnScratch<T, D>>) -> OpResult<()> {
+        for &dims in self.cache_layout.linear_dims() {
+            scratch.validate(self.dims.dim, dims, 0)?;
+        }
+        for block in &mut self.blocks {
+            if let Attention::Linear(gdn) = &mut block.attention {
+                gdn.install_scratch(scratch.clone())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decoder<T, D, F> {
+    fn install_gdn_scratch(&mut self, scratch: Rc<GdnScratch<T, D>>) -> OpResult<()> {
+        Decoder::install_gdn_scratch(self, scratch)
+    }
+
     fn dims(&self) -> ModelDims {
         self.dims
+    }
+
+    fn cache_layout(&self) -> &CacheLayout {
+        &self.cache_layout
     }
 
     fn stages(&self) -> &[StageKind] {
@@ -80,7 +152,7 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         scratch: std::rc::Rc<crate::domain::forward_scratch::ForwardScratch<T, D>>,
     ) {
         for block in &mut self.blocks {
-            block.attention.scratch = Some(scratch.clone());
+            block.attention.install_scratch(scratch.clone());
             block.ffn.install_scratch(scratch.clone());
         }
         self.scratch = Some(scratch);
@@ -99,13 +171,24 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         &self,
         range: LayerRange,
         hidden: &mut Hidden<T, D>,
-        kv: &mut KvView<'_, T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
+        cache.validate(&self.cache_layout, range, ctx.plan())?;
+        if hidden.stream.shape().as_slice() != [ctx.plan().num_tokens, self.dims.dim] {
+            return Err(OpError::Shape(
+                "decoder hidden shape does not match plan".into(),
+            ));
+        }
+        // Validate every GDN before any earlier layer can modify its cache.
+        for block in &self.blocks[range.start..range.end] {
+            if let Attention::Linear(gdn) = &block.attention {
+                gdn.validate_execution(hidden, ctx)?;
+            }
+        }
         for layer_idx in range.start..range.end {
-            let local = layer_idx - range.start;
-            let mut layer_view = kv.single_layer(local);
-            self.blocks[layer_idx].run(hidden, Some(&mut layer_view), ctx)?;
+            let layer_cache = cache.layer(self.cache_layout.layers()[layer_idx])?;
+            self.blocks[layer_idx].run(hidden, layer_cache, ctx)?;
         }
         // Flush the last sublayer's deferred residual delta so `stream` holds the
         // true residual for `finalize`. This is the one residual boundary not
@@ -264,7 +347,7 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
 
     let (sin_cache, cos_cache) = compute_rope_cache::<T, D>(
         cfg.seq_len,
-        cfg.head_dim,
+        cfg.rotary_dim,
         cfg.rope_theta,
         cfg.rope_scaling.as_ref(),
         device,
@@ -291,7 +374,7 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         )?;
         let qkv_proj = loader.load_fused_qkv_with_fp8::<T, D>(
             &lp,
-            global_q_dim,
+            global_q_dim * (1 + usize::from(cfg.attn_output_gate)),
             global_kv_dim,
             cfg.dim,
             cfg.fp8_block,
@@ -362,7 +445,7 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         }
 
         blocks.push(DecoderBlock {
-            attention: Attention {
+            attention: Attention::Full(FullAttention {
                 input_layernorm: comp_rms(input_layernorm),
                 qkv_proj,
                 o_proj,
@@ -373,9 +456,11 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
                 head_num: local_head_num,
                 kv_head_num: local_kv_head_num,
                 head_dim: cfg.head_dim,
+                rotary_dim: cfg.rotary_dim,
+                attn_output_gate: cfg.attn_output_gate,
                 scale,
                 scratch: None,
-            },
+            }),
             ffn: DenseFfn {
                 post_attention_layernorm: comp_rms(post_attention_layernorm),
                 gate_up_proj,
@@ -385,12 +470,12 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         });
     }
 
-    Ok(Decoder {
+    Decoder::new(
         embed,
         blocks,
-        norm: comp_rms(final_norm),
-        lm_head: LmHead { proj: lm_head },
-        dims: ModelDims {
+        comp_rms(final_norm),
+        LmHead { proj: lm_head },
+        ModelDims {
             dim: cfg.dim,
             q_dim,
             kv_dim,
@@ -406,13 +491,13 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
             moe_intermediate_size: 0,
             num_shared_experts: 0,
         },
-        scratch: None,
-    })
+    )
 }
 
 /// `models::layers::RMSNorm` → `components::RmsNorm`.
 fn comp_rms<T: Dtype, D: OpBackend + LlmBackend>(r: LayerRmsNorm<T, D>) -> RmsNorm<T, D> {
     RmsNorm {
+        zero_centered: false,
         weight: r.weight,
         eps: r.eps,
     }
@@ -446,7 +531,11 @@ mod tests {
     }
 
     fn rms(weight: Tensor<f32, Cpu>) -> RmsNorm<f32, Cpu> {
-        RmsNorm { weight, eps: 1e-5 }
+        RmsNorm {
+            zero_centered: false,
+            weight,
+            eps: 1e-5,
+        }
     }
 
     fn lin(rows: usize, cols: usize) -> Linear<f32, Cpu> {
@@ -460,19 +549,19 @@ mod tests {
         let kv_dim = HEAD_NUM * HEAD_DIM;
         let qkv_dim = q_dim + 2 * kv_dim;
         let sin = Tensor::from_host_slice(
-            &vec![0.0f32; MAX_SEQ * HEAD_DIM],
-            Shape::from_slice(&[MAX_SEQ, HEAD_DIM]),
+            &vec![0.0f32; MAX_SEQ * (HEAD_DIM / 2)],
+            Shape::from_slice(&[MAX_SEQ, HEAD_DIM / 2]),
             &Cpu,
         )
         .unwrap();
         let cos = Tensor::from_host_slice(
-            &vec![1.0f32; MAX_SEQ * HEAD_DIM],
-            Shape::from_slice(&[MAX_SEQ, HEAD_DIM]),
+            &vec![1.0f32; MAX_SEQ * (HEAD_DIM / 2)],
+            Shape::from_slice(&[MAX_SEQ, HEAD_DIM / 2]),
             &Cpu,
         )
         .unwrap();
         let block = DecoderBlock {
-            attention: Attention {
+            attention: Attention::Full(FullAttention {
                 input_layernorm: rms(ones(DIM)),
                 qkv_proj: lin(qkv_dim, DIM),
                 o_proj: lin(DIM, q_dim),
@@ -483,9 +572,11 @@ mod tests {
                 head_num: HEAD_NUM,
                 kv_head_num: HEAD_NUM,
                 head_dim: HEAD_DIM,
+                rotary_dim: HEAD_DIM,
+                attn_output_gate: false,
                 scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                 scratch: None,
-            },
+            }),
             ffn: DenseFfn {
                 post_attention_layernorm: rms(ones(DIM)),
                 gate_up_proj: lin(2 * INTER, DIM),
@@ -493,14 +584,14 @@ mod tests {
                 scratch: None,
             },
         };
-        Decoder {
-            embed: Embed::new(weight(VOCAB, DIM)),
-            blocks: vec![block],
-            norm: rms(ones(DIM)),
-            lm_head: LmHead {
+        Decoder::new(
+            Embed::new(weight(VOCAB, DIM)),
+            vec![block],
+            rms(ones(DIM)),
+            LmHead {
                 proj: lin(VOCAB, DIM),
             },
-            dims: ModelDims {
+            ModelDims {
                 dim: DIM,
                 q_dim,
                 kv_dim,
@@ -516,11 +607,11 @@ mod tests {
                 moe_intermediate_size: 0,
                 num_shared_experts: 0,
             },
-            scratch: None,
-        }
+        )
+        .unwrap()
     }
 
-    use crate::components::attention::Attention;
+    use crate::components::full_attention::FullAttention;
 
     fn runner(num_blocks: usize, cap_batch: usize) -> Runtime<f32, Cpu, Decoder<f32, Cpu>> {
         Runtime::new(

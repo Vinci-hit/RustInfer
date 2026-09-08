@@ -33,12 +33,12 @@ jobs:
         run: |
           cargo clippy -p infer-core -p infer-backend-cpu -p infer-protocol \
             -p infer-scheduler -p infer-server --all-targets -- -D warnings
-          cargo clippy -p infer-worker --no-default-features --lib -- -D warnings
+          cargo clippy -p infer-worker --no-default-features --all-targets -- -D warnings
       - name: Test GPU-independent crates
         run: |
           cargo test -p infer-core -p infer-backend-cpu -p infer-protocol \
             -p infer-scheduler -p infer-server
-          cargo test -p infer-worker --no-default-features --lib
+          cargo test -p infer-worker --no-default-features --lib --tests
 
   frontend:
     name: Browser frontend

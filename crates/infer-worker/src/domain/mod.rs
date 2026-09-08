@@ -4,9 +4,11 @@
 //! All trait definitions (ports) live here. Infrastructure implements them.
 
 pub use infer_core::component;
+pub mod cache;
 pub use infer_core::dtype;
 pub use infer_core::exec;
 pub mod forward_scratch;
+pub mod gdn_scratch;
 pub mod global_kv_alloc;
 pub use infer_core::kv;
 #[cfg(test)]

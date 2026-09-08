@@ -18,6 +18,8 @@ pub struct ModelInfo {
 
 /// 共享应用状态，通过 Axum State 注入到所有 handler
 pub struct AppState {
+    pub image_processor: Option<Arc<crate::chat::multimodal::Qwen35Processor>>,
+    pub image_admission: Arc<tokio::sync::Semaphore>,
     /// ZMQ 客户端（与 Scheduler 通信）
     pub client: ZmqClient,
     /// Tokenizer（Server 端负责 encode/decode）

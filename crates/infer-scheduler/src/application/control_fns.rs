@@ -412,6 +412,7 @@ mod tests {
     fn dummy_running_session(table: &mut RequestTable, external_id: &str, sid: u64) -> RequestId {
         let request_id = RequestId::new_v4();
         let meta = Arc::new(RequestMeta {
+            multimodal: None,
             id: request_id,
             external_id: external_id.into(),
             sequence_id: SequenceId(sid),

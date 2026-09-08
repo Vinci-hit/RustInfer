@@ -161,9 +161,27 @@ where
         self.graph = Some(GraphRunner::new(
             self.capture_sizes.clone(),
             self.cap_batch,
-            PREFILL_GRAPH_MAX_TOKENS,
+            if self.has_recurrent_state() {
+                0
+            } else {
+                PREFILL_GRAPH_MAX_TOKENS
+            },
         )?);
         Ok(())
+    }
+
+    /// Smallest capture size usable for padding the mixed-step decode prefix.
+    /// Hybrid mixed steps remain eager and use their actual row count; their
+    /// pure decode graph selection goes through GraphRunner instead.
+    pub fn next_capture_slot(&self, batch: usize) -> Option<usize> {
+        if self.has_recurrent_state() || batch == 0 {
+            return None;
+        }
+        self.capture_sizes
+            .iter()
+            .copied()
+            .filter(|&s| s >= batch && s <= self.cap_batch)
+            .min()
     }
 
     /// Eagerly capture a decode CUDA graph for every configured capture size,
@@ -186,25 +204,20 @@ where
     /// admitted, and real sequences allocate from the free list and overwrite
     /// whatever lands there. The decode kernels address the KV pool by raw
     /// block id, so no allocator interaction or ownership check is needed.
-    /// Smallest decode capture size `>= batch` (and `<= cap_batch`), or `None` if
-    /// `batch` is 0 or exceeds the largest capture size. The fused path pads its
-    /// cuDNN decode-prefix up to this slot so the prewarmed (per-capture-size)
-    /// cuDNN SDPA plan is reused instead of paying a ~370ms HEURISTICS_CHOICE
-    /// build on every novel decode-row count. See [[eager-fused-mixed-tail-regression]].
-    pub fn next_capture_slot(&self, batch: usize) -> Option<usize> {
-        if batch == 0 {
-            return None;
-        }
-        self.capture_sizes
-            .iter()
-            .copied()
-            .filter(|&s| s >= batch && s <= self.cap_batch)
-            .min()
-    }
-
+    /// Hybrid warmup requests release their recurrent slots after every size;
+    /// subsequent assignment clears those synthetic histories before reuse.
     pub fn prewarm_decode_graphs(&mut self) -> OpResult<()> {
         if self.graph.is_none() {
             return Ok(());
+        }
+        if self
+            .recurrent
+            .as_ref()
+            .is_some_and(|state| state.has_live_sequences())
+        {
+            return Err(OpError::Shape(
+                "decode graph prewarm requires no live recurrent sequences".into(),
+            ));
         }
         for batch in self.capture_sizes.clone() {
             if batch == 0 || batch > self.cap_batch {
@@ -232,7 +245,16 @@ where
                 draft_tokens: Vec::new(),
             };
             // Drives the `step_graph` cold path for this exact size → capture.
-            self.step(&req)?;
+            let result = self.step(&req);
+            // Synthetic recurrent histories must not occupy request slots or
+            // leak into the next capture size. Reassignment resets both states.
+            if self.has_recurrent_state() {
+                for seq in &req.seqs {
+                    self.release_sequence(seq.sequence_id);
+                    self.kv_pool.seq_kv_len.remove(&seq.sequence_id);
+                }
+            }
+            result?;
             if self.scope.topology().tp.size > 1 {
                 // NCCL treats graph launch as a collective. The mirrored cold
                 // Step above must finish capture/instantiate on every rank
@@ -264,6 +286,9 @@ where
     /// allocator rounds sizes to bins, so a coarse grid covers nearby lengths;
     /// scratch KV blocks `0..len` are throwaway (overwritten by real requests).
     pub fn prewarm_prefill_shapes(&mut self, lengths: &[usize]) -> OpResult<()> {
+        if self.has_recurrent_state() {
+            return Ok(());
+        }
         let max_len = self
             .max_seq_len
             .min(self.cap_num_tokens)
@@ -350,20 +375,20 @@ where
         if self.scope.graph_ready(key) {
             // Hot path: pure replay. `upload_index` (in `step`) and the id
             // refresh above already rewrote every input buffer this graph reads.
-            self.scope.graph_launch(key)?;
+            self.launch_decode_graph(key)?;
         } else if slot_batch == plan.batch {
             // Cold path, exact shape. First run one EAGER forward at this exact
             // shape so the libraries that lazily plan/benchmark on a cold shape
             // (cuDNN SDPA plan cache, cuBLASLt algo selection) populate their
             // shape-keyed caches — those code paths do mallocs/private-stream
             // launches that are illegal under stream capture. This eager pass
-            // also produces a correct result; the KV scatter it performs writes
-            // the same values at the same paged positions the replay will, so
-            // the immediately following capture+launch is idempotent on KV state.
+            // also produces this step's result. KV writes are idempotent, but
+            // recurrent updates are not: hybrid models return the eager result
+            // after recording and only replay the graph on subsequent steps.
             self.forward_finalize_argmax(plan, &input_ids)?;
             self.scope.synchronize()?;
 
-            // Now trace the (warm) forward+finalize+argmax into a graph and run once.
+            // Stream capture records kernels without executing them.
             self.scope.graph_capture_begin()?;
             if let Err(e) = self.forward_finalize_argmax(plan, &input_ids) {
                 // Close the capture so the stream is left in a usable state.
@@ -375,7 +400,7 @@ where
                 "[graph] captured decode graph (forward+argmax) for batch={}",
                 plan.batch
             );
-            if self.scope.topology().tp.size == 1 {
+            if self.scope.topology().tp.size == 1 && !self.has_recurrent_state() {
                 self.scope.graph_launch(key)?;
             }
         } else {
@@ -394,6 +419,15 @@ where
         // synchronize before capture is still required (and already issued
         // above before `graph_capture_begin`).
         self.decode_output_from_c(plan, req)
+    }
+
+    /// Replay bypasses run_layers, so advance host-owned recurrent history here.
+    pub(super) fn launch_decode_graph(&mut self, key: u64) -> OpResult<()> {
+        let result = self.scope.graph_launch(key);
+        if let Some(state) = &mut self.recurrent {
+            state.complete(result.is_ok());
+        }
+        result
     }
 
     /// Single-sequence prefill via CUDA graph (Stage A). The captured region is

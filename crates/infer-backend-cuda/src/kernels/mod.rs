@@ -17,10 +17,13 @@ pub mod dtype_kernel;
 // --- kernels with a co-located mod.rs in their dir ---
 pub mod add;
 pub mod broadcast_mul;
+pub mod causal_conv1d;
 pub mod embedding;
 pub mod ewise_mul;
 pub mod flash_attn_gqa; // was attention_paged
 pub mod fused_add_rmsnorm;
+pub mod gated_delta_rule;
+pub mod gated_rmsnorm;
 pub mod gather_merge;
 pub mod groupnorm;
 pub mod kv_cache; // was scatter_kv_paged

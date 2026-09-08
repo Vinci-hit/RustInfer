@@ -415,7 +415,12 @@ where
         || pending_prefills
             .iter()
             .any(cmd_requires_stochastic_sampling);
-    let overlap_enabled = !stochastic_requested
+    let multimodal_requested = active.keys().any(|&id| runner.has_multimodal_sequence(id))
+        || pending_prefills
+            .iter()
+            .any(|cmd| cmd.segments.iter().any(|s| s.has_multimodal));
+    let overlap_enabled = !multimodal_requested
+        && !stochastic_requested
         && runner.mixed_eager_mode()
         && std::env::var_os("RUSTINFER_FUSED_OVERLAP").is_none_or(|v| v != "0");
     let mut overlap_prior: Option<(Vec<u64>, Vec<u32>, KvLease)> = None;
@@ -746,7 +751,8 @@ where
             draft_tokens: Vec::new(),
             seqs,
         };
-        let stochastic_group = req.sampling.iter().any(|params| !params.is_greedy());
+        let stochastic_group =
+            req.sampling.iter().any(|params| !params.is_greedy()) || multimodal_requested;
         let mut mixed_lease = KvLease::empty();
         let mut mixed_device_prepared = false;
         if can_record_abc_rows && !stochastic_group {
@@ -774,12 +780,39 @@ where
         } else {
             Some(mixed_lease.as_slice())
         };
+        runner.retain_sequences(
+            active
+                .keys()
+                .chain(prefilling.keys())
+                .copied()
+                .chain(req.seqs.iter().map(|seq| seq.sequence_id)),
+        );
         let (out_res, prior_send) = if stochastic_group {
             // Mixed ABC bakes argmax into its graph/eager region. The regular
             // eager runtime leaves logits available to the filtered sampler.
             // Stochastic admission disabled overlap above, so no placeholder
             // decode ids can reach this branch.
-            let out = runner.step(&req);
+            let out = (|| {
+                for &pi in &group.preps {
+                    let prep = &preps[pi];
+                    for (segment, plan) in prep.cmd.segments.iter().zip(&prep.plans) {
+                        if plan.skipped {
+                            continue;
+                        }
+                        if let Some(input) = &segment.multimodal {
+                            runner.register_multimodal(segment.sequence_id, input.clone())?;
+                        }
+                        if segment.has_multimodal
+                            != runner.has_multimodal_sequence(segment.sequence_id)
+                        {
+                            return Err(OpError::Shape(
+                                "missing or stale multimodal request state".into(),
+                            ));
+                        }
+                    }
+                }
+                runner.step(&req)
+            })();
             let sent = send_prior_output(data, &mut prior_output);
             (out, sent)
         } else {

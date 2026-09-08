@@ -72,6 +72,7 @@ mod tests {
 
     fn meta_for_test(stream: bool, prompt: Vec<i32>) -> Arc<RequestMeta> {
         Arc::new(RequestMeta {
+            multimodal: None,
             id: RequestId::new_v4(),
             external_id: "test-ext".to_string(),
             sequence_id: SequenceId(1),

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct ChatCompletionRequest {
     #[serde(default)]
     pub model: Option<String>,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<InputChatMessage>,
 
     #[serde(default)]
     pub max_tokens: Option<usize>,
@@ -47,6 +47,58 @@ pub struct ChatCompletionRequest {
 }
 
 /// 聊天消息
+#[derive(Debug, Clone, Deserialize)]
+pub struct InputChatMessage {
+    pub role: String,
+    pub content: MessageContent,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl InputChatMessage {
+    pub fn has_image(&self) -> bool {
+        matches!(&self.content, MessageContent::Parts(parts) if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+    }
+    pub fn text_message(&self) -> Result<ChatMessage, &'static str> {
+        let content = match &self.content {
+            MessageContent::Text(text) => text.clone(),
+            MessageContent::Parts(parts) => {
+                let mut text = String::new();
+                for p in parts {
+                    match p {
+                        ContentPart::Text { text: t } => text.push_str(t),
+                        _ => return Err("model does not support images"),
+                    }
+                }
+                text
+            }
+        };
+        Ok(ChatMessage {
+            role: self.role.clone(),
+            content,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

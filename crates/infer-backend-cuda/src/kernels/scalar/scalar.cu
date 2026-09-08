@@ -1,5 +1,41 @@
 #include "scalar.h"
 
+template<typename T>
+__global__ void gelu_kernel(T* x, int n, bool approximate) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float a = static_cast<float>(x[i]);
+        float c = approximate ? tanhf(0.7978845608f * (a + 0.044715f * a * a * a)) : erff(a * 0.7071067812f);
+        x[i] = static_cast<T>(0.5f * a * (1.0f + c));
+    }
+}
+
+template<typename T>
+__global__ void rotary_angles_kernel(T* x, const float* sin, const float* cos,
+    int heads, int dim, int half_dim, long long row_stride) {
+    int row = blockIdx.x / heads;
+    int head = blockIdx.x % heads;
+    for (int j = threadIdx.x; j < half_dim; j += blockDim.x) {
+        T* p = x + row * row_stride + head * dim;
+        float a = static_cast<float>(p[j]), b = static_cast<float>(p[j + half_dim]);
+        float s = sin[row * half_dim + j], c = cos[row * half_dim + j];
+        p[j] = static_cast<T>(a * c - b * s);
+        p[j + half_dim] = static_cast<T>(a * s + b * c);
+    }
+}
+
+extern "C" void gelu_forward(void* x, int dtype, int n, bool approximate, cudaStream_t stream) {
+    if (dtype == 0) gelu_kernel<<<(n+255)/256,256,0,stream>>>((float*)x,n,approximate);
+    if (dtype == 1) gelu_kernel<<<(n+255)/256,256,0,stream>>>((__half*)x,n,approximate);
+    if (dtype == 2) gelu_kernel<<<(n+255)/256,256,0,stream>>>((__nv_bfloat16*)x,n,approximate);
+}
+extern "C" void rotary_angles_forward(void* x, int dtype, const float* sin, const float* cos,
+    int rows, int heads, int dim, int half_dim, long long row_stride, cudaStream_t stream) {
+    if (dtype == 0) rotary_angles_kernel<<<rows*heads,32,0,stream>>>((float*)x,sin,cos,heads,dim,half_dim,row_stride);
+    if (dtype == 1) rotary_angles_kernel<<<rows*heads,32,0,stream>>>((__half*)x,sin,cos,heads,dim,half_dim,row_stride);
+    if (dtype == 2) rotary_angles_kernel<<<rows*heads,32,0,stream>>>((__nv_bfloat16*)x,sin,cos,heads,dim,half_dim,row_stride);
+}
+
 // ===================== scalar_mul kernels =====================
 
 __global__ void scalar_mul_f32_kernel(float* dst, const float* src, float val, int n) {
@@ -440,4 +476,87 @@ void sinusoid_embedding_from_dev_f16_forward(__half* out, const float* d_t, int 
     constexpr int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     sinusoid_embedding_from_dev_f16_kernel<<<blocks, threads, 0, stream>>>(out, d_t, dim);
+}
+
+// Round sigmoid to the activation dtype before multiplying, matching PyTorch.
+template<typename T>
+__global__ void sigmoid_mul_kernel(T* output, const T* gate, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        T sigmoid = static_cast<T>(1.0f / (1.0f + expf(-static_cast<float>(gate[i]))));
+        output[i] = static_cast<T>(static_cast<float>(output[i]) * static_cast<float>(sigmoid));
+    }
+}
+extern "C" void sigmoid_mul_f32_forward(float* output, const float* gate, int n, cudaStream_t stream) {
+    sigmoid_mul_kernel<<<(n + 255) / 256, 256, 0, stream>>>(output, gate, n);
+}
+extern "C" void sigmoid_mul_bf16_forward(__nv_bfloat16* output, const __nv_bfloat16* gate, int n, cudaStream_t stream) {
+    sigmoid_mul_kernel<<<(n + 255) / 256, 256, 0, stream>>>(output, gate, n);
+}
+extern "C" void sigmoid_mul_f16_forward(__half* output, const __half* gate, int n, cudaStream_t stream) {
+    sigmoid_mul_kernel<<<(n + 255) / 256, 256, 0, stream>>>(output, gate, n);
+}
+
+// Qwen3.5 scales and normalization remain FP32 until the final store.
+template<typename T>
+__global__ void zero_norm_kernel(const T* input, const T* weight, T* output,
+    int heads, int dim, int input_stride, int output_stride, float eps) {
+    int row = blockIdx.x;
+    int src = (row / heads) * input_stride + (row % heads) * dim;
+    int dst = (row / heads) * output_stride + (row % heads) * dim;
+    __shared__ float sums[256];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = static_cast<float>(input[src + i]);
+        sum += v * v;
+    }
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (int n = 128; n > 0; n /= 2) {
+        if (threadIdx.x < n) sums[threadIdx.x] += sums[threadIdx.x + n];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sums[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float norm = static_cast<float>(input[src + i]) * inv;
+        output[dst + i] = static_cast<T>(norm * (1.0f + static_cast<float>(weight[i])));
+    }
+}
+extern "C" void zero_norm_f32_forward(const float* input, const float* weight, float* output,
+    int rows, int heads, int dim, int input_stride, int output_stride, float eps, cudaStream_t stream) {
+    zero_norm_kernel<<<rows * heads, 256, 0, stream>>>(input, weight, output, heads, dim, input_stride, output_stride, eps);
+}
+extern "C" void zero_norm_bf16_forward(const __nv_bfloat16* input, const __nv_bfloat16* weight, __nv_bfloat16* output,
+    int rows, int heads, int dim, int input_stride, int output_stride, float eps, cudaStream_t stream) {
+    zero_norm_kernel<<<rows * heads, 256, 0, stream>>>(input, weight, output, heads, dim, input_stride, output_stride, eps);
+}
+extern "C" void zero_norm_f16_forward(const __half* input, const __half* weight, __half* output,
+    int rows, int heads, int dim, int input_stride, int output_stride, float eps, cudaStream_t stream) {
+    zero_norm_kernel<<<rows * heads, 256, 0, stream>>>(input, weight, output, heads, dim, input_stride, output_stride, eps);
+}
+
+template<typename T>
+__global__ void affine_layer_norm_kernel(const T* x,const T* weight,const T* bias,T* out,int cols,float eps) {
+    __shared__ float scratch[256];
+    int tid=threadIdx.x,row=blockIdx.x;
+    float sum=0.0f;
+    for(int j=tid;j<cols;j+=256) sum+=static_cast<float>(x[row*cols+j]);
+    scratch[tid]=sum; __syncthreads();
+    for(int d=128;d;d/=2) {if(tid<d) scratch[tid]+=scratch[tid+d]; __syncthreads();}
+    float mean=scratch[0]/cols, var=0.0f;
+    __syncthreads();
+    for(int j=tid;j<cols;j+=256) {float v=static_cast<float>(x[row*cols+j])-mean;var+=v*v;}
+    scratch[tid]=var; __syncthreads();
+    for(int d=128;d;d/=2) {if(tid<d) scratch[tid]+=scratch[tid+d]; __syncthreads();}
+    float inv=rsqrtf(scratch[0]/cols+eps);
+    for(int j=tid;j<cols;j+=256) {
+        float v=(static_cast<float>(x[row*cols+j])-mean)*inv;
+        out[row*cols+j]=static_cast<T>(v*static_cast<float>(weight[j])+static_cast<float>(bias[j]));
+    }
+}
+extern "C" void affine_layer_norm_forward(const void* x,const void* w,const void* b,void* out,
+    int dtype,int rows,int cols,float eps,cudaStream_t stream) {
+    if(dtype==0) affine_layer_norm_kernel<<<rows,256,0,stream>>>((const float*)x,(const float*)w,(const float*)b,(float*)out,cols,eps);
+    if(dtype==1) affine_layer_norm_kernel<<<rows,256,0,stream>>>((const __half*)x,(const __half*)w,(const __half*)b,(__half*)out,cols,eps);
+    if(dtype==2) affine_layer_norm_kernel<<<rows,256,0,stream>>>((const __nv_bfloat16*)x,(const __nv_bfloat16*)w,(const __nv_bfloat16*)b,(__nv_bfloat16*)out,cols,eps);
 }

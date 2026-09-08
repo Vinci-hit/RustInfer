@@ -36,3 +36,4 @@ pub use server_to_scheduler::{
     CancelReason, CancelRequest as ServerCancelRequest, DiffusionRequest, InferenceModality,
     InferenceRequest, ServerCommand,
 };
+pub mod multimodal;

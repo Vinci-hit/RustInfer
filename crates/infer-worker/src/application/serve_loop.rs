@@ -202,9 +202,16 @@ where
     }
     let max_blocks_per_seq = bs.max_seq_len.div_ceil(bs.block_size);
     let model_dims = model.dims();
+    let enable_prefix_caching = bs.load.enable_prefix_caching && !model.cache_layout().has_linear();
+    if bs.load.enable_prefix_caching && !enable_prefix_caching {
+        tracing::info!("KV-only prefix caching disabled for recurrent attention");
+    }
 
-    let bytes_per_block =
-        model_dims.num_layers * 2 * bs.block_size * model_dims.kv_dim * std::mem::size_of::<bf16>();
+    let bytes_per_block = model.cache_layout().num_full_layers()
+        * 2
+        * bs.block_size
+        * model_dims.kv_dim
+        * std::mem::size_of::<bf16>();
 
     let cap_num_tokens = bs.load.max_batch_tokens;
     let cap_batch = bs.load.max_batch_seqs;
@@ -388,6 +395,10 @@ where
             .map_err(|error| format!("start TP Runtime followers: {error}"))?;
     }
 
+    runner
+        .profile_vision()
+        .map_err(|e| format!("profile_vision: {e:?}"))?;
+    let encoder_reserve = runner.encoder_cache_reserve_bytes();
     let num_blocks = if bs.num_blocks_override != 0 {
         bs.num_blocks_override
     } else {
@@ -437,12 +448,13 @@ where
                     // Hold back a fixed reserve for incremental prewarm allocations,
                     // then add one graph-scratch block plus 0.5% fragmentation slack.
                     let usable = free_after
-                        .saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES);
+                        .saturating_sub(crate::application::tuning::PREWARM_HEADROOM_BYTES)
+                        .saturating_sub(encoder_reserve);
                     let budget = (usable as f64 * fraction as f64) as usize;
                     let raw = budget / bytes_per_block.max(1);
                     let reserve = 1 + (raw / 200).max(1);
                     let probed = raw.saturating_sub(reserve).max(1);
-                    let capacity = if bs.load.enable_prefix_caching {
+                    let capacity = if enable_prefix_caching {
                         probed
                     } else {
                         probed.min(working_set)
@@ -628,7 +640,6 @@ where
         num_blocks,
         bs.block_size,
     );
-    let enable_prefix_caching = bs.load.enable_prefix_caching;
     tracing::info!(
         "[serve] prefix caching: {}",
         if enable_prefix_caching {
@@ -661,6 +672,7 @@ where
     let mut deferred_prefills: Vec<PrefillBatchCmd> = Vec::new();
 
     loop {
+        runner.retain_sequences(active.keys().chain(prefilling.keys()).copied());
         let drain_result = {
             let mut ctx = WorkerCtx {
                 active: &mut active,
@@ -765,6 +777,8 @@ where
                 continue;
             }
         }
+
+        runner.retain_sequences(active.keys().chain(prefilling.keys()).copied());
 
         // Stall tracer: start timing the *work* section (idle poll wait above
         // is intentionally excluded — it is not a stall).
@@ -1029,6 +1043,7 @@ where
                 return Ok(true);
             }
             SchedulerControlMessage::Cancel(c) => {
+                runner.release_sequence(c.sequence_id);
                 apply_cancel(control, ctx, c.sequence_id, req_id);
             }
             SchedulerControlMessage::FreeKvIndices(free) => {
@@ -1037,6 +1052,9 @@ where
                 }
             }
             SchedulerControlMessage::Preempt(p) => {
+                for &id in &p.sequence_ids {
+                    runner.release_sequence(id);
+                }
                 apply_preempt(ctx, &p.sequence_ids, &p.free_indices);
             }
             SchedulerControlMessage::Ping => {
@@ -1152,6 +1170,7 @@ where
                 .release_owned(&seq.block_table, ctx.enable_prefix_caching);
         }
         ctx.decode_engine.clear();
+        runner.retain_sequences([]);
     }
     if req_id.is_correlated()
         && let Err(e) = control.send(

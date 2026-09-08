@@ -366,7 +366,11 @@ fn argmax_row<T: Dtype>(row: &[T]) -> OpResult<(i32, f64)> {
     row.iter()
         .enumerate()
         .map(|(i, v)| (i as i32, T::read_f64(v)))
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.cmp(&a.0))
+        })
         .ok_or_else(|| OpError::Shape("argmax_row: empty vocab".into()))
 }
 
@@ -376,6 +380,12 @@ mod tests {
     use crate::domain::exec::{HostScope, StepCtx};
     use crate::domain::plan::{BatchKind, BatchPlan};
     use crate::infrastructure::cpu::Cpu;
+
+    #[test]
+    fn greedy_ties_choose_the_lowest_token_id() {
+        assert_eq!(argmax_row(&[23.625f32, 23.625, 0.0]).unwrap().0, 0);
+        assert_eq!(argmax_row(&[0.0f32, 23.625, 23.625]).unwrap().0, 1);
+    }
 
     #[test]
     fn greedy_verify_returns_per_sequence_acceptance() {

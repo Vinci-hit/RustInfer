@@ -13,6 +13,73 @@ use infer_core::ports::OpResult;
 use infer_core::tensor::Tensor;
 
 unsafe extern "C" {
+    fn affine_layer_norm_forward(
+        x: *const std::ffi::c_void,
+        w: *const std::ffi::c_void,
+        b: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        dtype: i32,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    );
+
+    fn gelu_forward(x: *mut std::ffi::c_void, dtype: i32, n: i32, tanh: bool, stream: cudaStream_t);
+    fn rotary_angles_forward(
+        x: *mut std::ffi::c_void,
+        dtype: i32,
+        sin: *const f32,
+        cos: *const f32,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        half_dim: i32,
+        row_stride: i64,
+        stream: cudaStream_t,
+    );
+    fn zero_norm_f16_forward(
+        input: *const f16,
+        weight: *const f16,
+        output: *mut f16,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    );
+
+    fn zero_norm_bf16_forward(
+        input: *const bf16,
+        weight: *const bf16,
+        output: *mut bf16,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    );
+
+    fn zero_norm_f32_forward(
+        input: *const f32,
+        weight: *const f32,
+        output: *mut f32,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    );
+
+    fn sigmoid_mul_f32_forward(output: *mut f32, gate: *const f32, n: i32, stream: cudaStream_t);
+    fn sigmoid_mul_bf16_forward(output: *mut bf16, gate: *const bf16, n: i32, stream: cudaStream_t);
+    fn sigmoid_mul_f16_forward(output: *mut f16, gate: *const f16, n: i32, stream: cudaStream_t);
     // dst = src * val
     fn scalar_mul_f32_forward(
         dst: *mut f32,
@@ -86,6 +153,83 @@ unsafe extern "C" {
     );
 }
 
+fn float_code<T: infer_core::dtype::Dtype>() -> OpResult<i32> {
+    use infer_core::types::DTypeId;
+    match T::ID {
+        DTypeId::F32 => Ok(0),
+        DTypeId::F16 => Ok(1),
+        DTypeId::BF16 => Ok(2),
+        _ => Err(infer_core::ports::OpError::unsupported(
+            "CUDA",
+            "vision scalar dtype",
+        )),
+    }
+}
+
+pub fn gelu<T: infer_core::dtype::Dtype>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+    tanh: bool,
+) -> OpResult<()> {
+    use infer_core::ports::OpError;
+    if !x.is_contiguous() {
+        return Err(OpError::Shape("gelu: non-contiguous input".into()));
+    }
+    let n = i32::try_from(x.numel()).map_err(|_| OpError::Shape("gelu: size overflow".into()))?;
+    let dtype = float_code::<T>()?;
+    if n > 0 {
+        unsafe {
+            gelu_forward(x.data_ptr_mut().cast(), dtype, n, tanh, stream);
+        }
+    }
+    Ok(())
+}
+
+pub fn rope_with_angles<T: infer_core::dtype::Dtype>(
+    stream: cudaStream_t,
+    x: &mut Tensor<T, Cuda>,
+    sin: &Tensor<f32, Cuda>,
+    cos: &Tensor<f32, Cuda>,
+    dim: usize,
+) -> OpResult<()> {
+    use infer_core::ports::OpError;
+    if x.shape().len() != 2
+        || sin.shape().len() != 2
+        || sin.shape() != cos.shape()
+        || dim == 0
+        || x.shape()[1] % dim != 0
+        || sin.shape()[0] != x.shape()[0]
+        || sin.shape()[1] == 0
+        || sin.shape()[1] * 2 > dim
+        || x.strides()[1] != 1
+        || !sin.is_contiguous()
+        || !cos.is_contiguous()
+    {
+        return Err(OpError::Shape(
+            "rope_with_angles: invalid shapes/strides".into(),
+        ));
+    }
+    let cv = |n| i32::try_from(n).map_err(|_| OpError::Shape("rotary size overflow".into()));
+    let dtype = float_code::<T>()?;
+    if x.shape()[0] > 0 {
+        unsafe {
+            rotary_angles_forward(
+                x.data_ptr_mut().cast(),
+                dtype,
+                sin.data_ptr(),
+                cos.data_ptr(),
+                cv(x.shape()[0])?,
+                cv(x.shape()[1] / dim)?,
+                cv(dim)?,
+                cv(sin.shape()[1])?,
+                x.strides()[0] as i64,
+                stream,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Element types with the scalar-op CUDA kernels. Each method forwards to this
 /// dtype's `extern` entry; the wrappers below are generic over this trait, so
 /// the dtype→kernel mapping lives here as a type attribute.
@@ -96,7 +240,20 @@ unsafe extern "C" {
 /// [`scalar_mul_inplace_from_dev`]); this just names the FFI entries and
 /// performs no checks.
 pub trait ScalarKernel: CudaFloat {
+    unsafe fn zero_norm(
+        input: *const Self,
+        weight: *const Self,
+        output: *mut Self,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    );
     /// `dst = src * val`, elementwise over `n` elements.
+    unsafe fn sigmoid_mul(output: *mut Self, gate: *const Self, n: i32, stream: cudaStream_t);
     unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t);
     /// `dst = src + val`, elementwise over `n` elements.
     unsafe fn scalar_add(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t);
@@ -114,6 +271,37 @@ pub trait ScalarKernel: CudaFloat {
 }
 
 impl ScalarKernel for f32 {
+    unsafe fn zero_norm(
+        input: *const Self,
+        weight: *const Self,
+        output: *mut Self,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            zero_norm_f32_forward(
+                input,
+                weight,
+                output,
+                rows,
+                heads,
+                dim,
+                input_stride,
+                output_stride,
+                eps,
+                stream,
+            )
+        }
+    }
+    unsafe fn sigmoid_mul(output: *mut Self, gate: *const Self, n: i32, stream: cudaStream_t) {
+        unsafe { sigmoid_mul_f32_forward(output, gate, n, stream) }
+    }
+
     #[inline]
     unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
         unsafe { scalar_mul_f32_forward(dst, src, val, n, stream) }
@@ -142,6 +330,37 @@ impl ScalarKernel for f32 {
 }
 
 impl ScalarKernel for bf16 {
+    unsafe fn zero_norm(
+        input: *const Self,
+        weight: *const Self,
+        output: *mut Self,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            zero_norm_bf16_forward(
+                input,
+                weight,
+                output,
+                rows,
+                heads,
+                dim,
+                input_stride,
+                output_stride,
+                eps,
+                stream,
+            )
+        }
+    }
+    unsafe fn sigmoid_mul(output: *mut Self, gate: *const Self, n: i32, stream: cudaStream_t) {
+        unsafe { sigmoid_mul_bf16_forward(output, gate, n, stream) }
+    }
+
     #[inline]
     unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
         unsafe { scalar_mul_bf16_forward(dst, src, val, n, stream) }
@@ -170,6 +389,37 @@ impl ScalarKernel for bf16 {
 }
 
 impl ScalarKernel for f16 {
+    unsafe fn zero_norm(
+        input: *const Self,
+        weight: *const Self,
+        output: *mut Self,
+        rows: i32,
+        heads: i32,
+        dim: i32,
+        input_stride: i32,
+        output_stride: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) {
+        unsafe {
+            zero_norm_f16_forward(
+                input,
+                weight,
+                output,
+                rows,
+                heads,
+                dim,
+                input_stride,
+                output_stride,
+                eps,
+                stream,
+            )
+        }
+    }
+    unsafe fn sigmoid_mul(output: *mut Self, gate: *const Self, n: i32, stream: cudaStream_t) {
+        unsafe { sigmoid_mul_f16_forward(output, gate, n, stream) }
+    }
+
     #[inline]
     unsafe fn scalar_mul(dst: *mut Self, src: *const Self, val: f32, n: i32, stream: cudaStream_t) {
         unsafe { scalar_mul_f16_forward(dst, src, val, n, stream) }
@@ -373,5 +623,294 @@ mod tests {
         for (a, b) in expected.iter().zip(got.iter()) {
             assert!((a - b).abs() < 1e-5);
         }
+    }
+}
+
+pub fn sigmoid_mul<T: ScalarKernel>(
+    stream: cudaStream_t,
+    output: &mut Tensor<T, Cuda>,
+    gate: &Tensor<T, Cuda>,
+) -> OpResult<()> {
+    use infer_core::ports::OpError;
+    if output.shape() != gate.shape() || !output.is_contiguous() || !gate.is_contiguous() {
+        return Err(OpError::Shape(
+            "sigmoid_mul: expected matching contiguous tensors".into(),
+        ));
+    }
+    let n = i32::try_from(output.numel())
+        .map_err(|_| OpError::Shape("sigmoid_mul: size exceeds i32".into()))?;
+    if n > 0 {
+        unsafe {
+            T::sigmoid_mul(output.data_ptr_mut(), gate.data_ptr(), n, stream);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod sigmoid_tests {
+    use super::*;
+    use crate::CudaScope;
+    use infer_core::dtype::Dtype;
+    use infer_core::ports::FusedOps;
+
+    fn check<T: Dtype>() {
+        let cuda = Cuda::new(0).unwrap();
+        let scope = CudaScope::new(cuda.clone());
+        // More than one block, with a tail and saturating gates.
+        let gates: Vec<T> = (0..513)
+            .map(|i| T::write_f64((i as f64 - 256.0) / 3.0))
+            .collect();
+        let values: Vec<T> = (0..513)
+            .map(|i| T::write_f64((i as f64 * 0.13).sin()))
+            .collect();
+        let expected: Vec<f32> = values
+            .iter()
+            .zip(&gates)
+            .map(|(v, g)| {
+                let g = T::read_f64(g) as f32;
+                let sigmoid = T::write_f64((1.0 / (1.0 + (-g).exp())) as f64);
+                let result =
+                    T::write_f64(((T::read_f64(v) as f32) * (T::read_f64(&sigmoid) as f32)) as f64);
+                T::read_f64(&result) as f32
+            })
+            .collect();
+        let gate = Tensor::from_host_slice(&gates, [513], &cuda).unwrap();
+        let mut output = Tensor::from_host_slice(&values, [513], &cuda).unwrap();
+        <Cuda as FusedOps>::sigmoid_mul(&scope, &mut output, &gate).unwrap();
+        for (got, expected) in output.to_host_vec().unwrap().iter().zip(expected) {
+            let got = T::read_f64(got) as f32;
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "got={got}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sigmoid_mul_matches_activation_dtype_rounding() {
+        check::<f32>();
+        check::<bf16>();
+        check::<f16>();
+    }
+}
+
+pub fn rmsnorm_zero_centered<T: ScalarKernel>(
+    stream: cudaStream_t,
+    input: &Tensor<T, Cuda>,
+    weight: &Tensor<T, Cuda>,
+    output: &mut Tensor<T, Cuda>,
+    eps: f32,
+) -> OpResult<()> {
+    use infer_core::ports::OpError;
+    let dim = weight.numel();
+    if dim == 0
+        || input.shape() != output.shape()
+        || input.shape().len() != 2
+        || input.shape()[1] % dim != 0
+        || input.strides()[1] != 1
+        || output.strides()[1] != 1
+        || !weight.is_contiguous()
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return Err(OpError::Shape(
+            "rmsnorm_zero_centered: invalid shapes, strides or epsilon".into(),
+        ));
+    }
+    let cv = |n: usize| {
+        i32::try_from(n)
+            .map_err(|_| OpError::Shape("rmsnorm_zero_centered: size exceeds i32".into()))
+    };
+    let rows = cv(input.shape()[0])?;
+    let heads = cv(input.shape()[1] / dim)?;
+    if rows > 0 {
+        unsafe {
+            T::zero_norm(
+                input.data_ptr(),
+                weight.data_ptr(),
+                output.data_ptr_mut(),
+                rows,
+                heads,
+                cv(dim)?,
+                cv(input.strides()[0])?,
+                cv(output.strides()[0])?,
+                eps,
+                stream,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod zero_norm_tests {
+    use super::*;
+    use crate::CudaScope;
+    use infer_core::ports::FusedOps;
+
+    #[test]
+    fn zero_centered_norm_keeps_scale_in_fp32_and_handles_strided_heads() {
+        let cuda = Cuda::new(0).unwrap();
+        let scope = CudaScope::new(cuda.clone());
+        let values: Vec<bf16> = (0..24)
+            .map(|i| bf16::from_f32((i as f32 - 9.0) * 0.25))
+            .collect();
+        let tensor = Tensor::from_host_slice(&values, [2, 12], &cuda).unwrap();
+        let mut view = tensor.narrow(1, 2, 8).unwrap();
+        let input = view.clone();
+        let weights: Vec<bf16> = [0.001953125, -0.00390625, 0.125, -0.25]
+            .map(bf16::from_f32)
+            .to_vec();
+        let weight = Tensor::from_host_slice(&weights, [4], &cuda).unwrap();
+        <Cuda as FusedOps>::rmsnorm_zero_centered(&scope, &input, &weight, &mut view, 1e-6)
+            .unwrap();
+        let actual = tensor.to_host_vec().unwrap();
+        for row in 0..2 {
+            for i in [0, 1, 10, 11] {
+                assert_eq!(actual[row * 12 + i], values[row * 12 + i]);
+            }
+            for head in 0..2 {
+                let offset = row * 12 + 2 + head * 4;
+                let x = &values[offset..offset + 4];
+                let inv = (x.iter().map(|v| v.to_f32().powi(2)).sum::<f32>() / 4.0 + 1e-6)
+                    .sqrt()
+                    .recip();
+                for i in 0..4 {
+                    let expected =
+                        bf16::from_f32(x[i].to_f32() * inv * (1.0 + weights[i].to_f32()));
+                    assert_eq!(actual[offset + i], expected);
+                }
+            }
+        }
+    }
+}
+
+pub fn layer_norm<T: infer_core::dtype::Dtype>(
+    stream: cudaStream_t,
+    input: &Tensor<T, Cuda>,
+    weight: &Tensor<T, Cuda>,
+    bias: &Tensor<T, Cuda>,
+    output: &mut Tensor<T, Cuda>,
+    eps: f32,
+) -> OpResult<()> {
+    use infer_core::ports::OpError;
+    let shape = input.shape().as_slice();
+    if !eps.is_finite()
+        || eps <= 0.0
+        || shape.len() != 2
+        || shape[1] == 0
+        || output.shape() != input.shape()
+        || weight.shape().as_slice() != [shape[1]]
+        || bias.shape() != weight.shape()
+        || !input.is_contiguous()
+        || !output.is_contiguous()
+        || !weight.is_contiguous()
+        || !bias.is_contiguous()
+    {
+        return Err(OpError::Shape("layer_norm shape/stride mismatch".into()));
+    }
+    let rows =
+        i32::try_from(shape[0]).map_err(|_| OpError::Shape("layer_norm rows overflow".into()))?;
+    let cols =
+        i32::try_from(shape[1]).map_err(|_| OpError::Shape("layer_norm cols overflow".into()))?;
+    let dtype = float_code::<T>()?;
+    if rows > 0 {
+        unsafe {
+            affine_layer_norm_forward(
+                input.data_ptr().cast(),
+                weight.data_ptr().cast(),
+                bias.data_ptr().cast(),
+                output.data_ptr_mut().cast(),
+                dtype,
+                rows,
+                cols,
+                eps,
+                stream,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod vision_tests {
+    use super::*;
+    use infer_core::ports::{FusedOps, MathOps};
+    #[test]
+    fn affine_norm_linear_and_partial_rotary_preserve_bf16_semantics() {
+        let cuda = Cuda::new(0).unwrap();
+        let scope = cuda.scope();
+        let values: Vec<_> = (0..32)
+            .map(|i| bf16::from_f32((i as f32 - 12.0) * 0.125))
+            .collect();
+        let input = Tensor::from_host_slice(&values, [2, 16], &cuda).unwrap();
+        let weights: Vec<_> = (0..16)
+            .map(|i| bf16::from_f32(0.7 + i as f32 * 0.1))
+            .collect();
+        let biases: Vec<_> = (0..16)
+            .map(|i| bf16::from_f32(-0.3 + i as f32 * 0.01))
+            .collect();
+        let weight = Tensor::from_host_slice(&weights, [16], &cuda).unwrap();
+        let bias = Tensor::from_host_slice(&biases, [16], &cuda).unwrap();
+        let mut out = Tensor::zeros([2, 16], &cuda).unwrap();
+        Cuda::layer_norm(&scope, &input, &weight, &bias, &mut out, 1e-6).unwrap();
+        let actual = out.to_host_vec().unwrap();
+        for row in 0..2 {
+            let x: Vec<f32> = values[row * 16..(row + 1) * 16]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect();
+            let mean = x.iter().sum::<f32>() / 16.0;
+            let inv = (x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 16.0 + 1e-6)
+                .sqrt()
+                .recip();
+            for j in 0..16 {
+                assert_eq!(
+                    actual[row * 16 + j],
+                    bf16::from_f32((x[j] - mean) * inv * weights[j].to_f32() + biases[j].to_f32())
+                );
+            }
+        }
+        let mut view = input.narrow(1, 2, 8).unwrap();
+        let sin = Tensor::from_host_slice(&[1.0f32, 0.0, 0.0, 1.0], [2, 2], &cuda).unwrap();
+        let cos = Tensor::from_host_slice(&[0.0f32, 1.0, 1.0, 0.0], [2, 2], &cuda).unwrap();
+        Cuda::rope_with_angles(&scope, &mut view, &sin, &cos, 8).unwrap();
+        let actual = input.to_host_vec().unwrap();
+        for row in 0..2 {
+            let j = row;
+            let base = row * 16 + 2;
+            for k in 0..16 {
+                let expected = if k == 2 + j {
+                    -values[base + j + 2].to_f32()
+                } else if k == 4 + j {
+                    values[base + j].to_f32()
+                } else {
+                    values[row * 16 + k].to_f32()
+                };
+                assert_eq!(actual[row * 16 + k].to_f32(), expected);
+            }
+        }
+        // Dot product 1.00390625 rounds to 1.0 in BF16; adding the bias
+        // before that rounding must produce 1.0078125.
+        let x = Tensor::from_host_slice(
+            &[bf16::from_f32(1.0), bf16::from_f32(0.00390625)],
+            [1, 2],
+            &cuda,
+        )
+        .unwrap();
+        let w = Tensor::from_host_slice(&[bf16::from_f32(1.0); 2], [1, 2], &cuda).unwrap();
+        let b = Tensor::from_host_slice(&[bf16::from_f32(0.001953125)], [1], &cuda).unwrap();
+        let mut o = Tensor::zeros([1, 1], &cuda).unwrap();
+        Cuda::linear(&scope, &x, &w, &b, &mut o).unwrap();
+        assert_eq!(o.to_host_vec().unwrap()[0].to_f32(), 1.0078125);
+        let mut g =
+            Tensor::from_host_slice(&[bf16::from_f32(-1.0), bf16::from_f32(1.0)], [1, 2], &cuda)
+                .unwrap();
+        Cuda::gelu_inplace(&scope, &mut g, false).unwrap();
+        assert_eq!(
+            g.to_host_vec().unwrap(),
+            vec![bf16::from_f32(-0.15865525), bf16::from_f32(0.84134475)]
+        );
     }
 }
