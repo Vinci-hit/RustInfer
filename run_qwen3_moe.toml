@@ -1,0 +1,28 @@
+# TP1 BF16 eager bring-up for Qwen3-30B-A3B.
+# Batch-invariance validation: scripts/e2e_qwen3_moe.py --force-gemm --require-batch-match
+# Direct launches: set RUSTINFER_FORCE_GEMM=1 for the worker.
+model = "/mnt/md2/liuwenqi/vllm_bench/qwen3-30b-a3b"
+model_name = "Qwen3-30B-A3B"
+cluster_id = "rustinfer-qwen3-moe-smoke"
+device = "cuda:7"
+host = "127.0.0.1"
+port = 18137
+request_timeout_secs = 600
+max_batch_tokens = 64
+max_batch_seqs = 2
+max_model_len = 512
+batch_wait_ms = 0
+paged_block_size = 1
+chunked_prefill_size = 32
+enable_prefix_caching = false
+mem_fraction_static = 0.8
+num_blocks = 2048
+ignore_eos = false
+mode = "llm"
+worker_id = "worker-0"
+log_level = "info"
+capture_sizes = []
+[cuda_memory]
+kernel_workspace_mib = 256
+graph_arena_mib = 0
+pool_retain_mib = 256

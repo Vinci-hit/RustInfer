@@ -11,19 +11,24 @@ __global__ void accumulate_weighted_routes_bf16_kernel(
     const float* __restrict__ route_weights,
     float* __restrict__ accumulator,
     size_t elements,
-    int tokens,
+    int routes,
     int hidden)
 {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= elements) return;
 
-    const int route = static_cast<int>(index / hidden);
+    const int token = static_cast<int>(index / hidden);
     const int column = static_cast<int>(index % hidden);
-    const int token = source_tokens[route];
-    if (token < 0 || token >= tokens) return;
-    atomicAdd(
-        accumulator + static_cast<size_t>(token) * hidden + column,
-        route_weights[route] * __bfloat162float(expert_output[index]));
+    // Stable expert-major accumulation makes repeated greedy decoding
+    // independent of CUDA block scheduling and atomic arrival order.
+    float sum = 0.0f;
+    for (int route = 0; route < routes; ++route) {
+        if (source_tokens[route] == token) {
+            sum += route_weights[route] * __bfloat162float(
+                expert_output[static_cast<size_t>(route) * hidden + column]);
+        }
+    }
+    accumulator[index] = sum;
 }
 
 __global__ void write_combined_bf16_kernel(
@@ -49,25 +54,17 @@ extern "C" int moe_combine_bf16(
     cudaStream_t stream)
 {
     const size_t output_elements = static_cast<size_t>(tokens) * hidden;
-    cudaError_t status = cudaMemsetAsync(
-        accumulator,
-        0,
-        output_elements * sizeof(float),
-        stream);
-    if (status != cudaSuccess) return static_cast<int>(status);
-
     constexpr int threads = 256;
-    const size_t route_elements = static_cast<size_t>(routes) * hidden;
-    const int route_blocks = static_cast<int>((route_elements + threads - 1) / threads);
+    const int route_blocks = static_cast<int>((output_elements + threads - 1) / threads);
     accumulate_weighted_routes_bf16_kernel<<<route_blocks, threads, 0, stream>>>(
         expert_output,
         source_tokens,
         route_weights,
         accumulator,
-        route_elements,
-        tokens,
+        output_elements,
+        routes,
         hidden);
-    status = cudaGetLastError();
+    cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return static_cast<int>(status);
 
     const int output_blocks = static_cast<int>((output_elements + threads - 1) / threads);

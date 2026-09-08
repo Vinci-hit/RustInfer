@@ -2226,3 +2226,7 @@ mod qwen35_checkpoint_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_tests/qwen3_moe.rs"]
+mod qwen3_moe_checkpoint_tests;
