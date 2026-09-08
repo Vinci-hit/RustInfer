@@ -204,11 +204,13 @@ fn run_stream<S, F>(
     ),
     shape: S,
     mut on_first_content: F,
+    observation: crate::metrics::RequestMetrics,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
 where
     S: ChunkShape + Send + 'static,
     F: FnMut() + Send + 'static,
 {
+    let mut metrics = observation.start_stream();
     let stream = async_stream::stream! {
         // Hold the admission permit for the lifetime of the stream. Binding it
         // INSIDE the generator is what ties its release to stream completion or
@@ -236,6 +238,9 @@ where
 
                     match decoder.push(token_id as u32) {
                         Ok(Some(delta)) => {
+                            if !delta.is_empty() {
+                                metrics.first_content();
+                            }
                             if !first_content_sent {
                                 first_content_sent = true;
                                 on_first_content();
@@ -246,6 +251,7 @@ where
                             // 当前 token 仅扩展了未确认尾部（如多字节字符的中间字节），不下发。
                         }
                         Err(e) => {
+                            metrics.finish(false);
                             tracing::error!(
                                 request_id = %request_id,
                                 error = %e,
@@ -260,6 +266,7 @@ where
                     }
                 }
                 ChunkType::Done => {
+                    metrics.finish(chunk.finish_reason.as_deref() != Some("error"));
                     // 提前标记完成：scheduler 已发 Done，逻辑上请求已结束。
                     // 若放在 yield 之后，客户端在收到 finish_chunk 后立即关闭连接（常见行为）
                     // 会触发 stream future drop → StreamHandle::Drop → 向 scheduler 发出
@@ -271,6 +278,12 @@ where
                     // 走到这里说明流自然结束，残留的 U+FFFD 是真实的不可解码序列，
                     // 应当下发给客户端而不是丢弃。
                     if let Ok(Some(tail)) = decoder.flush() {
+                        if !tail.is_empty() {
+                            metrics.first_content();
+                            if !first_content_sent {
+                                on_first_content();
+                            }
+                        }
                         yield Ok(json_event(&request_id, &shape.content(tail)));
                     }
 
@@ -290,6 +303,7 @@ where
                     break;
                 }
                 ChunkType::Error => {
+                    metrics.finish(false);
                     stream_handle.mark_finished();
                     ended_clean = true;
                     // Surface the failure instead of masquerading as success —
@@ -320,6 +334,7 @@ where
         }
 
         if !ended_clean {
+            metrics.finish(false);
             // Channel closed mid-stream with no terminal chunk. mark_finished
             // suppresses the Drop-cancel (the server side already dropped the
             // request when it closed the channel).
@@ -353,6 +368,7 @@ pub fn stream_chat_completion(
         crate::middleware::admission::AdmissionPermit,
         Option<tokio::sync::OwnedSemaphorePermit>,
     ),
+    observation: crate::metrics::RequestMetrics,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let shape = ChatShape {
         chunk_id: format!("chatcmpl-{}", request_id),
@@ -377,10 +393,12 @@ pub fn stream_chat_completion(
                 "TTFT_TRACE: chat first content chunk"
             );
         },
+        observation,
     )
 }
 
 /// 构建 Text Completion SSE 流
+#[allow(clippy::too_many_arguments)]
 pub fn stream_completion(
     request_id: String,
     model: String,
@@ -389,6 +407,7 @@ pub fn stream_completion(
     tokenizer: Arc<Tokenizer>,
     include_usage: bool,
     permit: crate::middleware::admission::AdmissionPermit,
+    observation: crate::metrics::RequestMetrics,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let shape = CompletionShape {
         chunk_id: format!("cmpl-{}", request_id),
@@ -404,5 +423,6 @@ pub fn stream_completion(
         (permit, None),
         shape,
         || {},
+        observation,
     )
 }

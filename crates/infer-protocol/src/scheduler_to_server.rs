@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol version of the server↔scheduler (frontend) plane. Bumped on any
 /// wire-incompatible change. The scheduler reports it in [`SchedulerPong`];
 /// the server refuses readiness (`/ready` 503) on mismatch.
-pub const FRONTEND_PROTOCOL_VERSION: u32 = 2;
+pub const FRONTEND_PROTOCOL_VERSION: u32 = 3;
 
 /// Scheduler -> Server 的统一回复信封（tagged union）。
 ///
@@ -21,6 +21,54 @@ pub enum SchedulerReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerPong {
     pub protocol_version: u32,
+    /// Inference readiness, including worker bootstrap and engine freshness.
+    /// Legacy Pongs without this field must never imply inference readiness.
+    #[serde(default)]
+    pub readiness: SchedulerReadiness,
+    /// Compact engine snapshot; absent before bootstrap or when the engine is stale.
+    #[serde(default)]
+    pub metrics: Option<SchedulerMetricsSnapshot>,
+}
+
+/// Runtime state sampled by the scheduler event loop, carried on its heartbeat.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerMetricsSnapshot {
+    pub metrics_enabled: bool,
+    pub queued_requests: u64,
+    /// All requests in the authoritative table, including queued requests.
+    pub active_requests: u64,
+    pub prefilling_requests: u64,
+    pub decoding_requests: u64,
+    /// Worker-reported allocated KV token slots, including retained prefixes.
+    pub kv_tokens_used: u32,
+    /// Projected prefill slots dispatched but not yet reported by the worker.
+    pub kv_tokens_pending: u32,
+    pub kv_tokens_capacity: u32,
+    pub total_requests: u64,
+    pub total_completions: u64,
+    pub total_tokens_generated: u64,
+    pub total_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerReadiness {
+    #[default]
+    Loading,
+    Ready,
+    Draining,
+    Failed,
+}
+
+impl SchedulerReadiness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Ready => "ready",
+            Self::Draining => "draining",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Scheduler -> Server 的完整响应。
@@ -87,5 +135,26 @@ impl Default for InferenceMetrics {
             num_tokens: 0,
             tokens_per_second: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_pong_defaults_to_loading() {
+        #[derive(Serialize)]
+        struct LegacyPong {
+            protocol_version: u32,
+        }
+        let encoded = rmp_serde::to_vec(&LegacyPong {
+            protocol_version: 2,
+        })
+        .unwrap();
+        let decoded: SchedulerPong = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.readiness, SchedulerReadiness::Loading);
+        assert!(decoded.metrics.is_none());
+        assert_ne!(decoded.protocol_version, FRONTEND_PROTOCOL_VERSION);
     }
 }

@@ -36,6 +36,7 @@ use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport,
 
 /// The main scheduler engine.
 pub struct SchedulerEngine {
+    readiness: crate::infrastructure::transport::readiness::ReadinessHandle,
     // ─── Workflow ───
     /// Mode-specific scheduling and output processing. Owns the
     /// `PlanningSystem` and any mode-specific state (e.g. Diffusion's
@@ -148,6 +149,7 @@ impl SchedulerEngine {
         });
 
         Self {
+            readiness: Default::default(),
             workflow,
             dispatch: crate::application::DispatchSystem::new(Box::new(frontend), Box::new(worker)),
             radix: RadixTree::new(),
@@ -168,12 +170,21 @@ impl SchedulerEngine {
         }
     }
 
+    pub fn with_readiness(
+        mut self,
+        readiness: crate::infrastructure::transport::readiness::ReadinessHandle,
+    ) -> Self {
+        self.readiness = readiness;
+        self
+    }
+
     /// Run the scheduler event loop.
     ///
     /// Spawns a background decode task for worker output and then
     /// enters the main event loop. All MsgPack deserialization
     /// happens off the main async task.
     pub async fn run(mut self) -> Result<()> {
+        let _readiness_guard = self.readiness.guard();
         tracing::info!("SchedulerEngine starting event loop...");
 
         // Extract the raw worker output receiver — present only for
@@ -189,6 +200,12 @@ impl SchedulerEngine {
         // MsgPack → forward typed SchedulerEvent.
         let mode = self.config.mode;
         tokio::spawn(decode_worker_output(raw_worker_rx, decoded_tx, mode));
+
+        if !self.worker_group.is_ready() {
+            return Err(crate::error::SchedulerError::Shutdown);
+        }
+        self.readiness
+            .set(infer_protocol::scheduler_to_server::SchedulerReadiness::Ready);
 
         crate::application::event_loop::run_event_loop(&mut self, decoded_rx).await
     }
@@ -362,6 +379,31 @@ impl SchedulerEngine {
         self.metrics.clone()
     }
 
+    pub(crate) fn metrics_snapshot(
+        &self,
+    ) -> infer_protocol::scheduler_to_server::SchedulerMetricsSnapshot {
+        let counters = self.metrics.snapshot();
+        infer_protocol::scheduler_to_server::SchedulerMetricsSnapshot {
+            metrics_enabled: self.config.metrics_enabled,
+            queued_requests: self.requests.waiting().len() as u64,
+            active_requests: self.requests.active_count() as u64,
+            prefilling_requests: self.requests.prefilling_len() as u64,
+            decoding_requests: self.requests.decoding_len() as u64,
+            kv_tokens_used: self.kv_budget.outstanding(),
+            // The stored budget is refreshed before dispatch. Read the live
+            // segments so this snapshot also reflects the latest dispatch/ack.
+            kv_tokens_pending:
+                crate::domain::inference_session::table::accounting::inflight_prefill_tokens(
+                    &self.requests,
+                ),
+            kv_tokens_capacity: self.kv_budget.capacity(),
+            total_requests: counters.total_requests,
+            total_completions: counters.total_completions,
+            total_tokens_generated: counters.total_tokens_generated,
+            total_latency_ms: counters.total_latency_ms,
+        }
+    }
+
     /// Handle a decoded worker step output — delegates to the workflow.
     ///
     /// The event is already decoded by the background decode task;
@@ -383,6 +425,16 @@ impl SchedulerEngine {
     /// relief only applies in LLM mode with caching enabled.
     pub(crate) async fn on_control_event(&mut self, event: ControlEvent) -> Result<()> {
         use crate::application::ControlOutcome;
+        use infer_protocol::scheduler_to_server::SchedulerReadiness;
+        use infer_protocol::worker_to_scheduler_control::WorkerState;
+
+        if let ControlEvent::Heartbeat { hb, .. } = &event {
+            match hb.state {
+                WorkerState::Ready | WorkerState::Running => {}
+                WorkerState::Draining => self.readiness.set(SchedulerReadiness::Draining),
+                _ => self.readiness.set(SchedulerReadiness::Failed),
+            }
+        }
 
         let enable_prefix_caching =
             matches!(self.config.mode, SchedulerMode::Llm) && self.config.enable_prefix_caching;
@@ -408,6 +460,8 @@ impl SchedulerEngine {
                 Ok(())
             }
             ControlOutcome::Terminate { error } => {
+                self.readiness
+                    .set(infer_protocol::scheduler_to_server::SchedulerReadiness::Failed);
                 let msg = error.to_string();
                 let running: Vec<RequestId> = self
                     .requests
@@ -519,13 +573,18 @@ impl SchedulerEngine {
         &mut self,
         decoded_rx: &mut mpsc::UnboundedReceiver<SchedulerEvent>,
     ) -> SchedulerEvent {
+        self.readiness.tick(self.metrics_snapshot());
         let has_work = self.has_pending_work() || self.has_in_flight_batch();
         let deadline = self.schedule_deadline;
         let frontend = self.dispatch.frontend_mut();
         let control_events = &mut self.control_events;
 
         tokio::select! {
-            Some(ev) = control_events.recv() => SchedulerEvent::ControlSignal(ev),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => SchedulerEvent::ReadinessTick,
+            ev = control_events.recv() => match ev {
+                Some(ev) => SchedulerEvent::ControlSignal(ev),
+                None => SchedulerEvent::WorkerShutdown,
+            },
             result = frontend.recv_event() => frontend_result_to_event(result),
             // Batch-accumulation deadline (throughput mode only). The deadline
             // is absolute, so re-arming this branch each poll fires at the same

@@ -15,11 +15,12 @@ pub async fn admit(
     mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let permit = Arc::new(
-        capacity
-            .try_acquire_owned()
-            .map_err(|_| AppError::too_many("server overloaded, please retry later"))?,
-    );
+    let permit = Arc::new(capacity.try_acquire_owned().map_err(|_| {
+        if let Some(observation) = request.extensions().get::<crate::metrics::RequestMetrics>() {
+            observation.registry.reject_inflight();
+        }
+        AppError::too_many("server overloaded, please retry later")
+    })?);
     request.extensions_mut().insert(permit.clone());
     let response = next.run(request).await;
     // Handlers retain a clone through inference and SSE; failed extraction releases it here.

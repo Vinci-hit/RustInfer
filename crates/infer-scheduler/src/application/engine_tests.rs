@@ -576,6 +576,86 @@ fn make_engine() -> (
     (engine, default_worker, event_tx, cmd_rx)
 }
 
+#[tokio::test]
+async fn metrics_snapshot_tracks_request_lifecycle_and_reported_kv() -> Result<()> {
+    use infer_protocol::server_to_scheduler::{InferenceModality, InferenceRequest};
+
+    let (mut engine, _, _events, _commands) = make_engine();
+    let request = InferenceRequest {
+        multimodal: None,
+        request_id: "metrics-lifecycle".into(),
+        modality: InferenceModality::Llm,
+        input_ids: vec![1, 2],
+        max_tokens: 2,
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: -1,
+        stream: false,
+        priority: 0,
+        stop_sequences: vec![],
+        ignore_eos: false,
+        diffusion: None,
+    };
+    engine
+        .handle_new_request(ClientId::dummy(), request)
+        .await?;
+    let snapshot = engine.metrics_snapshot();
+    assert_eq!(snapshot.queued_requests, 1);
+    assert_eq!(snapshot.active_requests, 1);
+    assert_eq!(snapshot.total_requests, 1);
+    assert_eq!(snapshot.kv_tokens_capacity, 32);
+
+    engine.maybe_schedule().await?;
+    let snapshot = engine.metrics_snapshot();
+    assert_eq!(snapshot.queued_requests, 0);
+    assert_eq!(snapshot.prefilling_requests, 1);
+    assert_eq!(snapshot.kv_tokens_pending, 2);
+    let sequence_id = engine.requests.prefilling()[0].meta.sequence_id.0;
+    let codec = MsgPackCodec;
+    let output = StepOutput {
+        prefill_done: vec![sequence_id],
+        tokens: vec![GeneratedToken {
+            sequence_id,
+            token_id: 42,
+            finished: false,
+        }],
+        assigned_indices: vec![AssignedIndices {
+            sequence_id,
+            base: 0,
+            len: 2,
+            token_ids: vec![1, 2],
+        }],
+    };
+    engine
+        .handle_step_output_llm(codec.encode(&output)?)
+        .await?;
+    let snapshot = engine.metrics_snapshot();
+    assert_eq!(snapshot.prefilling_requests, 0);
+    assert_eq!(snapshot.decoding_requests, 1);
+    assert_eq!(snapshot.kv_tokens_used, 2);
+    assert_eq!(snapshot.kv_tokens_pending, 0);
+    assert_eq!(snapshot.total_completions, 0);
+
+    let output = StepOutput {
+        prefill_done: vec![],
+        tokens: vec![GeneratedToken {
+            sequence_id,
+            token_id: 43,
+            finished: true,
+        }],
+        assigned_indices: vec![],
+    };
+    engine
+        .handle_step_output_llm(codec.encode(&output)?)
+        .await?;
+    let snapshot = engine.metrics_snapshot();
+    assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.decoding_requests, 0);
+    assert_eq!(snapshot.total_completions, 1);
+    assert_eq!(snapshot.total_tokens_generated, 2);
+    Ok(())
+}
+
 fn insert_decoding_session(engine: &mut SchedulerEngine, sid: u64, input_len: usize) -> RequestId {
     let meta = Arc::new(RequestMeta {
         multimodal: None,
@@ -638,6 +718,8 @@ async fn step_error_via_control_plane_fails_inflight() -> Result<()> {
 #[tokio::test]
 async fn worker_lost_fails_all_inflight() -> Result<()> {
     let (mut engine, default_worker, _event_tx, _cmd_rx) = make_engine();
+    use infer_protocol::scheduler_to_server::SchedulerReadiness;
+    engine.readiness.set(SchedulerReadiness::Ready);
     let result = engine
         .on_control_event(
             crate::infrastructure::transport::control_plane::ControlEvent::WorkerLost {
@@ -647,7 +729,48 @@ async fn worker_lost_fails_all_inflight() -> Result<()> {
         )
         .await;
     assert!(matches!(result, Err(SchedulerError::WorkerError(_))));
+    assert_eq!(engine.readiness.state(), SchedulerReadiness::Failed);
     Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_worker_heartbeat_revokes_readiness() -> Result<()> {
+    use crate::infrastructure::transport::control_plane::ControlEvent;
+    use infer_protocol::scheduler_to_server::SchedulerReadiness;
+    use infer_protocol::worker_to_scheduler_control::{WorkerHeartbeat, WorkerState};
+    for (state, expected) in [
+        (WorkerState::Draining, SchedulerReadiness::Draining),
+        (WorkerState::Error, SchedulerReadiness::Failed),
+        (WorkerState::Stopped, SchedulerReadiness::Failed),
+    ] {
+        let (mut engine, worker, _event_tx, _cmd_rx) = make_engine();
+        engine.readiness.set(SchedulerReadiness::Ready);
+        engine
+            .on_control_event(ControlEvent::Heartbeat {
+                worker,
+                hb: WorkerHeartbeat {
+                    worker_id: "worker".into(),
+                    state,
+                    active_requests: 0,
+                    kv_outstanding: None,
+                    kv_transient_reserved: None,
+                    kv_total_free: None,
+                    kv_released_pending: None,
+                },
+            })
+            .await?;
+        assert_eq!(engine.readiness.state(), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_closure_is_not_hidden_by_idle_readiness_ticks() {
+    let (mut engine, _, event_tx, _cmd_rx) = make_engine();
+    drop(event_tx);
+    let (_decoded_tx, mut decoded_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event = engine.poll_next_event(&mut decoded_rx).await;
+    assert!(matches!(event, SchedulerEvent::WorkerShutdown));
 }
 
 /// `cancel_request` on a prefilling sequence should unicast a Cancel

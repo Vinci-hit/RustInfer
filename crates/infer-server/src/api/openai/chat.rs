@@ -23,6 +23,7 @@ use super::types::*;
 pub async fn chat_completions(
     State(state): State<SharedState>,
     Extension(permit): Extension<crate::middleware::admission::AdmissionPermit>,
+    Extension(observation): Extension<crate::metrics::RequestMetrics>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, AppError> {
     let request_start = Instant::now();
@@ -37,7 +38,10 @@ pub async fn chat_completions(
                 .image_admission
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| AppError::too_many("image request capacity exhausted"))?,
+                .map_err(|_| {
+                    state.metrics.reject_image();
+                    AppError::too_many("image request capacity exhausted")
+                })?,
         )
     } else {
         None
@@ -158,6 +162,7 @@ pub async fn chat_completions(
             include_usage,
             request_start,
             (permit, image_permit),
+            observation,
         );
 
         Ok(sse.into_response())

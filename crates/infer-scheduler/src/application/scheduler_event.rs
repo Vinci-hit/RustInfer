@@ -38,6 +38,8 @@ pub enum SchedulerEvent {
     /// Batch-accumulation deadline elapsed — flush deferred prefills.
     /// Only emitted when `batch_wait` is enabled (throughput mode).
     BatchTimer,
+    /// Refresh engine readiness during idle periods.
+    ReadinessTick,
     /// Frontend transport closed.
     FrontendShutdown,
     /// Worker transport closed.

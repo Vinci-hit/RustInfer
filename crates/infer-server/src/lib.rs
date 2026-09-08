@@ -7,6 +7,7 @@ pub mod chat;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod middleware;
 pub mod router;
 pub mod state;

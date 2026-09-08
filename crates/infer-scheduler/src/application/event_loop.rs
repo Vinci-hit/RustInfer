@@ -56,6 +56,7 @@ pub async fn run_event_loop(
         let event = engine.poll_next_event(&mut decoded_rx).await;
 
         match event {
+            SchedulerEvent::ReadinessTick => {}
             SchedulerEvent::NewRequest { client_id, request } => {
                 let _t = std::time::Instant::now();
                 engine.handle_new_request(client_id, request).await?;

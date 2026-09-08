@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use infer_protocol::scheduler_to_server::{
-    ChunkType, FRONTEND_PROTOCOL_VERSION, InferenceMetrics, InferenceResponse, SchedulerReply,
-    StreamChunk,
+    ChunkType, FRONTEND_PROTOCOL_VERSION, InferenceMetrics, InferenceResponse,
+    SchedulerMetricsSnapshot, SchedulerPong, SchedulerReadiness, SchedulerReply, StreamChunk,
 };
 use infer_protocol::server_to_scheduler::{
     CancelReason, CancelRequest as ServerCancelRequest, InferenceRequest, ServerCommand,
@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,14 +22,13 @@ use super::InferClient;
 
 const CLIENT_COMMAND_BUFFER: usize = 1024;
 const STREAM_CHUNK_BUFFER: usize = 64;
-/// Send a liveness `Ping` when nothing has been heard from the scheduler for
-/// this long. The scheduler's frontend thread answers `Pong` immediately, so
-/// under a healthy link `last_contact` stays fresh even with zero traffic.
+/// Probe periodically even during inference traffic: replies and stream chunks
+/// cannot establish model readiness or refresh the engine's readiness lease.
 const PING_INTERVAL: Duration = Duration::from_secs(3);
 /// `/ready` reports ready only if the scheduler was heard from within this
 /// window. Must comfortably exceed `PING_INTERVAL` so one lost pong does not
 /// flap readiness.
-const READY_STALE_MS: u64 = 10_000;
+const READY_STALE_AFTER: Duration = Duration::from_secs(10);
 /// Idle ceiling on a single `zmq::poll`: with the wake pipe restored, new
 /// commands interrupt the poll instantly and responses arrive via POLLIN, so
 /// this only bounds how often `cancel_timed_out_requests` runs while fully
@@ -128,17 +126,49 @@ pub struct ZmqClient {
     command_tx: SyncSender<RequestEnvelope>,
     waker: std::sync::Arc<Waker>,
     timeout: Duration,
-    /// Unix millis of the last decoded scheduler reply (any kind). `0` until
-    /// first contact. Written by the ZMQ thread, read by `/ready`.
-    last_contact: std::sync::Arc<AtomicU64>,
+    readiness: std::sync::Arc<Mutex<ClientReadiness>>,
 }
 
-/// Current unix time in milliseconds (0 if the clock is before the epoch).
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+#[derive(Default)]
+struct ClientReadiness {
+    last_pong: Option<Instant>,
+    scheduler: SchedulerReadiness,
+    draining: bool,
+    metrics: Option<SchedulerMetricsSnapshot>,
+}
+
+impl ClientReadiness {
+    fn record_pong(&mut self, pong: SchedulerPong) {
+        if pong.protocol_version != FRONTEND_PROTOCOL_VERSION {
+            tracing::error!(
+                scheduler_version = pong.protocol_version,
+                server_version = FRONTEND_PROTOCOL_VERSION,
+                "scheduler frontend protocol version mismatch; holding /ready at 503"
+            );
+            self.last_pong = None;
+            self.scheduler = SchedulerReadiness::Failed;
+            self.metrics = None;
+            return;
+        }
+        self.last_pong = Some(Instant::now());
+        self.scheduler = pong.readiness;
+        self.metrics = pong.metrics;
+    }
+
+    fn alive(&self) -> bool {
+        self.last_pong
+            .is_some_and(|last| last.elapsed() < READY_STALE_AFTER)
+    }
+
+    fn state(&self) -> SchedulerReadiness {
+        if self.draining {
+            SchedulerReadiness::Draining
+        } else if self.scheduler == SchedulerReadiness::Ready && !self.alive() {
+            SchedulerReadiness::Failed
+        } else {
+            self.scheduler
+        }
+    }
 }
 
 /// Cancels a oneshot (non-stream) request if the HTTP handler future is
@@ -202,16 +232,24 @@ impl ZmqClient {
             writer: Mutex::new(wake_tx),
         });
 
-        let last_contact = std::sync::Arc::new(AtomicU64::new(0));
-        let last_contact_thread = last_contact.clone();
+        let readiness = std::sync::Arc::new(Mutex::new(ClientReadiness::default()));
+        let readiness_thread = readiness.clone();
 
         thread::Builder::new()
             .name("zmq-client".to_string())
             .spawn(move || {
-                if let Err(e) =
-                    Self::zmq_thread(endpoint, command_rx, wake_rx, timeout, last_contact_thread)
-                {
+                if let Err(e) = Self::zmq_thread(
+                    endpoint,
+                    command_rx,
+                    wake_rx,
+                    timeout,
+                    readiness_thread.clone(),
+                ) {
                     tracing::error!("ZMQ thread exited with error: {:?}", e);
+                }
+                if let Ok(mut readiness) = readiness_thread.lock() {
+                    readiness.last_pong = None;
+                    readiness.scheduler = SchedulerReadiness::Failed;
                 }
             })?;
 
@@ -219,17 +257,41 @@ impl ZmqClient {
             command_tx,
             waker,
             timeout,
-            last_contact,
+            readiness,
         })
     }
 
-    /// Whether the scheduler has been heard from recently enough to accept
-    /// traffic. Drives `/ready`: false until the first reply/pong after boot,
-    /// and false again within `READY_STALE_MS` of the scheduler dying (DEALER
-    /// `connect` is lazy and never fails, so socket state says nothing).
+    /// Recent compatible control-plane contact, independent of readiness.
     pub fn scheduler_alive(&self) -> bool {
-        let last = self.last_contact.load(Ordering::Relaxed);
-        last != 0 && unix_ms().saturating_sub(last) < READY_STALE_MS
+        self.readiness.lock().is_ok_and(|state| state.alive())
+    }
+
+    pub fn scheduler_ready(&self) -> bool {
+        self.readiness_state() == SchedulerReadiness::Ready
+    }
+
+    /// Latest live scheduler snapshot; never expose stale resource gauges.
+    pub fn scheduler_metrics(&self) -> Option<SchedulerMetricsSnapshot> {
+        self.readiness.lock().ok().and_then(|state| {
+            if state.alive() && state.scheduler == SchedulerReadiness::Ready {
+                state.metrics.clone()
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn readiness_state(&self) -> SchedulerReadiness {
+        self.readiness
+            .lock()
+            .map(|state| state.state())
+            .unwrap_or(SchedulerReadiness::Failed)
+    }
+
+    pub fn begin_draining(&self) {
+        if let Ok(mut readiness) = self.readiness.lock() {
+            readiness.draining = true;
+        }
     }
 
     fn zmq_thread(
@@ -237,7 +299,7 @@ impl ZmqClient {
         command_rx: Receiver<RequestEnvelope>,
         mut wake_rx: std::io::PipeReader,
         timeout: Duration,
-        last_contact: std::sync::Arc<AtomicU64>,
+        readiness: std::sync::Arc<Mutex<ClientReadiness>>,
     ) -> Result<()> {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::DEALER)?;
@@ -276,17 +338,11 @@ impl ZmqClient {
 
             // 4) DEALER 有数据：尽量多收（一次 poll 唤醒可能对应多个消息到达）
             if items[0].is_readable() {
-                Self::drain_dealer(&socket, &mut pending, &last_contact, timeout);
+                Self::drain_dealer(&socket, &mut pending, &readiness, timeout);
             }
 
-            // 4b) Liveness probe: nothing heard within PING_INTERVAL → send a
-            //     Ping (rate-limited by last_ping). The poll above wakes at
-            //     least every POLL_MAX_TIMEOUT, so this runs on time even when
-            //     fully idle.
-            let contact_age = unix_ms().saturating_sub(last_contact.load(Ordering::Relaxed));
-            if contact_age >= PING_INTERVAL.as_millis() as u64
-                && last_ping.elapsed() >= PING_INTERVAL
-            {
+            // 4b) Readiness probes cannot be suppressed by ordinary replies.
+            if last_ping.elapsed() >= PING_INTERVAL {
                 last_ping = Instant::now();
                 if let Err(e) = Self::send_command(&socket, &ServerCommand::Ping) {
                     tracing::warn!("failed to send liveness ping: {:?}", e);
@@ -358,16 +414,14 @@ impl ZmqClient {
     fn drain_dealer(
         socket: &zmq::Socket,
         pending: &mut HashMap<String, PendingRequest>,
-        last_contact: &AtomicU64,
+        readiness: &Mutex<ClientReadiness>,
         timeout: Duration,
     ) {
         loop {
             // DEALER 收到的第一帧是空 delimiter（来自 ROUTER 的回程）
             match socket.recv_bytes(zmq::DONTWAIT) {
                 Ok(_delim) => match socket.recv_bytes(zmq::DONTWAIT) {
-                    Ok(data) => {
-                        Self::handle_response(socket, pending, last_contact, &data, timeout)
-                    }
+                    Ok(data) => Self::handle_response(socket, pending, readiness, &data, timeout),
                     Err(zmq::Error::EAGAIN) => {
                         tracing::warn!("ZMQ response delimiter without payload");
                         break;
@@ -432,7 +486,7 @@ impl ZmqClient {
     fn handle_response(
         socket: &zmq::Socket,
         pending: &mut HashMap<String, PendingRequest>,
-        last_contact: &AtomicU64,
+        readiness: &Mutex<ClientReadiness>,
         data: &[u8],
         timeout: Duration,
     ) {
@@ -448,24 +502,14 @@ impl ZmqClient {
 
         match reply {
             SchedulerReply::Pong(pong) => {
-                if pong.protocol_version != FRONTEND_PROTOCOL_VERSION {
-                    // Refuse readiness on mismatch: don't refresh last_contact,
-                    // so /ready keeps reporting 503.
-                    tracing::error!(
-                        scheduler_version = pong.protocol_version,
-                        server_version = FRONTEND_PROTOCOL_VERSION,
-                        "scheduler frontend protocol version mismatch; holding /ready at 503"
-                    );
-                    return;
+                if let Ok(mut readiness) = readiness.lock() {
+                    readiness.record_pong(pong);
                 }
-                last_contact.store(unix_ms(), Ordering::Relaxed);
             }
             SchedulerReply::Full(response) => {
-                last_contact.store(unix_ms(), Ordering::Relaxed);
                 Self::handle_full_response(socket, pending, response);
             }
             SchedulerReply::Chunk(chunk) => {
-                last_contact.store(unix_ms(), Ordering::Relaxed);
                 Self::handle_stream_chunk(socket, pending, chunk, timeout);
             }
         }
@@ -682,6 +726,65 @@ impl InferClient for ZmqClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pong(readiness: SchedulerReadiness) -> SchedulerPong {
+        SchedulerPong {
+            protocol_version: FRONTEND_PROTOCOL_VERSION,
+            readiness,
+            metrics: None,
+        }
+    }
+
+    #[test]
+    fn model_loading_pong_is_alive_but_not_ready() {
+        let mut state = ClientReadiness::default();
+        assert!(!state.alive());
+        state.record_pong(pong(SchedulerReadiness::Loading));
+        assert!(state.alive());
+        assert_eq!(state.state(), SchedulerReadiness::Loading);
+        state.record_pong(pong(SchedulerReadiness::Ready));
+        assert_eq!(state.state(), SchedulerReadiness::Ready);
+        state.last_pong = Some(Instant::now() - READY_STALE_AFTER);
+        assert_eq!(state.state(), SchedulerReadiness::Failed);
+    }
+
+    #[test]
+    fn mismatch_and_draining_cannot_be_hidden_by_inference_replies() {
+        let context = zmq::Context::new();
+        let socket = context.socket(zmq::DEALER).unwrap();
+        let readiness = Mutex::new(ClientReadiness::default());
+        readiness
+            .lock()
+            .unwrap()
+            .record_pong(pong(SchedulerReadiness::Ready));
+        let mut incompatible = pong(SchedulerReadiness::Ready);
+        incompatible.protocol_version = FRONTEND_PROTOCOL_VERSION - 1;
+        readiness.lock().unwrap().record_pong(incompatible);
+        let reply = SchedulerReply::Full(InferenceResponse {
+            request_id: "unknown".into(),
+            status: infer_protocol::scheduler_to_server::ResponseStatus::Success,
+            output_token_ids: Vec::new(),
+            images: Vec::new(),
+            finish_reason: None,
+            error: None,
+            metrics: InferenceMetrics::default(),
+        });
+        ZmqClient::handle_response(
+            &socket,
+            &mut HashMap::new(),
+            &readiness,
+            &rmp_serde::to_vec(&reply).unwrap(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            readiness.lock().unwrap().state(),
+            SchedulerReadiness::Failed
+        );
+        let mut state = readiness.lock().unwrap();
+        state.draining = true;
+        state.record_pong(pong(SchedulerReadiness::Ready));
+        assert_eq!(state.state(), SchedulerReadiness::Draining);
+    }
 
     #[test]
     fn unary_pending_requests_have_no_zmq_thread_deadline() {

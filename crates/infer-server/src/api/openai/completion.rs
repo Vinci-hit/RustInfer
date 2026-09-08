@@ -21,6 +21,7 @@ use super::types::*;
 pub async fn completions(
     State(state): State<SharedState>,
     Extension(permit): Extension<crate::middleware::admission::AdmissionPermit>,
+    Extension(observation): Extension<crate::metrics::RequestMetrics>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, AppError> {
     // 1. 校验
@@ -99,6 +100,7 @@ pub async fn completions(
             state.tokenizer.clone(),
             include_usage,
             permit,
+            observation,
         );
 
         Ok(sse.into_response())
