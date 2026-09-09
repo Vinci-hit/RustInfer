@@ -391,8 +391,13 @@ where
             // Stream capture records kernels without executing them.
             self.scope.graph_capture_begin()?;
             if let Err(e) = self.forward_finalize_argmax(plan, &input_ids) {
-                // Close the capture so the stream is left in a usable state.
-                let _ = self.scope.graph_capture_end(key);
+                // Preserve the forward error unless cleanup observes a fatal
+                // device fault, in which case the worker must stop retrying.
+                if let Err(cleanup) = self.scope.graph_capture_abort()
+                    && cleanup.is_fatal()
+                {
+                    return Err(cleanup);
+                }
                 return Err(e);
             }
             self.scope.graph_capture_end(key)?;
@@ -481,7 +486,11 @@ where
             self.scope.synchronize()?;
             self.scope.graph_capture_begin()?;
             if let Err(e) = self.run_layers(plan, &input_ids) {
-                let _ = self.scope.graph_capture_end(key);
+                if let Err(cleanup) = self.scope.graph_capture_abort()
+                    && cleanup.is_fatal()
+                {
+                    return Err(cleanup);
+                }
                 return Err(e);
             }
             self.scope.graph_capture_end(key)?;

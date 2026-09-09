@@ -8,12 +8,13 @@ pub mod device_utils;
 pub mod error;
 pub mod ffi;
 mod nccl;
+mod pool;
 // Raw kernel launch wrappers are an implementation detail. Keeping this module
 // private prevents external callers from manufacturing invalid CUDA streams or
 // device pointers; the safe backend traits below are the supported API.
 mod kernels;
 
-pub use config::{CudaConfig, CudaMemoryPlan, CudaWorkspace, GraphSlot};
+pub use config::{CudaConfig, CudaMemoryPlan, CudaPoolStats, CudaWorkspace, GraphSlot};
 pub use error::CudaError;
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclCommunicator, NcclUniqueId};
 
@@ -153,9 +154,11 @@ impl infer_core::exec::ExecScope for CudaScope {
             buffer_id: 0,
             slot_signature: 0,
         };
-        let r = self.device.config.capture_end(slot);
-        self.device.config.arena_end();
-        r
+        self.device.config.capture_end(slot)
+    }
+
+    fn graph_capture_abort(&self) -> OpResult<()> {
+        self.device.config.capture_abort()
     }
 
     fn graph_launch(&self, key: u64) -> OpResult<()> {
@@ -1289,40 +1292,13 @@ impl MemoryPort for Cuda {
     fn alloc_bytes(&self, size: usize) -> OpResult<NonNull<u8>> {
         // During graph capture/replay, serve scratch from the capture arena so
         // no `cudaMalloc` is issued (illegal while a stream is capturing).
-        if let Some(arena_ptr) = self.config.arena_alloc(size) {
+        if let Some(arena_ptr) = self.config.arena_alloc(size)? {
             return NonNull::new(arena_ptr as *mut u8)
                 .ok_or_else(|| OpError::Kernel("graph arena returned null".into()));
         }
-        // Recycle a previously-freed block of the same size class if one is
-        // available — avoids cudaMalloc entirely once the pool warms up.
-        let n = self.config.round_up_256(size);
-        if let Some(ptr) = self.config.pool_pop(n) {
-            // The reused block holds a prior tenant's bytes; zero it stream-
-            // ordered (async, no host stall) to preserve `Tensor::zeros`
-            // semantics for every caller.
-            unsafe {
-                ffi::cudaMemsetAsync(ptr, 0, n, self.config.stream);
-            }
-            return NonNull::new(ptr as *mut u8)
-                .ok_or_else(|| OpError::Kernel("cuda pool returned null".into()));
-        }
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: cudaMalloc/cudaMemsetAsync are safe to call with valid args.
-        unsafe {
-            let code = ffi::cudaMalloc(&mut ptr, n);
-            if code != ffi::cudaError_cudaSuccess {
-                return Err(OpError::Kernel(format!(
-                    "cudaMalloc({}) failed: {:?}",
-                    n, code
-                )));
-            }
-            // Async, stream-ordered zero — replaces the host-blocking
-            // synchronous cudaMemset that dominated eager-forward TTFT.
-            ffi::cudaMemsetAsync(ptr, 0, n, self.config.stream);
-        }
-        self.config.pool_note_cold_alloc(n);
+        let ptr = self.config.pool_alloc(size)?;
         NonNull::new(ptr as *mut u8)
-            .ok_or_else(|| OpError::Kernel("cudaMalloc returned null".into()))
+            .ok_or_else(|| OpError::Kernel("cuda pool returned null".into()))
     }
 
     unsafe fn free_bytes(&self, ptr: NonNull<u8>, size: usize) {
@@ -1335,12 +1311,10 @@ impl MemoryPort for Cuda {
         {
             return;
         }
-        // Recycle into the size-keyed pool instead of `cudaFree` (which would
-        // device-synchronize). The block is reused by the next same-size alloc;
-        // all retained blocks are released in `CudaConfig::Drop` via `pool_drain`.
-        let n = self.config.round_up_256(size);
+        // The pool remembers the actual capacity of a larger-block reuse;
+        // `size` remains the original request supplied by Storage::drop.
         self.config
-            .pool_push(n, ptr.as_ptr() as *mut std::ffi::c_void);
+            .pool_release(ptr.as_ptr() as *mut std::ffi::c_void, size);
     }
 
     unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
@@ -1437,17 +1411,7 @@ impl MemoryPort for Cuda {
     }
 
     fn synchronize(&self) -> OpResult<()> {
-        let stream = self.config.stream;
-        // SAFETY: stream is owned by self.config.
-        let code = unsafe { ffi::cudaStreamSynchronize(stream) };
-        if code != ffi::cudaError_cudaSuccess {
-            return Err(OpError::Kernel(format!(
-                "cudaStreamSynchronize failed: {:?}",
-                code
-            )));
-        }
-        error::check_last_error("cuda synchronize observed prior kernel error")?;
-        Ok(())
+        self.config.synchronize()
     }
 
     unsafe fn copy_device_to_device(

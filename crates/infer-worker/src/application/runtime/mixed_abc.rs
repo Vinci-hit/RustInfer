@@ -789,7 +789,7 @@ where
         self.scope.graph_capture_begin()?;
         // FA3 declines to launch under capture unless this is raised; the bucket
         // plan bakes `max_q`/`b` to upper bounds, so the captured FA3 node stays
-        // correct at replay. Lower it before `graph_capture_end` on every path so
+        // correct at replay. Lower it before ending or aborting capture so
         // no later capture inherits the permission.
         if self.mixed_fa3_graph {
             D::set_unified_mixed_capture(true);
@@ -800,7 +800,11 @@ where
             D::set_unified_mixed_capture(false);
         }
         if let Err(e) = region {
-            let _ = self.scope.graph_capture_end(key);
+            if let Err(cleanup) = self.scope.graph_capture_abort()
+                && cleanup.is_fatal()
+            {
+                return Err(cleanup);
+            }
             return Err(e);
         }
         self.scope.graph_capture_end(key)?;

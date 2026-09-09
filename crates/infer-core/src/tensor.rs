@@ -100,9 +100,8 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             storage_elems,
         );
 
-        // Some operations intentionally treat a non-contiguous tensor as a
-        // linear prefix (for example host uploads). Keep that independent
-        // access pattern in bounds as well as the logical strided span above.
+        // Some backend operations still index non-contiguous tensors linearly.
+        // Keep that access pattern in bounds as well as the strided span above.
         let linear_end = offset_elems
             .checked_add(numel)
             .expect("Tensor linear view address calculation overflow");
@@ -132,6 +131,27 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             }
         }
     }
+
+    /// Whether the logical elements form a packed row-major range. A strided
+    /// parent can produce a packed view when narrowed to a single row.
+    fn has_contiguous_layout(shape: &Shape, strides: &Strides) -> bool {
+        // Empty tensors address no elements, regardless of their strides.
+        if shape.as_slice().contains(&0) {
+            return true;
+        }
+        let mut expected_stride = 1usize;
+        for (&extent, &stride) in shape.as_slice().iter().zip(strides.as_slice()).rev() {
+            if extent > 1 && stride != expected_stride {
+                return false;
+            }
+            let Some(next_stride) = expected_stride.checked_mul(extent) else {
+                return false;
+            };
+            expected_stride = next_stride;
+        }
+        true
+    }
+
     // ─── Construction ──────────────────────────────────────────────
 
     /// Build a tensor from checked raw parts that alias `storage`.
@@ -328,10 +348,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
 
     /// Slice along `dim` from `start` for `length` elements.
     ///
-    /// Zero-copy: returns a view sharing the same `Arc<Storage>`. The result
-    /// is non-contiguous unless `dim == 0` and `start == 0` (or the slice
-    /// covers the full extent), but downstream kernels that accept row/col
-    /// strides (rope, scatter, matmul) handle this directly.
+    /// Zero-copy: returns a view sharing the same `Arc<Storage>`. Contiguity
+    /// follows the resulting shape and strides: selecting columns across
+    /// multiple rows leaves gaps, while selecting a packed single row does not.
     pub fn narrow(&self, dim: usize, start: usize, length: usize) -> OpResult<Self> {
         let shape = self.shape.as_slice();
         if dim >= shape.len() {
@@ -363,12 +382,7 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
                 self.offset_elems, extra_offset,
             ))
         })?;
-        // Contiguity after narrow: a slice along `dim == 0` stays a single
-        // contiguous block (only the base offset shifts), so it remains
-        // contiguous for any `start`/`length`. Narrowing an inner dim to less
-        // than its full extent introduces gaps between rows and is
-        // non-contiguous (unless it is the identity slice).
-        let is_contig = self.is_contiguous && (dim == 0 || (start == 0 && length == shape[dim]));
+        let is_contig = Self::has_contiguous_layout(&new_shape, &self.strides);
         Ok(self.view_raw(new_shape, self.strides, new_offset, is_contig))
     }
 
@@ -477,9 +491,9 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
                 self.numel,
             )));
         }
-        // No is_contiguous check: upload is a linear H2D memcpy;
-        // non-contiguous views that are memory-packed (e.g. narrow on dim 0)
-        // are fine.
+        if !self.is_contiguous {
+            return Err(OpError::NotContiguous(self.shape));
+        }
         let size_bytes = self.numel * T::SIZE_BYTES;
         if size_bytes > 0 {
             // SAFETY: self.data_ptr() points to valid device memory of at
@@ -651,16 +665,30 @@ impl<T: Dtype, D: MemoryPort> std::fmt::Debug for Tensor<T, D> {
 /// `HostDevice` keeps them as inherent methods on `Tensor` so they move with it
 /// into infer-core, without a cross-crate inherent-impl on a foreign type.)
 impl<T: Dtype, D: HostDevice + MemoryPort> Tensor<T, D> {
-    /// Borrow the tensor as a typed slice (host-accessible + contiguous only).
-    pub fn as_slice(&self) -> &[T] {
-        assert!(self.is_contiguous(), "as_slice requires contiguous");
-        // SAFETY: host-accessible storage; pointer valid for `numel` elements.
-        unsafe { std::slice::from_raw_parts(self.data_ptr(), self.numel()) }
+    /// Borrow a contiguous host tensor with exclusively owned storage.
+    ///
+    /// Panics if a tensor, view, or strong/weak storage handle aliases this
+    /// allocation. Use [`Self::to_host_vec`] for a snapshot of shared storage.
+    /// The mutable borrow prevents creating an alias that could write while
+    /// the returned slice is still live:
+    ///
+    /// ```compile_fail,E0502
+    /// use infer_core::device::{HostDevice, MemoryPort};
+    /// use infer_core::tensor::Tensor;
+    ///
+    /// fn cannot_clone_during_borrow<D: HostDevice + MemoryPort>(mut tensor: Tensor<i32, D>) {
+    ///     let values = tensor.as_slice();
+    ///     let alias = tensor.clone();
+    ///     assert_eq!(values.len(), alias.numel());
+    /// }
+    /// ```
+    pub fn as_slice(&mut self) -> &[T] {
+        self.as_slice_mut()
     }
 
     /// Mutable typed slice. Panics unless this tensor is the sole owner of its
     /// storage; `&mut self` alone cannot make storage exclusive when cloned
-    /// tensors or views retain the same `Arc`.
+    /// tensors, views, or weak handles retain the same allocation.
     pub fn as_slice_mut(&mut self) -> &mut [T] {
         assert!(self.is_contiguous(), "as_slice_mut requires contiguous");
         let storage = Arc::get_mut(&mut self.storage)
@@ -816,12 +844,12 @@ mod tests {
         let tensor = Tensor::from_host_slice(&data, [3, 4], &TestDevice).unwrap();
 
         let raw = tensor.view_raw(Shape::from([2, 4]), Strides::from_slice(&[4, 1]), 4, true);
-        assert_eq!(raw.as_slice(), &data[4..]);
+        assert_eq!(raw.to_host_vec().unwrap(), &data[4..]);
 
         let narrow = tensor.narrow(0, 1, 2).unwrap();
         assert!(narrow.is_contiguous());
         assert_eq!(narrow.offset_elems(), 4);
-        assert_eq!(narrow.as_slice(), &data[4..]);
+        assert_eq!(narrow.to_host_vec().unwrap(), &data[4..]);
 
         let inner = tensor.narrow(1, 1, 2).unwrap();
         assert!(!inner.is_contiguous());
@@ -832,17 +860,123 @@ mod tests {
     }
 
     #[test]
-    fn mutable_slice_requires_unique_storage() {
-        let tensor = Tensor::from_host_slice(&[1_i32, 2, 3], [3], &TestDevice).unwrap();
+    fn uploads_reject_strided_columns_but_allow_packed_rows() {
+        let data: Vec<i32> = (0..12).collect();
+        let tensor = Tensor::from_host_slice(&data, [3, 4], &TestDevice).unwrap();
+        let mut columns = tensor.narrow(1, 1, 2).unwrap();
+
+        let result = columns.upload_from_host(&[99; 6]);
+        assert!(matches!(result, Err(OpError::NotContiguous(_))));
+        assert_eq!(tensor.to_host_vec().unwrap(), data);
+
+        let mut row = columns.narrow(0, 1, 1).unwrap();
+        assert!(row.is_contiguous());
+        assert_eq!(row.shape().as_slice(), &[1, 2]);
+        assert_eq!(row.strides().as_slice(), &[4, 1]);
+        assert_eq!(row.offset_elems(), 5);
+        row.upload_from_host(&[50, 60]).unwrap();
+        assert_eq!(row.to_host_vec().unwrap(), &[50, 60]);
+        assert_eq!(
+            tensor.to_host_vec().unwrap(),
+            &[0, 1, 2, 3, 4, 50, 60, 7, 8, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn narrow_contiguity_ignores_only_singleton_strides() {
+        let tensor = Tensor::<i32, TestDevice>::zeros([3, 4], &TestDevice).unwrap();
+        let column = tensor.narrow(1, 1, 1).unwrap();
+        assert!(!column.is_contiguous());
+        assert_eq!(column.shape().as_slice(), &[3, 1]);
+        assert_eq!(column.strides().as_slice(), &[4, 1]);
+        let element = column.narrow(0, 1, 1).unwrap();
+        assert!(element.is_contiguous());
+        assert_eq!(element.strides(), column.strides());
+
+        // A single row remains strided if its elements are not adjacent.
+        let every_other =
+            tensor.view_raw(Shape::from([2, 3]), Strides::from_slice(&[6, 2]), 0, false);
+        let mut row = every_other.narrow(0, 1, 1).unwrap();
+        assert!(!row.is_contiguous());
+        assert_eq!(row.offset_elems(), 6);
+        assert!(matches!(
+            row.upload_from_host(&[1, 2, 3]),
+            Err(OpError::NotContiguous(_))
+        ));
+    }
+
+    #[test]
+    fn empty_narrow_is_contiguous_without_stride_overflow() {
+        let tensor = Tensor::<i32, TestDevice>::zeros([3, 4], &TestDevice).unwrap();
+        let mut end = tensor.narrow(0, 3, 0).unwrap();
+        assert!(end.is_contiguous());
+        assert_eq!(end.offset_elems(), 12);
+        end.upload_from_host(&[]).unwrap();
+        assert!(end.to_host_vec().unwrap().is_empty());
+
+        // Empty shapes must not overflow while examining non-empty suffixes.
+        let empty = tensor.view_raw(
+            Shape::from([0, usize::MAX, usize::MAX]),
+            Strides::from_slice(&[0, 0, 0]),
+            0,
+            false,
+        );
+        let mut narrowed = empty.narrow(0, 0, 0).unwrap();
+        assert!(narrowed.is_contiguous());
+        narrowed.upload_from_host(&[]).unwrap();
+    }
+
+    fn assert_shared_slices_rejected(tensor: &mut Tensor<i32, TestDevice>) {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = tensor.as_slice();
+            }))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = tensor.as_slice_mut();
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn slices_require_unique_storage_and_shared_snapshots_remain_usable() {
+        let mut tensor = Tensor::from_host_slice(&[1_i32, 2, 3], [3], &TestDevice).unwrap();
         let mut alias = tensor.clone();
+        assert_shared_slices_rejected(&mut tensor);
 
-        let aliased_mutation = catch_unwind(AssertUnwindSafe(|| {
-            alias.as_slice_mut()[0] = 9;
-        }));
-        assert!(aliased_mutation.is_err());
+        let snapshot = tensor.to_host_vec().unwrap();
+        alias.upload_from_host(&[4, 5, 6]).unwrap();
+        assert_eq!(snapshot, &[1, 2, 3]);
+        assert_eq!(tensor.to_host_vec().unwrap(), &[4, 5, 6]);
+        drop(alias);
 
+        let view = tensor.narrow(0, 1, 1).unwrap();
+        assert_shared_slices_rejected(&mut tensor);
+        drop(view);
+
+        let storage = Arc::clone(tensor.storage());
+        assert_shared_slices_rejected(&mut tensor);
+        drop(storage);
+
+        let weak = Arc::downgrade(tensor.storage());
+        assert_shared_slices_rejected(&mut tensor);
+        drop(weak);
+
+        tensor.as_slice_mut()[0] = 9;
+        assert_eq!(tensor.as_slice(), &[9, 5, 6]);
+    }
+
+    #[test]
+    fn sole_remaining_view_can_borrow_slices_at_its_offset() {
+        let tensor = Tensor::from_host_slice(&[1_i32, 2, 3], [3], &TestDevice).unwrap();
+        let mut view = tensor.narrow(0, 1, 2).unwrap();
         drop(tensor);
-        alias.as_slice_mut()[0] = 9;
-        assert_eq!(alias.as_slice(), &[9, 2, 3]);
+
+        assert_eq!(view.as_slice(), &[2, 3]);
+        view.as_slice_mut()[0] = 9;
+        assert_eq!(view.to_host_vec().unwrap(), &[9, 3]);
     }
 }

@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn tensor_zeros_and_slice() {
-        let t = Tensor::<f32, Cpu>::zeros_cpu([2, 3]);
+        let mut t = Tensor::<f32, Cpu>::zeros_cpu([2, 3]);
         assert_eq!(t.shape().as_slice(), &[2, 3]);
         assert_eq!(t.numel(), 6);
         assert!(t.as_slice().iter().all(|&x| x == 0.0));
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn tensor_from_slice_roundtrip() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
-        let t = Tensor::<f32, Cpu>::from_slice(&data, [4]);
+        let mut t = Tensor::<f32, Cpu>::from_slice(&data, [4]);
         assert_eq!(t.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
     }
 
@@ -1399,7 +1399,7 @@ mod tests {
         Cpu::matmul(&input, &weight, &mut shard).unwrap();
 
         assert_eq!(
-            output.as_slice(),
+            output.to_host_vec().unwrap(),
             &[-1.0, 1.0, 2.0, -1.0, -1.0, -1.0, 3.0, 4.0, -1.0, -1.0]
         );
     }
@@ -1413,7 +1413,7 @@ mod tests {
         Cpu::broadcast_add_inplace(&mut shard, &bias).unwrap();
 
         assert_eq!(
-            output.as_slice(),
+            output.to_host_vec().unwrap(),
             &[-1.0, 9.0, 19.0, -1.0, -1.0, -1.0, 9.0, 19.0, -1.0, -1.0]
         );
     }
@@ -1550,7 +1550,7 @@ mod tests {
     #[test]
     fn gated_rmsnorm_is_stateless_and_normalizes_each_head() {
         let scope = infer_core::exec::HostScope::new(Cpu);
-        let input = Tensor::<f32, Cpu>::from_slice(
+        let mut input = Tensor::<f32, Cpu>::from_slice(
             &[
                 1.0, 2.0, 3.0, // token 0, head 0
                 2.0, -1.0, 0.5, // token 0, head 1
@@ -1559,13 +1559,13 @@ mod tests {
             ],
             [2, 2, 3],
         );
-        let gate = Tensor::<f32, Cpu>::from_slice(
+        let mut gate = Tensor::<f32, Cpu>::from_slice(
             &[
                 0.0, 1.0, -1.0, 0.5, -0.5, 2.0, 1.5, -2.0, 0.25, -1.5, 0.75, 1.25,
             ],
             [2, 2, 3],
         );
-        let weight = Tensor::<f32, Cpu>::from_slice(&[0.5, 1.0, 1.5], [3]);
+        let mut weight = Tensor::<f32, Cpu>::from_slice(&[0.5, 1.0, 1.5], [3]);
         let mut output = Tensor::<f32, Cpu>::zeros_cpu([2, 2, 3]);
         let eps = 1e-6;
 
@@ -1665,6 +1665,28 @@ mod tests {
 
         assert_eq!(q.as_slice(), &[-3.0, -4.0, 1.0, 2.0, 5.0, 6.0]);
         assert_eq!(k.as_slice(), &[-30.0, -40.0, 10.0, 20.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn rope_with_angles_updates_only_selected_columns_across_strided_rows() {
+        let scope = infer_core::exec::HostScope::new(Cpu);
+        let values: Vec<f32> = (1..=32).map(|value| value as f32).collect();
+        let input = Tensor::<f32, Cpu>::from_slice(&values, [2, 16]);
+        let mut view = input.narrow(1, 2, 8).unwrap();
+        assert!(!view.is_contiguous());
+        let sin = Tensor::<f32, Cpu>::from_slice(&[1.0, 0.0, 0.0, 1.0], [2, 2]);
+        let cos = Tensor::<f32, Cpu>::from_slice(&[0.0, 1.0, 1.0, 0.0], [2, 2]);
+
+        <Cpu as FusedOps>::rope_with_angles(&scope, &mut view, &sin, &cos, 8).unwrap();
+
+        // Rotate the first half-split pair in row 0 and the second in row 1.
+        // Every other column, including the unselected prefix and tail, stays unchanged.
+        let mut expected = values.clone();
+        expected[2] = -values[4];
+        expected[4] = values[2];
+        expected[19] = -values[21];
+        expected[21] = values[19];
+        assert_eq!(input.to_host_vec().unwrap(), expected);
     }
 
     // ─── Diffusion op tests ─────────────────────────────────────────

@@ -23,6 +23,12 @@ rustinfer_discover_cuda_libraries
 printf 'GPU regression artifacts: %s\n' "$ARTIFACT_DIR"
 cargo build --release --locked -p infer-worker -p infer-scheduler -p infer-server \
     2>&1 | tee "$ARTIFACT_DIR/build.log"
+cargo test --release --locked -p infer-backend-cuda --test graph_memory \
+    -- --ignored --test-threads=1 2>&1 | tee "$ARTIFACT_DIR/graph-memory.log"
+cargo test --release --locked -p infer-backend-cuda --test pool_memory \
+    -- --ignored --test-threads=1 2>&1 | tee "$ARTIFACT_DIR/pool-memory.log"
+cargo test --release --locked -p infer-backend-cuda --lib config::pool_failure_tests \
+    -- --ignored --test-threads=1 2>&1 | tee "$ARTIFACT_DIR/pool-failures.log"
 cargo test --release --locked -p infer-backend-cuda --lib \
     hd256_paged_prefill_matches_causal_mean_across_split_tiles \
     -- --ignored --test-threads=1 2>&1 | tee "$ARTIFACT_DIR/attention.log"

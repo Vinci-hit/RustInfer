@@ -2,6 +2,8 @@
 
 use super::error::cuda_check;
 use super::ffi;
+pub use super::pool::CudaPoolStats;
+use super::pool::{PoolBlock, PoolState};
 use infer_core::ports::{OpError, OpResult};
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -47,6 +49,13 @@ impl Drop for CudaTestLease {
 }
 
 const MIB: usize = 1024 * 1024;
+
+fn pool_allocation_size(size: usize) -> OpResult<usize> {
+    size.max(1)
+        .checked_add(255)
+        .map(|n| n & !255usize)
+        .ok_or_else(|| OpError::Kernel("CUDA memory pool allocation size overflow".into()))
+}
 
 /// Central CUDA scratch-memory policy.
 ///
@@ -220,21 +229,54 @@ impl Drop for CudaGraph {
     }
 }
 
-/// Size-keyed free-list of recycled device blocks. Eliminates the per-forward
-/// `cudaMalloc`/`cudaFree` storm: every transient scratch `Tensor` returns its
-/// block here on drop (keyed by 256B-rounded size) and the next same-size alloc
-/// pops it, so an eager forward issues ~0 `cudaMalloc`/`cudaFree` in steady
-/// state. Disjoint from the graph-capture arena — arena pointers are filtered
-/// out (via `arena_contains`) before they can reach the pool, so a pooled block
-/// can never alias a captured graph's baked-in scratch addresses.
-#[derive(Debug, Default)]
-struct PoolState {
-    /// key = `round_up_256(size)` → stack of reusable device pointers.
-    free: HashMap<usize, Vec<*mut c_void>>,
-    /// Bytes currently handed out (popped or cold-malloc'd) and not yet returned.
-    live_bytes: usize,
-    /// Bytes retained across the free lists, available for reuse.
-    pooled_bytes: usize,
+/// Release all handles from a discarded capture, even if one destroy fails.
+/// Always consume the runtime's last error and preserve fatal device faults
+/// ahead of recoverable failures. These handles came directly from CUDA.
+fn discard_capture_graph(
+    graph: ffi::cudaGraph_t,
+    exec: ffi::cudaGraphExec_t,
+    reported_error: Option<ffi::cudaError_t>,
+) -> OpResult<()> {
+    // A later successful destroy may replace the runtime's last-error value;
+    // retain a fatal original API result independently of that thread-local slot.
+    let mut error = reported_error
+        .filter(|&code| code != ffi::cudaError_cudaSuccess)
+        .map(|code| super::error::classify_capture_error(code, "CUDA graph capture cleanup"))
+        .filter(OpError::is_fatal);
+    let results = unsafe {
+        [
+            (
+                "destroy discarded graph exec",
+                if exec.is_null() {
+                    ffi::cudaError_cudaSuccess
+                } else {
+                    ffi::cudaGraphExecDestroy(exec)
+                },
+            ),
+            (
+                "destroy discarded graph",
+                if graph.is_null() {
+                    ffi::cudaError_cudaSuccess
+                } else {
+                    ffi::cudaGraphDestroy(graph)
+                },
+            ),
+        ]
+    };
+    for (context, code) in results {
+        if code != ffi::cudaError_cudaSuccess {
+            let next = super::error::classify_sync_error(code, context);
+            if error.is_none() || next.is_fatal() {
+                error = Some(next);
+            }
+        }
+    }
+    if let Err(next) = super::error::check_capture_cleanup_error(reported_error)
+        && (error.is_none() || next.is_fatal())
+    {
+        error = Some(next);
+    }
+    error.map_or(Ok(()), Err)
 }
 
 #[derive(Debug)]
@@ -291,18 +333,22 @@ pub struct CudaConfig {
 
     // ─── Graph-capture scratch arena ─────────────────────────────────
     //
-    // CUDA stream capture forbids `cudaMalloc`. The decode forward allocates
-    // ~190 transient scratch tensors per step, so during capture (and replay)
-    // those allocations are served from this pre-reserved bump arena instead.
-    // Sizes/order are deterministic for a fixed decode batch, so the arena
-    // hands out identical addresses every step — exactly what graph replay
-    // requires. `free` of an arena pointer is a no-op; the arena is reset to
-    // offset 0 at the start of each capture.
+    // Captured transient tensors need addresses reserved across graph replays.
+    // The ordinary pool can recycle dropped tensors, so capture allocations
+    // must stay in this arena. `free` of an arena pointer is a no-op; captures
+    // share the backing region and execute serially on the compute stream.
+    // Reset the offset before each capture, never while capture is active.
     graph_arena: std::sync::Mutex<Option<DeviceRegion>>,
     arena_base: std::sync::atomic::AtomicPtr<c_void>,
     arena_failed: std::sync::atomic::AtomicBool,
     pub arena_off: std::sync::atomic::AtomicUsize,
     pub arena_enabled: std::sync::atomic::AtomicBool,
+    /// Track capture even for callers using the low-level capture API without
+    /// an arena. Such captures must never allocate from the recycling pool.
+    capture_active: std::sync::atomic::AtomicBool,
+    /// A local allocation error need not invalidate CUDA's capture. Remember
+    /// it so even a caller that tries to finish cannot publish a partial graph.
+    capture_failed: std::sync::atomic::AtomicBool,
 
     // ─── Recycling scratch allocator (eager forward path) ────────────
     //
@@ -310,6 +356,9 @@ pub struct CudaConfig {
     // this size-keyed free list instead of round-tripping `cudaMalloc`/
     // `cudaFree` (the latter device-synchronizes). See `PoolState`.
     pool: std::sync::Mutex<PoolState>,
+    /// Drop cannot return an error. A failed CUDA free poisons further pool
+    /// operations instead of silently handing out an uncertain allocation.
+    pool_error: std::sync::atomic::AtomicU32,
     /// Armed at the beginning of `Drop`, then dropped after every device-owned
     /// field so the caller's previously active CUDA device is restored last.
     restore_device: CudaDeviceRestore,
@@ -395,7 +444,10 @@ impl CudaConfig {
             arena_failed: std::sync::atomic::AtomicBool::new(false),
             arena_off: std::sync::atomic::AtomicUsize::new(0),
             arena_enabled: std::sync::atomic::AtomicBool::new(false),
+            capture_active: std::sync::atomic::AtomicBool::new(false),
+            capture_failed: std::sync::atomic::AtomicBool::new(false),
             pool: std::sync::Mutex::new(PoolState::default()),
+            pool_error: std::sync::atomic::AtomicU32::new(ffi::cudaError_cudaSuccess),
             restore_device: CudaDeviceRestore { previous: -1 },
             #[cfg(test)]
             _test_lease: test_lease,
@@ -431,6 +483,11 @@ impl CudaConfig {
     /// `cudaMalloc` would no longer be legal.
     pub fn arena_begin(&self) -> OpResult<()> {
         use std::sync::atomic::Ordering;
+        if self.capture_active.load(Ordering::Acquire) {
+            return Err(OpError::Kernel(
+                "cannot reset CUDA graph arena during capture".into(),
+            ));
+        }
         if self.memory_plan.graph_arena_bytes == 0 {
             return Err(OpError::Kernel("CUDA graph arena is disabled".into()));
         }
@@ -454,25 +511,55 @@ impl CudaConfig {
         Ok(())
     }
 
-    /// Stop routing allocations through the arena (eager `cudaMalloc` resumes).
+    /// Stop an eager arena session. Capture keeps its routing until end/abort,
+    /// so a nested pipeline cleanup cannot expose the ordinary pool to capture.
     pub fn arena_end(&self) {
+        if self
+            .capture_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         self.arena_enabled
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
-    /// Serve `size` bytes from the arena, or `None` if the arena is disabled,
-    /// unavailable, or exhausted (caller then falls back to `cudaMalloc`).
+    /// Serve `size` bytes from the arena. Only eager execution may fall back to
+    /// the recycling pool. Capture failures poison this capture until abort/end;
+    /// a pooled address must never be baked into a graph and then recycled.
     /// Zero-initializes asynchronously on the compute stream (capture-safe).
-    pub fn arena_alloc(&self, size: usize) -> Option<*mut c_void> {
+    pub fn arena_alloc(&self, size: usize) -> OpResult<Option<*mut c_void>> {
+        use std::sync::atomic::Ordering;
+        let capturing = self.capture_active.load(Ordering::Acquire);
+        let result = self.try_arena_alloc(size, capturing);
+        if capturing && result.is_err() {
+            self.capture_failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn try_arena_alloc(&self, size: usize, capturing: bool) -> OpResult<Option<*mut c_void>> {
         use std::sync::atomic::Ordering;
         if !self.arena_enabled.load(Ordering::Acquire) {
-            return None;
+            return if capturing {
+                Err(OpError::Kernel(
+                    "CUDA capture allocation requires an active graph arena".into(),
+                ))
+            } else {
+                Ok(None)
+            };
         }
         let base = self.arena_base.load(Ordering::Acquire);
         if base.is_null() {
-            return None;
+            return Err(OpError::Kernel(
+                "active CUDA graph arena has no storage".into(),
+            ));
         }
-        let n = self.round_up_256(size);
+        let n = size
+            .max(1)
+            .checked_add(255)
+            .map(|n| n & !255usize)
+            .ok_or_else(|| OpError::Kernel("CUDA graph arena allocation size overflow".into()))?;
         // Reserve `n` bytes atomically without ever transiently over-committing
         // the bump offset. `fetch_add`+rollback could momentarily publish an
         // offset past the arena end to a concurrent allocator; `fetch_update`
@@ -487,15 +574,21 @@ impl CudaConfig {
             });
         let off = match off {
             Ok(prev) => prev, // prev offset; our region is [prev, prev+n)
-            Err(_) => return None,
+            Err(used) if capturing => {
+                return Err(OpError::Kernel(format!(
+                    "CUDA graph arena exhausted: requested {n} bytes, used {used} bytes, capacity {} bytes",
+                    self.memory_plan.graph_arena_bytes,
+                )));
+            }
+            Err(_) => return Ok(None),
         };
         let ptr = unsafe { (base as *mut u8).add(off) as *mut c_void };
         // Zero-initialize on the compute stream (capture-safe: cudaMemsetAsync
         // is a recordable stream op).
         unsafe {
-            ffi::cudaMemsetAsync(ptr, 0, n, self.stream);
+            cuda_check!(ffi::cudaMemsetAsync(ptr, 0, n, self.stream));
         }
-        Some(ptr)
+        Ok(Some(ptr))
     }
 
     /// Whether `ptr` lies inside the arena (its `free` must be a no-op).
@@ -511,73 +604,215 @@ impl CudaConfig {
 
     // ─── Recycling scratch allocator ─────────────────────────────────
 
-    /// Size class for the free list: round up to 256 B so an alloc and its
-    /// later free hash to the same bucket. Shared with the arena so both
-    /// allocators agree on block sizes.
-    #[inline]
-    pub fn round_up_256(&self, n: usize) -> usize {
-        (n.max(1) + 255) & !255usize
+    /// Eager-pool counters and capacities. Fixed kernel workspaces and graph
+    /// arenas are separate allocations and are not included in this snapshot.
+    pub fn pool_stats(&self) -> CudaPoolStats {
+        self.pool.lock().unwrap().stats()
     }
 
-    /// Pop a previously-freed block of the given rounded size, if any.
-    /// No CUDA calls under the lock — the caller zeros the block afterward.
-    pub fn pool_pop(&self, n: usize) -> Option<*mut c_void> {
-        let mut g = self.pool.lock().unwrap();
-        let p = g.free.get_mut(&n).and_then(|v| v.pop());
-        if p.is_some() {
-            g.pooled_bytes = g.pooled_bytes.saturating_sub(n);
-            g.live_bytes += n;
+    fn check_pool_error(&self) -> OpResult<()> {
+        let code = self.pool_error.load(std::sync::atomic::Ordering::Acquire);
+        if code == ffi::cudaError_cudaSuccess {
+            Ok(())
+        } else {
+            Err(OpError::Fatal(format!(
+                "CUDA memory pool cannot be reused after a deallocation failure: {}",
+                super::error::CudaError(code),
+            )))
         }
-        p
     }
 
-    /// Record a cold `cudaMalloc` so `live_bytes` stays consistent (diagnostic).
-    pub fn pool_note_cold_alloc(&self, n: usize) {
-        self.pool.lock().unwrap().live_bytes += n;
+    /// Allocate on the compute stream. A reused block may be slightly larger
+    /// than `size`; only the requested, 256B-rounded range needs clearing.
+    pub(crate) fn pool_alloc(&self, size: usize) -> OpResult<*mut c_void> {
+        self.pool_alloc_with(size, Self::pool_malloc, |ptr, n| {
+            // All eager scratch uses this compute stream. Prior consumers
+            // precede initialization of the next checkout on that stream.
+            unsafe { ffi::cudaMemsetAsync(ptr, 0, n, self.stream) }
+        })
     }
 
-    /// Return a block to the free list for later reuse (no `cudaFree`), unless
-    /// retaining it would push the pool over the configured retention limit — then the
-    /// block is `cudaFree`d (outside the lock; legal here since arena/capture
-    /// pointers were already filtered out by `free_bytes`).
-    pub(crate) fn pool_push(&self, n: usize, ptr: *mut c_void) {
-        let retained = {
-            let mut g = self.pool.lock().unwrap();
-            g.live_bytes = g.live_bytes.saturating_sub(n);
-            if g.pooled_bytes + n > self.memory_plan.pool_retain_bytes {
-                false
-            } else {
-                debug_assert!(
-                    g.free.get(&n).is_none_or(|v| !v.contains(&ptr)),
-                    "double-free into cuda pool: ptr={:?} size-class={}",
-                    ptr,
-                    n
-                );
-                g.free.entry(n).or_default().push(ptr);
-                g.pooled_bytes += n;
-                true
+    // Keep driver calls injectable for small fault-path tests: an OOM must be
+    // testable without filling the GPU, and a failed zero must not poison it.
+    fn pool_alloc_with(
+        &self,
+        size: usize,
+        mut malloc: impl FnMut(usize) -> Result<*mut c_void, ffi::cudaError_t>,
+        initialize: impl FnOnce(*mut c_void, usize) -> ffi::cudaError_t,
+    ) -> OpResult<*mut c_void> {
+        self.check_pool_error()?;
+        let n = pool_allocation_size(size)?;
+        let cached = self.pool.lock().unwrap().take(n);
+        let block = match cached {
+            Some(block) => block,
+            None => {
+                let ptr = self.pool_cold_alloc(n, &mut malloc)?;
+                self.pool.lock().unwrap().record_cold_allocation(n);
+                PoolBlock { ptr, capacity: n }
             }
         };
-        if !retained {
-            // SAFETY: ptr came from cudaMalloc and is not arena/capture-owned.
-            unsafe {
-                ffi::cudaFree(ptr);
+        let code = initialize(block.ptr, n);
+        if code != ffi::cudaError_cudaSuccess {
+            let error = super::error::allocation_error(code, "CUDA pool initialization");
+            let block = self.pool.lock().unwrap().release(block.ptr, n);
+            // A failed initialization must neither escape as Tensor::zeros nor
+            // leave capacity charged to a live Tensor that was never created.
+            if let Err(cleanup) = self.free_pool_block(block)
+                && !error.is_fatal()
+            {
+                return Err(cleanup);
+            }
+            return Err(error);
+        }
+        Ok(block.ptr)
+    }
+
+    fn pool_malloc(n: usize) -> Result<*mut c_void, ffi::cudaError_t> {
+        let mut ptr = std::ptr::null_mut();
+        let code = unsafe { ffi::cudaMalloc(&mut ptr, n) };
+        if code == ffi::cudaError_cudaSuccess {
+            Ok(ptr)
+        } else {
+            Err(code)
+        }
+    }
+
+    fn pool_cold_alloc(
+        &self,
+        n: usize,
+        malloc: &mut impl FnMut(usize) -> Result<*mut c_void, ffi::cudaError_t>,
+    ) -> OpResult<*mut c_void> {
+        self.pool.lock().unwrap().note_malloc_attempt();
+        match malloc(n) {
+            Ok(ptr) => Ok(ptr),
+            Err(code) => {
+                let error = super::error::allocation_error(code, "CUDA pool allocation");
+                // A different pending device failure takes precedence over an
+                // OOM, and cannot be repaired by freeing cached allocations.
+                if code != ffi::cudaError_cudaErrorMemoryAllocation || error.is_fatal() {
+                    return Err(error);
+                }
+                if self.trim_pool(0)? == 0 {
+                    return Err(error);
+                }
+                {
+                    let mut pool = self.pool.lock().unwrap();
+                    pool.note_retry();
+                    pool.note_malloc_attempt();
+                }
+                malloc(n)
+                    .map_err(|code| super::error::allocation_error(code, "CUDA pool OOM retry"))
             }
         }
     }
 
-    /// `cudaFree` every retained block and clear the free lists. Called on
-    /// device teardown (Drop). Must run while the CUDA context is still valid.
-    pub fn pool_drain(&self) {
-        let mut g = self.pool.lock().unwrap();
-        for (_n, v) in g.free.drain() {
-            for ptr in v {
-                unsafe {
-                    ffi::cudaFree(ptr);
+    /// Return an eager allocation using its original request size. Metadata
+    /// recovers the physical capacity when a larger block supplied that request.
+    pub(crate) fn pool_release(&self, ptr: *mut c_void, size: usize) {
+        use std::sync::atomic::Ordering;
+        let n = pool_allocation_size(size).expect("free must match a successful allocation");
+        let capturing = self.capture_active.load(Ordering::Acquire);
+        let poisoned = self.pool_error.load(Ordering::Acquire) != ffi::cudaError_cudaSuccess;
+        // Restore capacity and return the block under one lock, just as on the
+        // original exact-size fast path. CUDA frees stay outside the lock.
+        let evicted = {
+            let mut pool = self.pool.lock().unwrap();
+            let block = pool.release(ptr, n);
+            if capturing || poisoned {
+                // An eager pointer may already be recorded as a graph input.
+                // Keep it isolated until the recording has been discarded.
+                pool.defer(block);
+                if capturing {
+                    self.capture_failed.store(true, Ordering::Release);
+                }
+                return;
+            }
+            pool.retain_or_evict(block, self.memory_plan.pool_retain_bytes)
+        };
+        if let Err(error) = self.free_pool_blocks(evicted) {
+            tracing::error!(?error, "CUDA pool release failed");
+        }
+    }
+
+    fn retain_pool_block(&self, block: PoolBlock) -> OpResult<()> {
+        let evicted = self
+            .pool
+            .lock()
+            .unwrap()
+            .retain_or_evict(block, self.memory_plan.pool_retain_bytes);
+        self.free_pool_blocks(evicted).map(|_| ())
+    }
+
+    fn free_pool_block(&self, block: PoolBlock) -> OpResult<()> {
+        // No driver calls while holding the pool mutex. Only complete
+        // cudaMalloc allocations are released; the pool never splits blocks.
+        let code = unsafe { ffi::cudaFree(block.ptr) };
+        if code == ffi::cudaError_cudaSuccess {
+            self.pool.lock().unwrap().record_free(block.capacity);
+            Ok(())
+        } else {
+            self.pool_error
+                .store(code, std::sync::atomic::Ordering::Release);
+            // CUDA may have reported an asynchronous error. Quarantine this
+            // address rather than guessing whether the free actually occurred.
+            self.pool.lock().unwrap().defer(block);
+            self.check_pool_error()
+        }
+    }
+
+    fn flush_deferred_pool(&self) -> OpResult<()> {
+        self.check_pool_error()?;
+        let blocks = self.pool.lock().unwrap().take_deferred();
+        let mut error = None;
+        for block in blocks {
+            if let Err(next) = self.check_pool_error() {
+                self.pool.lock().unwrap().defer(block);
+                error.get_or_insert(next);
+            } else if let Err(next) = self.retain_pool_block(block) {
+                error = Some(next);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Release idle blocks until cached capacity is at most `target_bytes`.
+    /// Returns bytes actually released. Live tensors, fixed workspaces and
+    /// graph arenas are untouched. This can synchronize CUDA and must be used
+    /// outside capture, with the owning device active.
+    pub fn trim_pool(&self, target_bytes: usize) -> OpResult<usize> {
+        if self
+            .capture_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(OpError::Kernel(
+                "cannot trim CUDA memory pool during capture".into(),
+            ));
+        }
+        self.check_pool_error()?;
+        let blocks = self.pool.lock().unwrap().drain_to(target_bytes);
+        self.free_pool_blocks(blocks)
+    }
+
+    fn free_pool_blocks(&self, blocks: Vec<PoolBlock>) -> OpResult<usize> {
+        let mut released = 0;
+        let mut error = None;
+        for block in blocks {
+            if let Err(next) = self.check_pool_error() {
+                self.pool.lock().unwrap().defer(block);
+                error.get_or_insert(next);
+            } else {
+                match self.free_pool_block(block) {
+                    Ok(()) => released += block.capacity,
+                    Err(next) => error = Some(next),
                 }
             }
         }
-        g.pooled_bytes = 0;
+        error.map_or(Ok(released), Err)
+    }
+
+    /// Release all idle eager blocks; live allocations remain owned by tensors.
+    pub fn pool_drain(&self) -> OpResult<usize> {
+        self.trim_pool(0)
     }
 
     pub fn graph_ready(&self, slot: GraphSlot) -> bool {
@@ -600,25 +835,99 @@ impl CudaConfig {
     }
 
     pub fn capture_begin_relaxed(&self) -> OpResult<()> {
+        use std::sync::atomic::Ordering;
+        self.check_pool_error()?;
+        if self
+            .capture_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(OpError::Kernel(
+                "CUDA graph capture is already active".into(),
+            ));
+        }
+        self.capture_failed.store(false, Ordering::Release);
         // Mode 2 = cudaStreamCaptureModeRelaxed. Relaxed (not ThreadLocal=1)
         // is required so the potentially-unsafe API calls that cuBLASLt / cuDNN
         // make internally while enqueuing a matmul/attention are tolerated
         // during capture instead of returning an error (e.g. cuBLASLt
         // EXECUTION_FAILED / status=13 under ThreadLocal capture).
-        unsafe {
-            cuda_check!(ffi::cudaStreamBeginCapture(self.stream, 2));
+        let code = unsafe { ffi::cudaStreamBeginCapture(self.stream, 2) };
+        if code != ffi::cudaError_cudaSuccess {
+            self.capture_active.store(false, Ordering::Release);
+            self.arena_end();
+            discard_capture_graph(std::ptr::null_mut(), std::ptr::null_mut(), Some(code))?;
+            return Err(super::error::classify_capture_error(
+                code,
+                "cudaStreamBeginCapture",
+            ));
         }
         Ok(())
     }
 
+    /// Discard the in-progress capture, including one CUDA has invalidated.
+    /// EndCapture is required to restore the stream even in that case. Never
+    /// instantiate or publish the discarded graph, and leave existing slots
+    /// intact so a failed replacement does not destroy a previously valid graph.
+    pub fn capture_abort(&self) -> OpResult<()> {
+        use std::sync::atomic::Ordering;
+        if !self.capture_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut graph = std::ptr::null_mut();
+        let code = unsafe { ffi::cudaStreamEndCapture(self.stream, &mut graph) };
+        self.capture_active.store(false, Ordering::Release);
+        self.capture_failed.store(false, Ordering::Release);
+        self.arena_end();
+        discard_capture_graph(graph, std::ptr::null_mut(), Some(code))?;
+        // CUDA reports invalidation while successfully ending that capture.
+        if code != ffi::cudaError_cudaSuccess
+            && code != ffi::cudaError_cudaErrorStreamCaptureInvalidated
+        {
+            return Err(super::error::classify_capture_error(
+                code,
+                "cudaStreamEndCapture while aborting",
+            ));
+        }
+        self.flush_deferred_pool()
+    }
+
     pub fn capture_end(&self, slot: GraphSlot) -> OpResult<()> {
+        use std::sync::atomic::Ordering;
+        if !self.capture_active.load(Ordering::Acquire) {
+            return Err(OpError::Kernel("no CUDA graph capture is active".into()));
+        }
+        if self.capture_failed.load(Ordering::Acquire) {
+            self.capture_abort()?;
+            return Err(OpError::Kernel(
+                "CUDA graph capture discarded after an allocation or ownership failure".into(),
+            ));
+        }
         let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
-        unsafe {
-            cuda_check!(ffi::cudaStreamEndCapture(self.stream, &mut graph));
+        let code = unsafe { ffi::cudaStreamEndCapture(self.stream, &mut graph) };
+        self.capture_active.store(false, Ordering::Release);
+        self.capture_failed.store(false, Ordering::Release);
+        self.arena_end();
+        if code != ffi::cudaError_cudaSuccess {
+            discard_capture_graph(graph, std::ptr::null_mut(), Some(code))?;
+            return Err(super::error::classify_capture_error(
+                code,
+                "cudaStreamEndCapture",
+            ));
+        }
+        if graph.is_null() {
+            return Err(OpError::Kernel(
+                "cudaStreamEndCapture returned a null graph".into(),
+            ));
         }
         let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
-        unsafe {
-            cuda_check!(ffi::cudaGraphInstantiate(&mut exec, graph, 0));
+        let code = unsafe { ffi::cudaGraphInstantiate(&mut exec, graph, 0) };
+        if code != ffi::cudaError_cudaSuccess {
+            discard_capture_graph(graph, exec, Some(code))?;
+            return Err(super::error::classify_capture_error(
+                code,
+                "cudaGraphInstantiate",
+            ));
         }
         self.graphs
             .lock()
@@ -628,6 +937,7 @@ impl CudaConfig {
     }
 
     pub fn launch(&self, slot: GraphSlot) -> OpResult<()> {
+        self.check_pool_error()?;
         let guard = self.graphs.lock().unwrap();
         let g = guard
             .get(&slot)
@@ -647,6 +957,7 @@ impl CudaConfig {
     }
 
     pub fn synchronize(&self) -> OpResult<()> {
+        self.check_pool_error()?;
         unsafe {
             cuda_check!(ffi::cudaStreamSynchronize(self.stream));
         }
@@ -826,6 +1137,9 @@ impl Drop for CudaConfig {
                     "cudaSetDevice during CudaConfig teardown failed"
                 );
             }
+            if let Err(error) = self.capture_abort() {
+                tracing::error!(?error, "abort CUDA capture during teardown failed");
+            }
             if !self.ev_in.is_null() {
                 ffi::cudaEventDestroy(self.ev_in);
             }
@@ -855,7 +1169,9 @@ impl Drop for CudaConfig {
             }
         }
         // Release every recycled scratch block (disjoint from the arena).
-        self.pool_drain();
+        if let Err(error) = self.pool_drain() {
+            tracing::error!(?error, "drain CUDA pool during teardown failed");
+        }
     }
 }
 unsafe impl Send for CudaConfig {}
@@ -864,6 +1180,19 @@ unsafe impl Sync for CudaConfig {}
 #[cfg(test)]
 mod memory_plan_tests {
     use super::*;
+
+    #[test]
+    fn pool_alignment_checks_overflow() {
+        assert_eq!(pool_allocation_size(0).unwrap(), 256);
+        assert_eq!(pool_allocation_size(255).unwrap(), 256);
+        assert_eq!(pool_allocation_size(256).unwrap(), 256);
+        assert_eq!(pool_allocation_size(257).unwrap(), 512);
+        assert_eq!(
+            pool_allocation_size(usize::MAX - 255).unwrap(),
+            usize::MAX - 255
+        );
+        assert!(pool_allocation_size(usize::MAX).is_err());
+    }
 
     #[test]
     fn default_plan_uses_compact_fixed_regions() {
@@ -887,5 +1216,270 @@ mod memory_plan_tests {
                 pool_retain_bytes: 32,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_failure_tests {
+    use super::*;
+
+    struct Allocation<'a> {
+        config: &'a CudaConfig,
+        ptr: *mut c_void,
+        requested_bytes: usize,
+    }
+
+    impl Drop for Allocation<'_> {
+        fn drop(&mut self) {
+            self.config.pool_release(self.ptr, self.requested_bytes);
+        }
+    }
+
+    fn config() -> CudaConfig {
+        let code = unsafe { ffi::cudaSetDevice(0) };
+        assert_eq!(code, ffi::cudaError_cudaSuccess, "select logical GPU 0");
+        CudaConfig::with_memory_plan(CudaMemoryPlan {
+            kernel_workspace_bytes: 0,
+            graph_arena_bytes: 0,
+            pool_retain_bytes: MIB,
+        })
+        .expect("create CUDA config for injected pool failures")
+    }
+
+    fn allocation(config: &CudaConfig, bytes: usize) -> Allocation<'_> {
+        Allocation {
+            config,
+            ptr: config.pool_alloc(bytes).expect("allocate small CUDA block"),
+            requested_bytes: bytes,
+        }
+    }
+
+    fn warm(config: &CudaConfig, bytes: usize) -> *mut c_void {
+        let block = allocation(config, bytes);
+        let code = unsafe { ffi::cudaMemsetAsync(block.ptr, 71, bytes, config.stream) };
+        assert_eq!(code, ffi::cudaError_cudaSuccess, "fill cached allocation");
+        config.synchronize().expect("finish pool warmup");
+        let ptr = block.ptr;
+        drop(block);
+        ptr
+    }
+
+    fn assert_zeroed(block: &Allocation<'_>) {
+        let mut host = vec![255u8; block.requested_bytes];
+        // SAFETY: the allocation owns the requested byte range, and the host
+        // destination remains alive until the stream synchronization below.
+        let code = unsafe {
+            ffi::cudaMemcpyAsync(
+                host.as_mut_ptr().cast(),
+                block.ptr,
+                block.requested_bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                block.config.stream,
+            )
+        };
+        assert_eq!(
+            code,
+            ffi::cudaError_cudaSuccess,
+            "download initialized block"
+        );
+        block
+            .config
+            .synchronize()
+            .expect("finish initialization check");
+        assert!(host.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn oom_reclaims_idle_capacity_and_retries_once_successfully() {
+        let config = config();
+        warm(&config, 1024);
+        let before = config.pool_stats();
+        let mut calls = 0;
+        let ptr = config
+            .pool_alloc_with(
+                2048,
+                |n| {
+                    assert_eq!(n, 2048);
+                    calls += 1;
+                    if calls == 1 {
+                        Err(ffi::cudaError_cudaErrorMemoryAllocation)
+                    } else {
+                        CudaConfig::pool_malloc(n)
+                    }
+                },
+                |ptr, n| unsafe { ffi::cudaMemsetAsync(ptr, 0, n, config.stream) },
+            )
+            .expect("retry succeeds after injected OOM");
+        let block = Allocation {
+            config: &config,
+            ptr,
+            requested_bytes: 2048,
+        };
+        assert_eq!(calls, 2);
+        assert_zeroed(&block);
+        let after = config.pool_stats();
+        assert_eq!(after.allocation_requests, before.allocation_requests + 1);
+        assert_eq!(after.cuda_malloc_calls, before.cuda_malloc_calls + 2);
+        assert_eq!(after.cold_allocations, before.cold_allocations + 1);
+        assert_eq!(after.allocation_retries, before.allocation_retries + 1);
+        assert_eq!(after.cuda_frees, before.cuda_frees + 1);
+        assert_eq!(after.cache_hits, before.cache_hits);
+        assert_eq!(after.live_bytes, 2048);
+        assert_eq!(after.pooled_bytes, 0);
+        assert_eq!(after.reserved_bytes, 2048);
+        assert_eq!(after.pending_bytes, 0);
+        drop(block);
+        assert_eq!(config.trim_pool(0).unwrap(), 2048);
+        assert_eq!(config.pool_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn persistent_oom_stops_after_one_retry_and_never_initializes() {
+        let config = config();
+        warm(&config, 1024);
+        let before = config.pool_stats();
+        let mut calls = 0;
+        let result = config.pool_alloc_with(
+            2048,
+            |n| {
+                assert_eq!(n, 2048);
+                calls += 1;
+                Err(ffi::cudaError_cudaErrorMemoryAllocation)
+            },
+            |_, _| panic!("failed allocation must not initialize"),
+        );
+        let error = result.expect_err("both injected allocation attempts fail");
+        assert!(
+            !error.is_fatal(),
+            "injected OOM remains recoverable: {error}"
+        );
+        assert_eq!(calls, 2);
+        let after = config.pool_stats();
+        assert_eq!(after.allocation_requests, before.allocation_requests + 1);
+        assert_eq!(after.cuda_malloc_calls, before.cuda_malloc_calls + 2);
+        assert_eq!(after.cold_allocations, before.cold_allocations);
+        assert_eq!(after.allocation_retries, before.allocation_retries + 1);
+        assert_eq!(after.cuda_frees, before.cuda_frees + 1);
+        assert_eq!(after.live_bytes, 0);
+        assert_eq!(after.pooled_bytes, 0);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.pending_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn oom_without_idle_capacity_does_not_retry_or_initialize() {
+        let config = config();
+        let before = config.pool_stats();
+        let mut calls = 0;
+        let result = config.pool_alloc_with(
+            2048,
+            |_| {
+                calls += 1;
+                Err(ffi::cudaError_cudaErrorMemoryAllocation)
+            },
+            |_, _| panic!("failed allocation must not initialize"),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        let after = config.pool_stats();
+        assert_eq!(after.cuda_malloc_calls, before.cuda_malloc_calls + 1);
+        assert_eq!(after.cold_allocations, before.cold_allocations);
+        assert_eq!(after.allocation_retries, before.allocation_retries);
+        assert_eq!(after.cuda_frees, before.cuda_frees);
+        assert_eq!(after.live_bytes, 0);
+        assert_eq!(after.pooled_bytes, 0);
+        assert_eq!(after.reserved_bytes, 0);
+        assert_eq!(after.pending_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn non_oom_allocation_error_preserves_idle_blocks_without_retry() {
+        let config = config();
+        let address = warm(&config, 1024);
+        let before = config.pool_stats();
+        let mut calls = 0;
+        let result = config.pool_alloc_with(
+            2048,
+            |_| {
+                calls += 1;
+                Err(ffi::cudaError_cudaErrorInvalidValue)
+            },
+            |_, _| panic!("failed allocation must not initialize"),
+        );
+        let error = result.expect_err("injected invalid-value allocation failure");
+        assert!(!error.is_fatal(), "synchronous API failure: {error}");
+        assert_eq!(calls, 1);
+        let after = config.pool_stats();
+        assert_eq!(after.cuda_malloc_calls, before.cuda_malloc_calls + 1);
+        assert_eq!(after.cold_allocations, before.cold_allocations);
+        assert_eq!(after.allocation_retries, before.allocation_retries);
+        assert_eq!(after.cuda_frees, before.cuda_frees);
+        assert_eq!(after.live_bytes, 0);
+        assert_eq!(after.pooled_bytes, 1024);
+        assert_eq!(after.reserved_bytes, 1024);
+        assert_eq!(after.pending_bytes, 0);
+        let recovered = allocation(&config, 1024);
+        assert_eq!(recovered.ptr, address);
+        assert_zeroed(&recovered);
+        drop(recovered);
+        assert_eq!(config.trim_pool(0).unwrap(), 1024);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn failed_initialization_releases_full_reused_capacity_and_recovers() {
+        let config = config();
+        let address = warm(&config, 8192);
+        let before = config.pool_stats();
+        let result = config.pool_alloc_with(
+            7680,
+            |_| panic!("larger cached block must avoid malloc"),
+            |ptr, n| {
+                assert_eq!(ptr, address);
+                assert_eq!(n, 7680);
+                ffi::cudaError_cudaErrorInvalidValue
+            },
+        );
+        let error = result.expect_err("injected initialization failure");
+        assert!(
+            !error.is_fatal(),
+            "synchronous initialization failure: {error}"
+        );
+        let after = config.pool_stats();
+        assert_eq!(after.allocation_requests, before.allocation_requests + 1);
+        assert_eq!(after.cache_hits, before.cache_hits + 1);
+        assert_eq!(after.larger_reuses, before.larger_reuses + 1);
+        assert_eq!(after.cuda_malloc_calls, before.cuda_malloc_calls);
+        assert_eq!(after.cold_allocations, before.cold_allocations);
+        assert_eq!(after.allocation_retries, before.allocation_retries);
+        assert_eq!(after.cuda_frees, before.cuda_frees + 1);
+        assert_eq!(after.live_bytes, 0);
+        assert_eq!(after.pooled_bytes, 0);
+        assert_eq!(
+            after.reserved_bytes, 0,
+            "the complete 8192-byte block was freed"
+        );
+        assert_eq!(after.pending_bytes, 0);
+        let recovered = allocation(&config, 8192);
+        assert_zeroed(&recovered);
+        let recovered_stats = config.pool_stats();
+        assert_eq!(recovered_stats.live_bytes, 8192);
+        assert_eq!(recovered_stats.reserved_bytes, 8192);
+        assert_eq!(
+            recovered_stats.cuda_malloc_calls,
+            before.cuda_malloc_calls + 1
+        );
+        assert_eq!(
+            recovered_stats.cold_allocations,
+            before.cold_allocations + 1
+        );
+        drop(recovered);
+        assert_eq!(config.pool_stats().live_bytes, 0);
+        assert_eq!(config.trim_pool(0).unwrap(), 8192);
+        assert_eq!(config.pool_stats().reserved_bytes, 0);
     }
 }

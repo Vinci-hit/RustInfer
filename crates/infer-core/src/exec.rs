@@ -64,6 +64,11 @@ pub trait ExecScope: Send + Sync + Sized + 'static {
             "graph_capture_end: unsupported on this scope".into(),
         ))
     }
+    /// Abort an in-progress capture and discard its recorded work. Implementations
+    /// must not instantiate or register a graph from the aborted capture.
+    fn graph_capture_abort(&self) -> OpResult<()> {
+        Err(OpError::unsupported("scope", "graph_capture_abort"))
+    }
     /// Replay the captured graph keyed by `key`.
     fn graph_launch(&self, _key: u64) -> OpResult<()> {
         Err(crate::error::OpError::Kernel(
