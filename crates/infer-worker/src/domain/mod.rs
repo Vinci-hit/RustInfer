@@ -15,6 +15,7 @@ pub use infer_core::kv;
 mod kv_tests;
 pub mod model;
 pub mod plan;
+pub mod speculative;
 pub mod tensor_parallel;
 pub use infer_core::ports;
 pub use infer_core::storage;

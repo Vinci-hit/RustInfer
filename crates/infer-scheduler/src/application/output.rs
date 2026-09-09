@@ -120,6 +120,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speculative_burst_stops_before_later_tokens_are_appended_or_streamed() {
+        use crate::domain::inference_session::table::RequestTable;
+        use crate::infrastructure::metrics::MetricsRecorder;
+        use infer_protocol::worker_to_scheduler_data::{GeneratedToken, StepOutput};
+        for stream in [false, true] {
+            let mut meta = meta_for_test(stream, vec![1, 2, 3, 4]);
+            Arc::get_mut(&mut meta).unwrap().stop_sequences = vec![vec![7, 8]];
+            let request_id = meta.id;
+            let mut table = RequestTable::new();
+            table.insert_new(meta, RequestHandle::noop()).unwrap();
+            let queued = table.take_waiting(&request_id).unwrap();
+            table
+                .commit_prefill_start(
+                    queued,
+                    crate::infrastructure::kv_cache::traits::PrefixMatch::none(),
+                    4,
+                )
+                .unwrap();
+            table.ack_prefill(SequenceId(1)).unwrap();
+            let mut frontend = CapturingFrontend::default();
+            let out = StepOutput {
+                prefill_done: vec![],
+                assigned_indices: vec![],
+                tokens: [5, 7, 8, 9]
+                    .into_iter()
+                    .map(|token_id| GeneratedToken {
+                        sequence_id: 1,
+                        token_id,
+                        finished: token_id == 9,
+                    })
+                    .collect(),
+            };
+            let done = crate::application::output_fns::process_llm_step_decoded(
+                &mut table,
+                &mut frontend,
+                &MetricsRecorder::new(false),
+                &out,
+            )
+            .await
+            .unwrap();
+            assert_eq!(done.len(), 1);
+            assert!(done[0].stop_sequence_finished);
+            assert_eq!(table.decoding_len(), 0);
+            if !stream {
+                let responses = frontend.responses.lock().unwrap();
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0].output_token_ids, [5]);
+            }
+            let chunks = frontend.chunks.lock().unwrap();
+            assert_eq!(
+                chunks.iter().filter_map(|c| c.token_id).collect::<Vec<_>>(),
+                if stream { vec![5] } else { vec![] }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn fail_prefilling_emits_error_response() {
         let mut frontend = CapturingFrontend::default();
         crate::application::output_fns::fail_prefilling_session(

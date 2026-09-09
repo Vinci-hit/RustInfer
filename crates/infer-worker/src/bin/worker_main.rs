@@ -775,6 +775,10 @@ fn main() -> Result<(), String> {
         tp_devices: &all_devices,
     };
 
+    if cfg.mtp_num_draft_tokens > 0 && model_type != "qwen3_5" {
+        return Err("MTP serving currently requires a Qwen3.5 dense checkpoint".into());
+    }
+
     match model_type.as_str() {
         "llama3" => {
             let model = llama3::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
@@ -847,15 +851,41 @@ fn main() -> Result<(), String> {
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
             );
-            run_with_model(
-                &control,
-                &data,
-                model,
-                make_bootstrap(),
-                followers,
-                &eos_ids,
-                args.profile_cuda_steps,
-            )?;
+            if cfg.mtp_num_draft_tokens > 0 {
+                let mtp_config = serde_json::from_value(full_config["text_config"].clone())
+                    .map_err(|e| format!("MTP config: {e}"))?;
+                let head = model
+                    .load_mtp(&loader, &load_cfg, &mtp_config)
+                    .map_err(|e| format!("MTP load: {e}"))?;
+                let execution = infer_worker::application::speculative::serving::MtpServing::new(
+                    head,
+                    max_seq_len,
+                    load.max_batch_tokens,
+                    cfg.mtp_num_draft_tokens,
+                    &cuda,
+                )
+                .map_err(|e| format!("MTP serving: {e}"))?;
+                infer_worker::application::serve_loop::run_with_model_and_execution(
+                    &control,
+                    &data,
+                    model,
+                    make_bootstrap(),
+                    followers,
+                    &eos_ids,
+                    args.profile_cuda_steps,
+                    execution,
+                )?;
+            } else {
+                run_with_model(
+                    &control,
+                    &data,
+                    model,
+                    make_bootstrap(),
+                    followers,
+                    &eos_ids,
+                    args.profile_cuda_steps,
+                )?;
+            }
         }
         "qwen3_moe" => {
             let model = qwen3_moe::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
@@ -1293,7 +1323,7 @@ mod qwen35_checkpoint_tests {
                 stream: Tensor::zeros([n, dims.dim], &cuda).unwrap(),
                 pending: None,
             };
-            model.embed(&ints(&ids), &mut hidden, &ctx).unwrap();
+            model.embed(&ints(ids), &mut hidden, &ctx).unwrap();
             dump(
                 format!("step{step}_embed.f32"),
                 hidden.stream.to_host_vec().unwrap(),
@@ -2230,3 +2260,7 @@ mod qwen35_checkpoint_tests {
 #[cfg(test)]
 #[path = "checkpoint_tests/qwen3_moe.rs"]
 mod qwen3_moe_checkpoint_tests;
+
+#[cfg(test)]
+#[path = "checkpoint_tests/qwen3_5_mtp.rs"]
+mod qwen35_mtp_checkpoint_tests;

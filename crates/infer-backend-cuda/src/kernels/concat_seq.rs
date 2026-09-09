@@ -73,8 +73,94 @@ pub fn concat_seq_into<T: Dtype>(
     Ok(())
 }
 
+/// Concatenate columns using two pitched, stream-ordered device copies.
+pub fn concat_cols_into<T: Dtype>(
+    stream: cudaStream_t,
+    a: &Tensor<T, Cuda>,
+    b: &Tensor<T, Cuda>,
+    dst: &mut Tensor<T, Cuda>,
+) -> OpResult<()> {
+    let sa = a.shape().as_slice();
+    let sb = b.shape().as_slice();
+    let sd = dst.shape().as_slice();
+    if sa.len() != 2
+        || sb.len() != 2
+        || sd.len() != 2
+        || sa[0] != sb[0]
+        || sd[0] != sa[0]
+        || sa[1].checked_add(sb[1]) != Some(sd[1])
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !dst.is_contiguous()
+    {
+        return Err(OpError::Shape(
+            "concat_cols requires contiguous [N,A], [N,B], [N,A+B]".into(),
+        ));
+    }
+    let (rows, ac, bc, dc) = (sa[0], sa[1], sb[1], sd[1]);
+    if rows == 0 || dc == 0 {
+        return Ok(());
+    }
+    let dst_start = dst.data_ptr() as usize;
+    let dst_end = dst_start + dst.numel() * T::SIZE_BYTES;
+    for src in [a, b] {
+        let start = src.data_ptr() as usize;
+        let end = start + src.numel() * T::SIZE_BYTES;
+        if start < dst_end && dst_start < end {
+            return Err(OpError::Shape("concat_cols output overlaps input".into()));
+        }
+    }
+    if a.device().device_id != b.device().device_id
+        || a.device().device_id != dst.device().device_id
+    {
+        return Err(OpError::Shape("concat_cols device mismatch".into()));
+    }
+    for (src, cols, offset) in [(a, ac, 0), (b, bc, ac)] {
+        if cols == 0 {
+            continue;
+        }
+        // SAFETY: validated disjoint contiguous matrices; pitch and extent fit each row.
+        let code = unsafe {
+            crate::ffi::cudaMemcpy2DAsync(
+                dst.data_ptr_mut().add(offset).cast(),
+                dc * T::SIZE_BYTES,
+                src.data_ptr().cast(),
+                cols * T::SIZE_BYTES,
+                cols * T::SIZE_BYTES,
+                rows,
+                cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream,
+            )
+        };
+        if code != cudaError_cudaSuccess {
+            return Err(crate::error::classify_sync_error(code, "concat_cols"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concat_cols_preserves_row_order_and_rejects_aliases() {
+        let device = Cuda::new(0).unwrap();
+        let a = Tensor::from_host_slice(&[1f32, 2., 3., 4.], [2, 2], &device).unwrap();
+        let b = Tensor::from_host_slice(&[10f32, 20.], [2, 1], &device).unwrap();
+        let mut dst = Tensor::zeros([2, 3], &device).unwrap();
+        concat_cols_into(device.config.stream, &a, &b, &mut dst).unwrap();
+        assert_eq!(dst.to_host_vec().unwrap(), [1., 2., 10., 3., 4., 20.]);
+        let a = a.narrow(1, 0, 1).unwrap();
+        assert!(concat_cols_into(device.config.stream, &a, &b, &mut dst).is_err());
+        let a = dst.narrow(0, 0, 1).unwrap();
+        let empty = Tensor::zeros([1, 0], &device).unwrap();
+        let mut overlap = a.clone();
+        assert!(concat_cols_into(device.config.stream, &a, &empty, &mut overlap).is_err());
+        let a = Tensor::<f32, _>::zeros([0, 2], &device).unwrap();
+        let b = Tensor::zeros([0, 1], &device).unwrap();
+        let mut dst = Tensor::zeros([0, 3], &device).unwrap();
+        concat_cols_into(device.config.stream, &a, &b, &mut dst).unwrap();
+    }
+
     use super::*;
     use half::bf16;
 
@@ -134,5 +220,38 @@ mod tests {
             OpError::Shape(_) => {}
             other => panic!("got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod column_dtype_tests {
+    use super::*;
+    #[test]
+    fn concat_cols_bf16() {
+        use half::bf16;
+        let device = Cuda::new(0).unwrap();
+        let a = Tensor::from_host_slice(&[bf16::from_f32(1.), bf16::from_f32(2.)], [2, 1], &device)
+            .unwrap();
+        let b = Tensor::from_host_slice(
+            &[
+                bf16::from_f32(3.),
+                bf16::from_f32(4.),
+                bf16::from_f32(5.),
+                bf16::from_f32(6.),
+            ],
+            [2, 2],
+            &device,
+        )
+        .unwrap();
+        let mut dst = Tensor::zeros([2, 3], &device).unwrap();
+        concat_cols_into(device.config.stream, &a, &b, &mut dst).unwrap();
+        assert_eq!(
+            dst.to_host_vec()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_f32())
+                .collect::<Vec<_>>(),
+            [1., 3., 4., 2., 5., 6.]
+        );
     }
 }

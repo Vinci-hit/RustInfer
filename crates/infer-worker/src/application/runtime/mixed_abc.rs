@@ -457,9 +457,12 @@ where
         let result = (|| {
             let plan = self.build_plan(req)?;
             self.prepare_recurrent(req, &plan)?;
-            self.upload_index(&plan, req)?;
-            self.prepare_multimodal(req)?;
-            self.step_eager(&plan, req)
+            let result = (|| {
+                self.upload_index(&plan, req)?;
+                self.prepare_multimodal(req)?;
+                self.step_eager(&plan, req)
+            })();
+            self.finish_recurrent_step(result)
         })();
         D::pipeline_arena_end(&self.scope);
         result
@@ -556,69 +559,79 @@ where
             }
         }
         self.prepare_recurrent(req, &plan)?;
-        if let Some(slots) = next_slots {
-            self.upload_mixed_next_slots(slots)?;
-        }
-
-        let trace = std::env::var_os("RUSTINFER_MIXED_TRACE").is_some();
-        let t0 = std::time::Instant::now();
-        let ran_graph = self.try_run_mixed_abc_graph(&plan, req, row_kind, next_slots.is_some())?;
-        if !ran_graph {
-            self.upload_index(&plan, req)?;
-            let run_plan = self.eager_mixed_run_plan(&plan);
-            let run_tokens = run_plan
-                .as_ref()
-                .map(|rp| rp.num_tokens)
-                .unwrap_or(plan.num_tokens);
-            let input_ids = if c_prefix_rows > 0 {
-                // q=1 decode rows lead the batch, so flat tape offset == row
-                // index: gather C[0..c] into the tape prefix on device and
-                // upload only the suffix (pad rows + prefill tokens + bucket
-                // zero-pad) from the host.
-                let ids =
-                    self.upload_input_ids_suffix(req, c_prefix_rows, plan.num_tokens, run_tokens)?;
-                D::append_decode_admissions(
-                    &self.scope,
-                    &mut self.prefill_ids_buf,
-                    &self.abc.argmax_out_dev,
-                    0,
-                    c_prefix_rows,
-                )?;
-                ids
-            } else if run_tokens > plan.num_tokens {
-                self.upload_input_ids_bucket(req, plan.num_tokens, run_tokens)?
-            } else {
-                self.input_ids_tensor(req, &plan)?
-            };
-            self.upload_mixed_abc_metadata(req, row_kind, plan.batch)?;
-            // WAR guard for the overlapped issue: the in-flight step's copy-out
-            // (So) reads A + the merge side-bands; make compute wait its ev_out
-            // before this region's merge rewrites them. No-op after a drain
-            // (the sync already collected the copy-out).
-            if self.abc.copy_out_recorded {
-                D::pipeline_compute_wait_copy_out(&self.scope)?;
+        let result = (|| {
+            if let Some(slots) = next_slots {
+                self.upload_mixed_next_slots(slots)?;
             }
-            D::pipeline_arena_begin(&self.scope)?;
-            let result = self.run_mixed_abc_eager_region(
-                run_plan.as_ref().unwrap_or(&plan),
-                req,
-                &input_ids,
-                next_slots.is_some(),
-            );
-            D::pipeline_arena_end(&self.scope);
-            result?;
-        }
-        let copied_out = !defer_copy_out;
-        if copied_out {
-            self.copy_out_mixed_abc(plan.batch)?;
-        }
-        Ok(MixedStepTicket {
-            plan,
-            ran_graph,
-            trace,
-            t0,
-            copied_out,
-        })
+
+            let trace = std::env::var_os("RUSTINFER_MIXED_TRACE").is_some();
+            let t0 = std::time::Instant::now();
+            let ran_graph =
+                self.try_run_mixed_abc_graph(&plan, req, row_kind, next_slots.is_some())?;
+            if !ran_graph {
+                self.upload_index(&plan, req)?;
+                let run_plan = self.eager_mixed_run_plan(&plan);
+                let run_tokens = run_plan
+                    .as_ref()
+                    .map(|rp| rp.num_tokens)
+                    .unwrap_or(plan.num_tokens);
+                let input_ids = if c_prefix_rows > 0 {
+                    // q=1 decode rows lead the batch, so flat tape offset == row
+                    // index: gather C[0..c] into the tape prefix on device and
+                    // upload only the suffix (pad rows + prefill tokens + bucket
+                    // zero-pad) from the host.
+                    let ids = self.upload_input_ids_suffix(
+                        req,
+                        c_prefix_rows,
+                        plan.num_tokens,
+                        run_tokens,
+                    )?;
+                    D::append_decode_admissions(
+                        &self.scope,
+                        &mut self.prefill_ids_buf,
+                        &self.abc.argmax_out_dev,
+                        0,
+                        c_prefix_rows,
+                    )?;
+                    ids
+                } else if run_tokens > plan.num_tokens {
+                    self.upload_input_ids_bucket(req, plan.num_tokens, run_tokens)?
+                } else {
+                    self.input_ids_tensor(req, &plan)?
+                };
+                self.upload_mixed_abc_metadata(req, row_kind, plan.batch)?;
+                // WAR guard for the overlapped issue: the in-flight step's copy-out
+                // (So) reads A + the merge side-bands; make compute wait its ev_out
+                // before this region's merge rewrites them. No-op after a drain
+                // (the sync already collected the copy-out).
+                if self.abc.copy_out_recorded {
+                    D::pipeline_compute_wait_copy_out(&self.scope)?;
+                }
+                D::pipeline_arena_begin(&self.scope)?;
+                let result = self.run_mixed_abc_eager_region(
+                    run_plan.as_ref().unwrap_or(&plan),
+                    req,
+                    &input_ids,
+                    next_slots.is_some(),
+                );
+                D::pipeline_arena_end(&self.scope);
+                result?;
+            }
+            let copied_out = !defer_copy_out;
+            if copied_out {
+                self.copy_out_mixed_abc(plan.batch)?;
+            }
+            Ok(MixedStepTicket {
+                plan,
+                ran_graph,
+                trace,
+                t0,
+                copied_out,
+            })
+        })();
+        // Ordinary ABC advances host history only after the complete issue
+        // succeeds, so a subsequent overlapping issue sees the right prefix.
+        self.finish_recurrent_step(result)
     }
 
     /// Collect a mixed step issued by `issue_fused_abc`: drain the copy-out
@@ -646,27 +659,35 @@ where
         req: &StepRequest,
         row_kind: &[RaggedRowKind],
     ) -> OpResult<StepOutput> {
-        // Overlapped issue deferred the copy-out (the host mirrors belonged to
-        // the then-in-flight decode step); by the time the caller finalizes
-        // the fused step that step has been drained, so enqueue it now.
-        if !ticket.copied_out {
-            self.copy_out_mixed_abc(ticket.plan.batch)?;
+        let result = (|| {
+            // Overlapped issue deferred the copy-out (the host mirrors belonged to
+            // the then-in-flight decode step); by the time the caller finalizes
+            // the fused step that step has been drained, so enqueue it now.
+            if !ticket.copied_out {
+                self.copy_out_mixed_abc(ticket.plan.batch)?;
+            }
+            let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
+            sync_result?;
+            if ticket.trace {
+                // `elapsed` spans issue→sync, so it includes any host work the
+                // caller overlapped between the two halves.
+                tracing::info!(
+                    "[mixed-trace] mode={} rows={} tokens={} tiles={} elapsed={:.2}ms",
+                    if ticket.ran_graph { "graph" } else { "eager" },
+                    ticket.plan.batch,
+                    ticket.plan.num_tokens,
+                    ticket.plan.total_q_tiles,
+                    ticket.t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            self.finalize_mixed_abc(&ticket.plan, req, row_kind)
+        })();
+        if result.is_err() {
+            for seq in &req.seqs {
+                self.release_sequence(seq.sequence_id);
+            }
         }
-        let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
-        sync_result?;
-        if ticket.trace {
-            // `elapsed` spans issue→sync, so it includes any host work the
-            // caller overlapped between the two halves.
-            tracing::info!(
-                "[mixed-trace] mode={} rows={} tokens={} tiles={} elapsed={:.2}ms",
-                if ticket.ran_graph { "graph" } else { "eager" },
-                ticket.plan.batch,
-                ticket.plan.num_tokens,
-                ticket.plan.total_q_tiles,
-                ticket.t0.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        self.finalize_mixed_abc(&ticket.plan, req, row_kind)
+        result
     }
 
     /// Synchronous mixed step: issue + finalize back-to-back. Used by the
@@ -1315,7 +1336,8 @@ where
         }
         Ok(StepOutput {
             tokens,
-            accepted: plan.q_lens.iter().map(|&q| q.max(0) as u32).collect(),
+            materialized_tokens: plan.q_lens.iter().map(|&q| q.max(0) as u32).collect(),
+            accepted_drafts: None,
             finished,
             hidden_tap: None,
         })

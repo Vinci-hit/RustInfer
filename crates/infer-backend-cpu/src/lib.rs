@@ -725,6 +725,59 @@ impl CoreOps for Cpu {
         Ok(())
     }
 
+    fn concat_cols<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let sa = a.shape().as_slice();
+        let sb = b.shape().as_slice();
+        let sd = dst.shape().as_slice();
+        if sa.len() != 2
+            || sb.len() != 2
+            || sd.len() != 2
+            || sa[0] != sb[0]
+            || sd[0] != sa[0]
+            || sa[1].checked_add(sb[1]) != Some(sd[1])
+            || !a.is_contiguous()
+            || !b.is_contiguous()
+            || !dst.is_contiguous()
+        {
+            return Err(OpError::Shape(
+                "concat_cols requires contiguous [N,A], [N,B], [N,A+B]".into(),
+            ));
+        }
+        let (rows, ac, bc, dc) = (sa[0], sa[1], sb[1], sd[1]);
+        if rows == 0 || dc == 0 {
+            return Ok(());
+        }
+        let dst_start = dst.data_ptr() as usize;
+        let dst_end = dst_start + dst.numel() * T::SIZE_BYTES;
+        for src in [a, b] {
+            let start = src.data_ptr() as usize;
+            let end = start + src.numel() * T::SIZE_BYTES;
+            if start < dst_end && dst_start < end {
+                return Err(OpError::Shape("concat_cols output overlaps input".into()));
+            }
+        }
+        for r in 0..rows {
+            // SAFETY: validated contiguous shapes and disjoint output above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    a.data_ptr().add(r * ac),
+                    dst.data_ptr_mut().add(r * dc),
+                    ac,
+                );
+                std::ptr::copy_nonoverlapping(
+                    b.data_ptr().add(r * bc),
+                    dst.data_ptr_mut().add(r * dc + ac),
+                    bc,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn concat_seq<T: Dtype>(
         _a: &Tensor<T, Self>,
         _b: &Tensor<T, Self>,
@@ -1314,6 +1367,26 @@ fn check_numel3<T: Dtype, D: MemoryPort>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concat_cols_preserves_row_order_and_rejects_aliases() {
+        let device = Cpu;
+        let a = Tensor::from_host_slice(&[1f32, 2., 3., 4.], [2, 2], &device).unwrap();
+        let b = Tensor::from_host_slice(&[10f32, 20.], [2, 1], &device).unwrap();
+        let mut dst = Tensor::zeros([2, 3], &device).unwrap();
+        <Cpu as CoreOps>::concat_cols(&a, &b, &mut dst).unwrap();
+        assert_eq!(dst.to_host_vec().unwrap(), [1., 2., 10., 3., 4., 20.]);
+        let a = a.narrow(1, 0, 1).unwrap();
+        assert!(<Cpu as CoreOps>::concat_cols(&a, &b, &mut dst).is_err());
+        let a = dst.narrow(0, 0, 1).unwrap();
+        let empty = Tensor::zeros([1, 0], &device).unwrap();
+        let mut overlap = a.clone();
+        assert!(<Cpu as CoreOps>::concat_cols(&a, &empty, &mut overlap).is_err());
+        let a = Tensor::<f32, _>::zeros([0, 2], &device).unwrap();
+        let b = Tensor::zeros([0, 1], &device).unwrap();
+        let mut dst = Tensor::zeros([0, 3], &device).unwrap();
+        <Cpu as CoreOps>::concat_cols(&a, &b, &mut dst).unwrap();
+    }
+
     use super::*;
     use infer_core::ports::FusedOps;
     use infer_core::storage::Storage;

@@ -18,13 +18,25 @@ pub struct StepRequest {
     pub seqs: Vec<SeqStep>,
     pub sampling: Vec<crate::domain::ports::sampler::SamplingParams>,
     pub stop: StopCriteria,
+    /// Empty for ordinary execution. Otherwise one draft row per sequence,
+    /// with `seq.input_ids == [pending_token] + draft_tokens[row]`.
+    /// A row with K drafts requires K+1 target prediction rows, including the
+    /// independent correction/bonus prediction. K=0 is a valid verify row.
     pub draft_tokens: Vec<Vec<i32>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StepOutput {
     pub tokens: Vec<Vec<SampledToken>>,
-    pub accepted: Vec<u32>,
+    /// Leading input tokens eligible for retention by the caller. Ordinary
+    /// steps retain every input; verification retains the pending token plus
+    /// accepted drafts, shortened if output stops early. The last emitted
+    /// token remains pending rather than becoming part of this input prefix.
+    /// The caller owns KV leases and must return the unretained suffix.
+    pub materialized_tokens: Vec<u32>,
+    /// Consecutive matching drafts before EOS/output-budget truncation.
+    /// `None` for ordinary execution; these counts are NOT KV increments.
+    pub accepted_drafts: Option<Vec<u32>>,
     pub finished: Vec<bool>,
     pub hidden_tap: Option<HiddenTap>,
 }

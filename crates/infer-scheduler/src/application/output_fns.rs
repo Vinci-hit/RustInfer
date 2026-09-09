@@ -261,7 +261,14 @@ pub async fn process_llm_step_decoded(
     // 2. Process generated tokens.
     let mut finished_sequences: Vec<CompletedSequence> = Vec::new();
     let mut token_chunks: Vec<(ClientId, StreamChunk)> = Vec::new();
+    let mut stopped = std::collections::HashSet::new();
     for token in &output.tokens {
+        // A speculative burst can contain several tokens for one sequence.
+        // Stop strings are matched here; later tokens in that burst must not
+        // be appended or streamed after the first terminal token.
+        if stopped.contains(&token.sequence_id) {
+            continue;
+        }
         match sessions.append_generated_token(
             SequenceId(token.sequence_id),
             token.token_id,
@@ -283,6 +290,7 @@ pub async fn process_llm_step_decoded(
                     }
                 }
                 if outcome.finished {
+                    stopped.insert(token.sequence_id);
                     finished_sequences.push(CompletedSequence {
                         sequence_id: outcome.sequence_id,
                         worker_finished: outcome.worker_finished,

@@ -595,6 +595,19 @@ impl infer_core::ports::MathOps for Cuda {
         })
     }
 
+    fn concat_cols<T: Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        require_scope_tensor(scope, a, "concat_cols a")?;
+        require_scope_tensor(scope, b, "concat_cols b")?;
+        require_scope_tensor(scope, dst, "concat_cols dst")?;
+        kernels::concat_seq::concat_cols_into(scope_stream(scope), a, b, dst)
+    }
+
     fn concat_seq<T: Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         a: &Tensor<T, Self>,
@@ -1646,6 +1659,13 @@ impl CoreOps for Cuda {
                 dst_cols as i32,
             )
         })
+    }
+    fn concat_cols<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::concat_seq::concat_cols_into(a.device().config.stream, a, b, dst)
     }
     fn concat_seq<T: Dtype>(
         a: &Tensor<T, Self>,

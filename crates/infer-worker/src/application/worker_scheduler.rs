@@ -21,6 +21,9 @@ use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
 
+mod eager_prefill;
+pub(crate) use eager_prefill::handle_eager_prefill;
+
 fn sampling_params(params: &WireSamplingParams) -> SamplingParams {
     SamplingParams {
         temperature: params.temperature,

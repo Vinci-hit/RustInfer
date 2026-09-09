@@ -220,6 +220,7 @@ fn main() {
             .allowlist_function("cudaFree")
             .allowlist_function("cudaMemcpy")
             .allowlist_function("cudaMemcpyAsync")
+            .allowlist_function("cudaMemcpy2DAsync")
             .allowlist_function("cudaMemset")
             .allowlist_function("cudaMemsetAsync")
             .allowlist_function("cudaHostRegister")

@@ -149,6 +149,13 @@ pub trait CoreOps: MemoryPort {
         dst_cols: usize,
     ) -> OpResult<()>;
 
+    /// Concatenate contiguous matrices by columns into disjoint output storage.
+    fn concat_cols<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()>;
+
     /// Concat two `[*, D]` tensors along dim 0 into a pre-allocated dst.
     fn concat_seq<T: Dtype>(
         a: &Tensor<T, Self>,

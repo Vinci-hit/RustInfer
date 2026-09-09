@@ -1,5 +1,6 @@
 //! Qwen3.5 hybrid decoder with an optional vision encoder.
 
+pub mod mtp;
 pub mod vision;
 
 use crate::components::{
@@ -383,6 +384,25 @@ fn load_norm<T: Dtype, D: OpBackend + LlmBackend>(
     })
 }
 
+impl<T: Dtype, D: LlmBackend> crate::domain::model::DecoderReadout<T, D> for Qwen3_5Model<T, D> {
+    fn normalize_hidden_into(
+        &self,
+        hidden: &crate::domain::component::Hidden<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &crate::domain::exec::StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        self.decoder.normalize_hidden_into(hidden, output, ctx)
+    }
+    fn project_logits_into(
+        &self,
+        normalized: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &crate::domain::exec::StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        self.decoder.project_logits_into(normalized, output, ctx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,7 +413,7 @@ mod tests {
     use safetensors::{Dtype as SafeDtype, tensor::TensorView};
     use std::collections::BTreeMap;
 
-    fn config() -> LoadConfig {
+    pub(super) fn config() -> LoadConfig {
         LoadConfig {
             dim: 8,
             intermediate_size: 16,
@@ -426,8 +446,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn builds_checkpoint_layout_and_ties_embeddings() {
+    pub(super) fn checkpoint(mtp: bool) -> SafetensorsReader {
         let mut tensors = BTreeMap::new();
         let mut add = |name: String, shape: Vec<usize>, value: f32| {
             let bytes: Vec<u8> = (0..shape.iter().product::<usize>())
@@ -476,6 +495,30 @@ mod tests {
                 }
             }
         }
+        if mtp {
+            for (name, shape) in [
+                ("fc", vec![8, 16]),
+                ("pre_fc_norm_embedding", vec![8]),
+                ("pre_fc_norm_hidden", vec![8]),
+                ("norm", vec![8]),
+                ("layers.0.input_layernorm", vec![8]),
+                ("layers.0.post_attention_layernorm", vec![8]),
+                ("layers.0.self_attn.q_proj", vec![16, 8]),
+                ("layers.0.self_attn.k_proj", vec![4, 8]),
+                ("layers.0.self_attn.v_proj", vec![4, 8]),
+                ("layers.0.self_attn.o_proj", vec![8, 8]),
+                ("layers.0.self_attn.q_norm", vec![4]),
+                ("layers.0.self_attn.k_norm", vec![4]),
+                ("layers.0.mlp.gate_proj", vec![16, 8]),
+                ("layers.0.mlp.up_proj", vec![16, 8]),
+                ("layers.0.mlp.down_proj", vec![8, 16]),
+            ] {
+                let bytes = (0..shape.iter().product::<usize>())
+                    .flat_map(|i| (((i * 7 % 19) as f32 - 9.) * 0.035).to_le_bytes())
+                    .collect();
+                tensors.insert(format!("mtp.{name}.weight"), (shape, bytes));
+            }
+        }
         let views: BTreeMap<_, _> = tensors
             .iter()
             .map(|(name, (shape, bytes))| {
@@ -486,12 +529,20 @@ mod tests {
             })
             .collect();
         let path = std::env::temp_dir().join(format!(
-            "rustinfer-qwen35-{}.safetensors",
-            std::process::id()
+            "rustinfer-qwen35-{}-{}-{:?}.safetensors",
+            std::process::id(),
+            mtp,
+            std::thread::current().id()
         ));
         safetensors::tensor::serialize_to_file(views, None, &path).unwrap();
         let reader = SafetensorsReader::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
+        reader
+    }
+
+    #[test]
+    fn builds_checkpoint_layout_and_ties_embeddings() {
+        let reader = checkpoint(false);
         let loader = WeightLoader::new(&reader);
         let cfg = config();
         let model = build::<f32, Cpu>(&loader, &cfg, &Cpu).unwrap();

@@ -25,7 +25,7 @@ use crate::domain::dtype::Dtype;
 use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::gdn_scratch::GdnScratch;
-use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
+use crate::domain::model::{DecoderModel, DecoderReadout, Logits, ModelDims, SampleRows};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
@@ -205,6 +205,11 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         rows: SampleRows<'_>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<Logits<T, D>> {
+        if hidden.pending.is_some() {
+            return Err(OpError::Shape(
+                "readout requires a materialized residual".into(),
+            ));
+        }
         let num_tokens = hidden.num_tokens();
         let dev = hidden.stream.device().clone();
         let dim = self.dims.dim;
@@ -236,7 +241,10 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
                 }
             }
             SampleRows::Explicit(sel) => {
-                if sel.len() >= num_tokens {
+                if sel.iter().any(|&i| i < 0 || i as usize >= num_tokens) {
+                    return Err(OpError::Shape("readout row out of bounds".into()));
+                }
+                if sel.iter().copied().eq(0..num_tokens as i32) {
                     None
                 } else {
                     Some(sel.to_vec())
@@ -280,6 +288,48 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         self.norm.forward(src, &mut normed, ctx)?;
         self.lm_head.forward(&normed, &mut logits, ctx)?;
         Ok(Logits(logits))
+    }
+}
+
+impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderReadout<T, D> for Decoder<T, D, F> {
+    fn normalize_hidden_into(
+        &self,
+        hidden: &Hidden<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        if hidden.pending.is_some()
+            || hidden.stream.shape().as_slice() != [ctx.plan().num_tokens, self.dims.dim]
+            || output.shape() != hidden.stream.shape()
+            || !output.is_contiguous()
+            || !hidden.stream.is_contiguous()
+        {
+            return Err(OpError::Shape(
+                "target readout requires materialized [tokens, dim] hidden and matching output"
+                    .into(),
+            ));
+        }
+        self.norm.forward(&hidden.stream, output, ctx)
+    }
+
+    fn project_logits_into(
+        &self,
+        normalized: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        let shape = normalized.shape().as_slice();
+        if shape.len() != 2
+            || shape[1] != self.dims.dim
+            || output.shape().as_slice() != [shape[0], self.dims.vocab_size]
+            || !normalized.is_contiguous()
+            || !output.is_contiguous()
+        {
+            return Err(OpError::Shape(
+                "readout projection shape/layout mismatch".into(),
+            ));
+        }
+        self.lm_head.forward(normalized, output, ctx)
     }
 }
 
@@ -655,6 +705,74 @@ mod tests {
         };
         let _ = n;
         runner.step(&req).unwrap().tokens[0][0].token_id
+    }
+
+    #[test]
+    fn readout_composition_preserves_rows_and_owned_hidden() {
+        use crate::domain::plan::{BatchKind, BatchPlan};
+        let mut model = tiny_decoder();
+        model.install_scratch(ForwardScratch::new(&Cpu, model.dims(), 3, 1).unwrap());
+        let scope = crate::domain::exec::HostScope::new(Cpu);
+        let plan = BatchPlan {
+            kind: BatchKind::Ragged,
+            num_tokens: 3,
+            batch: 1,
+            q_lens: vec![3],
+            kv_lens: vec![3],
+            seq_positions: vec![0],
+            rope_positions: vec![0, 1, 2],
+            max_blocks_per_seq: 3,
+            block_size: 1,
+            total_q_tiles: 1,
+        };
+        let ctx = StepCtx::new(&scope, &plan);
+        let mut hidden = Hidden {
+            stream: weight(3, DIM),
+            pending: None,
+        };
+        let mut normalized = Tensor::zeros([3, DIM], &Cpu).unwrap();
+        model
+            .normalize_hidden_into(&hidden, &mut normalized, &ctx)
+            .unwrap();
+        let saved = normalized.to_host_vec().unwrap();
+        let mut projected = Tensor::zeros([3, VOCAB], &Cpu).unwrap();
+        model
+            .project_logits_into(&normalized, &mut projected, &ctx)
+            .unwrap();
+        let all = model
+            .finalize(&hidden, SampleRows::All, &ctx)
+            .unwrap()
+            .0
+            .to_host_vec()
+            .unwrap();
+        assert_eq!(projected.to_host_vec().unwrap(), all);
+        let selected = model
+            .finalize(&hidden, SampleRows::Explicit(&[2, 0, 2]), &ctx)
+            .unwrap()
+            .0
+            .to_host_vec()
+            .unwrap();
+        assert_eq!(
+            selected,
+            [&all[2 * VOCAB..], &all[..VOCAB], &all[2 * VOCAB..]].concat()
+        );
+        assert!(
+            model
+                .finalize(&hidden, SampleRows::Explicit(&[-1]), &ctx)
+                .is_err()
+        );
+        assert!(
+            model
+                .finalize(&hidden, SampleRows::Explicit(&[3]), &ctx)
+                .is_err()
+        );
+        hidden.pending = Some(weight(3, DIM));
+        assert!(
+            model
+                .normalize_hidden_into(&hidden, &mut normalized, &ctx)
+                .is_err()
+        );
+        assert_eq!(normalized.to_host_vec().unwrap(), saved);
     }
 
     /// Component forward correctness: a ragged 2-sequence prefill must produce
