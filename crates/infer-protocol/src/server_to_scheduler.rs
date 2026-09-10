@@ -70,6 +70,8 @@ pub struct InferenceRequest {
     // Append wire fields to preserve legacy positional MessagePack frames.
     #[serde(default)]
     pub multimodal: Option<std::sync::Arc<crate::multimodal::MultimodalInput>>,
+    #[serde(default)]
+    pub beam: Option<crate::beam::BeamOptions>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

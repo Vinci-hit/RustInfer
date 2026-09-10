@@ -36,9 +36,10 @@ jobs:
     env:
       GPU_BUILD_ARCH: ${{ inputs.cuda_arch || vars.GPU_CUDA_ARCH || 'sm_90' }}
       MODEL_PATH: ${{ vars.QWEN35_MODEL_PATH }}
-      ARTIFACT_DIR: ${{ runner.temp }}/rustinfer-gpu-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set artifact directory
+        run: echo "ARTIFACT_DIR=$RUNNER_TEMP/rustinfer-gpu-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - name: Check runner provisioning
         run: |
           test -n "$MODEL_PATH" && test -f "$MODEL_PATH/config.json"

@@ -13,6 +13,7 @@ use crate::common::{ProtocolError, ProtocolResult};
 pub enum BatchCommand {
     Prefill(PrefillBatchCmd),
     DiffusionBatch(DiffusionBatchCmd),
+    Beam(Box<crate::beam::BeamCommand>),
 }
 
 /// Scheduler -> Worker 的 prefill segment batch (paged-only).

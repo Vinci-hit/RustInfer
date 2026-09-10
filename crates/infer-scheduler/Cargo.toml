@@ -14,6 +14,7 @@ name = "rustinfer-scheduler"
 path = "src/main.rs"
 
 [dependencies]
+infer-core = { version = "1.0.1", path = "../infer-core" }
 # Protocol
 infer-protocol = { version = "1.0.1", path = "../infer-protocol" }
 

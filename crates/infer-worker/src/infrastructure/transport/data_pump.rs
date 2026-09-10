@@ -77,7 +77,15 @@ impl DataPump {
             .map_err(|e| format!("send: {}", e))
     }
 
-    /// Send diffusion batch output.
+    /// Send tagged beam completion.
+    pub fn send_beam_output(
+        &self,
+        output: &infer_protocol::beam::BeamOutput,
+    ) -> Result<(), String> {
+        let bytes = rmp_serde::to_vec(output).map_err(|e| e.to_string())?;
+        self.send_socket.send(bytes, 0).map_err(|e| e.to_string())
+    }
+
     pub fn send_diffusion_output(&self, output: &DiffusionBatchOutput) -> Result<(), String> {
         let bytes = rmp_serde::to_vec(output).map_err(|e| format!("serialize: {}", e))?;
         self.send_socket

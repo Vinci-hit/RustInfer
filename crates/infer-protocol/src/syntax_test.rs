@@ -5,6 +5,7 @@ use crate::*;
 #[allow(dead_code)]
 fn test_protocol_types() {
     let _req = InferenceRequest {
+        beam: None,
         multimodal: None,
         request_id: "test".to_string(),
         modality: InferenceModality::Llm,

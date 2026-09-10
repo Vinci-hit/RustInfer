@@ -37,6 +37,8 @@ unsafe extern "C" {
 /// P2: Bundles the mutable worker state that `drain_control` and its helpers
 /// pass around, eliminating 6 repeated parameters across every call site.
 struct WorkerCtx<'a> {
+    beam_id: Option<u64>,
+    cancelled_beam: &'a mut Option<u64>,
     active: &'a mut ActiveSeqMap,
     prefilling: &'a mut PrefillSeqMap,
     decode_engine: &'a mut DecodeEngine,
@@ -414,6 +416,14 @@ where
         bs.capture_sizes.clone(),
     )
     .map_err(|e| format!("Runtime::new: {:?}", e))?;
+    let mut beam_serving = if !E::SPECULATIVE && bs.load.tp_size == 1 {
+        Some(
+            super::beam_serving::BeamServing::reserve(&mut runner, eos_ids.len())
+                .map_err(|e| format!("beam workspace: {e}"))?,
+        )
+    } else {
+        None
+    };
     if E::SPECULATIVE {
         runner
             .prepare_speculative()
@@ -722,11 +732,17 @@ where
     // than one prewarmed mixed-graph bucket is spread across consecutive
     // steps). Carried across iterations, consumed ahead of fresh arrivals.
     let mut deferred_prefills: Vec<PrefillBatchCmd> = Vec::new();
+    let mut pending_beam = None;
+    let mut cancelled_beam = None;
 
     loop {
-        runner.retain_sequences(active.keys().chain(prefilling.keys()).copied());
+        if !beam_serving.as_ref().is_some_and(|b| b.is_active()) {
+            runner.retain_sequences(active.keys().chain(prefilling.keys()).copied());
+        }
         let drain_result = {
             let mut ctx = WorkerCtx {
+                beam_id: beam_serving.as_ref().and_then(|b| b.sequence_id()),
+                cancelled_beam: &mut cancelled_beam,
                 active: &mut active,
                 prefilling: &mut prefilling,
                 decode_engine: &mut decode_engine,
@@ -760,8 +776,13 @@ where
         // This removes the old `idle_wait_ms = heartbeat/2` polling window
         // that dominated TTFT at low QPS.
         let mut pending_prefills = std::mem::take(&mut deferred_prefills);
-        pending_prefills.extend(drain_data(data));
-        if pending_prefills.is_empty() && active.is_empty() && !decode_engine.has_pending() {
+        pending_prefills.extend(drain_data(data, &mut pending_beam));
+        if pending_prefills.is_empty()
+            && active.is_empty()
+            && !decode_engine.has_pending()
+            && pending_beam.is_none()
+            && !beam_serving.as_ref().is_some_and(|b| b.is_active())
+        {
             maybe_heartbeat(
                 control,
                 active.len() + prefilling.len(),
@@ -800,13 +821,15 @@ where
 
             // Data plane ready → pull every queued prefill in one go.
             if data_ready {
-                pending_prefills.extend(drain_data(data));
+                pending_prefills.extend(drain_data(data, &mut pending_beam));
             }
             // Control plane ready → handle it now (may be a cancel/shutdown
             // that voids the prefill we are about to run).
             if control_ready {
                 let drain_result = {
                     let mut ctx = WorkerCtx {
+                        beam_id: beam_serving.as_ref().and_then(|b| b.sequence_id()),
+                        cancelled_beam: &mut cancelled_beam,
                         active: &mut active,
                         prefilling: &mut prefilling,
                         decode_engine: &mut decode_engine,
@@ -825,12 +848,65 @@ where
                 }
             }
 
-            if pending_prefills.is_empty() && active.is_empty() && !decode_engine.has_pending() {
+            if pending_prefills.is_empty()
+                && active.is_empty()
+                && !decode_engine.has_pending()
+                && pending_beam.is_none()
+                && !beam_serving.as_ref().is_some_and(|b| b.is_active())
+            {
                 continue;
             }
         }
 
-        runner.retain_sequences(active.keys().chain(prefilling.keys()).copied());
+        if !beam_serving.as_ref().is_some_and(|b| b.is_active()) {
+            runner.retain_sequences(active.keys().chain(prefilling.keys()).copied());
+        }
+
+        if let Some(command) = pending_beam.take() {
+            kv_allocator.free(&command.free_indices);
+            let result = if !active.is_empty()
+                || !prefilling.is_empty()
+                || decode_engine.has_pending()
+                || !pending_prefills.is_empty()
+            {
+                Err((command, "beam admission requires an idle worker".into()))
+            } else if let Some(serving) = beam_serving.as_mut() {
+                serving
+                    .start(&command, &runner, &mut kv_allocator, eos_ids)
+                    .map_err(|error| (command, error))
+            } else {
+                Err((command, "beam search requires TP=1 and MTP disabled".into()))
+            };
+            if let Err((command, error)) = result {
+                data.send_beam_output(
+                    &super::beam_serving::error_output(command, error)
+                        .with_kv_usage(kv_allocator.outstanding()),
+                )
+                .map_err(|e| format!("send beam error: {e}"))?;
+            }
+        }
+        if let Some(serving) = beam_serving.as_mut()
+            && serving.is_active()
+        {
+            let output = match serving.step(&mut runner, &mut kv_allocator, &mut cancelled_beam) {
+                Ok(output) => output,
+                Err(error) => escalate_fatal_and_exit(control, &active, &prefilling, &error),
+            };
+            if let Some(output) = output {
+                data.send_beam_output(&output)
+                    .map_err(|e| format!("send beam result: {e}"))?;
+            }
+            maybe_heartbeat(
+                control,
+                usize::from(serving.is_active()),
+                &mut last_heartbeat,
+                heartbeat_interval,
+                &kv_allocator,
+                decode_engine.transient_reserved_slots(),
+            );
+            deferred_prefills.extend(pending_prefills);
+            continue;
+        }
 
         // Stall tracer: start timing the *work* section (idle poll wait above
         // is intentionally excluded — it is not a stall).
@@ -1113,6 +1189,9 @@ where
                 return Ok(true);
             }
             SchedulerControlMessage::Cancel(c) => {
+                if c.sequence_id & (1u64 << 63) != 0 {
+                    *ctx.cancelled_beam = Some(c.sequence_id);
+                }
                 runner.release_sequence(c.sequence_id);
                 apply_cancel(control, ctx, c.sequence_id, req_id);
             }
@@ -1226,6 +1305,9 @@ where
     M: DecoderModel<bf16, Cuda>,
 {
     if matches!(mode, DrainMode::Immediate) {
+        if let Some(id) = ctx.beam_id {
+            *ctx.cancelled_beam = Some(id);
+        }
         // Close rank-local and peer-side async decode spans before any block
         // can be returned to the allocator and reused.
         ctx.decode_engine
@@ -1245,7 +1327,9 @@ where
     if req_id.is_correlated()
         && let Err(e) = control.send(
             WorkerControlMessage::DrainAck(DrainAck {
-                remaining_requests: ctx.active.len() + ctx.prefilling.len(),
+                remaining_requests: ctx.active.len()
+                    + ctx.prefilling.len()
+                    + usize::from(ctx.beam_id.is_some()),
             }),
             req_id,
         )
@@ -1255,11 +1339,25 @@ where
     Ok(())
 }
 
-fn drain_data(data: &DataPump) -> Vec<PrefillBatchCmd> {
+fn drain_data(
+    data: &DataPump,
+    beam: &mut Option<infer_protocol::beam::BeamCommand>,
+) -> Vec<PrefillBatchCmd> {
     let mut pending_prefills = Vec::new();
     loop {
         match data.try_recv_batch(0) {
             Ok(Some(BatchCommand::Prefill(p))) => pending_prefills.push(p),
+            Ok(Some(BatchCommand::Beam(command))) => {
+                let command = *command;
+                if beam.is_none() {
+                    *beam = Some(command);
+                } else {
+                    let _ = data.send_beam_output(&super::beam_serving::error_output(
+                        command,
+                        "beam request already pending".into(),
+                    ));
+                }
+            }
             Ok(Some(BatchCommand::DiffusionBatch(_))) => {
                 if let Err(e) =
                     data.send_diffusion_output(&DiffusionBatchOutput { results: vec![] })

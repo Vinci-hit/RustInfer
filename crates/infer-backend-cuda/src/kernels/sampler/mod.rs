@@ -149,3 +149,246 @@ mod tests {
         assert_eq!(picked.to_host_vec().unwrap(), vec![3501, 198]);
     }
 }
+
+unsafe extern "C" {
+    fn filtered_workspace_bytes(n: i32, bytes: *mut usize) -> i32;
+    fn filtered_sample(
+        logits: *const std::ffi::c_void,
+        dtype: i32,
+        n: i32,
+        temperature: f32,
+        k: i32,
+        top_p: f32,
+        min_p: f32,
+        draw: f64,
+        out: *mut i32,
+        logprob: *mut f32,
+        workspace: *mut std::ffi::c_void,
+        workspace_bytes: usize,
+        stream: cudaStream_t,
+    ) -> i32;
+}
+
+pub fn sampling_workspace_words(vocab: usize) -> OpResult<usize> {
+    let n =
+        i32::try_from(vocab).map_err(|_| OpError::Shape("sampling vocab exceeds i32".into()))?;
+    let mut bytes = 0;
+    let status = unsafe { filtered_workspace_bytes(n, &mut bytes) };
+    if status != 0 {
+        return Err(OpError::Kernel(format!(
+            "sampling workspace query: CUDA error {status}"
+        )));
+    }
+    Ok(bytes.div_ceil(4))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sample_filtered_into<T: Dtype>(
+    stream: cudaStream_t,
+    logits: &Tensor<T, Cuda>,
+    params: infer_core::ports::sampler::SamplingParams,
+    draw: f64,
+    out: &mut Tensor<i32, Cuda>,
+    logprob: &mut Tensor<f32, Cuda>,
+    workspace: &Tensor<f32, Cuda>,
+) -> OpResult<bool> {
+    let dtype = match T::DATA_TYPE {
+        DataType::BF16 => 0,
+        DataType::F32 => 1,
+        _ => return Ok(false),
+    };
+    if params.want_logprobs || params.repetition_penalty != 1.0 {
+        return Ok(false);
+    }
+    let n = i32::try_from(logits.numel())
+        .map_err(|_| OpError::Shape("sampling row exceeds i32".into()))?;
+    if n == 0
+        || logits.ndim() != 1
+        || !logits.is_contiguous()
+        || out.numel() != 1
+        || !out.is_contiguous()
+        || logprob.numel() != 1
+        || !logprob.is_contiguous()
+        || !workspace.is_contiguous()
+        || !params.temperature.is_finite()
+        || params.temperature < 0.0
+        || !params.top_p.is_finite()
+        || !(0.0..=1.0).contains(&params.top_p)
+        || !params.min_p.is_finite()
+        || !(0.0..=1.0).contains(&params.min_p)
+        || !draw.is_finite()
+        || !(0.0..1.0).contains(&draw)
+    {
+        return Err(OpError::Shape(
+            "invalid filtered sampling row, parameters or output".into(),
+        ));
+    }
+    let status = unsafe {
+        filtered_sample(
+            logits.data_ptr().cast(),
+            dtype,
+            n,
+            params.temperature,
+            params.top_k.min(n as u32) as i32,
+            params.top_p,
+            params.min_p,
+            draw,
+            out.data_ptr_mut(),
+            logprob.data_ptr_mut(),
+            workspace.data_ptr_mut().cast(),
+            workspace.numel() * 4,
+            stream,
+        )
+    };
+    if status != 0 {
+        return Err(OpError::Kernel(format!(
+            "filtered sampling: CUDA error {status}"
+        )));
+    }
+    Ok(true)
+}
+
+unsafe extern "C" {
+    fn beam_candidates(
+        logits: *const std::ffi::c_void,
+        dtype: i32,
+        n: i32,
+        k: i32,
+        out: *mut i32,
+        logprobs: *mut f32,
+        workspace: *mut std::ffi::c_void,
+        bytes: usize,
+        stream: cudaStream_t,
+    ) -> i32;
+}
+
+pub fn beam_candidates_into<T: Dtype>(
+    stream: cudaStream_t,
+    logits: &Tensor<T, Cuda>,
+    ids: &mut Tensor<i32, Cuda>,
+    logprobs: &mut Tensor<f32, Cuda>,
+    workspace: &Tensor<f32, Cuda>,
+) -> OpResult<bool> {
+    let dtype = match T::DATA_TYPE {
+        DataType::BF16 => 0,
+        DataType::F32 => 1,
+        _ => return Ok(false),
+    };
+    if logits.ndim() != 1
+        || logits.numel() > i32::MAX as usize
+        || ids.numel() == 0
+        || ids.numel() > logits.numel()
+        || ids.numel() != logprobs.numel()
+        || !logits.is_contiguous()
+        || !ids.is_contiguous()
+        || !logprobs.is_contiguous()
+        || !workspace.is_contiguous()
+    {
+        return Err(OpError::Shape("invalid beam candidate buffers".into()));
+    }
+    let status = unsafe {
+        beam_candidates(
+            logits.data_ptr().cast(),
+            dtype,
+            logits.numel() as i32,
+            ids.numel() as i32,
+            ids.data_ptr_mut(),
+            logprobs.data_ptr_mut(),
+            workspace.data_ptr_mut().cast(),
+            workspace.numel() * 4,
+            stream,
+        )
+    };
+    if status != 0 {
+        return Err(OpError::Kernel(format!(
+            "beam candidates: CUDA error {status}"
+        )));
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod filtered_tests {
+    use super::*;
+    use infer_core::ports::sampler::SamplingParams;
+    #[test]
+    fn filtered_gpu_sampling_and_beam_scores() {
+        let cuda = Cuda::new(0).unwrap();
+        let scope = crate::CudaScope::new(cuda.clone());
+        let stream = crate::scope_stream(&scope);
+        // Production Qwen vocabulary size, including token IDs beyond 200k.
+        let vocab = 248320;
+        let mut values = vec![half::bf16::from_f32(-1000.0); vocab];
+        values[200001] = half::bf16::from_f32(3.0);
+        values[2] = half::bf16::from_f32(2.0);
+        values[7] = half::bf16::from_f32(1.0);
+        let logits = Tensor::from_host_slice(&values, [vocab], &cuda).unwrap();
+        let workspace = Tensor::zeros([sampling_workspace_words(vocab).unwrap()], &cuda).unwrap();
+        let address = workspace.data_ptr();
+        let mut ids = Tensor::zeros([1], &cuda).unwrap();
+        let mut logprobs = Tensor::zeros([1], &cuda).unwrap();
+        for (k, p, draw, expected) in [
+            (2, 1.0, 0.99, 2),
+            (0, 0.5, 0.99, 200001),
+            (0, 1.0, 0.99, 7),
+            (2, 0.8, 0.99, 2),
+            (1, 1.0, 0.99, 200001),
+        ] {
+            let params = SamplingParams {
+                temperature: 1.0,
+                top_k: k,
+                top_p: p,
+                ..Default::default()
+            };
+            assert!(
+                sample_filtered_into(
+                    stream,
+                    &logits,
+                    params,
+                    draw,
+                    &mut ids,
+                    &mut logprobs,
+                    &workspace
+                )
+                .unwrap()
+            );
+            assert_eq!(ids.to_host_vec().unwrap(), [expected]);
+            assert!(logprobs.to_host_vec().unwrap()[0].is_finite());
+            assert_eq!(workspace.data_ptr(), address);
+        }
+        let mut top_ids = Tensor::zeros([3], &cuda).unwrap();
+        let mut top_probs = Tensor::zeros([3], &cuda).unwrap();
+        beam_candidates_into(stream, &logits, &mut top_ids, &mut top_probs, &workspace).unwrap();
+        assert_eq!(top_ids.to_host_vec().unwrap(), [200001, 2, 7]);
+        let expected = -(1f32 + (-1f32).exp() + (-2f32).exp()).ln();
+        for (i, logprob) in top_probs.to_host_vec().unwrap().iter().enumerate() {
+            assert!((logprob - (expected - i as f32)).abs() < 2e-5);
+        }
+        // Equal positive infinities have equal mass; ties retain token order.
+        let tied =
+            Tensor::from_host_slice(&[f32::INFINITY, 0., f32::INFINITY], [3], &cuda).unwrap();
+        let scratch = Tensor::zeros([sampling_workspace_words(3).unwrap()], &cuda).unwrap();
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        for (draw, expected) in [(0.0, 0), (0.49, 0), (0.5, 2), (0.99, 2)] {
+            sample_filtered_into(
+                stream,
+                &tied,
+                params,
+                draw,
+                &mut ids,
+                &mut logprobs,
+                &scratch,
+            )
+            .unwrap();
+            assert_eq!(ids.to_host_vec().unwrap(), [expected]);
+        }
+        let tiny = Tensor::zeros([1], &cuda).unwrap();
+        assert!(
+            sample_filtered_into(stream, &logits, params, 0.5, &mut ids, &mut logprobs, &tiny)
+                .is_err()
+        );
+    }
+}

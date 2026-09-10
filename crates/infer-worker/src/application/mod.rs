@@ -1,5 +1,6 @@
 //! Application layer — orchestration of inference, scheduling, and serve loop.
 
+pub mod beam_search;
 #[cfg(feature = "cuda")]
 pub mod decode_common;
 #[cfg(feature = "cuda")]
@@ -21,3 +22,6 @@ pub mod tuning;
 #[cfg(feature = "cuda")]
 pub mod worker_scheduler;
 pub mod worker_state;
+
+#[cfg(feature = "cuda")]
+mod beam_serving;

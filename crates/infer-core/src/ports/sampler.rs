@@ -52,6 +52,21 @@ pub struct SampleBatch {
 }
 
 pub trait Sampler<T: Dtype, D: LlmBackend>: Send + Sync {
+    /// Runtime-owned scratch is allocated once at startup. Custom samplers keep
+    /// their existing behavior unless they explicitly opt into this entry point.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_with_workspace(
+        &self,
+        logits: &Tensor<T, D>,
+        params: &[SamplingParams],
+        ctx: &StepCtx<'_, D>,
+        _workspace: &Tensor<f32, D>,
+        _ids: &mut Tensor<i32, D>,
+        _logprobs: &mut Tensor<f32, D>,
+    ) -> OpResult<SampleBatch> {
+        self.sample(logits, params, ctx)
+    }
+
     fn sample(
         &self,
         logits: &Tensor<T, D>,

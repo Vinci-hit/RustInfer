@@ -199,4 +199,4 @@ pub enum WorkerControlMessage {
     UnloadAck(UnloadAck),
 }
 
-pub const WORKER_CONTROL_PROTOCOL_VERSION: u32 = 4;
+pub const WORKER_CONTROL_PROTOCOL_VERSION: u32 = 5;

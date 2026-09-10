@@ -109,6 +109,62 @@ impl<T: Dtype, D: LlmBackend> RecurrentState<T, D> {
 }
 
 impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
+    pub(crate) fn prepare_beam_forks(&mut self) -> OpResult<()> {
+        if let Some(state) = &mut self.recurrent {
+            state.prepare_snapshot()?;
+        }
+        Ok(())
+    }
+
+    /// Dedicated beam sessions own IDs 0..N. Capture before remapping so a
+    /// duplicated parent and cyclic permutations both preserve source history.
+    pub(crate) fn fork_beams(
+        &mut self,
+        old_count: usize,
+        parents: &[usize],
+        len: i32,
+    ) -> OpResult<()> {
+        if old_count > self.cap_batch
+            || parents.len() > self.cap_batch
+            || parents.iter().any(|&p| p >= old_count)
+        {
+            return Err(OpError::Shape("invalid beam parents".into()));
+        }
+        let Some(state) = self.recurrent.as_mut() else {
+            return Ok(());
+        };
+        if state.has_decode_in_flight() || state.slots.len() != old_count {
+            return Err(OpError::Shape(
+                "beam fork requires exclusive idle runtime".into(),
+            ));
+        }
+        let slots: Vec<usize> = (0..old_count)
+            .map(|id| {
+                state
+                    .slots
+                    .get(&(id as u64))
+                    .filter(|(_, n)| *n == len)
+                    .map(|(slot, _)| *slot)
+                    .ok_or_else(|| OpError::Shape("beam history mismatch".into()))
+            })
+            .collect::<OpResult<_>>()?;
+        if parents.len() == old_count && parents.iter().copied().eq(0..old_count) {
+            return Ok(());
+        }
+        state.prepare_snapshot()?;
+        let snapshot = state.verification_snapshot.as_mut().unwrap();
+        snapshot.capture_on(&state.layers, &slots, &self.scope)?;
+        let targets: Vec<_> = (0..parents.len()).collect();
+        snapshot.fork_on(&mut state.layers, parents, &targets, &self.scope)?;
+        state.slots.clear();
+        state
+            .slots
+            .extend(targets.iter().map(|&slot| (slot as u64, (slot, len))));
+        state.free.clear();
+        state.free.extend((parents.len()..state.capacity).rev());
+        Ok(())
+    }
+
     pub fn has_recurrent_state(&self) -> bool {
         self.recurrent.is_some()
     }

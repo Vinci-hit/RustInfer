@@ -50,6 +50,14 @@ struct Args {
     /// Use with: nsys profile --capture-range=cudaProfilerApi ...
     #[arg(long)]
     profile_cuda_steps: Option<u32>,
+
+    /// Run a text beam search locally and print ranked JSON results, without the scheduler.
+    #[arg(long)]
+    beam_prompt: Option<String>,
+    #[arg(long, default_value_t = 4, requires = "beam_prompt")]
+    beam_width: usize,
+    #[arg(long, default_value_t = 32, requires = "beam_prompt")]
+    beam_max_tokens: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -527,6 +535,102 @@ where
         .collect()
 }
 
+fn run_beam_cli(
+    cfg: &infer_protocol::RustInferConfig,
+    args: &Args,
+    prompt: &str,
+) -> Result<(), String> {
+    use infer_worker::application::beam_search::{BeamSearchConfig, BeamSession};
+    if cfg.tensor_parallel_size != 1 || cfg.mtp_num_draft_tokens != 0 {
+        return Err("beam CLI requires TP=1 and MTP disabled".into());
+    }
+    let tokenizer = tokenizers::Tokenizer::from_file(Path::new(&cfg.model).join("tokenizer.json"))
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<i32> = tokenizer
+        .encode(prompt, true)
+        .map_err(|e| e.to_string())?
+        .get_ids()
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+    let context = ids
+        .len()
+        .checked_add(args.beam_max_tokens)
+        .filter(|&n| n <= cfg.max_model_len)
+        .ok_or("beam prompt/output exceeds max_model_len")?;
+    if args.beam_width == 0
+        || args.beam_width > context
+        || args.beam_max_tokens == 0
+        || ids.is_empty()
+    {
+        return Err("invalid beam width, prompt or output budget".into());
+    }
+    let raw =
+        std::fs::read(Path::new(&cfg.model).join("config.json")).map_err(|e| e.to_string())?;
+    let load_cfg = build_load_config(&parse_hf_config(&raw)?, context)?;
+    let cuda = Cuda::with_memory_plan(
+        parse_device_id(&cfg.device)?,
+        CudaMemoryPlan {
+            kernel_workspace_bytes: cfg.cuda_memory.kernel_workspace_mib * 1024 * 1024,
+            graph_arena_bytes: 0,
+            pool_retain_bytes: cfg.cuda_memory.pool_retain_mib * 1024 * 1024,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let model_type = infer_protocol::config::resolve_model_type(&cfg.model)?;
+    let reader = SafetensorsReader::open(&cfg.model).map_err(|e| e.to_string())?;
+    let loader = WeightLoader::new(&reader);
+    let limits = BeamSearchConfig {
+        width: args.beam_width,
+        max_context: context,
+        max_step_tokens: context.min(128).max(args.beam_width),
+        max_new_tokens: args.beam_max_tokens,
+        length_penalty: 1.0,
+        eos_ids: read_eos_ids(&cfg.model, &model_type),
+    };
+    fn generate<M: DecoderModel<bf16, Cuda>>(
+        model: M,
+        cuda: &Cuda,
+        limits: BeamSearchConfig,
+        ids: &[i32],
+        tokenizer: &tokenizers::Tokenizer,
+    ) -> Result<(), String> {
+        let scope = infer_worker::infrastructure::cuda::CudaScope::new(cuda.clone());
+        let mut session = BeamSession::new(model, scope, limits).map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let results = session.generate(ids).map_err(|e| e.to_string())?;
+        let beams: Vec<_> = results.into_iter().map(|b| {
+            let ids: Vec<u32> = b.token_ids.iter().map(|&id| id as u32).collect();
+            Ok(serde_json::json!({"text": tokenizer.decode(&ids, true).map_err(|e| e.to_string())?,
+                "token_ids": b.token_ids, "logprob": b.logprob, "score": b.score,
+                "ended_with_eos": b.ended_with_eos}))
+        }).collect::<Result<_, String>>()?;
+        println!(
+            "{}",
+            serde_json::json!({"elapsed_seconds": started.elapsed().as_secs_f64(), "beams": beams})
+        );
+        Ok(())
+    }
+    macro_rules! run {
+        ($builder:path) => {
+            generate(
+                $builder(&loader, &load_cfg, &cuda).map_err(|e| e.to_string())?,
+                &cuda,
+                limits,
+                &ids,
+                &tokenizer,
+            )
+        };
+    }
+    match model_type.as_str() {
+        "qwen3_5" => run!(qwen3_5::build::<bf16, Cuda>),
+        "qwen3" => run!(qwen3::build::<bf16, Cuda>),
+        "llama3" => run!(llama3::build::<bf16, Cuda>),
+        "qwen3_moe" => run!(qwen3_moe::build::<bf16, Cuda>),
+        _ => Err(format!("beam CLI unsupported model type {model_type}")),
+    }
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let cfg = infer_protocol::RustInferConfig::load(&args.config)?;
@@ -536,6 +640,10 @@ fn main() -> Result<(), String> {
                 .unwrap_or_else(|_| cfg.log_level.clone().into()),
         )
         .init();
+
+    if let Some(prompt) = &args.beam_prompt {
+        return run_beam_cli(&cfg, &args, prompt);
+    }
 
     let control_endpoint = cfg.worker_control_endpoint();
     let data_recv_endpoint = cfg.worker_in_endpoint();
@@ -2264,3 +2372,23 @@ mod qwen3_moe_checkpoint_tests;
 #[cfg(test)]
 #[path = "checkpoint_tests/qwen3_5_mtp.rs"]
 mod qwen35_mtp_checkpoint_tests;
+
+#[cfg(test)]
+mod beam_cli_tests {
+    use super::*;
+    #[test]
+    fn beam_options_do_not_change_normal_worker_launch() {
+        let args = Args::try_parse_from(["rustinfer-worker"]).unwrap();
+        assert!(args.beam_prompt.is_none());
+        let args = Args::try_parse_from([
+            "rustinfer-worker",
+            "--beam-prompt",
+            "Hello",
+            "--beam-width",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(args.beam_width, 2);
+        assert!(Args::try_parse_from(["rustinfer-worker", "--beam-width", "2"]).is_err());
+    }
+}

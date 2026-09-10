@@ -33,6 +33,16 @@ pub async fn completions(
         req.top_k,
         false,
     )?;
+    let beam = shared::beam_options(
+        req.beam_width,
+        req.length_penalty,
+        req.stream,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        false,
+        &state.config,
+    )?;
     let response_model = state.model_info.model_id.clone();
 
     // 2. 获取 input_ids（直接 tokenize prompt，不经过 chat template）
@@ -70,6 +80,7 @@ pub async fn completions(
             .await?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
+        beam,
         multimodal: None,
         request_id: request_id.clone(),
         modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,

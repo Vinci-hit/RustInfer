@@ -1043,6 +1043,46 @@ impl infer_core::ports::FusedOps for Cuda {
         })
     }
 
+    fn sampling_workspace_words(vocab: usize) -> OpResult<usize> {
+        kernels::sampler::sampling_workspace_words(vocab)
+    }
+
+    fn sample_filtered_into<T: Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+        params: infer_core::ports::sampler::SamplingParams,
+        draw: f64,
+        out: &mut Tensor<i32, Self>,
+        logprob: &mut Tensor<f32, Self>,
+        workspace: &Tensor<f32, Self>,
+    ) -> OpResult<bool> {
+        kernels::sampler::sample_filtered_into(
+            scope_stream(ctx.scope()),
+            logits,
+            params,
+            draw,
+            out,
+            logprob,
+            workspace,
+        )
+    }
+
+    fn beam_candidates_into<T: Dtype>(
+        ctx: &infer_core::exec::StepCtx<'_, Self>,
+        logits: &Tensor<T, Self>,
+        ids: &mut Tensor<i32, Self>,
+        logprobs: &mut Tensor<f32, Self>,
+        workspace: &Tensor<f32, Self>,
+    ) -> OpResult<bool> {
+        kernels::sampler::beam_candidates_into(
+            scope_stream(ctx.scope()),
+            logits,
+            ids,
+            logprobs,
+            workspace,
+        )
+    }
+
     fn argmax<T: infer_core::dtype::Dtype>(
         ctx: &infer_core::exec::StepCtx<'_, Self>,
         logits: &Tensor<T, Self>,

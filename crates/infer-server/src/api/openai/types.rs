@@ -33,6 +33,8 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<i32>,
+    pub beam_width: Option<usize>,
+    pub length_penalty: Option<f64>,
 
     /// Stop sequences
     #[serde(default)]
@@ -166,6 +168,8 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<i32>,
+    pub beam_width: Option<usize>,
+    pub length_penalty: Option<f64>,
 
     #[serde(default)]
     pub stop: Option<StopSequence>,
