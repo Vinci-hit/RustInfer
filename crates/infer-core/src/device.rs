@@ -48,6 +48,20 @@ pub trait MemoryPort: Device {
     /// `src` must be a valid host pointer with at least `size` bytes.
     unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()>;
 
+    /// Upload bulk host bytes, returning only after the source can be reused.
+    /// Backends may overlap bounded host staging with device transfers. Used by
+    /// weight-byte constructors; ordinary and explicitly async uploads retain
+    /// their existing behavior.
+    ///
+    /// # Safety
+    /// Same pointer and size requirements as `upload`.
+    unsafe fn upload_bulk(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
+        unsafe {
+            self.upload(dst, src, size)?;
+        }
+        self.synchronize()
+    }
+
     /// Async H2D copy that does NOT synchronize the device stream.
     ///
     /// CPU impl: identical to `upload` (memcpy is already synchronous).

@@ -223,6 +223,8 @@ fn main() {
             .allowlist_function("cudaMemcpy2DAsync")
             .allowlist_function("cudaMemset")
             .allowlist_function("cudaMemsetAsync")
+            .allowlist_function("cudaMallocHost")
+            .allowlist_function("cudaFreeHost")
             .allowlist_function("cudaHostRegister")
             .allowlist_function("cudaHostUnregister")
             .allowlist_function("cudaMemGetInfo")

@@ -7,6 +7,8 @@
 //! into components — lives in the model modules (`models/decoder.rs`, …), not
 //! here. Filesystem access is delegated to `infra::io::SafetensorsReader`.
 
+use std::borrow::Cow;
+
 use safetensors::tensor::TensorView;
 
 use super::layers::{Embedding, Linear, RMSNorm};
@@ -923,14 +925,14 @@ enum MatrixShardAxis {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct MatrixShardHost {
-    bytes: Vec<u8>,
+struct MatrixShardHost<'a> {
+    bytes: Cow<'a, [u8]>,
     shape: [usize; 2],
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct VectorShardHost {
-    bytes: Vec<u8>,
+struct VectorShardHost<'a> {
+    bytes: Cow<'a, [u8]>,
     len: usize,
 }
 
@@ -970,12 +972,12 @@ fn even_shard_range(what: &str, global: usize, tp: RankPair) -> OpResult<(usize,
 /// Cast a rank-2 safetensor to `T`, then retain only this rank's matrix shard.
 /// The returned host buffer is contiguous and is the only data uploaded to the
 /// device. Row shards are contiguous; column shards are gathered row by row.
-fn prepare_matrix_shard<T: Dtype>(
+fn prepare_matrix_shard<'a, T: Dtype>(
     name: &str,
-    view: &TensorView<'_>,
+    view: &'a TensorView<'_>,
     axis: MatrixShardAxis,
     tp: RankPair,
-) -> OpResult<MatrixShardHost> {
+) -> OpResult<MatrixShardHost<'a>> {
     let shape = view.shape();
     if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
         return Err(OpError::Shape(format!(
@@ -1030,6 +1032,12 @@ fn prepare_matrix_shard<T: Dtype>(
             let capacity = rows.checked_mul(local_src_row_bytes).ok_or_else(|| {
                 OpError::Shape(format!("tensor '{}': shard byte size overflows", name))
             })?;
+            if tp.size == 1 {
+                return Ok(MatrixShardHost {
+                    bytes: convert_host_bytes::<T>(view.data(), src_dtype, rows * cols, name)?,
+                    shape: [rows, cols],
+                });
+            }
             let mut src_shard = Vec::with_capacity(capacity);
             for row in 0..rows {
                 let elem_start = row
@@ -1045,7 +1053,14 @@ fn prepare_matrix_shard<T: Dtype>(
                     .extend_from_slice(&view.data()[byte_start..byte_start + local_src_row_bytes]);
             }
             Ok(MatrixShardHost {
-                bytes: convert_host_bytes::<T>(&src_shard, src_dtype, rows * local_cols, name)?,
+                bytes: if src_dtype == T::DATA_TYPE {
+                    Cow::Owned(src_shard)
+                } else {
+                    Cow::Owned(
+                        convert_host_bytes::<T>(&src_shard, src_dtype, rows * local_cols, name)?
+                            .into_owned(),
+                    )
+                },
                 shape: [rows, local_cols],
             })
         }
@@ -1054,12 +1069,12 @@ fn prepare_matrix_shard<T: Dtype>(
 
 /// Cast a rank-1 output bias to `T`, then retain the same even vocabulary
 /// range used by the corresponding row-sharded LM-head matrix.
-fn prepare_vector_shard<T: Dtype>(
+fn prepare_vector_shard<'a, T: Dtype>(
     name: &str,
-    view: &TensorView<'_>,
+    view: &'a TensorView<'_>,
     expected_len: usize,
     tp: RankPair,
-) -> OpResult<VectorShardHost> {
+) -> OpResult<VectorShardHost<'a>> {
     if view.shape() != [expected_len] {
         return Err(OpError::Shape(format!(
             "tensor '{}': expected bias shape [{}], got {:?}",
@@ -1107,7 +1122,7 @@ fn prepare_fused_output_shards<T: Dtype>(
     what: &str,
     parts: &[(&str, &TensorView<'_>)],
     tp: RankPair,
-) -> OpResult<MatrixShardHost> {
+) -> OpResult<MatrixShardHost<'static>> {
     if parts.is_empty() {
         return Err(OpError::Shape(format!(
             "{}: cannot fuse an empty projection list",
@@ -1137,7 +1152,7 @@ fn prepare_fused_output_shards<T: Dtype>(
     }
 
     Ok(MatrixShardHost {
-        bytes,
+        bytes: Cow::Owned(bytes),
         shape: [total_rows, cols.expect("parts is non-empty")],
     })
 }
@@ -1582,19 +1597,21 @@ fn prepare_fp8_fused_output_shards(
     })
 }
 
-fn safetensor_view_to_host_bytes<T: Dtype>(view: &TensorView<'_>) -> OpResult<Vec<u8>> {
+fn safetensor_view_to_host_bytes<'a, T: Dtype>(
+    view: &'a TensorView<'_>,
+) -> OpResult<Cow<'a, [u8]>> {
     let shape_vec: Vec<usize> = view.shape().to_vec();
     let numel: usize = shape_vec.iter().product();
     let src_dtype = st_dtype(view)?;
     convert_host_bytes::<T>(view.data(), src_dtype, numel, "safetensor view")
 }
 
-fn convert_host_bytes<T: Dtype>(
-    src_bytes: &[u8],
+fn convert_host_bytes<'a, T: Dtype>(
+    src_bytes: &'a [u8],
     src_dtype: DataType,
     numel: usize,
     what: &str,
-) -> OpResult<Vec<u8>> {
+) -> OpResult<Cow<'a, [u8]>> {
     let expected_src_bytes = numel
         .checked_mul(src_dtype.size_in_bytes())
         .ok_or_else(|| OpError::Shape(format!("{}: source byte size overflows", what)))?;
@@ -1612,7 +1629,7 @@ fn convert_host_bytes<T: Dtype>(
         .checked_mul(T::SIZE_BYTES)
         .ok_or_else(|| OpError::Shape(format!("{}: target byte size overflows", what)))?;
     if src_dtype == T::DATA_TYPE {
-        return Ok(src_bytes.to_vec());
+        return Ok(Cow::Borrowed(src_bytes));
     }
     if src_dtype == DataType::F8E4M3 || T::DATA_TYPE == DataType::F8E4M3 {
         return Err(OpError::Kernel(format!(
@@ -1629,7 +1646,7 @@ fn convert_host_bytes<T: Dtype>(
         T::DATA_TYPE,
         numel,
     );
-    Ok(host_buf)
+    Ok(Cow::Owned(host_buf))
 }
 
 fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
@@ -1796,6 +1813,46 @@ mod tp_tests {
     use crate::infrastructure::cpu::Cpu;
     use half::bf16;
     use safetensors::{Dtype, tensor::TensorView};
+
+    #[test]
+    fn contiguous_same_dtype_shards_borrow_checkpoint_bytes() {
+        let bytes = bf16_bytes(&[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let view = TensorView::new(Dtype::BF16, vec![4, 2], &bytes).unwrap();
+        for axis in [MatrixShardAxis::OutputRows, MatrixShardAxis::InputColumns] {
+            let shard =
+                prepare_matrix_shard::<bf16>("weight", &view, axis, RankPair { rank: 0, size: 1 })
+                    .unwrap();
+            assert!(matches!(shard.bytes, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(shard.bytes.as_ptr(), bytes.as_ptr());
+        }
+        let rows = prepare_matrix_shard::<bf16>(
+            "weight",
+            &view,
+            MatrixShardAxis::OutputRows,
+            RankPair { rank: 1, size: 2 },
+        )
+        .unwrap();
+        assert!(matches!(rows.bytes, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(rows.bytes.as_ref(), &bytes[8..]);
+        let columns = prepare_matrix_shard::<bf16>(
+            "weight",
+            &view,
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 1, size: 2 },
+        )
+        .unwrap();
+        assert!(matches!(columns.bytes, std::borrow::Cow::Owned(_)));
+        assert_eq!(decode_bf16(&columns.bytes), vec![2., 4., 6., 8.]);
+        let converted = prepare_matrix_shard::<f32>(
+            "weight",
+            &view,
+            MatrixShardAxis::OutputRows,
+            RankPair { rank: 0, size: 1 },
+        )
+        .unwrap();
+        assert!(matches!(converted.bytes, std::borrow::Cow::Owned(_)));
+        assert_eq!(converted.bytes.len(), 8 * 4);
+    }
 
     fn bf16_bytes(values: &[f32]) -> Vec<u8> {
         values
