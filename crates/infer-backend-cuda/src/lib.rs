@@ -7,6 +7,7 @@ pub mod config;
 pub mod device_utils;
 pub mod error;
 pub mod ffi;
+mod host_buffer;
 mod nccl;
 mod pool;
 mod timing;
@@ -1397,6 +1398,12 @@ impl MemoryPort for Cuda {
             error::check_last_error("cuda upload sync observed prior kernel error")?;
         }
         Ok(())
+    }
+
+    fn alloc_host_buffer(&self, size: usize) -> OpResult<Box<dyn infer_core::device::HostBuffer>> {
+        let scope = self.scope();
+        let _guard = infer_core::exec::ExecScope::enter(&scope);
+        Ok(Box::new(host_buffer::PinnedBuffer::new(size)?))
     }
 
     unsafe fn upload_async(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {

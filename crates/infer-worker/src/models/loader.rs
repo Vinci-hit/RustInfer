@@ -7,6 +7,8 @@
 //! into components — lives in the model modules (`models/decoder.rs`, …), not
 //! here. Filesystem access is delegated to `infra::io::SafetensorsReader`.
 
+use std::borrow::Cow;
+
 use safetensors::tensor::TensorView;
 
 use super::layers::{Embedding, Linear, RMSNorm};
@@ -20,6 +22,7 @@ use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
 use crate::domain::tensor::Tensor;
 use crate::domain::types::{DataType, Dtype, Shape};
 use crate::infrastructure::io::SafetensorsReader;
+use crate::infrastructure::io::safetensors::{LayerPrefetch, PrefetchedLayer};
 
 /// Llama-3 NTK-aware RoPE scaling parameters.
 ///
@@ -228,6 +231,7 @@ impl ExpertLinearLoadSpec {
 /// typed model structs. The reader is borrowed (no copy until upload).
 pub struct WeightLoader<'a> {
     reader: &'a SafetensorsReader,
+    prefetched: Option<&'a PrefetchedLayer>,
     tp: RankPair,
 }
 
@@ -237,6 +241,7 @@ impl<'a> WeightLoader<'a> {
     pub fn new(reader: &'a SafetensorsReader) -> Self {
         Self {
             reader,
+            prefetched: None,
             tp: RankPair { rank: 0, size: 1 },
         }
     }
@@ -248,7 +253,11 @@ impl<'a> WeightLoader<'a> {
         size: usize,
     ) -> OpResult<Self> {
         let tp = validate_tp(RankPair { rank, size })?;
-        Ok(Self { reader, tp })
+        Ok(Self {
+            reader,
+            prefetched: None,
+            tp,
+        })
     }
 
     pub fn tensor_parallel(&self) -> RankPair {
@@ -277,7 +286,30 @@ impl<'a> WeightLoader<'a> {
 
     /// Borrow a raw safetensors `TensorView` by name.
     pub fn read_view(&self, name: &str) -> Result<TensorView<'_>, String> {
+        if let Some(view) = self.prefetched.and_then(|layer| layer.read_view(name)) {
+            return view;
+        }
         self.reader.read_view(name)
+    }
+
+    pub fn prefetch_layers<D: MemoryPort>(
+        &self,
+        prefix: &str,
+        layers: usize,
+        device: &D,
+    ) -> OpResult<LayerPrefetch> {
+        self.reader.prefetch_layers(
+            (0..layers).map(|index| format!("{prefix}.{index}.")),
+            device,
+        )
+    }
+
+    pub fn with_prefetched<'b>(&'b self, layer: &'b PrefetchedLayer) -> WeightLoader<'b> {
+        WeightLoader {
+            reader: self.reader,
+            prefetched: Some(layer),
+            tp: self.tp,
+        }
     }
 
     /// Load a tensor by name, cast to target dtype T, place on device D.
@@ -287,7 +319,6 @@ impl<'a> WeightLoader<'a> {
         device: &D,
     ) -> OpResult<Tensor<T, D>> {
         let view = self
-            .reader
             .read_view(name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}' not found: {}", name, e)))?;
         tensor_from_safetensor_view::<T, D>(&view, device)
@@ -312,7 +343,7 @@ impl<'a> WeightLoader<'a> {
                 names
                     .iter()
                     .map(|name| {
-                        self.reader.read_view(name).map_err(|error| {
+                        self.read_view(name).map_err(|error| {
                             OpError::Kernel(format!("tensor '{}': {}", name, error))
                         })
                     })
@@ -353,7 +384,7 @@ impl<'a> WeightLoader<'a> {
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
         let Some(block) = fp8_block else {
-            let view = self.reader.read_view(weight_name).map_err(|e| {
+            let view = self.read_view(weight_name).map_err(|e| {
                 OpError::Kernel(format!("tensor '{}' not found: {}", weight_name, e))
             })?;
             let host = prepare_matrix_shard::<T>(
@@ -377,11 +408,10 @@ impl<'a> WeightLoader<'a> {
         };
 
         let view = self
-            .reader
             .read_view(weight_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}' not found: {}", weight_name, e)))?;
         let scale_name = format!("{}_scale_inv", weight_name);
-        let scale_view = self.reader.read_view(&scale_name).map_err(|e| {
+        let scale_view = self.read_view(&scale_name).map_err(|e| {
             OpError::Kernel(format!(
                 "FP8 tensor '{}' is missing scale tensor '{}': {}",
                 weight_name, scale_name, e
@@ -453,7 +483,6 @@ impl<'a> WeightLoader<'a> {
         device: &D,
     ) -> OpResult<CompEmbed<T, D>> {
         let view = self
-            .reader
             .read_view(name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))?;
         validate_matrix_shape(name, &view, global_vocab_size, dim)?;
@@ -484,7 +513,6 @@ impl<'a> WeightLoader<'a> {
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
         let view = self
-            .reader
             .read_view(weight_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", weight_name, e)))?;
         validate_matrix_shape(weight_name, &view, global_vocab_size, dim)?;
@@ -523,7 +551,6 @@ impl<'a> WeightLoader<'a> {
         device: &D,
     ) -> OpResult<Tensor<T, D>> {
         let view = self
-            .reader
             .read_view(name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))?;
         let host = prepare_vector_shard::<T>(name, &view, global_vocab_size, self.tp)?;
@@ -553,8 +580,7 @@ impl<'a> WeightLoader<'a> {
         let k_name = format!("{}.self_attn.k_proj.weight", prefix);
         let v_name = format!("{}.self_attn.v_proj.weight", prefix);
         let read = |name: &str| {
-            self.reader
-                .read_view(name)
+            self.read_view(name)
                 .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))
         };
         let q_view = read(&q_name)?;
@@ -604,8 +630,7 @@ impl<'a> WeightLoader<'a> {
         let k_name = format!("{}.self_attn.k_proj.weight", prefix);
         let v_name = format!("{}.self_attn.v_proj.weight", prefix);
         let read = |name: &str| {
-            self.reader
-                .read_view(name)
+            self.read_view(name)
                 .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", name, e)))
         };
         let q_view = read(&q_name)?;
@@ -675,11 +700,9 @@ impl<'a> WeightLoader<'a> {
         let gate_name = format!("{}.mlp.gate_proj.weight", prefix);
         let up_name = format!("{}.mlp.up_proj.weight", prefix);
         let gate_view = self
-            .reader
             .read_view(&gate_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", gate_name, e)))?;
         let up_view = self
-            .reader
             .read_view(&up_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", up_name, e)))?;
 
@@ -719,11 +742,9 @@ impl<'a> WeightLoader<'a> {
         let gate_name = format!("{}.mlp.gate_proj.weight", prefix);
         let up_name = format!("{}.mlp.up_proj.weight", prefix);
         let gate_view = self
-            .reader
             .read_view(&gate_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", gate_name, e)))?;
         let up_view = self
-            .reader
             .read_view(&up_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", up_name, e)))?;
 
@@ -733,11 +754,9 @@ impl<'a> WeightLoader<'a> {
         let gate_scale_name = format!("{}_scale_inv", gate_name);
         let up_scale_name = format!("{}_scale_inv", up_name);
         let gate_scale = self
-            .reader
             .read_view(&gate_scale_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", gate_scale_name, e)))?;
         let up_scale = self
-            .reader
             .read_view(&up_scale_name)
             .map_err(|e| OpError::Kernel(format!("tensor '{}': {}", up_scale_name, e)))?;
         let parts = [
@@ -843,8 +862,7 @@ impl<'a> WeightLoader<'a> {
         self.require_tp1("AWQ column-parallel gate/up")?;
         let view = |proj: &str, part: &str| -> OpResult<TensorView<'_>> {
             let name = format!("{}.{}.{}", mlp_prefix, proj, part);
-            self.reader
-                .read_view(&name)
+            self.read_view(&name)
                 .map_err(|e| OpError::Kernel(format!("{}: {}", name, e)))
         };
         let packed = self.fuse_rows_verbatim::<i32, D>(
@@ -923,14 +941,14 @@ enum MatrixShardAxis {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct MatrixShardHost {
-    bytes: Vec<u8>,
+struct MatrixShardHost<'a> {
+    bytes: Cow<'a, [u8]>,
     shape: [usize; 2],
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct VectorShardHost {
-    bytes: Vec<u8>,
+struct VectorShardHost<'a> {
+    bytes: Cow<'a, [u8]>,
     len: usize,
 }
 
@@ -970,12 +988,12 @@ fn even_shard_range(what: &str, global: usize, tp: RankPair) -> OpResult<(usize,
 /// Cast a rank-2 safetensor to `T`, then retain only this rank's matrix shard.
 /// The returned host buffer is contiguous and is the only data uploaded to the
 /// device. Row shards are contiguous; column shards are gathered row by row.
-fn prepare_matrix_shard<T: Dtype>(
+fn prepare_matrix_shard<'a, T: Dtype>(
     name: &str,
-    view: &TensorView<'_>,
+    view: &'a TensorView<'_>,
     axis: MatrixShardAxis,
     tp: RankPair,
-) -> OpResult<MatrixShardHost> {
+) -> OpResult<MatrixShardHost<'a>> {
     let shape = view.shape();
     if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
         return Err(OpError::Shape(format!(
@@ -1030,6 +1048,12 @@ fn prepare_matrix_shard<T: Dtype>(
             let capacity = rows.checked_mul(local_src_row_bytes).ok_or_else(|| {
                 OpError::Shape(format!("tensor '{}': shard byte size overflows", name))
             })?;
+            if tp.size == 1 {
+                return Ok(MatrixShardHost {
+                    bytes: convert_host_bytes::<T>(view.data(), src_dtype, rows * cols, name)?,
+                    shape: [rows, cols],
+                });
+            }
             let mut src_shard = Vec::with_capacity(capacity);
             for row in 0..rows {
                 let elem_start = row
@@ -1045,7 +1069,14 @@ fn prepare_matrix_shard<T: Dtype>(
                     .extend_from_slice(&view.data()[byte_start..byte_start + local_src_row_bytes]);
             }
             Ok(MatrixShardHost {
-                bytes: convert_host_bytes::<T>(&src_shard, src_dtype, rows * local_cols, name)?,
+                bytes: if src_dtype == T::DATA_TYPE {
+                    Cow::Owned(src_shard)
+                } else {
+                    Cow::Owned(
+                        convert_host_bytes::<T>(&src_shard, src_dtype, rows * local_cols, name)?
+                            .into_owned(),
+                    )
+                },
                 shape: [rows, local_cols],
             })
         }
@@ -1054,12 +1085,12 @@ fn prepare_matrix_shard<T: Dtype>(
 
 /// Cast a rank-1 output bias to `T`, then retain the same even vocabulary
 /// range used by the corresponding row-sharded LM-head matrix.
-fn prepare_vector_shard<T: Dtype>(
+fn prepare_vector_shard<'a, T: Dtype>(
     name: &str,
-    view: &TensorView<'_>,
+    view: &'a TensorView<'_>,
     expected_len: usize,
     tp: RankPair,
-) -> OpResult<VectorShardHost> {
+) -> OpResult<VectorShardHost<'a>> {
     if view.shape() != [expected_len] {
         return Err(OpError::Shape(format!(
             "tensor '{}': expected bias shape [{}], got {:?}",
@@ -1107,7 +1138,7 @@ fn prepare_fused_output_shards<T: Dtype>(
     what: &str,
     parts: &[(&str, &TensorView<'_>)],
     tp: RankPair,
-) -> OpResult<MatrixShardHost> {
+) -> OpResult<MatrixShardHost<'static>> {
     if parts.is_empty() {
         return Err(OpError::Shape(format!(
             "{}: cannot fuse an empty projection list",
@@ -1137,7 +1168,7 @@ fn prepare_fused_output_shards<T: Dtype>(
     }
 
     Ok(MatrixShardHost {
-        bytes,
+        bytes: Cow::Owned(bytes),
         shape: [total_rows, cols.expect("parts is non-empty")],
     })
 }
@@ -1582,19 +1613,21 @@ fn prepare_fp8_fused_output_shards(
     })
 }
 
-fn safetensor_view_to_host_bytes<T: Dtype>(view: &TensorView<'_>) -> OpResult<Vec<u8>> {
+fn safetensor_view_to_host_bytes<'a, T: Dtype>(
+    view: &'a TensorView<'_>,
+) -> OpResult<Cow<'a, [u8]>> {
     let shape_vec: Vec<usize> = view.shape().to_vec();
     let numel: usize = shape_vec.iter().product();
     let src_dtype = st_dtype(view)?;
     convert_host_bytes::<T>(view.data(), src_dtype, numel, "safetensor view")
 }
 
-fn convert_host_bytes<T: Dtype>(
-    src_bytes: &[u8],
+fn convert_host_bytes<'a, T: Dtype>(
+    src_bytes: &'a [u8],
     src_dtype: DataType,
     numel: usize,
     what: &str,
-) -> OpResult<Vec<u8>> {
+) -> OpResult<Cow<'a, [u8]>> {
     let expected_src_bytes = numel
         .checked_mul(src_dtype.size_in_bytes())
         .ok_or_else(|| OpError::Shape(format!("{}: source byte size overflows", what)))?;
@@ -1612,7 +1645,7 @@ fn convert_host_bytes<T: Dtype>(
         .checked_mul(T::SIZE_BYTES)
         .ok_or_else(|| OpError::Shape(format!("{}: target byte size overflows", what)))?;
     if src_dtype == T::DATA_TYPE {
-        return Ok(src_bytes.to_vec());
+        return Ok(Cow::Borrowed(src_bytes));
     }
     if src_dtype == DataType::F8E4M3 || T::DATA_TYPE == DataType::F8E4M3 {
         return Err(OpError::Kernel(format!(
@@ -1629,7 +1662,7 @@ fn convert_host_bytes<T: Dtype>(
         T::DATA_TYPE,
         numel,
     );
-    Ok(host_buf)
+    Ok(Cow::Owned(host_buf))
 }
 
 fn tensor_from_safetensor_view<T: Dtype, D: MemoryPort>(
@@ -1796,6 +1829,46 @@ mod tp_tests {
     use crate::infrastructure::cpu::Cpu;
     use half::bf16;
     use safetensors::{Dtype, tensor::TensorView};
+
+    #[test]
+    fn contiguous_same_dtype_shards_borrow_checkpoint_bytes() {
+        let bytes = bf16_bytes(&[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let view = TensorView::new(Dtype::BF16, vec![4, 2], &bytes).unwrap();
+        for axis in [MatrixShardAxis::OutputRows, MatrixShardAxis::InputColumns] {
+            let shard =
+                prepare_matrix_shard::<bf16>("weight", &view, axis, RankPair { rank: 0, size: 1 })
+                    .unwrap();
+            assert!(matches!(shard.bytes, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(shard.bytes.as_ptr(), bytes.as_ptr());
+        }
+        let rows = prepare_matrix_shard::<bf16>(
+            "weight",
+            &view,
+            MatrixShardAxis::OutputRows,
+            RankPair { rank: 1, size: 2 },
+        )
+        .unwrap();
+        assert!(matches!(rows.bytes, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(rows.bytes.as_ref(), &bytes[8..]);
+        let columns = prepare_matrix_shard::<bf16>(
+            "weight",
+            &view,
+            MatrixShardAxis::InputColumns,
+            RankPair { rank: 1, size: 2 },
+        )
+        .unwrap();
+        assert!(matches!(columns.bytes, std::borrow::Cow::Owned(_)));
+        assert_eq!(decode_bf16(&columns.bytes), vec![2., 4., 6., 8.]);
+        let converted = prepare_matrix_shard::<f32>(
+            "weight",
+            &view,
+            MatrixShardAxis::OutputRows,
+            RankPair { rank: 0, size: 1 },
+        )
+        .unwrap();
+        assert!(matches!(converted.bytes, std::borrow::Cow::Owned(_)));
+        assert_eq!(converted.bytes.len(), 8 * 4);
+    }
 
     fn bf16_bytes(values: &[f32]) -> Vec<u8> {
         values
