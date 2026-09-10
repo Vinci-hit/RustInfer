@@ -102,6 +102,53 @@ impl<T: Dtype, D: LlmBackend> LinearSnapshot<T, D> {
         Ok(())
     }
 
+    /// Scatter saved rows to new owners. Repeated parents are allowed; targets
+    /// must be unique. All sources come from the snapshot, so permutations and
+    /// one-to-many forks cannot overwrite a still-needed parent.
+    pub fn fork_on(
+        &self,
+        layers: &mut [LinearLayerState<T, D>],
+        parents: &[usize],
+        targets: &[usize],
+        scope: &D::Scope,
+    ) -> OpResult<()> {
+        if parents.len() != targets.len()
+            || layers.len() != self.layers.len()
+            || parents.iter().any(|&p| p >= self.slots.len())
+            || targets
+                .iter()
+                .enumerate()
+                .any(|(i, s)| targets[..i].contains(s))
+            || layers.iter().zip(&self.layers).any(|(dst, src)| {
+                dst.dims != src.dims
+                    || targets.iter().any(|&s| s >= dst.conv.shape()[0])
+                    || infer_core::device::Device::device_id(src.conv.device())
+                        != infer_core::device::Device::device_id(dst.conv.device())
+                    || infer_core::device::Device::device_id(src.conv.device())
+                        != infer_core::device::Device::device_id(
+                            infer_core::exec::ExecScope::device(scope),
+                        )
+            })
+        {
+            return Err(OpError::Shape("invalid recurrent fork mapping".into()));
+        }
+        for (dst, src) in layers.iter().zip(&self.layers) {
+            for (&parent, &target) in parents.iter().zip(targets) {
+                D::copy_tensor(
+                    scope,
+                    &src.conv.narrow(0, parent, 1)?,
+                    &mut dst.conv.narrow(0, target, 1)?,
+                )?;
+                D::copy_tensor(
+                    scope,
+                    &src.ssm.narrow(0, parent, 1)?,
+                    &mut dst.ssm.narrow(0, target, 1)?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn capture(layers: &[LinearLayerState<T, D>], slots: &[usize]) -> OpResult<Self> {
         let unique: HashSet<_> = slots.iter().copied().collect();
         if slots.is_empty()

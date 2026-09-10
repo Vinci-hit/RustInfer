@@ -592,6 +592,39 @@ pub trait FusedOps: MathOps {
         ))
     }
 
+    /// Number of f32 words for one reusable filtered-sampling row workspace.
+    /// Backends returning zero use the host sampler instead.
+    fn sampling_workspace_words(_vocab: usize) -> OpResult<usize> {
+        Ok(0)
+    }
+
+    /// Filter and sample one contiguous row without downloading its logits.
+    /// Returns false when the dtype/options are unsupported; no output is then written.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_filtered_into<T: Dtype>(
+        _ctx: &StepCtx<'_, Self>,
+        _logits: &Tensor<T, Self>,
+        _params: crate::ports::sampler::SamplingParams,
+        _draw: f64,
+        _out: &mut Tensor<i32, Self>,
+        _logprob: &mut Tensor<f32, Self>,
+        _workspace: &Tensor<f32, Self>,
+    ) -> OpResult<bool> {
+        Ok(false)
+    }
+
+    /// Highest raw-model log probabilities (no sampling filters), for beam search.
+    /// Writes k entries into each output; false selects the host reference path.
+    fn beam_candidates_into<T: Dtype>(
+        _ctx: &StepCtx<'_, Self>,
+        _logits: &Tensor<T, Self>,
+        _ids: &mut Tensor<i32, Self>,
+        _logprobs: &mut Tensor<f32, Self>,
+        _workspace: &Tensor<f32, Self>,
+    ) -> OpResult<bool> {
+        Ok(false)
+    }
+
     /// Greedy argmax over the last (vocab) dimension. `logits` is `[rows, vocab]`;
     /// returns the winning column index for every row as a host `Vec<i32>` of
     /// length `rows`. Equal maxima choose the lowest column index.

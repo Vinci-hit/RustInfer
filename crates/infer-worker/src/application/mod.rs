@@ -1,5 +1,6 @@
 //! Application layer — orchestration of inference, scheduling, and serve loop.
 
+pub mod beam_search;
 #[cfg(feature = "cuda")]
 pub mod decode_common;
 #[cfg(feature = "cuda")]

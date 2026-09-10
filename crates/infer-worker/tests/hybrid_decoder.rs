@@ -1377,3 +1377,115 @@ fn full_attention_partial_rope_and_gate_match_scalar_reference() {
         }
     }
 }
+
+#[test]
+fn beam_search_cached_gdn_forks_match_recomputed_prefixes_and_reuse() {
+    use infer_worker::application::beam_search::{BeamSearchConfig, BeamSession};
+    let prompt = [1, 2, 3, 4, 5];
+    let reference_model = model(false);
+    let mut oracle = vec![(Vec::<i32>::new(), 0.0f64)];
+    for _ in 0..3 {
+        let mut expansions = Vec::new();
+        for (suffix, score) in &oracle {
+            let mut input = prompt.to_vec();
+            input.extend_from_slice(suffix);
+            let mut fixture = Fixture::new(&reference_model);
+            let step = fixture.step(&[(0, &input)]);
+            let scope = HostScope::new(Cpu);
+            let ctx = StepCtx::new(&scope, &step.plan);
+            let mut hidden = Hidden {
+                stream: Tensor::zeros([input.len(), DIM], &Cpu).unwrap(),
+                pending: None,
+            };
+            let mut cache = ModelCacheView::hybrid(
+                &mut fixture.kv,
+                &step.index,
+                &mut fixture.linear,
+                &step.linear,
+            );
+            let logits = reference_model
+                .forward(
+                    &step.ids,
+                    &mut hidden,
+                    &mut cache,
+                    infer_worker::domain::model::SampleRows::LastPerSeq,
+                    &ctx,
+                )
+                .unwrap()
+                .0
+                .to_host_vec()
+                .unwrap();
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let logsum = logits
+                .iter()
+                .map(|&x| (x as f64 - max).exp())
+                .sum::<f64>()
+                .ln();
+            for (id, &x) in logits.iter().enumerate() {
+                let mut next = suffix.clone();
+                next.push(id as i32);
+                expansions.push((next, score + x as f64 - max - logsum));
+            }
+        }
+        expansions.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        expansions.truncate(3);
+        oracle = expansions;
+    }
+    let mut session = BeamSession::new(
+        model(false),
+        HostScope::new(Cpu),
+        BeamSearchConfig {
+            width: 3,
+            max_context: MAX_SEQ,
+            max_step_tokens: 3,
+            max_new_tokens: 3,
+            length_penalty: 0.0,
+            eos_ids: vec![],
+        },
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let actual = session.generate(&prompt).unwrap();
+        for (actual, expected) in actual.iter().zip(&oracle) {
+            assert_eq!(actual.token_ids, expected.0);
+            assert!(
+                (actual.logprob - expected.1).abs() < 2e-5,
+                "{} vs {}",
+                actual.logprob,
+                expected.1
+            );
+        }
+    }
+    assert!(session.generate(&[VOCAB as i32]).is_err());
+}
+
+#[test]
+fn beam_width_one_matches_hybrid_greedy() {
+    use infer_worker::application::beam_search::{BeamSearchConfig, BeamSession};
+    let mut greedy = hybrid_runtime(1);
+    let mut tokens = vec![1, 2, 3];
+    let mut expected = Vec::new();
+    for i in 0..4 {
+        let start = if i == 0 { 0 } else { tokens.len() - 1 };
+        let out = greedy
+            .step(&request(&[(0, 0, start, &tokens[start..])]))
+            .unwrap();
+        let id = out.tokens[0][0].token_id;
+        expected.push(id);
+        tokens.push(id);
+    }
+    let mut beam = BeamSession::new(
+        model(false),
+        HostScope::new(Cpu),
+        BeamSearchConfig {
+            width: 1,
+            max_context: MAX_SEQ,
+            max_step_tokens: 3,
+            max_new_tokens: 4,
+            length_penalty: 1.0,
+            eos_ids: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(beam.generate(&[1, 2, 3]).unwrap()[0].token_ids, expected);
+}

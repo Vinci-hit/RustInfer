@@ -367,9 +367,8 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             )));
         }
         let strides = self.strides.as_slice();
-        let mut new_shape_vec: Vec<usize> = shape.to_vec();
-        new_shape_vec[dim] = length;
-        let new_shape = Shape::from_slice(&new_shape_vec);
+        let mut new_shape = self.shape;
+        new_shape.0[dim] = length;
         let extra_offset = start.checked_mul(strides[dim]).ok_or_else(|| {
             OpError::Shape(format!(
                 "narrow: offset overflow (start={}, stride={})",

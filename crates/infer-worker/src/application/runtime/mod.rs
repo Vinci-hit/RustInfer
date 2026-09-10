@@ -29,6 +29,7 @@ use crate::domain::tensor::Tensor;
 use crate::domain::types::Shape;
 
 mod abc_decode;
+mod beam;
 mod graph_exec;
 mod mixed_abc;
 mod multimodal;
@@ -64,6 +65,8 @@ where
     pub hidden: Hidden<T, D>,
     pub scope: <D as Device>::Scope,
     pub sampler: Box<dyn Sampler<T, D>>,
+    sampling_workspace: Tensor<f32, D>,
+    sampling_logprobs: Tensor<f32, D>,
     pub dims: ModelDims,
     pub block_size: usize,
     pub max_blocks_per_seq: usize,
@@ -495,10 +498,17 @@ where
             }
         };
 
+        let sampling_workspace = Tensor::zeros(
+            [D::sampling_workspace_words(dims.vocab_size)?.max(1)],
+            device,
+        )?;
+        let sampling_logprobs = Tensor::zeros([cb], device)?;
         let execution_metrics = ExecutionMetrics::from_env("target");
         execution_metrics.prepare_gpu(&scope)?;
         Ok(Self {
             execution_metrics,
+            sampling_workspace,
+            sampling_logprobs,
             recurrent,
             retained_request: None,
             visual: multimodal::VisualState::default(),
@@ -822,7 +832,14 @@ where
         {
             let mut tokens: Vec<Vec<SampledToken>> =
                 if req.sampling.iter().any(|params| !params.is_greedy()) {
-                    let sampled = self.sampler.sample(&logits.0, &req.sampling, &ctx)?;
+                    let sampled = self.sampler.sample_with_workspace(
+                        &logits.0,
+                        &req.sampling,
+                        &ctx,
+                        &self.sampling_workspace,
+                        &mut self.abc.argmax_out_dev,
+                        &mut self.sampling_logprobs,
+                    )?;
                     if sampled.tokens.len() != plan.batch {
                         return Err(OpError::Shape(format!(
                             "sample_tail: sampler returned {} rows for batch {}",

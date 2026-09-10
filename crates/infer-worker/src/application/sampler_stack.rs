@@ -10,6 +10,68 @@ use rand::{Rng, SeedableRng};
 pub struct GreedySampler;
 
 impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
+    fn sample_with_workspace(
+        &self,
+        logits: &Tensor<T, D>,
+        params: &[SamplingParams],
+        ctx: &StepCtx<'_, D>,
+        workspace: &Tensor<f32, D>,
+        ids: &mut Tensor<i32, D>,
+        logprobs: &mut Tensor<f32, D>,
+    ) -> OpResult<SampleBatch> {
+        let shape = logits.shape().as_slice();
+        if shape.len() != 2
+            || shape[0] != params.len()
+            || params.is_empty()
+            || params.iter().any(|p| p.want_logprobs)
+            || workspace.numel() <= 1
+        {
+            return self.sample(logits, params, ctx);
+        }
+        for &p in params {
+            validate_sampling_params(p)?;
+        }
+        if ids.numel() < params.len() || logprobs.numel() < params.len() {
+            return Err(OpError::Shape("sampling output capacity too small".into()));
+        }
+        for (row, &p) in params.iter().enumerate() {
+            let position = ctx
+                .plan()
+                .seq_positions
+                .get(row)
+                .copied()
+                .unwrap_or_default() as u64;
+            let draw = sampling_draw(p.seed, position, row);
+            let input = logits
+                .narrow(0, row, 1)?
+                .view_contiguous([shape[1]].into())?;
+            if !D::sample_filtered_into(
+                ctx,
+                &input,
+                p,
+                draw,
+                &mut ids.narrow(0, row, 1)?,
+                &mut logprobs.narrow(0, row, 1)?,
+                workspace,
+            )? {
+                return self.sample(logits, params, ctx);
+            }
+        }
+        let ids = ids.narrow(0, 0, params.len())?.to_host_vec()?;
+        let logprobs = logprobs.narrow(0, 0, params.len())?.to_host_vec()?;
+        Ok(SampleBatch {
+            tokens: ids
+                .into_iter()
+                .zip(logprobs)
+                .map(|(token_id, logprob)| crate::domain::plan::SampledToken {
+                    token_id,
+                    logprob,
+                    top_logprobs: Vec::new(),
+                })
+                .collect(),
+        })
+    }
+
     fn sample(
         &self,
         logits: &Tensor<T, D>,
@@ -37,11 +99,15 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
             )));
         }
 
+        for &params in params {
+            validate_sampling_params(params)?;
+        }
+
         // Preserve the device argmax path when every row is deterministic. A
         // stochastic row needs its distribution on the host until the backend
         // exposes a filtered multinomial kernel; mixed batches take that same
         // correctness path so row ordering remains exact.
-        if params.is_empty() || params.iter().all(|p| p.is_greedy()) {
+        if params.is_empty() || params.iter().all(|p| p.is_greedy() && !p.want_logprobs) {
             let ids = D::argmax(ctx, logits)?;
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
@@ -67,22 +133,13 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
         let mut tokens = Vec::with_capacity(rows.len());
         for (seq_index, row) in rows.into_iter().enumerate() {
             let params = params.get(seq_index).unwrap_or(&default_params);
-            validate_sampling_params(*params)?;
             let position = ctx
                 .plan()
                 .seq_positions
                 .get(seq_index)
                 .copied()
                 .unwrap_or_default() as u64;
-            let draw = match params.seed {
-                Some(seed) => {
-                    let mixed_seed = seed
-                        ^ position.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                        ^ (seq_index as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                    StdRng::seed_from_u64(mixed_seed).random::<f64>()
-                }
-                None => rand::rng().random::<f64>(),
-            };
+            let draw = sampling_draw(params.seed, position, seq_index);
             let start = row.checked_mul(vocab).ok_or_else(|| {
                 OpError::Shape("GreedySampler::sample: logits row offset overflow".into())
             })?;
@@ -98,6 +155,18 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
             tokens.push(sample_filtered_row(row_logits, *params, draw)?);
         }
         Ok(SampleBatch { tokens })
+    }
+}
+
+fn sampling_draw(seed: Option<u64>, position: u64, row: usize) -> f64 {
+    match seed {
+        Some(seed) => {
+            let mixed = seed
+                ^ position.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (row as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            StdRng::seed_from_u64(mixed).random::<f64>()
+        }
+        None => rand::rng().random::<f64>(),
     }
 }
 
@@ -166,25 +235,26 @@ fn sample_filtered_row<T: Dtype>(
             )
         })
         .collect();
-    candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    if params.top_k > 0 {
-        candidates.truncate((params.top_k as usize).min(candidates.len()));
+    let order = |a: &(i32, f64), b: &(i32, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    if params.top_k > 0 && (params.top_k as usize) < candidates.len() {
+        let k = params.top_k as usize;
+        candidates.select_nth_unstable_by(k, order);
+        candidates.truncate(k);
     }
+    candidates.sort_unstable_by(order);
 
     let max = candidates[0].1;
-    let mut weighted: Vec<(i32, f64)> = candidates
-        .into_iter()
-        .map(|(token_id, score)| {
-            let weight = if max == f64::INFINITY {
-                if score == f64::INFINITY { 1.0 } else { 0.0 }
-            } else if max == f64::NEG_INFINITY {
-                1.0
-            } else {
-                (score - max).exp()
-            };
-            (token_id, weight)
-        })
-        .collect();
+    // Convert scores in place: no second vocabulary-sized allocation.
+    let mut weighted = candidates;
+    for (_, score) in &mut weighted {
+        *score = if max == f64::INFINITY {
+            if *score == f64::INFINITY { 1.0 } else { 0.0 }
+        } else if max == f64::NEG_INFINITY {
+            1.0
+        } else {
+            (*score - max).exp()
+        };
+    }
 
     if params.min_p > 0.0 {
         let threshold = weighted[0].1 * f64::from(params.min_p);
@@ -271,6 +341,29 @@ fn argmax_row<T: Dtype>(row: &[T]) -> OpResult<(i32, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_k_then_nucleus_renormalizes_and_breaks_ties_by_id() {
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 0.8,
+            ..SamplingParams::default()
+        };
+        let selected = sample_filtered_row(&[3f32, 2., 1.], params, 0.99).unwrap();
+        assert_eq!(selected.token_id, 1);
+        assert!((selected.logprob - (1f32 / (1f32.exp() + 1.)).ln()).abs() < 1e-6);
+        let tied = sample_filtered_row(&[0f32; 32], params, 0.99).unwrap();
+        assert_eq!(tied.token_id, 1);
+        assert!(
+            validate_sampling_params(SamplingParams {
+                temperature: f32::NAN,
+                top_k: 1,
+                ..params
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn greedy_ties_choose_the_lowest_token_id() {
