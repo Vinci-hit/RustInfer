@@ -37,3 +37,5 @@ pub use server_to_scheduler::{
     InferenceRequest, ServerCommand,
 };
 pub mod multimodal;
+
+pub mod beam;

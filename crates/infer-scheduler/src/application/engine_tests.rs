@@ -193,6 +193,7 @@ async fn rejected_ingestion_returns_an_immediate_error() -> Result<()> {
         WorkerId::from_identity(b"worker-test"),
     );
     let request = InferenceRequest {
+        beam: None,
         multimodal: None,
         request_id: "invalid-empty-prompt".to_string(),
         modality: InferenceModality::Llm,
@@ -583,6 +584,7 @@ async fn metrics_snapshot_tracks_request_lifecycle_and_reported_kv() -> Result<(
 
     let (mut engine, _, _events, _commands) = make_engine();
     let request = InferenceRequest {
+        beam: None,
         multimodal: None,
         request_id: "metrics-lifecycle".into(),
         modality: InferenceModality::Llm,
@@ -1287,5 +1289,152 @@ async fn alloc_failed_round_1_preempts_decoding() -> Result<()> {
     assert_eq!(engine.requests.decoding_len(), 1);
     let waiting_front = engine.requests.waiting().front().unwrap();
     assert_eq!(waiting_front.meta.sequence_id, SequenceId(11));
+    Ok(())
+}
+
+#[tokio::test]
+async fn beam_admission_drains_decode_and_cancel_waits_for_cleanup() -> Result<()> {
+    let (mut engine, _, _events, _control) = make_engine();
+    insert_decoding_session(&mut engine, 77, 2);
+    let request = infer_protocol::InferenceRequest {
+        beam: Some(infer_protocol::beam::BeamOptions {
+            width: 2,
+            length_penalty: 1.0,
+        }),
+        multimodal: None,
+        request_id: "beam-test".into(),
+        modality: Default::default(),
+        input_ids: vec![1, 2],
+        max_tokens: 3,
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: -1,
+        stream: false,
+        priority: 0,
+        stop_sequences: vec![],
+        ignore_eos: false,
+        diffusion: None,
+    };
+    let mut ordinary = request.clone();
+    ordinary.beam = None;
+    ordinary.request_id = "ordinary-after-beam".into();
+    engine
+        .handle_new_request(ClientId::dummy(), request)
+        .await?;
+    engine.maybe_schedule().await?;
+    assert!(engine.active_beam.is_none());
+    engine
+        .handle_step_output(SchedulerEvent::WorkerLlmStep(StepOutput {
+            prefill_done: vec![],
+            assigned_indices: vec![],
+            tokens: vec![GeneratedToken {
+                sequence_id: 77,
+                token_id: 4,
+                finished: true,
+            }],
+        }))
+        .await?;
+    engine.maybe_schedule().await?;
+    assert!(engine.active_beam.is_some());
+    engine
+        .handle_new_request(ClientId::dummy(), ordinary)
+        .await?;
+    engine.cancel_request_by_external_id("beam-test").await?;
+    engine.maybe_schedule().await?;
+    assert!(
+        engine.active_beam.is_some(),
+        "cancel must not release admission before worker cleanup"
+    );
+    let response = InferenceResponse {
+        request_id: "beam-test".into(),
+        status: ResponseStatus::Error,
+        output_token_ids: vec![],
+        images: vec![],
+        finish_reason: None,
+        error: Some("cancelled".into()),
+        metrics: infer_protocol::InferenceMetrics {
+            total_ms: 0,
+            num_tokens: 0,
+            tokens_per_second: 0.0,
+        },
+    };
+    let output = infer_protocol::beam::BeamOutput::Finished {
+        sequence_id: 1u64 << 63,
+        allocated_kv_tokens: Some(0),
+        response,
+    };
+    let bytes = MsgPackCodec.encode(&output)?;
+    let decoded = decode_llm_step(&MsgPackCodec, &bytes);
+    assert!(matches!(decoded, SchedulerEvent::WorkerBeam(_)));
+    engine.handle_step_output(decoded).await?;
+    assert!(engine.active_beam.is_none());
+    assert_eq!(
+        engine.requests.prefilling_len(),
+        1,
+        "ordinary waiters get an admission round after beam cleanup"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn beam_keeps_unneeded_cached_prefixes_and_restores_budget() -> Result<()> {
+    let (mut engine, _, _events, _control) = make_engine();
+    for i in 0..24 {
+        engine.radix.append_token(99, i, i as u32);
+    }
+    engine.radix.mark_finished_chain(99);
+    engine.kv_budget.force_set_outstanding(24);
+    let request = infer_protocol::InferenceRequest {
+        beam: Some(infer_protocol::beam::BeamOptions {
+            width: 2,
+            length_penalty: 1.0,
+        }),
+        multimodal: None,
+        request_id: "beam-cache".into(),
+        modality: Default::default(),
+        input_ids: vec![1, 2],
+        max_tokens: 3,
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: -1,
+        stream: false,
+        priority: 0,
+        stop_sequences: vec![],
+        ignore_eos: false,
+        diffusion: None,
+    };
+    engine
+        .handle_new_request(ClientId::dummy(), request)
+        .await?;
+    engine.maybe_schedule().await?;
+    assert!(engine.active_beam.is_some());
+    assert_eq!(
+        engine.radix.token_count(),
+        24,
+        "existing 8-slot headroom is enough"
+    );
+    engine
+        .handle_step_output(SchedulerEvent::WorkerBeam(
+            infer_protocol::beam::BeamOutput::Finished {
+                sequence_id: 1u64 << 63,
+                allocated_kv_tokens: Some(24),
+                response: InferenceResponse {
+                    request_id: "beam-cache".into(),
+                    status: ResponseStatus::Success,
+                    output_token_ids: vec![5],
+                    images: vec![],
+                    finish_reason: Some("stop".into()),
+                    error: None,
+                    metrics: infer_protocol::InferenceMetrics {
+                        total_ms: 1,
+                        num_tokens: 1,
+                        tokens_per_second: 1000.0,
+                    },
+                },
+            },
+        ))
+        .await?;
+    assert_eq!(engine.kv_budget.headroom(), 8);
+    assert_eq!(engine.radix.token_count(), 24);
     Ok(())
 }

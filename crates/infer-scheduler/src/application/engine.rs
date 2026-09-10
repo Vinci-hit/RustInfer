@@ -13,6 +13,7 @@
 //! variants, and forwards them through a second mpsc channel. The
 //! main event loop only ever processes fully-decoded events.
 
+mod beam;
 use infer_protocol::server_to_scheduler::InferenceRequest;
 use tokio::sync::mpsc;
 
@@ -36,6 +37,9 @@ use crate::infrastructure::transport::traits::{FrontendEvent, FrontendTransport,
 
 /// The main scheduler engine.
 pub struct SchedulerEngine {
+    beam_queue: std::collections::VecDeque<beam::PendingBeam>,
+    active_beam: Option<beam::PendingBeam>,
+    next_beam_id: u64,
     readiness: crate::infrastructure::transport::readiness::ReadinessHandle,
     // ─── Workflow ───
     /// Mode-specific scheduling and output processing. Owns the
@@ -149,6 +153,9 @@ impl SchedulerEngine {
         });
 
         Self {
+            beam_queue: Default::default(),
+            active_beam: None,
+            next_beam_id: 1u64 << 63,
             readiness: Default::default(),
             workflow,
             dispatch: crate::application::DispatchSystem::new(Box::new(frontend), Box::new(worker)),
@@ -222,6 +229,9 @@ impl SchedulerEngine {
     ) -> Result<()> {
         use crate::application::ingestion::{IngestOutcome, RejectReason};
 
+        if request.beam.is_some() {
+            return self.enqueue_beam(client_id, request).await;
+        }
         let external_id = request.request_id.clone();
         let stream = request.stream;
         let response_client = client_id.clone();
@@ -306,13 +316,23 @@ impl SchedulerEngine {
 
     /// Run one scheduling iteration — delegates to the workflow.
     pub(crate) async fn run_iteration(&mut self) -> Result<()> {
+        if self.schedule_beam().await? {
+            return Ok(());
+        }
         if !self.workflow.can_schedule(&self.requests) {
             return Ok(());
         }
         self.iteration_id += 1;
 
+        let old_limit = self.config.max_num_seqs;
+        if !self.beam_queue.is_empty() {
+            self.config.max_num_seqs =
+                self.requests.prefilling_len() + self.requests.decoding_len();
+        }
         let (workflow, dispatch, mut ctx) = self.split_for_workflow();
-        workflow.try_schedule(&mut ctx, dispatch).await
+        let result = workflow.try_schedule(&mut ctx, dispatch).await;
+        self.config.max_num_seqs = old_limit;
+        result
     }
 
     /// Schedule prefills, honoring the batch-accumulation window.
@@ -323,6 +343,10 @@ impl SchedulerEngine {
     /// full, or continuation work present), arming a timer so the held batch
     /// flushes even if no further events arrive.
     pub(crate) async fn maybe_schedule(&mut self) -> Result<()> {
+        if self.active_beam.is_some() || !self.beam_queue.is_empty() {
+            self.schedule_deadline = None;
+            return self.run_iteration().await;
+        }
         if !self.can_schedule() {
             return Ok(());
         }
@@ -385,8 +409,10 @@ impl SchedulerEngine {
         let counters = self.metrics.snapshot();
         infer_protocol::scheduler_to_server::SchedulerMetricsSnapshot {
             metrics_enabled: self.config.metrics_enabled,
-            queued_requests: self.requests.waiting().len() as u64,
-            active_requests: self.requests.active_count() as u64,
+            queued_requests: (self.requests.waiting().len() + self.beam_queue.len()) as u64,
+            active_requests: (self.requests.active_count()
+                + self.beam_queue.len()
+                + usize::from(self.active_beam.is_some())) as u64,
             prefilling_requests: self.requests.prefilling_len() as u64,
             decoding_requests: self.requests.decoding_len() as u64,
             kv_tokens_used: self.kv_budget.outstanding(),
@@ -409,6 +435,9 @@ impl SchedulerEngine {
     /// The event is already decoded by the background decode task;
     /// no MsgPack deserialization happens here.
     pub(crate) async fn handle_step_output(&mut self, event: SchedulerEvent) -> Result<()> {
+        if let SchedulerEvent::WorkerBeam(output) = event {
+            return self.finish_beam(output).await;
+        }
         let (workflow, dispatch, mut ctx) = self.split_for_workflow();
         workflow.handle_step_output(&mut ctx, dispatch, event).await
     }
@@ -463,6 +492,7 @@ impl SchedulerEngine {
                 self.readiness
                     .set(infer_protocol::scheduler_to_server::SchedulerReadiness::Failed);
                 let msg = error.to_string();
+                self.fail_beams(&msg).await;
                 let running: Vec<RequestId> = self
                     .requests
                     .running_sequence_ids()
@@ -530,6 +560,8 @@ impl SchedulerEngine {
 
     pub(crate) fn has_pending_work(&self) -> bool {
         self.requests.has_pending_work()
+            || self.active_beam.is_some()
+            || !self.beam_queue.is_empty()
     }
 
     pub(crate) fn has_in_flight_batch(&self) -> bool {
@@ -549,6 +581,9 @@ impl SchedulerEngine {
 
     /// Cancel by client-supplied external id.
     pub(crate) async fn cancel_request_by_external_id(&mut self, external_id: &str) -> Result<()> {
+        if self.cancel_beam(external_id)? {
+            return Ok(());
+        }
         crate::application::cancel::cancel_request_by_external_id_with_kv(
             &mut self.requests,
             &mut self.radix,
@@ -632,6 +667,9 @@ async fn decode_worker_output(
 }
 
 fn decode_llm_step(codec: &MsgPackCodec, data: &[u8]) -> SchedulerEvent {
+    if let Ok(output) = codec.decode::<infer_protocol::beam::BeamOutput>(data) {
+        return SchedulerEvent::WorkerBeam(output);
+    }
     match codec.decode::<infer_protocol::worker_to_scheduler_data::StepOutput>(data) {
         Ok(output) => SchedulerEvent::WorkerLlmStep(output),
         Err(e) => SchedulerEvent::WorkerDecodeError(e.to_string()),

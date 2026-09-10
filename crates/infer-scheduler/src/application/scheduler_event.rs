@@ -31,6 +31,7 @@ pub enum SchedulerEvent {
     },
     /// Worker step output (LLM mode) — already decoded.
     WorkerLlmStep(StepOutput),
+    WorkerBeam(infer_protocol::beam::BeamOutput),
     /// Worker step output (Diffusion mode) — already decoded.
     WorkerDiffusionStep(DiffusionBatchOutput),
     /// Control-plane event (heartbeat, AllocFailed, etc.).

@@ -32,7 +32,21 @@ requests for top log-probabilities use the host reference sampler.
 
 ## Beam search
 
-First entry points are the public Rust `BeamSession` and a standalone worker CLI:
+Both `/v1/completions` and `/v1/chat/completions` accept `beam_width` and optional
+`length_penalty` (default 1). They return the highest-scoring hypothesis in the
+usual single-choice response. Chat requests use the existing chat template.
+
+```json
+{"model":"Qwen3.5-4B", "prompt":"The capital of France is", "max_tokens":32,
+ "beam_width":4, "length_penalty":1.0, "stream":false}
+```
+
+Beam width must fit `max_batch_seqs` and `max_batch_tokens`. This first serving
+version supports non-streaming text, TP=1 and MTP disabled. Sampling filters do
+not apply: omit temperature/top-k/top-p (explicit temperature 0 or 1, unrestricted
+top-k, and top-p 1 are also accepted). `stop` and `ignore_eos` are supported.
+
+The public Rust `BeamSession` and standalone CLI also remain available:
 
 ```sh
 # Uses the model/device from the shared TOML, without starting scheduler/server.
@@ -43,8 +57,6 @@ target/release/rustinfer-worker --config rustinfer.toml \
 The prompt is raw text completion input, without automatic chat templating.
 Output JSON contains ranked beams with `text`, `token_ids`, cumulative `logprob`,
 normalized `score`, and `ended_with_eos`, plus search elapsed time (excluding load).
-The HTTP server does **not yet expose beam search**. It needs scheduler-owned
-candidate groups, cancellation and admission accounting before that integration.
 The CLI requires text input, TP=1 and MTP disabled; it runs eagerly.
 
 Rust callers construct `BeamSession::new(model, scope, BeamSearchConfig { ... })`
@@ -61,15 +73,41 @@ pruned by cumulative log-probability; finished results by normalized score. Earl
 termination uses an optimistic bound at the maximum generated length. Width one
 follows greedy, including immediate termination on EOS. Ties use token order.
 
-Full-attention KV uses reference-counted token slots with block size 1. Read-only
-prefixes are shared across children; each next token gets a new slot, and pruning
-reclaims slots no longer referenced. Forking does not copy the full KV prefix.
-The dedicated pool reserves `width * max_context` slots once.
+Full-attention KV sharing now uses the same `infer-core::radix_tree::RadixTree`
+implementation as scheduler prefix caching. `fork_sequence` pins a known chain
+tip directly, without a fresh token-prefix lookup or per-token reference walk.
+Children append fresh token slots; pruned chains become evictable after their last
+owner leaves. The kernel block table is materialized from the tree; no KV payload
+is copied. CPU token histories and flat block-table uploads are still required.
+The standalone pool reserves `width * max_context` slots once.
+
+HTTP beam requests reuse the resident model, Runtime, activation buffers and
+`GlobalKvAllocator`. Ordinary in-flight requests drain first (chunked prefills may
+continue, fresh admissions pause). Beam work then runs exclusively, one forward
+per serving-loop iteration; ordinary scheduling resumes after completion or
+cancellation cleanup. Ordinary waiters get an admission round between beam searches
+to prevent starvation. This is deliberately not mixed continuous batching of beams
+and ordinary decodes. Queued beams can be cancelled; active cancellation is checked
+between forwards. The HTTP request timeout uses the same cancellation path.
+
+At admission the worker reserves at most `prompt_len + width * max_tokens` slots
+from its existing pool, not a second GPU KV pool. Only enough unowned scheduler prefixes to satisfy the reservation are
+evicted, with the same command before allocation, avoiding control/data reordering.
+Completion synchronizes pending writes before returning the reservation. Candidate
+buffers and GDN fork snapshots are reserved at TP1 non-MTP worker startup, before
+memory profiling sizes the KV pool. Fork snapshots add recurrent workspace memory
+(up to one extra state per configured sequence slot), reducing available KV capacity.
+
+The tree implementation and physical KV pool are shared, but the beam search's
+live tree is worker-local. It does not publish its branches into the scheduler's
+cross-request prefix index; its reservation is returned when the search ends.
+Cross-request GDN caching stays disabled: a KV-only hit cannot restore the recurrent
+state at that prefix. GDN reuse inside the search is paired with state forking.
 
 Qwen3.5's GDN convolution and FP32 recurrent states must be independent per child.
 A startup-allocated snapshot captures parents before scattering states into the
 new row order. Duplicate parents and cyclic reorderings therefore cannot clobber
-source histories. Identity mappings skip these copies, and width one does not
+source histories. Identity mappings skip these copies, and a standalone width-one session does not
 allocate a fork snapshot. These device copies are required by the mutable recurrent state;
 state storage is not allocated per decoding step. The CPU still maintains beam
 histories, block-table metadata and scores. BF16/F32 CUDA candidate selection only
@@ -95,3 +133,12 @@ The final HTTP smoke check also exercised greedy and three stochastic settings
 with two concurrent request slots. The standalone width-one Qwen run returned
 the same 12 tokens as the HTTP greedy check. Local reports are under
 `target/sampling-smoke/`; numerical correctness does not depend on this smoke test.
+
+HTTP integration tests cover parameter rejection, shared-prefix eviction, partial
+edge forks, scheduler cancellation barriers, and tagged output decoding. The GPU
+HTTP smoke report is written to `target/beam-http-smoke/results.json` when run.
+Beam execution remains eager; this change does not add CUDA Graph capture.
+
+Deploy server, scheduler and worker together: frontend protocol is now version 4
+and worker control protocol version 5, so older workers cannot silently interpret
+a beam request as ordinary sampling. CUDA Graph is unchanged for ordinary decode.

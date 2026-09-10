@@ -22,3 +22,6 @@ pub mod tuning;
 #[cfg(feature = "cuda")]
 pub mod worker_scheduler;
 pub mod worker_state;
+
+#[cfg(feature = "cuda")]
+mod beam_serving;

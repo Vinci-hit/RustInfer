@@ -285,3 +285,71 @@ mod tests {
         assert!(validate_sampling(None, None, Some(0), None).is_ok());
     }
 }
+
+/// Beam search ranks complete hypotheses, so partial streaming is not supported.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn beam_options(
+    width: Option<usize>,
+    length_penalty: Option<f64>,
+    stream: bool,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i32>,
+    has_images: bool,
+    config: &infer_protocol::RustInferConfig,
+) -> Result<Option<infer_protocol::beam::BeamOptions>, AppError> {
+    let Some(width) = width else {
+        if length_penalty.is_some() {
+            return Err(AppError::bad_request("length_penalty requires beam_width"));
+        }
+        return Ok(None);
+    };
+    if stream || has_images || config.tensor_parallel_size != 1 || config.mtp_num_draft_tokens != 0
+    {
+        return Err(AppError::bad_request(
+            "beam search requires non-streaming text, TP=1 and MTP disabled",
+        ));
+    }
+    if temperature.is_some_and(|t| t != 0.0 && t != 1.0)
+        || top_p.is_some_and(|p| p != 1.0)
+        || top_k.is_some_and(|k| k > 0)
+    {
+        return Err(AppError::bad_request(
+            "beam search does not use temperature, top_p or top_k filters",
+        ));
+    }
+    let options = infer_protocol::beam::BeamOptions {
+        width,
+        length_penalty: length_penalty.unwrap_or(1.0),
+    };
+    options
+        .validate(config.max_batch_seqs.min(config.max_batch_tokens))
+        .map_err(AppError::bad_request)?;
+    Ok(Some(options))
+}
+
+#[cfg(test)]
+mod beam_tests {
+    use super::*;
+    #[test]
+    fn beam_validation_rejects_incompatible_modes_and_limits() {
+        let mut config: infer_protocol::RustInferConfig =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        config.max_batch_seqs = 4;
+        let options = beam_options(Some(4), None, false, None, None, None, false, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.width, 4);
+        assert_eq!(options.length_penalty, 1.0);
+        assert!(beam_options(Some(5), None, false, None, None, None, false, &config).is_err());
+        assert!(beam_options(Some(4), None, true, None, None, None, false, &config).is_err());
+        assert!(beam_options(Some(4), None, false, None, None, None, true, &config).is_err());
+        assert!(
+            beam_options(Some(4), Some(-1.0), false, None, None, None, false, &config).is_err()
+        );
+        assert!(beam_options(Some(4), None, false, None, Some(0.9), None, false, &config).is_err());
+        assert!(beam_options(None, Some(1.0), false, None, None, None, false, &config).is_err());
+        config.mtp_num_draft_tokens = 1;
+        assert!(beam_options(Some(4), None, false, None, None, None, false, &config).is_err());
+    }
+}

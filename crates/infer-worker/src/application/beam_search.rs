@@ -39,9 +39,7 @@ pub struct BeamSession<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> {
     config: BeamSearchConfig,
     ids: Tensor<i32, D>,
     logprobs: Tensor<f32, D>,
-    refs: Vec<usize>,
-    free: Vec<u32>,
-    candidates_per_row: usize,
+    slots: Vec<u32>,
     poisoned: bool,
 }
 
@@ -99,9 +97,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> BeamSession<T, D, M> {
             config,
             ids,
             logprobs,
-            refs: vec![0; blocks],
-            free: (0..blocks as u32).rev().collect(),
-            candidates_per_row: k,
+            slots: (0..blocks as u32).collect(),
             poisoned: false,
         })
     }
@@ -126,9 +122,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> BeamSession<T, D, M> {
         for id in 0..self.config.width {
             self.runtime.release_sequence(id as u64);
         }
-        self.refs.fill(0);
-        self.free.clear();
-        self.free.extend((0..self.refs.len() as u32).rev());
+
         match result {
             Err(error) => Err(error),
             Ok(out) => {
@@ -138,82 +132,166 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> BeamSession<T, D, M> {
         }
     }
 
-    fn allocate(&mut self) -> OpResult<u32> {
+    fn generate_inner(&mut self, prompt: &[i32]) -> OpResult<Vec<BeamHypothesis>> {
+        let mut search = BeamSearch::new(
+            prompt.to_vec(),
+            self.config.clone(),
+            self.slots.clone(),
+            vec![],
+        )?;
+        loop {
+            if let Some(result) =
+                search.step(&mut self.runtime, &mut self.ids, &mut self.logprobs)?
+            {
+                return Ok(result);
+            }
+        }
+    }
+}
+
+/// Incremental search on a borrowed runtime. Each call executes at most one
+/// forward, allowing the serving loop to process cancellation and heartbeats.
+/// RadixTree owns prefix sharing and pruning; slots are reserved from the
+/// serving allocator and returned by the caller after stream synchronization.
+pub(crate) struct BeamSearch {
+    config: BeamSearchConfig,
+    prompt: Vec<i32>,
+    stop_sequences: Vec<Vec<i32>>,
+    tree: infer_core::radix_tree::RadixTree,
+    free: Vec<u32>,
+    owners: Vec<u64>,
+    next_owner: u64,
+    live: Vec<BeamHypothesis>,
+    finished: Vec<BeamHypothesis>,
+    candidates: Vec<Vec<(i32, f32)>>,
+    len: usize,
+    generated: usize,
+}
+
+impl BeamSearch {
+    pub(crate) fn new(
+        prompt: Vec<i32>,
+        config: BeamSearchConfig,
+        slots: Vec<u32>,
+        stop_sequences: Vec<Vec<i32>>,
+    ) -> OpResult<Self> {
+        if prompt.is_empty()
+            || config.width == 0
+            || config.max_new_tokens == 0
+            || config.max_step_tokens < config.width
+            || prompt.len().saturating_add(config.max_new_tokens) > config.max_context
+            || slots.len()
+                < prompt
+                    .len()
+                    .saturating_add(config.width.saturating_mul(config.max_new_tokens))
+        {
+            return Err(OpError::Shape("invalid beam search capacity".into()));
+        }
+        let mut tree = infer_core::radix_tree::RadixTree::new();
+        tree.lookup_prefix(&[], 0);
+        Ok(Self {
+            config,
+            prompt,
+            stop_sequences,
+            tree,
+            free: slots,
+            owners: vec![0],
+            next_owner: 1,
+            live: vec![BeamHypothesis {
+                token_ids: vec![],
+                logprob: 0.0,
+                score: 0.0,
+                ended_with_eos: false,
+            }],
+            finished: vec![],
+            candidates: vec![],
+            len: 0,
+            generated: 0,
+        })
+    }
+
+    fn append(&mut self, owner: u64, token: i32) -> OpResult<()> {
         let slot = self
             .free
             .pop()
             .ok_or_else(|| OpError::Shape("beam KV pool exhausted".into()))?;
-        self.refs[slot as usize] = 1;
-        Ok(slot)
+        self.tree.append_token(owner, token, slot);
+        Ok(())
     }
 
-    fn generate_inner(&mut self, prompt: &[i32]) -> OpResult<Vec<BeamHypothesis>> {
-        let mut tables = vec![Vec::with_capacity(self.config.max_context)];
-        let mut candidates = Vec::new();
-        let mut len = 0;
-        for chunk in prompt.chunks(self.config.max_step_tokens) {
-            for _ in chunk {
-                tables[0].push(self.allocate()?);
+    pub(crate) fn step<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>>(
+        &mut self,
+        runtime: &mut Runtime<T, D, M>,
+        ids: &mut Tensor<i32, D>,
+        logprobs: &mut Tensor<f32, D>,
+    ) -> OpResult<Option<Vec<BeamHypothesis>>> {
+        let tokens;
+        if self.len < self.prompt.len() {
+            let end = (self.len + self.config.max_step_tokens).min(self.prompt.len());
+            let chunk = self.prompt[self.len..end].to_vec();
+            for &token in &chunk {
+                self.append(0, token)?;
             }
-            let req = request(&[chunk.to_vec()], &tables, len);
-            candidates = self.runtime.beam_step(
-                &req,
-                self.candidates_per_row,
-                &mut self.ids,
-                &mut self.logprobs,
-            )?;
-            len += chunk.len();
-        }
-        let mut live = vec![BeamHypothesis {
-            token_ids: Vec::new(),
-            logprob: 0.0,
-            score: 0.0,
-            ended_with_eos: false,
-        }];
-        let mut finished = Vec::new();
-        for generated in 1..=self.config.max_new_tokens {
-            let (next, parents) =
-                expand(&live, &candidates, &mut finished, &self.config, generated);
+            tokens = vec![chunk];
+        } else {
+            self.generated += 1;
+            let (next, parents) = expand_with_stops(
+                &self.live,
+                &self.candidates,
+                &mut self.finished,
+                &self.config,
+                self.generated,
+                &self.stop_sequences,
+            );
             if next.is_empty() {
-                break;
+                if self.finished.is_empty() {
+                    return Err(OpError::Shape(
+                        "beam search produced no finite hypotheses".into(),
+                    ));
+                }
+                return Ok(Some(std::mem::take(&mut self.finished)));
             }
-            let mut new_tables = Vec::with_capacity(next.len());
+            let mut owners = Vec::with_capacity(next.len());
             for &parent in &parents {
-                let table = tables[parent].clone();
-                for &slot in &table {
-                    self.refs[slot as usize] += 1;
+                let id = self.next_owner;
+                self.next_owner += 1;
+                if !self.tree.fork_sequence(self.owners[parent], id) {
+                    return Err(OpError::Shape("beam prefix fork failed".into()));
                 }
-                new_tables.push(table);
+                owners.push(id);
             }
-            for table in &tables {
-                for &slot in table {
-                    self.refs[slot as usize] -= 1;
-                    if self.refs[slot as usize] == 0 {
-                        self.free.push(slot);
-                    }
-                }
+            for &owner in &self.owners {
+                self.tree.mark_finished_chain(owner);
             }
-            self.runtime.fork_beams(live.len(), &parents, len as i32)?;
-            for table in &mut new_tables {
-                table.push(self.allocate()?);
-            }
-            tables = new_tables;
-            let tokens: Vec<_> = next
+            self.free.extend(self.tree.evict(usize::MAX));
+            runtime.fork_beams(self.live.len(), &parents, self.len as i32)?;
+            tokens = next
                 .iter()
                 .map(|b| vec![*b.token_ids.last().unwrap()])
-                .collect();
-            let req = request(&tokens, &tables, len);
-            candidates = self.runtime.beam_step(
-                &req,
-                self.candidates_per_row,
-                &mut self.ids,
-                &mut self.logprobs,
-            )?;
-            len += 1;
-            live = next;
+                .collect::<Vec<_>>();
+            for (&owner, token) in owners.iter().zip(&tokens) {
+                self.append(owner, token[0])?;
+            }
+            self.owners = owners;
+            self.live = next;
         }
-        sort_hypotheses(&mut finished, self.config.width);
-        Ok(finished)
+        let mut tables = Vec::with_capacity(self.owners.len());
+        for &owner in &self.owners {
+            let mut table = Vec::with_capacity(self.len + tokens[0].len());
+            if !self.tree.sequence_indices(owner, &mut table) {
+                return Err(OpError::Shape("missing beam prefix".into()));
+            }
+            tables.push(table);
+        }
+        let req = request(&tokens, &tables, self.len);
+        let k = self
+            .config
+            .width
+            .saturating_mul(self.config.eos_ids.len().saturating_add(1))
+            .min(runtime.dims.vocab_size);
+        self.candidates = runtime.beam_step(&req, k, ids, logprobs)?;
+        self.len += tokens[0].len();
+        Ok(None)
     }
 }
 
@@ -252,12 +330,24 @@ fn sort_hypotheses(beams: &mut Vec<BeamHypothesis>, width: usize) {
     beams.truncate(width);
 }
 
+#[cfg(test)]
 fn expand(
     live: &[BeamHypothesis],
     rows: &[Vec<(i32, f32)>],
     finished: &mut Vec<BeamHypothesis>,
     config: &BeamSearchConfig,
     generated: usize,
+) -> (Vec<BeamHypothesis>, Vec<usize>) {
+    expand_with_stops(live, rows, finished, config, generated, &[])
+}
+
+fn expand_with_stops(
+    live: &[BeamHypothesis],
+    rows: &[Vec<(i32, f32)>],
+    finished: &mut Vec<BeamHypothesis>,
+    config: &BeamSearchConfig,
+    generated: usize,
+    stops: &[Vec<i32>],
 ) -> (Vec<BeamHypothesis>, Vec<usize>) {
     let mut expansions = Vec::new();
     for (parent, (beam, row)) in live.iter().zip(rows).enumerate() {
@@ -281,18 +371,21 @@ fn expand(
     let mut parents = Vec::with_capacity(config.width);
     for (parent, token, logprob) in expansions {
         let eos = config.eos_ids.contains(&token);
-        if !eos && generated < config.max_new_tokens && next.len() == config.width {
-            continue;
-        }
         let mut token_ids = live[parent].token_ids.clone();
         token_ids.push(token);
+        let stopped = stops
+            .iter()
+            .any(|stop| !stop.is_empty() && token_ids.ends_with(stop));
+        if !eos && !stopped && generated < config.max_new_tokens && next.len() == config.width {
+            continue;
+        }
         let beam = BeamHypothesis {
             token_ids,
             logprob,
             score: logprob / (generated as f64).powf(config.length_penalty),
             ended_with_eos: eos,
         };
-        if eos || generated == config.max_new_tokens {
+        if eos || stopped || generated == config.max_new_tokens {
             finished.push(beam);
         } else {
             next.push(beam);
@@ -369,6 +462,23 @@ mod tests {
             score: 0.0,
             ended_with_eos: false,
         }]
+    }
+    #[test]
+    fn multi_token_stop_finishes_the_hypothesis() {
+        let mut live = root();
+        live[0].token_ids = vec![5];
+        let mut finished = vec![];
+        let (next, _) = expand_with_stops(
+            &live,
+            &[vec![(6, -0.1), (7, -0.2)]],
+            &mut finished,
+            &config(1),
+            2,
+            &[vec![5, 6]],
+        );
+        assert!(next.is_empty());
+        assert_eq!(finished[0].token_ids, [5, 6]);
+        assert!(!finished[0].ended_with_eos);
     }
     #[test]
     fn width_one_stops_at_greedy_eos() {

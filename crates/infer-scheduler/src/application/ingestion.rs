@@ -244,6 +244,7 @@ mod tests {
 
     fn dummy_llm_request(id: &str, prompt_tokens: usize) -> InferenceRequest {
         InferenceRequest {
+            beam: None,
             multimodal: None,
             request_id: id.to_string(),
             modality: InferenceModality::Llm,

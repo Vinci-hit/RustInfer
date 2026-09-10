@@ -75,7 +75,9 @@ pub async fn run_event_loop(
                 engine.cancel_request_by_external_id(&external_id).await?;
                 engine.maybe_schedule().await?;
             }
-            SchedulerEvent::WorkerLlmStep(_) | SchedulerEvent::WorkerDiffusionStep(_) => {
+            SchedulerEvent::WorkerLlmStep(_)
+            | SchedulerEvent::WorkerDiffusionStep(_)
+            | SchedulerEvent::WorkerBeam(_) => {
                 let _t = std::time::Instant::now();
                 engine.handle_step_output(event).await?;
                 engine.maybe_schedule().await?;

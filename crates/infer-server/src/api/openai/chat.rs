@@ -37,6 +37,16 @@ pub async fn chat_completions(
         req.top_k,
         req.messages.iter().any(InputChatMessage::has_image),
     )?;
+    let beam = shared::beam_options(
+        req.beam_width,
+        req.length_penalty,
+        req.stream,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.messages.iter().any(InputChatMessage::has_image),
+        &state.config,
+    )?;
     let response_model = state.model_info.model_id.clone();
 
     let mut image_permit = if req.messages.iter().any(InputChatMessage::has_image) {
@@ -125,6 +135,7 @@ pub async fn chat_completions(
         "TTFT_TRACE: server tokenized"
     );
     let engine_req = infer_protocol::server_to_scheduler::InferenceRequest {
+        beam,
         multimodal,
         request_id: request_id.clone(),
         modality: infer_protocol::server_to_scheduler::InferenceModality::Llm,
