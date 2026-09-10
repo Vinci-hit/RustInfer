@@ -74,6 +74,15 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
         req: &StepRequest,
         plan: &BatchPlan,
     ) -> OpResult<(StepOutput, BatchPlan)> {
+        self.step_speculative_with_input(req, plan, None)
+    }
+
+    fn step_speculative_with_input(
+        &mut self,
+        req: &StepRequest,
+        plan: &BatchPlan,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<(StepOutput, BatchPlan)> {
         self.validate_eager_transaction(req)?;
         self.prepare_recurrent_verification(req, plan)?;
         let mut retained = self.retained_request.take().unwrap_or_else(|| {
@@ -85,7 +94,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
             }
             self.upload_index(plan, req)?;
             self.prepare_multimodal(req)?;
-            let output = self.step_eager(plan, req)?;
+            let output = self.step_eager_with_input(plan, req, device_input)?;
             if output.materialized_tokens.len() != req.seqs.len()
                 || req
                     .seqs
@@ -114,7 +123,13 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
                     self.prepare_recurrent(&retained, &retained_plan)?;
                 }
                 self.upload_index(&retained_plan, &retained)?;
-                let input = self.input_ids_tensor(&retained, &retained_plan)?;
+                let input = match device_input {
+                    // The direct path is single-sequence, so its retained tape
+                    // is a contiguous prefix. Multi-sequence repacking stays on
+                    // the ordinary host-input path.
+                    Some(input) => input.narrow(0, 0, retained_plan.num_tokens)?,
+                    None => self.input_ids_tensor(&retained, &retained_plan)?,
+                };
                 self.run_layers(&retained_plan, &input)?;
             }
             if let Some(state) = &mut self.recurrent {
@@ -152,8 +167,32 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
         req: &StepRequest,
         normalized_hidden: &mut Tensor<T, D>,
     ) -> OpResult<StepOutput> {
+        self.step_with_hidden_input(req, normalized_hidden, None)
+    }
+
+    /// Internal paired-input path. The serving adapter supplies the host IDs
+    /// and device tape from the same completed proposer call. Keep the tape
+    /// alive and unchanged until this synchronous transaction returns.
+    pub(crate) fn step_with_hidden_input(
+        &mut self,
+        req: &StepRequest,
+        normalized_hidden: &mut Tensor<T, D>,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<StepOutput> {
         let plan = self.build_plan(req)?;
         self.validate_eager_transaction(req)?;
+        if let Some(input) = device_input
+            && (req.seqs.len() != 1
+                || req.draft_tokens.is_empty()
+                || input.shape().as_slice() != [plan.num_tokens]
+                || !input.is_contiguous()
+                || infer_core::device::Device::device_id(input.device())
+                    != infer_core::device::Device::device_id(self.scope.device()))
+        {
+            return Err(OpError::Shape(
+                "invalid speculative device token tape".into(),
+            ));
+        }
         if normalized_hidden.shape().len() != 2
             || normalized_hidden.shape()[0] < plan.num_tokens
             || normalized_hidden.shape()[1] != self.dims.dim
@@ -174,7 +213,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
             })();
             (self.finish_recurrent_step(result)?, plan)
         } else {
-            self.step_speculative(req, &plan)?
+            self.step_speculative_with_input(req, &plan, device_input)?
         };
         let result = (|| {
             let n = retained_plan.num_tokens;

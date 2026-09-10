@@ -106,7 +106,10 @@ impl<T: Dtype, D: LlmBackend> MtpWorkspace<T, D> {
             .upload_from_host(&self.control_host[..=self.pending_offset])
     }
     pub fn prepare_observe(&mut self, ids: &[i32], start: usize) -> OpResult<()> {
-        let n = ids.len();
+        self.prepare_observe_index(ids.len(), start)?;
+        self.input(ids.len())?.upload_from_host(ids)
+    }
+    pub fn prepare_observe_index(&mut self, n: usize, start: usize) -> OpResult<()> {
         self.set_plan(start, n);
         let tiles = self.plan.total_q_tiles as usize;
         self.control_host[..5].copy_from_slice(&[
@@ -127,8 +130,7 @@ impl<T: Dtype, D: LlmBackend> MtpWorkspace<T, D> {
         let used = 7 + n + 2 * tiles;
         self.control
             .narrow(0, 0, used)?
-            .upload_from_host(&self.control_host[..used])?;
-        self.input(n)?.upload_from_host(ids)
+            .upload_from_host(&self.control_host[..used])
     }
     pub fn index(&self, slot: usize, n: usize) -> OpResult<KvIndexTensors<D>> {
         let tiles = n.div_ceil(RAGGED_Q_TILE as usize);
@@ -223,5 +225,29 @@ mod tests {
             ws.hidden(0, 1).unwrap().data_ptr(),
             ws.hidden(1, 1).unwrap().data_ptr()
         );
+    }
+    #[test]
+    fn catchup_index_updates_preserve_device_token_tape() {
+        let mut ws = MtpWorkspace::<f32, _>::new(
+            ModelDims {
+                dim: 4,
+                vocab_size: 8,
+                ..Default::default()
+            },
+            64,
+            8,
+            &Cpu,
+        )
+        .unwrap();
+        let mut tape = ws.input(4).unwrap();
+        tape.upload_from_host(&[3, 4, 5, 6]).unwrap();
+        for n in [1, 4, 2] {
+            ws.prepare_observe_index(n, 7).unwrap();
+            assert_eq!(tape.to_host_vec().unwrap(), [3, 4, 5, 6]);
+            assert_eq!(
+                ws.index(0, n).unwrap().kv_lens.to_host_vec().unwrap(),
+                [(7 + n) as i32]
+            );
+        }
     }
 }

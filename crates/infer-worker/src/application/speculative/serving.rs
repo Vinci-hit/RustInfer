@@ -139,7 +139,9 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             .map_err(|e| OpError::Shape(e.to_string()))?;
         let result = (|| {
             let started = std::time::Instant::now();
-            let drafts = self.proposer.draft(seq.last_token, k, &ctx.runner.scope)?;
+            let (drafts, device_input) =
+                self.proposer
+                    .draft_with_device(seq.last_token, k, &ctx.runner.scope)?;
             let drafted = started.elapsed();
             let req = &mut self.request;
             let staged = &mut req.seqs[0];
@@ -167,16 +169,19 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             req.stop.max_tokens.push(seq.max_tokens as u32);
             req.stop.ignore_eos.clear();
             req.stop.ignore_eos.push(seq.ignore_eos);
-            let mut output = ctx
-                .runner
-                .step_with_hidden_into(req, &mut self.target_hidden)?;
+            let mut output = ctx.runner.step_with_hidden_input(
+                req,
+                &mut self.target_hidden,
+                Some(&device_input),
+            )?;
             let verified = started.elapsed();
             let kept = output.materialized_tokens[0] as usize;
-            self.proposer.observe(
+            self.proposer.observe_with_input(
                 &req.seqs[0].input_ids[..kept],
                 seq.kv_len,
                 &self.target_hidden.narrow(0, 0, kept)?,
                 &ctx.runner.scope,
+                Some(&device_input.narrow(0, 0, kept)?),
             )?;
             if seq.kv_len + kept >= ctx.runner.max_seq_len {
                 output.finished[0] = true;

@@ -69,3 +69,26 @@ CUDA_ARCH=sm_89 cargo test -p infer-backend-cuda --test graph_memory scoped_copy
 旧 worker SHA256：`7f331ff21d0efb8305293bda548462db78fd166fb8bbe361f3823013345fd146`
 
 最终 worker SHA256：`9f50eff9a9f273d18a36f2f284d2590d84e9aed7682cd9295265186b221bfc81`
+
+
+## 后续小优化：复用设备 token 缓冲
+
+基于 `9099b5e`，proposer 将 pending token 与 draft ID 保留在连续的设备缓冲中。Target 验证直接读取该缓冲；拒绝后的单序列重放和 MTP catch-up 读取其保留前缀。省掉验证、重放（发生时）和 catch-up 的重复 token H2D。为拼成连续输入，新增一次 4-byte pending token D2D。
+
+本轮仍在 CPU 上验证接受前缀，draft ID 的 D2H 和现有事务同步仍保留；没有加入 CUDA Graph、GPU 接受判断、跨轮 issue/finalize 或 GDN 前缀状态保存。该内部接口只接收同一次 proposer 输出的 host/device 配对数据，仅用于单序列 MTP。普通、多序列和 prefill 继续走原有接口。
+
+验证：144 项 worker 单测 + 21 项 hybrid 测试通过；CPU Clippy `-D warnings`、格式检查和 CUDA release 构建通过。新增测试覆盖零 draft、不同接受前缀、EOS 截断、错误形状/多序列拒绝，并断言验证与重放不触碰 host token 上传缓冲、catch-up 元数据更新不覆盖设备 token。
+
+同卡新旧二进制各跑 graph / K=1 / K=3，3 个 prompt × 3 次 × 128 token，配置同上。总吞吐如下：
+
+| 模式 | 9099b5e tokens/s | 设备 token 复用 tokens/s | 变化 | 接受数/提议数（旧 → 新） |
+|---|---:|---:|---:|---|
+| graph | 57.90 | 57.69 | -0.37% | — |
+| mtp1 | 68.76 | 68.34 | -0.61% | 528/612 → 527/612 |
+| mtp3 | 63.43 | 63.68 | +0.40% | 717/1248 → 717/1248 |
+
+该轮结果不足以证明稳定的端到端吞吐提升。省掉的 ID 上传非常小，且仍有 CPU 接受判断、状态同步及模型计算；共享桌面 GPU 的波动也会影响结果。不把本次改动宣传为已实现完整 ABC 加速。
+
+新旧版短文本均 3/3 通过；与普通解码的长文本差异、stop-string 检查失败仍存在，基准仍以失败退出。
+
+原始记录：`target/mtp-bench-direct-before/results.json`、`target/mtp-bench-direct-after/results.json`，含配置、响应、日志和二进制 SHA256。

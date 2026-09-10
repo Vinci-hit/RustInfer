@@ -191,22 +191,25 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
                 .draft_tokens
                 .min(available - 1)
                 .min(capacity - 1);
-            let drafts = self
-                .proposer
-                .draft(self.pending.unwrap(), k, &self.target.scope)?;
+            let (drafts, device_input) =
+                self.proposer
+                    .draft_with_device(self.pending.unwrap(), k, &self.target.scope)?;
             let mut ids = Vec::with_capacity(k + 1);
             ids.push(self.pending.unwrap());
             ids.extend_from_slice(&drafts);
             let req = self.request(&ids, vec![drafts]);
-            let output = self
-                .target
-                .step_with_hidden_into(&req, &mut self.target_hidden)?;
+            let output = self.target.step_with_hidden_input(
+                &req,
+                &mut self.target_hidden,
+                Some(&device_input),
+            )?;
             let retained = output.materialized_tokens[0] as usize;
-            self.proposer.observe(
+            self.proposer.observe_with_input(
                 &ids[..retained],
                 self.len,
                 &self.target_hidden.narrow(0, 0, retained)?,
                 &self.target.scope,
+                Some(&device_input.narrow(0, 0, retained)?),
             )?;
             let tokens = output.tokens[0]
                 .iter()

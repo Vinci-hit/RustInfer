@@ -652,6 +652,15 @@ where
         plan: &crate::domain::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
+        self.step_eager_with_input(plan, req, None)
+    }
+
+    fn step_eager_with_input(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<StepOutput> {
         // Eager prefill (num_tokens > batch) routes bf16 GEMMs to the build-free
         // chunked path so each distinct prompt length skips the cuBLASLt cache
         // build (~9-18ms off TTFT). A guard restores the default on any return so
@@ -661,7 +670,10 @@ where
             D::set_prefill_gemm_mode(true);
         }
         let _gemm_guard = PrefillGemmGuard::<D>(prefill_gemm, std::marker::PhantomData);
-        let input_ids = self.input_ids_tensor(req, plan)?;
+        let input_ids = match device_input {
+            Some(input) => input.clone(),
+            None => self.input_ids_tensor(req, plan)?,
+        };
         let _trace = std::env::var_os("RUSTINFER_TTFT_TRACE").is_some();
         let _t0 = std::time::Instant::now();
         self.run_layers(plan, &input_ids)?;
@@ -1492,6 +1504,29 @@ mod tests {
         }
     }
 
+    impl crate::domain::model::DecoderReadout<f32, Cpu> for TinyDecoder {
+        fn normalize_hidden_into(
+            &self,
+            hidden: &Hidden<f32, Cpu>,
+            output: &mut Tensor<f32, Cpu>,
+            _ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<()> {
+            output.copy_from(&hidden.stream)
+        }
+        fn project_logits_into(
+            &self,
+            normalized: &Tensor<f32, Cpu>,
+            output: &mut Tensor<f32, Cpu>,
+            ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<()> {
+            let hidden = Hidden {
+                stream: normalized.clone(),
+                pending: None,
+            };
+            output.copy_from(&self.finalize(&hidden, SampleRows::All, ctx)?.0)
+        }
+    }
+
     fn tok(token_id: i32) -> SampledToken {
         SampledToken {
             token_id,
@@ -1692,6 +1727,80 @@ mod tests {
             assert_eq!(output.finished, vec![false]);
             assert!(runtime.kv_pool.seq_kv_len.is_empty());
         }
+    }
+
+    #[test]
+    fn device_tape_verification_and_replay_skip_host_input_staging() {
+        for draft in [vec![], vec![0, 2], vec![1, 0], vec![1, 2]] {
+            for stop_at_first in [false, true] {
+                let mut direct = tiny_runtime();
+                let mut reference = tiny_runtime();
+                let mut req = verification_request(&[&draft]);
+                if stop_at_first {
+                    req.stop.eos_ids = vec![1];
+                }
+                let tape = Tensor::from_host_slice(&req.seqs[0].input_ids, [draft.len() + 1], &Cpu)
+                    .unwrap();
+                direct.prefill_ids_host.fill(-7);
+                direct
+                    .prefill_ids_buf
+                    .upload_from_host(&vec![-7; direct.prefill_ids_buf.numel()])
+                    .unwrap();
+                let mut hidden = Tensor::zeros([draft.len() + 1, 1], &Cpu).unwrap();
+                let out = direct
+                    .step_with_hidden_input(&req, &mut hidden, Some(&tape))
+                    .unwrap();
+                let expected = reference.step_with_hidden(&req).unwrap();
+                assert_eq!(out.accepted_drafts, expected.output.accepted_drafts);
+                assert_eq!(out.materialized_tokens, expected.output.materialized_tokens);
+                assert_eq!(out.finished, expected.output.finished);
+                assert_eq!(
+                    out.tokens[0].iter().map(|t| t.token_id).collect::<Vec<_>>(),
+                    expected.output.tokens[0]
+                        .iter()
+                        .map(|t| t.token_id)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    hidden
+                        .narrow(0, 0, out.materialized_tokens[0] as usize)
+                        .unwrap()
+                        .to_host_vec()
+                        .unwrap(),
+                    expected.normalized_hidden.to_host_vec().unwrap()
+                );
+                assert!(direct.prefill_ids_host.iter().all(|&x| x == -7));
+                assert!(
+                    direct
+                        .prefill_ids_buf
+                        .to_host_vec()
+                        .unwrap()
+                        .iter()
+                        .all(|&x| x == -7)
+                );
+                assert_eq!(tape.to_host_vec().unwrap(), req.seqs[0].input_ids);
+            }
+        }
+    }
+
+    #[test]
+    fn device_tape_rejects_bad_shape_and_multi_sequence_before_execution() {
+        let mut runtime = tiny_runtime();
+        let mut hidden = Tensor::zeros([8, 1], &Cpu).unwrap();
+        let req = verification_request(&[&[1, 2]]);
+        let short = Tensor::from_host_slice(&[0, 1], [2], &Cpu).unwrap();
+        assert!(
+            runtime
+                .step_with_hidden_input(&req, &mut hidden, Some(&short))
+                .is_err()
+        );
+        let multi = verification_request(&[&[], &[]]);
+        assert!(
+            runtime
+                .step_with_hidden_input(&multi, &mut hidden, Some(&short))
+                .is_err()
+        );
+        assert!(runtime.step_with_hidden(&req).is_ok());
     }
 
     #[test]

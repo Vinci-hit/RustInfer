@@ -92,7 +92,28 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         hidden: &Tensor<T, D>,
         scope: &D::Scope,
     ) -> OpResult<()> {
+        self.observe_with_input(ids, start, hidden, scope, None)
+    }
+
+    /// Continuation catch-up can consume the same tape as target verification.
+    pub(crate) fn observe_with_input(
+        &mut self,
+        ids: &[i32],
+        start: usize,
+        hidden: &Tensor<T, D>,
+        scope: &D::Scope,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<()> {
         self.validate(ids, start, scope)?;
+        if let Some(input) = device_input
+            && (self.alignment.pending().is_none()
+                || input.shape().as_slice() != [ids.len()]
+                || !input.is_contiguous()
+                || infer_core::device::Device::device_id(input.device())
+                    != infer_core::device::Device::device_id(scope.device()))
+        {
+            return Err(OpError::Shape("invalid MTP catch-up device tape".into()));
+        }
         if hidden.shape().as_slice() != [ids.len(), self.head.dims().dim]
             || infer_core::device::Device::device_id(hidden.device())
                 != infer_core::device::Device::device_id(scope.device())
@@ -105,12 +126,24 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         let chunk = self.alignment.prepare_on(ids, positions, hidden, scope)?;
         let result = (|| {
             if !chunk.next_token_ids.is_empty() {
-                self.workspace
-                    .prepare_observe(&chunk.next_token_ids, chunk.positions[0] as usize)?;
+                let input = match device_input {
+                    Some(input) => {
+                        self.workspace.prepare_observe_index(
+                            chunk.next_token_ids.len(),
+                            chunk.positions[0] as usize,
+                        )?;
+                        input.clone()
+                    }
+                    None => {
+                        self.workspace
+                            .prepare_observe(&chunk.next_token_ids, chunk.positions[0] as usize)?;
+                        self.workspace.input(chunk.next_token_ids.len())?
+                    }
+                };
                 run_head(
                     &self.head,
                     &mut self.kv,
-                    &self.workspace.input(chunk.next_token_ids.len())?,
+                    &input,
                     &chunk.target_hidden,
                     &mut self.workspace.hidden(0, chunk.next_token_ids.len())?,
                     &self.workspace.index(0, chunk.next_token_ids.len())?,
@@ -129,6 +162,18 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
     }
 
     pub fn draft(&mut self, pending: i32, count: usize, scope: &D::Scope) -> OpResult<Vec<i32>> {
+        self.draft_with_device(pending, count, scope)
+            .map(|(ids, _)| ids)
+    }
+
+    /// Host verification metadata and its matching device input tape. The tape
+    /// remains valid until the next proposer operation; callers consume it now.
+    pub(crate) fn draft_with_device(
+        &mut self,
+        pending: i32,
+        count: usize,
+        scope: &D::Scope,
+    ) -> OpResult<(Vec<i32>, Tensor<i32, D>)> {
         let (position, hidden) = self
             .alignment
             .pending()
@@ -141,13 +186,17 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         {
             return Err(OpError::Shape("MTP draft exceeds capacity".into()));
         }
-        if count == 0 {
-            return Ok(Vec::new());
-        }
         let mut conditioning = hidden.clone();
         self.workspace
             .prepare_draft(pending, position as usize, count)?;
         let result = (|| {
+            // The head reads pending from the packed control upload. Preserve
+            // it beside the draft outputs for target's contiguous input tape.
+            D::copy_tensor(
+                scope,
+                &self.workspace.token(0)?,
+                &mut self.workspace.input(1)?,
+            )?;
             for i in 0..count {
                 self.workspace.set_decode_position(position as usize + i);
                 let mut next_hidden = self.workspace.hidden(i % 2, 1)?;
@@ -191,7 +240,7 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         {
             return Err(OpError::Shape("invalid MTP argmax output".into()));
         }
-        Ok(draft)
+        Ok((draft, self.workspace.input(count + 1)?))
     }
 
     fn validate(&self, ids: &[i32], start: usize, scope: &D::Scope) -> OpResult<()> {
