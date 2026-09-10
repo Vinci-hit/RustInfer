@@ -60,7 +60,8 @@ struct MockFrontend;
 #[async_trait]
 impl FrontendTransport for MockFrontend {
     async fn recv_event(&mut self) -> Result<FrontendEvent> {
-        Err(crate::error::SchedulerError::Shutdown)
+        // An idle frontend must not race control-plane events with shutdown.
+        std::future::pending().await
     }
 
     async fn send_response(
@@ -769,7 +770,12 @@ async fn control_plane_closure_is_not_hidden_by_idle_readiness_ticks() {
     let (mut engine, _, event_tx, _cmd_rx) = make_engine();
     drop(event_tx);
     let (_decoded_tx, mut decoded_rx) = tokio::sync::mpsc::unbounded_channel();
-    let event = engine.poll_next_event(&mut decoded_rx).await;
+    let event = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        engine.poll_next_event(&mut decoded_rx),
+    )
+    .await
+    .expect("closed control plane must wake the idle scheduler");
     assert!(matches!(event, SchedulerEvent::WorkerShutdown));
 }
 
