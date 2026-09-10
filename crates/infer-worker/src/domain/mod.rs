@@ -15,6 +15,7 @@ pub use infer_core::kv;
 mod kv_tests;
 pub mod model;
 pub mod plan;
+pub mod speculative;
 pub mod tensor_parallel;
 pub use infer_core::ports;
 pub use infer_core::storage;
@@ -37,3 +38,5 @@ pub use storage::Storage;
 pub use tensor::Tensor;
 pub use tensor_parallel::TensorParallelPlacement;
 pub use types::{DataType, Dims, Dtype, MAX_RANK, Shape, Strides};
+
+pub(crate) mod mtp_scratch;

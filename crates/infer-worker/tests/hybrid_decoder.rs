@@ -19,7 +19,8 @@ use infer_worker::domain::forward_scratch::ForwardScratch;
 use infer_worker::domain::gdn_scratch::GdnScratch;
 use infer_worker::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use infer_worker::domain::model::{DecoderModel, ModelDims};
-use infer_worker::domain::plan::{BatchKind, BatchPlan, MaskMode};
+use infer_worker::domain::plan::{BatchKind, BatchPlan, MaskMode, StepOutput, StepRequest};
+use infer_worker::domain::ports::OpResult;
 use infer_worker::domain::tensor::Tensor;
 use infer_worker::infrastructure::cpu::Cpu;
 use infer_worker::models::decoder::Decoder;
@@ -599,6 +600,223 @@ fn hybrid_runtime(capacity: usize) -> Runtime<f32, Cpu, Decoder<f32, Cpu>> {
     .unwrap()
 }
 
+#[test]
+fn hybrid_verification_restores_every_rejected_prefix_and_continues_greedy() {
+    // Sweep K=0 and rejection at every possible draft position, including
+    // full acceptance. Continuation checks both full KV and all recurrent layers.
+    for k in 0..=3 {
+        for accepted in 0..=k {
+            let mut oracle = hybrid_runtime(1);
+            let first = oracle
+                .step(&request(&[(10, 0, 0, &[1, 2, 3])]))
+                .unwrap()
+                .tokens[0][0]
+                .token_id;
+            let mut tape = vec![first];
+            for i in 0..k + 3 {
+                let next = oracle
+                    .step(&request(&[(10, 0, 3 + i, &[tape[i]])]))
+                    .unwrap()
+                    .tokens[0][0]
+                    .token_id;
+                tape.push(next);
+            }
+            let mut actual = hybrid_runtime(1);
+            use infer_worker::application::execution::{ExecutionMetrics, Phase};
+            actual.execution_metrics = ExecutionMetrics::new("test-target", 100);
+            let mut reference = hybrid_runtime(1);
+            let prefill = request(&[(10, 0, 0, &[1, 2, 3])]);
+            actual.step(&prefill).unwrap();
+            reference.step(&prefill).unwrap();
+            let mut inputs = tape[..k + 1].to_vec();
+            if accepted < k {
+                inputs[accepted + 1] = (inputs[accepted + 1] + 1) % VOCAB as i32;
+            }
+            let mut verify = request(&[(10, 0, 3, &inputs)]);
+            verify.draft_tokens = vec![inputs[1..].to_vec()];
+            let result = actual.step_with_hidden(&verify).unwrap();
+            assert_eq!(result.output.accepted_drafts, Some(vec![accepted as u32]));
+            assert_eq!(actual.execution_metrics.snapshot(Phase::Verify).calls, 1);
+            assert_eq!(actual.execution_metrics.snapshot(Phase::Snapshot).calls, 1);
+            assert_eq!(
+                actual.execution_metrics.snapshot(Phase::Restore).calls,
+                u64::from(accepted < k)
+            );
+            assert_eq!(
+                actual.execution_metrics.snapshot(Phase::Replay).tokens,
+                if accepted < k {
+                    (accepted + 1) as u64
+                } else {
+                    0
+                }
+            );
+            assert_eq!(result.output.materialized_tokens, vec![accepted as u32 + 1]);
+            assert_eq!(
+                result.output.tokens[0]
+                    .iter()
+                    .map(|t| t.token_id)
+                    .collect::<Vec<_>>(),
+                tape[1..accepted + 2]
+            );
+            let expected = reference
+                .step_with_hidden(&request(&[(10, 0, 3, &tape[..accepted + 1])]))
+                .unwrap();
+            close(
+                &result.normalized_hidden.to_host_vec().unwrap(),
+                &expected.normalized_hidden.to_host_vec().unwrap(),
+            );
+            let saved = result.normalized_hidden.to_host_vec().unwrap();
+            for (i, &token) in tape.iter().enumerate().skip(accepted + 1).take(2) {
+                let req = request(&[(10, 0, 3 + i, &[token])]);
+                let a = actual.step(&req).unwrap();
+                let b = reference.step(&req).unwrap();
+                assert_runtime_outputs_match(&actual, &reference, &a, &b, 1);
+            }
+            assert_eq!(result.normalized_hidden.to_host_vec().unwrap(), saved);
+        }
+    }
+}
+
+#[test]
+fn hybrid_verification_eos_and_reordered_ragged_requests_commit_only_retained_history() {
+    let mut actual = hybrid_runtime(2);
+    let mut reference = hybrid_runtime(2);
+    let prefill = request(&[(10, 0, 0, &[1, 2]), (20, 1, 0, &[3])]);
+    actual.step(&prefill).unwrap();
+    reference.step(&prefill).unwrap();
+    // The first sequence has K=0; the other has a longer speculative suffix.
+    let mut req = request(&[(20, 1, 1, &[4]), (10, 0, 2, &[5, 6, 7])]);
+    req.draft_tokens = vec![vec![], vec![6, 7]];
+    // Make every possible first output an EOS, testing truncation independently
+    // of this synthetic model's token predictions.
+    req.stop.eos_ids = (0..VOCAB as i32).collect();
+    req.stop.ignore_eos = vec![false, false];
+    let out = actual.step_with_hidden(&req).unwrap();
+    assert_eq!(out.output.materialized_tokens, [1, 1]);
+    assert_eq!(out.output.finished, [true, true]);
+    let retained = request(&[(20, 1, 1, &[4]), (10, 0, 2, &[5])]);
+    let expected = reference.step_with_hidden(&retained).unwrap();
+    close(
+        &out.normalized_hidden.to_host_vec().unwrap(),
+        &expected.normalized_hidden.to_host_vec().unwrap(),
+    );
+    let next = request(&[(10, 0, 3, &[8]), (20, 1, 2, &[9])]);
+    let a = actual.step(&next).unwrap();
+    let b = reference.step(&next).unwrap();
+    assert_runtime_outputs_match(&actual, &reference, &a, &b, 2);
+}
+
+#[test]
+fn failed_recurrent_replay_invalidates_the_request_until_reprefill() {
+    use infer_worker::domain::model::{Logits, SampleRows};
+    use infer_worker::domain::ports::OpError;
+    use std::cell::Cell;
+    struct FailReplay {
+        decoder: Decoder<f32, Cpu>,
+        calls: Cell<usize>,
+        fail_at: Cell<usize>,
+    }
+    impl DecoderModel<f32, Cpu> for FailReplay {
+        fn dims(&self) -> ModelDims {
+            self.decoder.dims()
+        }
+        fn cache_layout(&self) -> &CacheLayout {
+            self.decoder.cache_layout()
+        }
+        fn stages(&self) -> &[infer_worker::domain::component::StageKind] {
+            self.decoder.stages()
+        }
+        fn install_scratch(&mut self, s: std::rc::Rc<ForwardScratch<f32, Cpu>>) {
+            self.decoder.install_scratch(s);
+        }
+        fn install_gdn_scratch(&mut self, s: std::rc::Rc<GdnScratch<f32, Cpu>>) -> OpResult<()> {
+            self.decoder.install_gdn_scratch(s)
+        }
+        fn embed(
+            &self,
+            ids: &Tensor<i32, Cpu>,
+            h: &mut Hidden<f32, Cpu>,
+            ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<()> {
+            self.decoder.embed(ids, h, ctx)
+        }
+        fn decode_layers(
+            &self,
+            range: LayerRange,
+            h: &mut Hidden<f32, Cpu>,
+            cache: &mut ModelCacheView<'_, f32, Cpu>,
+            ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<()> {
+            self.calls.set(self.calls.get() + 1);
+            self.decoder.decode_layers(range, h, cache, ctx)?;
+            if self.calls.get() == self.fail_at.get() {
+                return Err(OpError::Kernel("injected replay failure".into()));
+            }
+            Ok(())
+        }
+        fn finalize(
+            &self,
+            h: &Hidden<f32, Cpu>,
+            rows: SampleRows<'_>,
+            ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<Logits<f32, Cpu>> {
+            self.decoder.finalize(h, rows, ctx)
+        }
+    }
+    let model = FailReplay {
+        decoder: model(false),
+        calls: Cell::new(0),
+        fail_at: Cell::new(3),
+    };
+    let mut runtime = Runtime::new(
+        model,
+        HostScope::new(Cpu),
+        Box::new(GreedySampler),
+        SLOTS * MAX_SEQ,
+        1,
+        MAX_SEQ,
+        MAX_SEQ,
+        32,
+        2,
+        vec![],
+    )
+    .unwrap();
+    let mut reference = hybrid_runtime(2);
+    let prefill = request(&[(10, 0, 0, &[1, 2]), (20, 1, 0, &[3])]);
+    runtime.step(&prefill).unwrap();
+    reference.step(&prefill).unwrap();
+    let mut req = request(&[(10, 0, 2, &[4, 5, 6])]);
+    req.draft_tokens = vec![vec![5, 6]];
+    req.stop.eos_ids = (0..VOCAB as i32).collect();
+    req.stop.ignore_eos = vec![false];
+    assert!(
+        runtime
+            .step(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("injected replay failure")
+    );
+    assert!(runtime.step(&request(&[(10, 0, 3, &[7])])).is_err());
+    let next = request(&[(20, 1, 1, &[8])]);
+    let a = runtime.step(&next).unwrap();
+    let b = reference.step(&next).unwrap();
+    assert_eq!(a.tokens[0][0].token_id, b.tokens[0][0].token_id);
+    close(
+        &runtime.hidden.stream.to_host_vec().unwrap()[..DIM],
+        &reference.hidden.stream.to_host_vec().unwrap()[..DIM],
+    );
+    // Same id can recover from zero after the failed transaction.
+    reference.release_sequence(10);
+    let replay = request(&[(10, 0, 0, &[1, 2, 4])]);
+    let a = runtime.step(&replay).unwrap();
+    let b = reference.step(&replay).unwrap();
+    assert_eq!(a.tokens[0][0].token_id, b.tokens[0][0].token_id);
+    close(
+        &runtime.hidden.stream.to_host_vec().unwrap()[..3 * DIM],
+        &reference.hidden.stream.to_host_vec().unwrap()[..3 * DIM],
+    );
+}
+
 fn request(seqs: &[(u64, usize, usize, &[i32])]) -> infer_worker::domain::plan::StepRequest {
     use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
     StepRequest {
@@ -624,6 +842,132 @@ fn request(seqs: &[(u64, usize, usize, &[i32])]) -> infer_worker::domain::plan::
         },
         draft_tokens: vec![],
     }
+}
+
+fn assert_runtime_outputs_match(
+    actual: &Runtime<f32, Cpu, Decoder<f32, Cpu>>,
+    expected: &Runtime<f32, Cpu, Decoder<f32, Cpu>>,
+    actual_out: &StepOutput,
+    expected_out: &StepOutput,
+    input_rows: usize,
+) {
+    let token_ids = |out: &StepOutput| {
+        out.tokens
+            .iter()
+            .map(|row| row.iter().map(|token| token.token_id).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(token_ids(actual_out), token_ids(expected_out));
+    assert_eq!(actual_out.finished, expected_out.finished);
+    close(
+        &actual.hidden.stream.to_host_vec().unwrap()[..input_rows * DIM],
+        &expected.hidden.stream.to_host_vec().unwrap()[..input_rows * DIM],
+    );
+    let rows = actual_out.tokens.len();
+    close(
+        &actual
+            .model
+            .scratch
+            .as_ref()
+            .unwrap()
+            .logits(rows)
+            .to_host_vec()
+            .unwrap(),
+        &expected
+            .model
+            .scratch
+            .as_ref()
+            .unwrap()
+            .logits(rows)
+            .to_host_vec()
+            .unwrap(),
+    );
+}
+
+fn assert_finalize_failure_invalidates_history(
+    new_tokens: &[i32],
+    fail: impl FnOnce(&mut Runtime<f32, Cpu, Decoder<f32, Cpu>>, &StepRequest) -> OpResult<()>,
+) {
+    let mut runtime = hybrid_runtime(2);
+    let mut reference = hybrid_runtime(2);
+    let prefill = request(&[(10, 0, 0, &[1, 2])]);
+    runtime.step(&prefill).unwrap();
+    reference.step(&prefill).unwrap();
+    let failed = request(&[(10, 0, 2, &[3]), (20, 1, 0, new_tokens)]);
+    reference.step(&failed).unwrap();
+
+    // Both the existing request and a newly assigned slot reach all decoder
+    // layers before the lm_head's incompatible input width rejects finalize.
+    let original = std::mem::replace(&mut runtime.model.lm_head.proj, linear(VOCAB, DIM + 1, 1.0));
+    assert!(fail(&mut runtime, &failed).is_err());
+    close(
+        &runtime.hidden.stream.to_host_vec().unwrap()[..(1 + new_tokens.len()) * DIM],
+        &reference.hidden.stream.to_host_vec().unwrap()[..(1 + new_tokens.len()) * DIM],
+    );
+    runtime.model.lm_head.proj = original;
+
+    // Neither the pre-step nor the would-be committed position can continue:
+    // kernels already changed persistent state, so the whole history is invalid.
+    for (id, slot, position) in [(10, 0, 2), (10, 0, 3), (20, 1, new_tokens.len())] {
+        let error = runtime
+            .step(&request(&[(id, slot, position, &[6])]))
+            .unwrap_err();
+        assert!(error.to_string().contains("recurrent history"), "{error}");
+    }
+
+    let mut fresh = hybrid_runtime(2);
+    for (req, rows) in [
+        (request(&[(20, 1, 0, &[7, 8]), (10, 0, 0, &[9])]), 3),
+        (request(&[(10, 0, 1, &[10]), (20, 1, 2, &[11])]), 2),
+    ] {
+        let actual = runtime.step(&req).unwrap();
+        let expected = fresh.step(&req).unwrap();
+        assert_runtime_outputs_match(&runtime, &fresh, &actual, &expected, rows);
+    }
+}
+
+#[test]
+fn runtime_hybrid_finalize_failure_invalidates_and_rebuilds_history() {
+    assert_finalize_failure_invalidates_history(&[4, 5], |runtime, req| {
+        runtime.step(req).map(|_| ())
+    });
+}
+
+#[test]
+fn runtime_hybrid_fused_finalize_failure_invalidates_and_rebuilds_history() {
+    assert_finalize_failure_invalidates_history(&[4, 5], |runtime, req| {
+        runtime.step_fused_eager(req).map(|_| ())
+    });
+}
+
+#[test]
+fn runtime_hybrid_mixed_issue_failure_invalidates_and_rebuilds_history() {
+    use infer_worker::application::runtime::RaggedRowKind;
+    assert_finalize_failure_invalidates_history(&[4, 5], |runtime, req| {
+        runtime
+            .issue_fused_abc(
+                req,
+                &[RaggedRowKind::Decode, RaggedRowKind::PrefillFinal],
+                None,
+            )
+            .map(|_| ())
+    });
+}
+
+#[test]
+fn runtime_hybrid_decode_issue_failure_invalidates_and_rebuilds_history() {
+    assert_finalize_failure_invalidates_history(&[4], |runtime, req| {
+        runtime.issue_decode_abc(
+            req,
+            0,
+            &[0, 0],
+            &[100, 100],
+            &[true, true],
+            &[],
+            None,
+            false,
+        )
+    });
 }
 
 #[test]
@@ -768,11 +1112,115 @@ fn runtime_hybrid_mixed_and_abc_use_the_same_request_history() {
         &runtime.hidden.stream.to_host_vec().unwrap()[..2 * DIM],
         &ordinary.hidden.stream.to_host_vec().unwrap()[..2 * DIM],
     );
-    let mut spec = request(&[(10, 0, 3, &[6])]);
-    spec.draft_tokens = vec![vec![6]];
-    assert!(runtime.step(&spec).is_err());
+    let mut spec = request(&[(10, 0, 3, &[6, 7])]);
+    // Stochastic verification remains unsupported and must fail before mutation.
+    spec.draft_tokens = vec![vec![7]];
+    spec.sampling[0].temperature = 1.0;
+    let error = runtime.step(&spec).unwrap_err();
+    assert!(error.to_string().contains("stochastic"), "{error}");
+    spec.sampling[0].temperature = 0.0;
     spec.draft_tokens.clear();
-    runtime.step(&spec).unwrap();
+    let actual = runtime.step(&spec).unwrap();
+    let expected = ordinary.step(&spec).unwrap();
+    assert_runtime_outputs_match(&runtime, &ordinary, &actual, &expected, 2);
+}
+
+#[test]
+fn runtime_hybrid_overlapped_decode_and_mixed_keep_committed_history() {
+    use infer_worker::application::runtime::RaggedRowKind;
+    let mut runtime = hybrid_runtime(2);
+    let mut ordinary = hybrid_runtime(2);
+    assert!(runtime.mixed_eager_mode());
+    let prefill = request(&[(10, 0, 0, &[1, 2])]);
+    runtime.step(&prefill).unwrap();
+    ordinary.step(&prefill).unwrap();
+
+    let decode = request(&[(10, 0, 2, &[3])]);
+    let expected_decode = ordinary.step(&decode).unwrap();
+    let next_token = expected_decode.tokens[0][0].token_id;
+    runtime
+        .issue_decode_abc(&decode, 0, &[0], &[100], &[true], &[], None, false)
+        .unwrap();
+
+    let mut verify = request(&[(10, 0, 3, &[next_token])]);
+    verify.draft_tokens = vec![vec![]];
+    assert!(
+        runtime
+            .step(&verify)
+            .unwrap_err()
+            .to_string()
+            .contains("in-flight")
+    );
+
+    let kinds = [RaggedRowKind::Decode, RaggedRowKind::PrefillFinal];
+    let mixed = request(&[(10, 0, 3, &[next_token]), (20, 1, 0, &[4, 5])]);
+    let expected_mixed = ordinary.step(&mixed).unwrap();
+    let mut placeholders = mixed.clone();
+    placeholders.seqs[0].input_ids[0] = (next_token + 1) % VOCAB as i32;
+    // The earlier decode still owns the host mirrors. Its GPU argmax feeds the
+    // mixed tape, while recurrent history must already expose its issued prefix.
+    let ticket = runtime
+        .issue_fused_abc_overlapped(&placeholders, &kinds, None, 1)
+        .unwrap();
+    let decoded = runtime.finalize_decode_abc(1).unwrap();
+    assert_eq!(decoded.active.len(), 1);
+    assert!(decoded.finished.is_empty());
+    assert_eq!(decoded.active[0].src_row, 0);
+    assert_eq!(decoded.active[0].token_id, next_token);
+    let actual_mixed = runtime
+        .finalize_fused_abc(ticket, &placeholders, &kinds)
+        .unwrap();
+    assert_runtime_outputs_match(&runtime, &ordinary, &actual_mixed, &expected_mixed, 3);
+
+    // Finalizing the earlier ticket must not reset the later step's length or
+    // discard a request admitted by that later step; reorder both on continuation.
+    let continuation = request(&[(20, 1, 2, &[7]), (10, 0, 4, &[8])]);
+    let actual = runtime.step(&continuation).unwrap();
+    let expected = ordinary.step(&continuation).unwrap();
+    assert_runtime_outputs_match(&runtime, &ordinary, &actual, &expected, 2);
+}
+
+#[test]
+fn runtime_hybrid_decode_collection_failure_invalidates_only_its_owners() {
+    use infer_worker::application::runtime::RaggedRowKind;
+    let mut runtime = hybrid_runtime(2);
+    let mut ordinary = hybrid_runtime(2);
+    let prefill = request(&[(10, 0, 0, &[1, 2])]);
+    runtime.step(&prefill).unwrap();
+    ordinary.step(&prefill).unwrap();
+    let decode = request(&[(10, 0, 2, &[3])]);
+    let next_token = ordinary.step(&decode).unwrap().tokens[0][0].token_id;
+    runtime
+        .issue_decode_abc(&decode, 0, &[0], &[100], &[true], &[], None, false)
+        .unwrap();
+
+    let kinds = [RaggedRowKind::Decode, RaggedRowKind::PrefillFinal];
+    let mixed = request(&[(10, 0, 3, &[next_token]), (20, 1, 0, &[4, 5])]);
+    ordinary.step(&mixed).unwrap();
+    let ticket = runtime
+        .issue_fused_abc_overlapped(&mixed, &kinds, None, 1)
+        .unwrap();
+    // A late collection error belongs to the earlier decode's owner set,
+    // even though another issue has since advanced shared/new histories.
+    let error = runtime.finalize_decode_abc(0).unwrap_err();
+    assert!(
+        error.to_string().contains("compact counts invalid"),
+        "{error}"
+    );
+    runtime.finalize_fused_abc(ticket, &mixed, &kinds).unwrap();
+    let error = runtime.step(&request(&[(10, 0, 4, &[6])])).unwrap_err();
+    assert!(error.to_string().contains("recurrent history"), "{error}");
+
+    let continuation = request(&[(20, 1, 2, &[7])]);
+    let actual = runtime.step(&continuation).unwrap();
+    let expected = ordinary.step(&continuation).unwrap();
+    assert_runtime_outputs_match(&runtime, &ordinary, &actual, &expected, 1);
+
+    let mut fresh = hybrid_runtime(1);
+    let rebuild = request(&[(10, 0, 0, &[8, 9])]);
+    let actual = runtime.step(&rebuild).unwrap();
+    let expected = fresh.step(&rebuild).unwrap();
+    assert_runtime_outputs_match(&runtime, &fresh, &actual, &expected, 2);
 }
 
 /// Independent scalar oracle: per-head Q/gate packing, partial rotation,

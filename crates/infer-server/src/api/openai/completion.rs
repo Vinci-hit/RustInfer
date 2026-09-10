@@ -26,6 +26,13 @@ pub async fn completions(
 ) -> Result<Response, AppError> {
     // 1. 校验
     validate_request(&req, state.tokenizer.get_vocab_size(true))?;
+    shared::validate_mtp_request(
+        state.config.mtp_num_draft_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        false,
+    )?;
     let response_model = state.model_info.model_id.clone();
 
     // 2. 获取 input_ids（直接 tokenize prompt，不经过 chat template）

@@ -189,6 +189,11 @@ pub struct RustInferConfig {
     #[serde(default = "default_capture_sizes")]
     pub capture_sizes: Vec<usize>,
 
+    /// Qwen3.5 text MTP serving. Zero disables speculation. The first serving
+    /// implementation requires TP1, one active sequence, and no prefix caching.
+    #[serde(default)]
+    pub mtp_num_draft_tokens: usize,
+
     /// CUDA scratch-memory plan. Read only from this shared launch config.
     #[serde(default)]
     pub cuda_memory: CudaMemoryConfig,
@@ -299,6 +304,14 @@ impl RustInferConfig {
         }
         if self.max_batch_seqs == 0 {
             return Err("`max_batch_seqs` must be > 0".into());
+        }
+        if self.mtp_num_draft_tokens > 0
+            && (self.tensor_parallel_size != 1
+                || self.max_batch_seqs != 1
+                || self.enable_prefix_caching
+                || self.mtp_num_draft_tokens >= self.max_batch_tokens)
+        {
+            return Err("MTP requires tensor_parallel_size=1, max_batch_seqs=1, enable_prefix_caching=false, and draft tokens < max_batch_tokens".into());
         }
         if self.paged_block_size == 0 {
             return Err("`paged_block_size` must be > 0".into());
@@ -539,6 +552,22 @@ mod model_type_tests {
 #[cfg(test)]
 mod launch_config_tests {
     use super::RustInferConfig;
+
+    #[test]
+    fn mtp_is_opt_in_and_rejects_incompatible_serving_limits() {
+        let mut cfg: RustInferConfig = toml::from_str("model='/tmp/model'").unwrap();
+        assert_eq!(cfg.mtp_num_draft_tokens, 0);
+        cfg.mtp_num_draft_tokens = 3;
+        assert!(cfg.validate().is_err());
+        cfg.max_batch_seqs = 1;
+        cfg.enable_prefix_caching = false;
+        cfg.validate().unwrap();
+        cfg.tensor_parallel_size = 2;
+        assert!(cfg.validate().is_err());
+        cfg.tensor_parallel_size = 1;
+        cfg.max_batch_tokens = 3;
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn tensor_parallel_size_defaults_to_one_and_accepts_explicit_value() {

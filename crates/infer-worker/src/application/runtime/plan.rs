@@ -59,7 +59,15 @@ where
                     self.max_blocks_per_seq
                 )));
             }
-            total_tokens += seq.input_ids.len();
+            total_tokens = total_tokens
+                .checked_add(seq.input_ids.len())
+                .ok_or_else(|| OpError::Shape("Runtime::step: token count overflow".into()))?;
+            if total_tokens > self.cap_num_tokens || seq.input_ids.len() > i32::MAX as usize {
+                return Err(OpError::Shape(format!(
+                    "Runtime::step: token count {total_tokens} exceeds capacity {}",
+                    self.cap_num_tokens
+                )));
+            }
             q_lens.push(seq.input_ids.len() as i32);
             if seq.kv_write_start < 0 || seq.kv_len_after < 0 {
                 return Err(OpError::Shape(format!(
@@ -93,6 +101,12 @@ where
                     seq.input_ids.len()
                 )));
             }
+            if expected_after as usize > self.max_seq_len {
+                return Err(OpError::Shape(format!(
+                    "Runtime::step: seq[{i}] context length {expected_after} exceeds max {}",
+                    self.max_seq_len
+                )));
+            }
             kv_lens.push(expected_after as i32);
             seq_positions.push(start as i32);
             if seq.input_ids.len() == 1
@@ -124,15 +138,37 @@ where
                 )));
             }
             for (i, (draft, seq)) in req.draft_tokens.iter().zip(req.seqs.iter()).enumerate() {
-                if draft.len() != seq.input_ids.len() {
+                if draft.len().checked_add(1) != Some(seq.input_ids.len()) {
                     return Err(OpError::Shape(format!(
-                        "Runtime::step: seq[{}] draft_tokens {} != input_ids {}",
+                        "Runtime::step: seq[{}] requires K+1 inputs for {} drafts, got {}",
                         i,
                         draft.len(),
                         seq.input_ids.len()
                     )));
                 }
+                if seq.input_ids[1..] != draft[..] {
+                    return Err(OpError::Shape(format!(
+                        "Runtime::step: seq[{i}] verification input suffix differs from drafts"
+                    )));
+                }
+                if seq
+                    .input_ids
+                    .iter()
+                    .any(|&id| id < 0 || id as usize >= self.dims.vocab_size)
+                {
+                    return Err(OpError::Shape(format!(
+                        "Runtime::step: seq[{i}] verification token outside vocabulary"
+                    )));
+                }
+                let generated = req.stop.generated_counts.get(i).copied().unwrap_or(0);
+                let max = req.stop.max_tokens.get(i).copied().unwrap_or(u32::MAX);
+                if seq.input_ids.len() > max.saturating_sub(generated) as usize {
+                    return Err(OpError::Shape(format!(
+                        "Runtime::step: seq[{i}] verification width exceeds remaining output budget"
+                    )));
+                }
             }
+            crate::application::speculative::validate_sampling(&req.sampling, batch)?;
         }
 
         // `total_q_tiles` is the only thing the plan needs from the ragged-tile

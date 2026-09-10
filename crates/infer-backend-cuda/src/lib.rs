@@ -9,6 +9,7 @@ pub mod error;
 pub mod ffi;
 mod nccl;
 mod pool;
+mod timing;
 // Raw kernel launch wrappers are an implementation detail. Keeping this module
 // private prevents external callers from manufacturing invalid CUDA streams or
 // device pointers; the safe backend traits below are the supported API.
@@ -126,6 +127,10 @@ impl infer_core::exec::ExecScope for CudaScope {
 
     fn workspace(&self) -> &infer_core::exec::Workspace<Self::Device> {
         &self.workspace
+    }
+
+    fn create_timer(&self) -> OpResult<Option<Box<dyn infer_core::exec::ScopeTimer>>> {
+        Ok(Some(Box::new(timing::CudaTimer::new(self.device.clone())?)))
     }
 
     fn supports_graphs(&self) -> bool {
@@ -255,6 +260,36 @@ pub(crate) fn require_scope_tensor<T: Dtype>(
 }
 
 impl infer_core::ports::MathOps for Cuda {
+    fn copy_tensor<T: Dtype>(
+        scope: &Self::Scope,
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        if src.shape() != dst.shape()
+            || !src.is_contiguous()
+            || !dst.is_contiguous()
+            || src.device().device_id != scope.device.device_id
+            || dst.device().device_id != scope.device.device_id
+        {
+            return Err(OpError::Shape(
+                "copy_tensor shape/layout/device mismatch".into(),
+            ));
+        }
+        let bytes = src.numel() * T::SIZE_BYTES;
+        let s = src.data_ptr() as usize;
+        let d = dst.data_ptr() as usize;
+        if bytes == 0 || s == d {
+            return Ok(());
+        }
+        if s < d + bytes && d < s + bytes {
+            return Err(OpError::Shape(
+                "copy_tensor requires disjoint storage".into(),
+            ));
+        }
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::cast_dtype::cast_dtype(scope_stream(scope), src, dst)
+    }
+
     fn add<T: Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         a: &Tensor<T, Self>,
@@ -593,6 +628,19 @@ impl infer_core::ports::MathOps for Cuda {
                 dst_cols as i32,
             )
         })
+    }
+
+    fn concat_cols<T: Dtype>(
+        scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        require_scope_tensor(scope, a, "concat_cols a")?;
+        require_scope_tensor(scope, b, "concat_cols b")?;
+        require_scope_tensor(scope, dst, "concat_cols dst")?;
+        kernels::concat_seq::concat_cols_into(scope_stream(scope), a, b, dst)
     }
 
     fn concat_seq<T: Dtype>(
@@ -1646,6 +1694,13 @@ impl CoreOps for Cuda {
                 dst_cols as i32,
             )
         })
+    }
+    fn concat_cols<T: Dtype>(
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        kernels::concat_seq::concat_cols_into(a.device().config.stream, a, b, dst)
     }
     fn concat_seq<T: Dtype>(
         a: &Tensor<T, Self>,

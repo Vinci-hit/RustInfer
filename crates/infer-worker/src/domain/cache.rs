@@ -11,6 +11,9 @@ use super::ports::backend::LlmBackend;
 use super::ports::{OpError, OpResult};
 use super::tensor::Tensor;
 
+mod snapshot;
+pub use snapshot::LinearSnapshot;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinearDims {
     pub num_key_heads: usize,
@@ -232,10 +235,18 @@ impl<D: LlmBackend> LinearBatch<D> {
     }
 
     pub fn validate_plan(&self, plan: &BatchPlan) -> OpResult<()> {
-        if matches!(plan.kind, BatchKind::Spec { .. }) {
+        if matches!(plan.kind, BatchKind::Spec { .. })
+            && !matches!(
+                plan.kind,
+                BatchKind::Spec {
+                    mask: super::plan::MaskMode::Causal,
+                    mask_handle: None,
+                }
+            )
+        {
             return Err(OpError::unsupported(
                 "linear attention",
-                "speculative execution",
+                "non-causal speculative execution",
             ));
         }
         if plan.batch != self.q_lens.len()

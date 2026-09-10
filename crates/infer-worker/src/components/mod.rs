@@ -12,6 +12,7 @@ pub mod moe_experts;
 pub mod moe_local;
 pub mod moe_permute;
 pub mod moe_router;
+pub mod mtp;
 pub mod norm;
 
 pub use attention::Attention;

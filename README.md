@@ -301,6 +301,7 @@ Config is a single TOML shared by all three processes. Key fields:
 | `mem_fraction_static`   | Fraction of GPU memory reserved for weights + static buffers. |
 | `num_blocks`            | KV-cache blocks (`0` = auto-size from a memory profile). |
 | `capture_sizes`         | Batch sizes to capture CUDA graphs for, e.g. `[1,2,4,8,16,24,32]`. |
+| `mtp_num_draft_tokens`  | Opt-in Qwen3.5 text MTP; `0` disables it. Requires greedy sampling, TP1, `max_batch_seqs=1`, and prefix caching disabled. Verification runs eager. |
 | `ignore_eos`            | Ignore EOS (useful for fixed-length benchmarking). |
 
 ### Tensor parallelism

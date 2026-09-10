@@ -4,13 +4,17 @@
 pub mod decode_common;
 #[cfg(feature = "cuda")]
 pub mod decode_engine;
+pub mod execution;
 pub mod hosting;
 #[cfg(feature = "cuda")]
 pub mod kv_relief;
 pub mod runtime;
 pub mod sampler_stack;
 #[cfg(feature = "cuda")]
+pub mod serve_execution;
+#[cfg(feature = "cuda")]
 pub mod serve_loop;
+pub mod speculative;
 #[cfg(feature = "cuda")]
 pub mod tensor_parallel;
 pub mod tuning;

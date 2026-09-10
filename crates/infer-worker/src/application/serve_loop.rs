@@ -193,7 +193,42 @@ pub fn run_with_model<M>(
 where
     M: DecoderModel<bf16, Cuda> + 'static,
 {
+    run_with_model_and_execution(
+        control,
+        data,
+        model,
+        bs,
+        follower_factories,
+        eos_ids,
+        profile_cuda_steps,
+        crate::application::serve_execution::OrdinaryExecution,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_model_and_execution<M, E>(
+    control: &ControlPump,
+    data: &DataPump,
+    model: M,
+    bs: Bootstrap<'_>,
+    follower_factories: Vec<RuntimeFollowerFactory<M>>,
+    eos_ids: &[i32],
+    profile_cuda_steps: Option<u32>,
+    mut execution: E,
+) -> Result<(), String>
+where
+    M: DecoderModel<bf16, Cuda> + 'static,
+    E: crate::application::serve_execution::ServingExecution<M>,
+{
     let _ = bs.load_cfg;
+    if E::SPECULATIVE
+        && (bs.load.max_batch_seqs != 1
+            || bs.load.tp_size != 1
+            || bs.load.enable_prefix_caching
+            || profile_cuda_steps.is_some())
+    {
+        return Err("MTP serving requires one TP1 request, prefix caching disabled, and no ordinary decode profiler override".into());
+    }
     if bs.block_size != 1 {
         return Err(format!(
             "worker-owned KV allocator requires block_size=1, got {}",
@@ -379,6 +414,14 @@ where
         bs.capture_sizes.clone(),
     )
     .map_err(|e| format!("Runtime::new: {:?}", e))?;
+    if E::SPECULATIVE {
+        runner
+            .prepare_speculative()
+            .map_err(|e| format!("MTP workspace: {e}"))?;
+    }
+    execution
+        .prepare(&runner)
+        .map_err(|e| format!("execution preparation: {e}"))?;
     if !peer_handles.is_empty() {
         let watchdog = peer_watchdog
             .take()
@@ -818,7 +861,25 @@ where
         } else {
             1usize
         };
-        if !pending_prefills.is_empty() {
+        if E::SPECULATIVE {
+            let result = execution.step(crate::application::serve_execution::ServingStep {
+                runner: &mut runner,
+                active: &mut active,
+                prefilling: &mut prefilling,
+                allocator: &mut kv_allocator,
+                control,
+                data,
+                eos_ids,
+                prefills: &mut pending_prefills,
+            });
+            deferred_prefills.append(&mut pending_prefills);
+            if let Err(error) = result {
+                if error.is_fatal() {
+                    escalate_fatal_and_exit(control, &active, &prefilling, &error);
+                }
+                return Err(format!("speculative serving: {error}"));
+            }
+        } else if !pending_prefills.is_empty() {
             if trace_steps {
                 for cmd in &pending_prefills {
                     tr_pf_seqs += cmd.segments.len();

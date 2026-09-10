@@ -66,6 +66,11 @@ log_level = "info"
 # deployment GPU after validating its memory headroom.
 capture_sizes = [1, 2, 4, 8, 16, 24, 32]
 
+# Optional Qwen3.5 text MTP (0 = disabled). Enabling requires
+# max_batch_seqs = 1, tensor_parallel_size = 1, and prefix caching disabled.
+# Requests must use greedy sampling. MTP currently runs eager.
+mtp_num_draft_tokens = 0
+
 # CUDA scratch memory (MiB). The graph arena is allocated lazily on first use;
 # the recycling-pool value is a retention ceiling, not an eager allocation.
 [cuda_memory]

@@ -31,5 +31,5 @@ pub use op_ports::{CoreOps, DiffusionOps, OpBackend};
 pub use pipeline_ops::{
     CompactExtendControlArgs, DecodePipelineOps, MergeCompactDecodeArgs, MergeCompactMixedArgs,
 };
-pub use sampler::{AcceptReject, SampleBatch, SampledToken, Sampler, SamplingParams};
+pub use sampler::{SampleBatch, SampledToken, Sampler, SamplingParams};
 pub use vocab_ops::VocabOps;

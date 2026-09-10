@@ -133,3 +133,23 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         self.finalize(hidden, rows, ctx)
     }
 }
+
+/// Optional target-model readout used by hidden-conditioned draft heads.
+/// Outputs belong to the caller and must not alias model forward scratch.
+/// Implementations use static dispatch; ordinary decoders need not expose it.
+pub trait DecoderReadout<T: V2Dtype, D: LlmBackend>: DecoderModel<T, D> {
+    /// Apply the final model norm to a fully materialized residual stream.
+    fn normalize_hidden_into(
+        &self,
+        hidden: &Hidden<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &crate::domain::exec::StepCtx<'_, D>,
+    ) -> OpResult<()>;
+    /// Project already normalized hidden states through the shared LM head.
+    fn project_logits_into(
+        &self,
+        normalized: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &crate::domain::exec::StepCtx<'_, D>,
+    ) -> OpResult<()>;
+}

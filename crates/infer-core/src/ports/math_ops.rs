@@ -11,6 +11,16 @@ use infer_core::tensor::Tensor;
 use infer_core::types::{Shape, Strides};
 
 pub trait MathOps: Device {
+    /// Stream-ordered copy between disjoint, contiguous tensors. As with other
+    /// operators, callers keep both storages alive until execution completes.
+    fn copy_tensor<T: Dtype>(
+        _scope: &Self::Scope,
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        dst.copy_from(src)
+    }
+
     fn alloc_tensor<T: Dtype>(shape: Shape, device: &Self) -> OpResult<Tensor<T, Self>> {
         Tensor::<T, Self>::zeros(shape, device)
     }
@@ -157,6 +167,14 @@ pub trait MathOps: Device {
         total_cols: usize,
         col_offset: usize,
         dst_cols: usize,
+    ) -> OpResult<()>;
+
+    /// Concatenate contiguous matrices by columns into disjoint output storage.
+    fn concat_cols<T: Dtype>(
+        scope: &Self::Scope,
+        a: &Tensor<T, Self>,
+        b: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
     ) -> OpResult<()>;
 
     fn concat_seq<T: Dtype>(
@@ -447,6 +465,16 @@ macro_rules! impl_math_ops_via_core_ops {
             ) -> $crate::ports::OpResult<()> {
                 let _guard = infer_core::exec::ExecScope::enter(scope);
                 <Self as $crate::ports::CoreOps>::concat_seq(a, b, dst)
+            }
+
+            fn concat_cols<T: infer_core::dtype::Dtype>(
+                scope: &<Self as infer_core::exec::ExecDevice>::Scope,
+                a: &infer_core::tensor::Tensor<T, Self>,
+                b: &infer_core::tensor::Tensor<T, Self>,
+                dst: &mut infer_core::tensor::Tensor<T, Self>,
+            ) -> $crate::ports::OpResult<()> {
+                let _guard = infer_core::exec::ExecScope::enter(scope);
+                <Self as $crate::ports::CoreOps>::concat_cols(a, b, dst)
             }
 
             fn cast<S: infer_core::dtype::Dtype, T: infer_core::dtype::Dtype>(

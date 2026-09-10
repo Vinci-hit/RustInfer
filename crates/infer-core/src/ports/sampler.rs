@@ -51,12 +51,6 @@ pub struct SampleBatch {
     pub tokens: Vec<SampledToken>,
 }
 
-#[derive(Debug, Clone)]
-pub struct AcceptReject {
-    pub accepted_count: Vec<u32>,
-    pub bonus_token: Vec<SampledToken>,
-}
-
 pub trait Sampler<T: Dtype, D: LlmBackend>: Send + Sync {
     fn sample(
         &self,
@@ -68,35 +62,6 @@ pub trait Sampler<T: Dtype, D: LlmBackend>: Send + Sync {
         Err(OpError::unsupported(
             logits.device().name(),
             "sampler.sample",
-        ))
-    }
-
-    fn probs(
-        &self,
-        logits: &Tensor<T, D>,
-        params: &[SamplingParams],
-        out: &mut Tensor<f32, D>,
-        ctx: &StepCtx<'_, D>,
-    ) -> OpResult<()> {
-        let _ = (params, out, ctx);
-        Err(OpError::unsupported(
-            logits.device().name(),
-            "sampler.probs",
-        ))
-    }
-
-    fn verify(
-        &self,
-        target_logits: &Tensor<T, D>,
-        draft_tokens: &[i32],
-        draft_probs: &Tensor<f32, D>,
-        params: &[SamplingParams],
-        ctx: &StepCtx<'_, D>,
-    ) -> OpResult<AcceptReject> {
-        let _ = (draft_tokens, draft_probs, params, ctx);
-        Err(OpError::unsupported(
-            target_logits.device().name(),
-            "sampler.verify",
         ))
     }
 }

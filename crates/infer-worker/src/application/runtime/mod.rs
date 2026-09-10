@@ -9,6 +9,9 @@
 //! This file keeps the `Runtime` struct and its address-stable buffers,
 //! construction, the eager step path, and the shared free helpers.
 
+use crate::application::execution::{
+    ExecutionMetrics, ExecutionMode, ExecutionPlan, Phase, WorkspaceUse,
+};
 use std::ptr::NonNull;
 
 use crate::domain::component::{Hidden, LayerRange};
@@ -32,7 +35,9 @@ mod multimodal;
 mod peer;
 mod plan;
 mod recurrent;
+mod speculative;
 mod startup;
+pub use speculative::TargetStep;
 
 pub use graph_exec::{GraphDecision, GraphRunner, GraphSlotId};
 pub use mixed_abc::MixedStepTicket;
@@ -49,8 +54,10 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
+    pub execution_metrics: ExecutionMetrics,
     pub model: M,
     recurrent: Option<recurrent::RecurrentState<T, D>>,
+    retained_request: Option<StepRequest>,
     visual: multimodal::VisualState<T, D>,
     pub kv_pool: PagedKvPool<T, D>,
     pub kv_index: KvIndexTensors<D>,
@@ -488,8 +495,12 @@ where
             }
         };
 
+        let execution_metrics = ExecutionMetrics::from_env("target");
+        execution_metrics.prepare_gpu(&scope)?;
         Ok(Self {
+            execution_metrics,
             recurrent,
+            retained_request: None,
             visual: multimodal::VisualState::default(),
             model,
             kv_pool,
@@ -612,32 +623,80 @@ where
 
     fn step_local(&mut self, req: &StepRequest) -> OpResult<StepOutput> {
         let plan = self.build_plan(req)?;
-        self.prepare_recurrent(req, &plan)?;
-        self.upload_index(&plan, req)?;
-        self.prepare_multimodal(req)?;
-        let decision = if self.requires_multimodal_prefill(req)
-            || req.sampling.iter().any(|params| !params.is_greedy())
-        {
-            // Captured decode and mixed ABC graphs include an argmax node and
-            // expose no logits to the sampler. Stochastic requests therefore
-            // use the eager tail, while deterministic traffic retains graphs.
-            GraphDecision::Eager
-        } else {
-            self.decide(&plan)
-        };
-        match decision {
-            GraphDecision::Eager => self.step_eager(&plan, req),
-            GraphDecision::Graph(slot) => self.step_graph(slot, &plan, req),
-            GraphDecision::PrefillGraph(num_tokens) => {
-                self.step_prefill_graph(num_tokens, &plan, req)
-            }
+        if !req.draft_tokens.is_empty() {
+            return self.step_speculative(req, &plan).map(|(output, _)| output);
         }
+        self.prepare_recurrent(req, &plan)?;
+        let result = (|| {
+            self.upload_index(&plan, req)?;
+            self.prepare_multimodal(req)?;
+            let decision = if self.requires_multimodal_prefill(req)
+                || !req.draft_tokens.is_empty()
+                || req.sampling.iter().any(|params| !params.is_greedy())
+            {
+                // Verification needs every target row, including the bonus
+                // row. Even K=0 uses its explicit eager verification contract.
+                // Captured ordinary decode contains an argmax-only tail.
+                GraphDecision::Eager
+            } else {
+                self.decide(&plan)
+            };
+            let execution = ExecutionPlan {
+                phase: if plan.q_lens.iter().all(|&q| q == 1) {
+                    Phase::Decode
+                } else {
+                    Phase::Prefill
+                },
+                mode: match decision {
+                    GraphDecision::Eager => ExecutionMode::Eager,
+                    GraphDecision::Graph(slot) => ExecutionMode::DecodeGraph {
+                        slot: self
+                            .graph
+                            .as_ref()
+                            .and_then(|g| g.slot_size(slot))
+                            .unwrap_or(plan.batch),
+                    },
+                    GraphDecision::PrefillGraph(tokens) => ExecutionMode::PrefillGraph { tokens },
+                },
+                batch: plan.batch,
+                tokens: plan.num_tokens,
+                workspace: WorkspaceUse::Runtime,
+            };
+            execution.execute(
+                &self.execution_metrics.clone(),
+                |execution| match execution.mode {
+                    ExecutionMode::Eager => self.step_eager(&plan, req),
+                    ExecutionMode::DecodeGraph { .. } => {
+                        let GraphDecision::Graph(slot) = decision else {
+                            unreachable!()
+                        };
+                        self.step_graph(slot, &plan, req)
+                    }
+                    ExecutionMode::PrefillGraph { tokens } => {
+                        self.step_prefill_graph(tokens, &plan, req)
+                    }
+                    ExecutionMode::MixedGraph { .. } => unreachable!("ordinary step plan"),
+                },
+            )
+        })();
+        // A successful forward alone does not make a step committable:
+        // finalization, sampling and result validation must succeed too.
+        self.finish_recurrent_step(result)
     }
 
     fn step_eager(
         &mut self,
         plan: &crate::domain::plan::BatchPlan,
         req: &StepRequest,
+    ) -> OpResult<StepOutput> {
+        self.step_eager_with_input(plan, req, None)
+    }
+
+    fn step_eager_with_input(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        device_input: Option<&Tensor<i32, D>>,
     ) -> OpResult<StepOutput> {
         // Eager prefill (num_tokens > batch) routes bf16 GEMMs to the build-free
         // chunked path so each distinct prompt length skips the cuBLASLt cache
@@ -648,7 +707,10 @@ where
             D::set_prefill_gemm_mode(true);
         }
         let _gemm_guard = PrefillGemmGuard::<D>(prefill_gemm, std::marker::PhantomData);
-        let input_ids = self.input_ids_tensor(req, plan)?;
+        let input_ids = match device_input {
+            Some(input) => input.clone(),
+            None => self.input_ids_tensor(req, plan)?,
+        };
         let _trace = std::env::var_os("RUSTINFER_TTFT_TRACE").is_some();
         let _t0 = std::time::Instant::now();
         self.run_layers(plan, &input_ids)?;
@@ -675,6 +737,8 @@ where
     /// (input ids, hidden, KV pool, KV index) is a fixed allocation, so the
     /// kernel sequence is replayable as a CUDA graph. Under graph capture the
     /// scratch tensors allocated inside the model come from the capture arena.
+    /// This only executes kernels; the enclosing step owns history commit or
+    /// invalidation. Recording a graph must never advance logical history.
     pub(super) fn run_layers(
         &mut self,
         plan: &crate::domain::plan::BatchPlan,
@@ -706,8 +770,7 @@ where
             ),
             None => crate::domain::cache::ModelCacheView::full(&mut self.kv_pool, &self.kv_index),
         };
-        let result = self
-            .model
+        self.model
             .embed(input_ids, &mut hidden, &ctx)
             .and_then(|()| {
                 for item in &self.visual.overrides {
@@ -722,14 +785,10 @@ where
                     &mut cache,
                     &ctx,
                 )
-            });
-        if let Some(state) = &mut self.recurrent {
-            state.complete(result.is_ok());
-        }
-        result
+            })
     }
 
-    /// Finalize (logits) + sample/verify + KV commit. Always eager: the capture
+    /// Finalize (logits) + sample/verify into a retention decision. Always eager: the capture
     /// arena is disabled here, so these allocations use the normal allocator and
     /// the (data-dependent, variable-shape) sampling never enters a graph.
     pub(super) fn sample_tail(
@@ -759,8 +818,8 @@ where
             SampleRows::All
         };
         let logits = self.model.finalize(&hidden, sample_rows, &ctx)?;
-        let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
-        let (mut tokens, accepted, speculative_len) = if req.draft_tokens.is_empty() {
+        let (mut tokens, mut materialized_tokens, accepted_drafts) = if req.draft_tokens.is_empty()
+        {
             let mut tokens: Vec<Vec<SampledToken>> =
                 if req.sampling.iter().any(|params| !params.is_greedy()) {
                     let sampled = self.sampler.sample(&logits.0, &req.sampling, &ctx)?;
@@ -825,76 +884,59 @@ where
                     tokens
                 };
             tokens.resize_with(plan.batch, Vec::new);
-            let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
-            let speculative_len = vec![0; plan.batch];
-            (tokens, accepted, speculative_len)
+            let materialized = plan.q_lens.iter().map(|&q| q as u32).collect();
+            (tokens, materialized, None)
         } else {
-            let draft_tokens = flatten_draft_tokens(req, plan)?;
-            let draft_probs = D::alloc_tensor::<f32>(
-                Shape::from_slice(&[logits.0.numel().max(1)]),
-                logits.0.device(),
+            let decisions = crate::application::speculative::GreedyVerifier.verify_into(
+                &logits.0,
+                &req.draft_tokens,
+                &req.sampling,
+                &ctx,
+                &mut self.abc.argmax_out_dev.narrow(0, 0, plan.num_tokens)?,
+                &self.abc.argmax_ws,
             )?;
-            let verify =
-                self.sampler
-                    .verify(&logits.0, &draft_tokens, &draft_probs, &req.sampling, &ctx)?;
-            if verify.accepted_count.len() != plan.batch {
-                return Err(OpError::Shape(format!(
-                    "Runtime::step: verify accepted_count {} != batch {}",
-                    verify.accepted_count.len(),
-                    plan.batch
-                )));
+            let mut tokens = Vec::with_capacity(plan.batch);
+            let mut materialized = Vec::with_capacity(plan.batch);
+            let mut accepted = Vec::with_capacity(plan.batch);
+            for (draft, decision) in req.draft_tokens.iter().zip(decisions) {
+                let n = decision.accepted_drafts;
+                let mut row = Vec::with_capacity(n + 1);
+                row.extend(draft[..n].iter().map(|&token_id| SampledToken {
+                    token_id,
+                    logprob: 0.0,
+                    top_logprobs: Vec::new(),
+                }));
+                row.push(decision.correction_or_bonus);
+                tokens.push(row);
+                // The pending input is retained even when every draft is rejected.
+                materialized.push((n + 1) as u32);
+                accepted.push(n as u32);
             }
-            let speculative_len: Vec<u32> = req
-                .draft_tokens
-                .iter()
-                .map(|tokens| tokens.len() as u32)
-                .collect();
-            for (i, (&accepted, &spec)) in verify
-                .accepted_count
-                .iter()
-                .zip(speculative_len.iter())
-                .enumerate()
-            {
-                if accepted > spec {
-                    return Err(OpError::Shape(format!(
-                        "Runtime::step: seq[{}] accepted {} > spec {}",
-                        i, accepted, spec
-                    )));
-                }
-            }
-            let tokens = spec_tokens(req, &verify.accepted_count, verify.bonus_token)?;
-            for (seq, &spec) in req.seqs.iter().zip(speculative_len.iter()) {
-                if spec > 0 {
-                    self.kv_pool
-                        .seq_kv_len
-                        .insert(seq.sequence_id, seq.kv_len_after as u32);
-                }
-            }
-            (tokens, verify.accepted_count, speculative_len)
+            (tokens, materialized, Some(accepted))
         };
         synchronize_tp_sampled_tokens::<D>(&self.scope, &self.abc.argmax_out_dev, &mut tokens)?;
-        // Non-speculative steps do NOT touch the pool's per-seq length map: the
-        // worker (`ActiveSeq`) owns the length for ordinary decode/prefill, and
-        // `build_plan` trusts the caller-provided `kv_write_start`. Only the
-        // speculative commit maintains `seq_kv_len` (for `KvEdit::truncate`).
-        // This keeps the map empty under normal operation, so out-of-band
-        // eviction (cancel/preempt/drain) can never orphan an entry.
-        if !req.draft_tokens.is_empty() {
-            self.kv_pool
-                .edit()
-                .apply_step(&sids, &accepted, &speculative_len)?;
-        }
-
-        let finished = finished_flags(req, &tokens);
-        for (sid, done) in sids.iter().zip(finished.iter()) {
-            if *done {
-                self.kv_pool.seq_kv_len.remove(sid);
+        let finished = if accepted_drafts.is_some() {
+            let finished = truncate_speculative_output(req, &mut tokens);
+            for (retained, row) in materialized_tokens.iter_mut().zip(&tokens) {
+                // Keep the pending input plus every emitted draft except the
+                // last emitted token. That last token becomes the next pending
+                // input (or terminates the sequence) and needs no retained KV.
+                *retained = row.len() as u32;
             }
-        }
+            finished
+        } else {
+            finished_flags(req, &tokens)
+        };
+
+        // Runtime does not own the caller's KV lease or authoritative sequence
+        // length. In particular, truncating a pool-side map would neither
+        // release provisional slots nor restore recurrent state. Return the
+        // exact retained input prefix for the enclosing decode engine instead.
 
         Ok(StepOutput {
             tokens,
-            accepted,
+            materialized_tokens,
+            accepted_drafts,
             finished,
             hidden_tap: None,
         })
@@ -960,7 +1002,6 @@ where
             true,
         );
         let ids = c_view.to_host_vec()?;
-        let sids: Vec<u64> = req.seqs.iter().map(|seq| seq.sequence_id).collect();
         let mut tokens: Vec<Vec<SampledToken>> = ids
             .iter()
             .map(|&token_id| {
@@ -972,16 +1013,12 @@ where
             })
             .collect();
         tokens.resize_with(batch, Vec::new);
-        let accepted: Vec<u32> = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
+        let materialized_tokens = plan.q_lens.iter().map(|&q| q.max(0) as u32).collect();
         let finished = finished_flags(req, &tokens);
-        for (sid, done) in sids.iter().zip(finished.iter()) {
-            if *done {
-                self.kv_pool.seq_kv_len.remove(sid);
-            }
-        }
         Ok(StepOutput {
             tokens,
-            accepted,
+            materialized_tokens,
+            accepted_drafts: None,
             finished,
             hidden_tap: None,
         })
@@ -1146,70 +1183,31 @@ pub(super) fn u32_to_i32_saturating(x: u32) -> i32 {
     x.min(i32::MAX as u32) as i32
 }
 
-fn flatten_draft_tokens(req: &StepRequest, plan: &BatchPlan) -> OpResult<Vec<i32>> {
-    if req.draft_tokens.len() != plan.batch {
-        return Err(OpError::Shape(format!(
-            "flatten_draft_tokens: draft_tokens {} != batch {}",
-            req.draft_tokens.len(),
-            plan.batch
-        )));
-    }
-    let mut out = Vec::with_capacity(plan.num_tokens);
-    for (i, draft) in req.draft_tokens.iter().enumerate() {
-        let expected = plan.q_lens[i].max(0) as usize;
-        if draft.len() != expected {
-            return Err(OpError::Shape(format!(
-                "flatten_draft_tokens: seq[{}] draft {} != q_len {}",
-                i,
-                draft.len(),
-                expected
-            )));
-        }
-        out.extend_from_slice(draft);
-    }
-    Ok(out)
-}
-
-fn spec_tokens(
-    req: &StepRequest,
-    accepted: &[u32],
-    bonus: Vec<SampledToken>,
-) -> OpResult<Vec<Vec<SampledToken>>> {
-    if accepted.len() != req.seqs.len() || bonus.len() != req.seqs.len() {
-        return Err(OpError::Shape(format!(
-            "spec_tokens: accepted={} bonus={} batch={}",
-            accepted.len(),
-            bonus.len(),
-            req.seqs.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(req.seqs.len());
-    for i in 0..req.seqs.len() {
-        let draft = req
-            .draft_tokens
-            .get(i)
-            .ok_or_else(|| OpError::Shape(format!("spec_tokens: missing draft row {}", i)))?;
-        let n = accepted[i] as usize;
-        if n > draft.len() {
-            return Err(OpError::Shape(format!(
-                "spec_tokens: accepted {} > draft {} for row {}",
-                n,
-                draft.len(),
-                i
-            )));
-        }
-        let mut row = draft[..n]
-            .iter()
-            .map(|&token_id| SampledToken {
-                token_id,
-                logprob: 0.0,
-                top_logprobs: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        row.push(bonus[i].clone());
-        out.push(row);
-    }
-    Ok(out)
+/// Stop a verified output at its first EOS or remaining generation budget.
+/// Callers derive the retained INPUT prefix from this final output, not from
+/// the untruncated number of matching drafts. An emitted terminal EOS remains
+/// the last (unmaterialized) token just like a correction/bonus token.
+fn truncate_speculative_output(req: &StepRequest, tokens: &mut [Vec<SampledToken>]) -> Vec<bool> {
+    tokens
+        .iter_mut()
+        .enumerate()
+        .map(|(i, row)| {
+            let generated = req.stop.generated_counts.get(i).copied().unwrap_or(0);
+            let max = req.stop.max_tokens.get(i).copied().unwrap_or(u32::MAX);
+            row.truncate(max.saturating_sub(generated) as usize);
+            let ignore_eos = req.stop.ignore_eos.get(i).copied().unwrap_or(false);
+            let eos = (!ignore_eos)
+                .then(|| {
+                    row.iter()
+                        .position(|token| req.stop.eos_ids.contains(&token.token_id))
+                })
+                .flatten();
+            if let Some(index) = eos {
+                row.truncate(index + 1);
+            }
+            eos.is_some() || generated.saturating_add(row.len() as u32) >= max
+        })
+        .collect()
 }
 
 /// Install rank 0's sampled ids on every TP rank before any rank derives stop
@@ -1273,8 +1271,13 @@ pub(super) fn finished_flags(req: &StepRequest, tokens: &[Vec<SampledToken>]) ->
                 && row
                     .iter()
                     .any(|token| req.stop.eos_ids.contains(&token.token_id));
-            let generated =
-                req.stop.generated_counts.get(i).copied().unwrap_or(0) + row.len() as u32;
+            let generated = req
+                .stop
+                .generated_counts
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(row.len() as u32);
             let max = req.stop.max_tokens.get(i).copied().unwrap_or(u32::MAX);
             hit_eos || generated >= max
         })
@@ -1538,6 +1541,29 @@ mod tests {
         }
     }
 
+    impl crate::domain::model::DecoderReadout<f32, Cpu> for TinyDecoder {
+        fn normalize_hidden_into(
+            &self,
+            hidden: &Hidden<f32, Cpu>,
+            output: &mut Tensor<f32, Cpu>,
+            _ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<()> {
+            output.copy_from(&hidden.stream)
+        }
+        fn project_logits_into(
+            &self,
+            normalized: &Tensor<f32, Cpu>,
+            output: &mut Tensor<f32, Cpu>,
+            ctx: &StepCtx<'_, Cpu>,
+        ) -> OpResult<()> {
+            let hidden = Hidden {
+                stream: normalized.clone(),
+                pending: None,
+            };
+            output.copy_from(&self.finalize(&hidden, SampleRows::All, ctx)?.0)
+        }
+    }
+
     fn tok(token_id: i32) -> SampledToken {
         SampledToken {
             token_id,
@@ -1683,12 +1709,276 @@ mod tests {
 
         let out = runtime.step(&req).unwrap();
 
-        assert_eq!(out.accepted, vec![1, 1]);
+        assert_eq!(out.materialized_tokens, vec![1, 1]);
+        assert_eq!(out.accepted_drafts, None);
         assert_eq!(out.tokens[0][0].token_id, 1);
         assert_eq!(out.tokens[1][0].token_id, 2);
-        // Non-speculative steps leave the pool's per-seq length map empty
-        // (the worker owns the length); only the speculative path populates it.
+        // The caller owns lengths and leases; the runtime keeps no duplicate
+        // pool-side length, for ordinary or speculative execution.
         assert!(runtime.kv_pool.seq_kv_len.is_empty());
+    }
+
+    fn tiny_runtime() -> Runtime<f32, Cpu, TinyDecoder> {
+        Runtime::new(
+            TinyDecoder::plain(),
+            HostScope::new(Cpu),
+            Box::new(GreedySampler),
+            32,
+            1,
+            32,
+            32,
+            16,
+            4,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn verification_request(drafts: &[&[i32]]) -> StepRequest {
+        let mut req = req_for_batch(drafts.len());
+        req.draft_tokens = drafts.iter().map(|draft| draft.to_vec()).collect();
+        for (seq, draft) in req.seqs.iter_mut().zip(drafts) {
+            seq.input_ids = std::iter::once(0).chain(draft.iter().copied()).collect();
+            seq.positions = (0..seq.input_ids.len() as i32).collect();
+            seq.kv_len_after = seq.input_ids.len() as i32;
+            seq.block_table = (0..seq.input_ids.len() as u32).collect();
+        }
+        req
+    }
+
+    #[test]
+    fn verification_keeps_pending_input_and_uses_independent_bonus_row() {
+        for (draft, accepted, expected) in [
+            (vec![0, 2], 0, vec![1]),
+            (vec![1, 0], 1, vec![1, 2]),
+            (vec![1, 2], 2, vec![1, 2, 3]),
+            (vec![], 0, vec![1]),
+        ] {
+            let mut runtime = tiny_runtime();
+            let req = verification_request(&[&draft]);
+            let output = runtime.step(&req).unwrap();
+            let actual: Vec<_> = output.tokens[0].iter().map(|t| t.token_id).collect();
+            assert_eq!(actual, expected);
+            assert_eq!(output.accepted_drafts, Some(vec![accepted]));
+            assert_eq!(output.materialized_tokens, vec![accepted + 1]);
+            assert_eq!(output.finished, vec![false]);
+            assert!(runtime.kv_pool.seq_kv_len.is_empty());
+        }
+    }
+
+    #[test]
+    fn device_tape_verification_and_replay_skip_host_input_staging() {
+        for draft in [vec![], vec![0, 2], vec![1, 0], vec![1, 2]] {
+            for stop_at_first in [false, true] {
+                let mut direct = tiny_runtime();
+                let mut reference = tiny_runtime();
+                let mut req = verification_request(&[&draft]);
+                if stop_at_first {
+                    req.stop.eos_ids = vec![1];
+                }
+                let tape = Tensor::from_host_slice(&req.seqs[0].input_ids, [draft.len() + 1], &Cpu)
+                    .unwrap();
+                direct.prefill_ids_host.fill(-7);
+                direct
+                    .prefill_ids_buf
+                    .upload_from_host(&vec![-7; direct.prefill_ids_buf.numel()])
+                    .unwrap();
+                let mut hidden = Tensor::zeros([draft.len() + 1, 1], &Cpu).unwrap();
+                let out = direct
+                    .step_with_hidden_input(&req, &mut hidden, Some(&tape))
+                    .unwrap();
+                let expected = reference.step_with_hidden(&req).unwrap();
+                assert_eq!(out.accepted_drafts, expected.output.accepted_drafts);
+                assert_eq!(out.materialized_tokens, expected.output.materialized_tokens);
+                assert_eq!(out.finished, expected.output.finished);
+                assert_eq!(
+                    out.tokens[0].iter().map(|t| t.token_id).collect::<Vec<_>>(),
+                    expected.output.tokens[0]
+                        .iter()
+                        .map(|t| t.token_id)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    hidden
+                        .narrow(0, 0, out.materialized_tokens[0] as usize)
+                        .unwrap()
+                        .to_host_vec()
+                        .unwrap(),
+                    expected.normalized_hidden.to_host_vec().unwrap()
+                );
+                assert!(direct.prefill_ids_host.iter().all(|&x| x == -7));
+                assert!(
+                    direct
+                        .prefill_ids_buf
+                        .to_host_vec()
+                        .unwrap()
+                        .iter()
+                        .all(|&x| x == -7)
+                );
+                assert_eq!(tape.to_host_vec().unwrap(), req.seqs[0].input_ids);
+            }
+        }
+    }
+
+    #[test]
+    fn device_tape_rejects_bad_shape_and_multi_sequence_before_execution() {
+        let mut runtime = tiny_runtime();
+        let mut hidden = Tensor::zeros([8, 1], &Cpu).unwrap();
+        let req = verification_request(&[&[1, 2]]);
+        let short = Tensor::from_host_slice(&[0, 1], [2], &Cpu).unwrap();
+        assert!(
+            runtime
+                .step_with_hidden_input(&req, &mut hidden, Some(&short))
+                .is_err()
+        );
+        let multi = verification_request(&[&[], &[]]);
+        assert!(
+            runtime
+                .step_with_hidden_input(&multi, &mut hidden, Some(&short))
+                .is_err()
+        );
+        assert!(runtime.step_with_hidden(&req).is_ok());
+    }
+
+    #[test]
+    fn verification_offsets_include_each_sequences_bonus_row() {
+        let mut runtime = tiny_runtime();
+        // TinyDecoder predicts [1,2,3 | 0 | 1,2]. The zero-draft middle
+        // sequence still owns a target row and emits its own correction.
+        let req = verification_request(&[&[1, 2], &[], &[3]]);
+        let output = runtime.step(&req).unwrap();
+        let ids: Vec<Vec<_>> = output
+            .tokens
+            .iter()
+            .map(|row| row.iter().map(|t| t.token_id).collect())
+            .collect();
+        assert_eq!(ids, vec![vec![1, 2, 3], vec![0], vec![1]]);
+        assert_eq!(output.accepted_drafts, Some(vec![2, 0, 0]));
+        assert_eq!(output.materialized_tokens, vec![3, 1, 1]);
+        assert!(runtime.kv_pool.seq_kv_len.is_empty());
+    }
+
+    #[test]
+    fn verification_eos_limits_output_and_retained_input_prefix() {
+        for (eos, expected) in [(1, vec![1]), (2, vec![1, 2]), (3, vec![1, 2, 3])] {
+            let mut runtime = tiny_runtime();
+            let mut req = verification_request(&[&[1, 2]]);
+            req.stop.eos_ids = vec![eos];
+            let output = runtime.step(&req).unwrap();
+            let ids: Vec<_> = output.tokens[0].iter().map(|t| t.token_id).collect();
+            assert_eq!(ids, expected);
+            assert_eq!(output.materialized_tokens, vec![expected.len() as u32]);
+            assert_eq!(output.accepted_drafts, Some(vec![2]));
+            assert_eq!(output.finished, vec![true]);
+        }
+        let mut runtime = tiny_runtime();
+        let mut req = verification_request(&[&[1, 2]]);
+        req.stop.eos_ids = vec![1];
+        req.stop.ignore_eos = vec![true];
+        req.stop.max_tokens = vec![3];
+        let output = runtime.step(&req).unwrap();
+        assert_eq!(output.tokens[0].len(), 3);
+        assert_eq!(output.materialized_tokens, vec![3]);
+        assert_eq!(output.finished, vec![true]);
+    }
+
+    #[test]
+    fn verification_rejects_bad_contracts_before_forward() {
+        let runtime = tiny_runtime();
+        let valid = verification_request(&[&[1, 2]]);
+        let mut bad = valid.clone();
+        bad.draft_tokens[0].push(3);
+        assert!(
+            runtime
+                .build_plan(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("K+1")
+        );
+        let mut bad = valid.clone();
+        bad.draft_tokens[0][1] = 0;
+        assert!(
+            runtime
+                .build_plan(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("suffix")
+        );
+        let mut bad = valid.clone();
+        bad.stop.max_tokens[0] = 2;
+        assert!(
+            runtime
+                .build_plan(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        let mut bad = valid.clone();
+        bad.sampling[0].temperature = 1.0;
+        assert!(runtime.build_plan(&bad).is_err());
+        let mut bad = valid.clone();
+        bad.seqs[0].input_ids[0] = -1;
+        assert!(
+            runtime
+                .build_plan(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("vocabulary")
+        );
+        let mut bad = valid;
+        bad.seqs[0].kv_write_start = 31;
+        bad.seqs[0].kv_len_after = 34;
+        assert!(
+            runtime
+                .build_plan(&bad)
+                .unwrap_err()
+                .to_string()
+                .contains("context")
+        );
+    }
+
+    #[test]
+    fn speculative_output_truncation_handles_exhausted_and_overflowing_counts() {
+        let mut req = req_for_batch(2);
+        req.stop.generated_counts = vec![15, u32::MAX];
+        req.stop.max_tokens = vec![16, u32::MAX];
+        let mut rows = vec![vec![tok(1), tok(2)], vec![tok(3)]];
+        assert_eq!(
+            truncate_speculative_output(&req, &mut rows),
+            vec![true, true]
+        );
+        assert_eq!(rows[0].len(), 1);
+        assert!(rows[1].is_empty());
+    }
+
+    #[test]
+    fn run_layers_does_not_commit_recurrent_history() {
+        use crate::domain::cache::{LayerCacheSpec, LinearDims};
+        let mut runtime = tiny_runtime();
+        let layout = CacheLayout::new([LayerCacheSpec::Linear(LinearDims {
+            num_key_heads: 1,
+            num_value_heads: 1,
+            key_head_dim: 1,
+            value_head_dim: 1,
+            conv_kernel_dim: 1,
+        })])
+        .unwrap();
+        runtime.recurrent = Some(recurrent::RecurrentState::new(&layout, 4, &Cpu).unwrap());
+        let req = req_for_batch(1);
+        let plan = runtime.build_plan(&req).unwrap();
+        runtime.prepare_recurrent(&req, &plan).unwrap();
+        runtime.upload_index(&plan, &req).unwrap();
+        let ids = runtime.input_ids_tensor(&req, &plan).unwrap();
+        runtime.run_layers(&plan, &ids).unwrap();
+        let mut next = req.clone();
+        next.seqs[0].kv_write_start = 1;
+        next.seqs[0].kv_len_after = 2;
+        next.seqs[0].positions = vec![1];
+        let next_plan = runtime.build_plan(&next).unwrap();
+        assert!(runtime.prepare_recurrent(&next, &next_plan).is_err());
+        runtime.finish_recurrent_step(Ok(())).unwrap();
+        runtime.prepare_recurrent(&next, &next_plan).unwrap();
+        runtime.finish_recurrent_step(Ok(())).unwrap();
     }
 
     #[test]

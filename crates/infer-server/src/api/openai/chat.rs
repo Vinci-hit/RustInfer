@@ -30,6 +30,13 @@ pub async fn chat_completions(
 
     // 1. 校验请求
     validate_request(&req)?;
+    shared::validate_mtp_request(
+        state.config.mtp_num_draft_tokens,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.messages.iter().any(InputChatMessage::has_image),
+    )?;
     let response_model = state.model_info.model_id.clone();
 
     let mut image_permit = if req.messages.iter().any(InputChatMessage::has_image) {

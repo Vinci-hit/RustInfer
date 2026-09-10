@@ -426,13 +426,10 @@ where
         self.decode_output_from_c(plan, req)
     }
 
-    /// Replay bypasses run_layers, so advance host-owned recurrent history here.
+    /// Enqueue only: the enclosing ordinary step/issue commits logical
+    /// recurrent history after its sampling and output setup succeed.
     pub(super) fn launch_decode_graph(&mut self, key: u64) -> OpResult<()> {
-        let result = self.scope.graph_launch(key);
-        if let Some(state) = &mut self.recurrent {
-            state.complete(result.is_ok());
-        }
-        result
+        self.scope.graph_launch(key)
     }
 
     /// Single-sequence prefill via CUDA graph (Stage A). The captured region is
