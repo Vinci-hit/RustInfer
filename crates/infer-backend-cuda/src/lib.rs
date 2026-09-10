@@ -7,10 +7,10 @@ pub mod config;
 pub mod device_utils;
 pub mod error;
 pub mod ffi;
+mod host_buffer;
 mod nccl;
 mod pool;
 mod timing;
-mod upload;
 // Raw kernel launch wrappers are an implementation detail. Keeping this module
 // private prevents external callers from manufacturing invalid CUDA streams or
 // device pointers; the safe backend traits below are the supported API.
@@ -1400,28 +1400,10 @@ impl MemoryPort for Cuda {
         Ok(())
     }
 
-    unsafe fn upload_bulk(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
-        // Match the owning context even when the caller changed CUDA devices.
+    fn alloc_host_buffer(&self, size: usize) -> OpResult<Box<dyn infer_core::device::HostBuffer>> {
         let scope = self.scope();
         let _guard = infer_core::exec::ExecScope::enter(&scope);
-        let mut capture = ffi::cudaStreamCaptureStatus_cudaStreamCaptureStatusNone;
-        unsafe {
-            error::cuda_check!(ffi::cudaStreamIsCapturing(self.config.stream, &mut capture));
-        }
-        if capture != ffi::cudaStreamCaptureStatus_cudaStreamCaptureStatusNone {
-            return Err(OpError::Kernel(
-                "bulk upload is not allowed during CUDA graph capture".into(),
-            ));
-        }
-        let mut staging = self
-            .config
-            .bulk_upload
-            .lock()
-            .map_err(|_| OpError::Fatal("bulk upload staging lock poisoned".into()))?;
-        if !staging.should_stage(size) {
-            return unsafe { self.upload(dst, src, size) };
-        }
-        unsafe { staging.upload(self.config.stream, dst.as_ptr(), src, size) }
+        Ok(Box::new(host_buffer::PinnedBuffer::new(size)?))
     }
 
     unsafe fn upload_async(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {

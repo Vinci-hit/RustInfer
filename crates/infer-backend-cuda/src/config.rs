@@ -305,7 +305,6 @@ pub struct CudaConfig {
     pub cublas_handle_v2: ffi::cublasHandle_t,
     memory_plan: CudaMemoryPlan,
     kernel_workspace: DeviceRegion,
-    pub(crate) bulk_upload: std::sync::Mutex<super::upload::BulkUpload>,
     /// Captured CUDA graphs, keyed by slot. Behind a Mutex so the runner
     /// can capture from `&CudaConfig` without an outer `&mut`.
     pub graphs: std::sync::Mutex<HashMap<GraphSlot, CudaGraph>>,
@@ -380,7 +379,6 @@ impl CudaConfig {
             cuda_check!(ffi::cudaGetDevice(&mut device_id));
         }
         let device_info = CudaDeviceInfo::query(device_id)?;
-        let bulk_upload = super::upload::BulkUpload::from_env()?;
         let mut stream: ffi::cudaStream_t = std::ptr::null_mut();
         unsafe {
             cuda_check!(ffi::cudaStreamCreate(&mut stream));
@@ -434,7 +432,6 @@ impl CudaConfig {
             cublas_handle_v2,
             memory_plan,
             kernel_workspace,
-            bulk_upload: std::sync::Mutex::new(bulk_upload),
             graphs: std::sync::Mutex::new(HashMap::new()),
             cudnn_handle,
             copy_in_stream,

@@ -21,6 +21,21 @@ pub trait Device: Clone + Send + Sync + Debug + 'static {
 /// Marker: "this device has host-accessible memory" (enables as_slice).
 pub trait HostDevice: Device {}
 
+/// Owned host storage for a loader's read/upload pipeline. A buffer is moved
+/// between reader and consumer; it is never mutated while being uploaded.
+pub trait HostBuffer: Send {
+    fn bytes(&self) -> &[u8];
+    fn bytes_mut(&mut self) -> &mut [u8];
+}
+impl HostBuffer for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
 /// Memory port — devices must implement raw allocation, free, and
 /// host/device copy primitives. The domain `Storage` type uses this to
 /// provide RAII; `Tensor::from_host_slice` / `to_host_vec` use it for I/O.
@@ -48,18 +63,10 @@ pub trait MemoryPort: Device {
     /// `src` must be a valid host pointer with at least `size` bytes.
     unsafe fn upload(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()>;
 
-    /// Upload bulk host bytes, returning only after the source can be reused.
-    /// Backends may overlap bounded host staging with device transfers. Used by
-    /// weight-byte constructors; ordinary and explicitly async uploads retain
-    /// their existing behavior.
-    ///
-    /// # Safety
-    /// Same pointer and size requirements as `upload`.
-    unsafe fn upload_bulk(&self, dst: NonNull<u8>, src: *const u8, size: usize) -> OpResult<()> {
-        unsafe {
-            self.upload(dst, src, size)?;
-        }
-        self.synchronize()
+    /// Allocate initialized host memory for direct file reads. CUDA returns
+    /// page-locked storage suitable for H2D; CPU uses ordinary host memory.
+    fn alloc_host_buffer(&self, size: usize) -> OpResult<Box<dyn HostBuffer>> {
+        Ok(Box::new(vec![0u8; size]))
     }
 
     /// Async H2D copy that does NOT synchronize the device stream.

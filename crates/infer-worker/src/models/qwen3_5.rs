@@ -196,7 +196,11 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
         device,
     )?;
     let mut blocks = Vec::with_capacity(cfg.layer_num);
+    let prefetch = loader.prefetch_layers(&format!("{prefix}.layers"), cfg.layer_num, device)?;
     for (i, &full) in linear.layer_is_full.iter().enumerate() {
+        let prefetched = prefetch.next_layer()?;
+        let layer_loader = loader.with_prefetched(&prefetched);
+        let loader = &layer_loader;
         let layer = format!("{prefix}.layers.{i}");
         let input_layernorm = load_norm(
             loader,
@@ -325,6 +329,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                 scratch: None,
             },
         });
+        prefetch.recycle(prefetched);
     }
     let norm = load_norm(
         loader,

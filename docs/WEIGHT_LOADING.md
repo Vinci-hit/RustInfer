@@ -1,103 +1,93 @@
-# Weight loading with bounded double buffering
+# Layer read/upload pipeline
 
-`Tensor::from_host_bytes` uses `MemoryPort::upload_bulk`. CPU and other backends
-retain a synchronous fallback; CUDA preallocates two pinned host buffers and two
-completion events when constructing `CudaConfig`. Default staging capacity is
-2 × 8 MiB per CUDA context, independent of checkpoint size. The buffers are
-reused across tensors and released with the context. They occupy host RAM, not
-VRAM, and are separate from the GPU kernel/graph workspace.
+Qwen3.5 and the shared dense decoder builder use two owned host buffers. A
+background reader reads layer N+1 while the model-building thread uploads layer
+N. The filesystem reads directly into the buffers used as upload sources:
 
-For an input larger than one chunk:
+```text
+reader thread:   file -> buffer A (layer 0) -> buffer B (layer 1) -> buffer A (layer 2)
+model thread:              buffer A -> GPU          buffer B -> GPU
+```
 
-1. CPU copies the first source range into slot A and enqueues its H2D copy.
-2. CPU fills slot B while A's transfer can run on the GPU copy engine.
-3. Before overwriting A, wait for A's completion event; enqueue alternating chunks.
-4. Drain the compute stream before returning, including after a submission error.
+There is no application-level mmap-to-staging copy. `SafetensorsReader` uses its
+existing parsed headers only to find file offsets, lengths, dtypes and shapes.
+It retains file handles and issues positional reads directly into each buffer.
+Normal buffered filesystem I/O may still use the OS page cache; this is not GDS
+or a claim of physical zero-copy storage I/O.
 
-No reader thread is required: CUDA performs the transfer asynchronously while
-the CPU prepares the next chunk. For borrowed mmap ranges, accessing the next
-chunk also drives filesystem page faults/readahead while the preceding H2D is
-in flight. This permits overlap; it does not guarantee physical disk reads on a
-warm page cache. There is still one completion boundary per tensor. Model
-construction, weight ownership and the ordinary decode upload paths stay intact.
-Bulk uploads are rejected during graph capture before staging or enqueueing.
+`MemoryPort::alloc_host_buffer` supplies owned host memory. CUDA allocates pinned
+memory with `cudaMallocHost`; CPU backends use ordinary initialized byte vectors.
+Both buffers are allocated once at the beginning of the layer loop, sized to the
+largest checkpoint layer selected by that builder. This is determined from model
+metadata, not a hardware benchmark or a fixed chunk size. There is no production
+configuration switch. Qwen3.5-4B uses 225,848,000 bytes per buffer, about 431 MiB
+of host memory for both. Buffers are released when loading finishes.
 
-Same-dtype tensors, contiguous output-row shards, and TP=1 input-column matrices
-now borrow the checkpoint's bytes instead of allocating/copying a full host
-vector. Dtype conversion, non-contiguous TP column gathering and fused projection
-packing still use owned CPU buffers before upload; their CPU preparation is not
-pipelined in this version. Total loader memory is therefore not limited to the
-16 MiB staging pool. This is ordinary host-to-device loading, not GDS.
+## Ownership and failure handling
 
-## Configuration and comparison
+A bounded ready queue and a free-buffer queue transfer exclusive ownership.
+The reader cannot overwrite a buffer until the consumer returns it. The current
+synchronous tensor upload contract is retained: each weight upload finishes
+before its source can be reused. This lets the next layer's filesystem reads
+run concurrently without changing inference stream ordering or model construction.
+Views borrow the current layer buffer; device tensors own their GPU allocations.
 
-`RUSTINFER_BULK_UPLOAD_CHUNK_MIB` is read when creating the CUDA context:
+The reader completes all reads for a layer before publishing it. An I/O error is
+reported to the consumer rather than publishing partial weights. On a model
+construction error, both queues are disconnected before joining the reader,
+including when it is waiting for a free buffer or space in the ready queue.
 
-- Unset: 8 MiB per slot.
-- `0`: disable staging and use the existing synchronous upload.
-- `1..=64`: chunk size in MiB; total pinned allocation is twice this size.
-- Invalid values fail initialization. Pinned allocation failures are reported.
+Contiguous same-dtype weights and row shards borrow their host bytes. Existing
+CPU dtype conversion, TP column gathering, and QKV/gate-up fusion still perform
+their required transformations. Those transformations can allocate owned
+buffers, so total loading memory is larger than the two-buffer capacity.
 
-Transfers of one chunk or less use the original upload to avoid an extra copy.
-No buffers, events or worker threads are allocated per chunk. A failed stream
-drain makes staging unusable and retains its pinned buffers rather than freeing
-a potentially active DMA source.
+Embedding, final output weights, separate vision/MTP builders and other paths
+outside the integrated decoder layer loops keep their existing loading behavior.
+Each TP worker currently prefetches whole checkpoint layers before selecting its
+local shards; this is correct but does not reduce storage reads or pinned-host
+capacity by TP size. MoE-specific builders are not integrated here.
+
+## Validation and measurement
+
+CPU tests verify that the next layer becomes available while the current buffer
+is held, only recycled buffers are reused, tensor ranges across checkpoint shards
+are correct, and the pipeline does not depend on the original mmap remaining
+alive. Other tests exercise early consumer exit and file-read error propagation.
+A GPU test reads a file into pinned memory on another thread, uploads those same
+bytes, then overwrites/frees the source and verifies the device result.
 
 ```bash
 python3 scripts/bench_weight_loading.py \
   --model /root/models/Qwen3.5-4B --gpu 0 \
-  --output target/weight-loading-comparison --repeats 3
+  --baseline-bin-dir target/weight-upload-before-bin \
+  --output target/layer-prefetch-comparison --repeats 3
 ```
 
-The script alternates serial and double-buffered loading in isolated workers,
-excludes one warm-up round by default, records the worker's weight-loading
-duration and full readiness time separately,
-and compares three short greedy responses. `--baseline-bin-dir` optionally adds
-saved pre-change binaries to measure the combined loader change. It retains OS
-caches and never drops global caches or stops unrelated GPU jobs. Therefore its
-results are not controlled cold-storage measurements. The serial variant retains
-the new borrowed-byte paths, isolating the additional effect of pinned staging.
+The benchmark compares saved baseline binaries with the current default path,
+excludes one warm-up round per variant, alternates order and checks three short
+greedy responses. Weight-loading time and full readiness time are reported
+separately. OS caches are retained; no global cache eviction or termination of
+unrelated GPU jobs occurs. These results do not measure controlled cold-disk
+performance or steady-state decode throughput.
 
-The intended gain is startup/load latency and less full-size host copying, not
-decode throughput or MTP acceptance. End-to-end startup also includes CUDA
-initialization, model setup and graph priming outside weight upload.
+### Local result (2026-09-10)
 
-## Validation
+RTX 4070 Ti SUPER, WSL2, Qwen3.5-4B BF16. Artifacts:
+`target/layer-prefetch-comparison/results.json` and per-run worker logs.
 
-- Loader tests cover borrowing contiguous same-dtype data, TP row offsets,
-  gathering non-contiguous columns, and retaining dtype conversion behavior.
-- CUDA `bulk_upload` integration test covers small/empty inputs, exact chunk
-  boundaries, odd tails, repeated slot reuse, immediate source overwrite/drop,
-  and graph-capture rejection before destination modification.
-- Existing worker/hybrid decoder and CPU/core tests cover model construction
-  and runtime behavior.
-
-## Local measurement (2026-09-10)
-
-Qwen3.5-4B BF16, RTX 4070 Ti SUPER, WSL2. One excluded warm-up round
-per variant, then three measured starts per variant with alternating order.
-No concurrent builds in this final run; OS caches retained. Artifacts:
-`target/weight-loading-final/results.json` and its per-run worker logs.
-
-| Variant | Median weights loaded |
+| Version | Median weight-loading interval |
 | --- | ---: |
-| Saved pre-change worker | 4.91 s |
-| Borrowed-byte loader, staging disabled | 2.40 s |
-| Borrowed-byte loader, 2 × 8 MiB staging | 2.44 s |
+| Saved original worker, before loader changes | 4.78 s |
+| Current layer pipeline and borrowed-byte loader | 2.34 s |
 
-The combined default change reduced this warm-cache loading interval by about
-50.3%. The isolated staging comparison was about 1.7% slower (40 ms), so this
-run provides **no evidence of an additional warm-cache speedup from double
-buffering**. The demonstrated improvement is from avoiding full-size temporary
-CPU copies; cold-storage overlap still needs a separate controlled measurement.
-This does not imply faster steady-state decoding.
+All three short responses matched across eight worker starts (one excluded
+warm-up plus three measured starts per variant). The combined loading change
+reduced this warm-cache interval by about 51%. This comparison includes removal
+of temporary full-size CPU copies; it does not isolate the speedup of overlapping
+layer reads and uploads. It is not evidence of a cold-storage speedup.
 
-All three short greedy responses matched across all twelve worker starts. This
-is a loading regression check, not a comprehensive model-accuracy benchmark.
-
-Validation completed: 170 worker unit/integration tests, 43 core/CPU tests and
-doctests, GPU bulk-copy test with staging both enabled and disabled, CPU-side
-Clippy with warnings denied, and CUDA release worker/scheduler/server builds.
-CUDA Clippy completed with existing warnings in flash-attention/scalar kernels;
-no new warnings originated in the upload implementation. Python compilation and
-existing script tests passed.
+Validation: 173 worker unit/integration tests, 43 core/CPU tests and doctests,
+CUDA direct-read/upload lifecycle test, CPU-side Clippy with warnings denied,
+and CUDA worker/scheduler/server Release build passed. The build retains its
+existing flash-attention dead-code warning.

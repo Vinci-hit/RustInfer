@@ -21,6 +21,7 @@ struct Shard {
     // SAFETY: `_mmap` outlives `header` (declared first → dropped second).
     header: SafeTensors<'static>,
     _mmap: Box<Mmap>,
+    file: std::sync::Arc<std::fs::File>,
 }
 
 impl Shard {
@@ -37,6 +38,7 @@ impl Shard {
         Ok(Self {
             header,
             _mmap: mmap,
+            file: std::sync::Arc::new(file),
         })
     }
 }
@@ -211,3 +213,6 @@ impl SafetensorsReader {
         }
     }
 }
+
+mod prefetch;
+pub use prefetch::{LayerPrefetch, PrefetchedLayer};

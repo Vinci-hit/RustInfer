@@ -257,7 +257,7 @@ impl<T: Dtype, D: MemoryPort> Tensor<T, D> {
             // SAFETY: storage just allocated with size_bytes bytes.
             unsafe {
                 let dst = std::ptr::NonNull::new_unchecked(storage.ptr());
-                device.upload_bulk(dst, bytes.as_ptr(), size_bytes)?;
+                device.upload(dst, bytes.as_ptr(), size_bytes)?;
             }
         }
         let strides = shape.contiguous_strides();

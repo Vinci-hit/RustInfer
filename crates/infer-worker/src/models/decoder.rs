@@ -410,7 +410,11 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
     let mut blocks = Vec::with_capacity(cfg.layer_num);
+    let prefetch = loader.prefetch_layers("model.layers", cfg.layer_num, device)?;
     for i in 0..cfg.layer_num {
+        let prefetched = prefetch.next_layer()?;
+        let layer_loader = loader.with_prefetched(&prefetched);
+        let loader = &layer_loader;
         let lp = format!("model.layers.{}", i);
         let input_layernorm = loader.load_rmsnorm::<T, D>(
             &format!("{}.input_layernorm.weight", lp),
@@ -518,6 +522,7 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
                 scratch: None,
             },
         });
+        prefetch.recycle(prefetched);
     }
 
     Decoder::new(
