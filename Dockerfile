@@ -2,12 +2,15 @@
 
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=24.04
+# Keep development and runtime NCCL packages aligned with the CUDA base image.
+ARG NCCL_VERSION=2.25.1-1+cuda12.8
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG RUST_VERSION=1.91.1
 ARG CUDA_ARCH=sm_90
 ARG CUDNN_FRONTEND_VERSION=1.18.0
+ARG NCCL_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/opt/cargo \
@@ -22,7 +25,7 @@ RUN apt-get update \
         cmake \
         curl \
         libclang-dev \
-        libnccl-dev \
+        libnccl-dev=${NCCL_VERSION} \
         pkg-config \
         python3 \
         python3-pip \
@@ -80,6 +83,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION} AS runtim
 
 ARG CUDA_ARCH=sm_90
 ARG VERSION=dev
+ARG NCCL_VERSION
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="RustInfer" \
@@ -95,7 +99,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         curl \
-        libnccl2 \
+        libnccl2=${NCCL_VERSION} \
         libstdc++6 \
         tini \
     && rm -rf /var/lib/apt/lists/* \

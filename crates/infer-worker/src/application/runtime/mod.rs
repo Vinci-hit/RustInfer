@@ -32,8 +32,8 @@ mod multimodal;
 mod peer;
 mod plan;
 mod recurrent;
-mod startup;
 mod speculative;
+mod startup;
 pub use speculative::TargetStep;
 
 pub use graph_exec::{GraphDecision, GraphRunner, GraphSlotId};
