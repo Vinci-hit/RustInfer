@@ -42,6 +42,7 @@ pub struct MtpSession<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: Decod
     generated: u32,
     finished: bool,
     poisoned: bool,
+    target_hidden: crate::domain::tensor::Tensor<T, D>,
 }
 
 impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
@@ -79,7 +80,11 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
         )?;
         let block_size = 16;
         let num_blocks = limits.max_context.div_ceil(block_size);
-        let target = Runtime::new(
+        let target_hidden = crate::domain::tensor::Tensor::zeros(
+            [limits.max_step_tokens, model.dims().dim],
+            scope.device(),
+        )?;
+        let mut target = Runtime::new(
             model,
             scope,
             Box::new(GreedySampler),
@@ -91,7 +96,9 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             1,
             vec![],
         )?;
+        target.prepare_speculative()?;
         Ok(Self {
+            target_hidden,
             target,
             proposer,
             blocks: (0..num_blocks as u32).collect(),
@@ -143,15 +150,17 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             let mut next = 0;
             for ids in prompt.chunks(self.limits.max_step_tokens) {
                 let request = self.request(ids, vec![]);
-                let target = self.target.step_with_hidden(&request)?;
+                let output = self
+                    .target
+                    .step_with_hidden_into(&request, &mut self.target_hidden)?;
                 self.proposer.observe(
                     ids,
                     self.len,
-                    &target.normalized_hidden,
+                    &self.target_hidden.narrow(0, 0, ids.len())?,
                     &self.target.scope,
                 )?;
                 self.len += ids.len();
-                next = target.output.tokens[0][0].token_id;
+                next = output.tokens[0][0].token_id;
             }
             self.pending = Some(next);
             self.generated = 1;
@@ -188,29 +197,30 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             let mut ids = Vec::with_capacity(k + 1);
             ids.push(self.pending.unwrap());
             ids.extend_from_slice(&drafts);
-            let target = self
+            let req = self.request(&ids, vec![drafts]);
+            let output = self
                 .target
-                .step_with_hidden(&self.request(&ids, vec![drafts]))?;
-            let retained = target.output.materialized_tokens[0] as usize;
+                .step_with_hidden_into(&req, &mut self.target_hidden)?;
+            let retained = output.materialized_tokens[0] as usize;
             self.proposer.observe(
                 &ids[..retained],
                 self.len,
-                &target.normalized_hidden,
+                &self.target_hidden.narrow(0, 0, retained)?,
                 &self.target.scope,
             )?;
-            let tokens = target.output.tokens[0]
+            let tokens = output.tokens[0]
                 .iter()
                 .map(|t| t.token_id)
                 .collect::<Vec<_>>();
             self.len += retained;
             self.generated += tokens.len() as u32;
             self.pending = tokens.last().copied();
-            self.finished = target.output.finished[0] || self.len >= self.limits.max_context;
+            self.finished = output.finished[0] || self.len >= self.limits.max_context;
             debug_assert_eq!(self.proposer.committed_len() + 1, self.len);
             Ok(MtpStep {
                 tokens,
                 proposed: k,
-                accepted: target.output.accepted_drafts.as_ref().unwrap()[0] as usize,
+                accepted: output.accepted_drafts.as_ref().unwrap()[0] as usize,
                 finished: self.finished,
             })
         })();

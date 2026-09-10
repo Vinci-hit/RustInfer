@@ -74,7 +74,8 @@ pool_retain_mib = 256
 
     def __enter__(self):
         info = gpu_info(self.args.gpu)
-        if info["memory_mib"] > 512 or info["utilization"] > 5:
+        if (info["memory_mib"] > self.args.max_background_memory_mib
+                or info["utilization"] > self.args.max_background_utilization):
             raise RuntimeError(f"GPU {self.args.gpu} is not idle: {info}")
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(self.args.gpu))
         try:
@@ -168,6 +169,10 @@ def main():
     parser.add_argument("--modes", nargs="+", choices=["graph", "eager", "mtp1", "mtp2", "mtp3", "mtp4"], default=["graph", "eager", "mtp1", "mtp3"])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--max-background-memory-mib", type=int, default=512,
+                        help="Allowed pre-existing GPU memory usage (e.g. a display GPU)")
+    parser.add_argument("--max-background-utilization", type=int, default=5,
+                        help="Allowed pre-existing GPU utilization percentage")
     args = parser.parse_args()
     if args.repeats < 1 or args.tokens < 2 or len(set(args.modes)) != len(args.modes):
         parser.error("repeats must be positive, tokens >= 2, and modes unique")
@@ -199,7 +204,8 @@ def main():
                 assert [r["text"] for r in queued] == [r["text"] for r in accuracy[:2]]
                 # The second half of a speculative burst must not escape a stop string.
                 stopped = stack.request(checks[2], count=32, ignore_eos=False, stop=["return"])
-                assert "return" not in stopped["text"], stopped
+                # Preserve failures without losing the other modes' measurements.
+                stop_check = dict(passed="return" not in stopped["text"], response=stopped)
                 cancel_payload = dict(prompt=chat_prompt(prompts[0]), temperature=0, max_tokens=512,
                                       ignore_eos=True, stream=True)
                 cancel = urllib.request.Request(stack.url + "/v1/completions",
@@ -249,6 +255,7 @@ def main():
                     for key in ("draft_ms", "verify_ms", "catchup_ms"):
                         summary["round_median_" + key] = statistics.median(float(re.search(rf"\b{key}=([0-9.eE+-]+)", line)[1]) for line in rounds)
                 report["modes"][mode] = dict(accuracy=accuracy, measured=measured, summary=summary,
+                                             stop_check=stop_check,
                                              measured_graph_replays=graph_replays, measured_mtp_rounds=len(rounds))
                 if "graph" in report["modes"]:
                     baseline = report["modes"]["graph"]
@@ -262,8 +269,12 @@ def main():
             for result in report["modes"].values():
                 result["accuracy_matches_graph"] = [a["text"] == b["text"] for a, b in zip(result["accuracy"], baseline["accuracy"])]
                 result["performance_text_matches_graph"] = [a["text"] == b["text"] for a, b in zip(result["measured"], baseline["measured"])]
-            report["accuracy_passed"] = all(all(m["accuracy_matches_graph"]) for m in report["modes"].values())
-            assert report["accuracy_passed"], "short greedy responses differed; see results.json"
+            report["accuracy_passed"] = all(
+                all(m["accuracy_matches_graph"]) and all(m["performance_text_matches_graph"])
+                for m in report["modes"].values())
+            report["stop_checks_passed"] = all(m["stop_check"]["passed"] for m in report["modes"].values())
+            assert report["accuracy_passed"], "greedy responses differed; see results.json"
+            assert report["stop_checks_passed"], "stop string check failed; see results.json"
     except BaseException as error:
         report["error"] = repr(error)
         raise

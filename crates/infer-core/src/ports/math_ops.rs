@@ -11,6 +11,16 @@ use infer_core::tensor::Tensor;
 use infer_core::types::{Shape, Strides};
 
 pub trait MathOps: Device {
+    /// Stream-ordered copy between disjoint, contiguous tensors. As with other
+    /// operators, callers keep both storages alive until execution completes.
+    fn copy_tensor<T: Dtype>(
+        _scope: &Self::Scope,
+        src: &Tensor<T, Self>,
+        dst: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        dst.copy_from(src)
+    }
+
     fn alloc_tensor<T: Dtype>(shape: Shape, device: &Self) -> OpResult<Tensor<T, Self>> {
         Tensor::<T, Self>::zeros(shape, device)
     }

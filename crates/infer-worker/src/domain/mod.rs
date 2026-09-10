@@ -38,3 +38,5 @@ pub use storage::Storage;
 pub use tensor::Tensor;
 pub use tensor_parallel::TensorParallelPlacement;
 pub use types::{DataType, Dims, Dtype, MAX_RANK, Shape, Strides};
+
+pub(crate) mod mtp_scratch;

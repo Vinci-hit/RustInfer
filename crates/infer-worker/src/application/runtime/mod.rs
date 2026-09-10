@@ -53,6 +53,7 @@ where
 {
     pub model: M,
     recurrent: Option<recurrent::RecurrentState<T, D>>,
+    retained_request: Option<StepRequest>,
     visual: multimodal::VisualState<T, D>,
     pub kv_pool: PagedKvPool<T, D>,
     pub kv_index: KvIndexTensors<D>,
@@ -492,6 +493,7 @@ where
 
         Ok(Self {
             recurrent,
+            retained_request: None,
             visual: multimodal::VisualState::default(),
             model,
             kv_pool,
@@ -836,11 +838,13 @@ where
             let materialized = plan.q_lens.iter().map(|&q| q as u32).collect();
             (tokens, materialized, None)
         } else {
-            let decisions = crate::application::speculative::GreedyVerifier.verify(
+            let decisions = crate::application::speculative::GreedyVerifier.verify_into(
                 &logits.0,
                 &req.draft_tokens,
                 &req.sampling,
                 &ctx,
+                &mut self.abc.argmax_out_dev.narrow(0, 0, plan.num_tokens)?,
+                &self.abc.argmax_ws,
             )?;
             let mut tokens = Vec::with_capacity(plan.batch);
             let mut materialized = Vec::with_capacity(plan.batch);

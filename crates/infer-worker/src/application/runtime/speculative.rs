@@ -10,6 +10,21 @@ pub struct TargetStep<T: Dtype, D: LlmBackend> {
 }
 
 impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
+    /// Called by speculative serving/session constructors before requests.
+    pub fn prepare_speculative(&mut self) -> OpResult<()> {
+        if self.retained_request.is_none() {
+            self.retained_request = Some(StepRequest::workspace(
+                self.cap_batch,
+                self.cap_num_tokens,
+                self.max_blocks_per_seq,
+            ));
+        }
+        if let Some(state) = self.recurrent.as_mut() {
+            state.prepare_snapshot()?;
+        }
+        Ok(())
+    }
+
     fn validate_eager_transaction(&self, req: &StepRequest) -> OpResult<()> {
         if self.scope.topology().tp.size != 1 {
             return Err(OpError::unsupported("target readout", "tensor parallelism"));
@@ -61,40 +76,40 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
     ) -> OpResult<(StepOutput, BatchPlan)> {
         self.validate_eager_transaction(req)?;
         self.prepare_recurrent_verification(req, plan)?;
+        let mut retained = self.retained_request.take().unwrap_or_else(|| {
+            StepRequest::workspace(self.cap_batch, self.cap_num_tokens, self.max_blocks_per_seq)
+        });
         let result = (|| {
-            self.scope.synchronize()?;
-            let snapshot = self
-                .recurrent
-                .as_ref()
-                .map(|r| r.snapshot(req))
-                .transpose()?;
-            infer_core::device::MemoryPort::synchronize(self.scope.device())?;
+            if let Some(state) = self.recurrent.as_mut() {
+                state.snapshot(req, &self.scope)?;
+            }
             self.upload_index(plan, req)?;
             self.prepare_multimodal(req)?;
             let output = self.step_eager(plan, req)?;
-            let mut retained = req.clone();
-            retained.draft_tokens.clear();
-            for (seq, &n) in retained.seqs.iter_mut().zip(&output.materialized_tokens) {
-                let n = n as usize;
-                if n == 0 || n > seq.input_ids.len() {
-                    return Err(OpError::Shape(
-                        "invalid speculative retention length".into(),
-                    ));
-                }
-                seq.input_ids.truncate(n);
-                seq.positions.truncate(n);
-                seq.kv_len_after = seq.kv_write_start + n as i32;
+            if output.materialized_tokens.len() != req.seqs.len()
+                || req
+                    .seqs
+                    .iter()
+                    .zip(&output.materialized_tokens)
+                    .any(|(seq, &n)| n == 0 || n as usize > seq.input_ids.len())
+            {
+                return Err(OpError::Shape(
+                    "invalid speculative retention length".into(),
+                ));
             }
+            retained.retain_from(req, &output.materialized_tokens);
             let retained_plan = self.build_plan(&retained)?;
             if retained_plan.num_tokens != plan.num_tokens {
                 // GDN has already consumed rejected inputs. Restore the entire
                 // participating batch, then replay just its retained prefixes.
                 // Full-attention KV suffix bytes become inaccessible via lengths;
                 // the lease owner may release the corresponding blocks.
-                self.scope.synchronize()?;
-                if let (Some(saved), Some(state)) = (snapshot.as_ref(), self.recurrent.as_mut()) {
-                    saved.restore(&mut state.layers)?;
-                    infer_core::device::MemoryPort::synchronize(self.scope.device())?;
+                if let Some(state) = self.recurrent.as_mut() {
+                    state
+                        .verification_snapshot
+                        .as_ref()
+                        .unwrap()
+                        .restore_on(&mut state.layers, &self.scope)?;
                     // Logical lengths still refer to the pre-verification prefix.
                     self.prepare_recurrent(&retained, &retained_plan)?;
                 }
@@ -109,6 +124,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
             self.scope.synchronize()?;
             Ok((output, retained_plan))
         })();
+        self.retained_request = Some(retained);
         self.finish_recurrent_step(result)
     }
 }
@@ -120,6 +136,35 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
     pub fn step_with_hidden(&mut self, req: &StepRequest) -> OpResult<TargetStep<T, D>> {
         let plan = self.build_plan(req)?;
         self.validate_eager_transaction(req)?;
+        let mut normalized_hidden =
+            Tensor::zeros([plan.num_tokens, self.dims.dim], self.scope.device())?;
+        let output = self.step_with_hidden_into(req, &mut normalized_hidden)?;
+        let n = output.materialized_tokens.iter().map(|&n| n as usize).sum();
+        Ok(TargetStep {
+            output,
+            normalized_hidden: normalized_hidden.narrow(0, 0, n)?,
+        })
+    }
+
+    /// Borrow caller-owned startup scratch; the caller consumes it before reuse.
+    pub fn step_with_hidden_into(
+        &mut self,
+        req: &StepRequest,
+        normalized_hidden: &mut Tensor<T, D>,
+    ) -> OpResult<StepOutput> {
+        let plan = self.build_plan(req)?;
+        self.validate_eager_transaction(req)?;
+        if normalized_hidden.shape().len() != 2
+            || normalized_hidden.shape()[0] < plan.num_tokens
+            || normalized_hidden.shape()[1] != self.dims.dim
+            || !normalized_hidden.is_contiguous()
+            || infer_core::device::Device::device_id(normalized_hidden.device())
+                != infer_core::device::Device::device_id(self.scope.device())
+        {
+            return Err(OpError::Shape(
+                "target hidden workspace capacity/layout/device mismatch".into(),
+            ));
+        }
         let (output, retained_plan) = if req.draft_tokens.is_empty() {
             self.prepare_recurrent(req, &plan)?;
             let result = (|| {
@@ -133,7 +178,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
         };
         let result = (|| {
             let n = retained_plan.num_tokens;
-            let mut normalized_hidden = Tensor::zeros([n, self.dims.dim], self.scope.device())?;
+            let mut normalized_hidden = normalized_hidden.narrow(0, 0, n)?;
             let hidden = Hidden {
                 stream: self.hidden.stream.narrow(0, 0, n)?,
                 pending: None,
@@ -142,10 +187,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
             self.model
                 .normalize_hidden_into(&hidden, &mut normalized_hidden, &ctx)?;
             self.scope.synchronize()?;
-            Ok(TargetStep {
-                output,
-                normalized_hidden,
-            })
+            Ok(output)
         })();
         if result.is_err() {
             for seq in &req.seqs {

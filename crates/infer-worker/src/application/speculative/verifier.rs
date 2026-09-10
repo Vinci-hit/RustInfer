@@ -9,6 +9,8 @@ use crate::domain::tensor::Tensor;
 /// in ordinary greedy sampling; CUDA transfers only the per-row token IDs.
 pub struct GreedyVerifier;
 
+type ArgmaxScratch<'a, D> = (&'a mut Tensor<i32, D>, &'a Tensor<f32, D>);
+
 impl GreedyVerifier {
     pub fn verify<T: Dtype, D: LlmBackend>(
         &self,
@@ -16,6 +18,30 @@ impl GreedyVerifier {
         drafts: &[Vec<i32>],
         params: &[SamplingParams],
         ctx: &StepCtx<'_, D>,
+    ) -> OpResult<Vec<Verification>> {
+        self.verify_impl(target_logits, drafts, params, ctx, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_into<T: Dtype, D: LlmBackend>(
+        &self,
+        target_logits: &Tensor<T, D>,
+        drafts: &[Vec<i32>],
+        params: &[SamplingParams],
+        ctx: &StepCtx<'_, D>,
+        out: &mut Tensor<i32, D>,
+        workspace: &Tensor<f32, D>,
+    ) -> OpResult<Vec<Verification>> {
+        self.verify_impl(target_logits, drafts, params, ctx, Some((out, workspace)))
+    }
+
+    fn verify_impl<T: Dtype, D: LlmBackend>(
+        &self,
+        target_logits: &Tensor<T, D>,
+        drafts: &[Vec<i32>],
+        params: &[SamplingParams],
+        ctx: &StepCtx<'_, D>,
+        scratch: Option<ArgmaxScratch<'_, D>>,
     ) -> OpResult<Vec<Verification>> {
         let plan = ctx.plan();
         validate_sampling(params, plan.batch)?;
@@ -48,7 +74,12 @@ impl GreedyVerifier {
         for seq in batch.sequences() {
             validate_token_ids(seq.drafts, vocab, "draft")?;
         }
-        let target_ids = D::argmax(ctx, target_logits)?;
+        let target_ids = if let Some((out, workspace)) = scratch {
+            D::argmax_into(ctx, target_logits, out, workspace, None)?;
+            out.to_host_vec()?
+        } else {
+            D::argmax(ctx, target_logits)?
+        };
         verify_predictions(&target_ids, batch, vocab)
     }
 }

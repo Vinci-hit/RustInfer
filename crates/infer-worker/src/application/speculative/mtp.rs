@@ -6,7 +6,8 @@ use crate::domain::dtype::Dtype;
 use crate::domain::exec::{ExecScope, StepCtx};
 use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use crate::domain::model::DecoderReadout;
-use crate::domain::plan::{BatchKind, BatchPlan};
+use crate::domain::mtp_scratch::MtpWorkspace;
+use crate::domain::plan::BatchPlan;
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpError, OpResult};
 use crate::domain::tensor::Tensor;
@@ -20,6 +21,7 @@ pub struct MtpProposer<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> {
     alignment: MtpPrefill<T, D>,
     max_context: usize,
     max_tokens: usize,
+    workspace: MtpWorkspace<T, D>,
 }
 
 impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
@@ -60,10 +62,13 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
             quant: KvQuantTier::None,
             seq_kv_len: Default::default(),
         };
+        let alignment = MtpPrefill::with_capacity(max_tokens, head.dims().dim, device)?;
+        let workspace = MtpWorkspace::new(head.dims(), max_context, max_tokens, device)?;
         Ok(Self {
             head,
             kv,
-            alignment: MtpPrefill::default(),
+            alignment,
+            workspace,
             max_context,
             max_tokens,
         })
@@ -78,8 +83,8 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         self.alignment.pending().map_or(0, |(p, _)| p as usize)
     }
 
-    /// Synchronize target outputs before calling. Default-stream alignment
-    /// copies are drained before launching on the supplied execution scope.
+    /// Synchronize target outputs before calling. Alignment copies and catch-up
+    /// execute in order on the supplied scope and complete before commit.
     pub fn observe(
         &mut self,
         ids: &[i32],
@@ -96,21 +101,29 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
                 "MTP target hidden shape/device mismatch".into(),
             ));
         }
-        scope.synchronize()?;
-        let positions = (start as i32..(start + ids.len()) as i32).collect::<Vec<_>>();
-        let chunk = self.alignment.prepare(ids, &positions, hidden)?;
-        infer_core::device::MemoryPort::synchronize(scope.device())?;
-        if !chunk.next_token_ids.is_empty() {
-            run_head(
-                &self.head,
-                &mut self.kv,
-                &chunk.next_token_ids,
-                chunk.positions[0] as usize,
-                &chunk.target_hidden,
-                scope,
-            )?;
-        }
-        scope.synchronize()?;
+        let positions = self.workspace.positions(start, ids.len());
+        let chunk = self.alignment.prepare_on(ids, positions, hidden, scope)?;
+        let result = (|| {
+            if !chunk.next_token_ids.is_empty() {
+                self.workspace
+                    .prepare_observe(&chunk.next_token_ids, chunk.positions[0] as usize)?;
+                run_head(
+                    &self.head,
+                    &mut self.kv,
+                    &self.workspace.input(chunk.next_token_ids.len())?,
+                    &chunk.target_hidden,
+                    &mut self.workspace.hidden(0, chunk.next_token_ids.len())?,
+                    &self.workspace.index(0, chunk.next_token_ids.len())?,
+                    &self.workspace.plan,
+                    scope,
+                )?;
+            }
+            Ok(())
+        })();
+        // Includes alignment copies and the catch-up forward, even on errors.
+        let completed = scope.synchronize();
+        result?;
+        completed?;
         chunk.commit();
         Ok(())
     }
@@ -128,32 +141,55 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         {
             return Err(OpError::Shape("MTP draft exceeds capacity".into()));
         }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let mut conditioning = hidden.clone();
-        let mut token = pending;
-        let mut draft = Vec::with_capacity(count);
-        for i in 0..count {
-            let (next_hidden, plan) = run_head(
-                &self.head,
-                &mut self.kv,
-                &[token],
-                position as usize + i,
-                &conditioning,
-                scope,
-            )?;
-            let ctx = StepCtx::new(scope, &plan);
-            let mut logits = Tensor::zeros([1, self.head.dims().vocab_size], scope.device())?;
-            self.head
-                .project_logits_into(&next_hidden, &mut logits, &ctx)?;
-            let predicted = D::argmax(&ctx, &logits)?;
-            if predicted.len() != 1
-                || predicted[0] < 0
-                || predicted[0] as usize >= self.head.dims().vocab_size
-            {
-                return Err(OpError::Shape("invalid MTP argmax output".into()));
+        self.workspace
+            .prepare_draft(pending, position as usize, count)?;
+        let result = (|| {
+            for i in 0..count {
+                self.workspace.set_decode_position(position as usize + i);
+                let mut next_hidden = self.workspace.hidden(i % 2, 1)?;
+                run_head(
+                    &self.head,
+                    &mut self.kv,
+                    &self.workspace.token(i)?,
+                    &conditioning,
+                    &mut next_hidden,
+                    &self.workspace.index(i, 1)?,
+                    &self.workspace.plan,
+                    scope,
+                )?;
+                let ctx = StepCtx::new(scope, &self.workspace.plan);
+                self.head
+                    .project_logits_into(&next_hidden, &mut self.workspace.logits, &ctx)?;
+                // The next embedding reads this device token directly. Only the
+                // completed draft vector crosses to the CPU, once per round.
+                D::argmax_into(
+                    &ctx,
+                    &self.workspace.logits,
+                    &mut self.workspace.token(i + 1)?,
+                    &self.workspace.argmax_ws,
+                    None,
+                )?;
+                conditioning = next_hidden;
             }
-            token = predicted[0];
-            draft.push(token);
-            conditioning = next_hidden;
+            // Downloads use the device's default stream, which need not be the
+            // caller's execution stream. Fence once after the complete chain.
+            scope.synchronize()?;
+            self.workspace.drafts(count)?.to_host_vec()
+        })();
+        // Workspace owns all intermediates; drain before reuse, including errors.
+        if result.is_err() {
+            let _ = scope.synchronize();
+        }
+        let draft = result?;
+        if draft
+            .iter()
+            .any(|&id| id < 0 || id as usize >= self.head.dims().vocab_size)
+        {
+            return Err(OpError::Shape("invalid MTP argmax output".into()));
         }
         Ok(draft)
     }
@@ -179,65 +215,24 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_head<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>>(
     head: &MtpHead<T, D, H>,
     kv: &mut PagedKvPool<T, D>,
-    ids: &[i32],
-    start: usize,
+    ids: &Tensor<i32, D>,
     hidden: &Tensor<T, D>,
+    output: &mut Tensor<T, D>,
+    index: &KvIndexTensors<D>,
+    plan: &BatchPlan,
     scope: &D::Scope,
-) -> OpResult<(Tensor<T, D>, BatchPlan)> {
-    let n = ids.len();
-    let device = scope.device();
-    let ints = |v: &[i32]| Tensor::from_host_slice(v, [v.len()], device);
-    let (cu, req, tile) = BatchPlan::plan_ragged_tiles(&[n as i32]);
-    let positions = (start as i32..(start + n) as i32).collect::<Vec<_>>();
-    let plan = BatchPlan {
-        kind: if n == 1 {
-            BatchKind::DecodeOnly
-        } else {
-            BatchKind::Ragged
-        },
-        num_tokens: n,
-        batch: 1,
-        q_lens: vec![n as i32],
-        kv_lens: vec![(start + n) as i32],
-        seq_positions: vec![start as i32],
-        rope_positions: positions.clone(),
-        max_blocks_per_seq: kv.num_blocks,
-        block_size: kv.block_size,
-        total_q_tiles: req.len() as i32,
-    };
-    let index = KvIndexTensors {
-        block_tables: Tensor::from_host_slice(
-            &(0..kv.num_blocks as i32).collect::<Vec<_>>(),
-            [1, kv.num_blocks],
-            device,
-        )?,
-        cu_q_lens: ints(&cu)?,
-        kv_lens: ints(&plan.kv_lens)?,
-        seq_positions: ints(&plan.seq_positions)?,
-        seq_lens_step: ints(&plan.q_lens)?,
-        rope_positions: ints(&positions)?,
-        block2req: ints(&req)?,
-        block2tile: ints(&tile)?,
-        valid_q_tiles: ints(&[req.len() as i32])?,
-        valid_suffix_q_tiles: ints(&[req.len() as i32])?,
-    };
-    let input = ints(ids)?;
-    let mut output = Tensor::zeros([n, head.dims().dim], device)?;
-    let result = head.forward_hidden_into(
+) -> OpResult<()> {
+    head.forward_hidden_into(
         MtpInput {
-            next_token_ids: &input,
+            next_token_ids: ids,
             target_hidden: hidden,
         },
-        &mut ModelCacheView::full(kv, &index),
-        &mut output,
-        &StepCtx::new(scope, &plan),
-    );
-    // These local control tensors must outlive all GPU readers, including errors.
-    let completed = scope.synchronize();
-    result?;
-    completed?;
-    Ok((output, plan))
+        &mut ModelCacheView::full(kv, index),
+        output,
+        &StepCtx::new(scope, plan),
+    )
 }

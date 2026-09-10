@@ -414,6 +414,11 @@ where
         bs.capture_sizes.clone(),
     )
     .map_err(|e| format!("Runtime::new: {:?}", e))?;
+    if E::SPECULATIVE {
+        runner
+            .prepare_speculative()
+            .map_err(|e| format!("MTP workspace: {e}"))?;
+    }
     if !peer_handles.is_empty() {
         let watchdog = peer_watchdog
             .take()

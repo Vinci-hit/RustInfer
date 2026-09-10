@@ -5,7 +5,7 @@ use crate::application::serve_execution::{ServingExecution, ServingStep};
 use crate::application::worker_scheduler::handle_eager_prefill;
 use crate::components::mtp::MtpHead;
 use crate::domain::model::DecoderReadout;
-use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
+use crate::domain::plan::StepRequest;
 use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use half::bf16;
@@ -15,6 +15,8 @@ pub struct MtpServing<H: DecoderReadout<bf16, Cuda>> {
     proposer: MtpProposer<bf16, Cuda, H>,
     owner: Option<u64>,
     draft_tokens: usize,
+    request: StepRequest,
+    target_hidden: crate::domain::tensor::Tensor<bf16, Cuda>,
 }
 
 impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
@@ -30,7 +32,13 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
                 "MTP serving draft width must fit K+1 target rows".into(),
             ));
         }
+        let target_hidden =
+            crate::domain::tensor::Tensor::zeros([max_step_tokens, head.dims().dim], device)?;
+        let mut request = StepRequest::workspace(1, draft_tokens + 1, max_context);
+        request.draft_tokens.push(Vec::with_capacity(draft_tokens));
         Ok(Self {
+            request,
+            target_hidden,
             proposer: MtpProposer::new(
                 head,
                 max_context,
@@ -86,18 +94,18 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             ctx.allocator,
             ctx.eos_ids,
             |runner, req| {
-                let mut target = runner.step_with_hidden(req)?;
+                let mut output = runner.step_with_hidden_into(req, &mut self.target_hidden)?;
                 let seq = &req.seqs[0];
                 self.proposer.observe(
                     &seq.input_ids,
                     seq.kv_write_start as usize,
-                    &target.normalized_hidden,
+                    &self.target_hidden.narrow(0, 0, seq.input_ids.len())?,
                     &runner.scope,
                 )?;
                 if seq.kv_len_after as usize >= runner.max_seq_len {
-                    target.output.finished[0] = true;
+                    output.finished[0] = true;
                 }
-                Ok(target.output)
+                Ok(output)
             },
         )?;
         ctx.data
@@ -133,51 +141,57 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             let started = std::time::Instant::now();
             let drafts = self.proposer.draft(seq.last_token, k, &ctx.runner.scope)?;
             let drafted = started.elapsed();
-            let mut input = vec![seq.last_token];
-            input.extend_from_slice(&drafts);
-            let mut table = seq.block_table.clone();
-            table.extend_from_slice(lease.as_slice());
-            let req = StepRequest {
-                seqs: vec![SeqStep {
-                    sequence_id: id,
-                    input_ids: input.clone(),
-                    positions: (seq.kv_len as i32..(seq.kv_len + input.len()) as i32).collect(),
-                    kv_write_start: seq.kv_len as i32,
-                    kv_len_after: (seq.kv_len + input.len()) as i32,
-                    block_table: table,
-                }],
-                sampling: vec![seq.sampling],
-                draft_tokens: vec![drafts],
-                stop: StopCriteria {
-                    eos_ids: ctx.eos_ids.to_vec(),
-                    generated_counts: vec![seq.generated_count as u32],
-                    max_tokens: vec![seq.max_tokens as u32],
-                    ignore_eos: vec![seq.ignore_eos],
-                },
-            };
-            let mut target = ctx.runner.step_with_hidden(&req)?;
+            let req = &mut self.request;
+            let staged = &mut req.seqs[0];
+            staged.sequence_id = id;
+            staged.input_ids.clear();
+            staged.input_ids.push(seq.last_token);
+            staged.input_ids.extend_from_slice(&drafts);
+            staged.positions.clear();
+            staged
+                .positions
+                .extend(seq.kv_len as i32..(seq.kv_len + k + 1) as i32);
+            staged.kv_write_start = seq.kv_len as i32;
+            staged.kv_len_after = (seq.kv_len + k + 1) as i32;
+            staged.block_table.clone_from(&seq.block_table);
+            staged.block_table.extend_from_slice(lease.as_slice());
+            req.sampling.clear();
+            req.sampling.push(seq.sampling);
+            req.draft_tokens[0].clear();
+            req.draft_tokens[0].extend_from_slice(&drafts);
+            req.stop.eos_ids.clear();
+            req.stop.eos_ids.extend_from_slice(ctx.eos_ids);
+            req.stop.generated_counts.clear();
+            req.stop.generated_counts.push(seq.generated_count as u32);
+            req.stop.max_tokens.clear();
+            req.stop.max_tokens.push(seq.max_tokens as u32);
+            req.stop.ignore_eos.clear();
+            req.stop.ignore_eos.push(seq.ignore_eos);
+            let mut output = ctx
+                .runner
+                .step_with_hidden_into(req, &mut self.target_hidden)?;
             let verified = started.elapsed();
-            let kept = target.output.materialized_tokens[0] as usize;
+            let kept = output.materialized_tokens[0] as usize;
             self.proposer.observe(
-                &input[..kept],
+                &req.seqs[0].input_ids[..kept],
                 seq.kv_len,
-                &target.normalized_hidden,
+                &self.target_hidden.narrow(0, 0, kept)?,
                 &ctx.runner.scope,
             )?;
             if seq.kv_len + kept >= ctx.runner.max_seq_len {
-                target.output.finished[0] = true;
+                output.finished[0] = true;
             }
             tracing::debug!(
                 sequence_id = id,
                 proposed = k,
-                accepted = target.output.accepted_drafts.as_ref().unwrap()[0],
-                emitted = target.output.tokens[0].len(),
+                accepted = output.accepted_drafts.as_ref().unwrap()[0],
+                emitted = output.tokens[0].len(),
                 draft_ms = drafted.as_secs_f64() * 1e3,
                 verify_ms = (verified - drafted).as_secs_f64() * 1e3,
                 catchup_ms = (started.elapsed() - verified).as_secs_f64() * 1e3,
                 "MTP round"
             );
-            Ok(target.output)
+            Ok(output)
         })();
         let output = match result {
             Ok(out) => out,

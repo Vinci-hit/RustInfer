@@ -14,27 +14,36 @@ pub(super) struct RecurrentState<T: Dtype, D: LlmBackend> {
     /// failure cannot leave reusable, partially executed recurrent history.
     decode_in_flight: Vec<u64>,
     capacity: usize,
+    pub(super) verification_snapshot: Option<crate::domain::cache::LinearSnapshot<T, D>>,
+    snapshot_slots: Vec<usize>,
 }
 
 impl<T: Dtype, D: LlmBackend> RecurrentState<T, D> {
-    pub(super) fn snapshot(
-        &self,
-        req: &StepRequest,
-    ) -> OpResult<crate::domain::cache::LinearSnapshot<T, D>> {
-        let slots = req
-            .seqs
-            .iter()
-            .map(|s| self.slots[&s.sequence_id].0)
-            .collect::<Vec<_>>();
-        crate::domain::cache::LinearSnapshot::capture(&self.layers, &slots)
+    pub(super) fn prepare_snapshot(&mut self) -> OpResult<()> {
+        if self.verification_snapshot.is_none() {
+            self.verification_snapshot = Some(crate::domain::cache::LinearSnapshot::reserve(
+                &self.layers,
+                self.capacity,
+            )?);
+        }
+        Ok(())
+    }
+    pub(super) fn snapshot(&mut self, req: &StepRequest, scope: &D::Scope) -> OpResult<()> {
+        self.prepare_snapshot()?;
+        self.snapshot_slots.clear();
+        self.snapshot_slots
+            .extend(req.seqs.iter().map(|s| self.slots[&s.sequence_id].0));
+        self.verification_snapshot.as_mut().unwrap().capture_on(
+            &self.layers,
+            &self.snapshot_slots,
+            scope,
+        )
     }
 
     pub(super) fn retain_step(&mut self, req: &StepRequest) {
-        self.step = req
-            .seqs
-            .iter()
-            .map(|s| (s.sequence_id, s.kv_len_after))
-            .collect();
+        self.step.clear();
+        self.step
+            .extend(req.seqs.iter().map(|s| (s.sequence_id, s.kv_len_after)));
     }
 
     pub(super) fn has_decode_in_flight(&self) -> bool {
@@ -58,7 +67,9 @@ impl<T: Dtype, D: LlmBackend> RecurrentState<T, D> {
             batch: None,
             slots: HashMap::new(),
             free: (0..capacity).rev().collect(),
-            step: Vec::new(),
+            step: Vec::with_capacity(capacity),
+            verification_snapshot: None,
+            snapshot_slots: Vec::with_capacity(capacity),
             decode_in_flight: Vec::with_capacity(capacity),
             capacity,
         })
@@ -69,7 +80,7 @@ impl<T: Dtype, D: LlmBackend> RecurrentState<T, D> {
         }
     }
     pub fn complete(&mut self, success: bool) {
-        for (id, len) in std::mem::take(&mut self.step) {
+        while let Some((id, len)) = self.step.pop() {
             if success {
                 if let Some(entry) = self.slots.get_mut(&id) {
                     entry.1 = len;

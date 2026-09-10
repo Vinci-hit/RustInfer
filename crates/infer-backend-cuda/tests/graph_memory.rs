@@ -319,3 +319,29 @@ fn low_level_capture_without_an_arena_rejects_dynamic_allocation_and_recovers() 
         .expect("end capture with an arena");
     assert_replay(&scope, 1, &output, &[21, 22, 23, 24]);
 }
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn scoped_copy_is_capture_safe_and_rejects_partial_overlap() {
+    use infer_core::ports::MathOps;
+    let scope = scope();
+    let mut source = tensor(&scope, &[1, 2, 3, 4]);
+    let mut output = tensor(&scope, &[0, 0, 0, 0]);
+    let same = source.clone();
+    Cuda::copy_tensor(&scope, &same, &mut source).unwrap();
+    assert!(
+        Cuda::copy_tensor(
+            &scope,
+            &source.narrow(0, 0, 3).unwrap(),
+            &mut source.narrow(0, 1, 3).unwrap(),
+        )
+        .is_err()
+    );
+    scope.synchronize().unwrap();
+    scope.graph_capture_begin().unwrap();
+    Cuda::copy_tensor(&scope, &source, &mut output).unwrap();
+    scope.graph_capture_end(13).unwrap();
+    assert_replay(&scope, 13, &output, &[1, 2, 3, 4]);
+    source.upload_from_host(&[9, 8, 7, 6]).unwrap();
+    assert_replay(&scope, 13, &output, &[9, 8, 7, 6]);
+}
