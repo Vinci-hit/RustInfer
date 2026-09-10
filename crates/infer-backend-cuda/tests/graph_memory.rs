@@ -345,3 +345,30 @@ fn scoped_copy_is_capture_safe_and_rejects_partial_overlap() {
     source.upload_from_host(&[9, 8, 7, 6]).unwrap();
     assert_replay(&scope, 13, &output, &[9, 8, 7, 6]);
 }
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn scope_timing_supports_replay_and_keeps_stream_alive() {
+    let scope = scope();
+    let input = tensor(&scope, &[7, 8, 9]);
+    let mut output = tensor(&scope, &[0, 0, 0]);
+    let mut timer = scope.create_timer().unwrap().expect("CUDA timer");
+    scope.graph_capture_begin().unwrap();
+    <Cuda as infer_core::ports::MathOps>::copy_tensor(&scope, &input, &mut output).unwrap();
+    scope.graph_capture_end(7171).unwrap();
+    timer.start().unwrap();
+    scope.graph_launch(7171).unwrap();
+    timer.stop().unwrap();
+    // Polling may yield None while work is pending; only the test synchronizes.
+    let _ = timer.elapsed_ms().unwrap();
+    scope.synchronize().unwrap();
+    let ms = timer.elapsed_ms().unwrap().expect("completed event");
+    assert!(ms.is_finite() && ms >= 0.0);
+    assert_eq!(output.to_host_vec().unwrap(), vec![7, 8, 9]);
+    drop(input);
+    drop(output);
+    drop(scope);
+    timer.start().unwrap();
+    timer.stop().unwrap();
+    // Timer owns its CUDA context through asynchronous destruction.
+}

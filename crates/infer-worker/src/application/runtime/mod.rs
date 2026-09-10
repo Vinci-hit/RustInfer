@@ -9,6 +9,9 @@
 //! This file keeps the `Runtime` struct and its address-stable buffers,
 //! construction, the eager step path, and the shared free helpers.
 
+use crate::application::execution::{
+    ExecutionMetrics, ExecutionMode, ExecutionPlan, Phase, WorkspaceUse,
+};
 use std::ptr::NonNull;
 
 use crate::domain::component::{Hidden, LayerRange};
@@ -51,6 +54,7 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
+    pub execution_metrics: ExecutionMetrics,
     pub model: M,
     recurrent: Option<recurrent::RecurrentState<T, D>>,
     retained_request: Option<StepRequest>,
@@ -491,7 +495,10 @@ where
             }
         };
 
+        let execution_metrics = ExecutionMetrics::from_env("target");
+        execution_metrics.prepare_gpu(&scope)?;
         Ok(Self {
+            execution_metrics,
             recurrent,
             retained_request: None,
             visual: multimodal::VisualState::default(),
@@ -634,13 +641,43 @@ where
             } else {
                 self.decide(&plan)
             };
-            match decision {
-                GraphDecision::Eager => self.step_eager(&plan, req),
-                GraphDecision::Graph(slot) => self.step_graph(slot, &plan, req),
-                GraphDecision::PrefillGraph(num_tokens) => {
-                    self.step_prefill_graph(num_tokens, &plan, req)
-                }
-            }
+            let execution = ExecutionPlan {
+                phase: if plan.q_lens.iter().all(|&q| q == 1) {
+                    Phase::Decode
+                } else {
+                    Phase::Prefill
+                },
+                mode: match decision {
+                    GraphDecision::Eager => ExecutionMode::Eager,
+                    GraphDecision::Graph(slot) => ExecutionMode::DecodeGraph {
+                        slot: self
+                            .graph
+                            .as_ref()
+                            .and_then(|g| g.slot_size(slot))
+                            .unwrap_or(plan.batch),
+                    },
+                    GraphDecision::PrefillGraph(tokens) => ExecutionMode::PrefillGraph { tokens },
+                },
+                batch: plan.batch,
+                tokens: plan.num_tokens,
+                workspace: WorkspaceUse::Runtime,
+            };
+            execution.execute(
+                &self.execution_metrics.clone(),
+                |execution| match execution.mode {
+                    ExecutionMode::Eager => self.step_eager(&plan, req),
+                    ExecutionMode::DecodeGraph { .. } => {
+                        let GraphDecision::Graph(slot) = decision else {
+                            unreachable!()
+                        };
+                        self.step_graph(slot, &plan, req)
+                    }
+                    ExecutionMode::PrefillGraph { tokens } => {
+                        self.step_prefill_graph(tokens, &plan, req)
+                    }
+                    ExecutionMode::MixedGraph { .. } => unreachable!("ordinary step plan"),
+                },
+            )
         })();
         // A successful forward alone does not make a step committable:
         // finalization, sampling and result validation must succeed too.

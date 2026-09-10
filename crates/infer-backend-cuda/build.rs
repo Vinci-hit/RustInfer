@@ -244,6 +244,7 @@ fn main() {
             .allowlist_function("cudaEventCreateWithFlags")
             .allowlist_function("cudaEventRecord")
             .allowlist_function("cudaEventSynchronize")
+            .allowlist_function("cudaEventQuery")
             .allowlist_function("cudaEventElapsedTime")
             .allowlist_function("cudaEventDestroy")
             .allowlist_type("cudaEvent_t")

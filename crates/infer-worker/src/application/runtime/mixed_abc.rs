@@ -2,6 +2,7 @@
 //! model: eager and bucketed-graph paths, issue/finalize halves, and the
 //! bootstrap mixed-graph prewarm (CUDA).
 
+use crate::application::execution::{ExecutionMode, ExecutionPlan, Phase, WorkspaceUse};
 use crate::domain::component::Hidden;
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::ExecScope;
@@ -460,7 +461,15 @@ where
             let result = (|| {
                 self.upload_index(&plan, req)?;
                 self.prepare_multimodal(req)?;
-                self.step_eager(&plan, req)
+                ExecutionPlan::eager(
+                    Phase::Mixed,
+                    plan.batch,
+                    plan.num_tokens,
+                    WorkspaceUse::Runtime,
+                )
+                .execute(&self.execution_metrics.clone(), |_| {
+                    self.step_eager(&plan, req)
+                })
             })();
             self.finish_recurrent_step(result)
         })();
@@ -608,12 +617,20 @@ where
                     D::pipeline_compute_wait_copy_out(&self.scope)?;
                 }
                 D::pipeline_arena_begin(&self.scope)?;
-                let result = self.run_mixed_abc_eager_region(
-                    run_plan.as_ref().unwrap_or(&plan),
-                    req,
-                    &input_ids,
-                    next_slots.is_some(),
+                let execution = ExecutionPlan::eager(
+                    Phase::Mixed,
+                    plan.batch,
+                    plan.num_tokens,
+                    WorkspaceUse::Abc,
                 );
+                let result = execution.execute(&self.execution_metrics.clone(), |_| {
+                    self.run_mixed_abc_eager_region(
+                        run_plan.as_ref().unwrap_or(&plan),
+                        req,
+                        &input_ids,
+                        next_slots.is_some(),
+                    )
+                });
                 D::pipeline_arena_end(&self.scope);
                 result?;
             }
@@ -666,7 +683,15 @@ where
             if !ticket.copied_out {
                 self.copy_out_mixed_abc(ticket.plan.batch)?;
             }
-            let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
+            let sync_result = ExecutionPlan::eager(
+                Phase::Wait,
+                ticket.plan.batch,
+                ticket.plan.num_tokens,
+                WorkspaceUse::Abc,
+            )
+            .execute(&self.execution_metrics, |_| {
+                D::pipeline_synchronize_copy_out(&self.scope)
+            });
             sync_result?;
             if ticket.trace {
                 // `elapsed` spans issue→sync, so it includes any host work the
@@ -781,7 +806,19 @@ where
             self.upload_index_with_suffix_prefix(plan, req, Some(shape.decode_prefix))?;
             self.upload_input_ids_bucket(req, plan.num_tokens, shape.tokens)?;
             self.upload_mixed_abc_metadata(req, row_kind, shape.rows)?;
-            self.scope.graph_launch(key)?;
+            ExecutionPlan {
+                phase: Phase::Mixed,
+                mode: ExecutionMode::MixedGraph { key },
+                batch: plan.batch,
+                tokens: plan.num_tokens,
+                workspace: WorkspaceUse::Abc,
+            }
+            .execute(&self.execution_metrics, |execution| {
+                let ExecutionMode::MixedGraph { key } = execution.mode else {
+                    unreachable!()
+                };
+                self.scope.graph_launch(key)
+            })?;
             return Ok(true);
         }
         if !self.mixed_graph_capture_enabled {
@@ -843,7 +880,19 @@ where
             self.mixed_graphs_captured,
             MIXED_GRAPH_BUDGET
         );
-        self.scope.graph_launch(key)?;
+        ExecutionPlan {
+            phase: Phase::Mixed,
+            mode: ExecutionMode::MixedGraph { key },
+            batch: plan.batch,
+            tokens: plan.num_tokens,
+            workspace: WorkspaceUse::Abc,
+        }
+        .execute(&self.execution_metrics, |execution| {
+            let ExecutionMode::MixedGraph { key } = execution.mode else {
+                unreachable!()
+            };
+            self.scope.graph_launch(key)
+        })?;
         Ok(true)
     }
 

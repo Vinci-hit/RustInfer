@@ -35,6 +35,14 @@ pub trait ExecDevice: MemoryPort {
 
 pub trait ExecHostDevice: ExecDevice {}
 
+/// Optional compute-stream timing pair. Recording and polling must never wait
+/// for GPU completion. Owners allocate pairs before serving and serialize use.
+pub trait ScopeTimer: Send {
+    fn start(&mut self) -> OpResult<()>;
+    fn stop(&mut self) -> OpResult<()>;
+    fn elapsed_ms(&mut self) -> OpResult<Option<f32>>;
+}
+
 pub trait ExecScope: Send + Sync + Sized + 'static {
     type Device: ExecDevice<Scope = Self>;
     type Stream: Stream;
@@ -46,6 +54,9 @@ pub trait ExecScope: Send + Sync + Sized + 'static {
     fn topology(&self) -> TopologyShape;
     fn quant_tier(&self) -> QuantTier;
     fn workspace(&self) -> &Workspace<Self::Device>;
+    fn create_timer(&self) -> OpResult<Option<Box<dyn ScopeTimer>>> {
+        Ok(None)
+    }
     fn supports_graphs(&self) -> bool {
         false
     }

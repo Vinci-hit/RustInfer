@@ -1,6 +1,7 @@
 //! ABC GPU-resident pipelined pure-decode: the `issue_decode_abc` /
 //! `finalize_decode_abc` halves of the 1-deep decode pipeline (CUDA).
 
+use crate::application::execution::{ExecutionMode, ExecutionPlan, Phase, WorkspaceUse};
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::ExecScope;
 use crate::domain::model::DecoderModel;
@@ -289,28 +290,37 @@ where
                 // decision never reaches here; treat it as eager for exhaustiveness.
                 GraphDecision::PrefillGraph(_) | GraphDecision::Eager => None,
             };
-            match slot_batch {
-                Some(sb) if self.scope.graph_ready(sb as u64) => {
-                    // Hot path: pure replay of the (>= batch) captured graph.
-                    tracing::debug!(
-                        batch,
-                        capture_batch = sb,
-                        multimodal = self.request_is_multimodal(req),
-                        "replaying decode CUDA graph"
-                    );
-                    self.launch_decode_graph(sb as u64)?;
+            let mode = match slot_batch {
+                Some(slot) if self.scope.graph_ready(slot as u64) => {
+                    ExecutionMode::DecodeGraph { slot }
                 }
-                // No ready graph for this shape (boot prewarm off/failed, or
-                // batch > max capture size): run EAGER at the real batch. We never
-                // capture inline at serve time — an inline capture is a full eager
-                // forward + `synchronize` + trace pass that blocks the serve loop
-                // (and every prefill queued behind it); that lazy capture WAS the
-                // original TTFT/TPOT stall. Every decode graph is captured once at
-                // boot by `prewarm_decode_graphs`; serving only replays or runs eager.
-                _ => {
-                    self.forward_finalize_argmax(&plan, &input_ids)?;
-                }
-            }
+                _ => ExecutionMode::Eager,
+            };
+            let execution = ExecutionPlan {
+                phase: Phase::Decode,
+                mode,
+                batch,
+                tokens: batch,
+                workspace: WorkspaceUse::Abc,
+            };
+            execution.execute(
+                &self.execution_metrics.clone(),
+                |execution| match execution.mode {
+                    ExecutionMode::DecodeGraph { slot } => {
+                        tracing::debug!(
+                            batch,
+                            capture_batch = slot,
+                            multimodal = self.request_is_multimodal(req),
+                            "replaying decode CUDA graph"
+                        );
+                        self.launch_decode_graph(slot as u64)
+                    }
+                    ExecutionMode::Eager => self.forward_finalize_argmax(&plan, &input_ids),
+                    ExecutionMode::PrefillGraph { .. } | ExecutionMode::MixedGraph { .. } => {
+                        unreachable!("validated decode plan")
+                    }
+                },
+            )?;
 
             // C feeds both stop evaluation and row compaction below. Synchronize
             // the sampled ids first so every rank takes the same active/finished
@@ -488,7 +498,10 @@ where
 
     fn finalize_decode_abc_local(&mut self, batch: usize) -> OpResult<DecodeCompactOutput> {
         let result = (|| {
-            let sync_result = D::pipeline_synchronize_copy_out(&self.scope);
+            let sync_result = ExecutionPlan::eager(Phase::Wait, batch, batch, WorkspaceUse::Abc)
+                .execute(&self.execution_metrics, |_| {
+                    D::pipeline_synchronize_copy_out(&self.scope)
+                });
             sync_result?; // host mirrors valid before we read them
 
             let active_n = self.abc.counts_host[0].max(0) as usize;

@@ -9,6 +9,7 @@ pub mod error;
 pub mod ffi;
 mod nccl;
 mod pool;
+mod timing;
 // Raw kernel launch wrappers are an implementation detail. Keeping this module
 // private prevents external callers from manufacturing invalid CUDA streams or
 // device pointers; the safe backend traits below are the supported API.
@@ -126,6 +127,10 @@ impl infer_core::exec::ExecScope for CudaScope {
 
     fn workspace(&self) -> &infer_core::exec::Workspace<Self::Device> {
         &self.workspace
+    }
+
+    fn create_timer(&self) -> OpResult<Option<Box<dyn infer_core::exec::ScopeTimer>>> {
+        Ok(Some(Box::new(timing::CudaTimer::new(self.device.clone())?)))
     }
 
     fn supports_graphs(&self) -> bool {

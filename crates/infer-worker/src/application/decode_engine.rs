@@ -642,16 +642,27 @@ impl DecodeEngine {
         let runtime_result = runner.finalize_decode_abc(p.batch);
         match runtime_result {
             Ok(compact) => {
-                let output = self.commit_results(
-                    active,
-                    kv_allocator,
-                    &p.order,
-                    p.new_indices,
-                    p.assigned,
-                    &compact,
-                    enable_prefix_caching,
-                    p.device_prepared,
-                )?;
+                let output = crate::application::execution::ExecutionPlan::eager(
+                    crate::application::execution::Phase::Commit,
+                    p.batch,
+                    p.batch,
+                    crate::application::execution::WorkspaceUse::Abc,
+                )
+                .execute(&runner.execution_metrics, |_| {
+                    self.commit_results(
+                        active,
+                        kv_allocator,
+                        &p.order,
+                        p.new_indices,
+                        p.assigned,
+                        &compact,
+                        enable_prefix_caching,
+                        p.device_prepared,
+                    )
+                })?;
+                runner
+                    .execution_metrics
+                    .committed(0, 0, output.tokens.len(), output.tokens.len());
                 // A now holds the surviving tokens compacted to the front in
                 // `rows` order (commit_results just set `rows` to the survivors).
                 self.prev_a_rows = self.rows.as_slice().to_vec();

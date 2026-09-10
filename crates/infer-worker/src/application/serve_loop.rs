@@ -419,6 +419,9 @@ where
             .prepare_speculative()
             .map_err(|e| format!("MTP workspace: {e}"))?;
     }
+    execution
+        .prepare(&runner)
+        .map_err(|e| format!("execution preparation: {e}"))?;
     if !peer_handles.is_empty() {
         let watchdog = peer_watchdog
             .take()

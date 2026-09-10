@@ -1,5 +1,6 @@
 //! MTP cache ownership, autoregressive drafting, and target-feature catch-up.
 use super::prefill::MtpPrefill;
+use crate::application::execution::{ExecutionMetrics, ExecutionPlan, Phase, WorkspaceUse};
 use crate::components::mtp::{MtpHead, MtpInput};
 use crate::domain::cache::ModelCacheView;
 use crate::domain::dtype::Dtype;
@@ -16,6 +17,7 @@ use crate::domain::tensor::Tensor;
 /// Catch-up overwrites them using actual target hidden states after verification,
 /// even when every draft was accepted. No target cache or sampling policy here.
 pub struct MtpProposer<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> {
+    metrics: ExecutionMetrics,
     head: MtpHead<T, D, H>,
     kv: PagedKvPool<T, D>,
     alignment: MtpPrefill<T, D>,
@@ -65,6 +67,7 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
         let alignment = MtpPrefill::with_capacity(max_tokens, head.dims().dim, device)?;
         let workspace = MtpWorkspace::new(head.dims(), max_context, max_tokens, device)?;
         Ok(Self {
+            metrics: ExecutionMetrics::from_env("proposer"),
             head,
             kv,
             alignment,
@@ -72,6 +75,10 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
             max_context,
             max_tokens,
         })
+    }
+
+    pub(crate) fn prepare_metrics(&self, scope: &D::Scope) -> OpResult<()> {
+        self.metrics.prepare_gpu(scope)
     }
 
     pub fn reset(&mut self) {
@@ -97,6 +104,20 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
 
     /// Continuation catch-up can consume the same tape as target verification.
     pub(crate) fn observe_with_input(
+        &mut self,
+        ids: &[i32],
+        start: usize,
+        hidden: &Tensor<T, D>,
+        scope: &D::Scope,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<()> {
+        ExecutionPlan::eager(Phase::CatchUp, 1, ids.len(), WorkspaceUse::Proposer)
+            .execute(&self.metrics.clone(), |_| {
+                self.observe_with_input_local(ids, start, hidden, scope, device_input)
+            })
+    }
+
+    fn observe_with_input_local(
         &mut self,
         ids: &[i32],
         start: usize,
@@ -154,7 +175,8 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
             Ok(())
         })();
         // Includes alignment copies and the catch-up forward, even on errors.
-        let completed = scope.synchronize();
+        let completed = ExecutionPlan::eager(Phase::Wait, 1, ids.len(), WorkspaceUse::Proposer)
+            .execute(&self.metrics, |_| scope.synchronize());
         result?;
         completed?;
         chunk.commit();
@@ -169,6 +191,18 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
     /// Host verification metadata and its matching device input tape. The tape
     /// remains valid until the next proposer operation; callers consume it now.
     pub(crate) fn draft_with_device(
+        &mut self,
+        pending: i32,
+        count: usize,
+        scope: &D::Scope,
+    ) -> OpResult<(Vec<i32>, Tensor<i32, D>)> {
+        ExecutionPlan::eager(Phase::Draft, 1, count, WorkspaceUse::Proposer)
+            .execute(&self.metrics.clone(), |_| {
+                self.draft_with_device_local(pending, count, scope)
+            })
+    }
+
+    fn draft_with_device_local(
         &mut self,
         pending: i32,
         count: usize,
@@ -226,7 +260,8 @@ impl<T: Dtype, D: LlmBackend, H: DecoderReadout<T, D>> MtpProposer<T, D, H> {
             }
             // Downloads use the device's default stream, which need not be the
             // caller's execution stream. Fence once after the complete chain.
-            scope.synchronize()?;
+            ExecutionPlan::eager(Phase::Wait, 1, count, WorkspaceUse::Proposer)
+                .execute(&self.metrics, |_| scope.synchronize())?;
             self.workspace.drafts(count)?.to_host_vec()
         })();
         // Workspace owns all intermediates; drain before reuse, including errors.

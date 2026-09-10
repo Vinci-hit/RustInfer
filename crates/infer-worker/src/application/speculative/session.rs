@@ -78,6 +78,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             limits.max_step_tokens,
             scope.device(),
         )?;
+        proposer.prepare_metrics(&scope)?;
         let block_size = 16;
         let num_blocks = limits.max_context.div_ceil(block_size);
         let target_hidden = crate::domain::tensor::Tensor::zeros(
@@ -220,6 +221,12 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             self.pending = tokens.last().copied();
             self.finished = output.finished[0] || self.len >= self.limits.max_context;
             debug_assert_eq!(self.proposer.committed_len() + 1, self.len);
+            self.target.execution_metrics.committed(
+                k,
+                output.accepted_drafts.as_ref().unwrap()[0] as usize,
+                tokens.len(),
+                retained,
+            );
             Ok(MtpStep {
                 tokens,
                 proposed: k,

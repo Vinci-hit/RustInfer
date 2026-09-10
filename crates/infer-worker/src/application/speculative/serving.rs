@@ -1,6 +1,7 @@
 //! Explicit MTP adapter for the existing worker control and data planes.
 use super::{MtpProposer, commit::commit_decode, validate_sampling};
 use crate::application::decode_common::send_step_error;
+use crate::application::execution::{ExecutionPlan, Phase, WorkspaceUse};
 use crate::application::serve_execution::{ServingExecution, ServingStep};
 use crate::application::worker_scheduler::handle_eager_prefill;
 use crate::components::mtp::MtpHead;
@@ -205,7 +206,16 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
                 return Err(e);
             }
         };
-        let wire = commit_decode(ctx.active, ctx.allocator, id, lease.take(), output)?;
+        let accepted = output.accepted_drafts.as_ref().unwrap()[0] as usize;
+        let emitted = output.tokens[0].len();
+        let materialized = output.materialized_tokens[0] as usize;
+        let wire = ExecutionPlan::eager(Phase::Commit, 1, materialized, WorkspaceUse::Runtime)
+            .execute(&ctx.runner.execution_metrics, |_| {
+                commit_decode(ctx.active, ctx.allocator, id, lease.take(), output)
+            })?;
+        ctx.runner
+            .execution_metrics
+            .committed(k, accepted, emitted, materialized);
         ctx.data
             .send_step_output(&wire)
             .map_err(|e| OpError::Kernel(e.to_string()))
@@ -216,6 +226,12 @@ impl<M: DecoderReadout<bf16, Cuda>, H: DecoderReadout<bf16, Cuda>> ServingExecut
     for MtpServing<H>
 {
     const SPECULATIVE: bool = true;
+    fn prepare(
+        &mut self,
+        runner: &crate::application::runtime::Runtime<bf16, Cuda, M>,
+    ) -> OpResult<()> {
+        self.proposer.prepare_metrics(&runner.scope)
+    }
     fn step(&mut self, mut ctx: ServingStep<'_, M>) -> OpResult<()> {
         if ctx.runner.cap_batch != 1 || ctx.active.len() + ctx.prefilling.len() > 1 {
             return Err(OpError::Shape(

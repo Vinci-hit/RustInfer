@@ -622,6 +622,8 @@ fn hybrid_verification_restores_every_rejected_prefix_and_continues_greedy() {
                 tape.push(next);
             }
             let mut actual = hybrid_runtime(1);
+            use infer_worker::application::execution::{ExecutionMetrics, Phase};
+            actual.execution_metrics = ExecutionMetrics::new("test-target", 100);
             let mut reference = hybrid_runtime(1);
             let prefill = request(&[(10, 0, 0, &[1, 2, 3])]);
             actual.step(&prefill).unwrap();
@@ -634,6 +636,20 @@ fn hybrid_verification_restores_every_rejected_prefix_and_continues_greedy() {
             verify.draft_tokens = vec![inputs[1..].to_vec()];
             let result = actual.step_with_hidden(&verify).unwrap();
             assert_eq!(result.output.accepted_drafts, Some(vec![accepted as u32]));
+            assert_eq!(actual.execution_metrics.snapshot(Phase::Verify).calls, 1);
+            assert_eq!(actual.execution_metrics.snapshot(Phase::Snapshot).calls, 1);
+            assert_eq!(
+                actual.execution_metrics.snapshot(Phase::Restore).calls,
+                u64::from(accepted < k)
+            );
+            assert_eq!(
+                actual.execution_metrics.snapshot(Phase::Replay).tokens,
+                if accepted < k {
+                    (accepted + 1) as u64
+                } else {
+                    0
+                }
+            );
             assert_eq!(result.output.materialized_tokens, vec![accepted as u32 + 1]);
             assert_eq!(
                 result.output.tokens[0]

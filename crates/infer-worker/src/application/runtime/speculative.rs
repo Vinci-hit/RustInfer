@@ -88,57 +88,76 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
         let mut retained = self.retained_request.take().unwrap_or_else(|| {
             StepRequest::workspace(self.cap_batch, self.cap_num_tokens, self.max_blocks_per_seq)
         });
-        let result = (|| {
-            if let Some(state) = self.recurrent.as_mut() {
-                state.snapshot(req, &self.scope)?;
-            }
-            self.upload_index(plan, req)?;
-            self.prepare_multimodal(req)?;
-            let output = self.step_eager_with_input(plan, req, device_input)?;
-            if output.materialized_tokens.len() != req.seqs.len()
-                || req
-                    .seqs
-                    .iter()
-                    .zip(&output.materialized_tokens)
-                    .any(|(seq, &n)| n == 0 || n as usize > seq.input_ids.len())
-            {
-                return Err(OpError::Shape(
-                    "invalid speculative retention length".into(),
-                ));
-            }
-            retained.retain_from(req, &output.materialized_tokens);
-            let retained_plan = self.build_plan(&retained)?;
-            if retained_plan.num_tokens != plan.num_tokens {
-                // GDN has already consumed rejected inputs. Restore the entire
-                // participating batch, then replay just its retained prefixes.
-                // Full-attention KV suffix bytes become inaccessible via lengths;
-                // the lease owner may release the corresponding blocks.
-                if let Some(state) = self.recurrent.as_mut() {
-                    state
-                        .verification_snapshot
-                        .as_ref()
-                        .unwrap()
-                        .restore_on(&mut state.layers, &self.scope)?;
-                    // Logical lengths still refer to the pre-verification prefix.
-                    self.prepare_recurrent(&retained, &retained_plan)?;
-                }
-                self.upload_index(&retained_plan, &retained)?;
-                let input = match device_input {
-                    // The direct path is single-sequence, so its retained tape
-                    // is a contiguous prefix. Multi-sequence repacking stays on
-                    // the ordinary host-input path.
-                    Some(input) => input.narrow(0, 0, retained_plan.num_tokens)?,
-                    None => self.input_ids_tensor(&retained, &retained_plan)?,
+        let result =
+            (|| {
+                let metrics = self.execution_metrics.clone();
+                let operation = |phase, tokens, workspace| {
+                    ExecutionPlan::eager(phase, plan.batch, tokens, workspace)
                 };
-                self.run_layers(&retained_plan, &input)?;
-            }
-            if let Some(state) = &mut self.recurrent {
-                state.retain_step(&retained);
-            }
-            // No request may observe committed state until replay completes.
-            self.scope.synchronize()?;
-            Ok((output, retained_plan))
-        })();
+                if let Some(state) = self.recurrent.as_mut() {
+                    operation(Phase::Snapshot, plan.num_tokens, WorkspaceUse::Recurrent)
+                        .execute(&metrics, |_| state.snapshot(req, &self.scope))?;
+                }
+                self.upload_index(plan, req)?;
+                self.prepare_multimodal(req)?;
+                let workspace = if device_input.is_some() {
+                    WorkspaceUse::BorrowedTape
+                } else {
+                    WorkspaceUse::Runtime
+                };
+                let output = operation(Phase::Verify, plan.num_tokens, workspace)
+                    .execute(&metrics, |_| {
+                        self.step_eager_with_input(plan, req, device_input)
+                    })?;
+                if output.materialized_tokens.len() != req.seqs.len()
+                    || req
+                        .seqs
+                        .iter()
+                        .zip(&output.materialized_tokens)
+                        .any(|(seq, &n)| n == 0 || n as usize > seq.input_ids.len())
+                {
+                    return Err(OpError::Shape(
+                        "invalid speculative retention length".into(),
+                    ));
+                }
+                retained.retain_from(req, &output.materialized_tokens);
+                let retained_plan = self.build_plan(&retained)?;
+                if retained_plan.num_tokens != plan.num_tokens {
+                    // GDN has already consumed rejected inputs. Restore the entire
+                    // participating batch, then replay just its retained prefixes.
+                    // Full-attention KV suffix bytes become inaccessible via lengths;
+                    // the lease owner may release the corresponding blocks.
+                    if let Some(state) = self.recurrent.as_mut() {
+                        operation(Phase::Restore, plan.num_tokens, WorkspaceUse::Recurrent)
+                            .execute(&metrics, |_| {
+                                state
+                                    .verification_snapshot
+                                    .as_ref()
+                                    .unwrap()
+                                    .restore_on(&mut state.layers, &self.scope)
+                            })?;
+                        // Logical lengths still refer to the pre-verification prefix.
+                        self.prepare_recurrent(&retained, &retained_plan)?;
+                    }
+                    self.upload_index(&retained_plan, &retained)?;
+                    let input = match device_input {
+                        // The direct path is single-sequence, so its retained tape
+                        // is a contiguous prefix. Multi-sequence repacking stays on
+                        // the ordinary host-input path.
+                        Some(input) => input.narrow(0, 0, retained_plan.num_tokens)?,
+                        None => self.input_ids_tensor(&retained, &retained_plan)?,
+                    };
+                    operation(Phase::Replay, retained_plan.num_tokens, workspace)
+                        .execute(&metrics, |_| self.run_layers(&retained_plan, &input))?;
+                }
+                if let Some(state) = &mut self.recurrent {
+                    state.retain_step(&retained);
+                }
+                // No request may observe committed state until replay completes.
+                operation(Phase::Wait, retained_plan.num_tokens, workspace)
+                    .execute(&metrics, |_| self.scope.synchronize())?;
+                Ok((output, retained_plan))
+            })();
         self.retained_request = Some(retained);
         self.finish_recurrent_step(result)
     }
@@ -209,7 +228,15 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
             let result = (|| {
                 self.upload_index(&plan, req)?;
                 self.prepare_multimodal(req)?;
-                self.step_eager(&plan, req)
+                ExecutionPlan::eager(
+                    Phase::Prefill,
+                    plan.batch,
+                    plan.num_tokens,
+                    WorkspaceUse::Runtime,
+                )
+                .execute(&self.execution_metrics.clone(), |_| {
+                    self.step_eager(&plan, req)
+                })
             })();
             (self.finish_recurrent_step(result)?, plan)
         } else {
@@ -223,9 +250,18 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
                 pending: None,
             };
             let ctx = crate::domain::exec::StepCtx::new(&self.scope, &retained_plan);
-            self.model
-                .normalize_hidden_into(&hidden, &mut normalized_hidden, &ctx)?;
-            self.scope.synchronize()?;
+            ExecutionPlan::eager(
+                Phase::Readout,
+                retained_plan.batch,
+                n,
+                WorkspaceUse::Runtime,
+            )
+            .execute(&self.execution_metrics, |_| {
+                self.model
+                    .normalize_hidden_into(&hidden, &mut normalized_hidden, &ctx)
+            })?;
+            ExecutionPlan::eager(Phase::Wait, retained_plan.batch, n, WorkspaceUse::Runtime)
+                .execute(&self.execution_metrics, |_| self.scope.synchronize())?;
             Ok(output)
         })();
         if result.is_err() {

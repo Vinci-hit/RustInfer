@@ -22,6 +22,9 @@ pub struct ServingStep<'a, M: DecoderModel<bf16, Cuda>> {
 
 pub trait ServingExecution<M: DecoderModel<bf16, Cuda>> {
     const SPECULATIVE: bool;
+    fn prepare(&mut self, _runner: &Runtime<bf16, Cuda, M>) -> OpResult<()> {
+        Ok(())
+    }
     fn step(&mut self, ctx: ServingStep<'_, M>) -> OpResult<()>;
 }
 
