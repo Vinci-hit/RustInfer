@@ -20,3 +20,5 @@ where
 {
     build_dense_decoder(loader, cfg, device)
 }
+
+pub mod eagle3;

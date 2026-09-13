@@ -12,6 +12,50 @@ use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
 pub trait FusedOps: MathOps {
+    /// Reserve optional backend-specific attention row indices at owner startup.
+    fn allocate_paged_decode_rows(
+        _device: &Self,
+        _cap_num_tokens: usize,
+        _max_blocks_per_seq: usize,
+    ) -> OpResult<Option<crate::kv::PagedDecodeRows<Self>>> {
+        Ok(None)
+    }
+
+    /// Prepare optional attention views after uploading the original KV index.
+    /// No logical cache state is changed; all layers share the prepared views.
+    fn prepare_paged_attention_index(
+        _scope: &Self::Scope,
+        _plan: &crate::plan::BatchPlan,
+        _index: &mut crate::kv::KvIndexTensors<Self>,
+    ) -> OpResult<()> {
+        Ok(())
+    }
+
+    /// Replace each ID with a lookup-table entry, in place. Invalid input IDs
+    /// become -1; the caller rejects them before committing generated tokens.
+    fn remap_ids_inplace(
+        scope: &Self::Scope,
+        ids: &mut Tensor<i32, Self>,
+        table: &Tensor<i32, Self>,
+    ) -> OpResult<()> {
+        validate_id_map(ids, table)?;
+        use crate::exec::ExecScope;
+        scope.synchronize()?;
+        let table = table.to_host_vec()?;
+        let mapped: Vec<i32> = ids
+            .to_host_vec()?
+            .iter()
+            .map(|&id| {
+                usize::try_from(id)
+                    .ok()
+                    .and_then(|i| table.get(i))
+                    .copied()
+                    .unwrap_or(-1)
+            })
+            .collect();
+        ids.upload_from_host(&mapped)
+    }
+
     fn layer_norm<T: Dtype>(
         _scope: &Self::Scope,
         input: &Tensor<T, Self>,
@@ -709,6 +753,28 @@ pub trait FusedOps: MathOps {
             }
         }
     }
+}
+
+pub fn validate_id_map<D: MathOps>(ids: &Tensor<i32, D>, table: &Tensor<i32, D>) -> OpResult<()> {
+    use crate::device::Device;
+    let overlaps = std::sync::Arc::ptr_eq(ids.storage(), table.storage())
+        && ids.numel() > 0
+        && ids.offset_elems() < table.offset_elems() + table.numel()
+        && table.offset_elems() < ids.offset_elems() + ids.numel();
+    if table.shape().len() != 1
+        || table.numel() == 0
+        || table.numel() > i32::MAX as usize
+        || ids.numel() > i32::MAX as usize
+        || !table.is_contiguous()
+        || !ids.is_contiguous()
+        || overlaps
+        || Device::device_id(table.device()) != Device::device_id(ids.device())
+    {
+        return Err(OpError::Shape(
+            "invalid ID lookup table or output layout".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn causal_conv1d_silu_reference<T, D>(

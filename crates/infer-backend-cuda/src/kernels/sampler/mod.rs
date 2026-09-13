@@ -7,6 +7,13 @@ use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
 
 unsafe extern "C" {
+    fn remap_ids_cu(
+        ids: *mut i32,
+        table: *const i32,
+        count: i32,
+        table_size: i32,
+        stream: cudaStream_t,
+    );
     // BF16 C signature: (logits, selected_rows_device, batch_size, vocab_size,
     // result_gpu, workspace, stream). `selected_rows_device` is nullable — null
     // means "argmax every row 0..batch". The previous binding OMITTED this
@@ -36,6 +43,24 @@ unsafe extern "C" {
         workspace: *mut f32,
         stream: cudaStream_t,
     );
+}
+
+pub fn remap_ids(
+    stream: cudaStream_t,
+    ids: &mut Tensor<i32, Cuda>,
+    table: &Tensor<i32, Cuda>,
+) -> OpResult<()> {
+    infer_core::ports::fused_ops::validate_id_map(ids, table)?;
+    unsafe {
+        remap_ids_cu(
+            ids.data_ptr_mut(),
+            table.data_ptr(),
+            ids.numel() as i32,
+            table.numel() as i32,
+            stream,
+        );
+    }
+    Ok(())
 }
 
 pub fn argmax<T: Dtype>(

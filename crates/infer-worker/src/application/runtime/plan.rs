@@ -413,6 +413,6 @@ where
                 &valid_suffix_q_tiles,
             )?;
         }
-        Ok(())
+        D::prepare_paged_attention_index(&self.scope, plan, &mut self.kv_index)
     }
 }

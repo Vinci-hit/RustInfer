@@ -369,6 +369,7 @@ where
         let cap_total_q_tiles = (cap_batch + cap_num_tokens.div_ceil(tile)).max(1);
         let alloc_i32 = |n: usize| D::alloc_tensor::<i32>(Shape::from_slice(&[n.max(1)]), device);
         let kv_index = KvIndexTensors {
+            decode_rows: D::allocate_paged_decode_rows(device, cap_num_tokens, max_blocks_per_seq)?,
             block_tables: D::alloc_tensor::<i32>(
                 Shape::from_slice(&[cap_batch, max_blocks_per_seq]),
                 device,
@@ -708,6 +709,21 @@ where
         req: &StepRequest,
         device_input: Option<&Tensor<i32, D>>,
     ) -> OpResult<StepOutput> {
+        self.step_eager_observed(
+            plan,
+            req,
+            device_input,
+            &mut crate::domain::features::NoopObserver,
+        )
+    }
+
+    fn step_eager_observed<O: crate::domain::features::LayerObserver<T, D>>(
+        &mut self,
+        plan: &BatchPlan,
+        req: &StepRequest,
+        device_input: Option<&Tensor<i32, D>>,
+        observer: &mut O,
+    ) -> OpResult<StepOutput> {
         // Eager prefill (num_tokens > batch) routes bf16 GEMMs to the build-free
         // chunked path so each distinct prompt length skips the cuBLASLt cache
         // build (~9-18ms off TTFT). A guard restores the default on any return so
@@ -723,7 +739,7 @@ where
         };
         let _trace = std::env::var_os("RUSTINFER_TTFT_TRACE").is_some();
         let _t0 = std::time::Instant::now();
-        self.run_layers(plan, &input_ids)?;
+        self.run_layers_observed(plan, &input_ids, observer)?;
         if _trace {
             let _ = self.scope.synchronize();
             tracing::info!(
@@ -753,6 +769,15 @@ where
         &mut self,
         plan: &crate::domain::plan::BatchPlan,
         input_ids: &Tensor<i32, D>,
+    ) -> OpResult<()> {
+        self.run_layers_observed(plan, input_ids, &mut crate::domain::features::NoopObserver)
+    }
+
+    fn run_layers_observed<O: crate::domain::features::LayerObserver<T, D>>(
+        &mut self,
+        plan: &BatchPlan,
+        input_ids: &Tensor<i32, D>,
+        observer: &mut O,
     ) -> OpResult<()> {
         let mut hidden = Hidden {
             stream: self.hidden.stream.view_raw(
@@ -789,11 +814,12 @@ where
                         .narrow(0, item.start, item.embedding.shape()[0])?
                         .copy_from(&item.embedding)?;
                 }
-                self.model.decode_layers(
+                self.model.decode_layers_observed(
                     LayerRange::all(self.dims.num_layers),
                     &mut hidden,
                     &mut cache,
                     &ctx,
+                    observer,
                 )
             })
     }

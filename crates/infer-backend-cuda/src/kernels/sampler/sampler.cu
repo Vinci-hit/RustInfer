@@ -8,6 +8,19 @@
 #include <thrust/system/cuda/execution_policy.h>
 #include "sampler.h"
 
+__global__ void remap_ids_kernel(int* ids, const int* table, int count, int table_size) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < static_cast<unsigned int>(count)) {
+        const int id = ids[i];
+        ids[i] = id >= 0 && id < table_size ? table[id] : -1;
+    }
+}
+
+extern "C" void remap_ids_cu(int* ids, const int* table, int count, int table_size,
+                              cudaStream_t stream) {
+    if (count > 0) remap_ids_kernel<<<(count - 1) / 256 + 1, 256, 0, stream>>>(ids, table, count, table_size);
+}
+
 // ------------------- F32 版本 -------------------
 void argmax_cu_f32_ffi(
     const float* logits_ptr,

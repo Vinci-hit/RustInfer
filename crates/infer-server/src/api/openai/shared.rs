@@ -15,7 +15,7 @@ use super::types::StopSequence;
 /// Bound CPU work independently of the larger image data-URL body limit.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-pub fn validate_mtp_request(
+pub fn validate_speculative_request(
     draft_tokens: usize,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -25,12 +25,12 @@ pub fn validate_mtp_request(
     if draft_tokens > 0 {
         if has_image {
             return Err(AppError::bad_request(
-                "MTP currently supports text input only",
+                "Speculative decoding currently supports text input only",
             ));
         }
         if temperature.unwrap_or(1.0) > 0.0 && top_k != Some(1) && top_p.unwrap_or(1.0) > 0.0 {
             return Err(AppError::bad_request(
-                "MTP currently requires greedy sampling (temperature=0, top_k=1, or top_p=0)",
+                "Speculative decoding currently requires greedy sampling (temperature=0, top_k=1, or top_p=0)",
             ));
         }
     }
@@ -236,13 +236,13 @@ pub fn decode_completion(
 mod tests {
     #[test]
     fn mtp_request_limits_do_not_change_ordinary_sampling() {
-        use super::validate_mtp_request;
-        assert!(validate_mtp_request(0, None, None, None, true).is_ok());
-        assert!(validate_mtp_request(3, Some(0.0), None, None, false).is_ok());
-        assert!(validate_mtp_request(3, None, None, Some(1), false).is_ok());
-        assert!(validate_mtp_request(3, None, Some(0.0), None, false).is_ok());
-        assert!(validate_mtp_request(3, None, None, None, false).is_err());
-        assert!(validate_mtp_request(3, Some(0.0), None, None, true).is_err());
+        use super::validate_speculative_request;
+        assert!(validate_speculative_request(0, None, None, None, true).is_ok());
+        assert!(validate_speculative_request(3, Some(0.0), None, None, false).is_ok());
+        assert!(validate_speculative_request(3, None, None, Some(1), false).is_ok());
+        assert!(validate_speculative_request(3, None, Some(0.0), None, false).is_ok());
+        assert!(validate_speculative_request(3, None, None, None, false).is_err());
+        assert!(validate_speculative_request(3, Some(0.0), None, None, true).is_err());
     }
     use super::*;
     use tokenizers::models::wordlevel::WordLevel;
@@ -304,7 +304,10 @@ pub(crate) fn beam_options(
         }
         return Ok(None);
     };
-    if stream || has_images || config.tensor_parallel_size != 1 || config.mtp_num_draft_tokens != 0
+    if stream
+        || has_images
+        || config.tensor_parallel_size != 1
+        || config.speculative_draft_tokens() != 0
     {
         return Err(AppError::bad_request(
             "beam search requires non-streaming text, TP=1 and MTP disabled",

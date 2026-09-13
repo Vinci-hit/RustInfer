@@ -19,7 +19,21 @@ pub struct PagedKvLayer<T: Dtype, D: Device> {
     pub v: Tensor<T, D>,
 }
 
+/// Optional attention-only view of packed queries as independent decode rows.
+/// The rows share physical KV pages and own only lengths and page indices.
+/// Owners allocate capacity once; a backend prepares the live rows before a
+/// forward, and every layer consumes that same view on the execution stream.
+#[derive(Clone)]
+pub struct PagedDecodeRows<D: Device> {
+    pub block_tables: Tensor<i32, D>,
+    pub q_lens: Tensor<i32, D>,
+    pub kv_lens: Tensor<i32, D>,
+    /// Zero until prepared, and reset when a step does not use this view.
+    pub num_rows: usize,
+}
+
 pub struct KvIndexTensors<D: Device> {
+    pub decode_rows: Option<PagedDecodeRows<D>>,
     pub block_tables: Tensor<i32, D>,
     pub cu_q_lens: Tensor<i32, D>,
     pub kv_lens: Tensor<i32, D>,

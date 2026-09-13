@@ -1,4 +1,4 @@
-//! Startup-owned MTP control/readout buffers, complementing ForwardScratch.
+//! Startup-owned draft control/readout buffers, complementing ForwardScratch.
 //! All views have stable storage. Host metadata is packed into one upload per
 //! round, and draft token IDs stay on device between head invocations.
 use super::dtype::Dtype;
@@ -9,7 +9,8 @@ use super::ports::OpResult;
 use super::ports::backend::LlmBackend;
 use super::tensor::Tensor;
 
-pub(crate) struct MtpWorkspace<T: Dtype, D: LlmBackend> {
+pub(crate) struct DraftWorkspace<T: Dtype, D: LlmBackend> {
+    decode_rows: Option<super::kv::PagedDecodeRows<D>>,
     control: Tensor<i32, D>,
     control_host: Vec<i32>,
     blocks: Tensor<i32, D>,
@@ -22,12 +23,13 @@ pub(crate) struct MtpWorkspace<T: Dtype, D: LlmBackend> {
     pub plan: BatchPlan,
 }
 
-impl<T: Dtype, D: LlmBackend> MtpWorkspace<T, D> {
+impl<T: Dtype, D: LlmBackend> DraftWorkspace<T, D> {
     pub fn new(dims: ModelDims, context: usize, capacity: usize, device: &D) -> OpResult<Self> {
         let blocks = context.div_ceil(16);
         let tiles = capacity.div_ceil(RAGGED_Q_TILE as usize);
         let control_size = (capacity * 10 + 1).max(7 + capacity + tiles * 2);
         Ok(Self {
+            decode_rows: D::allocate_paged_decode_rows(device, capacity, blocks)?,
             control: Tensor::zeros([control_size], device)?,
             control_host: vec![0; control_size],
             blocks: Tensor::from_host_slice(
@@ -137,6 +139,7 @@ impl<T: Dtype, D: LlmBackend> MtpWorkspace<T, D> {
         let base = slot * 10;
         let v = |offset, len| self.control.narrow(0, base + offset, len);
         Ok(KvIndexTensors {
+            decode_rows: self.decode_rows.clone(),
             block_tables: self.blocks.clone(),
             cu_q_lens: v(0, 2)?,
             kv_lens: v(2, 1)?,
@@ -148,6 +151,16 @@ impl<T: Dtype, D: LlmBackend> MtpWorkspace<T, D> {
             valid_q_tiles: v(5 + n + tiles * 2, 1)?,
             valid_suffix_q_tiles: v(6 + n + tiles * 2, 1)?,
         })
+    }
+    pub fn prepared_index(
+        &self,
+        slot: usize,
+        n: usize,
+        scope: &D::Scope,
+    ) -> OpResult<KvIndexTensors<D>> {
+        let mut index = self.index(slot, n)?;
+        D::prepare_paged_attention_index(scope, &self.plan, &mut index)?;
+        Ok(index)
     }
     pub fn input(&self, n: usize) -> OpResult<Tensor<i32, D>> {
         self.ids.narrow(0, 0, n)
@@ -175,7 +188,7 @@ mod tests {
     #[test]
     fn packed_indices_cross_tile_boundaries_and_reuse_storage() {
         let tile = RAGGED_Q_TILE as usize;
-        let mut ws = MtpWorkspace::<f32, _>::new(
+        let mut ws = DraftWorkspace::<f32, _>::new(
             ModelDims {
                 dim: 4,
                 vocab_size: 8,
@@ -228,7 +241,7 @@ mod tests {
     }
     #[test]
     fn catchup_index_updates_preserve_device_token_tape() {
-        let mut ws = MtpWorkspace::<f32, _>::new(
+        let mut ws = DraftWorkspace::<f32, _>::new(
             ModelDims {
                 dim: 4,
                 vocab_size: 8,

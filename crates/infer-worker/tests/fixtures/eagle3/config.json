@@ -1,0 +1,33 @@
+{
+  "architectures": [
+    "Qwen3Eagle3Model"
+  ],
+  "hidden_size": 8,
+  "intermediate_size": 16,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "head_dim": 4,
+  "vocab_size": 16,
+  "num_hidden_layers": 1,
+  "draft_num_hidden_layers": 1,
+  "num_target_layers": 6,
+  "target_layer_ids": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "target_model_name_or_path": "test/Qwen3-tiny",
+  "max_position_embeddings": 64,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "rope_theta": 10000.0,
+    "rope_type": "default"
+  },
+  "dtype": "bfloat16",
+  "hidden_act": "silu",
+  "attention_bias": false,
+  "tie_word_embeddings": false,
+  "ttt_length": 7
+}

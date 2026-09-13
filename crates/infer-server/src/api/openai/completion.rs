@@ -26,8 +26,8 @@ pub async fn completions(
 ) -> Result<Response, AppError> {
     // 1. 校验
     validate_request(&req, state.tokenizer.get_vocab_size(true))?;
-    shared::validate_mtp_request(
-        state.config.mtp_num_draft_tokens,
+    shared::validate_speculative_request(
+        state.config.speculative_draft_tokens(),
         req.temperature,
         req.top_p,
         req.top_k,

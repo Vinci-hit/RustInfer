@@ -36,6 +36,7 @@ fn indices<D: infer_worker::domain::ports::backend::LlmBackend>(
     };
     let ints = |v: &[i32]| Tensor::from_host_slice(v, [v.len()], device).unwrap();
     let idx = KvIndexTensors {
+        decode_rows: None,
         block_tables: Tensor::from_host_slice(
             &(0..blocks as i32).collect::<Vec<_>>(),
             [1, blocks],

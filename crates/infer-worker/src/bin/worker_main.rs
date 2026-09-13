@@ -12,6 +12,9 @@
 //! The worker owns the decode self-loop — the scheduler never re-sends
 //! per-step decode commands.
 
+#[path = "bootstrap/eagle3.rs"]
+mod eagle3_bootstrap;
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -541,7 +544,7 @@ fn run_beam_cli(
     prompt: &str,
 ) -> Result<(), String> {
     use infer_worker::application::beam_search::{BeamSearchConfig, BeamSession};
-    if cfg.tensor_parallel_size != 1 || cfg.mtp_num_draft_tokens != 0 {
+    if cfg.tensor_parallel_size != 1 || cfg.speculative_draft_tokens() != 0 {
         return Err("beam CLI requires TP=1 and MTP disabled".into());
     }
     let tokenizer = tokenizers::Tokenizer::from_file(Path::new(&cfg.model).join("tokenizer.json"))
@@ -883,8 +886,16 @@ fn main() -> Result<(), String> {
         tp_devices: &all_devices,
     };
 
-    if cfg.mtp_num_draft_tokens > 0 && model_type != "qwen3_5" {
+    if cfg.mtp_draft_tokens() > 0 && model_type != "qwen3_5" {
         return Err("MTP serving currently requires a Qwen3.5 dense checkpoint".into());
+    }
+
+    if matches!(
+        cfg.speculative,
+        Some(infer_protocol::config::SpeculativeConfig::Eagle3 { .. })
+    ) && model_type != "qwen3"
+    {
+        return Err("EAGLE3 serving currently requires a dense Qwen3 target".into());
     }
 
     match model_type.as_str() {
@@ -924,15 +935,39 @@ fn main() -> Result<(), String> {
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
             );
-            run_with_model(
-                &control,
-                &data,
-                model,
-                make_bootstrap(),
-                followers,
-                &eos_ids,
-                args.profile_cuda_steps,
-            )?;
+            if let Some(spec @ infer_protocol::config::SpeculativeConfig::Eagle3 { .. }) =
+                &cfg.speculative
+            {
+                let execution = eagle3_bootstrap::load_execution(
+                    spec,
+                    &load.model_path,
+                    &model,
+                    &load_cfg,
+                    max_seq_len,
+                    load.max_batch_tokens,
+                    &cuda,
+                )?;
+                infer_worker::application::serve_loop::run_with_model_and_execution(
+                    &control,
+                    &data,
+                    model,
+                    make_bootstrap(),
+                    followers,
+                    &eos_ids,
+                    args.profile_cuda_steps,
+                    execution,
+                )?;
+            } else {
+                run_with_model(
+                    &control,
+                    &data,
+                    model,
+                    make_bootstrap(),
+                    followers,
+                    &eos_ids,
+                    args.profile_cuda_steps,
+                )?;
+            }
         }
         "qwen3_5" => {
             let mut model = qwen3_5::build::<bf16, Cuda>(&loader, &load_cfg, &cuda)
@@ -959,7 +994,7 @@ fn main() -> Result<(), String> {
                 "[bootstrap] weights loaded in {:.2}s",
                 load_start.elapsed().as_secs_f32()
             );
-            if cfg.mtp_num_draft_tokens > 0 {
+            if cfg.mtp_draft_tokens() > 0 {
                 let mtp_config = serde_json::from_value(full_config["text_config"].clone())
                     .map_err(|e| format!("MTP config: {e}"))?;
                 let head = model
@@ -969,7 +1004,7 @@ fn main() -> Result<(), String> {
                     head,
                     max_seq_len,
                     load.max_batch_tokens,
-                    cfg.mtp_num_draft_tokens,
+                    cfg.mtp_draft_tokens(),
                     &cuda,
                 )
                 .map_err(|e| format!("MTP serving: {e}"))?;
@@ -1408,6 +1443,7 @@ mod qwen35_checkpoint_tests {
                 total_q_tiles: req.len() as i32,
             };
             let index = KvIndexTensors {
+                decode_rows: None,
                 block_tables: Tensor::from_host_slice(
                     &(0..blocks as i32).collect::<Vec<_>>(),
                     [1, blocks],
@@ -2392,3 +2428,7 @@ mod beam_cli_tests {
         assert!(Args::try_parse_from(["rustinfer-worker", "--beam-width", "2"]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_tests/qwen3_eagle3.rs"]
+mod qwen3_eagle3_checkpoint_tests;

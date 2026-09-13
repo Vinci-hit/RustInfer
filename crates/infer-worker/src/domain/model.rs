@@ -113,6 +113,24 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         ctx: &crate::domain::exec::StepCtx<'_, D>,
     ) -> OpResult<()>;
 
+    /// Optional non-mutating observation at complete decoder-block boundaries.
+    fn decode_layers_observed<O: super::features::LayerObserver<T, D>>(
+        &self,
+        range: LayerRange,
+        hidden: &mut Hidden<T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
+        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        observer: &mut O,
+    ) -> OpResult<()> {
+        if observer.is_active() {
+            return Err(crate::domain::ports::OpError::unsupported(
+                "model",
+                "decoder layer observation",
+            ));
+        }
+        self.decode_layers(range, hidden, cache, ctx)
+    }
+
     fn finalize(
         &self,
         hidden: &Hidden<T, D>,

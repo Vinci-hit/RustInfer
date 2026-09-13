@@ -11,6 +11,8 @@ pub mod forward_scratch;
 pub mod gdn_scratch;
 pub mod global_kv_alloc;
 pub use infer_core::kv;
+pub mod draft;
+pub mod features;
 #[cfg(test)]
 mod kv_tests;
 pub mod model;
@@ -39,4 +41,4 @@ pub use tensor::Tensor;
 pub use tensor_parallel::TensorParallelPlacement;
 pub use types::{DataType, Dims, Dtype, MAX_RANK, Shape, Strides};
 
-pub(crate) mod mtp_scratch;
+pub(crate) mod draft_scratch;

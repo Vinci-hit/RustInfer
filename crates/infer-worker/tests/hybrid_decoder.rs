@@ -92,33 +92,35 @@ fn model(shared_scratch: bool) -> Decoder<f32, Cpu> {
         let attention = if i % 4 == 3 {
             Attention::Full(FullAttention {
                 input_layernorm: norm(DIM),
-                qkv_proj: linear(DIM + 2 * KV_DIM, DIM, seed),
-                o_proj: linear(DIM, DIM, seed + 0.4),
-                q_norm: Some(norm(HEAD_DIM)),
-                k_norm: Some(norm(HEAD_DIM)),
-                sin: Tensor::from_host_slice(
-                    &(0..MAX_SEQ * 2)
-                        .map(|i| (i as f32 * 0.13).sin())
-                        .collect::<Vec<_>>(),
-                    [MAX_SEQ, 2],
-                    &Cpu,
-                )
-                .unwrap(),
-                cos: Tensor::from_host_slice(
-                    &(0..MAX_SEQ * 2)
-                        .map(|i| (i as f32 * 0.13).cos())
-                        .collect::<Vec<_>>(),
-                    [MAX_SEQ, 2],
-                    &Cpu,
-                )
-                .unwrap(),
-                head_num: 2,
-                kv_head_num: 1,
-                head_dim: HEAD_DIM,
-                rotary_dim: HEAD_DIM,
-                attn_output_gate: false,
-                scale: 0.5,
                 scratch: None,
+                core: infer_worker::components::attention_core::AttentionCore {
+                    qkv_proj: linear(DIM + 2 * KV_DIM, DIM, seed),
+                    o_proj: linear(DIM, DIM, seed + 0.4),
+                    q_norm: Some(norm(HEAD_DIM)),
+                    k_norm: Some(norm(HEAD_DIM)),
+                    sin: Tensor::from_host_slice(
+                        &(0..MAX_SEQ * 2)
+                            .map(|i| (i as f32 * 0.13).sin())
+                            .collect::<Vec<_>>(),
+                        [MAX_SEQ, 2],
+                        &Cpu,
+                    )
+                    .unwrap(),
+                    cos: Tensor::from_host_slice(
+                        &(0..MAX_SEQ * 2)
+                            .map(|i| (i as f32 * 0.13).cos())
+                            .collect::<Vec<_>>(),
+                        [MAX_SEQ, 2],
+                        &Cpu,
+                    )
+                    .unwrap(),
+                    head_num: 2,
+                    kv_head_num: 1,
+                    head_dim: HEAD_DIM,
+                    rotary_dim: HEAD_DIM,
+                    attn_output_gate: false,
+                    scale: 0.5,
+                },
             })
         } else {
             Attention::Linear(gdn(seed))
@@ -249,6 +251,7 @@ impl Fixture {
                 total_q_tiles: block2req.len() as i32,
             },
             index: KvIndexTensors {
+                decode_rows: None,
                 block_tables: Tensor::from_host_slice(&block_tables, [slots.len(), MAX_SEQ], &Cpu)
                     .unwrap(),
                 cu_q_lens: ints(&cu),
@@ -1304,39 +1307,41 @@ fn full_attention_partial_rope_and_gate_match_scalar_reference() {
             }
             let attention = FullAttention {
                 input_layernorm: norm(DIM),
-                qkv_proj: Linear::new(
-                    Tensor::from_host_slice(&projection, [24, DIM], &Cpu).unwrap(),
-                    Some(Tensor::from_host_slice(&bias, [24], &Cpu).unwrap()),
-                ),
-                o_proj: Linear::new(
-                    Tensor::from_host_slice(&identity, [DIM, DIM], &Cpu).unwrap(),
-                    None,
-                ),
-                q_norm: qk_norm.then(|| norm(4)),
-                k_norm: qk_norm.then(|| norm(4)),
-                sin: Tensor::from_host_slice(
-                    &(0..MAX_SEQ)
-                        .map(|p| (p as f32 * 0.37).sin())
-                        .collect::<Vec<_>>(),
-                    [MAX_SEQ, 1],
-                    &Cpu,
-                )
-                .unwrap(),
-                cos: Tensor::from_host_slice(
-                    &(0..MAX_SEQ)
-                        .map(|p| (p as f32 * 0.37).cos())
-                        .collect::<Vec<_>>(),
-                    [MAX_SEQ, 1],
-                    &Cpu,
-                )
-                .unwrap(),
-                head_num: 2,
-                kv_head_num: 1,
-                head_dim: 4,
-                rotary_dim: 2,
-                scale: 0.5,
-                attn_output_gate: true,
                 scratch: shared.then(|| ForwardScratch::new(&Cpu, model.dims(), 8, SLOTS).unwrap()),
+                core: infer_worker::components::attention_core::AttentionCore {
+                    qkv_proj: Linear::new(
+                        Tensor::from_host_slice(&projection, [24, DIM], &Cpu).unwrap(),
+                        Some(Tensor::from_host_slice(&bias, [24], &Cpu).unwrap()),
+                    ),
+                    o_proj: Linear::new(
+                        Tensor::from_host_slice(&identity, [DIM, DIM], &Cpu).unwrap(),
+                        None,
+                    ),
+                    q_norm: qk_norm.then(|| norm(4)),
+                    k_norm: qk_norm.then(|| norm(4)),
+                    sin: Tensor::from_host_slice(
+                        &(0..MAX_SEQ)
+                            .map(|p| (p as f32 * 0.37).sin())
+                            .collect::<Vec<_>>(),
+                        [MAX_SEQ, 1],
+                        &Cpu,
+                    )
+                    .unwrap(),
+                    cos: Tensor::from_host_slice(
+                        &(0..MAX_SEQ)
+                            .map(|p| (p as f32 * 0.37).cos())
+                            .collect::<Vec<_>>(),
+                        [MAX_SEQ, 1],
+                        &Cpu,
+                    )
+                    .unwrap(),
+                    head_num: 2,
+                    kv_head_num: 1,
+                    head_dim: 4,
+                    rotary_dim: 2,
+                    scale: 0.5,
+                    attn_output_gate: true,
+                },
             };
             let scope = HostScope::new(Cpu);
             let ctx = StepCtx::new(&scope, &step.plan);

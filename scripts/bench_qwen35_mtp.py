@@ -42,11 +42,13 @@ class Stack:
         self.cluster = "mtp-bench-" + uuid.uuid4().hex
         self.url = f"http://127.0.0.1:{unused_port()}"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.model_name = getattr(args, "model_name", "Qwen3.5-4B")
         k = int(mode.removeprefix("mtp")) if mode.startswith("mtp") else 0
-        arena = 0 if mode == "eager" else 256
+        eager = mode == "eager" or mode.startswith("eagle")
+        arena = 0 if eager else 256
         self.config = self.path / "config.toml"
         self.config.write_text(f'''model = {json.dumps(str(args.model))}
-model_name = "Qwen3.5-4B"
+model_name = {json.dumps(self.model_name)}
 cluster_id = "{self.cluster}"
 device = "cuda:0"
 host = "127.0.0.1"
@@ -64,12 +66,20 @@ num_blocks = 2048
 ignore_eos = false
 worker_heartbeat_timeout_secs = 30
 log_level = "debug"
-capture_sizes = {"[]" if mode == "eager" else "[1]"}
+capture_sizes = {"[]" if eager else "[1]"}
 mtp_num_draft_tokens = {k}
 [cuda_memory]
 kernel_workspace_mib = 256
 graph_arena_mib = {arena}
 pool_retain_mib = 256
+''')
+        if mode.startswith("eagle"):
+            with self.config.open("a") as config:
+                config.write(f'''\n[speculative]
+method = "eagle3"
+draft_model = {json.dumps(str(args.draft))}
+num_draft_tokens = {int(mode.removeprefix("eagle"))}
+allow_target_mismatch = {str(args.allow_target_mismatch).lower()}
 ''')
 
     def __enter__(self):
@@ -115,7 +125,7 @@ pool_retain_mib = 256
             path.unlink(missing_ok=True)
 
     def request(self, prompt, count=128, stream=True, ignore_eos=True, **extra):
-        payload = dict(model="Qwen3.5-4B", prompt=chat_prompt(prompt), temperature=0,
+        payload = dict(model=self.model_name, prompt=chat_prompt(prompt), temperature=0,
                        max_tokens=count, ignore_eos=ignore_eos, stream=stream,
                        stream_options={"include_usage": True}, **extra)
         req = urllib.request.Request(self.url + "/v1/completions", json.dumps(payload).encode(),
@@ -243,7 +253,7 @@ def main():
                     measured_log = re.sub(r"\x1b\[[0-9;]*m", "", log.read().decode())
                 (stack.path / "measured-worker.log").write_text(measured_log)
                 graph_replays = measured_log.count("replaying decode CUDA graph")
-                rounds = [line for line in measured_log.splitlines() if "MTP round" in line]
+                rounds = [line for line in measured_log.splitlines() if "MTP round" in line or "speculative round" in line]
                 if mode == "graph":
                     assert graph_replays > 0, "ordinary graph baseline did not replay graphs"
                 elif mode == "eager":

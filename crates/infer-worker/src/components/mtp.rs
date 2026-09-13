@@ -163,3 +163,57 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> MtpHead<T, D, M> {
         self.decoder.project_logits_into(normalized, output, ctx)
     }
 }
+
+impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> crate::domain::draft::ConditionedDraft<T, D>
+    for MtpHead<T, D, M>
+{
+    fn dims(&self) -> ModelDims {
+        self.dims()
+    }
+    fn device(&self) -> &D {
+        self.device()
+    }
+    fn cache_layout(&self) -> &CacheLayout {
+        self.cache_layout()
+    }
+    fn feature_width(&self) -> usize {
+        self.dims().dim
+    }
+    fn prepare(&mut self, capacity: usize, batch: usize) -> OpResult<()> {
+        self.prepare(capacity, batch)
+    }
+    fn project_features_into(
+        &self,
+        features: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        D::copy_tensor(ctx.scope(), features, output)
+    }
+    fn forward_hidden_into(
+        &self,
+        next_tokens: &Tensor<i32, D>,
+        conditioning: &Tensor<T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        self.forward_hidden_into(
+            MtpInput {
+                next_token_ids: next_tokens,
+                target_hidden: conditioning,
+            },
+            cache,
+            output,
+            ctx,
+        )
+    }
+    fn project_logits_into(
+        &self,
+        hidden: &Tensor<T, D>,
+        output: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        self.project_logits_into(hidden, output, ctx)
+    }
+}

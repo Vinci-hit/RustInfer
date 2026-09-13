@@ -734,6 +734,23 @@ impl infer_core::ports::VocabOps for Cuda {
 }
 
 impl infer_core::ports::FusedOps for Cuda {
+    fn allocate_paged_decode_rows(
+        device: &Self,
+        cap_num_tokens: usize,
+        max_blocks_per_seq: usize,
+    ) -> OpResult<Option<infer_core::kv::PagedDecodeRows<Self>>> {
+        kernels::flash_attn_gqa::short_query::allocate(device, cap_num_tokens, max_blocks_per_seq)
+    }
+
+    fn prepare_paged_attention_index(
+        scope: &Self::Scope,
+        plan: &infer_core::plan::BatchPlan,
+        index: &mut infer_core::kv::KvIndexTensors<Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::flash_attn_gqa::short_query::prepare(scope_stream(scope), plan, index)
+    }
+
     fn layer_norm<T: Dtype>(
         scope: &Self::Scope,
         input: &Tensor<T, Self>,
@@ -1081,6 +1098,15 @@ impl infer_core::ports::FusedOps for Cuda {
             logprobs,
             workspace,
         )
+    }
+
+    fn remap_ids_inplace(
+        scope: &Self::Scope,
+        ids: &mut Tensor<i32, Self>,
+        table: &Tensor<i32, Self>,
+    ) -> OpResult<()> {
+        let _guard = infer_core::exec::ExecScope::enter(scope);
+        kernels::sampler::remap_ids(scope_stream(scope), ids, table)
     }
 
     fn argmax<T: infer_core::dtype::Dtype>(

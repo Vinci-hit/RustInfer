@@ -19,7 +19,7 @@ impl<T: Dtype, D: LlmBackend> Attention<T, D> {
     pub(crate) fn cache_spec(&self) -> LayerCacheSpec {
         match self {
             Self::Full(attention) => LayerCacheSpec::Full {
-                kv_dim: attention.kv_head_num * attention.head_dim,
+                kv_dim: attention.core.kv_head_num * attention.core.head_dim,
             },
             Self::Linear(gdn) => LayerCacheSpec::Linear(gdn.dims()),
         }

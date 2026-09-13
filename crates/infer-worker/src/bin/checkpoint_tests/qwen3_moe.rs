@@ -93,6 +93,7 @@ fn qwen3_moe_checkpoint_diagnostic() {
             total_q_tiles: req.len() as i32,
         };
         let index = KvIndexTensors {
+            decode_rows: None,
             block_tables: Tensor::from_host_slice(
                 &(0..(blocks * batch) as i32).collect::<Vec<_>>(),
                 [batch, blocks],

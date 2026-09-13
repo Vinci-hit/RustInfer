@@ -21,6 +21,8 @@ use infer_core::types::{DataType, Dtype};
 use std::cell::Cell;
 use std::ffi::c_void;
 
+pub(crate) mod short_query;
+
 // When set, FA3 is allowed to launch under CUDA graph capture. The runtime
 // raises this only around the mixed FA3-graph capture region (where the bucket
 // plan bakes `max_q`/`b` to proven upper bounds over every replay composition)
@@ -455,6 +457,7 @@ pub enum PagedAttentionKind {
 
 #[derive(Clone, Copy)]
 pub struct PagedAttentionPlan<'a> {
+    pub decode_rows: Option<&'a infer_core::kv::PagedDecodeRows<Cuda>>,
     pub kind: PagedAttentionKind,
     pub num_tokens: usize,
     pub batch: usize,
@@ -484,6 +487,7 @@ impl<'a> PagedAttentionPlan<'a> {
             plan::BatchKind::Ragged | plan::BatchKind::Spec { .. } => PagedAttentionKind::Ragged,
         };
         Self {
+            decode_rows: index.decode_rows.as_ref(),
             kind,
             num_tokens: plan.num_tokens,
             batch: plan.batch,
@@ -908,6 +912,21 @@ pub fn attention_paged<T: Dtype>(
                 return Ok(());
             }
 
+            if short_query::try_attention(
+                stream,
+                q,
+                k_pool,
+                v_pool,
+                output,
+                plan,
+                head_num,
+                kv_head_num,
+                head_dim,
+                scale,
+            )? {
+                return Ok(());
+            }
+
             // Legacy split path — non-Hopper builds, non-bf16/hd128 models,
             // RUSTINFER_PREFILL_FA3=0, and always inside CUDA graph capture
             // (FA3 trusts host-side b/cu_seqlens; only CuTe's device-side
@@ -1077,6 +1096,7 @@ mod tests {
                 &v,
                 &mut output,
                 PagedAttentionPlan {
+                    decode_rows: None,
                     kind: PagedAttentionKind::Ragged,
                     num_tokens: q_len,
                     batch: 1,

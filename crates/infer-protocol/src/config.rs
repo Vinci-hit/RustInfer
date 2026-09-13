@@ -41,6 +41,21 @@ impl Default for CudaMemoryConfig {
     }
 }
 
+/// Optional speculative strategy. The target model remains the configured model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpeculativeConfig {
+    Mtp {
+        num_draft_tokens: usize,
+    },
+    Eagle3 {
+        draft_model: String,
+        num_draft_tokens: usize,
+        #[serde(default)]
+        allow_target_mismatch: bool,
+    },
+}
+
 /// Top-level launch config, deserialized from `rustinfer.toml`.
 ///
 /// Every field has a default so a minimal file containing only `model = "..."`
@@ -194,6 +209,9 @@ pub struct RustInferConfig {
     #[serde(default)]
     pub mtp_num_draft_tokens: usize,
 
+    #[serde(default)]
+    pub speculative: Option<SpeculativeConfig>,
+
     /// CUDA scratch-memory plan. Read only from this shared launch config.
     #[serde(default)]
     pub cuda_memory: CudaMemoryConfig,
@@ -267,6 +285,23 @@ fn default_cuda_pool_retain_mib() -> usize {
 }
 
 impl RustInferConfig {
+    pub fn speculative_draft_tokens(&self) -> usize {
+        match self.speculative {
+            Some(SpeculativeConfig::Mtp { num_draft_tokens })
+            | Some(SpeculativeConfig::Eagle3 {
+                num_draft_tokens, ..
+            }) => num_draft_tokens,
+            None => self.mtp_num_draft_tokens,
+        }
+    }
+    pub fn mtp_draft_tokens(&self) -> usize {
+        match self.speculative {
+            Some(SpeculativeConfig::Mtp { num_draft_tokens }) => num_draft_tokens,
+            Some(SpeculativeConfig::Eagle3 { .. }) => 0,
+            None => self.mtp_num_draft_tokens,
+        }
+    }
+
     /// Load and parse a TOML config file. Errors are returned as `String`
     /// (infer-protocol has no error-handling dep); callers wrap with context.
     pub fn load(path: &str) -> Result<Self, String> {
@@ -305,13 +340,24 @@ impl RustInferConfig {
         if self.max_batch_seqs == 0 {
             return Err("`max_batch_seqs` must be > 0".into());
         }
-        if self.mtp_num_draft_tokens > 0
+        if self.speculative.is_some() && self.mtp_num_draft_tokens != 0 {
+            return Err("use either speculative or legacy mtp_num_draft_tokens".into());
+        }
+        if self.speculative.is_some() && self.speculative_draft_tokens() == 0 {
+            return Err("speculative num_draft_tokens must be positive".into());
+        }
+        if let Some(SpeculativeConfig::Eagle3 { draft_model, .. }) = &self.speculative
+            && (draft_model.trim().is_empty() || self.paged_block_size != 1)
+        {
+            return Err("EAGLE3 requires a draft_model and paged_block_size=1".into());
+        }
+        if self.speculative_draft_tokens() > 0
             && (self.tensor_parallel_size != 1
                 || self.max_batch_seqs != 1
                 || self.enable_prefix_caching
-                || self.mtp_num_draft_tokens >= self.max_batch_tokens)
+                || self.speculative_draft_tokens() >= self.max_batch_tokens)
         {
-            return Err("MTP requires tensor_parallel_size=1, max_batch_seqs=1, enable_prefix_caching=false, and draft tokens < max_batch_tokens".into());
+            return Err("speculative serving requires tensor_parallel_size=1, max_batch_seqs=1, enable_prefix_caching=false, and draft tokens < max_batch_tokens".into());
         }
         if self.paged_block_size == 0 {
             return Err("`paged_block_size` must be > 0".into());
@@ -551,7 +597,60 @@ mod model_type_tests {
 
 #[cfg(test)]
 mod launch_config_tests {
-    use super::RustInferConfig;
+    use super::{RustInferConfig, SpeculativeConfig};
+
+    #[test]
+    fn eagle3_config_keeps_target_and_requires_explicit_compatible_limits() {
+        let valid = "model='/tmp/Qwen3-4B'\nmax_batch_seqs=1\npaged_block_size=1\n[speculative]\nmethod='eagle3'\ndraft_model='/tmp/draft'\nnum_draft_tokens=7";
+        let config: RustInferConfig = toml::from_str(valid).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.model, "/tmp/Qwen3-4B");
+        assert_eq!(config.speculative_draft_tokens(), 7);
+        assert_eq!(config.mtp_draft_tokens(), 0);
+        assert!(matches!(
+            config.speculative,
+            Some(SpeculativeConfig::Eagle3 {
+                allow_target_mismatch: false,
+                ..
+            })
+        ));
+
+        for invalid in [
+            valid.replace("max_batch_seqs=1", "max_batch_seqs=2"),
+            valid.replace("paged_block_size=1", "paged_block_size=16"),
+            valid.replace("num_draft_tokens=7", "num_draft_tokens=0"),
+            valid.replace("'/tmp/draft'", "' '"),
+            format!("mtp_num_draft_tokens=3\n{valid}"),
+            format!("enable_prefix_caching=true\n{valid}"),
+            format!("tensor_parallel_size=2\n{valid}"),
+            format!("max_batch_tokens=7\n{valid}"),
+        ] {
+            assert!(
+                toml::from_str::<RustInferConfig>(&invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            valid.replace("method='eagle3'", "method='unknown'"),
+            format!("{valid}\nnum_draft_token=3"),
+        ] {
+            assert!(toml::from_str::<RustInferConfig>(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_mtp_and_legacy_config_resolve_to_same_strategy() {
+        let config: RustInferConfig = toml::from_str(
+            "model='/tmp/model'\nmax_batch_seqs=1\n[speculative]\nmethod='mtp'\nnum_draft_tokens=3",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.mtp_draft_tokens(), 3);
+        assert_eq!(config.speculative_draft_tokens(), 3);
+    }
 
     #[test]
     fn mtp_is_opt_in_and_rejects_incompatible_serving_limits() {

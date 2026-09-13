@@ -30,8 +30,8 @@ pub async fn chat_completions(
 
     // 1. 校验请求
     validate_request(&req)?;
-    shared::validate_mtp_request(
-        state.config.mtp_num_draft_tokens,
+    shared::validate_speculative_request(
+        state.config.speculative_draft_tokens(),
         req.temperature,
         req.top_p,
         req.top_k,

@@ -83,6 +83,21 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
         plan: &BatchPlan,
         device_input: Option<&Tensor<i32, D>>,
     ) -> OpResult<(StepOutput, BatchPlan)> {
+        self.step_speculative_observed(
+            req,
+            plan,
+            device_input,
+            &mut crate::domain::features::NoopObserver,
+        )
+    }
+
+    fn step_speculative_observed<O: crate::domain::features::LayerObserver<T, D>>(
+        &mut self,
+        req: &StepRequest,
+        plan: &BatchPlan,
+        device_input: Option<&Tensor<i32, D>>,
+        observer: &mut O,
+    ) -> OpResult<(StepOutput, BatchPlan)> {
         self.validate_eager_transaction(req)?;
         self.prepare_recurrent_verification(req, plan)?;
         let mut retained = self.retained_request.take().unwrap_or_else(|| {
@@ -107,7 +122,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
                 };
                 let output = operation(Phase::Verify, plan.num_tokens, workspace)
                     .execute(&metrics, |_| {
-                        self.step_eager_with_input(plan, req, device_input)
+                        self.step_eager_observed(plan, req, device_input, observer)
                     })?;
                 if output.materialized_tokens.len() != req.seqs.len()
                     || req
@@ -122,7 +137,9 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
                 }
                 retained.retain_from(req, &output.materialized_tokens);
                 let retained_plan = self.build_plan(&retained)?;
-                if retained_plan.num_tokens != plan.num_tokens {
+                if retained_plan.num_tokens != plan.num_tokens
+                    && (self.recurrent.is_some() || !observer.is_active())
+                {
                     // GDN has already consumed rejected inputs. Restore the entire
                     // participating batch, then replay just its retained prefixes.
                     // Full-attention KV suffix bytes become inaccessible via lengths;
@@ -148,7 +165,9 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
                         None => self.input_ids_tensor(&retained, &retained_plan)?,
                     };
                     operation(Phase::Replay, retained_plan.num_tokens, workspace)
-                        .execute(&metrics, |_| self.run_layers(&retained_plan, &input))?;
+                        .execute(&metrics, |_| {
+                            self.run_layers_observed(&retained_plan, &input, observer)
+                        })?;
                 }
                 if let Some(state) = &mut self.recurrent {
                     state.retain_step(&retained);
@@ -164,6 +183,79 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
 }
 
 impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
+    pub fn step_with_features_into(
+        &mut self,
+        req: &StepRequest,
+        features: &mut crate::domain::features::TargetFeatures<T, D>,
+    ) -> OpResult<StepOutput> {
+        self.step_with_features_input(req, features, None)
+    }
+
+    /// Readout selection is supplied by the serving adapter. Layer features use
+    /// a single full-attention sequence so retained rows are a contiguous prefix.
+    pub(crate) fn step_with_features_input(
+        &mut self,
+        req: &StepRequest,
+        features: &mut crate::domain::features::TargetFeatures<T, D>,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<StepOutput> {
+        use crate::domain::features::TargetFeatures;
+        let TargetFeatures::Layers(layers) = features else {
+            let TargetFeatures::FinalNormalized(output) = features else {
+                unreachable!()
+            };
+            return self.step_with_hidden_input(req, output, device_input);
+        };
+        let plan = self.build_plan(req)?;
+        self.validate_eager_transaction(req)?;
+        layers.validate(self.dims, plan.num_tokens, self.scope.device())?;
+        if req.seqs.len() != 1 || self.recurrent.is_some() {
+            return Err(OpError::unsupported(
+                "layer readout",
+                "requires one full-attention sequence",
+            ));
+        }
+        if let Some(input) = device_input
+            && (req.draft_tokens.is_empty()
+                || input.shape().as_slice() != [plan.num_tokens]
+                || !input.is_contiguous()
+                || infer_core::device::Device::device_id(input.device())
+                    != infer_core::device::Device::device_id(self.scope.device()))
+        {
+            return Err(OpError::Shape(
+                "invalid speculative device token tape".into(),
+            ));
+        }
+        let result = (|| {
+            let output = if req.draft_tokens.is_empty() {
+                self.upload_index(&plan, req)?;
+                ExecutionPlan::eager(
+                    Phase::Prefill,
+                    plan.batch,
+                    plan.num_tokens,
+                    WorkspaceUse::Runtime,
+                )
+                .execute(&self.execution_metrics.clone(), |_| {
+                    self.step_eager_observed(&plan, req, None, layers)
+                })?
+            } else {
+                self.step_speculative_observed(req, &plan, device_input, layers)?
+                    .0
+            };
+            let retained = output.materialized_tokens[0] as usize;
+            ExecutionPlan::eager(Phase::Readout, 1, retained, WorkspaceUse::Runtime)
+                .execute(&self.execution_metrics, |_| {
+                    layers.concatenate(retained, &self.scope)
+                })?;
+            self.scope.synchronize()?;
+            Ok(output)
+        })();
+        if result.is_err() {
+            let _ = self.scope.synchronize();
+        }
+        result
+    }
+
     /// Explicit text-only, TP=1 eager entry point for a hidden-conditioned
     /// proposer. Output storage survives later forwards. On an execution error,
     /// callers must release their KV lease and rebuild the sequence from zero.

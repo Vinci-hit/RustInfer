@@ -161,20 +161,22 @@ where
     )?;
 
     let attention = FullAttention {
-        input_layernorm,
-        qkv_proj,
-        o_proj,
-        q_norm: Some(q_norm),
-        k_norm: Some(k_norm),
-        sin,
-        cos,
-        head_num: cfg.head_num,
-        kv_head_num: cfg.kv_head_num,
-        head_dim: cfg.head_dim,
-        scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-        rotary_dim: cfg.head_dim,
-        attn_output_gate: false,
         scratch: None,
+        input_layernorm,
+        core: crate::components::attention_core::AttentionCore {
+            qkv_proj,
+            o_proj,
+            q_norm: Some(q_norm),
+            k_norm: Some(k_norm),
+            sin,
+            cos,
+            head_num: cfg.head_num,
+            kv_head_num: cfg.kv_head_num,
+            head_dim: cfg.head_dim,
+            scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+            rotary_dim: cfg.head_dim,
+            attn_output_gate: false,
+        },
     };
     validate_attention_geometry(&attention, cfg.dim, qkv_dim)?;
     Ok(attention)
@@ -309,8 +311,9 @@ where
     D: LlmBackend,
 {
     let hidden_features = ffn.routed.hidden_features();
-    let q_dim = checked_attention_width("query", attention.head_num, attention.head_dim)?;
-    let kv_dim = checked_attention_width("KV", attention.kv_head_num, attention.head_dim)?;
+    let q_dim = checked_attention_width("query", attention.core.head_num, attention.core.head_dim)?;
+    let kv_dim =
+        checked_attention_width("KV", attention.core.kv_head_num, attention.core.head_dim)?;
     let qkv_dim = q_dim
         .checked_add(
             kv_dim
@@ -513,26 +516,26 @@ where
     let Attention::Full(attention) = &block.attention else {
         return Err(OpError::Shape("qwen3_moe requires full attention".into()));
     };
-    if attention.head_num != cfg.head_num
-        || attention.kv_head_num != cfg.kv_head_num
-        || attention.head_dim != cfg.head_dim
+    if attention.core.head_num != cfg.head_num
+        || attention.core.kv_head_num != cfg.kv_head_num
+        || attention.core.head_dim != cfg.head_dim
     {
         return Err(OpError::Shape(format!(
             "qwen3_moe layer {} attention geometry [{},{},{}] != config [{},{},{}]",
             layer_index,
-            attention.head_num,
-            attention.kv_head_num,
-            attention.head_dim,
+            attention.core.head_num,
+            attention.core.kv_head_num,
+            attention.core.head_dim,
             cfg.head_num,
             cfg.kv_head_num,
             cfg.head_dim
         )));
     }
-    if attention.sin.shape().as_slice()[0] != cfg.seq_len {
+    if attention.core.sin.shape().as_slice()[0] != cfg.seq_len {
         return Err(OpError::Shape(format!(
             "qwen3_moe layer {} RoPE cache length {} != config {}",
             layer_index,
-            attention.sin.shape().as_slice()[0],
+            attention.core.sin.shape().as_slice()[0],
             cfg.seq_len
         )));
     }
@@ -543,17 +546,17 @@ where
     )?;
     validate_configured_f32(
         &format!("layer {layer_index} q_norm epsilon"),
-        attention.q_norm.as_ref().unwrap().eps,
+        attention.core.q_norm.as_ref().unwrap().eps,
         cfg.rms_norm_eps,
     )?;
     validate_configured_f32(
         &format!("layer {layer_index} k_norm epsilon"),
-        attention.k_norm.as_ref().unwrap().eps,
+        attention.core.k_norm.as_ref().unwrap().eps,
         cfg.rms_norm_eps,
     )?;
     validate_configured_f32(
         &format!("layer {layer_index} attention scale"),
-        attention.scale,
+        attention.core.scale,
         1.0 / (cfg.head_dim as f32).sqrt(),
     )?;
 
@@ -720,15 +723,18 @@ where
     T: Dtype,
     D: LlmBackend,
 {
-    if attention.head_num == 0
-        || attention.kv_head_num == 0
-        || attention.head_dim == 0
-        || !attention.head_num.is_multiple_of(attention.kv_head_num)
-        || !attention.head_dim.is_multiple_of(2)
+    if attention.core.head_num == 0
+        || attention.core.kv_head_num == 0
+        || attention.core.head_dim == 0
+        || !attention
+            .core
+            .head_num
+            .is_multiple_of(attention.core.kv_head_num)
+        || !attention.core.head_dim.is_multiple_of(2)
     {
         return Err(OpError::Shape(format!(
             "qwen3_moe attention has invalid head geometry heads={}, kv_heads={}, head_dim={}",
-            attention.head_num, attention.kv_head_num, attention.head_dim
+            attention.core.head_num, attention.core.kv_head_num, attention.core.head_dim
         )));
     }
     if attention.input_layernorm.weight.shape().as_slice() != [hidden_features] {
@@ -739,7 +745,7 @@ where
         )));
     }
 
-    let qkv_weight = attention.qkv_proj.weight.as_dense().ok_or_else(|| {
+    let qkv_weight = attention.core.qkv_proj.weight.as_dense().ok_or_else(|| {
         OpError::Shape("qwen3_moe attention QKV weight must be dense in the local path".into())
     })?;
     if qkv_weight.shape().as_slice() != [qkv_features, hidden_features] {
@@ -750,8 +756,9 @@ where
             qkv_weight.shape().as_slice()
         )));
     }
-    let q_features = checked_attention_width("query", attention.head_num, attention.head_dim)?;
-    let o_weight = attention.o_proj.weight.as_dense().ok_or_else(|| {
+    let q_features =
+        checked_attention_width("query", attention.core.head_num, attention.core.head_dim)?;
+    let o_weight = attention.core.o_proj.weight.as_dense().ok_or_else(|| {
         OpError::Shape("qwen3_moe attention output weight must be dense in the local path".into())
     })?;
     if o_weight.shape().as_slice() != [hidden_features, q_features] {
@@ -762,20 +769,20 @@ where
             o_weight.shape().as_slice()
         )));
     }
-    if attention.qkv_proj.bias.is_some() || attention.o_proj.bias.is_some() {
+    if attention.core.qkv_proj.bias.is_some() || attention.core.o_proj.bias.is_some() {
         return Err(OpError::Shape(
             "qwen3_moe attention projections must not have bias".into(),
         ));
     }
-    if attention.qkv_proj.parallelism().tp().size != 1
-        || attention.o_proj.parallelism().tp().size != 1
+    if attention.core.qkv_proj.parallelism().tp().size != 1
+        || attention.core.o_proj.parallelism().tp().size != 1
     {
         return Err(OpError::Kernel(
             "qwen3_moe attention assembly currently requires TP1".into(),
         ));
     }
 
-    let (q_norm, k_norm) = match (&attention.q_norm, &attention.k_norm) {
+    let (q_norm, k_norm) = match (&attention.core.q_norm, &attention.core.k_norm) {
         (Some(q_norm), Some(k_norm)) => (q_norm, k_norm),
         _ => {
             return Err(OpError::Shape(
@@ -784,33 +791,33 @@ where
         }
     };
     for (name, norm) in [("q_norm", q_norm), ("k_norm", k_norm)] {
-        if norm.weight.shape().as_slice() != [attention.head_dim] {
+        if norm.weight.shape().as_slice() != [attention.core.head_dim] {
             return Err(OpError::Shape(format!(
                 "qwen3_moe attention {name} must be [{}], got {:?}",
-                attention.head_dim,
+                attention.core.head_dim,
                 norm.weight.shape().as_slice()
             )));
         }
     }
 
-    let sin_shape = attention.sin.shape().as_slice();
-    let cos_shape = attention.cos.shape().as_slice();
+    let sin_shape = attention.core.sin.shape().as_slice();
+    let cos_shape = attention.core.cos.shape().as_slice();
     if sin_shape.len() != 2
         || sin_shape[0] == 0
-        || sin_shape[1] != attention.head_dim / 2
+        || sin_shape[1] != attention.core.head_dim / 2
         || cos_shape != sin_shape
     {
         return Err(OpError::Shape(format!(
             "qwen3_moe attention RoPE caches must share [seq,{}], got sin={:?}, cos={:?}",
-            attention.head_dim / 2,
+            attention.core.head_dim / 2,
             sin_shape,
             cos_shape
         )));
     }
-    if !attention.scale.is_finite() || attention.scale <= 0.0 {
+    if !attention.core.scale.is_finite() || attention.core.scale <= 0.0 {
         return Err(OpError::Shape(format!(
             "qwen3_moe attention scale must be finite and positive, got {}",
-            attention.scale
+            attention.core.scale
         )));
     }
 
@@ -819,8 +826,8 @@ where
     validate_tensor_device(o_weight, "output weight", device_id)?;
     validate_tensor_device(&q_norm.weight, "q_norm", device_id)?;
     validate_tensor_device(&k_norm.weight, "k_norm", device_id)?;
-    validate_tensor_device(&attention.sin, "sin cache", device_id)?;
-    validate_tensor_device(&attention.cos, "cos cache", device_id)?;
+    validate_tensor_device(&attention.core.sin, "sin cache", device_id)?;
+    validate_tensor_device(&attention.core.cos, "cos cache", device_id)?;
     Ok(())
 }
 
@@ -1331,11 +1338,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(input_norm, vec![5.0, 6.0, 7.0, 8.0]);
         assert_eq!(attention.input_layernorm.eps, 1e-6);
-        assert_eq!(attention.head_num, HEADS);
-        assert_eq!(attention.kv_head_num, KV_HEADS);
-        assert_eq!(attention.head_dim, HEAD_DIM);
+        assert_eq!(attention.core.head_num, HEADS);
+        assert_eq!(attention.core.kv_head_num, KV_HEADS);
+        assert_eq!(attention.core.head_dim, HEAD_DIM);
 
         let qkv = attention
+            .core
             .qkv_proj
             .weight
             .as_dense()
@@ -1356,6 +1364,7 @@ mod tests {
         );
         assert_eq!(
             attention
+                .core
                 .o_proj
                 .weight
                 .as_dense()
@@ -1365,15 +1374,29 @@ mod tests {
             [HIDDEN, Q_DIM]
         );
         assert_eq!(
-            attention.q_norm.as_ref().unwrap().weight.shape().as_slice(),
+            attention
+                .core
+                .q_norm
+                .as_ref()
+                .unwrap()
+                .weight
+                .shape()
+                .as_slice(),
             [HEAD_DIM]
         );
         assert_eq!(
-            attention.k_norm.as_ref().unwrap().weight.shape().as_slice(),
+            attention
+                .core
+                .k_norm
+                .as_ref()
+                .unwrap()
+                .weight
+                .shape()
+                .as_slice(),
             [HEAD_DIM]
         );
-        assert_eq!(attention.sin.shape().as_slice(), [8, HEAD_DIM / 2]);
-        assert_eq!(attention.cos.shape().as_slice(), [8, HEAD_DIM / 2]);
+        assert_eq!(attention.core.sin.shape().as_slice(), [8, HEAD_DIM / 2]);
+        assert_eq!(attention.core.cos.shape().as_slice(), [8, HEAD_DIM / 2]);
         assert_eq!(block.ffn.routed.num_experts(), 2);
         assert_eq!(block.ffn.routed.top_k(), 1);
         assert!(attention.scratch.is_none());
@@ -1388,7 +1411,7 @@ mod tests {
         let cfg = test_config();
         let mut attention = load_layer_attention::<bf16, Cpu>(&loader, &cfg, 0, &Cpu).unwrap();
         let ffn = load_layer_ffn::<bf16, Cpu>(&loader, &cfg, 0, &Cpu).unwrap();
-        attention.k_norm = None;
+        attention.core.k_norm = None;
 
         let err = assemble_layer_block(attention, ffn).err().unwrap();
         assert!(err.to_string().contains("requires both q_norm and k_norm"));

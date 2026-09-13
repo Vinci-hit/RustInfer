@@ -229,7 +229,7 @@ where
             || bs.load.enable_prefix_caching
             || profile_cuda_steps.is_some())
     {
-        return Err("MTP serving requires one TP1 request, prefix caching disabled, and no ordinary decode profiler override".into());
+        return Err("Speculative serving requires one TP1 request, prefix caching disabled, and no ordinary decode profiler override".into());
     }
     if bs.block_size != 1 {
         return Err(format!(
@@ -578,83 +578,85 @@ where
     // enables real capture-on-first-hit / replay for decode-only batches whose
     // size matches a capture slot; on backends without graph support it is a
     // no-op and decode stays eager.
-    if let Err(e) = runner.prime_graphs() {
-        if e.is_fatal() {
-            return Err(format!("fatal graph priming failure: {e}"));
-        }
-        tracing::info!("[bootstrap] graph priming skipped, eager decode: {:?}", e);
-    } else {
-        // Capture every decode graph now, before serving, so no live decode
-        // step ever pays an inline capture stall (the dominant TTFT/TPOT tail
-        // spike under load — see `Runtime::prewarm_decode_graphs`).
-        let t_warm = Instant::now();
-        match runner.prewarm_decode_graphs() {
-            Ok(()) => tracing::info!(
-                "[bootstrap] decode graphs prewarmed ({} sizes) in {:.2}s",
-                bs.capture_sizes.len(),
-                t_warm.elapsed().as_secs_f64(),
-            ),
-            Err(e) if e.is_fatal() => {
-                return Err(format!("fatal decode graph prewarm failure: {e}"));
+    if !E::SPECULATIVE {
+        if let Err(e) = runner.prime_graphs() {
+            if e.is_fatal() {
+                return Err(format!("fatal graph priming failure: {e}"));
             }
-            Err(e) => tracing::info!("[bootstrap] decode graph prewarm skipped: {:?}", e),
-        }
-        // Warm the prefill path across a length grid so the first live prefill
-        // of each shape pays no inline allocator/library cost (the residual
-        // TTFT p99 tail after decode-graph prewarm). Grid is coarse — the CUDA
-        // allocator bins sizes, so nearby lengths reuse warmed pools.
-        let prefill_grid: Vec<usize> = [
-            8usize, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 768,
-            1024,
-        ]
-        .into_iter()
-        .filter(|&l| l <= bs.max_seq_len)
-        .collect();
-        let t_pf = Instant::now();
-        match runner.prewarm_prefill_shapes(&prefill_grid) {
-            Ok(()) => tracing::info!(
-                "[bootstrap] prefill shapes prewarmed ({} lengths) in {:.2}s",
-                prefill_grid.len(),
-                t_pf.elapsed().as_secs_f64(),
-            ),
-            Err(e) if e.is_fatal() => {
-                return Err(format!("fatal prefill prewarm failure: {e}"));
-            }
-            Err(e) => tracing::info!("[bootstrap] prefill prewarm skipped: {:?}", e),
-        }
-        let t_mixed = Instant::now();
-        if runner.mixed_eager_mode() {
-            // Eager-mixed mode (unified FA3): mixed graphs are never replayed,
-            // so skip the 104-bucket capture pass and warm the eager fused
-            // path's GEMM token buckets instead.
-            match runner.prewarm_mixed_eager_shapes(eos_ids) {
-                Ok(n) => tracing::info!(
-                    "[bootstrap] mixed eager shapes prewarmed ({} token buckets) in {:.2}s",
-                    n,
-                    t_mixed.elapsed().as_secs_f64(),
-                ),
-                Err(e) if e.is_fatal() => {
-                    return Err(format!("fatal mixed eager prewarm failure: {e}"));
-                }
-                Err(e) => tracing::info!("[bootstrap] mixed eager prewarm skipped: {:?}", e),
-            }
+            tracing::info!("[bootstrap] graph priming skipped, eager decode: {:?}", e);
         } else {
-            let attn = if runner.mixed_fa3_graph_mode() {
-                "FA3"
-            } else {
-                "CuTe-split"
-            };
-            match runner.prewarm_mixed_graphs(eos_ids) {
-                Ok(n) => tracing::info!(
-                    "[bootstrap] mixed ABC graphs prewarmed ({} buckets, {} attention) in {:.2}s",
-                    n,
-                    attn,
-                    t_mixed.elapsed().as_secs_f64(),
+            // Capture every decode graph now, before serving, so no live decode
+            // step ever pays an inline capture stall (the dominant TTFT/TPOT tail
+            // spike under load — see `Runtime::prewarm_decode_graphs`).
+            let t_warm = Instant::now();
+            match runner.prewarm_decode_graphs() {
+                Ok(()) => tracing::info!(
+                    "[bootstrap] decode graphs prewarmed ({} sizes) in {:.2}s",
+                    bs.capture_sizes.len(),
+                    t_warm.elapsed().as_secs_f64(),
                 ),
                 Err(e) if e.is_fatal() => {
-                    return Err(format!("fatal mixed graph prewarm failure: {e}"));
+                    return Err(format!("fatal decode graph prewarm failure: {e}"));
                 }
-                Err(e) => tracing::info!("[bootstrap] mixed graph prewarm skipped: {:?}", e),
+                Err(e) => tracing::info!("[bootstrap] decode graph prewarm skipped: {:?}", e),
+            }
+            // Warm the prefill path across a length grid so the first live prefill
+            // of each shape pays no inline allocator/library cost (the residual
+            // TTFT p99 tail after decode-graph prewarm). Grid is coarse — the CUDA
+            // allocator bins sizes, so nearby lengths reuse warmed pools.
+            let prefill_grid: Vec<usize> = [
+                8usize, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512,
+                768, 1024,
+            ]
+            .into_iter()
+            .filter(|&l| l <= bs.max_seq_len)
+            .collect();
+            let t_pf = Instant::now();
+            match runner.prewarm_prefill_shapes(&prefill_grid) {
+                Ok(()) => tracing::info!(
+                    "[bootstrap] prefill shapes prewarmed ({} lengths) in {:.2}s",
+                    prefill_grid.len(),
+                    t_pf.elapsed().as_secs_f64(),
+                ),
+                Err(e) if e.is_fatal() => {
+                    return Err(format!("fatal prefill prewarm failure: {e}"));
+                }
+                Err(e) => tracing::info!("[bootstrap] prefill prewarm skipped: {:?}", e),
+            }
+            let t_mixed = Instant::now();
+            if runner.mixed_eager_mode() {
+                // Eager-mixed mode (unified FA3): mixed graphs are never replayed,
+                // so skip the 104-bucket capture pass and warm the eager fused
+                // path's GEMM token buckets instead.
+                match runner.prewarm_mixed_eager_shapes(eos_ids) {
+                    Ok(n) => tracing::info!(
+                        "[bootstrap] mixed eager shapes prewarmed ({} token buckets) in {:.2}s",
+                        n,
+                        t_mixed.elapsed().as_secs_f64(),
+                    ),
+                    Err(e) if e.is_fatal() => {
+                        return Err(format!("fatal mixed eager prewarm failure: {e}"));
+                    }
+                    Err(e) => tracing::info!("[bootstrap] mixed eager prewarm skipped: {:?}", e),
+                }
+            } else {
+                let attn = if runner.mixed_fa3_graph_mode() {
+                    "FA3"
+                } else {
+                    "CuTe-split"
+                };
+                match runner.prewarm_mixed_graphs(eos_ids) {
+                    Ok(n) => tracing::info!(
+                        "[bootstrap] mixed ABC graphs prewarmed ({} buckets, {} attention) in {:.2}s",
+                        n,
+                        attn,
+                        t_mixed.elapsed().as_secs_f64(),
+                    ),
+                    Err(e) if e.is_fatal() => {
+                        return Err(format!("fatal mixed graph prewarm failure: {e}"));
+                    }
+                    Err(e) => tracing::info!("[bootstrap] mixed graph prewarm skipped: {:?}", e),
+                }
             }
         }
     }

@@ -1,10 +1,11 @@
-//! Explicit MTP adapter for the existing worker control and data planes.
-use super::{MtpProposer, commit::commit_decode, validate_sampling};
+//! Explicit speculative adapter for the existing worker control and data planes.
+use super::{ConditionedProposer, commit::commit_decode, validate_sampling};
 use crate::application::decode_common::send_step_error;
 use crate::application::execution::{ExecutionPlan, Phase, WorkspaceUse};
 use crate::application::serve_execution::{ServingExecution, ServingStep};
 use crate::application::worker_scheduler::handle_eager_prefill;
-use crate::components::mtp::MtpHead;
+use crate::domain::draft::ConditionedDraft;
+use crate::domain::features::{FeatureSpec, TargetFeatures};
 use crate::domain::model::DecoderReadout;
 use crate::domain::plan::StepRequest;
 use crate::domain::ports::{OpError, OpResult};
@@ -12,35 +13,56 @@ use crate::infrastructure::cuda::Cuda;
 use half::bf16;
 use infer_protocol::scheduler_to_worker_data::PrefillBatchCmd;
 
-pub struct MtpServing<H: DecoderReadout<bf16, Cuda>> {
-    proposer: MtpProposer<bf16, Cuda, H>,
+pub struct ConditionedServing<H: ConditionedDraft<bf16, Cuda>> {
+    proposer: ConditionedProposer<bf16, Cuda, H>,
     owner: Option<u64>,
     draft_tokens: usize,
     request: StepRequest,
-    target_hidden: crate::domain::tensor::Tensor<bf16, Cuda>,
+    target_hidden: TargetFeatures<bf16, Cuda>,
 }
 
-impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
+impl<H: ConditionedDraft<bf16, Cuda>> ConditionedServing<H> {
     pub fn new(
-        head: MtpHead<bf16, Cuda, H>,
+        head: H,
         max_context: usize,
         max_step_tokens: usize,
         draft_tokens: usize,
         device: &Cuda,
     ) -> OpResult<Self> {
-        if draft_tokens == 0 || draft_tokens >= max_step_tokens {
+        Self::with_features(
+            head,
+            FeatureSpec::FinalNormalized,
+            max_context,
+            max_step_tokens,
+            draft_tokens,
+            device,
+        )
+    }
+
+    pub fn with_features(
+        head: H,
+        feature_spec: FeatureSpec,
+        max_context: usize,
+        max_step_tokens: usize,
+        draft_tokens: usize,
+        device: &Cuda,
+    ) -> OpResult<Self> {
+        if draft_tokens == 0
+            || draft_tokens >= max_step_tokens
+            || feature_spec.width(head.dims().dim)? != head.feature_width()
+        {
             return Err(OpError::Shape(
-                "MTP serving draft width must fit K+1 target rows".into(),
+                "speculative serving requires K+1 target rows and matching feature width".into(),
             ));
         }
         let target_hidden =
-            crate::domain::tensor::Tensor::zeros([max_step_tokens, head.dims().dim], device)?;
+            TargetFeatures::new(feature_spec, head.dims().dim, max_step_tokens, device)?;
         let mut request = StepRequest::workspace(1, draft_tokens + 1, max_context);
         request.draft_tokens.push(Vec::with_capacity(draft_tokens));
         Ok(Self {
             request,
             target_hidden,
-            proposer: MtpProposer::new(
+            proposer: ConditionedProposer::new(
                 head,
                 max_context,
                 max_step_tokens.min(max_context),
@@ -64,7 +86,7 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             || seg.prefix_hint.as_ref().is_some_and(|p| !p.is_empty())
         {
             return Err(OpError::unsupported(
-                "MTP serving",
+                "speculative serving",
                 "multimodal inputs or prefix-cache hits",
             ));
         }
@@ -77,14 +99,16 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
         validate_sampling(&[params], 1)?;
         if seg.segment_start == 0 {
             if ctx.prefilling.contains_key(&seg.sequence_id) {
-                return Err(OpError::Shape("duplicate MTP initial prefill".into()));
+                return Err(OpError::Shape(
+                    "duplicate speculative initial prefill".into(),
+                ));
             }
             ctx.runner.release_sequence(seg.sequence_id);
             self.proposer.reset();
             self.owner = Some(seg.sequence_id);
         } else if self.owner != Some(seg.sequence_id) {
             return Err(OpError::Shape(
-                "MTP prefill continuation has no draft history".into(),
+                "speculative prefill continuation has no draft history".into(),
             ));
         }
         let wire = handle_eager_prefill(
@@ -95,12 +119,13 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             ctx.allocator,
             ctx.eos_ids,
             |runner, req| {
-                let mut output = runner.step_with_hidden_into(req, &mut self.target_hidden)?;
+                let mut output =
+                    runner.step_with_features_input(req, &mut self.target_hidden, None)?;
                 let seq = &req.seqs[0];
                 self.proposer.observe(
                     &seq.input_ids,
                     seq.kv_write_start as usize,
-                    &self.target_hidden.narrow(0, 0, seq.input_ids.len())?,
+                    &self.target_hidden.rows(seq.input_ids.len())?,
                     &runner.scope,
                 )?;
                 if seq.kv_len_after as usize >= runner.max_seq_len {
@@ -121,13 +146,17 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
     ) -> OpResult<()> {
         let seq = &ctx.active[&id];
         if self.owner != Some(id) || self.proposer.committed_len() + 1 != seq.kv_len {
-            return Err(OpError::Shape("MTP target/draft history mismatch".into()));
+            return Err(OpError::Shape(
+                "speculative target/draft history mismatch".into(),
+            ));
         }
         validate_sampling(std::slice::from_ref(&seq.sampling), 1)?;
         let remaining = seq.max_tokens.saturating_sub(seq.generated_count);
         let capacity = ctx.runner.max_seq_len.saturating_sub(seq.kv_len);
         if remaining == 0 || capacity == 0 {
-            return Err(OpError::Shape("MTP decode has exhausted its budget".into()));
+            return Err(OpError::Shape(
+                "speculative decode has exhausted its budget".into(),
+            ));
         }
         let k = self
             .draft_tokens
@@ -170,7 +199,7 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             req.stop.max_tokens.push(seq.max_tokens as u32);
             req.stop.ignore_eos.clear();
             req.stop.ignore_eos.push(seq.ignore_eos);
-            let mut output = ctx.runner.step_with_hidden_input(
+            let mut output = ctx.runner.step_with_features_input(
                 req,
                 &mut self.target_hidden,
                 Some(&device_input),
@@ -180,7 +209,7 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
             self.proposer.observe_with_input(
                 &req.seqs[0].input_ids[..kept],
                 seq.kv_len,
-                &self.target_hidden.narrow(0, 0, kept)?,
+                &self.target_hidden.rows(kept)?,
                 &ctx.runner.scope,
                 Some(&device_input.narrow(0, 0, kept)?),
             )?;
@@ -195,7 +224,7 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
                 draft_ms = drafted.as_secs_f64() * 1e3,
                 verify_ms = (verified - drafted).as_secs_f64() * 1e3,
                 catchup_ms = (started.elapsed() - verified).as_secs_f64() * 1e3,
-                "MTP round"
+                "speculative round"
             );
             Ok(output)
         })();
@@ -222,8 +251,8 @@ impl<H: DecoderReadout<bf16, Cuda>> MtpServing<H> {
     }
 }
 
-impl<M: DecoderReadout<bf16, Cuda>, H: DecoderReadout<bf16, Cuda>> ServingExecution<M>
-    for MtpServing<H>
+impl<M: DecoderReadout<bf16, Cuda>, H: ConditionedDraft<bf16, Cuda>> ServingExecution<M>
+    for ConditionedServing<H>
 {
     const SPECULATIVE: bool = true;
     fn prepare(
@@ -235,7 +264,7 @@ impl<M: DecoderReadout<bf16, Cuda>, H: DecoderReadout<bf16, Cuda>> ServingExecut
     fn step(&mut self, mut ctx: ServingStep<'_, M>) -> OpResult<()> {
         if ctx.runner.cap_batch != 1 || ctx.active.len() + ctx.prefilling.len() > 1 {
             return Err(OpError::Shape(
-                "MTP serving requires one active request".into(),
+                "speculative serving requires one active request".into(),
             ));
         }
         if self
@@ -284,3 +313,5 @@ impl<M: DecoderReadout<bf16, Cuda>, H: DecoderReadout<bf16, Cuda>> ServingExecut
         Ok(())
     }
 }
+
+pub type MtpServing<H> = ConditionedServing<crate::components::mtp::MtpHead<bf16, Cuda, H>>;

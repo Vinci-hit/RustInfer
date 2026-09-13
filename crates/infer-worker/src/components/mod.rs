@@ -1,5 +1,7 @@
 pub mod attention;
+pub mod attention_core;
 pub mod decoder_block;
+pub mod eagle3;
 pub mod embed;
 pub mod ffn_dense;
 pub mod ffn_moe;

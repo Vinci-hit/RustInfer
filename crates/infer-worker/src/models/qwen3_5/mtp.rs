@@ -106,45 +106,47 @@ fn load_full_attention<T: Dtype, D: OpBackend + LlmBackend>(
     let q_dim = cfg.head_num * cfg.head_dim;
     let kv_dim = cfg.kv_head_num * cfg.head_dim;
     Ok(FullAttention {
-        input_layernorm,
-        qkv_proj: loader.load_fused_qkv_with_fp8(
-            layer,
-            q_dim * (1 + usize::from(cfg.attn_output_gate)),
-            kv_dim,
-            cfg.dim,
-            None,
-            device,
-        )?,
-        o_proj: load_linear(
-            loader,
-            &format!("{layer}.self_attn.o_proj.weight"),
-            cfg.dim,
-            q_dim,
-            device,
-        )?,
-        q_norm: Some(load_norm(
-            loader,
-            &format!("{layer}.self_attn.q_norm.weight"),
-            cfg.head_dim,
-            cfg.rms_norm_eps,
-            device,
-        )?),
-        k_norm: Some(load_norm(
-            loader,
-            &format!("{layer}.self_attn.k_norm.weight"),
-            cfg.head_dim,
-            cfg.rms_norm_eps,
-            device,
-        )?),
-        sin: sin.clone(),
-        cos: cos.clone(),
-        head_num: cfg.head_num,
-        kv_head_num: cfg.kv_head_num,
-        head_dim: cfg.head_dim,
-        rotary_dim: cfg.rotary_dim,
-        attn_output_gate: cfg.attn_output_gate,
-        scale: 1.0 / (cfg.head_dim as f32).sqrt(),
         scratch: None,
+        input_layernorm,
+        core: crate::components::attention_core::AttentionCore {
+            qkv_proj: loader.load_fused_qkv_with_fp8(
+                layer,
+                q_dim * (1 + usize::from(cfg.attn_output_gate)),
+                kv_dim,
+                cfg.dim,
+                None,
+                device,
+            )?,
+            o_proj: load_linear(
+                loader,
+                &format!("{layer}.self_attn.o_proj.weight"),
+                cfg.dim,
+                q_dim,
+                device,
+            )?,
+            q_norm: Some(load_norm(
+                loader,
+                &format!("{layer}.self_attn.q_norm.weight"),
+                cfg.head_dim,
+                cfg.rms_norm_eps,
+                device,
+            )?),
+            k_norm: Some(load_norm(
+                loader,
+                &format!("{layer}.self_attn.k_norm.weight"),
+                cfg.head_dim,
+                cfg.rms_norm_eps,
+                device,
+            )?),
+            sin: sin.clone(),
+            cos: cos.clone(),
+            head_num: cfg.head_num,
+            kv_head_num: cfg.kv_head_num,
+            head_dim: cfg.head_dim,
+            rotary_dim: cfg.rotary_dim,
+            attn_output_gate: cfg.attn_output_gate,
+            scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+        },
     })
 }
 fn load_dense_ffn<T: Dtype, D: OpBackend + LlmBackend>(
@@ -283,6 +285,7 @@ mod tests {
         };
         let ints = |v: &[i32]| Tensor::from_host_slice(v, [v.len()], device).unwrap();
         let idx = KvIndexTensors {
+            decode_rows: None,
             block_tables: Tensor::from_host_slice(
                 &(0..blocks as i32).collect::<Vec<_>>(),
                 [1, blocks],

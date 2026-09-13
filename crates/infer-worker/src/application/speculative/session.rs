@@ -1,18 +1,19 @@
 //! Single-sequence eager reference engine. Owns both caches and commits a round
-//! only after target verification, recurrent recovery, and MTP catch-up succeed.
-use super::MtpProposer;
+//! only after target verification, recurrent recovery, and speculative catch-up succeed.
+use super::ConditionedProposer;
 use crate::application::runtime::Runtime;
 use crate::application::sampler_stack::GreedySampler;
-use crate::components::mtp::MtpHead;
+use crate::domain::draft::ConditionedDraft;
 use crate::domain::dtype::Dtype;
 use crate::domain::exec::ExecScope;
+use crate::domain::features::{FeatureSpec, TargetFeatures};
 use crate::domain::model::DecoderReadout;
 use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{OpError, OpResult};
 
 #[derive(Clone, Debug)]
-pub struct MtpLimits {
+pub struct SpeculativeLimits {
     pub max_context: usize,
     pub max_step_tokens: usize,
     pub max_output_tokens: u32,
@@ -21,7 +22,7 @@ pub struct MtpLimits {
 }
 
 #[derive(Debug)]
-pub struct MtpStep {
+pub struct SpeculativeStep {
     pub tokens: Vec<i32>,
     pub proposed: usize,
     /// Consecutive matching drafts before EOS truncation, not a KV increment.
@@ -32,27 +33,37 @@ pub struct MtpStep {
 /// Static dispatch for both the target and head. This engine is deliberately
 /// explicit: constructing a normal Runtime never loads or enables speculation.
 /// It owns a dedicated single-request KV allocation, not a serving scheduler lease.
-pub struct MtpSession<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>> {
+pub struct SpeculativeSession<
+    T: Dtype,
+    D: LlmBackend,
+    M: DecoderReadout<T, D>,
+    H: ConditionedDraft<T, D>,
+> {
     target: Runtime<T, D, M>,
-    proposer: MtpProposer<T, D, H>,
-    limits: MtpLimits,
+    proposer: ConditionedProposer<T, D, H>,
+    limits: SpeculativeLimits,
     blocks: Vec<u32>,
     len: usize,
     pending: Option<i32>,
     generated: u32,
     finished: bool,
     poisoned: bool,
-    target_hidden: crate::domain::tensor::Tensor<T, D>,
+    target_hidden: TargetFeatures<T, D>,
 }
 
-impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
-    MtpSession<T, D, M, H>
+impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: ConditionedDraft<T, D>>
+    SpeculativeSession<T, D, M, H>
 {
-    pub fn new(
+    pub fn new(model: M, head: H, scope: D::Scope, limits: SpeculativeLimits) -> OpResult<Self> {
+        Self::with_features(model, head, scope, limits, FeatureSpec::FinalNormalized)
+    }
+
+    pub fn with_features(
         model: M,
-        head: MtpHead<T, D, H>,
+        head: H,
         scope: D::Scope,
-        limits: MtpLimits,
+        limits: SpeculativeLimits,
+        feature_spec: FeatureSpec,
     ) -> OpResult<Self> {
         if limits.max_context == 0
             || limits.max_context > i32::MAX as usize
@@ -62,6 +73,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             || limits.max_output_tokens == 0
             || model.dims().dim != head.dims().dim
             || model.dims().vocab_size != head.dims().vocab_size
+            || feature_spec.width(model.dims().dim)? != head.feature_width()
             || limits
                 .eos_ids
                 .iter()
@@ -69,10 +81,10 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             || scope.topology().tp.size != 1
         {
             return Err(OpError::Shape(
-                "invalid MTP session limits or model dimensions".into(),
+                "invalid speculative session limits or model dimensions".into(),
             ));
         }
-        let proposer = MtpProposer::new(
+        let proposer = ConditionedProposer::new(
             head,
             limits.max_context,
             limits.max_step_tokens,
@@ -81,8 +93,10 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
         proposer.prepare_metrics(&scope)?;
         let block_size = 16;
         let num_blocks = limits.max_context.div_ceil(block_size);
-        let target_hidden = crate::domain::tensor::Tensor::zeros(
-            [limits.max_step_tokens, model.dims().dim],
+        let target_hidden = TargetFeatures::new(
+            feature_spec,
+            model.dims().dim,
+            limits.max_step_tokens,
             scope.device(),
         )?;
         let mut target = Runtime::new(
@@ -133,7 +147,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
         Ok(())
     }
 
-    pub fn prefill(&mut self, prompt: &[i32]) -> OpResult<MtpStep> {
+    pub fn prefill(&mut self, prompt: &[i32]) -> OpResult<SpeculativeStep> {
         if self.poisoned
             || self.pending.is_some()
             || self.len != 0
@@ -144,20 +158,22 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
                 .any(|&id| id < 0 || id as usize >= self.target.dims.vocab_size)
         {
             return Err(OpError::Shape(
-                "MTP prefill requires a fresh session and valid prompt".into(),
+                "speculative prefill requires a fresh session and valid prompt".into(),
             ));
         }
         let result = (|| {
             let mut next = 0;
             for ids in prompt.chunks(self.limits.max_step_tokens) {
                 let request = self.request(ids, vec![]);
-                let output = self
-                    .target
-                    .step_with_hidden_into(&request, &mut self.target_hidden)?;
+                let output = self.target.step_with_features_input(
+                    &request,
+                    &mut self.target_hidden,
+                    None,
+                )?;
                 self.proposer.observe(
                     ids,
                     self.len,
-                    &self.target_hidden.narrow(0, 0, ids.len())?,
+                    &self.target_hidden.rows(ids.len())?,
                     &self.target.scope,
                 )?;
                 self.len += ids.len();
@@ -168,7 +184,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             self.finished = self.limits.eos_ids.contains(&next)
                 || self.generated >= self.limits.max_output_tokens
                 || self.len >= self.limits.max_context;
-            Ok(MtpStep {
+            Ok(SpeculativeStep {
                 tokens: vec![next],
                 proposed: 0,
                 accepted: 0,
@@ -178,10 +194,10 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
         self.finish(result)
     }
 
-    pub fn decode(&mut self) -> OpResult<MtpStep> {
+    pub fn decode(&mut self) -> OpResult<SpeculativeStep> {
         if self.poisoned || self.finished || self.pending.is_none() {
             return Err(OpError::Shape(
-                "MTP decode requires an active healthy session".into(),
+                "speculative decode requires an active healthy session".into(),
             ));
         }
         let result = (|| {
@@ -199,7 +215,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             ids.push(self.pending.unwrap());
             ids.extend_from_slice(&drafts);
             let req = self.request(&ids, vec![drafts]);
-            let output = self.target.step_with_hidden_input(
+            let output = self.target.step_with_features_input(
                 &req,
                 &mut self.target_hidden,
                 Some(&device_input),
@@ -208,7 +224,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
             self.proposer.observe_with_input(
                 &ids[..retained],
                 self.len,
-                &self.target_hidden.narrow(0, 0, retained)?,
+                &self.target_hidden.rows(retained)?,
                 &self.target.scope,
                 Some(&device_input.narrow(0, 0, retained)?),
             )?;
@@ -227,7 +243,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
                 tokens.len(),
                 retained,
             );
-            Ok(MtpStep {
+            Ok(SpeculativeStep {
                 tokens,
                 proposed: k,
                 accepted: output.accepted_drafts.as_ref().unwrap()[0] as usize,
@@ -237,7 +253,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
         self.finish(result)
     }
 
-    fn finish(&mut self, result: OpResult<MtpStep>) -> OpResult<MtpStep> {
+    fn finish(&mut self, result: OpResult<SpeculativeStep>) -> OpResult<SpeculativeStep> {
         if result.is_err() {
             self.poisoned = true;
             self.target.release_sequence(0);
@@ -266,3 +282,10 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: DecoderReadout<T, D>>
         }
     }
 }
+
+/// Compatibility alias retaining the existing speculative session API.
+pub type MtpSession<T, D, M, H> =
+    SpeculativeSession<T, D, M, crate::components::mtp::MtpHead<T, D, H>>;
+
+pub type MtpLimits = SpeculativeLimits;
+pub type MtpStep = SpeculativeStep;

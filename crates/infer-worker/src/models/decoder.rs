@@ -91,9 +91,9 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> Decoder<T, D, F> {
                     ));
                 }
                 Attention::Full(attn)
-                    if attn.head_num != dims.head_num
-                        || attn.kv_head_num != dims.kv_head_num
-                        || attn.head_dim != dims.head_dim =>
+                    if attn.core.head_num != dims.head_num
+                        || attn.core.kv_head_num != dims.kv_head_num
+                        || attn.core.head_dim != dims.head_dim =>
                 {
                     return Err(OpError::Shape(
                         "attention geometry does not match decoder".into(),
@@ -174,6 +174,23 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         cache: &mut ModelCacheView<'_, T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
+        self.decode_layers_observed(
+            range,
+            hidden,
+            cache,
+            ctx,
+            &mut crate::domain::features::NoopObserver,
+        )
+    }
+
+    fn decode_layers_observed<O: crate::domain::features::LayerObserver<T, D>>(
+        &self,
+        range: LayerRange,
+        hidden: &mut Hidden<T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
+        ctx: &StepCtx<'_, D>,
+        observer: &mut O,
+    ) -> OpResult<()> {
         cache.validate(&self.cache_layout, range, ctx.plan())?;
         if hidden.stream.shape().as_slice() != [ctx.plan().num_tokens, self.dims.dim] {
             return Err(OpError::Shape(
@@ -189,6 +206,7 @@ impl<T: Dtype, D: LlmBackend, F: DecoderFfn<T, D>> DecoderModel<T, D> for Decode
         for layer_idx in range.start..range.end {
             let layer_cache = cache.layer(self.cache_layout.layers()[layer_idx])?;
             self.blocks[layer_idx].run(hidden, layer_cache, ctx)?;
+            observer.capture(layer_idx, hidden, ctx)?;
         }
         // Flush the last sublayer's deferred residual delta so `stream` holds the
         // true residual for `finalize`. This is the one residual boundary not
@@ -501,19 +519,21 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         blocks.push(DecoderBlock {
             attention: Attention::Full(FullAttention {
                 input_layernorm: comp_rms(input_layernorm),
-                qkv_proj,
-                o_proj,
-                q_norm,
-                k_norm,
-                sin: sin_cache.clone(),
-                cos: cos_cache.clone(),
-                head_num: local_head_num,
-                kv_head_num: local_kv_head_num,
-                head_dim: cfg.head_dim,
-                rotary_dim: cfg.rotary_dim,
-                attn_output_gate: cfg.attn_output_gate,
-                scale,
                 scratch: None,
+                core: crate::components::attention_core::AttentionCore {
+                    qkv_proj,
+                    o_proj,
+                    q_norm,
+                    k_norm,
+                    sin: sin_cache.clone(),
+                    cos: cos_cache.clone(),
+                    head_num: local_head_num,
+                    kv_head_num: local_kv_head_num,
+                    head_dim: cfg.head_dim,
+                    rotary_dim: cfg.rotary_dim,
+                    attn_output_gate: cfg.attn_output_gate,
+                    scale,
+                },
             }),
             ffn: DenseFfn {
                 post_attention_layernorm: comp_rms(post_attention_layernorm),
@@ -618,19 +638,21 @@ mod tests {
         let block = DecoderBlock {
             attention: Attention::Full(FullAttention {
                 input_layernorm: rms(ones(DIM)),
-                qkv_proj: lin(qkv_dim, DIM),
-                o_proj: lin(DIM, q_dim),
-                q_norm: None,
-                k_norm: None,
-                sin,
-                cos,
-                head_num: HEAD_NUM,
-                kv_head_num: HEAD_NUM,
-                head_dim: HEAD_DIM,
-                rotary_dim: HEAD_DIM,
-                attn_output_gate: false,
-                scale: 1.0 / (HEAD_DIM as f32).sqrt(),
                 scratch: None,
+                core: crate::components::attention_core::AttentionCore {
+                    qkv_proj: lin(qkv_dim, DIM),
+                    o_proj: lin(DIM, q_dim),
+                    q_norm: None,
+                    k_norm: None,
+                    sin,
+                    cos,
+                    head_num: HEAD_NUM,
+                    kv_head_num: HEAD_NUM,
+                    head_dim: HEAD_DIM,
+                    rotary_dim: HEAD_DIM,
+                    attn_output_gate: false,
+                    scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                },
             }),
             ffn: DenseFfn {
                 post_attention_layernorm: rms(ones(DIM)),
