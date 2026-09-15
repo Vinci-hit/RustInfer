@@ -6,7 +6,7 @@
 __global__ void prepare_short_query_rows_kernel(
     const int32_t* tables, const int32_t* cu_q, const int32_t* kv_lens,
     int32_t* row_tables, int32_t* row_q_lens, int32_t* row_kv_lens,
-    int batch, int max_blocks, int block_size) {
+    int batch, int max_blocks, int block_size, int causal) {
     const int row = blockIdx.x;
     int req = 0;
     while (req < batch && row >= cu_q[req + 1]) ++req;
@@ -15,7 +15,7 @@ __global__ void prepare_short_query_rows_kernel(
         const int q_len = cu_q[req + 1] - cu_q[req];
         const int kv_len = kv_lens[req];
         if (q_len > 0 && kv_len >= q_len && kv_len <= max_blocks * block_size)
-            visible = kv_len - q_len + (row - cu_q[req]) + 1;
+            visible = causal ? kv_len - q_len + (row - cu_q[req]) + 1 : kv_len;
     }
     if (threadIdx.x == 0) {
         row_q_lens[row] = visible > 0 ? 1 : 0;
@@ -32,9 +32,9 @@ __global__ void prepare_short_query_rows_kernel(
 extern "C" int rustinfer_prepare_short_query_rows(
     const int32_t* tables, const int32_t* cu_q, const int32_t* kv_lens,
     int32_t* row_tables, int32_t* row_q_lens, int32_t* row_kv_lens,
-    int batch, int rows, int max_blocks, int block_size, cudaStream_t stream) {
+    int batch, int rows, int max_blocks, int block_size, int causal, cudaStream_t stream) {
     prepare_short_query_rows_kernel<<<rows, 256, 0, stream>>>(
         tables, cu_q, kv_lens, row_tables, row_q_lens, row_kv_lens,
-        batch, max_blocks, block_size);
+        batch, max_blocks, block_size, causal);
     return static_cast<int>(cudaGetLastError());
 }

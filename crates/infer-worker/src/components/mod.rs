@@ -32,3 +32,5 @@ pub use moe_local::{MoeLocalPipeline, MoeLocalScratch};
 pub use moe_permute::{MoeRoutePlan, MoeTokenPermuter};
 pub use moe_router::MoeRouter;
 pub use norm::RmsNorm;
+
+pub mod dflash;

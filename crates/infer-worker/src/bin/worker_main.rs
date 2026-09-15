@@ -12,6 +12,8 @@
 //! The worker owns the decode self-loop — the scheduler never re-sends
 //! per-step decode commands.
 
+#[path = "bootstrap/dflash.rs"]
+mod dflash_bootstrap;
 #[path = "bootstrap/eagle3.rs"]
 mod eagle3_bootstrap;
 
@@ -892,10 +894,13 @@ fn main() -> Result<(), String> {
 
     if matches!(
         cfg.speculative,
-        Some(infer_protocol::config::SpeculativeConfig::Eagle3 { .. })
+        Some(
+            infer_protocol::config::SpeculativeConfig::Eagle3 { .. }
+                | infer_protocol::config::SpeculativeConfig::Dflash { .. }
+        )
     ) && model_type != "qwen3"
     {
-        return Err("EAGLE3 serving currently requires a dense Qwen3 target".into());
+        return Err("EAGLE3/DFlash serving currently requires a dense Qwen3 target".into());
     }
 
     match model_type.as_str() {
@@ -941,6 +946,27 @@ fn main() -> Result<(), String> {
                 let execution = eagle3_bootstrap::load_execution(
                     spec,
                     &load.model_path,
+                    &model,
+                    &load_cfg,
+                    max_seq_len,
+                    load.max_batch_tokens,
+                    &cuda,
+                )?;
+                infer_worker::application::serve_loop::run_with_model_and_execution(
+                    &control,
+                    &data,
+                    model,
+                    make_bootstrap(),
+                    followers,
+                    &eos_ids,
+                    args.profile_cuda_steps,
+                    execution,
+                )?;
+            } else if let Some(spec @ infer_protocol::config::SpeculativeConfig::Dflash { .. }) =
+                &cfg.speculative
+            {
+                let execution = dflash_bootstrap::load_execution(
+                    spec,
                     &model,
                     &load_cfg,
                     max_seq_len,
@@ -2432,3 +2458,10 @@ mod beam_cli_tests {
 #[cfg(test)]
 #[path = "checkpoint_tests/qwen3_eagle3.rs"]
 mod qwen3_eagle3_checkpoint_tests;
+
+#[cfg(test)]
+#[path = "checkpoint_tests/qwen3_dflash.rs"]
+mod qwen3_dflash_checkpoint_tests;
+#[cfg(test)]
+#[path = "checkpoint_tests/speculative_support.rs"]
+mod speculative_checkpoint_support;

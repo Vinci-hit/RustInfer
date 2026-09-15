@@ -453,6 +453,7 @@ unsafe fn launch_fa3_ragged<T: Dtype>(
 pub enum PagedAttentionKind {
     DecodeOnly,
     Ragged,
+    NonCausal,
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +485,10 @@ impl<'a> PagedAttentionPlan<'a> {
     pub fn from_v2(plan: &'a plan::BatchPlan, index: &'a KvIndexTensors<Cuda>) -> Self {
         let kind = match plan.kind {
             plan::BatchKind::DecodeOnly => PagedAttentionKind::DecodeOnly,
+            plan::BatchKind::Spec {
+                mask: plan::MaskMode::Full,
+                ..
+            } => PagedAttentionKind::NonCausal,
             plan::BatchKind::Ragged | plan::BatchKind::Spec { .. } => PagedAttentionKind::Ragged,
         };
         Self {
@@ -533,8 +538,8 @@ pub fn flash_attention_workspace_capacity_f32(
 /// in `block2req[tile]` (and `cu_q_lens[req]`), so a fused batch's prefill
 /// suffix runs by passing the full base pointers but with `block2req` /
 /// `block2tile` shifted past the leading decode tiles and `total_q_tiles`
-/// reduced to match. Always causal (chunked-prefill bottom-right via the
-/// kernel's `kv_len - q_len` mask shift).
+/// reduced to match. Causal mode uses the chunked-prefill bottom-right
+/// `kv_len - q_len` shift; full mode exposes all context and block rows.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_cute_ragged<T: Dtype>(
     q_ptr: *const T,
@@ -560,6 +565,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
     kv_head_num: usize,
     head_dim: usize,
     scale: f32,
+    causal: bool,
     stream: cudaStream_t,
 ) -> OpResult<()> {
     let rc = unsafe {
@@ -588,7 +594,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
                 kv_head_num as i32,
                 head_dim as i32,
                 scale,
-                1,
+                i32::from(causal),
                 stream,
             ),
             DataType::F16 => launch_flash_attn_paged_ragged_cute_fp16(
@@ -615,7 +621,7 @@ unsafe fn launch_cute_ragged<T: Dtype>(
                 kv_head_num as i32,
                 head_dim as i32,
                 scale,
-                1,
+                i32::from(causal),
                 stream,
             ),
             _ => {
@@ -883,13 +889,14 @@ pub fn attention_paged<T: Dtype>(
                 )));
             }
         }
-        PagedAttentionKind::Ragged => {
+        PagedAttentionKind::Ragged | PagedAttentionKind::NonCausal => {
+            let causal = plan.kind == PagedAttentionKind::Ragged;
             // FA3 (Hopper, eager) takes the WHOLE ragged batch — decode q=1
             // rows included — in one varlen+paged launch. The historical
             // decode/prefill split below exists only because the CuTe ragged
             // kernel runs q=1 rows at 1/128 tile utilization; FA3's persistent
             // varlen scheduler has no such penalty, so no rescue is needed.
-            if fa3_ragged_eligible::<T>(head_dim, stream) {
+            if causal && fa3_ragged_eligible::<T>(head_dim, stream) {
                 unsafe {
                     launch_fa3_ragged(
                         q,
@@ -993,6 +1000,7 @@ pub fn attention_paged<T: Dtype>(
                                 kv_head_num,
                                 head_dim,
                                 scale,
+                                causal,
                                 stream,
                             )?;
                         }
@@ -1034,6 +1042,7 @@ pub fn attention_paged<T: Dtype>(
                     kv_head_num,
                     head_dim,
                     scale,
+                    causal,
                     stream,
                 )?;
             }

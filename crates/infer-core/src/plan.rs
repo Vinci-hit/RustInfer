@@ -39,6 +39,26 @@ pub struct BatchPlan {
 }
 
 impl BatchPlan {
+    /// Paged attention supports causal and full visibility. Reject unsupported
+    /// masks explicitly so a block draft cannot silently receive causal attention.
+    pub fn attention_is_causal(&self) -> crate::ports::OpResult<bool> {
+        match self.kind {
+            BatchKind::DecodeOnly
+            | BatchKind::Ragged
+            | BatchKind::Spec {
+                mask: MaskMode::Causal,
+                mask_handle: None,
+            } => Ok(true),
+            BatchKind::Spec {
+                mask: MaskMode::Full,
+                mask_handle: None,
+            } => Ok(false),
+            _ => Err(crate::ports::OpError::Shape(
+                "unsupported paged attention mask".into(),
+            )),
+        }
+    }
+
     pub fn is_decode_only(&self) -> bool {
         matches!(self.kind, BatchKind::DecodeOnly)
     }

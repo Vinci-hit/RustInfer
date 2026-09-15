@@ -30,6 +30,11 @@ pub struct AttentionCore<T: Dtype, D: LlmBackend> {
     pub attn_output_gate: bool,
 }
 
+struct ProjectedQuery<T: Dtype, D: LlmBackend> {
+    query: Tensor<T, D>,
+    gate: Option<Tensor<T, D>>,
+}
+
 impl<T: Dtype, D: LlmBackend> AttentionCore<T, D> {
     pub fn project_into(
         &self,
@@ -49,6 +54,80 @@ impl<T: Dtype, D: LlmBackend> AttentionCore<T, D> {
                 "attention input/output layout mismatch".into(),
             ));
         }
+        let n = ctx.plan().num_tokens;
+        let scratch = scratch.filter(|s| s.fits(n));
+        let ProjectedQuery { query: q, gate } = self.project_and_cache(input, kv, scratch, ctx)?;
+        let mut attn_out = match scratch {
+            Some(s) => s.attn_out(n),
+            None => D::alloc_tensor(
+                Shape::from_slice(&[n, self.head_num * self.head_dim]),
+                input.device(),
+            )?,
+        };
+        let num_tokens = n;
+
+        // Flash-attention decode/FA3 workspace: prefer the preallocated buffer in
+        // `ForwardScratch` (address-stable across all layers and across CUDA
+        // graph capture/replay, zero per-layer alloc+memset). Fall back to
+        // backend self-allocation only when scratch is absent (CPU reference;
+        // tests). Each layer takes a fresh full-buffer view — layers run
+        // serially on one stream so the kernel's stream-ordered reads/writes
+        // do not race.
+        let flash_ws_required = D::flash_attention_workspace_capacity_f32(
+            ctx.plan().batch,
+            num_tokens,
+            self.head_num,
+            self.head_dim,
+        );
+        let mut flash_ws = scratch
+            .filter(|s| s.flash_workspace_elems() >= flash_ws_required)
+            .map(ForwardScratch::flash_workspace_mut);
+        D::attention_paged(
+            ctx,
+            &q,
+            kv,
+            &mut attn_out,
+            self.head_num,
+            self.kv_head_num,
+            self.head_dim,
+            self.scale,
+            flash_ws.as_mut(),
+        )?;
+        if let Some(gate) = &gate {
+            D::sigmoid_mul(ctx.scope(), &mut attn_out, gate)?;
+        }
+        self.o_proj.forward(&attn_out, output, ctx)?;
+        Ok(())
+    }
+    /// Materialize context K/V without running attention or an FFN. Context
+    /// normalization belongs to the conditioning component, just like query
+    /// input normalization belongs to FullAttention.
+    pub fn cache_context(
+        &self,
+        input: &Tensor<T, D>,
+        kv: &mut KvView<'_, T, D>,
+        scratch: &ForwardScratch<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()> {
+        if input.shape().as_slice() != [ctx.plan().num_tokens, self.o_proj.out_features()]
+            || !input.is_contiguous()
+            || !scratch.fits(ctx.plan().num_tokens)
+        {
+            return Err(OpError::Shape(
+                "attention context layout/capacity mismatch".into(),
+            ));
+        }
+        self.project_and_cache(input, kv, Some(scratch), ctx)
+            .map(|_| ())
+    }
+
+    fn project_and_cache(
+        &self,
+        input: &Tensor<T, D>,
+        kv: &mut KvView<'_, T, D>,
+        scratch: Option<&ForwardScratch<T, D>>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<ProjectedQuery<T, D>> {
         if self.rotary_dim == 0
             || self.rotary_dim > self.head_dim
             || !self.rotary_dim.is_multiple_of(2)
@@ -72,10 +151,6 @@ impl<T: Dtype, D: LlmBackend> AttentionCore<T, D> {
             Some(s) if self.attn_output_gate => s.gated_qkv(num_tokens),
             Some(s) => s.qkv(num_tokens),
             None => D::alloc_tensor(Shape::from_slice(&[num_tokens, qkv_dim]), &dev)?,
-        };
-        let mut attn_out = match scratch {
-            Some(s) => s.attn_out(num_tokens),
-            None => D::alloc_tensor(Shape::from_slice(&[num_tokens, q_dim]), &dev)?,
         };
         self.qkv_proj.forward(input, &mut qkv, ctx)?;
         // Q/K/V: zero-copy column views of `qkv` on CUDA (its kernels honor row
@@ -208,37 +283,6 @@ impl<T: Dtype, D: LlmBackend> AttentionCore<T, D> {
             }
         }
 
-        // Flash-attention decode/FA3 workspace: prefer the preallocated buffer in
-        // `ForwardScratch` (address-stable across all layers and across CUDA
-        // graph capture/replay, zero per-layer alloc+memset). Fall back to
-        // backend self-allocation only when scratch is absent (CPU reference;
-        // tests). Each layer takes a fresh full-buffer view — layers run
-        // serially on one stream so the kernel's stream-ordered reads/writes
-        // do not race.
-        let flash_ws_required = D::flash_attention_workspace_capacity_f32(
-            ctx.plan().batch,
-            num_tokens,
-            self.head_num,
-            self.head_dim,
-        );
-        let mut flash_ws = scratch
-            .filter(|s| s.flash_workspace_elems() >= flash_ws_required)
-            .map(ForwardScratch::flash_workspace_mut);
-        D::attention_paged(
-            ctx,
-            &q,
-            kv,
-            &mut attn_out,
-            self.head_num,
-            self.kv_head_num,
-            self.head_dim,
-            self.scale,
-            flash_ws.as_mut(),
-        )?;
-        if let Some(gate) = &gate {
-            D::sigmoid_mul(ctx.scope(), &mut attn_out, gate)?;
-        }
-        self.o_proj.forward(&attn_out, output, ctx)?;
-        Ok(())
+        Ok(ProjectedQuery { query: q, gate })
     }
 }

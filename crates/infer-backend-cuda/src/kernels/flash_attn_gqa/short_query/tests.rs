@@ -45,7 +45,7 @@ impl Case {
             total_q_tiles: reqs.len() as i32,
         };
         let index = KvIndexTensors {
-            decode_rows: allocate(device, 8, max_blocks).unwrap(),
+            decode_rows: allocate(device, MAX_ROWS, max_blocks).unwrap(),
             block_tables: Tensor::from_host_slice(&tables, [q_lens.len(), max_blocks], device)
                 .unwrap(),
             cu_q_lens: ints(&cu),
@@ -125,7 +125,11 @@ impl Case {
         for (req, (&q_len, &kv_len)) in self.plan.q_lens.iter().zip(&self.plan.kv_lens).enumerate()
         {
             for local in 0..q_len {
-                let visible = (kv_len - q_len + local + 1) as usize;
+                let visible = if self.plan.attention_is_causal().unwrap() {
+                    kv_len - q_len + local + 1
+                } else {
+                    kv_len
+                } as usize;
                 assert_eq!(lengths[row], visible as i32);
                 for head in 0..QH {
                     let logits: Vec<_> = (0..visible)
@@ -187,7 +191,7 @@ fn short_queries_match_causal_reference_and_ignore_future_kv() {
     let scope = scope();
     let _guard = scope.enter();
     for block_size in [1, 16] {
-        for q in [2, 3, 4, 8] {
+        for q in [2, 3, 4, 8, 16] {
             let mut case = Case::new(scope.device(), &[q], &[q], block_size);
             for kv in [q, 31, 32, 33, 127, 128, 129, 513, 2048] {
                 case.plan.kv_lens[0] = kv;
@@ -210,8 +214,8 @@ fn short_queries_match_causal_reference_and_ignore_future_kv() {
     assert_eq!(&before[..3 * QH * HD], &after[..3 * QH * HD]);
     assert_ne!(&before[3 * QH * HD..], &after[3 * QH * HD..]);
     // Reusing the same buffers for a long query must clear the short-row view.
-    case.plan.num_tokens = 9;
-    case.plan.q_lens[0] = 9;
+    case.plan.num_tokens = MAX_ROWS + 1;
+    case.plan.q_lens[0] = (MAX_ROWS + 1) as i32;
     prepare(scope.stream().0, &case.plan, &mut case.index).unwrap();
     assert_eq!(case.index.decode_rows.as_ref().unwrap().num_rows, 0);
 }
@@ -221,19 +225,64 @@ fn short_queries_match_causal_reference_and_ignore_future_kv() {
 fn short_queries_graph_replay_reads_new_lengths_and_request_mapping() {
     let scope = scope();
     let _guard = scope.enter();
-    let mut case = Case::new(scope.device(), &[2, 3, 1], &[31, 65, 129], 16);
-    case.run(&scope); // Populate the cuDNN plan cache before capture.
-    case.check(&scope);
-    scope.graph_capture_begin().unwrap();
-    case.run(&scope);
-    scope.graph_capture_end(901).unwrap();
-    for (queries, lengths) in [([1, 1, 4], [65, 33, 193]), ([3, 2, 1], [128, 129, 513])] {
-        case.plan.q_lens = queries.to_vec();
-        case.plan.kv_lens = lengths.to_vec();
-        let (cu, _, _) = BatchPlan::plan_ragged_tiles(&queries);
-        case.index.cu_q_lens.upload_from_host(&cu).unwrap();
-        case.index.kv_lens.upload_from_host(&lengths).unwrap();
-        scope.graph_launch(901).unwrap();
+    for causal in [true, false] {
+        let mut case = Case::new(scope.device(), &[2, 3, 1], &[31, 65, 129], 16);
+        if !causal {
+            case.plan.kind = BatchKind::Spec {
+                mask: MaskMode::Full,
+                mask_handle: None,
+            };
+        }
+        case.run(&scope); // Populate the cuDNN plan cache before capture.
         case.check(&scope);
+        scope.graph_capture_begin().unwrap();
+        case.run(&scope);
+        scope.graph_capture_end(901 + u64::from(causal)).unwrap();
+        for (queries, lengths) in [([1, 1, 4], [65, 33, 193]), ([3, 2, 1], [128, 129, 513])] {
+            case.plan.q_lens = queries.to_vec();
+            case.plan.kv_lens = lengths.to_vec();
+            let (cu, _, _) = BatchPlan::plan_ragged_tiles(&queries);
+            case.index.cu_q_lens.upload_from_host(&cu).unwrap();
+            case.index.kv_lens.upload_from_host(&lengths).unwrap();
+            scope.graph_launch(901 + u64::from(causal)).unwrap();
+            case.check(&scope);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a visible CUDA GPU and cuDNN"]
+fn full_visibility_blocks_match_reference_and_cute_fallback() {
+    let scope = scope();
+    let _guard = scope.enter();
+    for block in [1, 16] {
+        for q in [2, 8, 16] {
+            let mut case = Case::new(scope.device(), &[q], &[129], block);
+            case.plan.kind = BatchKind::Spec {
+                mask: MaskMode::Full,
+                mask_handle: None,
+            };
+            case.run(&scope);
+            case.check(&scope);
+            // Explicitly remove the fast-path index, exercising the common
+            // paged kernel fallback without mutating process environment.
+            case.index.decode_rows.as_mut().unwrap().num_rows = 0;
+            let mut ws = Tensor::<f32, Cuda>::zeros([1], scope.device()).unwrap();
+            super::super::attention_paged(
+                scope.stream().0,
+                &case.q,
+                &case.k,
+                &case.v,
+                &mut case.output,
+                PagedAttentionPlan::from_v2(&case.plan, &case.index),
+                &mut ws,
+                QH,
+                KH,
+                HD,
+                1.0 / (HD as f32).sqrt(),
+            )
+            .unwrap();
+            case.check(&scope);
+        }
     }
 }

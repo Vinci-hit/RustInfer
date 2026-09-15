@@ -1,4 +1,4 @@
-//! Reinterpret a small causal query batch as independent paged decode rows.
+//! Reinterpret a small query batch as independent paged decode rows.
 //! Only page indices are expanded, once per forward; Q and KV stay in place.
 use super::{PagedAttentionKind, PagedAttentionPlan, try_cudnn_paged_decode};
 use crate::{Cuda, ffi::cudaStream_t};
@@ -9,7 +9,7 @@ use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 use infer_core::types::{DataType, Dtype};
 
-const MAX_ROWS: usize = 8;
+const MAX_ROWS: usize = 16;
 const DISABLE_ENV: &str = "RUSTINFER_DISABLE_SHORT_QUERY_ATTENTION";
 
 unsafe extern "C" {
@@ -24,6 +24,7 @@ unsafe extern "C" {
         rows: i32,
         max_blocks: i32,
         block_size: i32,
+        causal: i32,
         stream: cudaStream_t,
     ) -> i32;
 }
@@ -55,7 +56,7 @@ fn eligible(plan: &BatchPlan) -> bool {
         plan.kind,
         BatchKind::Ragged
             | BatchKind::Spec {
-                mask: MaskMode::Causal,
+                mask: MaskMode::Causal | MaskMode::Full,
                 mask_handle: None
             }
     ) && (2..=MAX_ROWS).contains(&plan.num_tokens)
@@ -140,6 +141,7 @@ pub(crate) fn prepare(
             plan.num_tokens as i32,
             max_blocks as i32,
             plan.block_size as i32,
+            i32::from(plan.attention_is_causal()?),
             stream,
         )
     };

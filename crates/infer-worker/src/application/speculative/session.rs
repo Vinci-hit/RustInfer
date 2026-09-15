@@ -1,6 +1,6 @@
 //! Single-sequence eager reference engine. Owns both caches and commits a round
 //! only after target verification, recurrent recovery, and speculative catch-up succeed.
-use super::ConditionedProposer;
+use super::{ConditionedProposer, DraftProposer};
 use crate::application::runtime::Runtime;
 use crate::application::sampler_stack::GreedySampler;
 use crate::domain::draft::ConditionedDraft;
@@ -33,14 +33,10 @@ pub struct SpeculativeStep {
 /// Static dispatch for both the target and head. This engine is deliberately
 /// explicit: constructing a normal Runtime never loads or enables speculation.
 /// It owns a dedicated single-request KV allocation, not a serving scheduler lease.
-pub struct SpeculativeSession<
-    T: Dtype,
-    D: LlmBackend,
-    M: DecoderReadout<T, D>,
-    H: ConditionedDraft<T, D>,
-> {
+pub struct ProposerSession<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, P: DraftProposer<T, D>>
+{
     target: Runtime<T, D, M>,
-    proposer: ConditionedProposer<T, D, H>,
+    proposer: P,
     limits: SpeculativeLimits,
     blocks: Vec<u32>,
     len: usize,
@@ -65,15 +61,37 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: ConditionedDraft<T, D>
         limits: SpeculativeLimits,
         feature_spec: FeatureSpec,
     ) -> OpResult<Self> {
+        let proposer = ConditionedProposer::new(
+            head,
+            limits.max_context,
+            limits.max_step_tokens,
+            scope.device(),
+        )?;
+        Self::from_proposer(model, proposer, scope, limits, feature_spec)
+    }
+}
+
+pub type SpeculativeSession<T, D, M, H> = ProposerSession<T, D, M, ConditionedProposer<T, D, H>>;
+
+impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, P: DraftProposer<T, D>>
+    ProposerSession<T, D, M, P>
+{
+    pub fn from_proposer(
+        model: M,
+        proposer: P,
+        scope: D::Scope,
+        limits: SpeculativeLimits,
+        feature_spec: FeatureSpec,
+    ) -> OpResult<Self> {
         if limits.max_context == 0
             || limits.max_context > i32::MAX as usize
             || limits.max_step_tokens == 0
             || limits.max_step_tokens > limits.max_context
             || limits.draft_tokens >= limits.max_step_tokens
             || limits.max_output_tokens == 0
-            || model.dims().dim != head.dims().dim
-            || model.dims().vocab_size != head.dims().vocab_size
-            || feature_spec.width(model.dims().dim)? != head.feature_width()
+            || model.dims().dim != proposer.dims().dim
+            || model.dims().vocab_size != proposer.dims().vocab_size
+            || feature_spec.width(model.dims().dim)? != proposer.feature_width()
             || limits
                 .eos_ids
                 .iter()
@@ -84,12 +102,6 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: ConditionedDraft<T, D>
                 "invalid speculative session limits or model dimensions".into(),
             ));
         }
-        let proposer = ConditionedProposer::new(
-            head,
-            limits.max_context,
-            limits.max_step_tokens,
-            scope.device(),
-        )?;
         proposer.prepare_metrics(&scope)?;
         let block_size = 16;
         let num_blocks = limits.max_context.div_ceil(block_size);
@@ -236,7 +248,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>, H: ConditionedDraft<T, D>
             self.generated += tokens.len() as u32;
             self.pending = tokens.last().copied();
             self.finished = output.finished[0] || self.len >= self.limits.max_context;
-            debug_assert_eq!(self.proposer.committed_len() + 1, self.len);
+            debug_assert_eq!(self.proposer.context_len(), self.len);
             self.target.execution_metrics.committed(
                 k,
                 output.accepted_drafts.as_ref().unwrap()[0] as usize,

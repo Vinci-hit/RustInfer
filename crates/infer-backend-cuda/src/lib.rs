@@ -1311,6 +1311,7 @@ impl infer_core::ports::FusedOps for Cuda {
         scale: f32,
         workspace: Option<&mut Tensor<f32, Self>>,
     ) -> OpResult<()> {
+        ctx.plan().attention_is_causal()?;
         let _guard = infer_core::exec::ExecScope::enter(ctx.scope());
         let (k_pool, v_pool) = kv.layer(0);
         // Decode uses this region for split-K partials; FA3 ragged attention

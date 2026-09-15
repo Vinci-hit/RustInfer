@@ -1397,6 +1397,7 @@ where
     D: MathOps,
 {
     let plan = ctx.plan();
+    let causal = plan.attention_is_causal()?;
     let q_dim = head_num * head_dim;
     let kv_dim = kv_head_num * head_dim;
     if head_num == 0 || kv_head_num == 0 || head_dim == 0 {
@@ -1444,7 +1445,11 @@ where
                     q_row, plan.num_tokens
                 )));
             }
-            let visible = seq_kv_len.min(seq_start + tq + 1);
+            let visible = if causal {
+                seq_kv_len.min(seq_start + tq + 1)
+            } else {
+                seq_kv_len
+            };
             if visible == 0 {
                 continue;
             }

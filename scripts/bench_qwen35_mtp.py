@@ -44,7 +44,7 @@ class Stack:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.model_name = getattr(args, "model_name", "Qwen3.5-4B")
         k = int(mode.removeprefix("mtp")) if mode.startswith("mtp") else 0
-        eager = mode == "eager" or mode.startswith("eagle")
+        eager = mode == "eager" or mode.startswith(("eagle", "dflash"))
         arena = 0 if eager else 256
         self.config = self.path / "config.toml"
         self.config.write_text(f'''model = {json.dumps(str(args.model))}
@@ -80,6 +80,14 @@ method = "eagle3"
 draft_model = {json.dumps(str(args.draft))}
 num_draft_tokens = {int(mode.removeprefix("eagle"))}
 allow_target_mismatch = {str(args.allow_target_mismatch).lower()}
+''')
+
+        if mode.startswith("dflash"):
+            with self.config.open("a") as config:
+                config.write(f'''\n[speculative]
+method = "dflash"
+draft_model = {json.dumps(str(args.draft))}
+num_draft_tokens = {int(mode.removeprefix("dflash"))}
 ''')
 
     def __enter__(self):

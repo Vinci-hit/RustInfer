@@ -45,3 +45,29 @@ pub trait ConditionedDraft<T: Dtype, D: LlmBackend> {
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()>;
 }
+
+/// A single block diffusion pass. Confirmed target features populate context
+/// K/V separately from the temporary masked block; no autoregressive shift.
+pub trait BlockDraft<T: Dtype, D: LlmBackend> {
+    fn dims(&self) -> ModelDims;
+    fn device(&self) -> &D;
+    fn cache_layout(&self) -> &CacheLayout;
+    fn feature_width(&self) -> usize;
+    fn block_size(&self) -> usize;
+    fn mask_token_id(&self) -> i32;
+    fn prepare(&mut self, capacity: usize) -> OpResult<()>;
+    fn cache_features(
+        &self,
+        features: &Tensor<T, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()>;
+    /// Full-visibility [anchor, masks...] -> logits for mask positions only.
+    fn forward_block(
+        &self,
+        ids: &Tensor<i32, D>,
+        cache: &mut ModelCacheView<'_, T, D>,
+        logits: &mut Tensor<T, D>,
+        ctx: &StepCtx<'_, D>,
+    ) -> OpResult<()>;
+}

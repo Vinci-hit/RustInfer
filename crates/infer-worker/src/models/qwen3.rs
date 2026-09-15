@@ -22,3 +22,5 @@ where
 }
 
 pub mod eagle3;
+
+pub mod dflash;

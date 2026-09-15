@@ -1,5 +1,5 @@
 //! Explicit speculative adapter for the existing worker control and data planes.
-use super::{ConditionedProposer, commit::commit_decode, validate_sampling};
+use super::{ConditionedProposer, DraftProposer, commit::commit_decode, validate_sampling};
 use crate::application::decode_common::send_step_error;
 use crate::application::execution::{ExecutionPlan, Phase, WorkspaceUse};
 use crate::application::serve_execution::{ServingExecution, ServingStep};
@@ -13,8 +13,8 @@ use crate::infrastructure::cuda::Cuda;
 use half::bf16;
 use infer_protocol::scheduler_to_worker_data::PrefillBatchCmd;
 
-pub struct ConditionedServing<H: ConditionedDraft<bf16, Cuda>> {
-    proposer: ConditionedProposer<bf16, Cuda, H>,
+pub struct SpeculativeServing<P: DraftProposer<bf16, Cuda>> {
+    proposer: P,
     owner: Option<u64>,
     draft_tokens: usize,
     request: StepRequest,
@@ -47,27 +47,44 @@ impl<H: ConditionedDraft<bf16, Cuda>> ConditionedServing<H> {
         draft_tokens: usize,
         device: &Cuda,
     ) -> OpResult<Self> {
+        Self::from_proposer(
+            ConditionedProposer::new(head, max_context, max_step_tokens.min(max_context), device)?,
+            feature_spec,
+            max_context,
+            max_step_tokens,
+            draft_tokens,
+            device,
+        )
+    }
+}
+
+pub type ConditionedServing<H> = SpeculativeServing<ConditionedProposer<bf16, Cuda, H>>;
+
+impl<P: DraftProposer<bf16, Cuda>> SpeculativeServing<P> {
+    pub fn from_proposer(
+        proposer: P,
+        feature_spec: FeatureSpec,
+        max_context: usize,
+        max_step_tokens: usize,
+        draft_tokens: usize,
+        device: &Cuda,
+    ) -> OpResult<Self> {
         if draft_tokens == 0
             || draft_tokens >= max_step_tokens
-            || feature_spec.width(head.dims().dim)? != head.feature_width()
+            || feature_spec.width(proposer.dims().dim)? != proposer.feature_width()
         {
             return Err(OpError::Shape(
                 "speculative serving requires K+1 target rows and matching feature width".into(),
             ));
         }
         let target_hidden =
-            TargetFeatures::new(feature_spec, head.dims().dim, max_step_tokens, device)?;
+            TargetFeatures::new(feature_spec, proposer.dims().dim, max_step_tokens, device)?;
         let mut request = StepRequest::workspace(1, draft_tokens + 1, max_context);
         request.draft_tokens.push(Vec::with_capacity(draft_tokens));
         Ok(Self {
             request,
             target_hidden,
-            proposer: ConditionedProposer::new(
-                head,
-                max_context,
-                max_step_tokens.min(max_context),
-                device,
-            )?,
+            proposer,
             owner: None,
             draft_tokens,
         })
@@ -145,7 +162,7 @@ impl<H: ConditionedDraft<bf16, Cuda>> ConditionedServing<H> {
         id: u64,
     ) -> OpResult<()> {
         let seq = &ctx.active[&id];
-        if self.owner != Some(id) || self.proposer.committed_len() + 1 != seq.kv_len {
+        if self.owner != Some(id) || self.proposer.context_len() != seq.kv_len {
             return Err(OpError::Shape(
                 "speculative target/draft history mismatch".into(),
             ));
@@ -251,8 +268,8 @@ impl<H: ConditionedDraft<bf16, Cuda>> ConditionedServing<H> {
     }
 }
 
-impl<M: DecoderReadout<bf16, Cuda>, H: ConditionedDraft<bf16, Cuda>> ServingExecution<M>
-    for ConditionedServing<H>
+impl<M: DecoderReadout<bf16, Cuda>, P: DraftProposer<bf16, Cuda>> ServingExecution<M>
+    for SpeculativeServing<P>
 {
     const SPECULATIVE: bool = true;
     fn prepare(

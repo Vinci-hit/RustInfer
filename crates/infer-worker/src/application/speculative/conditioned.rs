@@ -348,3 +348,44 @@ fn run_head<T: Dtype, D: LlmBackend, H: ConditionedDraft<T, D>>(
         &StepCtx::new(scope, plan),
     )
 }
+
+impl<T: Dtype, D: LlmBackend, H: crate::domain::draft::ConditionedDraft<T, D>>
+    super::DraftProposer<T, D> for super::ConditionedProposer<T, D, H>
+{
+    fn dims(&self) -> crate::domain::model::ModelDims {
+        self.head.dims()
+    }
+    fn feature_width(&self) -> usize {
+        self.head.feature_width()
+    }
+    fn context_len(&self) -> usize {
+        self.alignment.pending().map_or(0, |(p, _)| p as usize + 1)
+    }
+    fn committed_len(&self) -> usize {
+        self.committed_len()
+    }
+    fn prepare_metrics(&self, scope: &D::Scope) -> OpResult<()> {
+        self.prepare_metrics(scope)
+    }
+    fn reset(&mut self) {
+        self.reset();
+    }
+    fn observe_with_input(
+        &mut self,
+        ids: &[i32],
+        start: usize,
+        hidden: &Tensor<T, D>,
+        scope: &D::Scope,
+        device_input: Option<&Tensor<i32, D>>,
+    ) -> OpResult<()> {
+        self.observe_with_input(ids, start, hidden, scope, device_input)
+    }
+    fn draft_with_device(
+        &mut self,
+        pending: i32,
+        count: usize,
+        scope: &D::Scope,
+    ) -> OpResult<(Vec<i32>, Tensor<i32, D>)> {
+        self.draft_with_device(pending, count, scope)
+    }
+}

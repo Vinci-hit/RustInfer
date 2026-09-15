@@ -48,6 +48,10 @@ pub enum SpeculativeConfig {
     Mtp {
         num_draft_tokens: usize,
     },
+    Dflash {
+        draft_model: String,
+        num_draft_tokens: usize,
+    },
     Eagle3 {
         draft_model: String,
         num_draft_tokens: usize,
@@ -290,6 +294,9 @@ impl RustInferConfig {
             Some(SpeculativeConfig::Mtp { num_draft_tokens })
             | Some(SpeculativeConfig::Eagle3 {
                 num_draft_tokens, ..
+            })
+            | Some(SpeculativeConfig::Dflash {
+                num_draft_tokens, ..
             }) => num_draft_tokens,
             None => self.mtp_num_draft_tokens,
         }
@@ -297,7 +304,7 @@ impl RustInferConfig {
     pub fn mtp_draft_tokens(&self) -> usize {
         match self.speculative {
             Some(SpeculativeConfig::Mtp { num_draft_tokens }) => num_draft_tokens,
-            Some(SpeculativeConfig::Eagle3 { .. }) => 0,
+            Some(SpeculativeConfig::Eagle3 { .. } | SpeculativeConfig::Dflash { .. }) => 0,
             None => self.mtp_num_draft_tokens,
         }
     }
@@ -346,10 +353,15 @@ impl RustInferConfig {
         if self.speculative.is_some() && self.speculative_draft_tokens() == 0 {
             return Err("speculative num_draft_tokens must be positive".into());
         }
-        if let Some(SpeculativeConfig::Eagle3 { draft_model, .. }) = &self.speculative
+        if let Some(
+            SpeculativeConfig::Eagle3 { draft_model, .. }
+            | SpeculativeConfig::Dflash { draft_model, .. },
+        ) = &self.speculative
             && (draft_model.trim().is_empty() || self.paged_block_size != 1)
         {
-            return Err("EAGLE3 requires a draft_model and paged_block_size=1".into());
+            return Err(
+                "external draft models require a draft_model and paged_block_size=1".into(),
+            );
         }
         if self.speculative_draft_tokens() > 0
             && (self.tensor_parallel_size != 1
@@ -638,6 +650,31 @@ mod launch_config_tests {
             format!("{valid}\nnum_draft_token=3"),
         ] {
             assert!(toml::from_str::<RustInferConfig>(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn dflash_is_a_separate_strategy_and_requires_single_sequence_limits() {
+        let text = "model='/tmp/target'\nmax_batch_seqs=1\npaged_block_size=1\n[speculative]\nmethod='dflash'\ndraft_model='/tmp/draft'\nnum_draft_tokens=15";
+        let cfg: RustInferConfig = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.speculative_draft_tokens(), 15);
+        assert_eq!(cfg.mtp_draft_tokens(), 0);
+        for bad in [
+            text.replace("num_draft_tokens=15", "num_draft_tokens=0"),
+            text.replace("max_batch_seqs=1", "max_batch_seqs=2"),
+            text.replace("paged_block_size=1", "paged_block_size=16"),
+            text.replace("'/tmp/draft'", "' '"),
+            format!("enable_prefix_caching=true\n{text}"),
+            format!("tensor_parallel_size=2\n{text}"),
+            format!("max_batch_tokens=15\n{text}"),
+        ] {
+            assert!(
+                toml::from_str::<RustInferConfig>(&bad)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
         }
     }
 
