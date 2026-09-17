@@ -343,6 +343,15 @@ regression covers mixed text/image concurrency and streaming. Hardware/model
 combinations still require GPU validation; a successful CUDA build alone does
 not establish inference correctness.
 
+DeepSeek V4 has an offline [tiny-model validation path](docs/DEEPSEEK_V4_TINY.md)
+for a single 16GB GPU. It checks unquantized random weights against Transformers
+using CUDA GEMMs and host reference operators; full-checkpoint serving is pending.
+Independent [GPU SWA operators](docs/DEEPSEEK_V4_SWA.md) provide
+BF16 shared-KV attention with a 128-token ring cache, 512-dimensional heads,
+attention sinks and CUDA Graph replay. Decode uses one fused kernel; Tensor Core
+prefill supports full/chunked inputs followed by a stream-ordered cache commit.
+Both paths allocate no temporary GPU storage.
+
 Workers execute a bounded prefill/decode self-check before advertising ready.
 `/health` reports HTTP process liveness; `/ready` requires a loaded Worker group
 and a fresh scheduler engine heartbeat, and becomes unavailable during failure

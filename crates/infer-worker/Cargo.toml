@@ -15,6 +15,10 @@ name = "rustinfer-worker"
 path = "src/bin/worker_main.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "rustinfer-v4-tiny"
+path = "src/bin/v4_tiny.rs"
+
 [dependencies]
 infer-protocol = { version = "1.0.1", path = "../infer-protocol" }
 infer-core = { version = "1.0.1", path = "../infer-core" }

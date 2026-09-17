@@ -43,6 +43,7 @@ pub mod softmax;
 pub mod split_cols;
 pub mod swiglu; // was activation
 pub mod upsample;
+pub mod v4_swa;
 
 // --- extra wrappers sharing a dir (distinct module names) ---
 #[path = "cast_fill/cast_dtype.rs"]

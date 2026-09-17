@@ -1038,6 +1038,52 @@ impl infer_core::ports::FusedOps for Cuda {
         })
     }
 
+    fn v4_swa_decode(
+        scope: &Self::Scope,
+        query: &Tensor<half::bf16, Self>,
+        new_kv: &Tensor<half::bf16, Self>,
+        sink: &Tensor<f32, Self>,
+        position: &Tensor<i32, Self>,
+        cache: &mut Tensor<half::bf16, Self>,
+        output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_swa::decode(
+            scope_stream(scope),
+            scope.device().device_id,
+            query,
+            new_kv,
+            sink,
+            position,
+            cache,
+            output,
+        )
+    }
+
+    fn v4_swa_prefill(
+        scope: &Self::Scope,
+        query: &Tensor<half::bf16, Self>,
+        new_kv: &Tensor<half::bf16, Self>,
+        sink: &Tensor<f32, Self>,
+        start_position: &Tensor<i32, Self>,
+        cache: &mut Tensor<half::bf16, Self>,
+        output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_swa::prefill(
+            scope_stream(scope),
+            scope.device().device_id,
+            query,
+            new_kv,
+            sink,
+            start_position,
+            cache,
+            output,
+        )
+    }
+
     fn gated_rmsnorm<T: infer_core::dtype::Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         input: &Tensor<T, Self>,

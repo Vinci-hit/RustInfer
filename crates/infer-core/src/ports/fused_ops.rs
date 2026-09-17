@@ -12,6 +12,74 @@ use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
 pub trait FusedOps: MathOps {
+    /// One-token V4 SWA decode, including a ring-cache append (BF16 only).
+    ///
+    /// Single request, fixed W=128 and D=512, 1..=128 heads. Contiguous tensors:
+    /// `query/output: [heads, 512]`, `new_kv: [512]`, `cache: [128, 512]`,
+    /// `sink: f32 [heads]`, `position: i32 [1]` (absolute, zero-based, on device).
+    /// Q/KV already include normalization and RoPE; output is BEFORE inverse
+    /// RoPE and output projection. The same KV vector supplies keys and values.
+    /// Scores use scale 1/sqrt(512); the per-head sink enters the softmax
+    /// denominator only. QK, softmax and weighted sums accumulate in FP32.
+    ///
+    /// The caller owns cache and position. Call in stream order, starting at
+    /// zero or with valid preceding history. Append overwrites `position % 128`;
+    /// position is NOT incremented. Unused cache slots need not be initialized.
+    /// Negative positions leave cache unchanged and produce NaN output without
+    /// an out-of-bounds access. Device values are not downloaded for validation.
+    /// Inputs must be finite (sink may also be -inf to disable it), and writable
+    /// tensors must not overlap any other argument. All tensors must outlive
+    /// asynchronous execution. CUDA performs one allocation-free kernel launch
+    /// and reads position at execution time, including during graph replay.
+    fn v4_swa_decode(
+        _scope: &Self::Scope,
+        _query: &Tensor<half::bf16, Self>,
+        _new_kv: &Tensor<half::bf16, Self>,
+        _sink: &Tensor<f32, Self>,
+        _position: &Tensor<i32, Self>,
+        _cache: &mut Tensor<half::bf16, Self>,
+        _output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_swa_decode",
+        ))
+    }
+
+    /// V4 SWA prefill / chunked prefill, single request, W=128, D=512.
+    ///
+    /// Contiguous BF16 Q/output `[tokens, heads, 512]`, KV `[tokens, 512]`,
+    /// cache `[128, 512]`, FP32 sink `[heads]`, device I32 start_position `[1]`.
+    /// `tokens > 0`, `1 <= heads <= 128`. Q/KV and output have the same
+    /// normalization/RoPE boundary as v4_swa_decode. Each query sees its own
+    /// causal window from preceding cache history and the current chunk.
+    ///
+    /// The first kernel reads history without modifying it; a stream-ordered
+    /// second kernel commits the last min(tokens,128) new rows to the ring.
+    /// Earlier cache rows remain when the chunk is shorter than the window.
+    /// No temporary GPU allocations or host synchronization. CUDA Graph replay
+    /// reads the updated device start_position; it is not incremented here.
+    /// Negative starts or a last position above i32::MAX produce NaN output
+    /// without changing cache. Other ownership/aliasing rules match decode.
+    ///
+    /// CUDA uses BF16 Tensor Cores with FP32 accumulation. Softmax is FP32;
+    /// its probabilities are split into BF16 high/residual parts for two PV
+    /// products, retaining more precision than a single BF16 probability cast.
+    fn v4_swa_prefill(
+        _scope: &Self::Scope,
+        _query: &Tensor<half::bf16, Self>,
+        _new_kv: &Tensor<half::bf16, Self>,
+        _sink: &Tensor<f32, Self>,
+        _start_position: &Tensor<i32, Self>,
+        _cache: &mut Tensor<half::bf16, Self>,
+        _output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_swa_prefill",
+        ))
+    }
+
     /// Reserve optional backend-specific attention row indices at owner startup.
     fn allocate_paged_decode_rows(
         _device: &Self,

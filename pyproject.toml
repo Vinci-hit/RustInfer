@@ -12,6 +12,12 @@ bench = [
 ]
 vllm-reference = ["vllm>=0.10"]
 sglang-reference = ["sglang>=0.4"]
+deepseek-v4-reference = [
+    "torch==2.11.0",
+    "transformers==5.12.0",
+    "safetensors==0.8.0",
+    "numpy>=2,<3",
+]
 
 [tool.uv]
 package = false
