@@ -12,6 +12,89 @@ use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
 pub trait FusedOps: MathOps {
+    /// I32 scratch words required by v4_indexer_topk, including both merge banks.
+    /// Query once before allocating/capturing; N,C>0, 1<=K<=512. CUDA needs one
+    /// unused word for C<=2048, else 4*N*ceil(C/2048)*K words.
+    fn v4_indexer_topk_workspace_words(
+        _tokens: usize,
+        _capacity: usize,
+        _k: usize,
+    ) -> OpResult<usize> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_indexer_topk_workspace_words",
+        ))
+    }
+
+    /// V4 Indexer deterministic top-k over compressed entries, single request.
+    ///
+    /// FP32 scores `[N,C]`, device I32 start `[1]`, caller-owned mutable I32
+    /// workspace `[W]` (at least v4_indexer_topk_workspace_words), and I32
+    /// indices `[N,K]`. N,C>0, 1<=K<=512; K may exceed C/visible candidates.
+    /// Returns absolute compressed-row IDs, sorted by descending score, with
+    /// ties broken by ascending ID; +0/-0 tie. No local-KV offset is added.
+    /// Missing results are -1. NaN and -inf scores are excluded; +inf ranks
+    /// above finite values. Scores are read-only. This selects prepared FP32
+    /// scores, without re-computing dots or matching PyTorch's unspecified ties.
+    ///
+    /// Reapplies ratio=4 causality: row t only reads j<(start+t+1)/4, even if
+    /// future scores are finite. Invalid negative start, last position beyond
+    /// i32::MAX, or insufficient C fills indices with -1. Workspace contents
+    /// are unspecified after a call and must not be shared by concurrent calls.
+    /// Contiguous, four-byte-aligned same-device tensors; writable arguments
+    /// cannot overlap any other argument. Lifetimes/stream rules match scores.
+    /// No internal allocation, host read or synchronization; graph-compatible
+    /// block selection and merge launches depend only on host tensor shapes.
+    fn v4_indexer_topk(
+        _scope: &Self::Scope,
+        _scores: &Tensor<f32, Self>,
+        _start: &Tensor<i32, Self>,
+        _workspace: &mut Tensor<i32, Self>,
+        _indices: &mut Tensor<i32, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_indexer_topk",
+        ))
+    }
+
+    /// V4 Lightning Indexer scores, single request, D=128, ratio=4.
+    ///
+    /// Contiguous BF16 query `[N,H,128]`, index keys `[C,128]`, FP32 head
+    /// weights `[N,H]`, device I32 start `[1]`, FP32 output `[N,C]`.
+    /// N,C > 0; 1 <= H <= 128. N=1 is decode; arbitrary N is chunked prefill.
+    /// Q/keys must already include their projections, RoPE and any chosen
+    /// Hadamard/quantization transform. Keys come from the separate INDEX
+    /// compressor, not the main attention's 512-dimensional compressed KV.
+    /// Weights already include 1/sqrt(128*H); they may be negative.
+    ///
+    /// output[t,j] = sum_h weights[t,h] * relu(dot(query[t,h], keys[j])).
+    /// Dot products, weighted sums and output are FP32; no BF16 intermediate
+    /// rounding, softmax or top-k. At absolute token p=start+t, only rows
+    /// j < (p+1)/4 are read. Every future/padding output is -inf, including
+    /// the all-masked first three tokens. C is total cache capacity.
+    ///
+    /// Negative start, last position >i32::MAX, or insufficient capacity for
+    /// the chunk's completed blocks fills ALL output with NaN. Start and keys
+    /// are read-only; caller publishes keys beforehand on the same stream.
+    /// Finite valid inputs, four-byte alignment, same-device contiguity and
+    /// output disjoint from all inputs are required. Unused keys may be NaN.
+    /// All tensors must outlive execution. One allocation-free Tensor Core
+    /// launch, with no host reads/synchronization; supports CUDA Graph replay.
+    fn v4_indexer_scores(
+        _scope: &Self::Scope,
+        _query: &Tensor<half::bf16, Self>,
+        _keys: &Tensor<half::bf16, Self>,
+        _weights: &Tensor<f32, Self>,
+        _start: &Tensor<i32, Self>,
+        _output: &mut Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_indexer_scores",
+        ))
+    }
+
     /// One-token V4 SWA decode, including a ring-cache append (BF16 only).
     ///
     /// Single request, fixed W=128 and D=512, 1..=128 heads. Contiguous tensors:

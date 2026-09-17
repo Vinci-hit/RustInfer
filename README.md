@@ -357,8 +357,13 @@ decode and Tensor Core prefill. They support chunked inputs and CUDA Graphs;
 model execution integration and checkpoint quantization are pending.
 The [GPU CSA compressor](docs/DEEPSEEK_V4_CSA.md) adds overlapping 4-token
 compression, fused pooling/RMSNorm/RoPE, and 18 KiB of incremental FP32 state.
-It supports full/chunked prefill and graph decode; the Lightning Indexer,
-top-k selection and sparse joint attention are subsequent steps.
+It supports full/chunked prefill and graph decode.
+The [Lightning Indexer scoring kernel](docs/DEEPSEEK_V4_INDEXER.md) fuses BF16
+Tensor Core dot products, ReLU, FP32 weighted head reduction and causal masking.
+Its [deterministic top-k operator](docs/DEEPSEEK_V4_TOPK.md) selects up to 512
+compressed-row IDs using block radix selection and parallel merges, with
+caller-owned graph-safe scratch. Index-key preparation and sparse joint
+attention remain pending.
 
 Workers execute a bounded prefill/decode self-check before advertising ready.
 `/health` reports HTTP process liveness; `/ready` requires a loaded Worker group

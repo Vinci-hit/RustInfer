@@ -6,10 +6,13 @@
 尾部 interleaved RoPE 宽度 64，支持完整 prefill、任意长度分块与单 token decode。
 可在单张 16GB 显卡上独立验证，不需要下载完整模型。
 
-这是 CSA 的压缩阶段。完整 CSA 还需要 Lightning Indexer/top-k，以及将选中的
-压缩 KV 和最近 128 个原始 KV 放进同一个 softmax 的稀疏注意力。
+这是 CSA 的压缩阶段。后续由 Lightning Indexer/top-k 筛选条目，再将选中的
+压缩 KV 和最近 128 个原始 KV 放进同一个 softmax，计算稀疏注意力。
 Indexer 有独立的压缩投影、维度及 Hadamard/FP4 路径，当前入口对应主注意力的
 512 维压缩池，不能直接充当完整 Indexer。
+后续已新增 [Indexer 融合打分 kernel](DEEPSEEK_V4_INDEXER.md) 和
+[top-k 选择](DEEPSEEK_V4_TOPK.md)，负责准备好的 128 维索引 Q/K 的相关性计算
+与条目筛选；索引输入准备和稀疏主注意力仍待接入。
 
 ## 为什么不能只把 HCA 的 128 改成 4
 

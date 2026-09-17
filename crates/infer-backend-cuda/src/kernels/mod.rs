@@ -45,6 +45,7 @@ pub mod swiglu; // was activation
 pub mod upsample;
 pub mod v4_csa;
 pub mod v4_hca;
+pub mod v4_indexer;
 pub mod v4_swa;
 
 // --- extra wrappers sharing a dir (distinct module names) ---

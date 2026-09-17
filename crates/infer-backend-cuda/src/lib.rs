@@ -1038,6 +1038,54 @@ impl infer_core::ports::FusedOps for Cuda {
         })
     }
 
+    fn v4_indexer_topk_workspace_words(
+        tokens: usize,
+        capacity: usize,
+        k: usize,
+    ) -> OpResult<usize> {
+        kernels::v4_indexer::topk_workspace_words(tokens, capacity, k)
+    }
+
+    fn v4_indexer_topk(
+        scope: &Self::Scope,
+        scores: &Tensor<f32, Self>,
+        start: &Tensor<i32, Self>,
+        workspace: &mut Tensor<i32, Self>,
+        indices: &mut Tensor<i32, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_indexer::topk(
+            scope_stream(scope),
+            scope.device().device_id,
+            scores,
+            start,
+            workspace,
+            indices,
+        )
+    }
+
+    fn v4_indexer_scores(
+        scope: &Self::Scope,
+        query: &Tensor<half::bf16, Self>,
+        keys: &Tensor<half::bf16, Self>,
+        weights: &Tensor<f32, Self>,
+        start: &Tensor<i32, Self>,
+        output: &mut Tensor<f32, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_indexer::scores(
+            scope_stream(scope),
+            scope.device().device_id,
+            query,
+            keys,
+            weights,
+            start,
+            output,
+        )
+    }
+
     fn v4_swa_decode(
         scope: &Self::Scope,
         query: &Tensor<half::bf16, Self>,
