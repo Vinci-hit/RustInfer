@@ -1084,6 +1084,87 @@ impl infer_core::ports::FusedOps for Cuda {
         )
     }
 
+    fn v4_hca_compress(
+        scope: &Self::Scope,
+        values: &Tensor<f32, Self>,
+        gates: &Tensor<f32, Self>,
+        ape: &Tensor<f32, Self>,
+        norm: &Tensor<f32, Self>,
+        rope: &Tensor<f32, Self>,
+        start: &Tensor<i32, Self>,
+        state: &mut Tensor<f32, Self>,
+        compressed: &mut Tensor<half::bf16, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_hca::compress(
+            scope_stream(scope),
+            scope.device().device_id,
+            values,
+            gates,
+            ape,
+            norm,
+            rope,
+            start,
+            state,
+            compressed,
+            eps,
+        )
+    }
+
+    fn v4_hca_decode(
+        scope: &Self::Scope,
+        query: &Tensor<half::bf16, Self>,
+        new_kv: &Tensor<half::bf16, Self>,
+        sink: &Tensor<f32, Self>,
+        start: &Tensor<i32, Self>,
+        compressed: &Tensor<half::bf16, Self>,
+        cache: &mut Tensor<half::bf16, Self>,
+        output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_hca::attention(
+            scope_stream(scope),
+            scope.device().device_id,
+            true,
+            query,
+            new_kv,
+            sink,
+            start,
+            compressed,
+            cache,
+            output,
+        )
+    }
+
+    fn v4_hca_prefill(
+        scope: &Self::Scope,
+        query: &Tensor<half::bf16, Self>,
+        new_kv: &Tensor<half::bf16, Self>,
+        sink: &Tensor<f32, Self>,
+        start: &Tensor<i32, Self>,
+        compressed: &Tensor<half::bf16, Self>,
+        cache: &mut Tensor<half::bf16, Self>,
+        output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_hca::attention(
+            scope_stream(scope),
+            scope.device().device_id,
+            false,
+            query,
+            new_kv,
+            sink,
+            start,
+            compressed,
+            cache,
+            output,
+        )
+    }
+
     fn gated_rmsnorm<T: infer_core::dtype::Dtype>(
         scope: &<Self as infer_core::exec::ExecDevice>::Scope,
         input: &Tensor<T, Self>,

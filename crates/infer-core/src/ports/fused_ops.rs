@@ -80,6 +80,97 @@ pub trait FusedOps: MathOps {
         ))
     }
 
+    /// V4 HCA learned pooling after the two FP32 projection GEMMs.
+    ///
+    /// Fixed ratio=128, D=512, trailing interleaved RoPE width=64. Contiguous
+    /// FP32 values/gates `[N,512]`, learned ape `[128,512]`, norm weight `[512]`,
+    /// RoPE cos/sin `[C,32,2]` (row b encodes absolute position b*128),
+    /// device I32 start `[1]`, mutable FP32 state `[3,512]` (max/sum/numerator),
+    /// mutable BF16 compressed cache `[C,512]`; N>0, C>0, eps finite and >0.
+    ///
+    /// Each completed block writes one cache row; an incomplete block is kept
+    /// in state. Start at zero or supply valid state for the preceding tokens.
+    /// Starting at a block boundary ignores old state, so initial state and
+    /// unused cache rows need not be initialized. N=1 is incremental decode;
+    /// arbitrary N supports full/chunked prefill. Start is not incremented.
+    /// Pooling/accumulation is FP32. BF16 rounding occurs before RMSNorm, after
+    /// RMSNorm and after RoPE, matching the unquantized BF16 reference path.
+    /// FP8/QAT simulation and projection GEMMs are outside this operator.
+    ///
+    /// Negative start, last position >i32::MAX, or insufficient completed-block
+    /// capacity cause NO writes. Caller must supply finite projections/weights,
+    /// a correct RoPE table and matching history, on one ordered stream.
+    /// Writable arguments cannot alias any other tensor. Four-byte alignment,
+    /// device and contiguity rules match SWA. No allocations, host reads or
+    /// synchronization; graph replay reads the current device start.
+    fn v4_hca_compress(
+        _scope: &Self::Scope,
+        _values: &Tensor<f32, Self>,
+        _gates: &Tensor<f32, Self>,
+        _ape: &Tensor<f32, Self>,
+        _norm: &Tensor<f32, Self>,
+        _rope: &Tensor<f32, Self>,
+        _start: &Tensor<i32, Self>,
+        _state: &mut Tensor<f32, Self>,
+        _compressed: &mut Tensor<half::bf16, Self>,
+        _eps: f32,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_hca_compress",
+        ))
+    }
+
+    /// HCA decode: local W=128 plus ALL completed compressed blocks, one softmax.
+    /// Shapes and Q/KV/output boundaries match v4_swa_decode, plus read-only
+    /// BF16 compressed `[C,512]`. Query at t sees rows `[0,(t+1)/128)`; call
+    /// v4_hca_compress first on the same stream to publish any newly full block.
+    /// Local and compressed entries may overlap in represented source tokens.
+    /// Sink enters the common denominator once. Output precedes inverse RoPE.
+    ///
+    /// One allocation-free kernel with fused local ring append. Negative t or
+    /// insufficient compressed capacity produces NaN output and no cache write.
+    /// All other ownership, alignment and graph rules match v4_swa_decode.
+    fn v4_hca_decode(
+        _scope: &Self::Scope,
+        _query: &Tensor<half::bf16, Self>,
+        _new_kv: &Tensor<half::bf16, Self>,
+        _sink: &Tensor<f32, Self>,
+        _position: &Tensor<i32, Self>,
+        _compressed: &Tensor<half::bf16, Self>,
+        _cache: &mut Tensor<half::bf16, Self>,
+        _output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_hca_decode",
+        ))
+    }
+
+    /// HCA full/chunked prefill. Shapes match v4_swa_prefill plus read-only
+    /// compressed `[C,512]`. Call compression for the whole chunk first;
+    /// each query masks out compressed blocks that it cannot yet see.
+    /// BF16 Tensor Cores, FP32 online softmax/accumulation, BF16 high/residual
+    /// probability products; scratch size does not grow with history length.
+    /// Local history stays immutable until a second kernel commits the ring.
+    /// Invalid start/range/capacity gives NaN output without cache mutation.
+    /// Other boundaries and caller obligations match v4_hca_decode/prefill SWA.
+    fn v4_hca_prefill(
+        _scope: &Self::Scope,
+        _query: &Tensor<half::bf16, Self>,
+        _new_kv: &Tensor<half::bf16, Self>,
+        _sink: &Tensor<f32, Self>,
+        _start: &Tensor<i32, Self>,
+        _compressed: &Tensor<half::bf16, Self>,
+        _cache: &mut Tensor<half::bf16, Self>,
+        _output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_hca_prefill",
+        ))
+    }
+
     /// Reserve optional backend-specific attention row indices at owner startup.
     fn allocate_paged_decode_rows(
         _device: &Self,

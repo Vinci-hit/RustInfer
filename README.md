@@ -351,6 +351,10 @@ BF16 shared-KV attention with a 128-token ring cache, 512-dimensional heads,
 attention sinks and CUDA Graph replay. Decode uses one fused kernel; Tensor Core
 prefill supports full/chunked inputs followed by a stream-ordered cache commit.
 Both paths allocate no temporary GPU storage.
+The [GPU HCA operators](docs/DEEPSEEK_V4_HCA.md) add incremental 128-token
+compression with 6 KiB of FP32 state, plus joint local/compressed attention for
+decode and Tensor Core prefill. They support chunked inputs and CUDA Graphs;
+model execution integration and checkpoint quantization are pending.
 
 Workers execute a bounded prefill/decode self-check before advertising ready.
 `/health` reports HTTP process liveness; `/ready` requires a loaded Worker group
