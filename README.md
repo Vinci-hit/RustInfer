@@ -355,6 +355,10 @@ The [GPU HCA operators](docs/DEEPSEEK_V4_HCA.md) add incremental 128-token
 compression with 6 KiB of FP32 state, plus joint local/compressed attention for
 decode and Tensor Core prefill. They support chunked inputs and CUDA Graphs;
 model execution integration and checkpoint quantization are pending.
+The [GPU CSA compressor](docs/DEEPSEEK_V4_CSA.md) adds overlapping 4-token
+compression, fused pooling/RMSNorm/RoPE, and 18 KiB of incremental FP32 state.
+It supports full/chunked prefill and graph decode; the Lightning Indexer,
+top-k selection and sparse joint attention are subsequent steps.
 
 Workers execute a bounded prefill/decode self-check before advertising ready.
 `/health` reports HTTP process liveness; `/ready` requires a loaded Worker group

@@ -1084,6 +1084,35 @@ impl infer_core::ports::FusedOps for Cuda {
         )
     }
 
+    fn v4_csa_compress(
+        scope: &Self::Scope,
+        values: &Tensor<f32, Self>,
+        gates: &Tensor<f32, Self>,
+        ape: &Tensor<f32, Self>,
+        norm: &Tensor<f32, Self>,
+        rope: &Tensor<f32, Self>,
+        start: &Tensor<i32, Self>,
+        state: &mut Tensor<f32, Self>,
+        compressed: &mut Tensor<half::bf16, Self>,
+        eps: f32,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_csa::compress(
+            scope_stream(scope),
+            scope.device().device_id,
+            values,
+            gates,
+            ape,
+            norm,
+            rope,
+            start,
+            state,
+            compressed,
+            eps,
+        )
+    }
+
     fn v4_hca_compress(
         scope: &Self::Scope,
         values: &Tensor<f32, Self>,

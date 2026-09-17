@@ -80,6 +80,49 @@ pub trait FusedOps: MathOps {
         ))
     }
 
+    /// V4 CSA overlapping learned pooling after two FP32 projection GEMMs.
+    ///
+    /// Single request, ratio=4, D=512, trailing interleaved RoPE width=64.
+    /// Contiguous FP32 values/gates `[N,1024]`, ape `[4,1024]`, norm `[512]`,
+    /// RoPE cos/sin `[C,32,2]` (row b encodes position b*4), device I32 start
+    /// `[1]`, mutable FP32 state `[3,3,512]`, BF16 compressed `[C,512]`.
+    /// N,C > 0; eps finite and positive. Each completed 4-token block pools
+    /// the PREVIOUS block's first 512 projection channels together with the
+    /// CURRENT block's last 512 channels, over one 8-token softmax per channel.
+    /// Block zero has only its current four tokens; missing history is masked.
+    ///
+    /// State groups: previous block first half, current block first half,
+    /// current block second half. Each group stores max/sum/numerator planes.
+    /// Only start=0 ignores all old state. Nonzero block boundaries still need
+    /// the preceding block's first-half state. Complete blocks advance that
+    /// group and reset the two current groups. Unused cache may be uninitialized.
+    /// N=1 updates state and fuses output on every fourth token; arbitrary N
+    /// supports full/chunked prefill. Start is read on device and NOT advanced.
+    ///
+    /// Pool -> BF16 -> FP32 RMSNorm -> BF16 -> FP32 partial RoPE -> BF16 cache.
+    /// This is the main attention compressor, before FP8/QAT; Indexer rotation,
+    /// quantization, top-k and sparse attention are separate operators.
+    /// Invalid negative start, last position >i32::MAX, or insufficient
+    /// completed-block capacity cause no writes. Other finite-input, alias,
+    /// device, lifetime, stream and allocation-free graph rules match HCA.
+    fn v4_csa_compress(
+        _scope: &Self::Scope,
+        _values: &Tensor<f32, Self>,
+        _gates: &Tensor<f32, Self>,
+        _ape: &Tensor<f32, Self>,
+        _norm: &Tensor<f32, Self>,
+        _rope: &Tensor<f32, Self>,
+        _start: &Tensor<i32, Self>,
+        _state: &mut Tensor<f32, Self>,
+        _compressed: &mut Tensor<half::bf16, Self>,
+        _eps: f32,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_csa_compress",
+        ))
+    }
+
     /// V4 HCA learned pooling after the two FP32 projection GEMMs.
     ///
     /// Fixed ratio=128, D=512, trailing interleaved RoPE width=64. Contiguous

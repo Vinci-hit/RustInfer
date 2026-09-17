@@ -43,6 +43,7 @@ pub mod softmax;
 pub mod split_cols;
 pub mod swiglu; // was activation
 pub mod upsample;
+pub mod v4_csa;
 pub mod v4_hca;
 pub mod v4_swa;
 
