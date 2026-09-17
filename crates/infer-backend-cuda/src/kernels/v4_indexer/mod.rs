@@ -1,7 +1,7 @@
 //! Lightning Indexer scoring and deterministic top-k selection.
+use super::v4_common::Validation;
 use crate::{Cuda, ffi};
 use half::bf16;
-use infer_core::dtype::Dtype;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 
@@ -59,6 +59,7 @@ pub fn topk(
     workspace: &mut Tensor<i32, Cuda>,
     indices: &mut Tensor<i32, Cuda>,
 ) -> OpResult<()> {
+    let check = Validation::new("v4_indexer_topk", device);
     let shape = scores.shape().as_slice();
     let tokens = shape.first().copied().unwrap_or(0);
     let capacity = shape.get(1).copied().unwrap_or(0);
@@ -72,19 +73,9 @@ pub fn topk(
     {
         return Err(OpError::Shape("v4_indexer_topk: expected scores [N,C], start [1], indices [N,K], and sufficient one-dimensional I32 workspace".into()));
     }
-    let reads = [check(scores, device)?, check(start, device)?];
-    let writes = [check(workspace, device)?, check(indices, device)?];
-    for (i, &w) in writes.iter().enumerate() {
-        if reads
-            .iter()
-            .chain(&writes[..i])
-            .any(|r| r.0 < w.1 && w.0 < r.1)
-        {
-            return Err(OpError::Shape(
-                "v4_indexer_topk: writable tensors must not overlap another argument".into(),
-            ));
-        }
-    }
+    let reads = [check.tensor(scores)?, check.tensor(start)?];
+    let writes = [check.tensor(workspace)?, check.tensor(indices)?];
+    check.disjoint(&reads, &writes)?;
     let status = unsafe {
         rustinfer_v4_indexer_topk(
             scores.data_ptr(),
@@ -97,27 +88,7 @@ pub fn topk(
             stream,
         )
     };
-    if status == ffi::cudaError_cudaSuccess as i32 {
-        Ok(())
-    } else {
-        Err(OpError::Kernel(format!(
-            "v4_indexer_topk: CUDA launch error {status}"
-        )))
-    }
-}
-
-fn check<T: Dtype>(t: &Tensor<T, Cuda>, device: i32) -> OpResult<(usize, usize)> {
-    if !t.is_contiguous()
-        || t.device().device_id != device
-        || !(t.data_ptr() as usize).is_multiple_of(4)
-    {
-        return Err(OpError::Shape(
-            "v4_indexer: tensors must be contiguous, four-byte aligned, and on the scope device"
-                .into(),
-        ));
-    }
-    let ptr = t.data_ptr() as usize;
-    Ok((ptr, ptr + t.numel() * std::mem::size_of::<T>()))
+    check.launched(status)
 }
 
 pub fn scores(
@@ -129,10 +100,12 @@ pub fn scores(
     start: &Tensor<i32, Cuda>,
     output: &mut Tensor<f32, Cuda>,
 ) -> OpResult<()> {
+    let check = Validation::new("v4_indexer_scores", device);
     let shape = query.shape().as_slice();
     let tokens = shape.first().copied().unwrap_or(0);
     let heads = shape.get(1).copied().unwrap_or(0);
     let capacity = keys.shape().as_slice().first().copied().unwrap_or(0);
+    let bucket = output.shape().as_slice().get(1).copied().unwrap_or(0);
     if !(1..=i32::MAX as usize).contains(&tokens)
         || !(1..=128).contains(&heads)
         || !(1..=i32::MAX as usize / 4 + 1).contains(&capacity)
@@ -140,23 +113,19 @@ pub fn scores(
         || keys.shape().as_slice() != [capacity, 128]
         || weights.shape().as_slice() != [tokens, heads]
         || start.shape().as_slice() != [1]
-        || output.shape().as_slice() != [tokens, capacity]
-        || tokens.saturating_mul(capacity.div_ceil(64)) > i32::MAX as usize
+        || !(1..=capacity).contains(&bucket)
+        || output.shape().as_slice() != [tokens, bucket]
+        || tokens.saturating_mul(bucket.div_ceil(64)) > i32::MAX as usize
     {
-        return Err(OpError::Shape("v4_indexer_scores: expected query [N,H,128], keys [C,128], weights [N,H], start [1], output [N,C]; N,C>0, 1<=H<=128, CUDA tile grid <=i32::MAX".into()));
+        return Err(OpError::Shape("v4_indexer_scores: expected query [N,H,128], keys [C,128], weights [N,H], start [1], output [N,B]; N,C>0, 1<=B<=C, 1<=H<=128, CUDA tile grid <=i32::MAX".into()));
     }
     let reads = [
-        check(query, device)?,
-        check(keys, device)?,
-        check(weights, device)?,
-        check(start, device)?,
+        check.tensor(query)?,
+        check.tensor(keys)?,
+        check.tensor(weights)?,
+        check.tensor(start)?,
     ];
-    let w = check(output, device)?;
-    if reads.iter().any(|r| r.0 < w.1 && w.0 < r.1) {
-        return Err(OpError::Shape(
-            "v4_indexer_scores: output must not overlap any input".into(),
-        ));
-    }
+    check.disjoint(&reads, &[check.tensor(output)?])?;
     let status = unsafe {
         rustinfer_v4_indexer_scores_bf16(
             query.data_ptr(),
@@ -166,15 +135,9 @@ pub fn scores(
             output.data_ptr_mut(),
             tokens as i32,
             heads as i32,
-            capacity as i32,
+            bucket as i32,
             stream,
         )
     };
-    if status == ffi::cudaError_cudaSuccess as i32 {
-        Ok(())
-    } else {
-        Err(OpError::Kernel(format!(
-            "v4_indexer_scores: CUDA launch error {status}"
-        )))
-    }
+    check.launched(status)
 }

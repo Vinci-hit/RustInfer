@@ -1,9 +1,12 @@
 //! CUDA-event timings for top-k and the prepared-Q/K scoring + top-k pipeline.
 use half::bf16;
 use infer_backend_cuda::{Cuda, CudaMemoryPlan, CudaScope};
-use infer_core::exec::ExecScope;
+use infer_core::exec::{ExecScope, StepCtx};
+use infer_core::plan::{BatchKind, BatchPlan};
 use infer_core::ports::FusedOps;
+use infer_core::ports::fused_ops::v4_indexer_score_capacity;
 use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 fn measure(
     s: &CudaScope,
@@ -35,6 +38,49 @@ fn measure(
 fn values(n: usize) -> Vec<f32> {
     (0..n).map(|i| ((i % 10007) as f32 * 0.137).sin()).collect()
 }
+// Existing sampler/Beam path includes full sort, exp/CDF and logprobs. Report
+// its complete reuse cost, not a fictional isolated radix-sort measurement.
+fn beam_baseline(
+    s: &CudaScope,
+    scores: &Tensor<f32, Cuda>,
+    expected: &[i32],
+    repeat: usize,
+) -> Result<(f32, usize), Box<dyn std::error::Error>> {
+    let width = scores.numel();
+    let row = scores
+        .clone()
+        .view_contiguous(Shape::from_slice(&[width]))?;
+    let words = Cuda::sampling_workspace_words(width)?;
+    let work = Tensor::<f32, _>::zeros([words], s.device())?;
+    let mut ids = Tensor::<i32, _>::zeros([expected.len()], s.device())?;
+    let mut probs = Tensor::<f32, _>::zeros([expected.len()], s.device())?;
+    let plan = BatchPlan {
+        kind: BatchKind::DecodeOnly,
+        num_tokens: 1,
+        batch: 1,
+        q_lens: vec![1],
+        kv_lens: vec![1],
+        seq_positions: vec![0],
+        rope_positions: vec![0],
+        max_blocks_per_seq: 0,
+        block_size: 128,
+        total_q_tiles: 1,
+    };
+    let ctx = StepCtx::new(s, &plan);
+    s.synchronize()?;
+    s.graph_capture_begin()?;
+    for _ in 0..repeat {
+        assert!(Cuda::beam_candidates_into(
+            &ctx, &row, &mut ids, &mut probs, &work
+        )?);
+    }
+    s.graph_capture_end(53)?;
+    let elapsed = measure(s, 53, repeat)?;
+    assert_eq!(ids.to_host_vec()?, expected);
+    // Graphs reference work/ids/probs; destroy before their allocations drop.
+    s.device().config.invalidate_all_graphs();
+    Ok((elapsed, words * 4))
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let s = Cuda::with_memory_plan(
         0,
@@ -57,6 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (1, 32767, 8192),
         (1, 131071, 32768),
         (1, 1048575, 262144),
+        (1, 127, 8192),
+        (1, 127, 262144),
+        (1, 32767, 262144),
+        (128, 0, 262144),
     ] {
         let q = Tensor::from_host_slice(
             &values(n * h * d)
@@ -83,53 +133,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dev,
         )?;
         let pos = Tensor::from_host_slice(&[start], [1], dev)?;
-        let mut scores = Tensor::<f32, _>::zeros([n, c], dev)?;
-        let words = Cuda::v4_indexer_topk_workspace_words(n, c, k)?;
-        let mut workspace = Tensor::<i32, _>::zeros([words], dev)?;
-        let mut ids = Tensor::<i32, _>::zeros([n, k], dev)?;
-        Cuda::v4_indexer_scores(&s, &q, &keys, &weights, &pos, &mut scores)?;
-        s.synchronize()?;
-        let repeat = if n == 1 { 32 } else { 8 };
-        s.graph_capture_begin()?;
-        for _ in 0..repeat {
+        let bucket = v4_indexer_score_capacity(start as usize, n, c)?;
+        let mut previous_ids = None;
+        for b in if bucket == c {
+            vec![c]
+        } else {
+            vec![c, bucket]
+        } {
+            let mut scores = Tensor::<f32, _>::zeros([n, b], dev)?;
+            let words = Cuda::v4_indexer_topk_workspace_words(n, b, k)?;
+            let mut workspace = Tensor::<i32, _>::zeros([words], dev)?;
+            let mut ids = Tensor::<i32, _>::zeros([n, k], dev)?;
             Cuda::v4_indexer_scores(&s, &q, &keys, &weights, &pos, &mut scores)?;
+            s.synchronize()?;
+            let repeat = if n == 1 { 32 } else { 8 };
+            s.graph_capture_begin()?;
+            for _ in 0..repeat {
+                Cuda::v4_indexer_scores(&s, &q, &keys, &weights, &pos, &mut scores)?;
+            }
+            s.graph_capture_end(50)?;
+            s.graph_capture_begin()?;
+            for _ in 0..repeat {
+                Cuda::v4_indexer_topk(&s, &scores, &pos, &mut workspace, &mut ids)?;
+            }
+            s.graph_capture_end(51)?;
+            s.graph_capture_begin()?;
+            for _ in 0..repeat {
+                Cuda::v4_indexer_scores(&s, &q, &keys, &weights, &pos, &mut scores)?;
+                Cuda::v4_indexer_topk(&s, &scores, &pos, &mut workspace, &mut ids)?;
+            }
+            s.graph_capture_end(52)?;
+            let scoring = measure(&s, 50, repeat)?;
+            let selection = measure(&s, 51, repeat)?;
+            let pipeline = measure(&s, 52, repeat)?;
+            let host_scores = scores.to_host_vec()?;
+            let host_ids = ids.to_host_vec()?;
+            for t in 0..n {
+                let row = &host_scores[t * b..(t + 1) * b];
+                let mut expected: Vec<_> = (0..(start as usize + t + 1) / 4)
+                    .filter(|&j| row[j] > f32::NEG_INFINITY)
+                    .collect();
+                expected.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+                let expected: Vec<_> = expected
+                    .into_iter()
+                    .map(|v| v as i32)
+                    .chain(std::iter::repeat(-1))
+                    .take(k)
+                    .collect();
+                assert_eq!(&host_ids[t * k..(t + 1) * k], &expected);
+            }
+            if let Some(previous) = &previous_ids {
+                assert_eq!(&host_ids, previous);
+            }
+            previous_ids = Some(host_ids.clone());
+            // At least K finite visible candidates: no mismatch between Beam's
+            // vocabulary semantics and the Indexer's -1 padding/exclusion contract.
+            let (beam_us, beam_bytes) = if n == 1 && (start as usize + 1) / 4 >= k {
+                let (us, bytes) = beam_baseline(&s, &scores, &host_ids, repeat)?;
+                (format!("{us:.3}"), bytes)
+            } else {
+                ("null".to_owned(), 0)
+            };
+            println!(
+                "{{\"tokens\":{n},\"start\":{start},\"capacity\":{c},\"score_capacity\":{b},\"k\":{k},\"score_us\":{scoring:.3},\"topk_us\":{selection:.3},\"pipeline_us\":{pipeline:.3},\"workspace_bytes\":{},\"score_bytes\":{},\"legacy_beam_us\":{beam_us},\"legacy_beam_workspace_bytes\":{beam_bytes},\"exact_cpu_sort_match\":true}}",
+                words * 4,
+                n * b * 4
+            );
+            dev.config.invalidate_all_graphs();
         }
-        s.graph_capture_end(50)?;
-        s.graph_capture_begin()?;
-        for _ in 0..repeat {
-            Cuda::v4_indexer_topk(&s, &scores, &pos, &mut workspace, &mut ids)?;
-        }
-        s.graph_capture_end(51)?;
-        s.graph_capture_begin()?;
-        for _ in 0..repeat {
-            Cuda::v4_indexer_scores(&s, &q, &keys, &weights, &pos, &mut scores)?;
-            Cuda::v4_indexer_topk(&s, &scores, &pos, &mut workspace, &mut ids)?;
-        }
-        s.graph_capture_end(52)?;
-        let scoring = measure(&s, 50, repeat)?;
-        let selection = measure(&s, 51, repeat)?;
-        let pipeline = measure(&s, 52, repeat)?;
-        let host_scores = scores.to_host_vec()?;
-        let host_ids = ids.to_host_vec()?;
-        for t in 0..n {
-            let row = &host_scores[t * c..(t + 1) * c];
-            let mut expected: Vec<_> = (0..(start as usize + t + 1) / 4)
-                .filter(|&j| row[j] > f32::NEG_INFINITY)
-                .collect();
-            expected.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
-            let expected: Vec<_> = expected
-                .into_iter()
-                .map(|v| v as i32)
-                .chain(std::iter::repeat(-1))
-                .take(k)
-                .collect();
-            assert_eq!(&host_ids[t * k..(t + 1) * k], &expected);
-        }
-        println!(
-            "{{\"tokens\":{n},\"start\":{start},\"capacity\":{c},\"k\":{k},\"score_us\":{scoring:.3},\"topk_us\":{selection:.3},\"pipeline_us\":{pipeline:.3},\"workspace_bytes\":{},\"exact_cpu_sort_match\":true}}",
-            words * 4
-        );
-        dev.config.invalidate_all_graphs();
     }
     Ok(())
 }

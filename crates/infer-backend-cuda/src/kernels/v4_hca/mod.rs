@@ -1,7 +1,7 @@
 //! Single-request HCA: streaming compression and joint local/compressed attention.
+use super::v4_common::Validation;
 use crate::{Cuda, ffi};
 use half::bf16;
-use infer_core::dtype::Dtype;
 use infer_core::ports::{OpError, OpResult};
 use infer_core::tensor::Tensor;
 
@@ -47,41 +47,6 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-fn check<T: Dtype>(t: &Tensor<T, Cuda>, device: i32) -> OpResult<(usize, usize)> {
-    if !t.is_contiguous()
-        || t.device().device_id != device
-        || !(t.data_ptr() as usize).is_multiple_of(4)
-    {
-        return Err(OpError::Shape(
-            "v4_hca: tensors must be contiguous, four-byte aligned, and on the scope device".into(),
-        ));
-    }
-    let start = t.data_ptr() as usize;
-    Ok((start, start + t.numel() * std::mem::size_of::<T>()))
-}
-
-fn disjoint(reads: &[(usize, usize)], writes: &[(usize, usize)]) -> OpResult<()> {
-    let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
-    for (i, &w) in writes.iter().enumerate() {
-        if reads.iter().chain(&writes[..i]).any(|&r| overlaps(r, w)) {
-            return Err(OpError::Shape(
-                "v4_hca: writable tensors must not overlap another argument".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn launched(status: i32) -> OpResult<()> {
-    if status != ffi::cudaError_cudaSuccess as i32 {
-        Err(OpError::Kernel(format!(
-            "v4_hca: CUDA launch error {status}"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 pub fn compress(
     stream: ffi::cudaStream_t,
     device: i32,
@@ -95,6 +60,7 @@ pub fn compress(
     compressed: &mut Tensor<bf16, Cuda>,
     eps: f32,
 ) -> OpResult<()> {
+    let check = Validation::new("v4_hca_compress", device);
     let tokens = values.shape().as_slice().first().copied().unwrap_or(0);
     let capacity = compressed.shape().as_slice().first().copied().unwrap_or(0);
     if !(1..=i32::MAX as usize).contains(&tokens)
@@ -113,15 +79,15 @@ pub fn compress(
         return Err(OpError::Shape("v4_hca_compress: expected values/gates [N,512], ape [128,512], norm [512], rope [C,32,2], start [1], state [3,512], compressed [C,512], positive finite eps".into()));
     }
     let reads = [
-        check(values, device)?,
-        check(gates, device)?,
-        check(ape, device)?,
-        check(norm, device)?,
-        check(rope, device)?,
-        check(start, device)?,
+        check.tensor(values)?,
+        check.tensor(gates)?,
+        check.tensor(ape)?,
+        check.tensor(norm)?,
+        check.tensor(rope)?,
+        check.tensor(start)?,
     ];
-    disjoint(&reads, &[check(state, device)?, check(compressed, device)?])?;
-    launched(unsafe {
+    check.disjoint(&reads, &[check.tensor(state)?, check.tensor(compressed)?])?;
+    check.launched(unsafe {
         rustinfer_v4_hca_compress(
             values.data_ptr(),
             gates.data_ptr(),
@@ -151,6 +117,7 @@ pub fn attention(
     cache: &mut Tensor<bf16, Cuda>,
     output: &mut Tensor<bf16, Cuda>,
 ) -> OpResult<()> {
+    let check = Validation::new("v4_hca_attention", device);
     let shape = query.shape().as_slice();
     let tokens = if decode {
         1
@@ -179,14 +146,14 @@ pub fn attention(
         return Err(OpError::Shape("v4_hca_attention: invalid Q/KV/output, sink, start or cache shapes (D=512,W=128,1<=H<=128,N>0,C>0)".into()));
     }
     let reads = [
-        check(query, device)?,
-        check(kv, device)?,
-        check(sink, device)?,
-        check(start, device)?,
-        check(compressed, device)?,
+        check.tensor(query)?,
+        check.tensor(kv)?,
+        check.tensor(sink)?,
+        check.tensor(start)?,
+        check.tensor(compressed)?,
     ];
-    disjoint(&reads, &[check(cache, device)?, check(output, device)?])?;
-    launched(unsafe {
+    check.disjoint(&reads, &[check.tensor(cache)?, check.tensor(output)?])?;
+    check.launched(unsafe {
         if decode {
             rustinfer_v4_hca_decode_bf16(
                 query.data_ptr(),

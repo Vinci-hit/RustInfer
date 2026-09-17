@@ -83,14 +83,23 @@ WMMA 使用 BF16 输入、FP32 点积累计。通过文档规定的 row-major st
 | keys | BF16 `[C,128]` | 独立索引压缩 Key 池，只读 |
 | weights | FP32 `[N,H]` | 已包含 `1/sqrt(128*H)` 的权重，允许负数 |
 | start | device I32 `[1]` | chunk 绝对起点或 decode 位置，只读、不自增 |
-| output | FP32 `[N,C]` | 有效分数及未来位置的 -inf |
+| output | FP32 `[N,B]` | 当前分数桶，1≤B≤C；有效分数及未来位置的 -inf |
 
 N=1 对应 decode，N>1 对应完整或分块 prefill；采用相同计算顺序。
 要求 N,C>0，1≤H≤128；张量连续、至少四字节对齐，位于 scope 的设备；
-output 不得与任何输入重叠。展平 CTA 数 `N*ceil(C/64)` 不得超过 CUDA grid.x 上限。
+output 不得与任何输入重叠。展平 CTA 数 `N*ceil(B/64)` 不得超过 CUDA grid.x 上限。
 输入与输出须存活至异步执行完成，调用者须在同一 stream 上先发布有效 Key。
 
-负 start、最后位置超过 I32 上限、完成块数超过 C 时，整个 output 填 NaN，
+KV 池的预留容量 C 与计算宽度 B 分开。调用
+`infer_core::ports::fused_ops::v4_indexer_score_capacity(start, N, C)`，
+以主机调度器已知的绝对位置计算覆盖整个 chunk 的二次幂桶（末桶截到 C）。
+尚无可见条目时 B=1。按 `[N,B]` 分配分数、按 B 查询 top-k scratch，
+无需缩小、拷贝或重新分配 KV 池。B=C 的旧调用仍然支持。
+Graph 在桶内重放；跨桶前切换到新形状的 Graph。若设备 start 意外超出桶，
+整块分数变为 NaN，后续 top-k 输出 -1，不会悄悄丢弃桶外的合法候选。
+详见 [top-k 容量分桶与基线](DEEPSEEK_V4_TOPK.md#容量分桶与既有实现基线)。
+
+负 start、最后位置超过 I32 上限、完成块数超过 B 时，整个 output 填 NaN，
 输入保持不变。维度、stride、对齐和 alias 错误由 Rust 立即返回错误。
 有效 Q/K/weights 必须有限；未使用的 Key 行可填 NaN。
 每次调用覆盖全部输出，包括未来位置，不需要外部清零；Graph 重放读取新的输入与 start。

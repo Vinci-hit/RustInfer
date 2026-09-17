@@ -21,6 +21,7 @@ source "$SCRIPT_DIR/lib/cuda_env.sh"
 rustinfer_discover_cuda_libraries
 
 printf 'GPU regression artifacts: %s\n' "$ARTIFACT_DIR"
+ARTIFACT_DIR="$ARTIFACT_DIR" bash "$SCRIPT_DIR/v4_regression.sh"
 cargo build --release --locked -p infer-worker -p infer-scheduler -p infer-server \
     2>&1 | tee "$ARTIFACT_DIR/build.log"
 cargo test --release --locked -p infer-backend-cuda --test graph_memory \

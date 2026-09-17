@@ -161,6 +161,8 @@ Prefill 基准将两个路径都捕获为 Graph：一次并行 prefill（含缓�
 所有输出与逐 token decode 的最大绝对差为 `0.00390625`。
 六项 GPU 测试全部通过（包含原来的三项 decode 测试）。Prefill 的 ptxas 报告为
 每线程 124 个寄存器、每 CTA 46,080 bytes shared memory、零寄存器 spill。
+后续公共 tile 代码抽取后为 125 个寄存器，shared memory 不变，仍零 spill；
+维护回归数据见 [top-k 维护验证](DEEPSEEK_V4_TOPK.md#自动回归与公共实现)。
 Clippy 检查通过，运行时排除了已有的 `dead_code`、`extra_unused_type_parameters`
 和 `manual_is_multiple_of` 告警；未改动这些无关的原有代码。
 

@@ -11,6 +11,29 @@ use infer_core::exec::StepCtx;
 use infer_core::tensor::Tensor;
 use infer_core::types::Shape;
 
+/// Score-buffer width for a V4 Indexer chunk, independent of the reserved KV pool.
+/// Call with the scheduler's host position before allocating/capturing. Reuse the
+/// graph while `(start + tokens) / 4 <= width`; switch buckets before crossing it.
+/// This does not read a device position or allocate memory. Kernels independently
+/// reject an insufficient bucket at execution time, including graph replay.
+pub fn v4_indexer_score_capacity(
+    start: usize,
+    tokens: usize,
+    cache_capacity: usize,
+) -> OpResult<usize> {
+    let end = start.checked_add(tokens);
+    if !(1..=i32::MAX as usize).contains(&tokens)
+        || !(1..=i32::MAX as usize / 4 + 1).contains(&cache_capacity)
+        || end.is_none_or(|end| end > i32::MAX as usize + 1 || end / 4 > cache_capacity)
+    {
+        return Err(OpError::Shape(
+            "v4_indexer: invalid position, chunk length or cache capacity".into(),
+        ));
+    }
+    let visible = end.expect("validated range") / 4;
+    Ok(visible.max(1).next_power_of_two().min(cache_capacity))
+}
+
 pub trait FusedOps: MathOps {
     /// I32 scratch words required by v4_indexer_topk, including both merge banks.
     /// Query once before allocating/capturing; N,C>0, 1<=K<=512. CUDA needs one
@@ -61,7 +84,7 @@ pub trait FusedOps: MathOps {
     /// V4 Lightning Indexer scores, single request, D=128, ratio=4.
     ///
     /// Contiguous BF16 query `[N,H,128]`, index keys `[C,128]`, FP32 head
-    /// weights `[N,H]`, device I32 start `[1]`, FP32 output `[N,C]`.
+    /// weights `[N,H]`, device I32 start `[1]`, FP32 output `[N,B]`, 1<=B<=C.
     /// N,C > 0; 1 <= H <= 128. N=1 is decode; arbitrary N is chunked prefill.
     /// Q/keys must already include their projections, RoPE and any chosen
     /// Hadamard/quantization transform. Keys come from the separate INDEX
@@ -72,9 +95,11 @@ pub trait FusedOps: MathOps {
     /// Dot products, weighted sums and output are FP32; no BF16 intermediate
     /// rounding, softmax or top-k. At absolute token p=start+t, only rows
     /// j < (p+1)/4 are read. Every future/padding output is -inf, including
-    /// the all-masked first three tokens. C is total cache capacity.
+    /// the all-masked first three tokens. C is reserved KV capacity; B is the
+    /// score bucket. Use [`v4_indexer_score_capacity`] to size B independently
+    /// of C and pass B to the top-k workspace query. B=C remains supported.
     ///
-    /// Negative start, last position >i32::MAX, or insufficient capacity for
+    /// Negative start, last position >i32::MAX, or insufficient score bucket for
     /// the chunk's completed blocks fills ALL output with NaN. Start and keys
     /// are read-only; caller publishes keys beforehand on the same stream.
     /// Finite valid inputs, four-byte alignment, same-device contiguity and
@@ -1887,4 +1912,38 @@ fn block_for_position(
         )));
     }
     Ok(block as usize)
+}
+
+#[cfg(test)]
+mod v4_capacity_tests {
+    use super::v4_indexer_score_capacity as bucket;
+
+    #[test]
+    fn buckets_cover_the_entire_chunk_and_clamp_to_the_pool() {
+        for (start, n, cap, expected) in [
+            (0, 1, 262144, 1),
+            (2, 1, 262144, 1),
+            (3, 1, 262144, 1),
+            (127, 1, 262144, 32),
+            (128, 3, 262144, 32),
+            (131, 1, 262144, 64),
+            (0, 137, 262144, 64),
+            (32768, 128, 262144, 16384),
+            (0, 137, 37, 37),
+            (i32::MAX as usize, 1, 536870912, 536870912),
+        ] {
+            assert_eq!(bucket(start, n, cap).unwrap(), expected);
+        }
+        for (start, n, cap) in [
+            (0, 0, 1),
+            (0, 4, 0),
+            (0, 8, 1),
+            (i32::MAX as usize, 2, 536870912),
+            (usize::MAX, 1, 1),
+            (0, usize::MAX, 1),
+            (0, 1, usize::MAX),
+        ] {
+            assert!(bucket(start, n, cap).is_err());
+        }
+    }
 }

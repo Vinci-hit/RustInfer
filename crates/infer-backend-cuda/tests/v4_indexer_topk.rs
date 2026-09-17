@@ -384,3 +384,81 @@ fn invalid_positions_shapes_workspace_and_aliases_fail_closed() {
     let wrong_start = Tensor::<i32, _>::zeros([2], dev).unwrap();
     assert!(Cuda::v4_indexer_topk(&s, &a.scores, &wrong_start, &mut a.work, &mut a.ids).is_err());
 }
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn score_buckets_reuse_large_key_pool_and_fail_closed_on_graph_overflow() {
+    use infer_core::ports::fused_ops::v4_indexer_score_capacity;
+    let s = scope();
+    let _active = s.enter();
+    let dev = s.device();
+    let (n, h, c, k) = (7, 64, 8193, 512);
+    let query = Tensor::from_host_slice(
+        &data(n * h * 128, 5)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect::<Vec<_>>(),
+        [n, h, 128],
+        dev,
+    )
+    .unwrap();
+    let keys = Tensor::from_host_slice(
+        &data(c * 128, 9)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect::<Vec<_>>(),
+        [c, 128],
+        dev,
+    )
+    .unwrap();
+    let weights = Tensor::from_host_slice(&data(n * h, 7), [n, h], dev).unwrap();
+    let key_address = keys.data_ptr();
+    let mut full = Select::new(&s, n, c, k, 0);
+    for start in [0usize, 121, 127, 8185, 8190, 32765] {
+        let b = v4_indexer_score_capacity(start, n, c).unwrap();
+        let mut small = Select::new(&s, n, b, k, start as i32);
+        s.synchronize().unwrap();
+        s.graph_capture_begin().unwrap();
+        Cuda::v4_indexer_scores(&s, &query, &keys, &weights, &small.start, &mut small.scores)
+            .unwrap();
+        small.run(&s);
+        s.graph_capture_end(4990).unwrap();
+        let allocations = dev.config.pool_stats();
+        // Grow within a bucket, deliberately cross it, then restart the request.
+        for pos in [
+            start as i32,
+            (b * 4 + 3 - n) as i32,
+            (b * 4 + 4 - n) as i32,
+            -1,
+            0,
+        ] {
+            small.start.upload_from_host(&[pos]).unwrap();
+            s.graph_launch(4990).unwrap();
+            s.synchronize().unwrap();
+            let got = small.ids.to_host_vec().unwrap();
+            let scores = small.scores.to_host_vec().unwrap();
+            if pos < 0 || (pos as usize + n) / 4 > b {
+                assert!(got.iter().all(|&id| id == -1));
+                assert!(scores.iter().all(|v| v.is_nan()));
+            } else {
+                full.start.upload_from_host(&[pos]).unwrap();
+                Cuda::v4_indexer_scores(&s, &query, &keys, &weights, &full.start, &mut full.scores)
+                    .unwrap();
+                full.run(&s);
+                s.synchronize().unwrap();
+                assert_eq!(got, full.ids.to_host_vec().unwrap());
+                let all = full.scores.to_host_vec().unwrap();
+                for t in 0..n {
+                    assert_eq!(&scores[t * b..(t + 1) * b], &all[t * c..t * c + b]);
+                }
+            }
+        }
+        assert_eq!(dev.config.pool_stats(), allocations);
+        assert_eq!(keys.data_ptr(), key_address);
+        dev.config.invalidate_all_graphs();
+    }
+    let mut too_wide = Tensor::zeros([n, c + 1], dev).unwrap();
+    assert!(
+        Cuda::v4_indexer_scores(&s, &query, &keys, &weights, &full.start, &mut too_wide).is_err()
+    );
+}

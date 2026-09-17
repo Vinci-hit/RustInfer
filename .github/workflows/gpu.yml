@@ -42,7 +42,6 @@ jobs:
         run: echo "ARTIFACT_DIR=$RUNNER_TEMP/rustinfer-gpu-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - name: Check runner provisioning
         run: |
-          test -n "$MODEL_PATH" && test -f "$MODEL_PATH/config.json"
           case "$GPU_BUILD_ARCH" in sm_80|sm_86|sm_89|sm_90) ;; *) exit 2 ;; esac
           nvidia-smi
           mkdir -p "$ARTIFACT_DIR"
@@ -51,10 +50,18 @@ jobs:
           set -o pipefail
           docker build --target builder --build-arg CUDA_ARCH="$GPU_BUILD_ARCH" \
             -t rustinfer-gpu-test . 2>&1 | tee "$ARTIFACT_DIR/docker-build.log"
-      - name: Run kernel and Qwen3.5 service regressions
+      - name: Run V4 kernels without a model checkpoint
+        if: env.MODEL_PATH == ''
+        run: |
+          docker run --rm --gpus all \
+            -v "$ARTIFACT_DIR:/artifacts" -e ARTIFACT_DIR=/artifacts \
+            rustinfer-gpu-test bash scripts/v4_regression.sh
+      - name: Run V4 kernels and Qwen3.5 service regressions
+        if: env.MODEL_PATH != ''
         env:
           RUSTINFER_REVISION: ${{ github.sha }}
         run: |
+          test -f "$MODEL_PATH/config.json"
           docker run --rm --gpus all \
             -v "$MODEL_PATH:/model:ro" -v "$ARTIFACT_DIR:/artifacts" \
             -e MODEL_PATH=/model -e ARTIFACT_DIR=/artifacts -e RUSTINFER_REVISION \
