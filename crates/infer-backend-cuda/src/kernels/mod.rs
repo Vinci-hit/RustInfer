@@ -47,6 +47,7 @@ mod v4_common;
 pub mod v4_csa;
 pub mod v4_hca;
 pub mod v4_indexer;
+pub mod v4_mhc;
 pub mod v4_swa;
 
 // --- extra wrappers sharing a dir (distinct module names) ---

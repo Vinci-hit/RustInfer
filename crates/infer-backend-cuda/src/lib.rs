@@ -1038,6 +1038,92 @@ impl infer_core::ports::FusedOps for Cuda {
         })
     }
 
+    fn v4_mhc_workspace_floats(tokens: usize, dim: usize, head: bool) -> OpResult<usize> {
+        kernels::v4_mhc::workspace_floats(tokens, dim, head)
+    }
+
+    fn v4_mhc_pre(
+        scope: &Self::Scope,
+        residual: &Tensor<half::bf16, Self>,
+        weight: &Tensor<f32, Self>,
+        scale: &Tensor<f32, Self>,
+        base: &Tensor<f32, Self>,
+        workspace: &mut Tensor<f32, Self>,
+        collapsed: &mut Tensor<half::bf16, Self>,
+        post: &mut Tensor<f32, Self>,
+        comb: &mut Tensor<f32, Self>,
+        norm_eps: f32,
+        hc_eps: f32,
+        iters: usize,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_mhc::pre(
+            scope_stream(scope),
+            scope.device().device_id,
+            residual,
+            weight,
+            scale,
+            base,
+            workspace,
+            collapsed,
+            Some((post, comb)),
+            norm_eps,
+            hc_eps,
+            iters,
+        )
+    }
+
+    fn v4_mhc_post(
+        scope: &Self::Scope,
+        residual: &Tensor<half::bf16, Self>,
+        branch: &Tensor<half::bf16, Self>,
+        post: &Tensor<f32, Self>,
+        comb: &Tensor<f32, Self>,
+        output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_mhc::post(
+            scope_stream(scope),
+            scope.device().device_id,
+            residual,
+            branch,
+            post,
+            comb,
+            output,
+        )
+    }
+
+    fn v4_mhc_head(
+        scope: &Self::Scope,
+        residual: &Tensor<half::bf16, Self>,
+        weight: &Tensor<f32, Self>,
+        scale: &Tensor<f32, Self>,
+        base: &Tensor<f32, Self>,
+        workspace: &mut Tensor<f32, Self>,
+        output: &mut Tensor<half::bf16, Self>,
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> OpResult<()> {
+        use infer_core::exec::ExecScope;
+        let _guard = scope.enter();
+        kernels::v4_mhc::pre(
+            scope_stream(scope),
+            scope.device().device_id,
+            residual,
+            weight,
+            scale,
+            base,
+            workspace,
+            output,
+            None,
+            norm_eps,
+            hc_eps,
+            1,
+        )
+    }
+
     fn v4_indexer_topk_workspace_words(
         tokens: usize,
         capacity: usize,

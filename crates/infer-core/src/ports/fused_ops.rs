@@ -35,6 +35,96 @@ pub fn v4_indexer_score_capacity(
 }
 
 pub trait FusedOps: MathOps {
+    /// FP32 scratch elements for four-stream mHC Pre (`head=false`) or Head
+    /// (`head=true`). N>0, even 2<=D<=8192. CUDA uses N*ceil(4D/256)*25
+    /// floats for Pre, or *5 for Head. Query before allocation/graph capture.
+    fn v4_mhc_workspace_floats(_tokens: usize, _dim: usize, _head: bool) -> OpResult<usize> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_mhc_workspace_floats",
+        ))
+    }
+
+    /// Four-stream mHC mapping, Sinkhorn and input collapse, prefill or decode.
+    /// BF16 residual [N,4,D]; FP32 weight [24,4D], scale [3], base [24].
+    /// Produces BF16 collapsed [N,D], FP32 post [N,4], comb [N,4,4].
+    /// Mapping = (X @ weight^T) / sqrt(mean(X^2)+norm_eps), then separate
+    /// scaled/biased sigmoid pre (+hc_eps), sigmoid post (*2), and stable
+    /// row softmax (+hc_eps) for comb. Sinkhorn starts with a column step,
+    /// followed by iters-1 row/column steps, adding hc_eps to denominators.
+    /// 1<=iters<=20; finite positive epsilons; finite inputs with FP32-range
+    /// intermediates. Norm is moved after the linear reduction, so arithmetic
+    /// is equivalent to the CPU reference up to FP32 reduction/rounding error.
+    ///
+    /// Caller-owned 1D FP32 workspace, sized by v4_mhc_workspace_floats.
+    /// Contiguous, four-byte-aligned same-device tensors; every writable tensor
+    /// is disjoint from every other argument. No in-place operation. No internal
+    /// allocation, host readback or synchronization. Shapes/eps/iters are fixed
+    /// during graph capture; tensor contents may change between replays. Keep
+    /// all buffers alive until stream completion, with normal stream ordering;
+    /// concurrent calls need distinct output/workspace buffers.
+    fn v4_mhc_pre(
+        _scope: &Self::Scope,
+        _residual: &Tensor<half::bf16, Self>,
+        _weight: &Tensor<f32, Self>,
+        _scale: &Tensor<f32, Self>,
+        _base: &Tensor<f32, Self>,
+        _workspace: &mut Tensor<f32, Self>,
+        _collapsed: &mut Tensor<half::bf16, Self>,
+        _post: &mut Tensor<f32, Self>,
+        _comb: &mut Tensor<f32, Self>,
+        _norm_eps: f32,
+        _hc_eps: f32,
+        _iters: usize,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_mhc_pre",
+        ))
+    }
+
+    /// mHC branch expansion + transposed residual mixing. BF16 residual
+    /// [N,4,D], branch [N,D], FP32 post [N,4], comb [N,4,4], BF16 output [N,4,D].
+    /// output_j = (comb^T @ residual)_j + post_j * branch. Matches the existing
+    /// Transformers BF16 reference: cast post/comb to BF16, FP32-accumulate
+    /// the residual mix, round mix and branch product separately to BF16,
+    /// then add and round again. This is not the all-FP32 official-script Post.
+    /// Dimension/ownership/stream rules match Pre; no workspace is required.
+    fn v4_mhc_post(
+        _scope: &Self::Scope,
+        _residual: &Tensor<half::bf16, Self>,
+        _branch: &Tensor<half::bf16, Self>,
+        _post: &Tensor<f32, Self>,
+        _comb: &Tensor<f32, Self>,
+        _output: &mut Tensor<half::bf16, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_mhc_post",
+        ))
+    }
+
+    /// Final four-stream collapse, before the model's final RMSNorm/lm_head.
+    /// Same mapping/collapse as Pre, but weight [4,4D], scale [1], base [4];
+    /// no post/comb/Sinkhorn. BF16 output [N,D]; workspace query uses head=true.
+    /// Dimension/ownership/stream and epsilon rules match Pre.
+    fn v4_mhc_head(
+        _scope: &Self::Scope,
+        _residual: &Tensor<half::bf16, Self>,
+        _weight: &Tensor<f32, Self>,
+        _scale: &Tensor<f32, Self>,
+        _base: &Tensor<f32, Self>,
+        _workspace: &mut Tensor<f32, Self>,
+        _output: &mut Tensor<half::bf16, Self>,
+        _norm_eps: f32,
+        _hc_eps: f32,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            std::any::type_name::<Self>(),
+            "v4_mhc_head",
+        ))
+    }
+
     /// I32 scratch words required by v4_indexer_topk, including both merge banks.
     /// Query once before allocating/capturing; N,C>0, 1<=K<=512. CUDA needs one
     /// unused word for C<=2048, else 4*N*ceil(C/2048)*K words.

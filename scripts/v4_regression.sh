@@ -8,5 +8,5 @@ rustinfer_discover_cuda_libraries
 ARTIFACT_DIR="${ARTIFACT_DIR:-$(mktemp -d /tmp/rustinfer-v4.XXXXXX)}"
 mkdir -p "$ARTIFACT_DIR"
 cargo test --profile "${V4_TEST_PROFILE:-release}" --locked -p infer-backend-cuda \
-    --test v4_swa --test v4_hca --test v4_csa --test v4_indexer --test v4_indexer_topk \
+    --test v4_swa --test v4_hca --test v4_csa --test v4_indexer --test v4_indexer_topk --test v4_mhc \
     -- --ignored --test-threads=1 2>&1 | tee "$ARTIFACT_DIR/v4-kernels.log"

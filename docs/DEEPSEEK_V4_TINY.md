@@ -21,6 +21,9 @@
 暂在主机端执行，矩阵乘法完成后显式同步。这条路径便于查看中间结果，会有设备往返开销。
 它还没有接入 `DecoderModel`、服务调度器或 CUDA Graph，不能用于推断生产吞吐。
 
+另有独立的 [mHC CUDA 算子](DEEPSEEK_V4_MHC.md)，覆盖 Pre/Sinkhorn、Post 和 Head；
+该算子尚未接入本节 tiny 主机参考路径。
+
 参考目标固定为 **Transformers 5.12.0 的 eager、非量化 V4**：
 
 - shared-KV、partial RoPE 与输出逆旋转、attention sink、分组低秩输出投影。

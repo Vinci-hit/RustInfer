@@ -113,8 +113,9 @@ See [METRICS.md](METRICS.md) for exporter names and measurement semantics.
 CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_89 bash scripts/v4_regression.sh
 ```
 
-此入口显式执行 SWA、HCA、CSA compressor、Indexer scores 和 top-k 的 GPU 回归。
+此入口显式执行 SWA、HCA、CSA compressor、Indexer scores、top-k 和 mHC 的 GPU 回归。
 默认 release，`V4_TEST_PROFILE=dev` 可复用本地 debug 构建；输出到
 `$ARTIFACT_DIR/v4-kernels.log`。GPU workflow 支持未配置 Qwen checkpoint 时独立运行。
 分桶规划的 CPU 边界测试包含在 `cargo test -p infer-core` 中。
 详见 [V4 top-k 验证与基线](DEEPSEEK_V4_TOPK.md#容量分桶与既有实现基线)。
+mHC 的 FP64 oracle、独立 Transformers 对照和 benchmark 见 [mHC 验证](DEEPSEEK_V4_MHC.md#验证与复现)。
