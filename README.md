@@ -233,6 +233,9 @@ Optional [Triton RMSNorm kernels](docs/TRITON.md) are enabled with
 `cargo build --release -p infer-worker --features triton`; see the guide for the
 pinned Python build dependency and supported layouts.
 
+Optional [TileLang RMSNorm kernels](docs/TILELANG.md) are enabled with
+`cargo build --release -p infer-worker --features tilelang`.
+
 #### Run (one-shot e2e smoke test)
 
 Launches scheduler + worker + server for a config, sends one chat completion,

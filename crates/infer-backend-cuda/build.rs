@@ -55,6 +55,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed=CUDA_ARCH");
         println!("cargo:rerun-if-env-changed=SKIP_BUILD_KERNELS");
         println!("cargo:rerun-if-env-changed=RUSTINFER_TRITON_PYTHON");
+        println!("cargo:rerun-if-env-changed=RUSTINFER_TILELANG_PYTHON");
 
         // 1. 自动处理 libclang 环境变量 (彻底免去手动 export LIBCLANG_PATH)
         auto_configure_libclang();
@@ -130,7 +131,14 @@ fn main() {
         println!("cargo:rustc-env=RUSTINFER_CUDA_ARCH={}", cuda_arch);
         eprintln!("RustInfer build: detected CUDA arch {}", cuda_arch);
         if env::var_os("CARGO_FEATURE_TRITON").is_some() {
-            compile_triton_kernels(&root, &cuda_arch);
+            compile_aot_kernels(&root, &cuda_arch, "triton", "3.6.0");
+        }
+        if env::var_os("CARGO_FEATURE_TILELANG").is_some() {
+            compile_aot_kernels(&root, &cuda_arch, "tilelang", "0.1.14");
+        }
+        if env::var_os("CARGO_FEATURE_TRITON").is_some()
+            || env::var_os("CARGO_FEATURE_TILELANG").is_some()
+        {
             // CUDA's driver stubs also allow linking on GPU-less build hosts.
             // Keep their search paths after the installed driver library paths.
             for lib_path in &cuda_lib_paths {
@@ -367,10 +375,11 @@ impl CudaArchiveSpec {
     }
 }
 
-fn compile_triton_kernels(root: &Path, cuda_arch: &str) {
-    let source_dir = root.join("triton");
+fn compile_aot_kernels(root: &Path, cuda_arch: &str, backend: &str, version: &str) {
+    let source_dir = root.join(backend);
     println!("cargo:rerun-if-changed={}", source_dir.display());
-    let python = env::var_os("RUSTINFER_TRITON_PYTHON").unwrap_or_else(|| "python3".into());
+    let python_env = format!("RUSTINFER_{}_PYTHON", backend.to_uppercase());
+    let python = env::var_os(&python_env).unwrap_or_else(|| "python3".into());
     let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR environment variable not set");
     let output = std::process::Command::new(&python)
         .arg(source_dir.join("compile.py"))
@@ -381,13 +390,13 @@ fn compile_triton_kernels(root: &Path, cuda_arch: &str) {
         .output()
         .unwrap_or_else(|error| {
             panic!(
-                "Could not run Triton compiler with {:?}: {}. Set RUSTINFER_TRITON_PYTHON to a Python interpreter with triton==3.6.0 installed.",
+                "Could not run {backend} compiler with {:?}: {}. Set {python_env} to a Python interpreter with {backend}=={version} installed.",
                 python, error
             )
         });
     if !output.status.success() {
         panic!(
-            "Triton AOT compilation failed ({}):\n{}\n{}",
+            "{backend} AOT compilation failed ({}):\n{}\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

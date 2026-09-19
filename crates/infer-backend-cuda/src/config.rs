@@ -309,9 +309,11 @@ pub struct CudaConfig {
     /// can capture from `&CudaConfig` without an outer `&mut`.
     pub graphs: std::sync::Mutex<HashMap<GraphSlot, CudaGraph>>,
     // Fields drop in declaration order: graph handles must be destroyed before
-    // unloading any Triton functions referenced by their nodes.
+    // unloading any AOT functions referenced by their nodes.
     #[cfg(feature = "triton")]
-    pub(crate) triton: Option<crate::triton::TritonKernels>,
+    pub(crate) triton: Option<crate::aot::AotKernels>,
+    #[cfg(feature = "tilelang")]
+    pub(crate) tilelang: Option<crate::aot::AotKernels>,
     pub cudnn_handle: ffi::cudnnHandle_t,
 
     // ─── Bubble-free decode pipeline (copy streams + events) ─────────
@@ -439,6 +441,8 @@ impl CudaConfig {
             graphs: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "triton")]
             triton: None,
+            #[cfg(feature = "tilelang")]
+            tilelang: None,
             cudnn_handle,
             copy_in_stream,
             copy_out_stream,
@@ -461,7 +465,13 @@ impl CudaConfig {
         #[cfg(feature = "triton")]
         let config = {
             let mut config = config;
-            config.triton = crate::triton::TritonKernels::new(device_id)?;
+            config.triton = crate::triton::load(device_id)?;
+            config
+        };
+        #[cfg(feature = "tilelang")]
+        let config = {
+            let mut config = config;
+            config.tilelang = crate::tilelang::load(device_id)?;
             config
         };
         Ok(config)
@@ -475,6 +485,19 @@ impl CudaConfig {
             self.triton.is_some()
         }
         #[cfg(not(feature = "triton"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this context has usable, eagerly loaded TileLang AOT kernels.
+    /// Unsupported layouts still dispatch to the native CUDA implementation.
+    pub fn tilelang_available(&self) -> bool {
+        #[cfg(feature = "tilelang")]
+        {
+            self.tilelang.is_some()
+        }
+        #[cfg(not(feature = "tilelang"))]
         {
             false
         }
@@ -1166,11 +1189,11 @@ impl Drop for CudaConfig {
             if let Err(error) = self.capture_abort() {
                 tracing::error!(?error, "abort CUDA capture during teardown failed");
             }
-            #[cfg(feature = "triton")]
-            if self.triton.is_some()
+            #[cfg(any(feature = "triton", feature = "tilelang"))]
+            if (self.triton_available() || self.tilelang_available())
                 && let Err(error) = self.synchronize()
             {
-                tracing::error!(?error, "synchronize before Triton module teardown failed");
+                tracing::error!(?error, "synchronize before AOT module teardown failed");
             }
             if !self.ev_in.is_null() {
                 ffi::cudaEventDestroy(self.ev_in);

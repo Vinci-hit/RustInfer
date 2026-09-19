@@ -6,6 +6,7 @@ dependencies = []
 
 [project.optional-dependencies]
 triton = ["triton==3.6.0"]
+tilelang = ["tilelang==0.1.14; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 bench = [
     "aiohttp>=3.10,<4",
     "matplotlib>=3.9,<4",
@@ -22,3 +23,9 @@ deepseek-v4-reference = [
 
 [tool.uv]
 package = false
+
+# The vLLM reference engine pins its own TileLang compiler. Install the Rust AOT
+# compiler separately instead of combining these optional environments.
+conflicts = [
+    [{ extra = "tilelang" }, { extra = "vllm-reference" }],
+]

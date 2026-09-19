@@ -50,3 +50,4 @@ default = ["cuda"]
 # toolchain lives entirely in `infer-backend-cuda`.
 cuda = ["dep:infer-backend-cuda"]
 triton = ["cuda", "infer-backend-cuda/triton"]
+tilelang = ["cuda", "infer-backend-cuda/tilelang"]

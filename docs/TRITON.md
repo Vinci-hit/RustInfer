@@ -12,7 +12,7 @@ Install the pinned Triton compiler into a Python environment and select that
 interpreter when building:
 
 ```bash
-uv sync --extra triton
+uv sync --inexact --extra triton
 RUSTINFER_TRITON_PYTHON="$PWD/.venv/bin/python" \
   cargo build --release -p infer-worker --features triton
 ```
@@ -39,7 +39,8 @@ at runtime; its kernels are embedded in the binary.
 
 ## Dispatch and lifecycle
 
-RMSNorm uses Triton when the running GPU matches the compiled compute
+When both AOT features are enabled, [TileLang](TILELANG.md) takes precedence.
+Otherwise, RMSNorm uses Triton when the running GPU matches the compiled compute
 capability, the input, weight, and output are contiguous, and the last dimension
 is between 1 and 16384 inclusive. Supported dtypes are FP32, FP16, and BF16.
 Input, weight, and output have the same dtype. Odd dimensions, including 37 and
@@ -97,6 +98,6 @@ The source kernel is in
 compiles cubins and a Rust manifest into Cargo's output directory. It verifies
 the launch parameter ABI and rejects unsupported scratch, cooperative launch,
 and cluster requirements. The internal
-[`src/triton.rs`](../crates/infer-backend-cuda/src/triton.rs) module owns CUDA
+[`src/aot.rs`](../crates/infer-backend-cuda/src/aot.rs) module owns CUDA
 Driver API loading and launching. Additional kernels need an explicit manifest,
 validated launch contract, operator dispatch, and correctness/capture tests.

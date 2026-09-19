@@ -111,7 +111,8 @@ def compile_kernels(arch: str, out_dir: Path) -> None:
             lines.append(
                 f"    KernelSpec {{ dtype: {dtype_id}, block: {block}, "
                 f"image: include_bytes!({path_literal}), name: b\"{metadata.name}\\0\", "
-                f"shared: {metadata.shared}, threads: {metadata.num_warps * target.warp_size} }},"
+                f"shared: {metadata.shared}, threads: {metadata.num_warps * target.warp_size}, "
+                "pointer_order: [0, 1, 2] },"
             )
     lines.append("];")
     (out_dir / "triton_kernels.rs").write_text("\n".join(lines) + "\n")
