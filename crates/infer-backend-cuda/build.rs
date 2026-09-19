@@ -52,6 +52,9 @@ fn main() {
         // Re-run discovery when a kernel file or directory is added/removed,
         // not only when an already-known source changes.
         println!("cargo:rerun-if-changed=src/kernels");
+        println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+        println!("cargo:rerun-if-env-changed=SKIP_BUILD_KERNELS");
+        println!("cargo:rerun-if-env-changed=RUSTINFER_TRITON_PYTHON");
 
         // 1. 自动处理 libclang 环境变量 (彻底免去手动 export LIBCLANG_PATH)
         auto_configure_libclang();
@@ -126,6 +129,18 @@ fn main() {
         let cuda_arch = detect_cuda_arch();
         println!("cargo:rustc-env=RUSTINFER_CUDA_ARCH={}", cuda_arch);
         eprintln!("RustInfer build: detected CUDA arch {}", cuda_arch);
+        if env::var_os("CARGO_FEATURE_TRITON").is_some() {
+            compile_triton_kernels(&root, &cuda_arch);
+            // CUDA's driver stubs also allow linking on GPU-less build hosts.
+            // Keep their search paths after the installed driver library paths.
+            for lib_path in &cuda_lib_paths {
+                let stubs = lib_path.join("stubs");
+                if stubs.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", stubs.display());
+                }
+            }
+            println!("cargo:rustc-link-lib=cuda");
+        }
 
         // Directory convention is the classification boundary:
         //   src/kernels/**             -> generic cc-rs device archive
@@ -350,6 +365,35 @@ impl CudaArchiveSpec {
     fn supports(&self, cuda_arch: &str) -> bool {
         cuda_arch_family(cuda_arch) == Some(self.arch_family)
     }
+}
+
+fn compile_triton_kernels(root: &Path, cuda_arch: &str) {
+    let source_dir = root.join("triton");
+    println!("cargo:rerun-if-changed={}", source_dir.display());
+    let python = env::var_os("RUSTINFER_TRITON_PYTHON").unwrap_or_else(|| "python3".into());
+    let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR environment variable not set");
+    let output = std::process::Command::new(&python)
+        .arg(source_dir.join("compile.py"))
+        .arg("--arch")
+        .arg(cuda_arch)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "Could not run Triton compiler with {:?}: {}. Set RUSTINFER_TRITON_PYTHON to a Python interpreter with triton==3.6.0 installed.",
+                python, error
+            )
+        });
+    if !output.status.success() {
+        panic!(
+            "Triton AOT compilation failed ({}):\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
 }
 
 fn cuda_arch_family(cuda_arch: &str) -> Option<u32> {

@@ -10,6 +10,11 @@ repository.workspace = true
 homepage.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Compile Triton kernels ahead of time; Python is required only during builds.
+triton = []
+
 [dependencies]
 infer-core = { version = "1.0.1", path = "../infer-core" }
 half = { version = "2.7.1", features = ["std", "num-traits"] }

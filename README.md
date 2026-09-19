@@ -229,6 +229,10 @@ export CUDNN_FRONTEND_INCLUDE_DIR=/path/to/site-packages/include
 cargo build --release
 ```
 
+Optional [Triton RMSNorm kernels](docs/TRITON.md) are enabled with
+`cargo build --release -p infer-worker --features triton`; see the guide for the
+pinned Python build dependency and supported layouts.
+
 #### Run (one-shot e2e smoke test)
 
 Launches scheduler + worker + server for a config, sends one chat completion,

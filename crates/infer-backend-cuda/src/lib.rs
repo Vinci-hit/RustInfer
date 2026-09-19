@@ -11,6 +11,8 @@ mod host_buffer;
 mod nccl;
 mod pool;
 mod timing;
+#[cfg(feature = "triton")]
+mod triton;
 // Raw kernel launch wrappers are an implementation detail. Keeping this module
 // private prevents external callers from manufacturing invalid CUDA streams or
 // device pointers; the safe backend traits below are the supported API.
@@ -460,6 +462,9 @@ impl infer_core::ports::MathOps for Cuda {
         output: &mut Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
+        require_scope_tensor(scope, input, "rmsnorm input")?;
+        require_scope_tensor(scope, weight, "rmsnorm weight")?;
+        require_scope_tensor(scope, output, "rmsnorm output")?;
         let _guard = infer_core::exec::ExecScope::enter(scope);
         let stream = scope_stream(scope);
         narrow_float!(T, "rmsnorm", |F| {
@@ -479,6 +484,8 @@ impl infer_core::ports::MathOps for Cuda {
         weight: &Tensor<T, Self>,
         eps: f32,
     ) -> OpResult<()> {
+        require_scope_tensor(scope, x, "rmsnorm input")?;
+        require_scope_tensor(scope, weight, "rmsnorm weight")?;
         let _guard = infer_core::exec::ExecScope::enter(scope);
         let stream = scope_stream(scope);
         narrow_float!(T, "rmsnorm_inplace", |F| {
