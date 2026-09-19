@@ -384,4 +384,4 @@ bash scripts/gpu_regression.sh
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE). Vendored components retain
-their own terms; see [Third-party notices](THIRD_PARTY_NOTICES.md).
+their own terms.
