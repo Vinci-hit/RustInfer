@@ -308,6 +308,10 @@ pub struct CudaConfig {
     /// Captured CUDA graphs, keyed by slot. Behind a Mutex so the runner
     /// can capture from `&CudaConfig` without an outer `&mut`.
     pub graphs: std::sync::Mutex<HashMap<GraphSlot, CudaGraph>>,
+    // Fields drop in declaration order: graph handles must be destroyed before
+    // unloading any Triton functions referenced by their nodes.
+    #[cfg(feature = "triton")]
+    pub(crate) triton: Option<crate::triton::TritonKernels>,
     pub cudnn_handle: ffi::cudnnHandle_t,
 
     // ─── Bubble-free decode pipeline (copy streams + events) ─────────
@@ -424,7 +428,7 @@ impl CudaConfig {
         unsafe {
             cuda_check!(ffi::cudaEventCreate(&mut ev_out));
         }
-        Ok(Self {
+        let config = Self {
             device_id,
             device_info,
             stream,
@@ -433,6 +437,8 @@ impl CudaConfig {
             memory_plan,
             kernel_workspace,
             graphs: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "triton")]
+            triton: None,
             cudnn_handle,
             copy_in_stream,
             copy_out_stream,
@@ -451,7 +457,27 @@ impl CudaConfig {
             restore_device: CudaDeviceRestore { previous: -1 },
             #[cfg(test)]
             _test_lease: test_lease,
-        })
+        };
+        #[cfg(feature = "triton")]
+        let config = {
+            let mut config = config;
+            config.triton = crate::triton::TritonKernels::new(device_id)?;
+            config
+        };
+        Ok(config)
+    }
+
+    /// Whether this context has usable, eagerly loaded Triton AOT kernels.
+    /// Unsupported layouts still dispatch to the native CUDA implementation.
+    pub fn triton_available(&self) -> bool {
+        #[cfg(feature = "triton")]
+        {
+            self.triton.is_some()
+        }
+        #[cfg(not(feature = "triton"))]
+        {
+            false
+        }
     }
 
     pub fn memory_plan(&self) -> CudaMemoryPlan {
@@ -1139,6 +1165,12 @@ impl Drop for CudaConfig {
             }
             if let Err(error) = self.capture_abort() {
                 tracing::error!(?error, "abort CUDA capture during teardown failed");
+            }
+            #[cfg(feature = "triton")]
+            if self.triton.is_some()
+                && let Err(error) = self.synchronize()
+            {
+                tracing::error!(?error, "synchronize before Triton module teardown failed");
             }
             if !self.ev_in.is_null() {
                 ffi::cudaEventDestroy(self.ev_in);

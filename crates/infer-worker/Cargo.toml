@@ -49,3 +49,4 @@ default = ["cuda"]
 # The worker no longer carries cc/bindgen/walkdir or a build.rs — the CUDA
 # toolchain lives entirely in `infer-backend-cuda`.
 cuda = ["dep:infer-backend-cuda"]
+triton = ["cuda", "infer-backend-cuda/triton"]

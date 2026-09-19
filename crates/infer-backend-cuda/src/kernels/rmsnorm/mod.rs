@@ -151,9 +151,44 @@ pub fn rmsnorm<T: RmsNormKernel>(
     output: &mut Tensor<T, Cuda>,
     eps: f32,
 ) -> OpResult<()> {
+    validate(input, weight, eps)?;
+    if stream != input.device().config.stream {
+        return Err(OpError::Kernel(
+            "rmsnorm: stream must belong to the input configuration".into(),
+        ));
+    }
+    if input.shape() != output.shape() || input.device().device_id != output.device().device_id {
+        return Err(OpError::Shape(
+            "rmsnorm: input/output shape or device mismatch".into(),
+        ));
+    }
+    if input.numel() == 0 {
+        return Ok(());
+    }
+    validate_aliases(input, weight, output)?;
     let dim = weight.numel();
+    #[cfg(feature = "triton")]
+    if input.is_contiguous()
+        && output.is_contiguous()
+        && let Some(triton) = &input.device().config.triton
+        && unsafe {
+            triton.rmsnorm(
+                stream,
+                output.data_ptr_mut(),
+                input.data_ptr(),
+                weight.data_ptr(),
+                input.numel() / dim,
+                dim,
+                eps,
+            )?
+        }
+    {
+        return Ok(());
+    }
     let in_layout = derive_layout(input, dim)?;
     let out_layout = derive_layout(output, dim)?;
+    validate_native(input, weight, in_layout)?;
+    validate_native(output, weight, out_layout)?;
 
     unsafe {
         T::rmsnorm(
@@ -176,9 +211,37 @@ pub fn rmsnorm_inplace<T: RmsNormKernel>(
     weight: &Tensor<T, Cuda>,
     eps: f32,
 ) -> OpResult<()> {
+    validate(x, weight, eps)?;
+    if stream != x.device().config.stream {
+        return Err(OpError::Kernel(
+            "rmsnorm: stream must belong to the input configuration".into(),
+        ));
+    }
+    if x.numel() == 0 {
+        return Ok(());
+    }
+    validate_aliases(x, weight, x)?;
     let dim = weight.numel();
-    let layout = derive_layout(x, dim)?;
     let ptr = x.data_ptr_mut();
+    #[cfg(feature = "triton")]
+    if x.is_contiguous()
+        && let Some(triton) = &x.device().config.triton
+        && unsafe {
+            triton.rmsnorm(
+                stream,
+                ptr,
+                ptr.cast_const(),
+                weight.data_ptr(),
+                x.numel() / dim,
+                dim,
+                eps,
+            )?
+        }
+    {
+        return Ok(());
+    }
+    let layout = derive_layout(x, dim)?;
+    validate_native(x, weight, layout)?;
 
     unsafe {
         T::rmsnorm(
@@ -195,6 +258,78 @@ pub fn rmsnorm_inplace<T: RmsNormKernel>(
 }
 
 // ─── Internal ────────────────────────────────────────────────────────────────
+
+fn validate<T: Dtype>(x: &Tensor<T, Cuda>, weight: &Tensor<T, Cuda>, eps: f32) -> OpResult<()> {
+    let dim = weight.numel();
+    if dim == 0
+        || dim > i32::MAX as usize
+        || x.shape().as_slice().last() != Some(&dim)
+        || x.numel() / dim > i32::MAX as usize
+        || !weight.is_contiguous()
+        || !eps.is_finite()
+        || eps < 0.0
+        || x.device().device_id != weight.device().device_id
+    {
+        return Err(OpError::Shape(
+            "rmsnorm: invalid shape, weight layout, device or epsilon".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_aliases<T: Dtype>(
+    input: &Tensor<T, Cuda>,
+    weight: &Tensor<T, Cuda>,
+    output: &Tensor<T, Cuda>,
+) -> OpResult<()> {
+    // Tensor construction already checks each strided span against its storage.
+    // Conservatively reject overlapping spans, even if holes happen to differ.
+    let span = |tensor: &Tensor<T, Cuda>| {
+        let elements = tensor
+            .shape()
+            .as_slice()
+            .iter()
+            .zip(tensor.strides().as_slice())
+            .fold(1usize, |size, (&extent, &stride)| {
+                size + (extent - 1) * stride
+            });
+        let begin = tensor.data_ptr() as usize;
+        (begin, begin + elements * T::SIZE_BYTES)
+    };
+    let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+    let out = span(output);
+    let exact_inplace = input.data_ptr() == output.data_ptr()
+        && input.shape() == output.shape()
+        && input.strides() == output.strides();
+    if overlaps(out, span(weight)) || (!exact_inplace && overlaps(out, span(input))) {
+        return Err(OpError::Shape(
+            "rmsnorm: output overlaps weights or partially aliases input".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Native kernels use 16-byte vector loads. A Triton-unsupported layout must not
+// silently enter a CUDA kernel that would truncate the row or access unaligned
+// memory. Triton's contiguous kernels do not require this alignment.
+fn validate_native<T: Dtype>(
+    x: &Tensor<T, Cuda>,
+    weight: &Tensor<T, Cuda>,
+    layout: Layout,
+) -> OpResult<()> {
+    let vector = 16 / T::SIZE_BYTES;
+    if layout.dim as usize % vector != 0
+        || layout.stride0 % vector as i64 != 0
+        || layout.stride1 % vector as i64 != 0
+        || x.data_ptr() as usize % 16 != 0
+        || weight.data_ptr() as usize % 16 != 0
+    {
+        return Err(OpError::Shape(
+            "rmsnorm: native CUDA fallback requires 16-byte aligned rows and weights".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 pub struct Layout {
@@ -217,7 +352,14 @@ fn derive_layout<T: Dtype, D: infer_core::ports::MemoryPort>(
             shape, strides, dim
         )));
     }
-    if t.is_contiguous() {
+    if strides.iter().any(|&stride| stride > i64::MAX as usize) {
+        return Err(OpError::Shape(
+            "rmsnorm: stride exceeds CUDA index range".into(),
+        ));
+    }
+    // Preserve the same row decomposition for both 3-D tensors, including when
+    // only one is contiguous: the CUDA ABI takes a single shared outer1.
+    if t.is_contiguous() && t.ndim() != 3 {
         return Ok(Layout {
             outer0: (t.numel() / dim) as i32,
             outer1: 1,
