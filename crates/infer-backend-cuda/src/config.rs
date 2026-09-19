@@ -314,6 +314,8 @@ pub struct CudaConfig {
     pub(crate) triton: Option<crate::aot::AotKernels>,
     #[cfg(feature = "tilelang")]
     pub(crate) tilelang: Option<crate::aot::AotKernels>,
+    #[cfg(feature = "cute-dsl")]
+    pub(crate) cute_dsl: Option<crate::aot::AotKernels>,
     pub cudnn_handle: ffi::cudnnHandle_t,
 
     // ─── Bubble-free decode pipeline (copy streams + events) ─────────
@@ -443,6 +445,8 @@ impl CudaConfig {
             triton: None,
             #[cfg(feature = "tilelang")]
             tilelang: None,
+            #[cfg(feature = "cute-dsl")]
+            cute_dsl: None,
             cudnn_handle,
             copy_in_stream,
             copy_out_stream,
@@ -474,6 +478,12 @@ impl CudaConfig {
             config.tilelang = crate::tilelang::load(device_id)?;
             config
         };
+        #[cfg(feature = "cute-dsl")]
+        let config = {
+            let mut config = config;
+            config.cute_dsl = crate::cute_dsl::load(device_id)?;
+            config
+        };
         Ok(config)
     }
 
@@ -498,6 +508,19 @@ impl CudaConfig {
             self.tilelang.is_some()
         }
         #[cfg(not(feature = "tilelang"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this context has usable, eagerly loaded CuTe DSL AOT kernels.
+    /// Unsupported layouts still dispatch to the native CUDA implementation.
+    pub fn cute_dsl_available(&self) -> bool {
+        #[cfg(feature = "cute-dsl")]
+        {
+            self.cute_dsl.is_some()
+        }
+        #[cfg(not(feature = "cute-dsl"))]
         {
             false
         }
@@ -1189,8 +1212,8 @@ impl Drop for CudaConfig {
             if let Err(error) = self.capture_abort() {
                 tracing::error!(?error, "abort CUDA capture during teardown failed");
             }
-            #[cfg(any(feature = "triton", feature = "tilelang"))]
-            if (self.triton_available() || self.tilelang_available())
+            #[cfg(any(feature = "triton", feature = "tilelang", feature = "cute-dsl"))]
+            if (self.triton_available() || self.tilelang_available() || self.cute_dsl_available())
                 && let Err(error) = self.synchronize()
             {
                 tracing::error!(?error, "synchronize before AOT module teardown failed");

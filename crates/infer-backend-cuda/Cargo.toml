@@ -16,6 +16,8 @@ default = []
 triton = []
 # Compile TileLang kernels ahead of time; takes precedence over Triton.
 tilelang = []
+# Optional CuTe DSL AOT RMSNorm kernels.
+cute-dsl = []
 
 [dependencies]
 infer-core = { version = "1.0.1", path = "../infer-core" }

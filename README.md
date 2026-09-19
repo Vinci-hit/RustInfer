@@ -236,6 +236,9 @@ pinned Python build dependency and supported layouts.
 Optional [TileLang RMSNorm kernels](docs/TILELANG.md) are enabled with
 `cargo build --release -p infer-worker --features tilelang`.
 
+Optional [CuTe DSL RMSNorm kernels](docs/CUTE_DSL.md) are enabled with
+`cargo build --release -p infer-worker --features cute-dsl`.
+
 #### Run (one-shot e2e smoke test)
 
 Launches scheduler + worker + server for a config, sends one chat completion,

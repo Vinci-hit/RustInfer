@@ -39,8 +39,9 @@ at runtime; its kernels are embedded in the binary.
 
 ## Dispatch and lifecycle
 
-When both AOT features are enabled, [TileLang](TILELANG.md) takes precedence.
-Otherwise, RMSNorm uses Triton when the running GPU matches the compiled compute
+With multiple AOT features, dispatch priority is [CuTe DSL](CUTE_DSL.md),
+[TileLang](TILELANG.md), then Triton.
+With only `triton` enabled, RMSNorm uses it when the GPU matches the compiled compute
 capability, the input, weight, and output are contiguous, and the last dimension
 is between 1 and 16384 inclusive. Supported dtypes are FP32, FP16, and BF16.
 Input, weight, and output have the same dtype. Odd dimensions, including 37 and

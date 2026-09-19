@@ -225,7 +225,7 @@ impl AotKernels {
         let mut dim = dim as i32;
         let mut eps = eps;
         // Triton appends two scratch pointers (validated unused at build time).
-        // TileLang has five parameters; CUDA reads only those first five
+        // TileLang and CuTe DSL have five parameters; CUDA reads those first five
         // entries according to its compiled function signature.
         let mut global_scratch: u64 = 0;
         let mut profile_scratch: u64 = 0;

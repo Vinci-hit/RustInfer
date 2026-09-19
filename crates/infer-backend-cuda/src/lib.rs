@@ -3,9 +3,11 @@
 //! Implements `Device`, `MemoryPort`, and `OpBackend` for `Cuda`.
 //! Contains: FFI bindings, CudaConfig (handles), and kernel dispatch wrappers.
 
-#[cfg(any(feature = "triton", feature = "tilelang"))]
+#[cfg(any(feature = "triton", feature = "tilelang", feature = "cute-dsl"))]
 mod aot;
 pub mod config;
+#[cfg(feature = "cute-dsl")]
+mod cute_dsl;
 pub mod device_utils;
 pub mod error;
 pub mod ffi;

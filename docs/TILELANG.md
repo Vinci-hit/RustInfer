@@ -49,8 +49,8 @@ remain runtime arguments; each dtype has power-of-two block specializations.
 Indices use 64-bit arithmetic. Exact input/output aliasing is supported, and
 half-precision arithmetic preserves the native CUDA rounding boundaries.
 
-Dispatch priority when both features are enabled is TileLang, then Triton, then
-native CUDA. Unsupported shapes/layouts use the next eligible implementation.
+Dispatch priority with multiple features is [CuTe DSL](CUTE_DSL.md), TileLang,
+Triton, then native CUDA. Unsupported shapes/layouts use the next eligible implementation.
 The native CUDA alignment requirements and all validation rules described in
 [the Triton guide](TRITON.md#dispatch-and-lifecycle) still apply. Runtime launch
 errors propagate rather than silently retrying.
@@ -81,7 +81,7 @@ and exercises odd dimensions, the largest supported dimension, in-place
 execution, rounding boundaries, strided/oversized native fallback, invalid
 arguments, independent configurations, and first-call graph capture/replay.
 Run each backend feature separately to verify its dispatch path; a combined
-build exercises TileLang first.
+build with `tilelang,triton` exercises TileLang first.
 
 This initial integration covers RMSNorm only. End-to-end inference and
 performance benchmarks are not part of this validation; no speedup is claimed.

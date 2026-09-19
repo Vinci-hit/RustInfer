@@ -167,6 +167,24 @@ pub fn rmsnorm<T: RmsNormKernel>(
     }
     validate_aliases(input, weight, output)?;
     let dim = weight.numel();
+    #[cfg(feature = "cute-dsl")]
+    if input.is_contiguous()
+        && output.is_contiguous()
+        && let Some(cute_dsl) = &input.device().config.cute_dsl
+        && unsafe {
+            cute_dsl.rmsnorm(
+                stream,
+                output.data_ptr_mut(),
+                input.data_ptr(),
+                weight.data_ptr(),
+                input.numel() / dim,
+                dim,
+                eps,
+            )?
+        }
+    {
+        return Ok(());
+    }
     #[cfg(feature = "tilelang")]
     if input.is_contiguous()
         && output.is_contiguous()
@@ -241,6 +259,23 @@ pub fn rmsnorm_inplace<T: RmsNormKernel>(
     validate_aliases(x, weight, x)?;
     let dim = weight.numel();
     let ptr = x.data_ptr_mut();
+    #[cfg(feature = "cute-dsl")]
+    if x.is_contiguous()
+        && let Some(cute_dsl) = &x.device().config.cute_dsl
+        && unsafe {
+            cute_dsl.rmsnorm(
+                stream,
+                ptr,
+                ptr.cast_const(),
+                weight.data_ptr(),
+                x.numel() / dim,
+                dim,
+                eps,
+            )?
+        }
+    {
+        return Ok(());
+    }
     #[cfg(feature = "tilelang")]
     if x.is_contiguous()
         && let Some(tilelang) = &x.device().config.tilelang

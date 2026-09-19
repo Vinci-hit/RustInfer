@@ -6,6 +6,7 @@ dependencies = []
 
 [project.optional-dependencies]
 triton = ["triton==3.6.0"]
+cute-dsl = ["nvidia-cutlass-dsl==4.7.1; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 tilelang = ["tilelang==0.1.14; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 bench = [
     "aiohttp>=3.10,<4",
@@ -24,8 +25,9 @@ deepseek-v4-reference = [
 [tool.uv]
 package = false
 
-# The vLLM reference engine pins its own TileLang compiler. Install the Rust AOT
-# compiler separately instead of combining these optional environments.
+# The vLLM reference engine pins its own TileLang and CuTe DSL compilers.
+# Install Rust AOT compilers separately from that reference environment.
 conflicts = [
     [{ extra = "tilelang" }, { extra = "vllm-reference" }],
+    [{ extra = "cute-dsl" }, { extra = "vllm-reference" }],
 ]

@@ -56,6 +56,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed=SKIP_BUILD_KERNELS");
         println!("cargo:rerun-if-env-changed=RUSTINFER_TRITON_PYTHON");
         println!("cargo:rerun-if-env-changed=RUSTINFER_TILELANG_PYTHON");
+        println!("cargo:rerun-if-env-changed=RUSTINFER_CUTE_DSL_PYTHON");
 
         // 1. 自动处理 libclang 环境变量 (彻底免去手动 export LIBCLANG_PATH)
         auto_configure_libclang();
@@ -136,8 +137,12 @@ fn main() {
         if env::var_os("CARGO_FEATURE_TILELANG").is_some() {
             compile_aot_kernels(&root, &cuda_arch, "tilelang", "0.1.14");
         }
+        if env::var_os("CARGO_FEATURE_CUTE_DSL").is_some() {
+            compile_aot_kernels(&root, &cuda_arch, "cute_dsl", "4.7.1");
+        }
         if env::var_os("CARGO_FEATURE_TRITON").is_some()
             || env::var_os("CARGO_FEATURE_TILELANG").is_some()
+            || env::var_os("CARGO_FEATURE_CUTE_DSL").is_some()
         {
             // CUDA's driver stubs also allow linking on GPU-less build hosts.
             // Keep their search paths after the installed driver library paths.
@@ -376,6 +381,11 @@ impl CudaArchiveSpec {
 }
 
 fn compile_aot_kernels(root: &Path, cuda_arch: &str, backend: &str, version: &str) {
+    let package = if backend == "cute_dsl" {
+        "nvidia-cutlass-dsl"
+    } else {
+        backend
+    };
     let source_dir = root.join(backend);
     println!("cargo:rerun-if-changed={}", source_dir.display());
     let python_env = format!("RUSTINFER_{}_PYTHON", backend.to_uppercase());
@@ -390,7 +400,7 @@ fn compile_aot_kernels(root: &Path, cuda_arch: &str, backend: &str, version: &st
         .output()
         .unwrap_or_else(|error| {
             panic!(
-                "Could not run {backend} compiler with {:?}: {}. Set {python_env} to a Python interpreter with {backend}=={version} installed.",
+                "Could not run {backend} compiler with {:?}: {}. Set {python_env} to a Python interpreter with {package}=={version} installed.",
                 python, error
             )
         });
