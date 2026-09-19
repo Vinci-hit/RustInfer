@@ -235,34 +235,33 @@ Launches scheduler + worker + server for a config, sends one chat completion,
 prints the reply, and tears everything down:
 
 ```bash
-scripts/e2e_smoke.sh run_qwen3.toml 8100 "Say hello in one short sentence."
+scripts/e2e_smoke.sh rustinfer.toml 8000 "Say hello in one short sentence."
 ```
 
-The checked-in configs are portable templates. Set their `model` field to the
-local Hugging Face model directory before launching; they bind to
-`127.0.0.1` and use `cuda:0` by default.
+The default launch config is `rustinfer.toml`. Set its `model` field to the
+local Hugging Face model directory before launching; it binds to
+`127.0.0.1:8000` and uses `cuda:0` by default.
 
 #### Run (manual, three processes)
 
 Each binary takes the same `--config`:
 
 ```bash
-./target/release/rustinfer-scheduler --config run_qwen3.toml &
-./target/release/rustinfer-worker    --config run_qwen3.toml &
-./target/release/rustinfer-server     --config run_qwen3.toml &
+./target/release/rustinfer-scheduler --config rustinfer.toml &
+./target/release/rustinfer-worker    --config rustinfer.toml &
+./target/release/rustinfer-server     --config rustinfer.toml &
 ```
 
 Then hit the OpenAI-compatible endpoint:
 
 ```bash
-curl http://127.0.0.1:8100/v1/chat/completions \
+curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen3-4B-Instruct-2507",
+  -d '{"model":"model",
        "messages":[{"role":"user","content":"What is the capital of France?"}]}'
 ```
 
-Ready-to-use configs: `run_qwen3.toml`, `run_qwen3_awq.toml` (AWQ int4),
-`run_llama1b.toml`.
+Use the model ID returned by `/v1/models` in the request's `model` field.
 
 #### Python benchmark tools
 
