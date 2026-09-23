@@ -13,6 +13,8 @@ use infer_core::ports::{
 use infer_core::tensor::Tensor;
 use infer_core::types::{Dtype, Shape};
 
+pub mod block_quant;
+
 // ─── Cpu Device ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,25 @@ impl infer_core::exec::ExecDevice for Cpu {
 impl infer_core::exec::ExecHostDevice for Cpu {}
 
 infer_core::impl_math_ops_via_core_ops!(Cpu, {
+    fn matmul_block_quant<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &infer_core::quantized::BlockQuantWeight<Self>,
+        bias: Option<&Tensor<T, Self>>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        block_quant::matmul(input, weight, bias, output)
+    }
+
+    fn embedding_block_quant<T: Dtype>(
+        _scope: &Self::Scope,
+        weight: &infer_core::quantized::BlockQuantWeight<Self>,
+        indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        block_quant::embedding(weight, indices, output)
+    }
+
     fn linear<T: Dtype>(
         _scope: &Self::Scope,
         input: &Tensor<T, Self>,

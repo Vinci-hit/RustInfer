@@ -1,9 +1,19 @@
+use super::block_quant_projection::BlockQuantProjection;
+use super::linear::Linear;
 use crate::domain::component::Hidden;
 use crate::domain::dtype::Dtype;
-use crate::domain::exec::{ExecScope, RankPair, StepCtx};
+use crate::domain::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
 use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp, VocabOps};
 use crate::domain::tensor::Tensor;
+use crate::domain::types::Shape;
+use infer_core::quantized::BlockQuantWeight;
+
+#[derive(Clone)]
+pub enum EmbeddingWeight<T: Dtype, D: LlmBackend> {
+    Dense(Tensor<T, D>),
+    BlockQuant(BlockQuantWeight<D>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingParallelism {
@@ -39,15 +49,75 @@ impl Default for EmbeddingParallelism {
 /// from input token ids. Not a `Component` — embedding runs once at the model
 /// boundary (`DecoderModel::embed`), not inside the per-layer stage list.
 pub struct Embed<T: Dtype, D: LlmBackend> {
-    pub table: Tensor<T, D>,
+    weight: EmbeddingWeight<T, D>,
     parallelism: EmbeddingParallelism,
 }
 
 impl<T: Dtype, D: LlmBackend> Embed<T, D> {
     pub fn new(table: Tensor<T, D>) -> Self {
         Self {
-            table,
+            weight: EmbeddingWeight::Dense(table),
             parallelism: EmbeddingParallelism::default(),
+        }
+    }
+
+    pub fn from_block_quant(weight: BlockQuantWeight<D>) -> Self {
+        Self {
+            weight: EmbeddingWeight::BlockQuant(weight),
+            parallelism: EmbeddingParallelism::SINGLE,
+        }
+    }
+
+    pub fn weight(&self) -> &EmbeddingWeight<T, D> {
+        &self.weight
+    }
+    pub fn shape(&self) -> Shape {
+        match &self.weight {
+            EmbeddingWeight::Dense(w) => *w.shape(),
+            EmbeddingWeight::BlockQuant(w) => Shape::from_slice(&w.layout().shape()),
+        }
+    }
+    pub fn device(&self) -> &D {
+        match &self.weight {
+            EmbeddingWeight::Dense(w) => w.device(),
+            EmbeddingWeight::BlockQuant(w) => w.device(),
+        }
+    }
+    pub fn as_dense(&self) -> Option<&Tensor<T, D>> {
+        match &self.weight {
+            EmbeddingWeight::Dense(w) => Some(w),
+            EmbeddingWeight::BlockQuant(_) => None,
+        }
+    }
+    pub fn require_dense(&self) -> OpResult<&Tensor<T, D>> {
+        self.as_dense().ok_or_else(|| {
+            OpError::unsupported(
+                self.device().name(),
+                "dense embedding access on block-quantized weights",
+            )
+        })
+    }
+    pub fn shallow_clone(&self) -> Self {
+        Self {
+            weight: self.weight.clone(),
+            parallelism: self.parallelism,
+        }
+    }
+
+    /// Explicit tied-weight construction for TP1. Never inferred from shape.
+    /// Existing sharded dense loaders retain their vocabulary-parallel path.
+    pub fn shared_linear(&self) -> OpResult<Linear<T, D>> {
+        if self.parallelism != EmbeddingParallelism::SINGLE {
+            return Err(OpError::unsupported(
+                "embedding",
+                "shared_linear requires replicated TP1",
+            ));
+        }
+        match &self.weight {
+            EmbeddingWeight::Dense(w) => Ok(Linear::new(w.clone(), None)),
+            EmbeddingWeight::BlockQuant(w) => {
+                Linear::from_block_quant(BlockQuantProjection::try_new(vec![w.clone()])?, None)
+            }
         }
     }
 
@@ -66,6 +136,34 @@ impl<T: Dtype, D: LlmBackend> Embed<T, D> {
         hidden: &mut Hidden<T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
+        if let EmbeddingWeight::BlockQuant(w) = &self.weight {
+            if self.parallelism != EmbeddingParallelism::SINGLE
+                || ctx.scope().topology().tp != (RankPair { rank: 0, size: 1 })
+            {
+                return Err(OpError::unsupported(
+                    "block-quantized embedding",
+                    "tensor parallelism",
+                ));
+            }
+            if input_ids.ndim() != 1
+                || hidden.stream.shape().as_slice() != [input_ids.numel(), w.layout().shape()[1]]
+            {
+                return Err(OpError::Shape(
+                    "block-quantized embedding input/output shape mismatch".into(),
+                ));
+            }
+            let device = <D as ExecDevice>::device_id(ctx.scope().device());
+            if [input_ids.device(), hidden.stream.device(), w.device()]
+                .into_iter()
+                .any(|d| <D as ExecDevice>::device_id(d) != device)
+            {
+                return Err(OpError::Shape(
+                    "block-quantized embedding device mismatch".into(),
+                ));
+            }
+            return D::embedding_block_quant(ctx.scope(), w, input_ids, &mut hidden.stream);
+        }
+        let table = self.require_dense()?;
         let component_tp = self.parallelism.tp();
         let scope_tp = ctx.scope().topology().tp;
         if component_tp != scope_tp {
@@ -77,14 +175,14 @@ impl<T: Dtype, D: LlmBackend> Embed<T, D> {
 
         match self.parallelism {
             EmbeddingParallelism::Replicated { .. } => {
-                D::embedding(ctx.scope(), &self.table, input_ids, &mut hidden.stream)
+                D::embedding(ctx.scope(), table, input_ids, &mut hidden.stream)
             }
             EmbeddingParallelism::Vocab {
                 tp,
                 vocab_start,
                 global_vocab_size,
             } => {
-                let table_shape = self.table.shape().as_slice();
+                let table_shape = table.shape().as_slice();
                 let local_vocab = table_shape.first().copied().ok_or_else(|| {
                     OpError::Shape("vocab-parallel Embedding table must be rank 2".into())
                 })?;
@@ -117,7 +215,7 @@ impl<T: Dtype, D: LlmBackend> Embed<T, D> {
                 }
                 <D as VocabOps>::vocab_embedding(
                     ctx.scope(),
-                    &self.table,
+                    table,
                     input_ids,
                     &mut hidden.stream,
                     vocab_start,

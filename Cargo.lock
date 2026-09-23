@@ -2159,6 +2159,7 @@ dependencies = [
  "bindgen",
  "cc",
  "half",
+ "infer-backend-cpu",
  "infer-core",
  "tracing",
  "walkdir",

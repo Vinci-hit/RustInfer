@@ -1,0 +1,165 @@
+//! CPU-only differential tests against a pinned upstream reader/writer.
+use infer_worker::infrastructure::io::gguf::{GgmlType, GgufArray, GgufReader, GgufValue};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+
+fn value_json(value: &GgufValue) -> Value {
+    macro_rules! scalar { ($($v:ident),+) => { match value {
+        $(GgufValue::$v(x) => json!(x),)+
+        GgufValue::Array(x) => array_json(x),
+    } }; }
+    scalar!(U8, I8, U16, I16, U32, I32, F32, Bool, String, U64, I64, F64)
+}
+
+fn array_json(value: &GgufArray) -> Value {
+    macro_rules! arrays { ($($v:ident),+) => { match value {
+        $(GgufArray::$v(x) => json!(x),)+
+        GgufArray::Array(x) => Value::Array(x.iter().map(array_json).collect()),
+    } }; }
+    arrays!(U8, I8, U16, I16, U32, I32, F32, Bool, String, U64, I64, F64)
+}
+
+fn type_ids(value: &GgufValue) -> Vec<u32> {
+    match value {
+        GgufValue::U8(_) => vec![0],
+        GgufValue::I8(_) => vec![1],
+        GgufValue::U16(_) => vec![2],
+        GgufValue::I16(_) => vec![3],
+        GgufValue::U32(_) => vec![4],
+        GgufValue::I32(_) => vec![5],
+        GgufValue::F32(_) => vec![6],
+        GgufValue::Bool(_) => vec![7],
+        GgufValue::String(_) => vec![8],
+        GgufValue::U64(_) => vec![10],
+        GgufValue::I64(_) => vec![11],
+        GgufValue::F64(_) => vec![12],
+        GgufValue::Array(a) => vec![
+            9,
+            match a {
+                GgufArray::U8(_) => 0,
+                GgufArray::I8(_) => 1,
+                GgufArray::U16(_) => 2,
+                GgufArray::I16(_) => 3,
+                GgufArray::U32(_) => 4,
+                GgufArray::I32(_) => 5,
+                GgufArray::F32(_) => 6,
+                GgufArray::Bool(_) => 7,
+                GgufArray::String(_) => 8,
+                GgufArray::Array(_) => 9,
+                GgufArray::U64(_) => 10,
+                GgufArray::I64(_) => 11,
+                GgufArray::F64(_) => 12,
+            },
+        ],
+    }
+}
+
+fn compare(path: &Path, reference: &Value) -> GgufReader {
+    let reader = GgufReader::open(path).unwrap();
+    assert_eq!(json!(reader.header().version), reference["version"]);
+    assert_eq!(json!(reader.header().alignment), reference["alignment"]);
+    assert_eq!(json!(reader.header().data_offset), reference["data_offset"]);
+    let metadata = reference["metadata"].as_array().unwrap();
+    assert_eq!(reader.metadata().len(), metadata.len());
+    for ((key, value), expected) in reader.metadata().iter().zip(metadata) {
+        assert_eq!(key, expected["key"].as_str().unwrap());
+        assert_eq!(json!(type_ids(value)), expected["types"], "{key} type");
+        assert_eq!(value_json(value), expected["value"], "{key} value");
+    }
+    let tensors = reference["tensors"].as_array().unwrap();
+    assert_eq!(reader.tensors().len(), tensors.len());
+    for (t, expected) in reader.tensors().iter().zip(tensors) {
+        assert_eq!(t.name(), expected["name"].as_str().unwrap());
+        assert_eq!(
+            json!(t.ggml_type().id()),
+            expected["type"],
+            "{} type",
+            t.name()
+        );
+        assert_eq!(
+            json!(t.dimensions()),
+            expected["dimensions"],
+            "{} shape",
+            t.name()
+        );
+        assert_eq!(
+            json!(t.file_offset()),
+            expected["offset"],
+            "{} offset",
+            t.name()
+        );
+        assert_eq!(
+            t.relative_offset(),
+            t.file_offset() - reader.header().data_offset
+        );
+        assert_eq!(json!(t.byte_len()), expected["bytes"], "{} size", t.name());
+        let view = reader.read_view(t.name()).unwrap();
+        for sample in expected["samples"].as_array().unwrap() {
+            let offset = sample["offset"].as_u64().unwrap() as usize;
+            let bytes = sample["bytes"].as_array().unwrap();
+            assert_eq!(
+                json!(&view.bytes[offset..offset + bytes.len()]),
+                sample["bytes"],
+                "{} sample",
+                t.name()
+            );
+        }
+    }
+    let layouts = reference["layouts"].as_array().unwrap();
+    assert_eq!(GgmlType::ALL.len(), layouts.len());
+    for l in layouts {
+        let ty = GgmlType::from_id(l["id"].as_u64().unwrap() as u32).unwrap();
+        assert_eq!(ty.name(), l["name"].as_str().unwrap());
+        assert_eq!(json!(ty.layout().elements), l["elements"]);
+        assert_eq!(json!(ty.layout().bytes), l["bytes"]);
+    }
+    reader
+}
+
+#[test]
+fn gguf_upstream_fixture() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gguf");
+    let reference: Value =
+        serde_json::from_slice(&std::fs::read(base.join("reference.json")).unwrap()).unwrap();
+    compare(&base.join("reference.gguf"), &reference);
+}
+
+#[test]
+#[ignore = "set RUSTINFER_GGUF_REFERENCE to a manifest generated by fixtures/gguf/generate.py"]
+fn gguf_local_model() {
+    let path = PathBuf::from(
+        std::env::var_os("RUSTINFER_GGUF_REFERENCE").expect("RUSTINFER_GGUF_REFERENCE"),
+    );
+    let reference: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let model = Path::new(reference["file"].as_str().unwrap());
+    let reader = compare(model, &reference);
+    eprintln!("{}: {:?}", model.display(), reader.header());
+    for (key, value) in reader.metadata().iter() {
+        match value {
+            GgufValue::Array(a) => eprintln!("  {key}: array[{}]", a.len()),
+            GgufValue::String(s) if s.len() > 200 => {
+                eprintln!("  {key}: string[{} bytes]", s.len())
+            }
+            _ => eprintln!("  {key}: {value:?}"),
+        }
+    }
+    let mut parts = std::collections::BTreeMap::<String, (usize, u64)>::new();
+    let mut types = std::collections::BTreeMap::<&str, (usize, u64)>::new();
+    for t in reader.tensors() {
+        let name = t.name();
+        let part = if name.starts_with("blk.") {
+            name.split('.').nth(2).unwrap_or(name).to_string()
+        } else if name.starts_with("v.blk.") {
+            "vision.blocks".into()
+        } else {
+            name.to_string()
+        };
+        let entry = parts.entry(part).or_default();
+        entry.0 += 1;
+        entry.1 += t.byte_len();
+        let entry = types.entry(t.ggml_type().name()).or_default();
+        entry.0 += 1;
+        entry.1 += t.byte_len();
+    }
+    eprintln!("Types (count, bytes): {types:#?}\nParts (count, bytes): {parts:#?}");
+}

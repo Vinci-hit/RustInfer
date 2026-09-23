@@ -103,6 +103,35 @@ pub trait MathOps: Device {
         ))
     }
 
+    /// Encoded W[N,K], X[M,K] -> Y[M,N]; optional bias is added in FP32
+    /// before conversion to T. Implementations must honor tensor strides.
+    fn matmul_block_quant<T: Dtype>(
+        _scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        _weight: &crate::quantized::BlockQuantWeight<Self>,
+        _bias: Option<&Tensor<T, Self>>,
+        _output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            input.device().name(),
+            "matmul_block_quant",
+        ))
+    }
+
+    /// Gather and decode selected rows only. Invalid token IDs must fail
+    /// before writing output. Backends without a decoder return Unsupported.
+    fn embedding_block_quant<T: Dtype>(
+        _scope: &Self::Scope,
+        weight: &crate::quantized::BlockQuantWeight<Self>,
+        _indices: &Tensor<i32, Self>,
+        _output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        Err(OpError::unsupported(
+            weight.device().name(),
+            "embedding_block_quant",
+        ))
+    }
+
     fn rmsnorm<T: Dtype>(
         scope: &Self::Scope,
         input: &Tensor<T, Self>,

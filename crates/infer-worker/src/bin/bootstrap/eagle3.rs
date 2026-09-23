@@ -65,7 +65,7 @@ pub(super) fn load_execution(
         .build::<bf16, Cuda>(
             &draft_loader,
             target_dims,
-            &target.embed.table,
+            target.embed.require_dense().map_err(|e| e.to_string())?,
             max_seq_len,
             cuda,
         )

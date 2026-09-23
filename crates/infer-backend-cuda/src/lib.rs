@@ -5,6 +5,8 @@
 
 #[cfg(any(feature = "triton", feature = "tilelang", feature = "cute-dsl"))]
 mod aot;
+#[cfg(feature = "cute-dsl")]
+mod block_embedding;
 pub mod config;
 #[cfg(feature = "cute-dsl")]
 mod cute_dsl;
@@ -269,6 +271,15 @@ pub(crate) fn require_scope_tensor<T: Dtype>(
 }
 
 impl infer_core::ports::MathOps for Cuda {
+    #[cfg(feature = "cute-dsl")]
+    fn embedding_block_quant<T: Dtype>(
+        scope: &Self::Scope,
+        weight: &infer_core::quantized::BlockQuantWeight<Self>,
+        indices: &Tensor<i32, Self>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        block_embedding::embedding(scope, weight, indices, output)
+    }
     fn copy_tensor<T: Dtype>(
         scope: &Self::Scope,
         src: &Tensor<T, Self>,

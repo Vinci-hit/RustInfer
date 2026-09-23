@@ -138,6 +138,7 @@ fn main() {
             compile_aot_kernels(&root, &cuda_arch, "tilelang", "0.1.14");
         }
         if env::var_os("CARGO_FEATURE_CUTE_DSL").is_some() {
+            println!("cargo:rerun-if-changed=../infer-core/src/dtype/quant/codebooks.rs");
             compile_aot_kernels(&root, &cuda_arch, "cute_dsl", "4.7.1");
         }
         if env::var_os("CARGO_FEATURE_TRITON").is_some()

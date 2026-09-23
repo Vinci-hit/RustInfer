@@ -120,7 +120,7 @@ fn specforge() -> (Eagle3Checkpoint, Eagle3DraftHead<f32, Cpu>) {
     .unwrap();
     let target = target();
     let head = checkpoint
-        .build(&loader, target.dims(), &target.embed.table, 64, &Cpu)
+        .build(&loader, target.dims(), target.embed.require_dense().unwrap(), 64, &Cpu)
         .unwrap();
     (checkpoint, head)
 }
@@ -664,7 +664,7 @@ fn specforge_rejects_corrupt_maps_before_loading_a_head() {
         let reader = SafetensorsReader::open(&path).unwrap();
         let loader = WeightLoader::new(&reader);
         let checkpoint = Eagle3Checkpoint::parse(&raw, &loader).unwrap();
-        let result = checkpoint.build(&loader, model.dims(), &model.embed.table, 64, &Cpu);
+        let result = checkpoint.build(&loader, model.dims(), model.embed.require_dense().unwrap(), 64, &Cpu);
         assert!(result.is_err(), "corrupt {name} accepted");
     }
     std::fs::remove_file(path).unwrap();

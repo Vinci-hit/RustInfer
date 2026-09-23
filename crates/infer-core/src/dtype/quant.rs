@@ -1,3 +1,4 @@
+pub mod codebooks;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Granularity {
     PerTensor,
@@ -44,3 +45,5 @@ impl QuantScheme {
         }
     }
 }
+pub mod block;
+pub use block::{BlockLayout, BlockQuantFormat};

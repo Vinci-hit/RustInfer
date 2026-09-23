@@ -316,6 +316,8 @@ pub struct CudaConfig {
     pub(crate) tilelang: Option<crate::aot::AotKernels>,
     #[cfg(feature = "cute-dsl")]
     pub(crate) cute_dsl: Option<crate::aot::AotKernels>,
+    #[cfg(feature = "cute-dsl")]
+    pub(crate) block_embedding: Option<crate::block_embedding::EmbeddingKernels>,
     pub cudnn_handle: ffi::cudnnHandle_t,
 
     // ─── Bubble-free decode pipeline (copy streams + events) ─────────
@@ -447,6 +449,8 @@ impl CudaConfig {
             tilelang: None,
             #[cfg(feature = "cute-dsl")]
             cute_dsl: None,
+            #[cfg(feature = "cute-dsl")]
+            block_embedding: None,
             cudnn_handle,
             copy_in_stream,
             copy_out_stream,
@@ -482,6 +486,9 @@ impl CudaConfig {
         let config = {
             let mut config = config;
             config.cute_dsl = crate::cute_dsl::load(device_id)?;
+            if config.cute_dsl.is_some() {
+                config.block_embedding = Some(crate::block_embedding::EmbeddingKernels::load()?);
+            }
             config
         };
         Ok(config)

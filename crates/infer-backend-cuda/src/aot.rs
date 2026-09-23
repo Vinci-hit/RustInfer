@@ -45,7 +45,7 @@ pub(crate) struct KernelSpec {
     pub(crate) pointer_order: [usize; 3],
 }
 
-fn check(code: i32, operation: &str) -> OpResult<()> {
+pub(crate) fn check(code: i32, operation: &str) -> OpResult<()> {
     if code == 0 {
         return Ok(());
     }
@@ -66,6 +66,80 @@ fn check(code: i32, operation: &str) -> OpResult<()> {
     } else {
         OpError::Kernel(message)
     })
+}
+
+/// Owned driver module for a kernel with a separately checked ABI.
+/// Created eagerly in the owning context, before any graph capture.
+#[cfg(feature = "cute-dsl")]
+#[derive(Debug)]
+pub(crate) struct RawKernel {
+    module: *mut c_void,
+    function: *mut c_void,
+}
+
+#[cfg(feature = "cute-dsl")]
+impl RawKernel {
+    pub(crate) fn load(image: &'static [u8], name: &'static [u8]) -> OpResult<Self> {
+        let mut result = Self {
+            module: ptr::null_mut(),
+            function: ptr::null_mut(),
+        };
+        unsafe {
+            check(
+                cuModuleLoadData(&mut result.module, image.as_ptr().cast()),
+                "load embedding module",
+            )?;
+            check(
+                cuModuleGetFunction(&mut result.function, result.module, name.as_ptr().cast()),
+                "resolve embedding kernel",
+            )?;
+        }
+        Ok(result)
+    }
+
+    /// # Safety
+    /// `args` must match the compiled ABI; pointer arguments must refer to
+    /// in-bounds live device storage through completion on the current context.
+    pub(crate) unsafe fn launch(
+        &self,
+        grid: u32,
+        threads: u32,
+        stream: ffi::cudaStream_t,
+        args: &mut [*mut c_void],
+    ) -> OpResult<()> {
+        unsafe {
+            check(
+                cuLaunchKernel(
+                    self.function,
+                    grid,
+                    1,
+                    1,
+                    threads,
+                    1,
+                    1,
+                    0,
+                    stream.cast(),
+                    args.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "launch block embedding",
+            )
+        }
+    }
+}
+
+#[cfg(feature = "cute-dsl")]
+impl Drop for RawKernel {
+    fn drop(&mut self) {
+        if !self.module.is_null()
+            && let Err(error) = check(
+                unsafe { cuModuleUnload(self.module) },
+                "unload embedding module",
+            )
+        {
+            tracing::error!(?error, "Embedding AOT module teardown failed");
+        }
+    }
 }
 
 #[derive(Debug)]

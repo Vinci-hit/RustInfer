@@ -79,7 +79,7 @@ where
         )?
     } else {
         loader.vocab_parallel_linear_from_weight(
-            embed.table.clone(),
+            embed.require_dense()?.clone(),
             lm_head_bias,
             cfg.vocab_size,
             device,
@@ -389,7 +389,7 @@ where
     validate_global_geometry(&global, cfg)?;
 
     let dims = model_dims(cfg)?;
-    let global_device = <D as ExecDevice>::device_id(global.embed.table.device());
+    let global_device = <D as ExecDevice>::device_id(global.embed.device());
     let mut checked_blocks = Vec::with_capacity(blocks.len());
     for (layer_index, block) in blocks.into_iter().enumerate() {
         let Attention::Full(attention) = block.attention else {
@@ -447,12 +447,12 @@ where
     T: Dtype,
     D: LlmBackend,
 {
-    if global.embed.table.shape().as_slice() != [cfg.vocab_size, cfg.dim] {
+    if global.embed.shape().as_slice() != [cfg.vocab_size, cfg.dim] {
         return Err(OpError::Shape(format!(
             "qwen3_moe embedding must be [{},{}], got {:?}",
             cfg.vocab_size,
             cfg.dim,
-            global.embed.table.shape().as_slice()
+            global.embed.shape().as_slice()
         )));
     }
     if global.embed.parallelism().tp().size != 1 {
@@ -494,7 +494,7 @@ where
         )));
     }
 
-    let device_id = <D as ExecDevice>::device_id(global.embed.table.device());
+    let device_id = <D as ExecDevice>::device_id(global.embed.device());
     validate_tensor_device(&global.norm.weight, "final norm", device_id)?;
     validate_tensor_device(lm_head_weight, "LM-head weight", device_id)?;
     if let Some(bias) = &global.lm_head.proj.bias {
@@ -1453,7 +1453,7 @@ mod tests {
         let cfg = test_config();
         let global = load_global_weights::<bf16, Cpu>(&loader, &cfg, &Cpu).unwrap();
 
-        assert_eq!(global.embed.table.shape().as_slice(), [8, HIDDEN]);
+        assert_eq!(global.embed.shape().as_slice(), [8, HIDDEN]);
         assert_eq!(
             global
                 .norm

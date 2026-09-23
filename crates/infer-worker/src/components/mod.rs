@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod attention_core;
+pub mod block_quant_projection;
 pub mod decoder_block;
 pub mod eagle3;
 pub mod embed;

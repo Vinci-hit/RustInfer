@@ -182,7 +182,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
         )?
     } else {
         loader.vocab_parallel_linear_from_weight(
-            embed.table.clone(),
+            embed.require_dense()?.clone(),
             None,
             cfg.vocab_size,
             device,
@@ -562,7 +562,7 @@ mod tests {
             vec![0.25; 8]
         );
         assert_eq!(
-            model.decoder.embed.table.data_ptr(),
+            model.decoder.embed.require_dense().unwrap().data_ptr(),
             model
                 .decoder
                 .lm_head

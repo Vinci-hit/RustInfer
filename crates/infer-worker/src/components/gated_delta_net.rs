@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use super::linear::Linear;
+use super::linear::{Linear, LinearWeight};
 use super::norm::RmsNorm;
 use crate::domain::cache::{LinearDims, LinearLayerStateView};
 use crate::domain::component::Hidden;
@@ -70,12 +70,14 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
             ("z", &weights.in_proj_z, dims.value_dim(), dim),
             ("out", &weights.out_proj, dim, dims.value_dim()),
         ] {
-            let weight = linear
-                .weight
-                .as_dense()
-                .ok_or_else(|| OpError::unsupported("GatedDeltaNet", "quantized weights"))?;
-            if weight.shape().as_slice() != [rows, cols]
-                || !weight.is_contiguous()
+            let valid_weight = match &linear.weight {
+                LinearWeight::Dense(weight) => {
+                    weight.shape().as_slice() == [rows, cols] && weight.is_contiguous()
+                }
+                LinearWeight::BlockQuant(weight) => weight.shape() == [rows, cols],
+                _ => return Err(OpError::unsupported("GatedDeltaNet", "quantized weights")),
+            };
+            if !valid_weight
                 || linear
                     .bias
                     .as_ref()

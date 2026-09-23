@@ -1,9 +1,11 @@
 //! Infrastructure I/O — file-system adapters for loading weights.
 //!
 //! This sub-module isolates filesystem access from the rest of the worker.
-//! Only `models/loader.rs` (and the standalone llama3 demo bin) depend on
-//! it, via the `SafetensorsReader` port.
+//! Model loading currently uses `SafetensorsReader`; `GgufReader` exposes
+//! validated file metadata and encoded tensor bytes for future model adapters.
 
+pub mod gguf;
 pub mod safetensors;
 
+pub use gguf::GgufReader;
 pub use safetensors::SafetensorsReader;

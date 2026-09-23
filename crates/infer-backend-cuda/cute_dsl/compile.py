@@ -90,6 +90,8 @@ def compile_kernels(arch: str, out_dir: Path) -> None:
     lines.append("];")
     (out_dir / "cute_dsl_kernels.rs").write_text("\n".join(lines) + "\n")
     print(f"Compiled 3 CuTe DSL RMSNorm kernels for {arch} (30 shape entries)")
+    from compile_embedding import compile_embedding
+    compile_embedding(arch, out_dir)
 
 
 def main() -> None:

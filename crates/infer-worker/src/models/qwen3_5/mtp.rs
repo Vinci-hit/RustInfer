@@ -1,6 +1,5 @@
 //! Qwen3.5 MTP checkpoint convention. Loaded explicitly, never by base build.
 use super::*;
-use crate::components::Embed;
 use crate::components::mtp::MtpHead;
 use crate::domain::model::DecoderModel;
 
@@ -19,7 +18,7 @@ impl<T: Dtype, D: OpBackend + LlmBackend> Qwen3_5Model<T, D> {
         cfg: &LoadConfig,
         mtp: &MtpConfig,
     ) -> OpResult<MtpHead<T, D, Decoder<T, D>>> {
-        let device = self.decoder.embed.table.device();
+        let device = self.decoder.embed.device();
         if mtp.mtp_num_hidden_layers != 1
             || mtp.mtp_use_dedicated_embeddings
             || loader.tensor_parallel().size != 1
@@ -78,7 +77,7 @@ impl<T: Dtype, D: OpBackend + LlmBackend> Qwen3_5Model<T, D> {
             .as_dense()
             .ok_or_else(|| OpError::unsupported("Qwen3.5 MTP", "quantized shared LM head"))?;
         let decoder = Decoder::new(
-            Embed::new(embedding.table.clone()).with_parallelism(embedding.parallelism()),
+            embedding.shallow_clone(),
             vec![block],
             norm("mtp.norm.weight")?,
             LmHead {

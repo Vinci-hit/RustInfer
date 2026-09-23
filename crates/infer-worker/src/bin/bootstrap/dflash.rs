@@ -47,7 +47,7 @@ pub(super) fn load_execution(
         &loader,
         &cfg,
         target.dims(),
-        &target.embed.table,
+        target.embed.require_dense().map_err(|e| e.to_string())?,
         readout,
         max_seq_len,
         cuda,

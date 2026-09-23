@@ -51,7 +51,7 @@ fn qwen3_dflash_checkpoint() {
         &WeightLoader::new(&draft_reader),
         &cfg,
         dims,
-        &model.embed.table,
+        model.embed.require_dense().unwrap(),
         model.lm_head.proj.weight.as_dense().unwrap(),
         context,
         &cuda,

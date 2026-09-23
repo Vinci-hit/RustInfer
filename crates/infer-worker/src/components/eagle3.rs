@@ -104,7 +104,7 @@ impl<T: Dtype, D: LlmBackend> ConditionedDraft<T, D> for Eagle3DraftHead<T, D> {
         self.dims
     }
     fn device(&self) -> &D {
-        self.weights.embedding.table.device()
+        self.weights.embedding.device()
     }
     fn cache_layout(&self) -> &CacheLayout {
         &self.layout

@@ -48,7 +48,7 @@ fn qwen3_eagle3_checkpoint() {
     .unwrap();
     println!("Detected format: {:?}", checkpoint.format());
     let mut head = checkpoint
-        .build::<bf16, Cuda>(&loader, dims, &model.embed.table, n + 16, &cuda)
+        .build::<bf16, Cuda>(&loader, dims, model.embed.require_dense().unwrap(), n + 16, &cuda)
         .unwrap();
     head.prepare(n, 1).unwrap();
     let read = |name: &str| -> Vec<f32> {

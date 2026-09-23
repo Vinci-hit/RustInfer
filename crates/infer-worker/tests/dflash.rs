@@ -162,7 +162,7 @@ fn head() -> DFlashDraftHead<f32, Cpu> {
         &WeightLoader::new(&reader),
         &config(),
         target.dims(),
-        &target.embed.table,
+        target.embed.require_dense().unwrap(),
         target.lm_head.proj.weight.as_dense().unwrap(),
         64,
         &Cpu,

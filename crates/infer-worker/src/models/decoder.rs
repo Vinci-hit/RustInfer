@@ -406,7 +406,7 @@ pub fn build_dense_decoder<T: Dtype, D: OpBackend + LlmBackend>(
         // Tied checkpoint: clone only the Tensor handle. Embedding and LM head
         // retain the same rank-local storage rather than uploading a duplicate.
         loader.vocab_parallel_linear_from_weight(
-            embed.table.clone(),
+            embed.require_dense()?.clone(),
             lm_head_bias,
             cfg.vocab_size,
             device,

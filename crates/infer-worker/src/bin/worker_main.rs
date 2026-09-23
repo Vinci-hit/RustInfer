@@ -1403,7 +1403,7 @@ mod qwen35_checkpoint_tests {
         assert_eq!(model.cache_layout().num_full_layers(), 8);
         assert_eq!(model.cache_layout().linear_dims().len(), 24);
         assert_eq!(
-            model.decoder.embed.table.data_ptr(),
+            model.decoder.embed.require_dense().unwrap().data_ptr(),
             model
                 .decoder
                 .lm_head

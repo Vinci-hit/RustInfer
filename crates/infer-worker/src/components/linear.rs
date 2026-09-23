@@ -1,3 +1,4 @@
+use super::block_quant_projection::BlockQuantProjection;
 use crate::domain::dtype::quant::QuantScheme;
 use crate::domain::dtype::{Dtype, Fp8E4m3};
 use crate::domain::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
@@ -5,7 +6,7 @@ use crate::domain::ports::backend::LlmBackend;
 use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp};
 use crate::domain::tensor::Tensor;
 
-/// A linear layer's weight: dense, int4 group-quantized, or block-scaled FP8.
+/// A linear layer's weight: dense, AWQ, FP8, or encoded block matrices.
 ///
 /// Quantization is an *attribute of the weight*, not a separate layer type, so
 /// every `Linear` (attention qkv/o, lm_head, MLP gate/up/down) transparently
@@ -14,6 +15,9 @@ use crate::domain::tensor::Tensor;
 pub enum LinearWeight<T: Dtype, D: LlmBackend> {
     /// Dense `[N, K]` weight in the activation dtype `T`.
     Dense(Tensor<T, D>),
+    /// One or more encoded matrices concatenated along logical output rows.
+    /// Each segment is dispatched separately, preserving its encoding.
+    BlockQuant(BlockQuantProjection<D>),
     /// compressed-tensors `pack-quantized` (llm-compressor AWQ W4A16):
     ///   - `packed`: `[N, K/8]` int32 — 8 int4 per word, sequential along K
     ///   - `zeros`:  `[N/8, K/group]` int32 — zero points packed along N
@@ -77,6 +81,7 @@ impl<T: Dtype, D: LlmBackend> LinearWeight<T, D> {
     pub fn out_features(&self) -> usize {
         match self {
             LinearWeight::Dense(w) => w.shape().as_slice()[0],
+            LinearWeight::BlockQuant(w) => w.shape()[0],
             LinearWeight::Awq { packed, .. } => packed.shape().as_slice()[0],
             LinearWeight::Fp8Block { weight, .. } => weight.shape().as_slice()[0],
         }
@@ -88,8 +93,28 @@ impl<T: Dtype, D: LlmBackend> LinearWeight<T, D> {
     pub fn as_dense(&self) -> Option<&Tensor<T, D>> {
         match self {
             LinearWeight::Dense(w) => Some(w),
-            LinearWeight::Awq { .. } | LinearWeight::Fp8Block { .. } => None,
+            LinearWeight::Awq { .. }
+            | LinearWeight::Fp8Block { .. }
+            | LinearWeight::BlockQuant(_) => None,
         }
+    }
+
+    /// Logical matrix dimensions independent of the physical encoding.
+    pub fn logical_shape(&self) -> OpResult<[usize; 2]> {
+        let (shape, factor) = match self {
+            Self::BlockQuant(w) => return Ok(w.shape()),
+            Self::Dense(w) => (w.shape().as_slice(), 1),
+            Self::Fp8Block { weight, .. } => (weight.shape().as_slice(), 1),
+            Self::Awq { packed, .. } => (packed.shape().as_slice(), 8),
+        };
+        let [n, k] = shape else {
+            return Err(OpError::Shape("linear weight must be rank 2".into()));
+        };
+        Ok([
+            *n,
+            k.checked_mul(factor)
+                .ok_or_else(|| OpError::Shape("linear input width overflow".into()))?,
+        ])
     }
 }
 
@@ -198,6 +223,34 @@ impl<T: Dtype, D: LlmBackend> ExpertLinear<T, D> {
 }
 
 impl<T: Dtype, D: LlmBackend> Linear<T, D> {
+    pub fn from_block_quant(
+        weight: BlockQuantProjection<D>,
+        bias: Option<Tensor<T, D>>,
+    ) -> OpResult<Self> {
+        Self::validate_block_bias(&weight, bias.as_ref())?;
+        Ok(Self {
+            weight: LinearWeight::BlockQuant(weight),
+            bias,
+            parallelism: LinearParallelism::SINGLE,
+        })
+    }
+
+    fn validate_block_bias(
+        weight: &BlockQuantProjection<D>,
+        bias: Option<&Tensor<T, D>>,
+    ) -> OpResult<()> {
+        if let Some(b) = bias
+            && (b.shape().as_slice() != [weight.shape()[0]]
+                || !b.is_contiguous()
+                || <D as ExecDevice>::device_id(b.device())
+                    != <D as ExecDevice>::device_id(weight.device()))
+        {
+            return Err(OpError::Shape(
+                "block-quantized linear bias shape/device mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
     /// Full-precision linear from a dense `[N, K]` weight.
     pub fn new(weight: Tensor<T, D>, bias: Option<Tensor<T, D>>) -> Self {
         Self {
@@ -268,6 +321,56 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         output: &mut Tensor<T, D>,
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
+        if let LinearWeight::BlockQuant(weight) = &self.weight {
+            let tp = self.parallelism.tp();
+            if tp != (RankPair { rank: 0, size: 1 }) || ctx.scope().topology().tp != tp {
+                return Err(OpError::unsupported(
+                    "block-quantized linear",
+                    "tensor parallelism",
+                ));
+            }
+            Self::validate_block_bias(weight, self.bias.as_ref())?;
+            let [n, k] = weight.shape();
+            let shape = input.shape().as_slice();
+            if shape.len() != 2 || shape[1] != k || output.shape().as_slice() != [shape[0], n] {
+                return Err(OpError::Shape(
+                    "block-quantized linear input/output shape mismatch".into(),
+                ));
+            }
+            let device = <D as ExecDevice>::device_id(ctx.scope().device());
+            if [input.device(), output.device(), weight.device()]
+                .into_iter()
+                .any(|d| <D as ExecDevice>::device_id(d) != device)
+            {
+                return Err(OpError::Shape(
+                    "block-quantized linear device mismatch".into(),
+                ));
+            }
+            // Check the whole composition before any segment can write.
+            if std::sync::Arc::ptr_eq(input.storage(), output.storage())
+                || self
+                    .bias
+                    .as_ref()
+                    .is_some_and(|b| std::sync::Arc::ptr_eq(b.storage(), output.storage()))
+                || weight
+                    .parts()
+                    .any(|(_, p)| std::sync::Arc::ptr_eq(p.bytes().storage(), output.storage()))
+            {
+                return Err(OpError::Shape(
+                    "block-quantized linear output aliases a source".into(),
+                ));
+            }
+            for (range, part) in weight.parts() {
+                let mut dst = output.narrow(1, range.start, range.len())?;
+                let bias = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.narrow(0, range.start, range.len()))
+                    .transpose()?;
+                D::matmul_block_quant(ctx.scope(), input, part, bias.as_ref(), &mut dst)?;
+            }
+            return Ok(());
+        }
         self.validate_execution_context(ctx)?;
 
         match self.parallelism {
@@ -378,6 +481,12 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
         ctx: &StepCtx<'_, D>,
     ) -> OpResult<()> {
         match &self.weight {
+            LinearWeight::BlockQuant(_) => {
+                return Err(OpError::unsupported(
+                    input.device().name(),
+                    "block-quantized linear computation",
+                ));
+            }
             LinearWeight::Dense(w) => D::matmul(ctx.scope(), input, w, output)?,
             LinearWeight::Awq {
                 packed,
