@@ -2,7 +2,7 @@
 
 日期：2026-09-23。按用户要求，完成 CPU 后停止；CUDA 后续使用 CuTe DSL。
 
-后续进展：量化 GPU Embedding 见 [CuTe DSL Embedding](BLOCK_QUANT_CUDA_EMBEDDING.md)。下文保留 CPU 阶段的完成边界。
+后续进展：[CuTe DSL Embedding](BLOCK_QUANT_CUDA_EMBEDDING.md)、[单 token 量化 GEMV](BLOCK_QUANT_CUDA_GEMV.md) 和[多 token GEMM](BLOCK_QUANT_CUDA_GEMM.md) 已接入 GPU。下文保留 CPU 阶段的完成边界。
 
 ## 已实现
 

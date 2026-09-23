@@ -1,4 +1,4 @@
-//! Shared CUDA driver ownership and launch support for AOT RMSNorm kernels.
+//! Shared CUDA driver ownership and launch support for AOT kernels.
 
 use crate::ffi;
 use infer_core::ports::{OpError, OpResult};
@@ -87,11 +87,11 @@ impl RawKernel {
         unsafe {
             check(
                 cuModuleLoadData(&mut result.module, image.as_ptr().cast()),
-                "load embedding module",
+                "load block quant module",
             )?;
             check(
                 cuModuleGetFunction(&mut result.function, result.module, name.as_ptr().cast()),
-                "resolve embedding kernel",
+                "resolve block quant kernel",
             )?;
         }
         Ok(result)
@@ -122,7 +122,7 @@ impl RawKernel {
                     args.as_mut_ptr(),
                     ptr::null_mut(),
                 ),
-                "launch block embedding",
+                "launch block quant kernel",
             )
         }
     }
@@ -134,10 +134,10 @@ impl Drop for RawKernel {
         if !self.module.is_null()
             && let Err(error) = check(
                 unsafe { cuModuleUnload(self.module) },
-                "unload embedding module",
+                "unload block quant module",
             )
         {
-            tracing::error!(?error, "Embedding AOT module teardown failed");
+            tracing::error!(?error, "Block quant AOT module teardown failed");
         }
     }
 }

@@ -561,3 +561,33 @@ fn block_quant_local_cuda_embedding() {
         ids.len()
     );
 }
+
+#[cfg(feature = "cute-dsl")]
+#[path = "block_quant_weights/cuda_gemv.rs"]
+mod cuda_gemv;
+
+#[test]
+fn mixed_projection_rejects_cross_segment_output_overlap_before_writing() {
+    use infer_core::types::Strides;
+    let parts = vec![
+        fixture_weight(BlockQuantFormat::Q4_K, 2).0,
+        fixture_weight(BlockQuantFormat::Q5_K, 2).0,
+    ];
+    let linear =
+        Linear::from_block_quant(BlockQuantProjection::try_new(parts).unwrap(), None).unwrap();
+    let x = Tensor::from_host_slice(&vec![1.0f32; 512], [2, 256], &Cpu).unwrap();
+    let storage = Tensor::from_host_slice(&[123.0f32; 8], [8], &Cpu).unwrap();
+    let mut output = storage.view_raw([2, 4].into(), Strides::from_slice(&[2, 1]), 0, false);
+    let scope = HostScope::new(Cpu);
+    let p = plan();
+    let ctx = StepCtx::new(&scope, &p);
+    assert!(matches!(
+        linear.forward(&x, &mut output, &ctx),
+        Err(OpError::Shape(_))
+    ));
+    assert_eq!(storage.to_host_vec().unwrap(), [123.0; 8]);
+}
+
+#[cfg(feature = "cute-dsl")]
+#[path = "block_quant_weights/cuda_gemm.rs"]
+mod cuda_gemm;

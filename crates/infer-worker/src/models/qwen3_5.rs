@@ -1,5 +1,6 @@
 //! Qwen3.5 hybrid decoder with an optional vision encoder.
 
+pub mod gguf;
 pub mod mtp;
 pub mod vision;
 

@@ -346,6 +346,18 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
                     "block-quantized linear device mismatch".into(),
                 ));
             }
+            // Validate the full output: individual projection slices can each
+            // be disjoint while different slices still overlap across tokens.
+            if !infer_core::types::matrix_elements_are_disjoint(
+                shape[0],
+                n,
+                output.strides().as_slice()[0],
+                output.strides().as_slice()[1],
+            ) {
+                return Err(OpError::Shape(
+                    "block-quantized linear output elements overlap".into(),
+                ));
+            }
             // Check the whole composition before any segment can write.
             if std::sync::Arc::ptr_eq(input.storage(), output.storage())
                 || self

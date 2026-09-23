@@ -39,6 +39,10 @@ pub(crate) struct EmbeddingKernels {
 }
 
 impl EmbeddingKernels {
+    pub(crate) fn tables_ptr(&self) -> *mut c_void {
+        self.tables.0
+    }
+
     /// Called only when the context's CuTe AOT target matches the current GPU.
     pub(crate) fn load() -> OpResult<Self> {
         let kernels = SPECS
@@ -73,27 +77,6 @@ impl EmbeddingKernels {
 fn int64(v: usize) -> OpResult<i64> {
     i64::try_from(v)
         .map_err(|_| OpError::Shape("block embedding dimension/stride exceeds i64".into()))
-}
-
-// Reject output layouts whose logical elements overlap, including broadcast
-// strides. Transposes and padded row/column strides remain supported.
-fn disjoint_elements(rows: usize, cols: usize, s0: usize, s1: usize) -> bool {
-    if rows == 0 || cols == 0 {
-        return true;
-    }
-    if (rows > 1 && s0 == 0) || (cols > 1 && s1 == 0) {
-        return false;
-    }
-    if rows <= 1 || cols <= 1 {
-        return true;
-    }
-    let (mut a, mut b) = (s0, s1);
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    s1 / a >= rows || s0 / a >= cols
 }
 
 pub(crate) fn embedding<T: Dtype>(
@@ -135,7 +118,7 @@ pub(crate) fn embedding<T: Dtype>(
         ));
     }
     let strides = output.strides().as_slice();
-    if !disjoint_elements(ids.numel(), cols, strides[0], strides[1]) {
+    if !infer_core::types::matrix_elements_are_disjoint(ids.numel(), cols, strides[0], strides[1]) {
         return Err(OpError::Shape(
             "block embedding output elements overlap".into(),
         ));

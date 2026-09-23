@@ -1,0 +1,587 @@
+{
+  "profile_source": "https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/tokenization_qwen3_5.py",
+  "pattern": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+  "tokenizers_version": "0.22.2",
+  "jinja2_version": "3.1.6",
+  "hf_tokenizer_sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+  "chat_template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+  "encodings": [
+    {
+      "text": "Hello!",
+      "ids": [
+        9419,
+        0
+      ],
+      "decoded": "Hello!"
+    },
+    {
+      "text": "你好，请用一句话介绍自己。",
+      "ids": [
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710
+      ],
+      "decoded": "你好，请用一句话介绍自己。"
+    },
+    {
+      "text": " Hello  world\t\r\n\n  ",
+      "ids": [
+        21251,
+        220,
+        1814,
+        197,
+        78035,
+        256
+      ],
+      "decoded": " Hello  world\t\r\n\n  "
+    },
+    {
+      "text": "I'm I'M we're can't won't I'd",
+      "ids": [
+        40,
+        2688,
+        353,
+        26708,
+        567,
+        2224,
+        628,
+        914,
+        2677,
+        914,
+        353,
+        4035
+      ],
+      "decoded": "I'm I'M we're can't won't I'd"
+    },
+    {
+      "text": "1234567890 3.1415926 -42 1e10",
+      "ids": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        15,
+        220,
+        18,
+        13,
+        16,
+        19,
+        16,
+        20,
+        24,
+        17,
+        21,
+        471,
+        19,
+        17,
+        220,
+        16,
+        68,
+        16,
+        15
+      ],
+      "decoded": "1234567890 3.1415926 -42 1e10"
+    },
+    {
+      "text": "café café a͜b हिन्दी العربية",
+      "ids": [
+        895,
+        56868,
+        50203,
+        264,
+        137,
+        250,
+        65,
+        190488,
+        150127,
+        177453,
+        171405
+      ],
+      "decoded": "café café a͜b हिन्दी العربية"
+    },
+    {
+      "text": "🙂👩🏽‍💻🚀🇨🇳",
+      "ids": [
+        169171,
+        9008,
+        239,
+        102,
+        9008,
+        237,
+        121,
+        373,
+        235,
+        88995,
+        119,
+        9008,
+        248,
+        222,
+        9008,
+        229,
+        101,
+        9008,
+        229,
+        111
+      ],
+      "decoded": "🙂👩🏽‍💻🚀🇨🇳"
+    },
+    {
+      "text": "a\u0000b",
+      "ids": [
+        64,
+        188,
+        65
+      ],
+      "decoded": "a\u0000b"
+    },
+    {
+      "text": "def f(x):\n    return x + 1\n",
+      "ids": [
+        727,
+        281,
+        2007,
+        1590,
+        198,
+        262,
+        460,
+        830,
+        478,
+        220,
+        16,
+        198
+      ],
+      "decoded": "def f(x):\n    return x + 1\n"
+    },
+    {
+      "text": "<|im_start|>user\nHello!<|im_end|>\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        9419,
+        0,
+        248046,
+        198
+      ],
+      "decoded": "<|im_start|>user\nHello!<|im_end|>\n"
+    },
+    {
+      "text": "<think>分析</think>\n\n答案<|im_end|>",
+      "ids": [
+        248068,
+        96847,
+        248069,
+        271,
+        97632,
+        248046
+      ],
+      "decoded": "<think>分析</think>\n\n答案<|im_end|>"
+    },
+    {
+      "text": "<tool_call>{}</tool_call>",
+      "ids": [
+        248058,
+        6061,
+        248059
+      ],
+      "decoded": "<tool_call>{}</tool_call>"
+    }
+  ],
+  "chats": [
+    {
+      "name": "no_thinking",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": false,
+      "effort": null,
+      "rendered": "<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ]
+    },
+    {
+      "name": "default_thinking",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": true,
+      "effort": null,
+      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [
+        248045,
+        8678,
+        198,
+        24342,
+        286,
+        4879,
+        369,
+        716,
+        310,
+        830,
+        11553,
+        13,
+        5044,
+        1683,
+        15060,
+        1472,
+        279,
+        3274,
+        11,
+        9307,
+        1328,
+        30800,
+        11,
+        2814,
+        47675,
+        25605,
+        11,
+        321,
+        60445,
+        55404,
+        11,
+        27224,
+        11,
+        321,
+        30246,
+        303,
+        279,
+        1534,
+        4087,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        198
+      ]
+    },
+    {
+      "name": "low_effort",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": true,
+      "effort": "low",
+      "rendered": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [
+        248045,
+        8678,
+        198,
+        24342,
+        286,
+        4879,
+        369,
+        716,
+        310,
+        3238,
+        13,
+        13262,
+        678,
+        7047,
+        9522,
+        321,
+        10419,
+        11,
+        6992,
+        5774,
+        310,
+        279,
+        16198,
+        1973,
+        24366,
+        24150,
+        362,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        198
+      ]
+    },
+    {
+      "name": "medium_effort",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": true,
+      "effort": "medium",
+      "rendered": "<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        198
+      ]
+    },
+    {
+      "name": "high_alias",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": true,
+      "effort": "high",
+      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [
+        248045,
+        8678,
+        198,
+        24342,
+        286,
+        4879,
+        369,
+        716,
+        310,
+        830,
+        11553,
+        13,
+        5044,
+        1683,
+        15060,
+        1472,
+        279,
+        3274,
+        11,
+        9307,
+        1328,
+        30800,
+        11,
+        2814,
+        47675,
+        25605,
+        11,
+        321,
+        60445,
+        55404,
+        11,
+        27224,
+        11,
+        321,
+        30246,
+        303,
+        279,
+        1534,
+        4087,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        198
+      ]
+    },
+    {
+      "name": "merged_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  简洁回答。 "
+        },
+        {
+          "role": "developer",
+          "content": "用中文。"
+        },
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": false,
+      "effort": null,
+      "rendered": "<|im_start|>system\n简洁回答。\n用中文。<|im_end|>\n<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [
+        248045,
+        8678,
+        198,
+        110123,
+        97913,
+        1710,
+        198,
+        95826,
+        99986,
+        1710,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ]
+    },
+    {
+      "name": "history",
+      "messages": [
+        {
+          "role": "user",
+          "content": "1+1?"
+        },
+        {
+          "role": "assistant",
+          "content": "2",
+          "reasoning_content": "addition"
+        },
+        {
+          "role": "user",
+          "content": "你好，请用一句话介绍自己。"
+        }
+      ],
+      "thinking": true,
+      "effort": "medium",
+      "rendered": "<|im_start|>user\n1+1?<|im_end|>\n<|im_start|>assistant\n<think>\naddition\n</think>\n\n2<|im_end|>\n<|im_start|>user\n你好，请用一句话介绍自己。<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        16,
+        10,
+        16,
+        30,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        198,
+        698,
+        662,
+        198,
+        248069,
+        271,
+        17,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        139054,
+        110827,
+        97431,
+        96115,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        198
+      ]
+    }
+  ]
+}

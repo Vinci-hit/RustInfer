@@ -1,6 +1,6 @@
 # CuTe DSL 块量化 Embedding
 
-本阶段只实现 GPU Embedding；量化 GEMV/GEMM 尚未接通。
+本文记录 GPU Embedding 阶段。后续已接通单 token 的[量化 GEMV](BLOCK_QUANT_CUDA_GEMV.md)；[多 token GEMM](BLOCK_QUANT_CUDA_GEMM.md) 也已接通。
 
 ## 调用路径
 

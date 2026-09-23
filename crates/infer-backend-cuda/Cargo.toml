@@ -16,7 +16,7 @@ default = []
 triton = []
 # Compile TileLang kernels ahead of time; takes precedence over Triton.
 tilelang = []
-# Optional CuTe DSL AOT RMSNorm and block-quantized Embedding kernels.
+# Optional CuTe DSL AOT RMSNorm, block-quantized Embedding and GEMV/GEMM kernels.
 cute-dsl = []
 
 [dev-dependencies]

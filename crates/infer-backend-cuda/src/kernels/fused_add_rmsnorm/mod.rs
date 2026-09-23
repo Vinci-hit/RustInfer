@@ -2,8 +2,8 @@
 //! residual += input; output = rmsnorm(residual, weight, eps)
 //!
 //! Dispatch is an attribute of the element type: [`FusedAddRmsNormKernel`] is
-//! implemented once per supported dtype and names that dtype's `extern "C"`
-//! entry point, so [`fused_add_rmsnorm`] is generic with no runtime `match`.
+//! implemented once per supported dtype. BF16/F16 use fused entry points;
+//! FP32 composes existing add and RMSNorm operators.
 //! Adding a dtype is one `impl`; an unsupported dtype fails to compile.
 
 use crate::Cuda;
@@ -33,100 +33,67 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     );
-    fn fused_add_rmsnorm_kernel_cu_fp32(
-        output: *mut f32,
-        residual: *mut f32,
-        input: *const f32,
-        weight: *const f32,
-        rows: i32,
-        dim: i32,
-        eps: f32,
-        stream: cudaStream_t,
-    );
 }
 
-/// Element types with a fused add+RMSNorm CUDA kernel. The method forwards to
-/// this dtype's `extern` entry; the wrapper below is generic over this trait, so
-/// the dtype→kernel mapping lives here as a type attribute.
-///
-/// # Safety
-/// Implementors' pointers must be valid device pointers for `rows * dim`
-/// elements on `stream`; this just names the FFI entry and performs no checks.
+/// Float dispatch for residual addition followed by RMSNorm. The FP32 path
+/// composes existing operators; no FP32 fused CUDA entry is compiled.
 pub trait FusedAddRmsNormKernel: CudaFloat {
-    /// `residual += input; output = rmsnorm(residual, weight, eps)`.
-    unsafe fn fused_add_rmsnorm(
-        output: *mut Self,
-        residual: *mut Self,
-        input: *const Self,
-        weight: *const Self,
-        rows: i32,
-        dim: i32,
-        eps: f32,
+    fn forward(
         stream: cudaStream_t,
-    );
+        output: &mut Tensor<Self, Cuda>,
+        residual: &mut Tensor<Self, Cuda>,
+        input: &Tensor<Self, Cuda>,
+        weight: &Tensor<Self, Cuda>,
+        eps: f32,
+    ) -> OpResult<()>;
 }
 
 impl FusedAddRmsNormKernel for f32 {
-    #[inline]
-    unsafe fn fused_add_rmsnorm(
-        output: *mut Self,
-        residual: *mut Self,
-        input: *const Self,
-        weight: *const Self,
-        rows: i32,
-        dim: i32,
-        eps: f32,
+    fn forward(
         stream: cudaStream_t,
-    ) {
-        unsafe {
-            fused_add_rmsnorm_kernel_cu_fp32(
-                output, residual, input, weight, rows, dim, eps, stream,
-            )
-        }
+        output: &mut Tensor<Self, Cuda>,
+        residual: &mut Tensor<Self, Cuda>,
+        input: &Tensor<Self, Cuda>,
+        weight: &Tensor<Self, Cuda>,
+        eps: f32,
+    ) -> OpResult<()> {
+        super::add::add_inplace(stream, residual, input)?;
+        super::rmsnorm::rmsnorm(stream, residual, weight, output, eps)
     }
 }
 
-impl FusedAddRmsNormKernel for half::bf16 {
-    #[inline]
-    unsafe fn fused_add_rmsnorm(
-        output: *mut Self,
-        residual: *mut Self,
-        input: *const Self,
-        weight: *const Self,
-        rows: i32,
-        dim: i32,
-        eps: f32,
-        stream: cudaStream_t,
-    ) {
-        unsafe {
-            fused_add_rmsnorm_kernel_cu_bf16(
-                output, residual, input, weight, rows, dim, eps, stream,
-            )
+macro_rules! fused {
+    ($ty:ty, $entry:ident) => {
+        impl FusedAddRmsNormKernel for $ty {
+            fn forward(
+                stream: cudaStream_t,
+                output: &mut Tensor<Self, Cuda>,
+                residual: &mut Tensor<Self, Cuda>,
+                input: &Tensor<Self, Cuda>,
+                weight: &Tensor<Self, Cuda>,
+                eps: f32,
+            ) -> OpResult<()> {
+                unsafe {
+                    $entry(
+                        output.data_ptr_mut(),
+                        residual.data_ptr_mut(),
+                        input.data_ptr(),
+                        weight.data_ptr(),
+                        (input.numel() / weight.numel()) as i32,
+                        weight.numel() as i32,
+                        eps,
+                        stream,
+                    );
+                }
+                Ok(())
+            }
         }
-    }
+    };
 }
+fused!(half::bf16, fused_add_rmsnorm_kernel_cu_bf16);
+fused!(half::f16, fused_add_rmsnorm_kernel_cu_fp16);
 
-impl FusedAddRmsNormKernel for half::f16 {
-    #[inline]
-    unsafe fn fused_add_rmsnorm(
-        output: *mut Self,
-        residual: *mut Self,
-        input: *const Self,
-        weight: *const Self,
-        rows: i32,
-        dim: i32,
-        eps: f32,
-        stream: cudaStream_t,
-    ) {
-        unsafe {
-            fused_add_rmsnorm_kernel_cu_fp16(
-                output, residual, input, weight, rows, dim, eps, stream,
-            )
-        }
-    }
-}
-
-/// Fused: residual += input; output = rmsnorm(residual, weight, eps)
+/// Fused: residual += input; output = rmsnorm(residual, weight, eps).
 pub fn fused_add_rmsnorm<T: FusedAddRmsNormKernel>(
     stream: cudaStream_t,
     output: &mut Tensor<T, Cuda>,
@@ -135,19 +102,5 @@ pub fn fused_add_rmsnorm<T: FusedAddRmsNormKernel>(
     weight: &Tensor<T, Cuda>,
     eps: f32,
 ) -> OpResult<()> {
-    let dim = weight.numel();
-    let rows = (input.numel() / dim) as i32;
-    unsafe {
-        T::fused_add_rmsnorm(
-            output.data_ptr_mut(),
-            residual.data_ptr_mut(),
-            input.data_ptr(),
-            weight.data_ptr(),
-            rows,
-            dim as i32,
-            eps,
-            stream,
-        );
-    }
-    Ok(())
+    T::forward(stream, output, residual, input, weight, eps)
 }

@@ -7,6 +7,8 @@
 mod aot;
 #[cfg(feature = "cute-dsl")]
 mod block_embedding;
+#[cfg(feature = "cute-dsl")]
+mod block_matmul;
 pub mod config;
 #[cfg(feature = "cute-dsl")]
 mod cute_dsl;
@@ -271,6 +273,17 @@ pub(crate) fn require_scope_tensor<T: Dtype>(
 }
 
 impl infer_core::ports::MathOps for Cuda {
+    #[cfg(feature = "cute-dsl")]
+    fn matmul_block_quant<T: Dtype>(
+        scope: &Self::Scope,
+        input: &Tensor<T, Self>,
+        weight: &infer_core::quantized::BlockQuantWeight<Self>,
+        bias: Option<&Tensor<T, Self>>,
+        output: &mut Tensor<T, Self>,
+    ) -> OpResult<()> {
+        block_matmul::matmul(scope, input, weight, bias, output)
+    }
+
     #[cfg(feature = "cute-dsl")]
     fn embedding_block_quant<T: Dtype>(
         scope: &Self::Scope,

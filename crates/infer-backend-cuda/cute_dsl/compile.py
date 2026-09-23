@@ -92,6 +92,10 @@ def compile_kernels(arch: str, out_dir: Path) -> None:
     print(f"Compiled 3 CuTe DSL RMSNorm kernels for {arch} (30 shape entries)")
     from compile_embedding import compile_embedding
     compile_embedding(arch, out_dir)
+    from compile_gemv import compile_gemv
+    compile_gemv(arch, out_dir)
+    from compile_gemm import compile_gemm
+    compile_gemm(arch, out_dir)
 
 
 def main() -> None:

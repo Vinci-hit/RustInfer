@@ -373,3 +373,57 @@ pub trait Float: Dtype {}
 impl Float for f32 {}
 impl Float for f16 {}
 impl Float for bf16 {}
+
+/// Whether distinct matrix indices address distinct elements. Empty matrices,
+/// transposes and padded layouts are allowed; broadcast outputs are rejected.
+/// For positive strides, the minimal collision has row distance s1/gcd(s0,s1)
+/// and column distance s0/gcd(s0,s1). No extent/stride multiplication is needed.
+pub fn matrix_elements_are_disjoint(rows: usize, cols: usize, s0: usize, s1: usize) -> bool {
+    if rows == 0 || cols == 0 {
+        return true;
+    }
+    if (rows > 1 && s0 == 0) || (cols > 1 && s1 == 0) {
+        return false;
+    }
+    if rows <= 1 || cols <= 1 {
+        return true;
+    }
+    let (mut a, mut b) = (s0, s1);
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    s1 / a >= rows || s0 / a >= cols
+}
+
+#[cfg(test)]
+mod matrix_layout_tests {
+    use super::matrix_elements_are_disjoint;
+    #[test]
+    fn disjoint_layout_matches_exhaustive_address_check() {
+        for rows in 0..7 {
+            for cols in 0..7 {
+                for s0 in 0..9 {
+                    for s1 in 0..9 {
+                        let mut addresses = std::collections::HashSet::new();
+                        let expected =
+                            (0..rows).all(|r| (0..cols).all(|c| addresses.insert(r * s0 + c * s1)));
+                        assert_eq!(
+                            matrix_elements_are_disjoint(rows, cols, s0, s1),
+                            expected,
+                            "shape=[{rows},{cols}], stride=[{s0},{s1}]"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(matrix_elements_are_disjoint(
+            2,
+            2,
+            usize::MAX,
+            usize::MAX - 1
+        ));
+        assert!(!matrix_elements_are_disjoint(2, 2, usize::MAX, usize::MAX));
+    }
+}

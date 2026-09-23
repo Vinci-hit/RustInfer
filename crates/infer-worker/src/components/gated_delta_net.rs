@@ -35,6 +35,7 @@ pub struct GatedDeltaNet<T: Dtype, D: LlmBackend> {
     dims: LinearDims,
     dim: usize,
     scratch: Option<Rc<GdnScratch<T, D>>>,
+    tiled_value_heads: bool,
 }
 
 impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
@@ -119,7 +120,17 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
             dims,
             dim,
             scratch: None,
+            tiled_value_heads: false,
         })
+    }
+
+    /// GGUF qwen35 stores all value-head weights, convolution channels and
+    /// output-projection columns in tiled order: k0,k1,...,k0,k1,... . Keep
+    /// those compressed weights intact and tile Q/K activations at execution.
+    pub fn new_tiled_value_heads(weights: GdnWeights<T, D>, dims: LinearDims) -> OpResult<Self> {
+        let mut result = Self::new(weights, dims)?;
+        result.tiled_value_heads = true;
+        Ok(result)
     }
 
     pub fn dims(&self) -> LinearDims {
@@ -233,10 +244,22 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
             2 * key,
             value,
         )?;
+        // The existing delta primitive maps value heads to Q/K by grouped
+        // repetition. Equal head counts make that mapping 1:1. For a tiled
+        // checkpoint explicitly repeat Q/K [k0,k1,...] to the value width;
+        // all weights and recurrent state retain their original tiled order.
+        // This correctness path uses existing concat kernels on CPU/CUDA.
+        let repeats = if self.tiled_value_heads {
+            self.dims.num_value_heads / self.dims.num_key_heads
+        } else {
+            1
+        };
+        let tiled_q = repeat_head_columns::<T, D>(&buf.q, repeats, ctx.scope())?;
+        let tiled_k = repeat_head_columns::<T, D>(&buf.k, repeats, ctx.scope())?;
         D::gated_delta_rule(
             ctx.scope(),
-            &buf.q,
-            &buf.k,
+            tiled_q.last().unwrap_or(&buf.q),
+            tiled_k.last().unwrap_or(&buf.k),
             &buf.v,
             &buf.a,
             &buf.b,
@@ -264,4 +287,24 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
         hidden.pending = Some(buf.out);
         Ok(())
     }
+}
+
+// Retain intermediate allocations through the caller's final use, including
+// on asynchronous backends. The ordinary HF path allocates nothing here.
+fn repeat_head_columns<T: Dtype, D: LlmBackend>(
+    input: &Tensor<T, D>,
+    repeats: usize,
+    scope: &D::Scope,
+) -> OpResult<Vec<Tensor<T, D>>> {
+    let shape = input.shape().as_slice();
+    let mut copies = Vec::new();
+    for n in 2..=repeats {
+        let cols = shape[1]
+            .checked_mul(n)
+            .ok_or_else(|| OpError::Shape("tiled GDN Q/K width overflow".into()))?;
+        let mut dst = Tensor::zeros([shape[0], cols], input.device())?;
+        D::concat_cols(scope, copies.last().unwrap_or(input), input, &mut dst)?;
+        copies.push(dst);
+    }
+    Ok(copies)
 }
