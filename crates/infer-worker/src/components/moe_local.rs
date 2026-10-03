@@ -2,11 +2,11 @@ use crate::components::moe_combine::{MoeCombineScratch, MoeCombiner};
 use crate::components::moe_experts::{MoeExpertScratch, MoeExperts};
 use crate::components::moe_permute::{MoeRoutePlan, MoeTokenPermuter};
 use crate::components::moe_router::MoeRouter;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::{DeviceId, ExecDevice, ExecScope, StepCtx};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::{DeviceId, ExecDevice, ExecScope, StepCtx};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 /// Address-stable storage for one fixed-size local MoE invocation.
 ///
@@ -322,9 +322,9 @@ fn validate_tensor<T: Dtype, D: LlmBackend>(
 mod tests {
     use super::*;
     use crate::components::{ExpertLinear, Linear};
-    use crate::domain::exec::{HostScope, StepCtx};
-    use crate::domain::plan::{BatchKind, BatchPlan};
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::exec::{HostScope, StepCtx};
+    use infer_core::plan::{BatchKind, BatchPlan};
 
     fn decode_plan(tokens: usize) -> BatchPlan {
         BatchPlan {

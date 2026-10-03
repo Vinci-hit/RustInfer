@@ -2,13 +2,12 @@
 use super::DraftProposer;
 use crate::application::execution::{ExecutionMetrics, ExecutionPlan, Phase, WorkspaceUse};
 use crate::domain::{
-    cache::ModelCacheView,
-    draft::BlockDraft,
-    draft_scratch::DraftWorkspace,
+    cache::ModelCacheView, draft::BlockDraft, draft_scratch::DraftWorkspace, model::ModelDims,
+};
+use infer_core::{
     dtype::Dtype,
     exec::{ExecScope, StepCtx},
     kv::{KvQuantTier, PagedKvLayer, PagedKvPool},
-    model::ModelDims,
     plan::{BatchKind, MaskMode},
     ports::{OpError, OpResult, backend::LlmBackend},
     tensor::Tensor,
@@ -252,12 +251,9 @@ impl<T: Dtype, D: LlmBackend, H: BlockDraft<T, D>> DraftProposer<T, D> for Block
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{
-        cache::{CacheLayout, LayerCacheSpec, LayerCacheView},
-        exec::HostScope,
-        ports::FusedOps,
-    };
+    use crate::domain::cache::{CacheLayout, LayerCacheSpec, LayerCacheView};
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::{exec::HostScope, ports::FusedOps};
     use std::{cell::Cell, rc::Rc};
 
     struct FailingHead {

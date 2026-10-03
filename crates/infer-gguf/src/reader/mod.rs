@@ -176,7 +176,7 @@ impl GgufReader {
     ///
     /// A view cannot outlive its reader:
     /// ```compile_fail
-    /// use infer_worker::infrastructure::io::gguf::GgufReader;
+    /// use infer_gguf::GgufReader;
     /// let reader = GgufReader::open("model.gguf").unwrap();
     /// let view = reader.read_view("output.weight").unwrap();
     /// drop(reader);

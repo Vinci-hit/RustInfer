@@ -3,6 +3,12 @@
 
 use std::collections::HashMap;
 
+use infer_core::component::{Hidden, LayerRange};
+use infer_core::exec::{HostScope, StepCtx};
+use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+use infer_core::plan::{BatchKind, BatchPlan, MaskMode};
+use infer_core::ports::OpResult;
+use infer_core::tensor::Tensor;
 use infer_worker::application::runtime::Runtime;
 use infer_worker::application::sampler_stack::GreedySampler;
 use infer_worker::components::{
@@ -13,15 +19,10 @@ use infer_worker::domain::cache::{
     CacheLayout, LayerCacheId, LayerCacheSpec, LinearBatch, LinearDims, LinearLayerState,
     ModelCacheView,
 };
-use infer_worker::domain::component::{Hidden, LayerRange};
-use infer_worker::domain::exec::{HostScope, StepCtx};
 use infer_worker::domain::forward_scratch::ForwardScratch;
 use infer_worker::domain::gdn_scratch::GdnScratch;
-use infer_worker::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use infer_worker::domain::model::{DecoderModel, ModelDims};
-use infer_worker::domain::plan::{BatchKind, BatchPlan, MaskMode, StepOutput, StepRequest};
-use infer_worker::domain::ports::OpResult;
-use infer_worker::domain::tensor::Tensor;
+use infer_worker::domain::plan::{StepOutput, StepRequest};
 use infer_worker::infrastructure::cpu::Cpu;
 use infer_worker::models::decoder::Decoder;
 
@@ -711,8 +712,8 @@ fn hybrid_verification_eos_and_reordered_ragged_requests_commit_only_retained_hi
 
 #[test]
 fn failed_recurrent_replay_invalidates_the_request_until_reprefill() {
+    use infer_core::ports::OpError;
     use infer_worker::domain::model::{Logits, SampleRows};
-    use infer_worker::domain::ports::OpError;
     use std::cell::Cell;
     struct FailReplay {
         decoder: Decoder<f32, Cpu>,
@@ -726,7 +727,7 @@ fn failed_recurrent_replay_invalidates_the_request_until_reprefill() {
         fn cache_layout(&self) -> &CacheLayout {
             self.decoder.cache_layout()
         }
-        fn stages(&self) -> &[infer_worker::domain::component::StageKind] {
+        fn stages(&self) -> &[infer_core::component::StageKind] {
             self.decoder.stages()
         }
         fn install_scratch(&mut self, s: std::rc::Rc<ForwardScratch<f32, Cpu>>) {
@@ -1230,7 +1231,7 @@ fn runtime_hybrid_decode_collection_failure_invalidates_only_its_owners() {
 /// causal GQA, then sigmoid gating before an identity output projection.
 #[test]
 fn full_attention_partial_rope_and_gate_match_scalar_reference() {
-    use infer_worker::domain::component::Component;
+    use infer_core::component::Component;
     let input = [
         [0.2, 0.4, -0.3, 0.7, 0.9, -0.1, 0.5, 0.8],
         [0.8, -0.2, 0.6, 0.1, -0.4, 0.3, 0.7, -0.9],

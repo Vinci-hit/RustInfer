@@ -1,13 +1,13 @@
 //! Offline GGUF inspection, text tokenization and single-sequence inference.
 use anyhow::{Result, ensure};
 use clap::{Parser, ValueEnum};
+use infer_core::{
+    dtype::Dtype,
+    exec::{ExecScope, HostScope},
+    ports::backend::LlmBackend,
+};
 use infer_worker::{
-    domain::{
-        dtype::Dtype,
-        exec::{ExecScope, HostScope},
-        model::DecoderModel,
-        ports::backend::LlmBackend,
-    },
+    domain::model::DecoderModel,
     infrastructure::{
         cpu::Cpu,
         io::gguf::{GgufArray, GgufReader, GgufValue},
@@ -75,53 +75,6 @@ struct Args {
     dump: Option<PathBuf>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn text_input_flags_are_exclusive_and_chat_flags_require_chat() {
-        for flags in [
-            vec!["--prompt", "hello", "--raw-prompt", "hello"],
-            vec!["--prompt", "hello", "--token-ids", "1"],
-            vec!["--raw-prompt", "hello", "--token-ids", "1"],
-            vec!["--raw-prompt", "hello", "--no-thinking"],
-            vec!["--system", "hello"],
-            vec!["--reasoning-effort", "low"],
-            vec![
-                "--prompt",
-                "hello",
-                "--no-thinking",
-                "--reasoning-effort",
-                "low",
-            ],
-        ] {
-            assert!(
-                Args::try_parse_from(
-                    ["gguf", "--model", "test.gguf"]
-                        .into_iter()
-                        .chain(flags.iter().copied())
-                )
-                .is_err(),
-                "{flags:?}"
-            );
-        }
-        let parsed = Args::try_parse_from([
-            "gguf",
-            "--model",
-            "test.gguf",
-            "--prompt",
-            "你好",
-            "--no-thinking",
-            "--system",
-            "简洁回答",
-        ])
-        .unwrap();
-        assert_eq!(parsed.prompt.as_deref(), Some("你好"));
-        assert!(parsed.no_thinking);
-        assert!(parsed.token_ids.is_empty());
-    }
-}
 struct TextInput {
     tokenizer: GgufText,
     rendered: String,
@@ -162,7 +115,7 @@ fn prepare_text(args: &mut Args, reader: &GgufReader) -> Result<Option<TextInput
     }))
 }
 
-fn loaded<T: Dtype, D: LlmBackend + infer_worker::domain::ports::OpBackend>(
+fn loaded<T: Dtype, D: LlmBackend + infer_core::ports::OpBackend>(
     l: &Qwen35GgufLoader<'_>,
     scope: D::Scope,
     args: &Args,
@@ -323,7 +276,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn forward<T: Dtype, D: LlmBackend + infer_worker::domain::ports::OpBackend>(
+fn forward<T: Dtype, D: LlmBackend + infer_core::ports::OpBackend>(
     loader: &Qwen35GgufLoader<'_>,
     scope: D::Scope,
     args: &Args,
@@ -505,4 +458,52 @@ fn compare(a: &ProbeOutput, b: &ProbeOutput) -> Result<serde_json::Value> {
     Ok(
         serde_json::json!({"max_abs":max_abs,"relative_l2":relative_l2,"same_top1":a.top_k(1)[0].0==b.top_k(1)[0].0,"layer_errors":layer_errors}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_input_flags_are_exclusive_and_chat_flags_require_chat() {
+        for flags in [
+            vec!["--prompt", "hello", "--raw-prompt", "hello"],
+            vec!["--prompt", "hello", "--token-ids", "1"],
+            vec!["--raw-prompt", "hello", "--token-ids", "1"],
+            vec!["--raw-prompt", "hello", "--no-thinking"],
+            vec!["--system", "hello"],
+            vec!["--reasoning-effort", "low"],
+            vec![
+                "--prompt",
+                "hello",
+                "--no-thinking",
+                "--reasoning-effort",
+                "low",
+            ],
+        ] {
+            assert!(
+                Args::try_parse_from(
+                    ["gguf", "--model", "test.gguf"]
+                        .into_iter()
+                        .chain(flags.iter().copied())
+                )
+                .is_err(),
+                "{flags:?}"
+            );
+        }
+        let parsed = Args::try_parse_from([
+            "gguf",
+            "--model",
+            "test.gguf",
+            "--prompt",
+            "你好",
+            "--no-thinking",
+            "--system",
+            "简洁回答",
+        ])
+        .unwrap();
+        assert_eq!(parsed.prompt.as_deref(), Some("你好"));
+        assert!(parsed.no_thinking);
+        assert!(parsed.token_ids.is_empty());
+    }
 }

@@ -14,11 +14,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::domain::dtype::Dtype;
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::StepRequest;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult};
+use infer_core::dtype::Dtype;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{CollectiveOps, CommAxis, OpError, OpResult};
 
 use super::{MixedStepTicket, RaggedRowKind, Runtime};
 

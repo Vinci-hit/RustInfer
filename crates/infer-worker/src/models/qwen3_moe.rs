@@ -9,14 +9,14 @@ use crate::components::{
     Attention, DecoderBlock, Embed, ExpertLinear, FullAttention, Linear, LmHead, MoeExperts,
     MoeFfn, MoeLocalPipeline, MoeRouter, RmsNorm,
 };
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::{DeviceId, ExecDevice};
 use crate::domain::model::ModelDims;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpBackend, OpError, OpResult};
 use crate::models::decoder::Decoder;
 use crate::models::layers::RMSNorm as LayerRmsNorm;
 use crate::models::loader::{ExpertLinearLoadSpec, LoadConfig, WeightLoader, compute_rope_cache};
+use infer_core::dtype::Dtype;
+use infer_core::exec::{DeviceId, ExecDevice};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpBackend, OpError, OpResult};
 
 pub const MODEL_TYPE: &str = "qwen3_moe";
 pub const HF_MODEL_TYPES: &[&str] = &["qwen3_moe"];
@@ -832,7 +832,7 @@ where
 }
 
 fn validate_tensor_device<T, D>(
-    tensor: &crate::domain::tensor::Tensor<T, D>,
+    tensor: &infer_core::tensor::Tensor<T, D>,
     name: &str,
     expected: DeviceId,
 ) -> OpResult<()>
@@ -979,11 +979,11 @@ mod tests {
     };
     use crate::components::{Attention, ExpertLinear, Linear, MoeRouter, RmsNorm};
     use crate::domain::model::DecoderModel;
-    use crate::domain::tensor::Tensor;
     use crate::infrastructure::cpu::Cpu;
     use crate::infrastructure::io::SafetensorsReader;
     use crate::models::loader::{LoadConfig, WeightLoader};
     use half::bf16;
+    use infer_core::tensor::Tensor;
     use safetensors::{
         Dtype as SafeDtype,
         tensor::{TensorView, serialize},

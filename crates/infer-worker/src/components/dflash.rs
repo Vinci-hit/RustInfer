@@ -3,12 +3,14 @@
 use super::{DenseFfn, Embed, FullAttention, Linear, LmHead, RmsNorm};
 use crate::domain::{
     cache::{CacheLayout, LayerCacheSpec, LayerCacheView, ModelCacheView},
-    component::{Component, Hidden, LayerRange},
     draft::BlockDraft,
-    dtype::Dtype,
-    exec::StepCtx,
     forward_scratch::ForwardScratch,
     model::ModelDims,
+};
+use infer_core::{
+    component::{Component, Hidden, LayerRange},
+    dtype::Dtype,
+    exec::StepCtx,
     ports::{OpError, OpResult, backend::LlmBackend},
     tensor::Tensor,
 };

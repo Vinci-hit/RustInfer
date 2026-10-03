@@ -4,10 +4,10 @@
 //! host. `embed_into` gathers per-axis slices into a unified
 //! `[seq_len, half_dim_total]` cos/sin tensor on the target CUDA device.
 
-use crate::domain::ports::{MemoryPort, OpError, OpResult};
-use crate::domain::tensor::Tensor;
 use crate::infrastructure::cpu::Cpu;
 use crate::infrastructure::cuda::Cuda;
+use infer_core::ports::{MemoryPort, OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 pub struct RopeEmbedder3D {
     pub theta: f64,
@@ -245,7 +245,7 @@ pub fn fill_image_pos_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::tensor::Tensor;
+    use infer_core::tensor::Tensor;
 
     #[test]
     fn precompute_cache_shapes() {

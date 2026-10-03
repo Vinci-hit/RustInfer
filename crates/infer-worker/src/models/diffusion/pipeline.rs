@@ -5,10 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{CoreOps, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
+use infer_core::ports::{CoreOps, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Dtype;
 
 use super::scheduler::FlowMatchEulerScheduler;
 use super::state::{DitShapeSpec, DitState, LATENT_CHANNELS, PipelineState, ZImageCapacity};
@@ -56,7 +56,7 @@ fn load_latent_from_npy<T: Dtype>(
         .collect();
     Tensor::<T, Cuda>::from_host_slice(
         &host,
-        crate::domain::types::Shape::from_slice(&[1, LATENT_CHANNELS, latent_h, latent_w]),
+        infer_core::types::Shape::from_slice(&[1, LATENT_CHANNELS, latent_h, latent_w]),
         dev,
     )
 }
@@ -263,8 +263,8 @@ impl<T: Dtype> ZImagePipeline<T> {
             assert_eq!(b, 1);
             // View-only reshape via view_raw.
             let latent_5d = sample.view_raw(
-                crate::domain::types::Shape::from_slice(&[c, 1, h, w]),
-                crate::domain::types::Shape::from_slice(&[h * w, h * w, w, 1]).contiguous_strides(),
+                infer_core::types::Shape::from_slice(&[c, 1, h, w]),
+                infer_core::types::Shape::from_slice(&[h * w, h * w, w, 1]).contiguous_strides(),
                 sample.offset_elems(),
                 true,
             );
@@ -278,8 +278,8 @@ impl<T: Dtype> ZImagePipeline<T> {
             )?;
             // model_out shape [C, 1, H, W]. Reshape to [1, C, H, W] for scheduler step.
             let mo_4d = model_out.view_raw(
-                crate::domain::types::Shape::from_slice(&[1, c, h, w]),
-                crate::domain::types::Shape::from_slice(&[c * h * w, h * w, w, 1])
+                infer_core::types::Shape::from_slice(&[1, c, h, w]),
+                infer_core::types::Shape::from_slice(&[c * h * w, h * w, w, 1])
                     .contiguous_strides(),
                 model_out.offset_elems(),
                 true,

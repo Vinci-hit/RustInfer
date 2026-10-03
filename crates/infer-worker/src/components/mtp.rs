@@ -2,14 +2,14 @@
 //! KV state belongs to the caller; all mutable work buffers are head-local.
 use crate::components::{Linear, RmsNorm};
 use crate::domain::cache::{CacheLayout, ModelCacheView};
-use crate::domain::component::{Hidden, LayerRange};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::model::{DecoderReadout, ModelDims};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::component::{Hidden, LayerRange};
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 /// Each row pairs target final-normalized h_i with token_(i+1).
 /// The execution plan and KV write position must refer to i, not i+1.

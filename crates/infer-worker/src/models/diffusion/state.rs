@@ -7,9 +7,9 @@
 //!
 //! Allocate-once-and-reuse so the hot path is alloc-free.
 
-use crate::domain::ports::{OpBackend, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Dtype;
+use infer_core::ports::{OpBackend, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Dtype;
 
 use super::dit_block::DiTBlockScratch;
 

@@ -6,14 +6,13 @@ use crate::{
         attention_core::AttentionCore,
         dflash::{DFlashDraftHead, DFlashLayer, DFlashWeights},
     },
-    domain::{
-        dtype::Dtype,
-        features::FeatureSpec,
-        model::ModelDims,
-        ports::{OpBackend, OpError, OpResult, backend::LlmBackend},
-        tensor::Tensor,
-    },
+    domain::{features::FeatureSpec, model::ModelDims},
     models::loader::{WeightLoader, compute_rope_cache},
+};
+use infer_core::{
+    dtype::Dtype,
+    ports::{OpBackend, OpError, OpResult, backend::LlmBackend},
+    tensor::Tensor,
 };
 
 #[derive(Clone, Debug, serde::Deserialize)]

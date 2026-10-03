@@ -1,9 +1,9 @@
 //! Per-sequence text-prefill alignment for a hidden-conditioned draft head.
 //! Only the conditioned feature row survives a completed chunk.
-use crate::domain::dtype::Dtype;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 type AlignmentScratch<T, D> = (Tensor<T, D>, [Tensor<T, D>; 2]);
 

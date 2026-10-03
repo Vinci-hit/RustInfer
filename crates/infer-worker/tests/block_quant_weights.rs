@@ -472,7 +472,7 @@ fn check_file(path: &Path) -> usize {
 
 #[test]
 fn gguf_fixture_to_block_weights() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gguf");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../infer-gguf/tests/fixtures/gguf");
     assert_eq!(check_file(&root.join("reference.gguf")), 13);
     let reader = GgufReader::open(root.join("reference.gguf")).unwrap();
     let expected = reader.read_view("test.q3_k").unwrap().bytes.to_vec();

@@ -5,11 +5,11 @@
 # ./rustinfer.toml).
 #
 # `model_type` is intentionally NOT here — it is resolved from the model's
-# config.json so the worker dispatch / chat template always match the weights.
+# config.json or GGUF metadata, so dispatch and chat templates match the weights.
 
-# Model directory (weights + tokenizer.json + config.json). Required. Relative
+# Model directory (Safetensors) or a single GGUF file. Required. Relative
 # paths are resolved from the directory where the binaries are launched.
-model = "./models/model"
+model = "/root/models/Qwen3.8-27B-GGUF-Q3_K_XL/Qwen3.8-27B-UD-Q3_K_XL.gguf"
 
 # Display name for /v1/models. Empty => derive from `model` basename.
 model_name = ""
@@ -24,15 +24,15 @@ tensor_parallel_size = 1
 
 # HTTP API server.
 host = "127.0.0.1"
-port = 8000
+port = 8080
 request_timeout_secs = 600
 tp_operation_timeout_secs = 120
 tp_startup_timeout_secs = 600
 
 # Batching / capacity.
-max_batch_tokens = 4096
-max_batch_seqs = 32
-max_model_len = 4096
+max_batch_tokens = 64
+max_batch_seqs = 1
+max_model_len = 2048
 
 # Throughput knob: max time (ms) the scheduler waits accumulating freshly
 # arrived requests into one larger prefill batch before dispatching.
@@ -42,7 +42,7 @@ batch_wait_ms = 0
 
 # Paged KV.
 paged_block_size = 1
-chunked_prefill_size = 256    # bound prefill tokens per fused step so burst arrivals can't stall decode rows (qps32 ITL p99 tail); 0 => whole prompt in one step
+chunked_prefill_size = 64     # bound scratch use on the 16 GiB card
 enable_prefix_caching = false
 mem_fraction_static = 0.85
 num_blocks = 0                # 0 => auto-size
@@ -64,7 +64,7 @@ log_level = "info"
 # Batch sizes not in this list will fall back to eager mode.
 # Keep the default template modest; tune this list with `max_batch_seqs` for the
 # deployment GPU after validating its memory headroom.
-capture_sizes = [1, 2, 4, 8, 16, 24, 32]
+capture_sizes = []            # GGUF currently uses eager ragged attention
 
 # Optional Qwen3.5 text MTP (0 = disabled). Enabling requires
 # max_batch_seqs = 1, tensor_parallel_size = 1, and prefix caching disabled.
@@ -74,6 +74,6 @@ mtp_num_draft_tokens = 0
 # CUDA scratch memory (MiB). The graph arena is allocated lazily on first use;
 # the recycling-pool value is a retention ceiling, not an eager allocation.
 [cuda_memory]
-kernel_workspace_mib = 256
-graph_arena_mib = 256
-pool_retain_mib = 256
+kernel_workspace_mib = 32
+graph_arena_mib = 0
+pool_retain_mib = 64

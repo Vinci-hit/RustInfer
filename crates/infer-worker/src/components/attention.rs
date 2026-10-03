@@ -2,12 +2,12 @@ use std::rc::Rc;
 
 use super::{FullAttention, GatedDeltaNet};
 use crate::domain::cache::{LayerCacheSpec, LayerCacheView};
-use crate::domain::component::{Component, Hidden};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
+use infer_core::component::{Component, Hidden};
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
 
 #[allow(clippy::large_enum_variant)]
 pub enum Attention<T: Dtype, D: LlmBackend> {

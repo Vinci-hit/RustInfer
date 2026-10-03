@@ -3,7 +3,7 @@ name = "RustInfer Frontend"
 default_platform = "web"
 
 [web.app]
-title = "RustInfer - Interactive Chat"
+title = "RustInfer · 本地智能工作台"
 
 [web.watcher]
 watch_path = ["src", "assets"]

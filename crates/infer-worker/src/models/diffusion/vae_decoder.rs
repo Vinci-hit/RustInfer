@@ -12,13 +12,13 @@
 //! reusable scratches don't help much — eager allocation matches the
 //! reference implementation).
 
-use crate::domain::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::io::SafetensorsReader;
 use crate::models::layers::Linear;
 use crate::models::loader::WeightLoader;
+use infer_core::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{Dtype, Shape};
 
 const NORM_GROUPS: usize = 32;
 const EPS: f32 = 1e-6;

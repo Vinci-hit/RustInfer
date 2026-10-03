@@ -27,13 +27,13 @@ use serde::Deserialize;
 use infer_protocol::scheduler_to_worker_control::SchedulerControlMessage;
 use infer_protocol::worker_to_scheduler_control::WORKER_CONTROL_PROTOCOL_VERSION;
 
+use infer_core::dtype::quant::{QuantScheme, Symmetry};
+use infer_core::ports::{OpError, OpResult};
 use infer_worker::application::serve_loop::{
     Bootstrap, RuntimeFollowerFactory, RuntimeFollowerInit, run_with_model,
 };
 use infer_worker::application::tensor_parallel::{LocalTpBootstrap, TpRankResource};
-use infer_worker::domain::dtype::quant::QuantScheme;
 use infer_worker::domain::model::DecoderModel;
-use infer_worker::domain::ports::{OpError, OpResult};
 use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan, device_utils};
 use infer_worker::infrastructure::io::SafetensorsReader;
 use infer_worker::infrastructure::transport::control_pump::ControlPump;
@@ -67,6 +67,8 @@ struct Args {
 
 #[derive(Debug, Deserialize)]
 struct HfConfig {
+    #[serde(default)]
+    model_type: String,
     hidden_size: usize,
     intermediate_size: usize,
     num_hidden_layers: usize,
@@ -86,7 +88,7 @@ struct HfConfig {
     #[serde(default)]
     architectures: Vec<String>,
     /// compressed-tensors / llm-compressor quantization block. Present only for
-    /// quantized checkpoints; we support int4 `pack-quantized` on the MLP.
+    /// quantized checkpoints; hybrid Qwen also supports packed attention/GDN.
     #[serde(default)]
     quantization_config: Option<HfQuantConfig>,
 
@@ -150,9 +152,8 @@ struct HfRopeParameters {
 
 /// Subset of the HuggingFace `quantization_config` block we act on. This covers
 /// both compressed-tensors INT4 metadata and HuggingFace's blockwise FP8
-/// metadata. The per-layer INT4 `ignore` list (attention, lm_head) is honored
-/// implicitly because the loader only reads packed tensors for the MLP
-/// projections.
+/// metadata. Hybrid Qwen chooses packed vs dense per projection from the
+/// checkpoint tensors, preserving the quantizer's ignored modules.
 #[derive(Debug, Deserialize)]
 struct HfQuantConfig {
     #[serde(default)]
@@ -164,11 +165,17 @@ struct HfQuantConfig {
     #[serde(default)]
     activation_scheme: Option<String>,
     #[serde(default)]
-    config_groups: std::collections::HashMap<String, HfQuantGroup>,
+    config_groups: std::collections::BTreeMap<String, HfQuantGroup>,
+    #[serde(default)]
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct HfQuantGroup {
+    #[serde(default)]
+    input_activations: Option<serde_json::Value>,
+    #[serde(default)]
+    output_activations: Option<serde_json::Value>,
     #[serde(default)]
     weights: Option<HfQuantWeights>,
     #[serde(default)]
@@ -177,6 +184,14 @@ struct HfQuantGroup {
 
 #[derive(Debug, Deserialize)]
 struct HfQuantWeights {
+    #[serde(default)]
+    symmetric: Option<bool>,
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    actorder: Option<String>,
     #[serde(default)]
     num_bits: Option<u32>,
     #[serde(default)]
@@ -256,37 +271,68 @@ fn build_linear_attn(cfg: &HfConfig) -> Option<LinearAttnConfig> {
     })
 }
 
-/// Derive the MLP int4 quant scheme from `quantization_config`, or `None` for a
-/// dense model. We enable int4 only when a config group is 4-bit and targets
-/// the MLP `gate/up/down` projections (the shape this build's kernel supports).
-fn derive_mlp_quant(cfg: &HfConfig) -> Option<QuantScheme> {
-    let qc = cfg.quantization_config.as_ref()?;
-    // compressed-tensors is the format llm-compressor emits for W4A16.
-    if qc.quant_method.as_deref() != Some("compressed-tensors") {
-        return None;
-    }
-    for group in qc.config_groups.values() {
-        let w = match &group.weights {
-            Some(w) => w,
-            None => continue,
-        };
-        if w.num_bits != Some(4) {
-            continue;
+/// Accept one uniform compressed-tensors W4A16 scheme. The hybrid Qwen
+/// loader chooses packed vs dense per tensor, so ignored GDN gates stay dense.
+/// Other decoders currently support explicitly targeted MLP projections only.
+fn derive_mlp_quant(cfg: &HfConfig) -> Result<Option<QuantScheme>, String> {
+    let Some(qc) = &cfg.quantization_config else {
+        return Ok(None);
+    };
+    match qc.quant_method.as_deref() {
+        Some("fp8") => return Ok(None),
+        Some("compressed-tensors") => {}
+        other => {
+            return Err(format!(
+                "unsupported quantization method {other:?}; expected compressed-tensors INT4 or block FP8"
+            ));
         }
-        let targets_mlp = group
-            .targets
-            .iter()
-            .any(|t| t.contains("gate_proj") || t.contains("up_proj") || t.contains("down_proj"));
-        if !targets_mlp {
-            continue;
+    }
+    if qc.format.as_deref() != Some("pack-quantized") || qc.config_groups.is_empty() {
+        return Err(
+            "INT4 requires compressed-tensors format=pack-quantized and config_groups".into(),
+        );
+    }
+    let mut result = None;
+    for (name, group) in &qc.config_groups {
+        let invalid = || {
+            format!(
+                "unsupported INT4 config group {name}: expected uniform groupwise W4A16 without activation quantization or actorder"
+            )
+        };
+        let w = group.weights.as_ref().ok_or_else(invalid)?;
+        let size = w.group_size.ok_or_else(invalid)?;
+        if w.num_bits != Some(4)
+            || size == 0
+            || !size.is_multiple_of(8)
+            || w.strategy.as_deref() != Some("group")
+            || w.kind.as_deref() != Some("int")
+            || w.actorder.as_deref().is_some_and(|v| v != "none")
+            || group.input_activations.is_some()
+            || group.output_activations.is_some()
+            || group.targets.is_empty()
+        {
+            return Err(invalid());
+        }
+        if cfg.model_type != "qwen3_5"
+            && group.targets.iter().any(|t| {
+                !(t.contains("gate_proj") || t.contains("up_proj") || t.contains("down_proj"))
+            })
+        {
+            return Err("this model supports INT4 only on explicitly targeted MLP projections; full Linear targeting is supported for qwen3_5".into());
         }
         let mut scheme = QuantScheme::AWQ_INT4_G128;
-        if let Some(g) = w.group_size {
-            scheme.group = g;
+        scheme.group = size;
+        scheme.symmetry = if w.symmetric.unwrap_or(true) {
+            Symmetry::Symmetric
+        } else {
+            Symmetry::Asymmetric
+        };
+        if result.is_some_and(|previous| previous != scheme) {
+            return Err("mixed INT4 group sizes/symmetries are not supported".into());
         }
-        return Some(scheme);
+        result = Some(scheme);
     }
-    None
+    Ok(result)
 }
 
 /// Validate HuggingFace blockwise-FP8 metadata and return the weight scale
@@ -448,7 +494,7 @@ fn build_load_config(cfg: &HfConfig, max_seq_len: usize) -> Result<LoadConfig, S
         rms_norm_eps: cfg.rms_norm_eps,
         rope_theta,
         rope_scaling,
-        mlp_quant: derive_mlp_quant(cfg),
+        mlp_quant: derive_mlp_quant(cfg)?,
         fp8_block: derive_fp8_block(cfg)?,
         rotary_dim,
         attn_output_gate: cfg.attn_output_gate,
@@ -732,6 +778,21 @@ fn main() -> Result<(), String> {
         ));
     }
 
+    let is_gguf = infer_gguf::is_gguf_path(&load.model_path);
+    if is_gguf {
+        if !cfg!(feature = "cute-dsl") {
+            return Err(
+                "GGUF CUDA serving requires building rustinfer-worker with --features cute-dsl"
+                    .into(),
+            );
+        }
+        if load.tp_size != 1 || cfg.speculative_draft_tokens() != 0 || load.enable_prefix_caching {
+            return Err(
+                "GGUF serving requires TP1, no speculative decoding or prefix caching".into(),
+            );
+        }
+    }
+
     // ── 4. Load model ──
     let device_id = parse_device_id(&load.device)?;
     const MIB: usize = 1024 * 1024;
@@ -790,13 +851,60 @@ fn main() -> Result<(), String> {
     }
     device_utils::set_current_device(cuda.device_id)
         .map_err(|error| format!("set TP rank 0 CUDA device {}: {error}", cuda.device_id))?;
+    if is_gguf {
+        use qwen3_5::gguf::{LoadOptions, Qwen35GgufLoader, text::GgufText};
+        let reader = infer_gguf::GgufReader::open(&load.model_path).map_err(|e| e.to_string())?;
+        let eos_ids = GgufText::from_gguf(&reader)
+            .map_err(|e| e.to_string())?
+            .end_token_ids();
+        let loader = Qwen35GgufLoader::new(
+            &reader,
+            LoadOptions {
+                context_length: load.max_model_len,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        let model = loader
+            .load::<bf16, Cuda>(&cuda)
+            .map_err(|e| format!("GGUF load: {e}"))?;
+        eprintln!(
+            "[bootstrap] GGUF weights loaded in {:.2}s; using eager ragged attention",
+            start.elapsed().as_secs_f64()
+        );
+        drop(loader);
+        drop(reader);
+        return run_with_model(
+            &control,
+            &data,
+            model,
+            Bootstrap {
+                load: &load,
+                tp_placement,
+                cuda: &cuda,
+                max_seq_len: load.max_model_len,
+                block_size,
+                num_blocks_override,
+                server_heartbeat_ms,
+                model_type: "qwen3_5".into(),
+                capture_sizes: Vec::new(),
+                peer_timeout: Duration::from_secs(cfg.tp_operation_timeout_secs),
+                peer_startup_timeout: Duration::from_secs(cfg.tp_startup_timeout_secs),
+                tp_communicator: leader_communicator.clone(),
+                tp_devices: &all_devices,
+            },
+            Vec::new(),
+            &eos_ids,
+            args.profile_cuda_steps,
+        );
+    }
     let cfg_path = Path::new(&load.model_path).join("config.json");
     let cfg_bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
     let hf_cfg: HfConfig =
         parse_hf_config(&cfg_bytes).map_err(|e| format!("parse {}: {}", cfg_path.display(), e))?;
     let max_seq_len = load.max_model_len;
-    let mut load_cfg = build_load_config(&hf_cfg, max_seq_len)
+    let load_cfg = build_load_config(&hf_cfg, max_seq_len)
         .map_err(|e| format!("invalid quantization config: {}", e))?;
     eprintln!(
         "[bootstrap] arch={} layers={} dim={} heads={}/{} vocab={}",
@@ -814,24 +922,15 @@ fn main() -> Result<(), String> {
         .map_err(|e| format!("invalid tensor-parallel topology: {}", e))?;
     let load_start = Instant::now();
 
-    // Reconcile the config's quant claim with the actual weights: only enable
-    // the int4 MLP path when packed tensors are really present. A mismatch
-    // (quantized config but dense weights, or vice-versa) falls back to dense
-    // rather than failing the load.
+    let has_packed = reader.names().iter().any(|n| n.ends_with(".weight_packed"));
+    if has_packed != load_cfg.mlp_quant.is_some() {
+        return Err("INT4 metadata and weight_packed tensors disagree; refusing to load with a different precision".into());
+    }
     if let Some(scheme) = load_cfg.mlp_quant {
-        let has_packed = loader.has_tensor("model.layers.0.mlp.gate_proj.weight_packed");
-        if has_packed {
-            eprintln!(
-                "[bootstrap] MLP int4 quant enabled (pack-quantized, group_size={})",
-                scheme.group
-            );
-        } else {
-            eprintln!(
-                "[bootstrap] config declares int4 MLP quant but no weight_packed tensors found; \
-                 loading as dense"
-            );
-            load_cfg.mlp_quant = None;
-        }
+        eprintln!(
+            "[bootstrap] INT4 pack-quantized enabled (group_size={}, {:?})",
+            scheme.group, scheme.symmetry
+        );
     }
 
     if let Some([block_n, block_k]) = load_cfg.fp8_block {
@@ -875,7 +974,6 @@ fn main() -> Result<(), String> {
         load: &load,
         tp_placement,
         cuda: &cuda,
-        load_cfg: &load_cfg,
         max_seq_len,
         block_size,
         num_blocks_override,
@@ -1353,15 +1451,15 @@ mod config_tests {
 #[cfg(test)]
 mod qwen35_checkpoint_tests {
     use super::*;
+    use infer_core::component::{Hidden, LayerRange};
+    use infer_core::exec::StepCtx;
+    use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+    use infer_core::plan::{BatchKind, BatchPlan};
+    use infer_core::tensor::Tensor;
     use infer_worker::domain::cache::{LinearBatch, LinearLayerState, ModelCacheView};
-    use infer_worker::domain::component::{Hidden, LayerRange};
-    use infer_worker::domain::exec::StepCtx;
     use infer_worker::domain::forward_scratch::ForwardScratch;
     use infer_worker::domain::gdn_scratch::GdnScratch;
-    use infer_worker::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
     use infer_worker::domain::model::SampleRows;
-    use infer_worker::domain::plan::{BatchKind, BatchPlan};
-    use infer_worker::domain::tensor::Tensor;
     use std::collections::HashMap;
 
     /// Opt-in checkpoint smoke test and fixed-token layer/logit diagnostic.
@@ -1534,8 +1632,7 @@ mod qwen35_checkpoint_tests {
                 .unwrap()
                 .0;
             let sampled =
-                <Cuda as infer_worker::domain::ports::FusedOps>::argmax(&ctx, &logits_tensor)
-                    .unwrap();
+                <Cuda as infer_core::ports::FusedOps>::argmax(&ctx, &logits_tensor).unwrap();
             if let Some(dir) = &dump_dir {
                 std::fs::write(
                     Path::new(dir).join(format!("step{step}_sampled.json")),
@@ -1627,9 +1724,9 @@ mod qwen35_checkpoint_tests {
     #[test]
     #[ignore = "requires QWEN35_MODEL_PATH and a CUDA device with enough free memory"]
     fn qwen35_decode_graph_matches_eager() {
+        use infer_core::exec::ExecScope;
         use infer_worker::application::runtime::{GraphDecision, Runtime};
         use infer_worker::application::sampler_stack::GreedySampler;
-        use infer_worker::domain::exec::ExecScope;
         use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
 
         let path = std::env::var("QWEN35_MODEL_PATH").expect("QWEN35_MODEL_PATH");
@@ -1897,10 +1994,10 @@ mod qwen35_checkpoint_tests {
     #[test]
     #[ignore = "requires QWEN35_MODEL_PATH, QWEN35_VISION_REFERENCE and CUDA"]
     fn qwen35_multimodal_precision_and_recompute() {
+        use infer_core::exec::ExecScope;
         use infer_protocol::multimodal::{IMAGE_TOKEN_ID, ImageInput, ImageSpan, MultimodalInput};
         use infer_worker::application::runtime::Runtime;
         use infer_worker::application::sampler_stack::GreedySampler;
-        use infer_worker::domain::exec::ExecScope;
         use infer_worker::domain::plan::{SeqStep, StepRequest, StopCriteria};
         let path = std::env::var("QWEN35_MODEL_PATH").unwrap();
         let reference = std::env::var("QWEN35_VISION_REFERENCE").unwrap();

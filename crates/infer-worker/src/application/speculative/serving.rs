@@ -8,9 +8,9 @@ use crate::domain::draft::ConditionedDraft;
 use crate::domain::features::{FeatureSpec, TargetFeatures};
 use crate::domain::model::DecoderReadout;
 use crate::domain::plan::StepRequest;
-use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use half::bf16;
+use infer_core::ports::{OpError, OpResult};
 use infer_protocol::scheduler_to_worker_data::PrefillBatchCmd;
 
 pub struct SpeculativeServing<P: DraftProposer<bf16, Cuda>> {
@@ -107,7 +107,7 @@ impl<P: DraftProposer<bf16, Cuda>> SpeculativeServing<P> {
                 "multimodal inputs or prefix-cache hits",
             ));
         }
-        let params = crate::domain::ports::SamplingParams {
+        let params = infer_core::ports::SamplingParams {
             temperature: seg.sampling_params.temperature,
             top_k: seg.sampling_params.top_k.max(0) as u32,
             top_p: seg.sampling_params.top_p,

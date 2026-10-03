@@ -14,6 +14,7 @@ pub async fn list_models(State(state): State<SharedState>) -> Json<ModelListResp
             object: "model".to_string(),
             created: 0, // 模型创建时间不适用
             owned_by: state.model_info.owned_by.clone(),
+            capabilities: crate::api::capabilities::ServerCapabilities::for_state(&state),
         }],
     })
 }

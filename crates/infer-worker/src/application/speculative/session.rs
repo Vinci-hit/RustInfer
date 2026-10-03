@@ -4,13 +4,13 @@ use super::{ConditionedProposer, DraftProposer};
 use crate::application::runtime::Runtime;
 use crate::application::sampler_stack::GreedySampler;
 use crate::domain::draft::ConditionedDraft;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::ExecScope;
 use crate::domain::features::{FeatureSpec, TargetFeatures};
 use crate::domain::model::DecoderReadout;
 use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
+use infer_core::dtype::Dtype;
+use infer_core::exec::ExecScope;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
 
 #[derive(Clone, Debug)]
 pub struct SpeculativeLimits {

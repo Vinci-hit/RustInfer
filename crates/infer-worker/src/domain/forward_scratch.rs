@@ -32,9 +32,9 @@ use std::cell::UnsafeCell;
 use std::rc::Rc;
 
 use super::model::ModelDims;
-use super::ports::{FusedOps, MemoryPort, OpResult};
-use super::tensor::Tensor;
-use super::types::{Dtype, Shape};
+use infer_core::ports::{FusedOps, MemoryPort, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{Dtype, Shape};
 
 /// Fixed-capacity scratch for the dense decoder forward (attention + dense FFN).
 /// Sized for the worst-case `cap_num_tokens` rows; sublayers view a row-prefix.

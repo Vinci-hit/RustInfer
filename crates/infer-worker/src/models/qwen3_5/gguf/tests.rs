@@ -2,11 +2,7 @@ use super::*;
 use crate::components::{embed::EmbeddingWeight, linear::LinearWeight};
 use crate::domain::{
     cache::{LayerCacheId, LinearBatch, LinearLayerState, ModelCacheView},
-    component::{Hidden, LayerRange},
-    exec::{HostScope, StepCtx},
-    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
     model::{DecoderModel, SampleRows},
-    plan::{BatchKind, BatchPlan},
 };
 use crate::infrastructure::io::{
     SafetensorsReader,
@@ -14,6 +10,12 @@ use crate::infrastructure::io::{
 };
 use crate::models::loader::{LinearAttnConfig, LoadConfig, WeightLoader};
 use infer_backend_cpu::{Cpu, block_quant::decode_row};
+use infer_core::{
+    component::{Hidden, LayerRange},
+    exec::{HostScope, StepCtx},
+    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
+    plan::{BatchKind, BatchPlan},
+};
 use std::collections::{BTreeMap, HashMap};
 
 struct Entry {
@@ -569,7 +571,7 @@ fn run_cpu(model: &Qwen3_5Model<f32, Cpu>) -> Vec<f32> {
     run_model(model, &Cpu, &HostScope::new(Cpu))
 }
 
-fn run_model<T: Dtype, D: LlmBackend + crate::domain::ports::OpBackend>(
+fn run_model<T: Dtype, D: LlmBackend + infer_core::ports::OpBackend>(
     model: &Qwen3_5Model<T, D>,
     device: &D,
     scope: &D::Scope,
@@ -1033,4 +1035,63 @@ fn cuda_probe_shared_scratch_matches_cpu_and_reset() {
     let suffix = gpu.step(&[5, 7], false).unwrap();
     assert_eq!(full.logits, suffix.logits);
     assert_eq!(next.logits, gpu.step(&[11], false).unwrap().logits);
+}
+
+#[test]
+fn serving_runtime_matches_offline_probe_across_chunked_prefill_and_reused_slots() {
+    use super::probe::GgufProbe;
+    use crate::application::{runtime::Runtime, sampler_stack::GreedySampler};
+    use crate::domain::model::DecoderModel;
+    use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
+    let reader = Fixture::new().reader();
+    let loader = Qwen35GgufLoader::new(&reader, options()).unwrap();
+    let model = loader.load::<f32, Cpu>(&Cpu).unwrap();
+    assert!(model.requires_eager_ragged());
+    let mut runtime = Runtime::new(
+        model,
+        HostScope::new(Cpu),
+        Box::new(GreedySampler),
+        17,
+        1,
+        16,
+        16,
+        4,
+        1,
+        vec![1],
+    )
+    .unwrap();
+    assert!(runtime.capture_sizes.is_empty());
+    let mut probe = GgufProbe::<f32, Cpu>::load(&loader, HostScope::new(Cpu), 4).unwrap();
+    // A completed request's state slot and KV addresses may be reused by a new
+    // sequence; recurrent state must start clean, including with q_len=1.
+    for sequence_id in [10, 11] {
+        probe.reset().unwrap();
+        let mut position = 0;
+        for ids in [vec![3, 5], vec![7], vec![11]] {
+            let expected = probe.step(&ids, false).unwrap().top_k(1)[0].0;
+            let after = position + ids.len();
+            let req = StepRequest {
+                seqs: vec![SeqStep {
+                    sequence_id,
+                    input_ids: ids,
+                    positions: (position..after).map(|p| p as i32).collect(),
+                    kv_write_start: position as i32,
+                    kv_len_after: after as i32,
+                    block_table: (0..after as u32).collect(),
+                }],
+                sampling: vec![Default::default()],
+                stop: StopCriteria {
+                    eos_ids: vec![],
+                    generated_counts: vec![0],
+                    max_tokens: vec![8],
+                    ignore_eos: vec![true],
+                },
+                draft_tokens: vec![],
+            };
+            let out = runtime.step(&req).unwrap();
+            assert_eq!(out.tokens[0][0].token_id, expected as i32);
+            position = after;
+        }
+        runtime.release_sequence(sequence_id);
+    }
 }

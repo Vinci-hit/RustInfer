@@ -30,6 +30,13 @@ pub async fn chat_completions(
 
     // 1. 校验请求
     validate_request(&req)?;
+    if state.gguf_text.is_none()
+        && (req.enable_thinking.is_some() || req.reasoning_effort.is_some())
+    {
+        return Err(AppError::bad_request(
+            "thinking controls currently require a GGUF chat template",
+        ));
+    }
     shared::validate_speculative_request(
         state.config.speculative_draft_tokens(),
         req.temperature,
@@ -87,6 +94,9 @@ pub async fn chat_completions(
         let messages = req.messages.clone();
         let tokenizer = state.tokenizer.clone();
         let model_type = state.model_type.clone();
+        let gguf_text = state.gguf_text.clone();
+        let thinking = req.enable_thinking.unwrap_or(true);
+        let effort = req.reasoning_effort.clone();
         let processing_admission = permit.clone();
         let ids = tokio::task::spawn_blocking(move || {
             let messages = messages
@@ -94,13 +104,20 @@ pub async fn chat_completions(
                 .map(InputChatMessage::text_message)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(AppError::bad_request)?;
-            let prompt = get_template(&model_type)
-                .apply(&messages)
-                .map_err(|e| AppError::bad_request(format!("Template error: {e}")))?;
-            let encoding = tokenizer
-                .encode(prompt, true)
-                .map_err(|e| AppError::internal(anyhow::anyhow!(e.to_string())))?;
-            let ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+            let ids: Vec<i32> = if let Some(text) = gguf_text {
+                encode_gguf_chat(&text, &messages, thinking, effort.as_deref())?
+            } else {
+                let prompt = get_template(&model_type)
+                    .apply(&messages)
+                    .map_err(|e| AppError::bad_request(format!("Template error: {e}")))?;
+                tokenizer
+                    .encode(prompt, true)
+                    .map_err(|e| AppError::internal(anyhow::anyhow!(e.to_string())))?
+                    .get_ids()
+                    .iter()
+                    .map(|&id| id as i32)
+                    .collect()
+            };
             if model_type == "qwen3_5" && ids.contains(&infer_protocol::multimodal::IMAGE_TOKEN_ID)
             {
                 return Err(AppError::bad_request(
@@ -225,8 +242,41 @@ pub async fn chat_completions(
     }
 }
 
+fn encode_gguf_chat(
+    text: &infer_gguf::text::GgufText,
+    messages: &[ChatMessage],
+    thinking: bool,
+    effort: Option<&str>,
+) -> Result<Vec<i32>, AppError> {
+    let messages = messages
+        .iter()
+        .map(|m| {
+            let role = serde_json::from_value(serde_json::Value::String(m.role.clone())).map_err(
+                |_| AppError::bad_request(format!("unsupported GGUF chat role: {}", m.role)),
+            )?;
+            Ok(infer_gguf::text::ChatMessage {
+                role,
+                content: m.content.clone(),
+                reasoning_content: None,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let prompt = text
+        .render_chat(&messages, thinking, effort)
+        .map_err(|e| AppError::bad_request(format!("GGUF template: {e}")))?;
+    text.encode(&prompt, false)
+        .map_err(|e| AppError::bad_request(e.to_string()))
+}
+
 /// 校验请求参数
 fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
+    if let Some(effort) = req.reasoning_effort.as_deref()
+        && !matches!(effort, "low" | "medium" | "high" | "xhigh")
+    {
+        return Err(AppError::bad_request(
+            "reasoning_effort must be low, medium, high or xhigh",
+        ));
+    }
     if req.messages.is_empty() {
         return Err(AppError::bad_request("messages must not be empty"));
     }
@@ -253,6 +303,39 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unknown_thinking_effort() {
+        let req = serde_json::from_value(serde_json::json!({
+            "messages": [{"role":"user", "content":"hello"}], "reasoning_effort":"typo"
+        }))
+        .unwrap();
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires RUSTINFER_GGUF_MODEL"]
+    fn gguf_http_encoding_matches_offline_ids() {
+        let reader =
+            infer_gguf::GgufReader::open(std::env::var("RUSTINFER_GGUF_MODEL").unwrap()).unwrap();
+        let text = infer_gguf::text::GgufText::from_gguf(&reader).unwrap();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "你好，请用一句话介绍自己。".into(),
+        }];
+        assert_eq!(
+            encode_gguf_chat(&text, &messages, false, None).unwrap(),
+            [
+                248045, 846, 198, 109266, 3709, 139054, 110827, 97431, 96115, 1710, 248046, 198,
+                248045, 74455, 198, 248068, 271, 248069, 271
+            ]
+        );
+        let bad = vec![ChatMessage {
+            role: "tool".into(),
+            content: "x".into(),
+        }];
+        assert!(encode_gguf_chat(&text, &bad, false, None).is_err());
+    }
 
     #[test]
     fn text_budget_is_aggregate_and_excludes_image_payloads() {

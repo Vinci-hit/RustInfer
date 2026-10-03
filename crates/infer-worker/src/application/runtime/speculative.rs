@@ -341,7 +341,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderReadout<T, D>> Runtime<T, D, M> {
                 stream: self.hidden.stream.narrow(0, 0, n)?,
                 pending: None,
             };
-            let ctx = crate::domain::exec::StepCtx::new(&self.scope, &retained_plan);
+            let ctx = infer_core::exec::StepCtx::new(&self.scope, &retained_plan);
             ExecutionPlan::eager(
                 Phase::Readout,
                 retained_plan.batch,

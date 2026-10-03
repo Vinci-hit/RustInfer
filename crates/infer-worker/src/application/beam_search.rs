@@ -2,13 +2,13 @@
 //! beam scores: every edge uses the full model's log-softmax probability.
 use crate::application::runtime::Runtime;
 use crate::application::sampler_stack::GreedySampler;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::ExecScope;
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::ExecScope;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 #[derive(Debug, Clone)]
 pub struct BeamSearchConfig {

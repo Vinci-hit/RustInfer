@@ -7,6 +7,9 @@ use tokenizers::Tokenizer;
 
 use crate::api::openai::types::{ChatMessage, ContentPart, InputChatMessage, MessageContent};
 
+pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_IMAGE_DIMENSION: u32 = 8192;
+
 pub struct Qwen35Processor {
     min_pixels: usize,
     max_pixels: usize,
@@ -131,7 +134,6 @@ impl Qwen35Processor {
     }
 
     fn decode(&self, url: &str) -> Result<ImageInput> {
-        const MAX_BYTES: usize = 10 * 1024 * 1024;
         let (header, payload) = url
             .split_once(',')
             .ok_or_else(|| anyhow::anyhow!("expected a PNG/JPEG base64 data URL"))?;
@@ -140,11 +142,14 @@ impl Qwen35Processor {
             "expected a PNG/JPEG base64 data URL"
         );
         ensure!(
-            payload.len() <= MAX_BYTES.div_ceil(3) * 4,
+            payload.len() <= MAX_IMAGE_BYTES.div_ceil(3) * 4,
             "encoded image exceeds 10 MiB"
         );
         let bytes = base64::engine::general_purpose::STANDARD.decode(payload)?;
-        ensure!(bytes.len() <= MAX_BYTES, "encoded image exceeds 10 MiB");
+        ensure!(
+            bytes.len() <= MAX_IMAGE_BYTES,
+            "encoded image exceeds 10 MiB"
+        );
         let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
         ensure!(
             matches!(
@@ -154,8 +159,8 @@ impl Qwen35Processor {
             "unsupported image format"
         );
         let mut limits = image::Limits::default();
-        limits.max_image_width = Some(8192);
-        limits.max_image_height = Some(8192);
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
         limits.max_alloc = Some(64 * 1024 * 1024);
         reader.limits(limits);
         let image = reader.decode()?.to_rgb8();

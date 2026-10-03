@@ -10,6 +10,7 @@ homepage.workspace = true
 publish.workspace = true
 
 [dependencies]
+infer-gguf = { version = "1.0.1", path = "../infer-gguf" }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_bytes = "0.11"
 sha2 = "0.10"

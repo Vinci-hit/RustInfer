@@ -3,14 +3,14 @@ use std::rc::Rc;
 use super::linear::{Linear, LinearWeight};
 use super::norm::RmsNorm;
 use crate::domain::cache::{LinearDims, LinearLayerStateView};
-use crate::domain::component::Hidden;
-use crate::domain::dtype::{DTypeId, Dtype};
-use crate::domain::exec::{ExecScope, RankPair, StepCtx};
 use crate::domain::gdn_scratch::GdnScratch;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use infer_core::component::Hidden;
+use infer_core::dtype::{DTypeId, Dtype};
+use infer_core::exec::{ExecScope, RankPair, StepCtx};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 /// The input norm is supplied by the model builder. Checkpoint-specific norm
 /// conventions are separate from the recurrent attention and its gated output norm.
@@ -75,8 +75,24 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
                 LinearWeight::Dense(weight) => {
                     weight.shape().as_slice() == [rows, cols] && weight.is_contiguous()
                 }
+                LinearWeight::Awq {
+                    packed,
+                    zeros,
+                    scales,
+                    scheme,
+                } => {
+                    scheme.group > 0
+                        && cols.is_multiple_of(8)
+                        && cols.is_multiple_of(scheme.group)
+                        && packed.shape().as_slice() == [rows, cols / 8]
+                        && zeros.shape().as_slice() == [rows.div_ceil(8), cols / scheme.group]
+                        && scales.shape().as_slice() == [rows, cols / scheme.group]
+                        && packed.is_contiguous()
+                        && zeros.is_contiguous()
+                        && scales.is_contiguous()
+                }
+                LinearWeight::Fp8Block { .. } => false,
                 LinearWeight::BlockQuant(weight) => weight.shape() == [rows, cols],
-                _ => return Err(OpError::unsupported("GatedDeltaNet", "quantized weights")),
             };
             if !valid_weight
                 || linear

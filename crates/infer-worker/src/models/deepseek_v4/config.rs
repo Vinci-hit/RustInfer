@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::domain::ports::{OpError, OpResult};
+use infer_core::ports::{OpError, OpResult};
 
 /// Deliberately bounded, unquantized V4 fixture contract. Production checkpoints
 /// must never silently enter this synchronous, host-assisted reference path.

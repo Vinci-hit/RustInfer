@@ -14,12 +14,13 @@ use crate::application::runtime::{RaggedRowKind, Runtime};
 use crate::application::worker_state::{ActiveSeq, ActiveSeqMap, PrefillSeq, PrefillSeqMap};
 use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::domain::model::DecoderModel;
-use crate::domain::plan::{SampledToken, SeqStep, StepRequest, StopCriteria};
-use crate::domain::ports::sampler::SamplingParams;
-use crate::domain::ports::{OpError, OpResult};
+use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
+use infer_core::ports::SampledToken;
+use infer_core::ports::sampler::SamplingParams;
+use infer_core::ports::{OpError, OpResult};
 
 mod eager_prefill;
 pub(crate) use eager_prefill::handle_eager_prefill;
@@ -496,38 +497,22 @@ where
         };
     let decode_count = decode_order.len();
 
-    // 2.5 Bound this step's prefill admission to the largest prewarmed
-    //     mixed-graph token bucket. Surplus cmds are deferred to the next
-    //     serve-loop iteration: decode rows advance every iteration
-    //     regardless, so a burst of arrivals is spread across consecutive
-    //     graphed steps instead of one oversized eager step that stalls every
-    //     decode row for the burst's whole prefill time. FCFS: once one cmd
-    //     defers, every later cmd defers behind it. The first cmd is always
-    //     admitted (progress guarantee even past the budget).
+    // Select a FIFO prefix before allocating KV. Commands stay atomic; the
+    // first may exceed soft limits for progress. Group packing below enforces
+    // hard forward capacities, and deferred commands keep their original order.
     let decode_slot = runner
         .next_capture_slot(decode_count)
         .unwrap_or(decode_count);
-    let step_token_budget = runner
-        .mixed_step_token_budget()
-        .unwrap_or(cap_num_tokens)
-        .min(cap_num_tokens);
-    let mut admitted_cmds: Vec<PrefillBatchCmd> = Vec::with_capacity(pending_prefills.len());
-    let mut budget_tokens = 0usize;
-    let mut deferring = false;
-    for cmd in pending_prefills {
-        // Upper-bound token estimate (ignores prefix-cache hits) — fine for a
-        // packing budget.
-        let est = cmd.input_ids.len();
-        if deferring
-            || (!admitted_cmds.is_empty() && decode_slot + budget_tokens + est > step_token_budget)
-        {
-            deferring = true;
-            deferred_out.push(cmd);
-            continue;
-        }
-        budget_tokens += est;
-        admitted_cmds.push(cmd);
-    }
+    let admitted_len = runner.mixed_tuning.admission.admitted_prefix(
+        pending_prefills
+            .iter()
+            .map(|cmd| (cmd.input_ids.len(), cmd.segments.len())),
+        decode_slot,
+        runner.mixed_step_token_budget(),
+        cap_num_tokens,
+    );
+    let mut admitted_cmds = pending_prefills;
+    deferred_out.extend(admitted_cmds.drain(admitted_len..));
 
     // 3. Plan + allocate KV for every admitted prefill cmd. Reject cmds that
     //    would push the concurrent decode-row count past the batch cap.

@@ -1,13 +1,13 @@
 use super::block_quant_projection::BlockQuantProjection;
 use super::linear::Linear;
-use crate::domain::component::Hidden;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp, VocabOps};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use infer_core::component::Hidden;
+use infer_core::dtype::Dtype;
+use infer_core::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp, VocabOps};
 use infer_core::quantized::BlockQuantWeight;
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 #[derive(Clone)]
 pub enum EmbeddingWeight<T: Dtype, D: LlmBackend> {

@@ -20,18 +20,18 @@ use crate::components::norm::RmsNorm;
 use std::rc::Rc;
 
 use crate::domain::cache::{CacheLayout, ModelCacheView};
-use crate::domain::component::{Component, Hidden, LayerRange, StageKind};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
 use crate::domain::gdn_scratch::GdnScratch;
 use crate::domain::model::{DecoderModel, DecoderReadout, Logits, ModelDims, SampleRows};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
 use crate::models::layers::RMSNorm as LayerRmsNorm;
 use crate::models::loader::{LoadConfig, WeightLoader, compute_rope_cache};
+use infer_core::component::{Component, Hidden, LayerRange, StageKind};
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 const STAGES: [StageKind; 3] = [StageKind::Embed, StageKind::DecoderBlock, StageKind::LmHead];
 
@@ -693,7 +693,7 @@ mod tests {
     fn runner(num_blocks: usize, cap_batch: usize) -> Runtime<f32, Cpu, Decoder<f32, Cpu>> {
         Runtime::new(
             tiny_decoder(),
-            crate::domain::exec::HostScope::new(Cpu),
+            infer_core::exec::HostScope::new(Cpu),
             Box::new(GreedySampler),
             num_blocks,
             1,
@@ -736,10 +736,10 @@ mod tests {
 
     #[test]
     fn readout_composition_preserves_rows_and_owned_hidden() {
-        use crate::domain::plan::{BatchKind, BatchPlan};
+        use infer_core::plan::{BatchKind, BatchPlan};
         let mut model = tiny_decoder();
         model.install_scratch(ForwardScratch::new(&Cpu, model.dims(), 3, 1).unwrap());
-        let scope = crate::domain::exec::HostScope::new(Cpu);
+        let scope = infer_core::exec::HostScope::new(Cpu);
         let plan = BatchPlan {
             kind: BatchKind::Ragged,
             num_tokens: 3,

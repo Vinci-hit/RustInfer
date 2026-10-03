@@ -14,15 +14,15 @@ use safetensors::tensor::TensorView;
 use super::layers::{Embedding, Linear, RMSNorm};
 use crate::components::embed::{Embed as CompEmbed, EmbeddingParallelism};
 use crate::components::linear::{ExpertLinear, Linear as CompLinear, LinearParallelism};
-use crate::domain::dtype::Fp8E4m3;
-use crate::domain::dtype::quant::QuantScheme;
-use crate::domain::exec::RankPair;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{MemoryPort, OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::{DataType, Dtype, Shape};
 use crate::infrastructure::io::SafetensorsReader;
 use crate::infrastructure::io::safetensors::{LayerPrefetch, PrefetchedLayer};
+use infer_core::dtype::Fp8E4m3;
+use infer_core::dtype::quant::{QuantScheme, Symmetry};
+use infer_core::exec::RankPair;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{MemoryPort, OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{DataType, Dtype, Shape};
 
 /// Llama-3 NTK-aware RoPE scaling parameters.
 ///
@@ -801,36 +801,115 @@ impl<'a> WeightLoader<'a> {
     // unchanged. `N` is divisible by 8, so the zero-point rows (`[N/8, g]`,
     // packed 8-along-`N`) concatenate on a clean word boundary.
 
-    /// Vertically concatenate two same-width row-major safetensors views of
-    /// dtype `E` into a fresh device tensor `[rows_a + rows_b, cols]`. Bytes
-    /// are copied verbatim (no cast), so the view dtype must already be `E`.
-    fn fuse_rows_verbatim<E: Dtype, D: MemoryPort>(
+    /// Load and row-fuse compressed-tensors INT4 projections without expanding
+    /// the weights. Repack zero points across segment boundaries (N need not
+    /// be divisible by eight). Symmetric checkpoints omit zero points and
+    /// encode signed values with an unsigned offset of eight.
+    pub(crate) fn load_int4_parts<T: Dtype, D: OpBackend + LlmBackend>(
         &self,
-        a: &TensorView,
-        b: &TensorView,
-        what: &str,
+        parts: &[(&str, usize)],
+        cols: usize,
+        scheme: QuantScheme,
         device: &D,
-    ) -> OpResult<Tensor<E, D>> {
-        let (sa, sb) = (a.shape(), b.shape());
-        if sa.len() != 2 || sb.len() != 2 || sa[1] != sb[1] {
-            return Err(OpError::Shape(format!(
-                "{}: cannot fuse views of shape {:?} and {:?}",
-                what, sa, sb
-            )));
+    ) -> OpResult<CompLinear<T, D>> {
+        self.require_tp1("INT4 projection")?;
+        if parts.is_empty()
+            || cols == 0
+            || !cols.is_multiple_of(8)
+            || scheme.group == 0
+            || !scheme.group.is_multiple_of(8)
+            || !cols.is_multiple_of(scheme.group)
+        {
+            return Err(OpError::Shape(
+                "INT4 requires nonempty, aligned matrices and groups".into(),
+            ));
         }
-        if st_dtype(a)? != E::DATA_TYPE || st_dtype(b)? != E::DATA_TYPE {
-            return Err(OpError::Kernel(format!(
-                "{}: expected dtype {:?}, got {:?}/{:?}",
-                what,
-                E::DATA_TYPE,
-                a.dtype(),
-                b.dtype()
-            )));
+        let groups = cols / scheme.group;
+        let rows: usize = parts.iter().map(|(_, rows)| rows).sum();
+        let mut packed = Vec::new();
+        let mut scales = Vec::new();
+        let mut zeros = vec![0i32; rows.div_ceil(8) * groups];
+        let mut offset = 0;
+        for &(prefix, n) in parts {
+            let read = |suffix: &str| {
+                self.read_view(&format!("{prefix}.{suffix}"))
+                    .map_err(OpError::Kernel)
+            };
+            let w = read("weight_packed")?;
+            let scale = read("weight_scale")?;
+            if n == 0
+                || w.dtype() != safetensors::Dtype::I32
+                || w.shape() != [n, cols / 8]
+                || scale.shape() != [n, groups]
+                || !matches!(
+                    scale.dtype(),
+                    safetensors::Dtype::F16 | safetensors::Dtype::BF16 | safetensors::Dtype::F32
+                )
+            {
+                return Err(OpError::Shape(format!(
+                    "{prefix}: invalid INT4 packed weight/scale shape or dtype"
+                )));
+            }
+            if self.has_tensor(&format!("{prefix}.weight_g_idx")) {
+                return Err(OpError::unsupported(
+                    "INT4 loader",
+                    "activation-order permutations",
+                ));
+            }
+            if self.has_tensor(&format!("{prefix}.weight_shape")) {
+                let shape = read("weight_shape")?;
+                let expected: Vec<u8> = [n as i64, cols as i64]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                if shape.dtype() != safetensors::Dtype::I64
+                    || shape.shape() != [2]
+                    || shape.data() != expected
+                {
+                    return Err(OpError::Shape(format!(
+                        "{prefix}: invalid logical weight_shape"
+                    )));
+                }
+            }
+            let zp = if scheme.symmetry == Symmetry::Asymmetric {
+                let zp = read("weight_zero_point")?;
+                if zp.dtype() != safetensors::Dtype::I32 || zp.shape() != [n.div_ceil(8), groups] {
+                    return Err(OpError::Shape(format!(
+                        "{prefix}: invalid packed zero points"
+                    )));
+                }
+                Some(zp)
+            } else {
+                if self.has_tensor(&format!("{prefix}.weight_zero_point")) {
+                    return Err(OpError::Shape(format!(
+                        "{prefix}: symmetric INT4 must omit zero points"
+                    )));
+                }
+                None
+            };
+            for row in 0..n {
+                for g in 0..groups {
+                    let zero = if let Some(zp) = &zp {
+                        let at = ((row / 8) * groups + g) * 4;
+                        let word = i32::from_le_bytes(zp.data()[at..at + 4].try_into().unwrap());
+                        (word >> ((row % 8) * 4)) & 15
+                    } else {
+                        8
+                    };
+                    zeros[((offset + row) / 8) * groups + g] |= zero << (((offset + row) % 8) * 4);
+                }
+            }
+            packed.extend_from_slice(w.data());
+            scales.extend_from_slice(&safetensor_view_to_host_bytes::<T>(&scale)?);
+            offset += n;
         }
-        let mut host = Vec::with_capacity(a.data().len() + b.data().len());
-        host.extend_from_slice(a.data());
-        host.extend_from_slice(b.data());
-        Tensor::<E, D>::from_host_bytes(&host, Shape::from_slice(&[sa[0] + sb[0], sa[1]]), device)
+        Ok(CompLinear::from_awq(
+            Tensor::from_host_bytes(&packed, Shape::from_slice(&[rows, cols / 8]), device)?,
+            Tensor::from_host_slice(&zeros, [rows.div_ceil(8), groups], device)?,
+            Tensor::from_host_bytes(&scales, Shape::from_slice(&[rows, groups]), device)?,
+            scheme,
+            None,
+        ))
     }
 
     /// Load a single int4 (`pack-quantized`) projection — e.g. `down_proj` —
@@ -842,12 +921,18 @@ impl<'a> WeightLoader<'a> {
         scheme: QuantScheme,
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
-        self.require_tp1("AWQ row-parallel Linear")?;
-        let packed = self.load_tensor::<i32, D>(&format!("{}.weight_packed", prefix), device)?;
-        let zeros = self.load_tensor::<i32, D>(&format!("{}.weight_zero_point", prefix), device)?;
-        let scales = self.load_tensor::<T, D>(&format!("{}.weight_scale", prefix), device)?;
-        Ok(CompLinear::from_awq(packed, zeros, scales, scheme, None)
-            .with_parallelism(LinearParallelism::Row { tp: self.tp }))
+        let view = self
+            .read_view(&format!("{prefix}.weight_packed"))
+            .map_err(OpError::Kernel)?;
+        if view.shape().len() != 2 {
+            return Err(OpError::Shape("INT4 weight must be a matrix".into()));
+        }
+        self.load_int4_parts(
+            &[(prefix, view.shape()[0])],
+            view.shape()[1] * 8,
+            scheme,
+            device,
+        )
     }
 
     /// Load int4 `gate_proj` + `up_proj` fused along rows into one quantized
@@ -859,37 +944,19 @@ impl<'a> WeightLoader<'a> {
         scheme: QuantScheme,
         device: &D,
     ) -> OpResult<CompLinear<T, D>> {
-        self.require_tp1("AWQ column-parallel gate/up")?;
-        let view = |proj: &str, part: &str| -> OpResult<TensorView<'_>> {
-            let name = format!("{}.{}.{}", mlp_prefix, proj, part);
-            self.read_view(&name)
-                .map_err(|e| OpError::Kernel(format!("{}: {}", name, e)))
-        };
-        let packed = self.fuse_rows_verbatim::<i32, D>(
-            &view("gate_proj", "weight_packed")?,
-            &view("up_proj", "weight_packed")?,
-            "fused_gate_up_awq packed",
+        let gate = format!("{mlp_prefix}.gate_proj");
+        let up = format!("{mlp_prefix}.up_proj");
+        let view = self
+            .read_view(&format!("{gate}.weight_packed"))
+            .map_err(OpError::Kernel)?;
+        if view.shape().len() != 2 {
+            return Err(OpError::Shape("INT4 weight must be a matrix".into()));
+        }
+        self.load_int4_parts(
+            &[(&gate, view.shape()[0]), (&up, view.shape()[0])],
+            view.shape()[1] * 8,
+            scheme,
             device,
-        )?;
-        let zeros = self.fuse_rows_verbatim::<i32, D>(
-            &view("gate_proj", "weight_zero_point")?,
-            &view("up_proj", "weight_zero_point")?,
-            "fused_gate_up_awq zeros",
-            device,
-        )?;
-        let scales = self.fuse_rows_verbatim::<T, D>(
-            &view("gate_proj", "weight_scale")?,
-            &view("up_proj", "weight_scale")?,
-            "fused_gate_up_awq scales",
-            device,
-        )?;
-        Ok(
-            CompLinear::from_awq(packed, zeros, scales, scheme, None).with_parallelism(
-                LinearParallelism::Column {
-                    tp: self.tp,
-                    gather_output: false,
-                },
-            ),
         )
     }
 }
@@ -1697,9 +1764,7 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
                 i32::from_le_bytes(b.try_into().unwrap()) as f64
             }
             DataType::I8 => src[i] as i8 as f64,
-            DataType::F8E4M3 => {
-                <Fp8E4m3 as crate::domain::dtype::Dtype>::read_f64(&Fp8E4m3(src[i]))
-            }
+            DataType::F8E4M3 => <Fp8E4m3 as infer_core::dtype::Dtype>::read_f64(&Fp8E4m3(src[i])),
         };
         unsafe {
             match dst_dt {
@@ -1735,7 +1800,7 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
                     *dst.add(i) = val as i8 as u8;
                 }
                 DataType::F8E4M3 => {
-                    *dst.add(i) = <Fp8E4m3 as crate::domain::dtype::Dtype>::write_f64(val).0;
+                    *dst.add(i) = <Fp8E4m3 as infer_core::dtype::Dtype>::write_f64(val).0;
                 }
             }
         }
@@ -1823,11 +1888,11 @@ mod tp_tests {
         prepare_matrix_shard, prepare_vector_shard, validate_tp,
     };
     use crate::components::linear::LinearParallelism;
-    use crate::domain::exec::RankPair;
-    use crate::domain::tensor::Tensor;
-    use crate::domain::types::Shape;
     use crate::infrastructure::cpu::Cpu;
     use half::bf16;
+    use infer_core::exec::RankPair;
+    use infer_core::tensor::Tensor;
+    use infer_core::types::Shape;
     use safetensors::{Dtype, tensor::TensorView};
 
     #[test]
@@ -2163,12 +2228,12 @@ mod fp8_tests {
         Fp8ViewPart, MatrixShardAxis, prepare_fp8_fused_host, prepare_fp8_fused_output_shards,
         prepare_fp8_fused_shard,
     };
-    use crate::domain::dtype::Fp8E4m3;
-    use crate::domain::exec::RankPair;
-    use crate::domain::tensor::Tensor;
-    use crate::domain::types::Shape;
     use crate::infrastructure::cpu::Cpu;
     use half::bf16;
+    use infer_core::dtype::Fp8E4m3;
+    use infer_core::exec::RankPair;
+    use infer_core::tensor::Tensor;
+    use infer_core::types::Shape;
     use safetensors::{Dtype, tensor::TensorView};
 
     fn bf16_bytes(values: &[f32]) -> Vec<u8> {
@@ -2405,3 +2470,7 @@ mod fp8_tests {
         assert!(format!("{err:?}").contains("non-finite"));
     }
 }
+
+#[cfg(test)]
+#[path = "int4_tests.rs"]
+mod int4_tests;

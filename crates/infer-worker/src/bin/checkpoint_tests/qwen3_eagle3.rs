@@ -1,14 +1,13 @@
 use super::speculative_checkpoint_support::{indices, pool};
 use super::*;
-use infer_worker::domain::{
-    ExecScope,
-    cache::ModelCacheView,
+use infer_core::{
     component::{Hidden, LayerRange},
-    draft::ConditionedDraft,
-    exec::StepCtx,
-    features::TargetFeatures,
-    forward_scratch::ForwardScratch,
+    exec::{ExecScope, StepCtx},
     tensor::Tensor,
+};
+use infer_worker::domain::{
+    cache::ModelCacheView, draft::ConditionedDraft, features::TargetFeatures,
+    forward_scratch::ForwardScratch,
 };
 
 #[test]
@@ -48,7 +47,13 @@ fn qwen3_eagle3_checkpoint() {
     .unwrap();
     println!("Detected format: {:?}", checkpoint.format());
     let mut head = checkpoint
-        .build::<bf16, Cuda>(&loader, dims, model.embed.require_dense().unwrap(), n + 16, &cuda)
+        .build::<bf16, Cuda>(
+            &loader,
+            dims,
+            model.embed.require_dense().unwrap(),
+            n + 16,
+            &cuda,
+        )
         .unwrap();
     head.prepare(n, 1).unwrap();
     let read = |name: &str| -> Vec<f32> {
@@ -151,7 +156,7 @@ fn qwen3_eagle3_checkpoint() {
         .unwrap();
     compare("logits", &logits, 0.04);
     if let Some(map) = head.token_map() {
-        use infer_worker::domain::ports::FusedOps;
+        use infer_core::ports::FusedOps;
         let mut ids = Tensor::from_host_slice(
             &[0, (map.numel() - 1) as i32, -1, map.numel() as i32],
             [4],

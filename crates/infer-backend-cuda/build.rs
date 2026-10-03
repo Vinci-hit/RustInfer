@@ -172,6 +172,32 @@ fn main() {
             }
         }
 
+        println!("cargo:rerun-if-env-changed=RUSTINFER_CUTE_ATTENTION");
+        let cute_attention = env::var("RUSTINFER_CUTE_ATTENTION").is_ok_and(|v| v == "1");
+        if cute_attention {
+            assert_eq!(cuda_arch, "sm_89", "CuTe attention currently targets sm_89");
+            println!("cargo:rerun-if-changed=cute_dsl");
+            let python =
+                env::var_os("RUSTINFER_CUTE_DSL_PYTHON").unwrap_or_else(|| "python3".into());
+            let result = std::process::Command::new(python)
+                .arg(root.join("cute_dsl/compile_attention.py"))
+                .arg("--out-dir")
+                .arg(env::var_os("OUT_DIR").unwrap())
+                .output()
+                .expect("Could not run CuTe attention AOT compiler");
+            assert!(
+                result.status.success(),
+                "CuTe attention AOT failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            println!(
+                "cargo:rustc-link-search=native={}",
+                cuda_path.join("lib64/stubs").display()
+            );
+            println!("cargo:rustc-link-lib=cuda");
+        }
+
         // 2. 配置 cc 编译器
         let mut build = cc::Build::new();
         build
@@ -184,6 +210,10 @@ fn main() {
             .include(&cudnn_frontend_include)
             .flag("-std=c++17")
             .flag(format!("-arch={}", cuda_arch));
+        if cute_attention {
+            build.define("RUSTINFER_CUTE_ATTENTION_SM89", None);
+            build.include(env::var_os("OUT_DIR").unwrap());
+        }
         for spec in CUDA_ARCHIVES
             .iter()
             .filter(|spec| spec.supports(&cuda_arch))

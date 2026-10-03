@@ -4,13 +4,13 @@ use crate::application::execution::{ExecutionMetrics, ExecutionPlan, Phase, Work
 use crate::domain::cache::ModelCacheView;
 use crate::domain::draft::ConditionedDraft;
 use crate::domain::draft_scratch::DraftWorkspace;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::{ExecScope, StepCtx};
-use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
-use crate::domain::plan::BatchPlan;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::{ExecScope, StepCtx};
+use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+use infer_core::plan::BatchPlan;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 /// One sequence's draft state. Speculative writes never advance `alignment`.
 /// Catch-up overwrites them using actual target hidden states after verification,

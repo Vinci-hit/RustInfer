@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Start the lockfile-pinned Tailwind CSS watcher in background.
+# Both commands use the project's pinned dependencies.
+npm run build:css
 npm run tailwind &
 TAILWIND_PID=$!
+trap 'kill "$TAILWIND_PID" 2>/dev/null || true' EXIT INT TERM
 
-# Start Dioxus dev server
-dx serve --port 3000
-
-# Kill Tailwind when dx serve exits
-kill $TAILWIND_PID
+dx serve --platform web --port 3000 "$@"

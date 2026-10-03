@@ -9,6 +9,7 @@ pub mod execution;
 pub mod hosting;
 #[cfg(feature = "cuda")]
 pub mod kv_relief;
+pub(crate) mod mixed_tuning;
 pub mod runtime;
 pub mod sampler_stack;
 #[cfg(feature = "cuda")]

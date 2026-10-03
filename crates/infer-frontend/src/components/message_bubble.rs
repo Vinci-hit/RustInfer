@@ -1,118 +1,57 @@
-use crate::state::conversation::Message;
-use crate::utils::markdown::render_markdown;
+use super::icon::Icon;
+use crate::{
+    state::{conversation::Message, workspace::Workspace},
+    utils::markdown::render_markdown,
+};
 use dioxus::prelude::*;
 
 #[component]
-pub fn MessageBubble(message: Message) -> Element {
+pub fn MessageBubble(
+    message: Message,
+    model: String,
+    can_retry: bool,
+    on_retry: EventHandler<()>,
+) -> Element {
+    let mut workspace = use_context::<Workspace>();
+    let mut copied = use_signal(|| false);
     let is_user = message.role == "user";
-    let is_streaming = message.is_streaming;
-
+    let markdown = render_markdown(&message.content);
+    let text = message.content.clone();
+    let model = message.model.as_deref().unwrap_or(&model);
+    let copy_icon = if copied() { "check" } else { "copy" };
     rsx! {
-        div {
-            class: "animate-slide-up",
-
-            div {
-                class: if is_user {
-                    "flex justify-end"
+        article { class: if is_user { "message user-message" } else { "message assistant-message" },
+            div { class: if is_user { "message-avatar user-avatar" } else { "message-avatar assistant-avatar" }, if is_user { "你" } else { "R" } }
+            div { class: "message-body",
+                div { class: "message-meta", strong { if is_user { "你" } else { "RustInfer" } } if !is_user { span { "{model}" } } }
+                if !message.attachments.is_empty() {
+                    div { class: "message-images", for attachment in &message.attachments {
+                        a { href: "{attachment.data_url}", target: "_blank", rel: "noopener noreferrer", title: "{attachment.name}", img { src: "{attachment.data_url}", alt: "{attachment.name}", loading: "lazy" } }
+                    } }
+                }
+                if is_user { div { class: "user-text", "{message.content}" } }
+                else if message.is_streaming && message.content.is_empty() {
+                    div { class: "thinking", role: "status", span {} span {} span {} "正在思考" }
                 } else {
-                    "flex justify-start"
-                },
-
-                div {
-                    class: if is_user {
-                        "max-w-[75%] rounded-2xl rounded-br-md px-5 py-3 bg-gradient-to-br from-indigo-600 to-purple-600 text-white shadow-lg shadow-indigo-500/20"
-                    } else {
-                        "max-w-[85%] rounded-2xl rounded-bl-md px-5 py-3 bg-[var(--color-surface-2)] border border-[var(--color-border)] text-[var(--color-text-primary)]"
-                    },
-
-                    // Role label
-                    div {
-                        class: "flex items-center gap-2 mb-2",
-
-                        // Avatar
-                        div {
-                            class: if is_user {
-                                "w-5 h-5 rounded-full bg-white/20 flex items-center justify-center"
-                            } else {
-                                "w-5 h-5 rounded-full bg-gradient-to-br from-emerald-400 to-cyan-400 flex items-center justify-center"
-                            },
-                            span {
-                                class: "text-[10px] font-bold",
-                                if is_user { "U" } else { "AI" }
-                            }
-                        }
-
-                        span {
-                            class: if is_user {
-                                "text-xs font-medium text-white/70 uppercase"
-                            } else {
-                                "text-xs font-medium text-[var(--color-text-muted)] uppercase"
-                            },
-                            if is_user { "You" } else { "Assistant" }
-                        }
-                    }
-
-                    // Content
-                    if is_user {
-                        div {
-                            class: "text-sm leading-relaxed whitespace-pre-wrap",
-                            "{message.content}"
-                        }
-                    } else if is_streaming && message.content.is_empty() {
-                        crate::components::streaming_indicator::StreamingIndicator {}
-                    } else {
-                        div {
-                            class: "text-sm leading-relaxed markdown-body",
-                            dangerous_inner_html: "{render_markdown(&message.content)}"
-                        }
-                        if is_streaming {
-                            span {
-                                class: "inline-block w-2 h-4 bg-[var(--color-accent)] animate-pulse rounded-sm ml-1"
-                            }
-                        }
-                    }
-
-                    // Performance metrics badge
-                    if let Some(metrics) = &message.metrics {
-                        div {
-                            class: "mt-3 pt-2 border-t border-white/10 flex flex-wrap gap-3",
-
-                            div {
-                                class: "flex items-center gap-1 text-xs",
-                                span { class: "text-emerald-400", "⚡" }
-                                span {
-                                    class: if is_user { "text-white/60" } else { "text-[var(--color-text-muted)]" },
-                                    "{metrics.tokens_per_second:.1} tok/s"
-                                }
-                            }
-
-                            div {
-                                class: "flex items-center gap-1 text-xs",
-                                span { class: "text-blue-400", "◆" }
-                                span {
-                                    class: if is_user { "text-white/60" } else { "text-[var(--color-text-muted)]" },
-                                    "Prefill {metrics.prefill_ms}ms"
-                                }
-                            }
-
-                            div {
-                                class: "flex items-center gap-1 text-xs",
-                                span { class: "text-purple-400", "◇" }
-                                span {
-                                    class: if is_user { "text-white/60" } else { "text-[var(--color-text-muted)]" },
-                                    "Decode {metrics.decode_ms}ms"
-                                }
-                            }
-
-                            div {
-                                class: "flex items-center gap-1 text-xs",
-                                span { class: "text-yellow-400", "●" }
-                                span {
-                                    class: if is_user { "text-white/60" } else { "text-[var(--color-text-muted)]" },
-                                    "{metrics.total_tokens} tokens"
-                                }
-                            }
-                        }
+                    div { class: "markdown-body", dangerous_inner_html: "{markdown}" }
+                    if message.is_streaming { span { class: "typing-cursor", aria_label: "正在生成" } }
+                }
+                if let Some(error) = &message.error { div { class: "message-error", role: "alert", Icon { name: "info", size: 15 } span { "{error}" } } }
+                if message.interrupted { p { class: "message-interrupted", "已停止生成" } }
+                if !is_user && !message.is_streaming {
+                    div { class: "message-actions",
+                        button { class: "message-action", aria_label: "复制回复", title: "复制回复", disabled: text.is_empty(), onclick: move |_| {
+                            let content = text.clone();
+                            spawn(async move {
+                                let eval = document::eval("const text = await dioxus.recv(); try { await navigator.clipboard.writeText(text); return true; } catch { return false; }");
+                                let _ = eval.send(content);
+                                if eval.join::<bool>().await.unwrap_or(false) {
+                                    copied.set(true); gloo_timers::future::TimeoutFuture::new(2000).await; copied.set(false);
+                                } else { workspace.notice.set(Some("复制失败，请选择回复文字手动复制。".into())); }
+                            });
+                        }, Icon { name: copy_icon, size: 14 } if copied() { "已复制" } }
+                        if can_retry { button { class: "message-action", title: "重新生成", aria_label: "重新生成", onclick: move |_| on_retry.call(()), Icon { name: "refresh", size: 14 } "重新生成" } }
+                        if let Some(metrics) = &message.metrics { span { class: "message-token-count", "{metrics.total_tokens} tokens" } }
                     }
                 }
             }

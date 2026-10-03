@@ -11,16 +11,15 @@ use crate::components::{
     Attention, DecoderBlock, DenseFfn, Embed, FullAttention, GatedDeltaNet, GdnWeights, Linear,
     LmHead, RmsNorm,
 };
-use crate::domain::{
-    cache::LinearDims,
-    dtype::Dtype,
-    model::ModelDims,
-    ports::{OpError, OpResult, backend::LlmBackend},
-    tensor::Tensor,
-};
+use crate::domain::{cache::LinearDims, model::ModelDims};
 use crate::infrastructure::io::gguf::{GgmlType, GgufReader};
 use crate::models::decoder::Decoder;
 use infer_core::dtype::DTypeId;
+use infer_core::{
+    dtype::Dtype,
+    ports::{OpError, OpResult, backend::LlmBackend},
+    tensor::Tensor,
+};
 use std::collections::{BTreeMap, HashSet};
 use weights::{Transform, Weights};
 
@@ -228,6 +227,7 @@ impl<'a> Qwen35GgufLoader<'a> {
             });
         }
         Ok(Qwen3_5Model {
+            eager_ragged: true,
             decoder: Decoder::new(
                 embed,
                 blocks,

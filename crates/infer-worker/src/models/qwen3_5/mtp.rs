@@ -49,7 +49,7 @@ impl<T: Dtype, D: OpBackend + LlmBackend> Qwen3_5Model<T, D> {
         let norm = |name: &str| load_norm(loader, name, cfg.dim, cfg.rms_norm_eps, device);
         let embedding_norm = norm("mtp.pre_fc_norm_embedding.weight")?;
         let hidden_norm = norm("mtp.pre_fc_norm_hidden.weight")?;
-        let fc = load_linear(loader, "mtp.fc.weight", cfg.dim, 2 * cfg.dim, device)?;
+        let fc = load_linear(loader, "mtp.fc.weight", cfg.dim, 2 * cfg.dim, None, device)?;
         let (sin, cos) = compute_rope_cache(
             cfg.seq_len,
             cfg.rotary_dim,
@@ -121,6 +121,7 @@ fn load_full_attention<T: Dtype, D: OpBackend + LlmBackend>(
                 &format!("{layer}.self_attn.o_proj.weight"),
                 cfg.dim,
                 q_dim,
+                None,
                 device,
             )?,
             q_norm: Some(load_norm(
@@ -174,6 +175,7 @@ fn load_dense_ffn<T: Dtype, D: OpBackend + LlmBackend>(
             &format!("{layer}.mlp.down_proj.weight"),
             cfg.dim,
             cfg.intermediate_size,
+            None,
             device,
         )?,
         scratch: None,
@@ -186,16 +188,16 @@ mod tests {
     use crate::application::speculative::prefill::MtpPrefill;
     use crate::components::mtp::MtpInput;
     use crate::domain::cache::ModelCacheView;
-    use crate::domain::exec::StepCtx;
-    use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
-    use crate::domain::plan::{BatchKind, BatchPlan};
-    use crate::domain::tensor::Tensor;
+    use infer_core::exec::StepCtx;
+    use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+    use infer_core::plan::{BatchKind, BatchPlan};
+    use infer_core::tensor::Tensor;
 
     #[test]
     fn eager_session_handles_chunked_prefill_budgets_eos_and_reuse() {
         use crate::application::speculative::{MtpLimits, MtpSession};
-        use crate::domain::exec::HostScope;
         use crate::infrastructure::cpu::Cpu;
+        use infer_core::exec::HostScope;
         let mut cfg = super::super::tests::config();
         cfg.seq_len = 32;
         let reader = super::super::tests::checkpoint(true);
@@ -258,7 +260,7 @@ mod tests {
             }
         }
     }
-    fn indices<D: crate::domain::ports::backend::LlmBackend>(
+    fn indices<D: infer_core::ports::backend::LlmBackend>(
         start: usize,
         n: usize,
         blocks: usize,
@@ -303,7 +305,7 @@ mod tests {
         };
         (plan, idx)
     }
-    fn pool<T: crate::domain::dtype::Dtype, D: crate::domain::ports::backend::LlmBackend>(
+    fn pool<T: infer_core::dtype::Dtype, D: infer_core::ports::backend::LlmBackend>(
         layers: usize,
         blocks: usize,
         kv_dim: usize,
@@ -379,7 +381,7 @@ mod tests {
             &Cpu,
         )
         .unwrap();
-        let scope = crate::domain::exec::HostScope::new(Cpu);
+        let scope = infer_core::exec::HostScope::new(Cpu);
         let mut expected: Option<Vec<f32>> = None;
         for cuts in [vec![5], vec![1, 2, 3, 4, 5], vec![2, 4, 5]] {
             let mut kv = pool(1, 8, 4, &Cpu);

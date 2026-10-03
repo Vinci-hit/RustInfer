@@ -1,10 +1,10 @@
 use super::block_quant_projection::BlockQuantProjection;
-use crate::domain::dtype::quant::QuantScheme;
-use crate::domain::dtype::{Dtype, Fp8E4m3};
-use crate::domain::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::quant::QuantScheme;
+use infer_core::dtype::{Dtype, Fp8E4m3};
+use infer_core::exec::{ExecDevice, ExecScope, RankPair, StepCtx};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp};
+use infer_core::tensor::Tensor;
 
 /// A linear layer's weight: dense, AWQ, FP8, or encoded block matrices.
 ///
@@ -534,10 +534,10 @@ impl<T: Dtype, D: LlmBackend> Linear<T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::exec::{HostScope, StepCtx, TopologyShape};
-    use crate::domain::plan::{BatchKind, BatchPlan};
-    use crate::domain::ports::OpError;
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::exec::{HostScope, StepCtx, TopologyShape};
+    use infer_core::plan::{BatchKind, BatchPlan};
+    use infer_core::ports::OpError;
 
     #[test]
     fn linear_defaults_to_replicated_tp1() {

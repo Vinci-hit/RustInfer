@@ -1,10 +1,10 @@
 use crate::application::runtime::{Runtime, run_layers_for_tap};
-use crate::domain::component::LayerRange;
-use crate::domain::dtype::Dtype;
 use crate::domain::model::{DecoderModel, ModelDims};
 use crate::domain::plan::{HiddenTap, StepOutput, StepRequest};
-use crate::domain::ports::OpResult;
-use crate::domain::ports::backend::LlmBackend;
+use infer_core::component::LayerRange;
+use infer_core::dtype::Dtype;
+use infer_core::ports::OpResult;
+use infer_core::ports::backend::LlmBackend;
 
 pub trait ErasedRuntime<T: Dtype, D: LlmBackend>: Send {
     fn step(&mut self, req: &StepRequest) -> OpResult<StepOutput>;
@@ -47,5 +47,5 @@ pub enum ModelRole {
 pub struct ModelHost<T: Dtype, D: LlmBackend> {
     pub primary: Box<dyn ErasedRuntime<T, D>>,
     pub aux: Vec<(ModelRole, Box<dyn ErasedRuntime<T, D>>)>,
-    pub topology: crate::domain::exec::TopologyShape,
+    pub topology: infer_core::exec::TopologyShape,
 }

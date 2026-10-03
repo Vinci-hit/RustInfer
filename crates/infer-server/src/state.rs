@@ -25,6 +25,10 @@ pub struct AppState {
     pub client: ZmqClient,
     /// Tokenizer（Server 端负责 encode/decode）
     pub tokenizer: Arc<Tokenizer>,
+    /// GGUF owns its tokenizer and chat template; no external HF files required.
+    pub gguf_text: Option<Arc<infer_gguf::text::GgufText>>,
+    /// Includes added tokens; compute once because get_vocab_size(true) copies the vocabulary.
+    pub tokenizer_vocab_size: usize,
     /// 服务器配置（来自共享 TOML）
     pub config: RustInferConfig,
     /// 服务端实际加载的模型类型（从 config.json 解析，用于 chat template）

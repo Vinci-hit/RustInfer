@@ -6,6 +6,7 @@ members = [
     "crates/infer-protocol",
     "crates/infer-scheduler",
     "crates/infer-core",
+    "crates/infer-gguf",
     "crates/infer-backend-cpu",
     "crates/infer-backend-cuda"
 ]

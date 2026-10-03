@@ -1,6 +1,6 @@
 //! Qwen3.5 ViT: non-causal attention, 2D rotary positions and patch merger.
 use super::*;
-use crate::domain::exec::ExecScope;
+use infer_core::exec::ExecScope;
 use infer_protocol::multimodal::{ImageInput, PATCH_WIDTH};
 use serde::Deserialize;
 
@@ -112,7 +112,7 @@ impl<T: Dtype, D: OpBackend + LlmBackend> VisionEncoder<T, D> {
             device,
         )?;
         let patch = Projection {
-            weight: patch_weight.view_contiguous(crate::domain::types::Shape::from_slice(&[
+            weight: patch_weight.view_contiguous(infer_core::types::Shape::from_slice(&[
                 c.hidden_size,
                 PATCH_WIDTH,
             ]))?,
@@ -231,13 +231,11 @@ impl<T: Dtype, D: LlmBackend> VisionEncoder<T, D> {
                 if j < 2 {
                     D::rope_with_angles(scope, &mut out, &sin, &cos, hd)?;
                 }
-                split.push(
-                    out.view_contiguous(crate::domain::types::Shape::from_slice(&[
-                        n,
-                        c.num_heads,
-                        hd,
-                    ]))?,
-                );
+                split.push(out.view_contiguous(infer_core::types::Shape::from_slice(&[
+                    n,
+                    c.num_heads,
+                    hd,
+                ]))?);
             }
             let mut attn = Tensor::zeros([n, c.num_heads, hd], scope.device())?;
             D::sdpa(
@@ -253,7 +251,7 @@ impl<T: Dtype, D: LlmBackend> VisionEncoder<T, D> {
                 (hd as f32).sqrt().recip(),
             )?;
             let attn =
-                attn.view_contiguous(crate::domain::types::Shape::from_slice(&[n, c.hidden_size]))?;
+                attn.view_contiguous(infer_core::types::Shape::from_slice(&[n, c.hidden_size]))?;
             let out = block.proj.forward(&attn, scope)?;
             D::add_inplace(scope, &mut x, &out)?;
             let norm = block.norm2.forward(&x, scope)?;
@@ -264,7 +262,7 @@ impl<T: Dtype, D: LlmBackend> VisionEncoder<T, D> {
             trace(&format!("block{i}"), &x)?;
         }
         let norm = self.norm.forward(&x, scope)?;
-        let merged = norm.view_contiguous(crate::domain::types::Shape::from_slice(&[
+        let merged = norm.view_contiguous(infer_core::types::Shape::from_slice(&[
             n / 4,
             4 * c.hidden_size,
         ]))?;

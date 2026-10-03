@@ -3,10 +3,10 @@ use crate::application::runtime::Runtime;
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
-use crate::domain::ports::{OpError, OpResult};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::{control_pump::ControlPump, data_pump::DataPump};
 use half::bf16;
+use infer_core::ports::{OpError, OpResult};
 use infer_protocol::scheduler_to_worker_data::PrefillBatchCmd;
 
 pub struct ServingStep<'a, M: DecoderModel<bf16, Cuda>> {

@@ -3,15 +3,15 @@ use std::rc::Rc;
 use crate::components::ffn_dense::DenseFfn;
 use crate::components::moe_local::MoeLocalPipeline;
 use crate::components::norm::RmsNorm;
-use crate::domain::component::{Component, Hidden, StageKind};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::{DeviceId, ExecDevice, ExecScope, StepCtx};
 use crate::domain::forward_scratch::ForwardScratch;
-use crate::domain::kv::KvView;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use infer_core::component::{Component, Hidden, StageKind};
+use infer_core::dtype::Dtype;
+use infer_core::exec::{DeviceId, ExecDevice, ExecScope, StepCtx};
+use infer_core::kv::KvView;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 /// Pre-norm, single-device sparse MoE FFN sublayer.
 ///
@@ -211,9 +211,9 @@ fn validate_tensor<T: Dtype, D: LlmBackend>(
 mod tests {
     use super::*;
     use crate::components::{ExpertLinear, Linear, MoeExperts};
-    use crate::domain::exec::{HostScope, StepCtx};
-    use crate::domain::plan::{BatchKind, BatchPlan};
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::exec::{HostScope, StepCtx};
+    use infer_core::plan::{BatchKind, BatchPlan};
 
     fn decode_plan(tokens: usize) -> BatchPlan {
         BatchPlan {

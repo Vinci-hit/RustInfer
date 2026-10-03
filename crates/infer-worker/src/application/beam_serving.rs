@@ -2,11 +2,10 @@
 //! recurrent slots and the same physical KV allocator as ordinary decoding.
 use super::beam_search::{BeamSearch, BeamSearchConfig};
 use super::runtime::Runtime;
-use crate::domain::{
+use crate::domain::{global_kv_alloc::GlobalKvAllocator, model::DecoderModel};
+use infer_core::{
     dtype::Dtype,
     exec::ExecScope,
-    global_kv_alloc::GlobalKvAllocator,
-    model::DecoderModel,
     ports::{OpError, OpResult, backend::LlmBackend},
     tensor::Tensor,
 };

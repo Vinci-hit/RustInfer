@@ -13,10 +13,10 @@ Generation used Python 3.12 and NumPy 2.5.2. Place that checkout's `gguf-py`
 directory on `PYTHONPATH`, then run from the RustInfer root:
 
 ```bash
-PYTHONPATH=/path/to/llama.cpp/gguf-py python crates/infer-worker/tests/fixtures/gguf/generate.py
-cargo test -p infer-worker --no-default-features --lib infrastructure::io
+PYTHONPATH=/path/to/llama.cpp/gguf-py python crates/infer-gguf/tests/fixtures/gguf/generate.py
+cargo test -p infer-gguf --lib reader
 cargo test -p infer-worker --no-default-features --test gguf
-cargo test -p infer-worker --no-default-features --doc infrastructure::io::gguf
+cargo test -p infer-gguf --doc
 ```
 
 To compare a real file, generate its independent manifest and explicitly enable
@@ -24,7 +24,7 @@ the ignored integration test. Use an **absolute** manifest path, because Cargo
 runs integration tests from the crate directory:
 
 ```bash
-PYTHONPATH=/path/to/llama.cpp/gguf-py python crates/infer-worker/tests/fixtures/gguf/generate.py \
+PYTHONPATH=/path/to/llama.cpp/gguf-py python crates/infer-gguf/tests/fixtures/gguf/generate.py \
   --model /absolute/path/model.gguf --output /tmp/model.reference.json
 RUSTINFER_GGUF_REFERENCE=/tmp/model.reference.json \
   cargo test -p infer-worker --no-default-features --test gguf gguf_local_model -- --ignored --nocapture

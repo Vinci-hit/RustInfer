@@ -35,6 +35,7 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> anyh
             post(api::openai::completion::completions).layer(admission),
         )
         .route("/v1/models", get(api::openai::models::list_models))
+        .route("/v1/capabilities", get(api::capabilities::get_capabilities))
         // 运维端点
         .route("/health", get(api::health::health_check))
         .route("/ready", get(api::health::ready_check))

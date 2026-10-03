@@ -1,12 +1,12 @@
 //! Scalar reference operations. GEMMs use the selected backend; these small
 //! operations intentionally synchronize through host memory during bring-up.
-use crate::domain::{
+use crate::models::loader::WeightLoader;
+use infer_core::{
     dtype::Dtype,
     exec::ExecScope,
     ports::{OpError, OpResult, backend::LlmBackend},
     tensor::Tensor,
 };
-use crate::models::loader::WeightLoader;
 
 pub(super) fn round<T: Dtype>(x: f32) -> f32 {
     T::read_f64(&T::write_f64(x as f64)) as f32

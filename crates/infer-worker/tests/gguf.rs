@@ -118,7 +118,7 @@ fn compare(path: &Path, reference: &Value) -> GgufReader {
 
 #[test]
 fn gguf_upstream_fixture() {
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gguf");
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../infer-gguf/tests/fixtures/gguf");
     let reference: Value =
         serde_json::from_slice(&std::fs::read(base.join("reference.json")).unwrap()).unwrap();
     compare(&base.join("reference.gguf"), &reference);

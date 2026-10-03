@@ -1,16 +1,16 @@
 use super::*;
+use infer_core::component::{Hidden, LayerRange};
+use infer_core::exec::StepCtx;
+use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+use infer_core::plan::{BatchKind, BatchPlan};
+use infer_core::tensor::Tensor;
 use infer_worker::application::speculative::prefill::MtpPrefill;
 use infer_worker::components::mtp::MtpInput;
 use infer_worker::domain::cache::{LinearBatch, LinearLayerState, ModelCacheView};
-use infer_worker::domain::component::{Hidden, LayerRange};
-use infer_worker::domain::exec::StepCtx;
 use infer_worker::domain::forward_scratch::ForwardScratch;
 use infer_worker::domain::gdn_scratch::GdnScratch;
-use infer_worker::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use infer_worker::domain::model::DecoderReadout;
-use infer_worker::domain::plan::{BatchKind, BatchPlan};
-use infer_worker::domain::tensor::Tensor;
-fn indices<D: infer_worker::domain::ports::backend::LlmBackend>(
+fn indices<D: infer_core::ports::backend::LlmBackend>(
     start: usize,
     n: usize,
     blocks: usize,
@@ -55,10 +55,7 @@ fn indices<D: infer_worker::domain::ports::backend::LlmBackend>(
     };
     (plan, idx)
 }
-fn pool<
-    T: infer_worker::domain::dtype::Dtype,
-    D: infer_worker::domain::ports::backend::LlmBackend,
->(
+fn pool<T: infer_core::dtype::Dtype, D: infer_core::ports::backend::LlmBackend>(
     layers: usize,
     blocks: usize,
     kv_dim: usize,

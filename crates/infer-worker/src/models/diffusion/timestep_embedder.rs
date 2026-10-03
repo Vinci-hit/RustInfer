@@ -4,10 +4,10 @@
 //! `frequency_embedding_size = 256` (= ADALN_EMBED_DIM), an MLP with
 //! `mid = 1024`, output dim = 256, SiLU between layers.
 
-use crate::domain::ports::{OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Dtype;
 use crate::models::layers::Linear;
+use infer_core::ports::{OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Dtype;
 
 pub struct TimestepEmbedder<T: Dtype, D: OpBackend> {
     pub mlp1: Linear<T, D>,
@@ -63,10 +63,10 @@ impl<T: Dtype, D: OpBackend> TimestepEmbedder<T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::tensor::Tensor;
-    use crate::domain::types::Shape;
     use crate::infrastructure::cuda::Cuda;
     use crate::models::layers::Linear;
+    use infer_core::tensor::Tensor;
+    use infer_core::types::Shape;
 
     /// Build a tiny embedder with identity-like weights so we can verify the
     /// sinusoid → MLP path numerically end-to-end. mlp1 is `[mid, freq_dim]`

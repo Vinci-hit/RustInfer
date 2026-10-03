@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use crate::domain::ports::{OpError, OpResult, SampledToken};
+use infer_core::ports::{OpError, OpResult, SampledToken};
 
 /// A verification decision; it does not commit or mutate model state.
 ///

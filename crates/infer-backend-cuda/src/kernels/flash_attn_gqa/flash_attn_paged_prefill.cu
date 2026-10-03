@@ -22,6 +22,10 @@
 #include <cstdio>
 #include <cmath>
 
+#ifdef RUSTINFER_CUTE_ATTENTION_SM89
+#include "cute_attention_sm89.cuh"
+#endif
+
 namespace flash_attn_paged_prefill {
 
 using namespace cute;
@@ -661,6 +665,9 @@ static cudaError_t init_kernel_attributes(int max_dynamic_smem)
 extern "C" int rustinfer_flash_attn_paged_prefill_init_kernel_attributes(
     int max_dynamic_smem)
 {
+#ifdef RUSTINFER_CUTE_ATTENTION_SM89
+    if (int rc = cute_attention_sm89::initialize()) return rc;
+#endif
     return static_cast<int>(
         flash_attn_paged_prefill::init_kernel_attributes(max_dynamic_smem));
 }
@@ -728,6 +735,18 @@ extern "C" int launch_flash_attn_paged_ragged_cute_bf16(
     float softmax_scale, int is_causal,
     cudaStream_t stream)
 {
+#ifdef RUSTINFER_CUTE_ATTENTION_SM89
+    if (!cute_attention_sm89::disabled() && block_size == 1 && num_q_heads == 32
+        && num_kv_heads == 8 && head_dim == 128
+        && qss % 8 == 0 && qsh % 8 == 0 && oss % 8 == 0 && osh % 8 == 0
+        && reinterpret_cast<uintptr_t>(q) % 16 == 0
+        && reinterpret_cast<uintptr_t>(o) % 16 == 0) {
+        return cute_attention_sm89::launch(q,qss,qsh,k_pool,v_pool,o,oss,osh,
+            block_tables,max_blocks_per_seq,block_size,kv_lens,cu_q_lens,
+            block2req,block2tile,valid_q_tiles,total_q_tiles,batch,total_q_tokens,
+            num_q_heads,num_kv_heads,head_dim,softmax_scale,is_causal,stream);
+    }
+#endif
     cudaError_t err = flash_attn_paged_prefill::launch_dispatch<__nv_bfloat16>(
         q, qss, qsh, k_pool, v_pool, o, oss, osh,
         block_tables, max_blocks_per_seq, block_size, kv_lens, cu_q_lens,

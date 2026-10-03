@@ -24,13 +24,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::domain::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::io::SafetensorsReader;
 use crate::models::layers::{Embedding, Linear, RMSNorm};
 use crate::models::loader::WeightLoader;
+use infer_core::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{Dtype, Shape};
 
 /// Maximum prompt length the encoder supports.
 pub const TEXT_ENCODER_MAX_SEQ_LEN: usize = 512;
@@ -283,11 +283,8 @@ impl<T: Dtype> Qwen3TextEncoder<T, Cuda> {
                 mask_host[i * seq_len + j] = T::write_f64(f64::from(v));
             }
         }
-        let mask_dev: Tensor<T, Cuda> = Tensor::from_host_slice(
-            &mask_host,
-            Shape::from_slice(&[seq_len, seq_len]),
-            dev,
-        )?;
+        let mask_dev: Tensor<T, Cuda> =
+            Tensor::from_host_slice(&mask_host, Shape::from_slice(&[seq_len, seq_len]), dev)?;
 
         // Per-layer scratches.
         let mut h: Tensor<T, Cuda> = Tensor::zeros([seq_len, dim], dev)?;

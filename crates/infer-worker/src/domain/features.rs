@@ -1,6 +1,9 @@
 //! Caller-owned target readout. Layer capture never modifies the residual stream.
-use super::{component::Hidden, dtype::Dtype, exec::StepCtx, model::ModelDims};
-use super::{
+use super::model::ModelDims;
+use infer_core::{
+    component::Hidden,
+    dtype::Dtype,
+    exec::StepCtx,
     ports::{OpError, OpResult, backend::LlmBackend},
     tensor::Tensor,
     types::Shape,

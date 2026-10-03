@@ -1,7 +1,7 @@
-pub use infer_core::plan::{BatchKind, BatchPlan, MaskMode, RAGGED_Q_TILE};
-// SampledToken now lives with the Sampler interface in infer-core::ports; the
-// runtime result types (StepOutput etc.) below still reference it via this path.
-pub use infer_core::ports::SampledToken;
+//! Worker step requests and results. Shared batch plan types live in
+//! `infer_core::plan`; the worker constructs them from these requests.
+
+use infer_core::ports::SampledToken;
 
 #[derive(Debug, Clone)]
 pub struct SeqStep {
@@ -16,7 +16,7 @@ pub struct SeqStep {
 #[derive(Debug, Clone)]
 pub struct StepRequest {
     pub seqs: Vec<SeqStep>,
-    pub sampling: Vec<crate::domain::ports::sampler::SamplingParams>,
+    pub sampling: Vec<infer_core::ports::sampler::SamplingParams>,
     pub stop: StopCriteria,
     /// Empty for ordinary execution. Otherwise one draft row per sequence,
     /// with `seq.input_ids == [pending_token] + draft_tokens[row]`.

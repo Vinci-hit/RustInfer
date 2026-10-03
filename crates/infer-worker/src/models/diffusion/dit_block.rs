@@ -25,10 +25,10 @@
 //! All buffers used during forward must be passed in by the caller as
 //! pre-allocated workspaces (`DiTBlockScratch`) so the hot path is alloc-free.
 
-use crate::domain::ports::{OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::{Dtype, Shape};
 use crate::models::layers::{Linear, RMSNorm};
+use infer_core::ports::{OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{Dtype, Shape};
 
 // ─── Dump infrastructure for numerical comparison with the Python reference ──
 //
@@ -60,10 +60,7 @@ pub fn dump_tensor<T: Dtype, D: OpBackend>(name: &str, t: &Tensor<T, D>) {
         }
     };
     let shape: Vec<usize> = t.shape().as_slice().to_vec();
-    let f32_data: Vec<f32> = host
-        .iter()
-        .map(|value| T::read_f64(value) as f32)
-        .collect();
+    let f32_data: Vec<f32> = host.iter().map(|value| T::read_f64(value) as f32).collect();
     if let Err(e) = write_npy_f32(&path, &shape, &f32_data) {
         eprintln!("[dump] {}: write failed: {}", name, e);
     } else {

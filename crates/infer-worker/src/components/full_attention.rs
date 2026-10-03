@@ -1,12 +1,12 @@
 use super::{RmsNorm, attention_core::AttentionCore};
-use crate::domain::component::{Component, Hidden, StageKind};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
-use crate::domain::kv::KvView;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::types::Shape;
+use infer_core::component::{Component, Hidden, StageKind};
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::kv::KvView;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::types::Shape;
 use std::rc::Rc;
 
 /// Pre-norm attention with deferred residual addition. The projection core is

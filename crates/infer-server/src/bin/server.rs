@@ -7,6 +7,7 @@
 //!   rustinfer-server --config rustinfer.toml
 
 use anyhow::Result;
+use axum::serve::ListenerExt;
 use clap::Parser;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -50,7 +51,7 @@ async fn main() -> Result<()> {
     let model_name = config.effective_model_name();
     let frontend_endpoint = config.frontend_endpoint();
 
-    // model_type drives the chat template; resolve from the model's config.json.
+    // Resolve architecture from config.json or GGUF general.architecture.
     let model_type = resolve_model_type(&config.model).map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!("╔══════════════════════════════════════════════════╗");
@@ -69,13 +70,20 @@ async fn main() -> Result<()> {
 
     // Load tokenizer
     tracing::info!("[server] Initializing Tokenizer and ZMQ Client...");
-    let tokenizer_path = std::path::Path::new(&config.model).join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-    tracing::info!(
-        "Tokenizer loaded (vocab_size={})",
-        tokenizer.get_vocab_size(true)
-    );
+    let gguf_text = if infer_gguf::is_gguf_path(&config.model) {
+        let reader = infer_gguf::GgufReader::open(&config.model)?;
+        Some(Arc::new(infer_gguf::text::GgufText::from_gguf(&reader)?))
+    } else {
+        None
+    };
+    let tokenizer = if let Some(text) = &gguf_text {
+        text.tokenizer().clone()
+    } else {
+        tokenizers::Tokenizer::from_file(std::path::Path::new(&config.model).join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
+    };
+    let tokenizer_vocab_size = tokenizer.get_vocab_size(true);
+    tracing::info!("Tokenizer loaded (vocab_size={})", tokenizer_vocab_size);
 
     // Connect to Scheduler
     let client = ZmqClient::new(&frontend_endpoint, config.request_timeout_secs).await?;
@@ -119,6 +127,8 @@ async fn main() -> Result<()> {
         image_admission: Arc::new(tokio::sync::Semaphore::new(4)),
         client,
         tokenizer: Arc::new(tokenizer),
+        gguf_text,
+        tokenizer_vocab_size,
         config,
         model_type,
         model_info,
@@ -128,7 +138,11 @@ async fn main() -> Result<()> {
     let app = build_router(state.clone(), &args.cors_allowed_origins)?;
     tracing::info!("API Server listening on http://{}:{}", host, port);
 
-    let listener = bind_listener(&host, port).await?;
+    let listener = bind_listener(&host, port).await?.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%error, "Failed to enable TCP_NODELAY for HTTP stream");
+        }
+    });
 
     // Create shutdown channel
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);

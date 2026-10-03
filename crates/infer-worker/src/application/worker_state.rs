@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::domain::ports::sampler::SamplingParams;
+use infer_core::ports::sampler::SamplingParams;
 
 /// Per-sequence prefill state held between chunked prefill segments.
 pub struct PrefillSeq {

@@ -3,7 +3,7 @@
 //! One TOML file drives every binary (server launcher, scheduler, worker, api).
 //! Each process takes only `--config <path>`; all knobs and the four IPC
 //! endpoints are derived from this file. `model_type` is intentionally NOT a
-//! config field — it is resolved from the model's `config.json` via
+//! config field — it is resolved from `config.json` or GGUF metadata via
 //! [`resolve_model_type`] so the worker dispatch / chat template always match
 //! the loaded weights.
 
@@ -72,7 +72,7 @@ pub enum SpeculativeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustInferConfig {
-    /// Model directory (weights + tokenizer.json + config.json). Required.
+    /// Safetensors model directory or a single GGUF file. Required.
     #[serde(default)]
     pub model: String,
 
@@ -329,6 +329,14 @@ impl RustInferConfig {
         if self.model.trim().is_empty() {
             return Err("`model` is required".into());
         }
+        if infer_gguf::is_gguf_path(&self.model)
+            && (self.tensor_parallel_size != 1
+                || self.speculative_draft_tokens() != 0
+                || self.enable_prefix_caching
+                || self.paged_block_size != 1)
+        {
+            return Err("GGUF serving requires TP1, paged_block_size=1, prefix caching disabled, and speculative decoding disabled".into());
+        }
         if self.tensor_parallel_size == 0 {
             return Err("`tensor_parallel_size` must be > 0".into());
         }
@@ -506,6 +514,19 @@ pub fn supported_model_types_csv() -> String {
 /// it can be unit-tested without touching the filesystem; this wrapper adds the
 /// I/O and the visible unsupported-model error.
 pub fn resolve_model_type(model_path: &str) -> Result<String, String> {
+    if infer_gguf::is_gguf_path(model_path) {
+        let reader = infer_gguf::GgufReader::open(model_path).map_err(|e| e.to_string())?;
+        return match reader
+            .metadata()
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+        {
+            Some("qwen35") => Ok("qwen3_5".into()),
+            arch => Err(format!(
+                "unsupported GGUF architecture {arch:?}; expected qwen35"
+            )),
+        };
+    }
     let cfg_path = Path::new(model_path).join("config.json");
     let bytes =
         std::fs::read(&cfg_path).map_err(|e| format!("read {}: {}", cfg_path.display(), e))?;
@@ -569,6 +590,41 @@ mod model_type_tests {
     use super::classify_model_type;
 
     #[test]
+    fn gguf_architecture_is_read_from_metadata_and_bad_files_fail() {
+        let path =
+            std::env::temp_dir().join(format!("rustinfer-arch-{}.gguf", uuid::Uuid::new_v4()));
+        let make = |architecture: &str| {
+            let mut data = b"GGUF".to_vec();
+            data.extend(3u32.to_le_bytes());
+            data.extend(0u64.to_le_bytes());
+            data.extend(1u64.to_le_bytes());
+            for (i, value) in ["general.architecture", architecture].iter().enumerate() {
+                if i == 1 {
+                    data.extend(8u32.to_le_bytes());
+                }
+                data.extend((value.len() as u64).to_le_bytes());
+                data.extend(value.as_bytes());
+            }
+            data.resize(data.len().div_ceil(32) * 32, 0);
+            std::fs::write(&path, data).unwrap();
+        };
+        make("qwen35");
+        assert_eq!(
+            super::resolve_model_type(path.to_str().unwrap()).unwrap(),
+            "qwen3_5"
+        );
+        make("llama");
+        assert!(
+            super::resolve_model_type(path.to_str().unwrap())
+                .unwrap_err()
+                .contains("unsupported GGUF")
+        );
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(super::resolve_model_type(path.to_str().unwrap()).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn qwen3_5_is_distinct_from_qwen3() {
         assert_eq!(classify_model_type("qwen3_5"), Some("qwen3_5"));
         assert_eq!(
@@ -610,6 +666,22 @@ mod model_type_tests {
 #[cfg(test)]
 mod launch_config_tests {
     use super::{RustInferConfig, SpeculativeConfig};
+
+    #[test]
+    fn gguf_serving_rejects_unimplemented_combinations() {
+        let base = "model='/tmp/checkpoint.gguf'\nmax_batch_seqs=1";
+        let valid: RustInferConfig = toml::from_str(base).unwrap();
+        valid.validate().unwrap();
+        for extra in [
+            "tensor_parallel_size=2",
+            "mtp_num_draft_tokens=3",
+            "enable_prefix_caching=true",
+            "paged_block_size=16",
+        ] {
+            let invalid: RustInferConfig = toml::from_str(&format!("{base}\n{extra}")).unwrap();
+            assert!(invalid.validate().unwrap_err().contains("GGUF serving"));
+        }
+    }
 
     #[test]
     fn eagle3_config_keeps_target_and_requires_explicit_compatible_limits() {

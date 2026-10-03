@@ -12,21 +12,21 @@
 use crate::application::execution::{
     ExecutionMetrics, ExecutionMode, ExecutionPlan, Phase, WorkspaceUse,
 };
+use crate::application::mixed_tuning::MixedTuning;
 use std::ptr::NonNull;
 
-use crate::domain::component::{Hidden, LayerRange};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::{ExecDevice as Device, ExecScope};
-use crate::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use crate::domain::model::{DecoderModel, ModelDims, SampleRows};
-use crate::domain::plan::{
-    BatchPlan, SampledToken, SeqStep, StepOutput, StepRequest, StopCriteria,
-};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::sampler::Sampler;
-use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use crate::domain::plan::{SeqStep, StepOutput, StepRequest, StopCriteria};
+use infer_core::component::{Hidden, LayerRange};
+use infer_core::dtype::Dtype;
+use infer_core::exec::{ExecDevice as Device, ExecScope};
+use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::sampler::Sampler;
+use infer_core::ports::{CollectiveOps, CommAxis, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
+use infer_core::{plan::BatchPlan, ports::SampledToken};
 
 mod abc_decode;
 mod beam;
@@ -63,6 +63,8 @@ where
     pub kv_pool: PagedKvPool<T, D>,
     pub kv_index: KvIndexTensors<D>,
     pub hidden: Hidden<T, D>,
+    mixed_readout_hidden: Option<Tensor<T, D>>,
+    pub(crate) mixed_tuning: MixedTuning,
     pub scope: <D as Device>::Scope,
     pub sampler: Box<dyn Sampler<T, D>>,
     sampling_workspace: Tensor<f32, D>,
@@ -307,6 +309,12 @@ where
         cap_batch: usize,
         capture_sizes: Vec<usize>,
     ) -> OpResult<Self> {
+        let mixed_tuning = MixedTuning::from_env().map_err(OpError::Shape)?;
+        let capture_sizes = if model.requires_eager_ragged() {
+            Vec::new()
+        } else {
+            capture_sizes
+        };
         let dims = model.dims();
         dims.validate()?;
         let has_recurrent = model.cache_layout().has_linear();
@@ -365,7 +373,7 @@ where
         // their max (the old `.max()` under-sized block2req/block2tile for mixed
         // batches and for the bucketed mixed graph's padded `cap_batch + ⌈B/TILE⌉`
         // tile grid).
-        let tile = crate::domain::plan::RAGGED_Q_TILE as usize;
+        let tile = infer_core::plan::RAGGED_Q_TILE as usize;
         let cap_total_q_tiles = (cap_batch + cap_num_tokens.div_ceil(tile)).max(1);
         let alloc_i32 = |n: usize| D::alloc_tensor::<i32>(Shape::from_slice(&[n.max(1)]), device);
         let kv_index = KvIndexTensors {
@@ -506,7 +514,16 @@ where
         let sampling_logprobs = Tensor::zeros([cb], device)?;
         let execution_metrics = ExecutionMetrics::from_env("target");
         execution_metrics.prepare_gpu(&scope)?;
+        // Selected readout needs stable storage throughout graph replay.
+        // Disabled experiments allocate no extra GPU scratch.
+        let mixed_readout_hidden = if mixed_tuning.graph.selected_readout {
+            Some(Tensor::zeros([cb, dims.dim], device)?)
+        } else {
+            None
+        };
         Ok(Self {
+            mixed_tuning,
+            mixed_readout_hidden,
             execution_metrics,
             sampling_workspace,
             sampling_logprobs,
@@ -697,7 +714,7 @@ where
 
     fn step_eager(
         &mut self,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
         self.step_eager_with_input(plan, req, None)
@@ -767,7 +784,7 @@ where
     /// invalidation. Recording a graph must never advance logical history.
     pub(super) fn run_layers(
         &mut self,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         input_ids: &Tensor<i32, D>,
     ) -> OpResult<()> {
         self.run_layers_observed(plan, input_ids, &mut crate::domain::features::NoopObserver)
@@ -788,7 +805,7 @@ where
             ),
             pending: None,
         };
-        let mut ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let mut ctx = infer_core::exec::StepCtx::new(&self.scope, plan);
         if let Some((sin, cos)) = &self.visual.angles {
             ctx = ctx.with_rotary_angles(sin, cos);
         }
@@ -829,7 +846,7 @@ where
     /// the (data-dependent, variable-shape) sampling never enters a graph.
     pub(super) fn sample_tail(
         &mut self,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
         let hidden = Hidden {
@@ -841,7 +858,7 @@ where
             ),
             pending: None,
         };
-        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let ctx = infer_core::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
         // Greedy first-token sampling only needs the last row of each sequence,
         // so project just those (`LastPerSeq`) — this keeps the lm_head GEMM at
@@ -992,7 +1009,7 @@ where
     /// result already on-device in C — no eager finalize/sample afterwards.
     pub(super) fn forward_finalize_argmax(
         &mut self,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         input_ids: &Tensor<i32, D>,
     ) -> OpResult<()> {
         self.run_layers(plan, input_ids)?;
@@ -1005,7 +1022,7 @@ where
             ),
             pending: None,
         };
-        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let ctx = infer_core::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
         let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
         // Pass a `[logits_rows]` view of the capacity-sized C buffer: the host
@@ -1034,7 +1051,7 @@ where
     /// path for finished-flag + KV-length bookkeeping.
     pub(super) fn decode_output_from_c(
         &mut self,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
         let batch = plan.batch;
@@ -1455,7 +1472,7 @@ where
         ),
         pending: None,
     };
-    let ctx = crate::domain::exec::StepCtx::new(&runtime.scope, &plan);
+    let ctx = infer_core::exec::StepCtx::new(&runtime.scope, &plan);
     let _guard = runtime.scope.enter();
     let mut cache =
         crate::domain::cache::ModelCacheView::full(&mut runtime.kv_pool, &runtime.kv_index);
@@ -1477,11 +1494,11 @@ mod tests {
     use super::*;
     use crate::application::sampler_stack::GreedySampler;
     use crate::domain::cache::{CacheLayout, ModelCacheView};
-    use crate::domain::component::{Hidden, LayerRange, StageKind};
-    use crate::domain::exec::{HostScope, RankPair, StepCtx, TopologyShape};
     use crate::domain::model::{DecoderModel, Logits, ModelDims, SampleRows};
     use crate::domain::plan::{SeqStep, StopCriteria};
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::component::{Hidden, LayerRange, StageKind};
+    use infer_core::exec::{HostScope, RankPair, StepCtx, TopologyShape};
 
     struct TinyDecoder {
         on_drop: Option<Box<dyn FnOnce()>>,

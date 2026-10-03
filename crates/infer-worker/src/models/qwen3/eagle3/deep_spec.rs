@@ -5,13 +5,12 @@ use crate::components::{
     attention_core::AttentionCore,
     eagle3::{Eagle3DraftHead, Eagle3Weights},
 };
-use crate::domain::{
+use crate::domain::{features::FeatureSpec, model::ModelDims};
+use crate::models::loader::{WeightLoader, compute_rope_cache};
+use infer_core::{
     dtype::Dtype,
-    features::FeatureSpec,
-    model::ModelDims,
     ports::{OpBackend, OpError, OpResult, backend::LlmBackend},
 };
-use crate::models::loader::{WeightLoader, compute_rope_cache};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct DeepSpecConfig {

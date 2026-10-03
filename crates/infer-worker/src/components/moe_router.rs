@@ -1,9 +1,9 @@
 use crate::components::linear::Linear;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 /// Dense gate plus top-k selection for one sparse MoE layer.
 ///
@@ -118,9 +118,9 @@ impl<T: Dtype, D: LlmBackend> MoeRouter<T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::exec::{HostScope, StepCtx};
-    use crate::domain::plan::{BatchKind, BatchPlan};
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::exec::{HostScope, StepCtx};
+    use infer_core::plan::{BatchKind, BatchPlan};
 
     fn decode_plan(tokens: usize) -> BatchPlan {
         BatchPlan {

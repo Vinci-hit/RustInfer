@@ -10,12 +10,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use half::bf16;
+use infer_core::component::Hidden;
+use infer_core::exec::{ExecScope, RankPair, StepCtx, TopologyShape};
+use infer_core::plan::{BatchKind, BatchPlan};
+use infer_core::tensor::Tensor;
 use infer_worker::components::embed::{Embed, EmbeddingParallelism};
 use infer_worker::components::linear::{Linear, LinearParallelism};
-use infer_worker::domain::component::Hidden;
-use infer_worker::domain::exec::{ExecScope, RankPair, StepCtx, TopologyShape};
-use infer_worker::domain::plan::{BatchKind, BatchPlan};
-use infer_worker::domain::tensor::Tensor;
 use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan, CudaScope, NcclCommunicator};
 
 const WORLD_SIZE: usize = 2;

@@ -1,8 +1,8 @@
 //! Sequence-local proposal policy. Target verification and cache commits are
 //! shared by autoregressive and block-parallel draft models.
-use crate::domain::{
+use crate::domain::model::ModelDims;
+use infer_core::{
     dtype::Dtype,
-    model::ModelDims,
     ports::{OpResult, backend::LlmBackend},
     tensor::Tensor,
 };

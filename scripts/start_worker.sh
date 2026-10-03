@@ -37,4 +37,18 @@ echo "Press Ctrl+C to stop."
 echo ""
 
 cd "$REPO_ROOT"
-exec cargo run --release -p infer-worker --bin rustinfer-worker -- --config "$CONFIG"
+FEATURE_ARGS=()
+if python3 - "$CONFIG" <<'PYGGUF'
+import sys, tomllib
+from pathlib import Path
+with open(sys.argv[1], "rb") as f:
+    model = tomllib.load(f)["model"]
+sys.exit(0 if Path(model).suffix.lower() == ".gguf" else 1)
+PYGGUF
+then
+    FEATURE_ARGS=(--features cute-dsl)
+    if [[ -z "${RUSTINFER_CUTE_DSL_PYTHON:-}" && -x "$REPO_ROOT/.venv/bin/python" ]]; then
+        export RUSTINFER_CUTE_DSL_PYTHON="$REPO_ROOT/.venv/bin/python"
+    fi
+fi
+exec cargo run --release -p infer-worker --bin rustinfer-worker "${FEATURE_ARGS[@]}" -- --config "$CONFIG"

@@ -1,9 +1,9 @@
 use super::{TinyConfig, math::*};
-use crate::domain::{
+use crate::models::loader::WeightLoader;
+use infer_core::{
     dtype::Dtype,
     ports::{OpError, OpResult, backend::LlmBackend},
 };
-use crate::models::loader::WeightLoader;
 
 struct Expert<T: Dtype, D: LlmBackend> {
     gate_up: Matrix<T, D>,

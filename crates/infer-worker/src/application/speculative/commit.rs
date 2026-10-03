@@ -2,7 +2,7 @@
 use crate::application::worker_state::ActiveSeqMap;
 use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::domain::plan::StepOutput;
-use crate::domain::ports::{OpError, OpResult};
+use infer_core::ports::{OpError, OpResult};
 use infer_protocol::worker_to_scheduler_data::{
     AssignedIndices, GeneratedToken, StepOutput as WireOutput,
 };
@@ -98,7 +98,7 @@ pub(crate) fn commit_decode(
 mod tests {
     use super::*;
     use crate::application::worker_state::ActiveSeq;
-    use crate::domain::plan::SampledToken;
+    use infer_core::ports::SampledToken;
     #[test]
     fn malformed_commit_returns_all_provisional_slots_without_changing_the_sequence() {
         let mut allocator = GlobalKvAllocator::new(16);

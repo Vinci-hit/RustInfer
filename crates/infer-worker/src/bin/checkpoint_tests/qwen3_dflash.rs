@@ -1,16 +1,15 @@
 use super::speculative_checkpoint_support::{indices, pool};
 use super::*;
-use infer_worker::domain::{
-    ExecScope,
-    cache::ModelCacheView,
+use infer_core::{
     component::{Hidden, LayerRange},
-    draft::BlockDraft,
-    exec::StepCtx,
-    features::TargetFeatures,
-    forward_scratch::ForwardScratch,
+    exec::{ExecScope, StepCtx},
     plan::{BatchKind, MaskMode},
     ports::FusedOps,
     tensor::Tensor,
+};
+use infer_worker::domain::{
+    cache::ModelCacheView, draft::BlockDraft, features::TargetFeatures,
+    forward_scratch::ForwardScratch,
 };
 
 #[test]

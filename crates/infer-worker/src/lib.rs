@@ -10,15 +10,17 @@
 //! │ models/           具体模型 (Qwen3, Llama3)               │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ domain/           域层 — 纯的，零 FFI，零 I/O             │
-//! │   types, tensor, ports, batch, model trait               │
+//! │   model/cache contracts, step requests, KV allocation   │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ infrastructure/   基础设施 — 实现 domain 的 trait          │
-//! │   cuda/, cpu/, io/, transport/                           │
+//! │ infrastructure/   基础设施 — I/O 与通信适配                │
+//! │   io/, transport/, backend re-exports                   │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! **依赖方向**: domain ← infrastructure ← models ← application
-//! domain 不 `use` infrastructure 的任何东西（通过 trait 反转依赖）。
+//! Shared tensors, storage, execution types, and backend ports are imported
+//! directly from `infer_core`. The domain and model layers depend on those
+//! contracts; `infer-backend-cpu` and `infer-backend-cuda` implement them.
+//! The application layer assembles models, backends, and I/O into the worker.
 
 pub mod application;
 pub mod components;

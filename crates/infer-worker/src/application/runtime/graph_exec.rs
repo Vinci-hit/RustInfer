@@ -3,13 +3,14 @@
 
 use std::marker::PhantomData;
 
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::ExecScope;
 use crate::domain::model::DecoderModel;
-use crate::domain::plan::{BatchKind, SeqStep, StepOutput, StepRequest, StopCriteria};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::types::Shape;
+use crate::domain::plan::{SeqStep, StepOutput, StepRequest, StopCriteria};
+use infer_core::dtype::Dtype;
+use infer_core::exec::ExecScope;
+use infer_core::plan::BatchKind;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::types::Shape;
 
 use super::{Runtime, upload_i32_prefix};
 
@@ -96,7 +97,7 @@ impl<D: LlmBackend> GraphRunner<D> {
         &self.capture_sizes
     }
 
-    pub fn decide(&self, plan: &crate::domain::plan::BatchPlan) -> GraphDecision {
+    pub fn decide(&self, plan: &infer_core::plan::BatchPlan) -> GraphDecision {
         if plan.is_decode_only() {
             return self
                 .slot_for_batch(plan.batch)
@@ -140,7 +141,7 @@ where
     D: LlmBackend,
     M: DecoderModel<T, D>,
 {
-    pub fn decide(&self, plan: &crate::domain::plan::BatchPlan) -> GraphDecision {
+    pub fn decide(&self, plan: &infer_core::plan::BatchPlan) -> GraphDecision {
         self.graph
             .as_ref()
             .map_or(GraphDecision::Eager, |graph| graph.decide(plan))
@@ -330,7 +331,7 @@ where
     pub(super) fn step_graph(
         &mut self,
         slot: GraphSlotId,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
         let Some(graph) = self.graph.as_ref() else {
@@ -453,7 +454,7 @@ where
     pub(super) fn step_prefill_graph(
         &mut self,
         num_tokens: usize,
-        plan: &crate::domain::plan::BatchPlan,
+        plan: &infer_core::plan::BatchPlan,
         req: &StepRequest,
     ) -> OpResult<StepOutput> {
         // Fall back to eager if graphs are unavailable on this scope.
@@ -510,8 +511,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::plan::BatchPlan;
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::plan::BatchPlan;
 
     #[test]
     fn graph_runner_picks_smallest_decode_slot() {

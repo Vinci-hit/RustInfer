@@ -2,8 +2,8 @@
 //! routing modes, including the first HCA block, CSA overlap and sliding wrap.
 use std::path::PathBuf;
 
+use infer_core::exec::HostScope;
 use infer_worker::{
-    domain::exec::HostScope,
     infrastructure::{cpu::Cpu, io::SafetensorsReader},
     models::{
         deepseek_v4::{TinyConfig, TinyModel},

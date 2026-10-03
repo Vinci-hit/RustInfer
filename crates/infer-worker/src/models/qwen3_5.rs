@@ -9,13 +9,13 @@ use crate::components::{
     RmsNorm,
 };
 use crate::domain::cache::LinearDims;
-use crate::domain::dtype::Dtype;
 use crate::domain::model::ModelDims;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
 use crate::models::decoder::Decoder;
 use crate::models::loader::{LoadConfig, WeightLoader, compute_rope_cache};
+use infer_core::dtype::Dtype;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 pub struct Qwen3_5Model<T: Dtype, D: LlmBackend> {
     pub decoder: Decoder<T, D>,
@@ -23,6 +23,7 @@ pub struct Qwen3_5Model<T: Dtype, D: LlmBackend> {
     rotary_dim: usize,
     rope_theta: f64,
     mrope_section: [usize; 3],
+    eager_ragged: bool,
 }
 
 impl<T: Dtype, D: OpBackend + LlmBackend> Qwen3_5Model<T, D> {
@@ -53,13 +54,17 @@ impl<T: Dtype, D: OpBackend + LlmBackend> Qwen3_5Model<T, D> {
 }
 
 impl<T: Dtype, D: LlmBackend> crate::domain::model::DecoderModel<T, D> for Qwen3_5Model<T, D> {
+    fn requires_eager_ragged(&self) -> bool {
+        self.eager_ragged
+    }
+
     fn dims(&self) -> ModelDims {
         self.decoder.dims()
     }
     fn cache_layout(&self) -> &crate::domain::cache::CacheLayout {
         self.decoder.cache_layout()
     }
-    fn stages(&self) -> &[crate::domain::component::StageKind] {
+    fn stages(&self) -> &[infer_core::component::StageKind] {
         self.decoder.stages()
     }
     fn install_scratch(
@@ -77,25 +82,25 @@ impl<T: Dtype, D: LlmBackend> crate::domain::model::DecoderModel<T, D> for Qwen3
     fn embed(
         &self,
         ids: &Tensor<i32, D>,
-        hidden: &mut crate::domain::component::Hidden<T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        hidden: &mut infer_core::component::Hidden<T, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()> {
         self.decoder.embed(ids, hidden, ctx)
     }
     fn decode_layers(
         &self,
-        range: crate::domain::component::LayerRange,
-        hidden: &mut crate::domain::component::Hidden<T, D>,
+        range: infer_core::component::LayerRange,
+        hidden: &mut infer_core::component::Hidden<T, D>,
         cache: &mut crate::domain::cache::ModelCacheView<'_, T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()> {
         self.decoder.decode_layers(range, hidden, cache, ctx)
     }
     fn finalize(
         &self,
-        hidden: &crate::domain::component::Hidden<T, D>,
+        hidden: &infer_core::component::Hidden<T, D>,
         rows: crate::domain::model::SampleRows<'_>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<crate::domain::model::Logits<T, D>> {
         self.decoder.finalize(hidden, rows, ctx)
     }
@@ -125,11 +130,8 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
     if loader.tensor_parallel().size != 1 {
         return Err(OpError::unsupported("qwen3_5::build", "tensor parallelism"));
     }
-    if cfg.mlp_quant.is_some() || cfg.fp8_block.is_some() || cfg.num_experts != 0 {
-        return Err(OpError::unsupported(
-            "qwen3_5::build",
-            "quantized or MoE weights",
-        ));
+    if cfg.fp8_block.is_some() || cfg.num_experts != 0 {
+        return Err(OpError::unsupported("qwen3_5::build", "FP8 or MoE weights"));
     }
     let linear = cfg.linear_attn.as_ref().ok_or_else(|| {
         OpError::Shape("qwen3_5 requires a linear attention configuration".into())
@@ -173,7 +175,16 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
         cfg.dim,
         device,
     )?;
-    let lm_head = if loader.has_tensor("lm_head.weight") {
+    let lm_head = if loader.has_tensor("lm_head.weight_packed") {
+        load_linear(
+            loader,
+            "lm_head.weight",
+            cfg.vocab_size,
+            cfg.dim,
+            cfg.mlp_quant,
+            device,
+        )?
+    } else if loader.has_tensor("lm_head.weight") {
         loader.load_vocab_parallel_linear::<T, D>(
             "lm_head.weight",
             None,
@@ -215,19 +226,36 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                 scratch: None,
                 input_layernorm,
                 core: crate::components::attention_core::AttentionCore {
-                    qkv_proj: loader.load_fused_qkv_with_fp8(
-                        &layer,
-                        q_dim * (1 + usize::from(cfg.attn_output_gate)),
-                        kv_dim,
+                    qkv_proj: load_fused_int4_or_dense(
+                        loader,
+                        &[
+                            (
+                                format!("{layer}.self_attn.q_proj"),
+                                q_dim * (1 + usize::from(cfg.attn_output_gate)),
+                            ),
+                            (format!("{layer}.self_attn.k_proj"), kv_dim),
+                            (format!("{layer}.self_attn.v_proj"), kv_dim),
+                        ],
                         cfg.dim,
-                        None,
+                        cfg.mlp_quant,
                         device,
+                        || {
+                            loader.load_fused_qkv_with_fp8(
+                                &layer,
+                                q_dim * (1 + usize::from(cfg.attn_output_gate)),
+                                kv_dim,
+                                cfg.dim,
+                                None,
+                                device,
+                            )
+                        },
                     )?,
                     o_proj: load_linear(
                         loader,
                         &format!("{layer}.self_attn.o_proj.weight"),
                         cfg.dim,
                         q_dim,
+                        cfg.mlp_quant,
                         device,
                     )?,
                     q_norm: Some(load_norm(
@@ -264,6 +292,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                         &format!("{attn}.in_proj_qkv.weight"),
                         linear.conv_dim(),
                         cfg.dim,
+                        cfg.mlp_quant,
                         device,
                     )?,
                     in_proj_a: load_linear(
@@ -271,6 +300,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                         &format!("{attn}.in_proj_a.weight"),
                         linear.num_value_heads,
                         cfg.dim,
+                        cfg.mlp_quant,
                         device,
                     )?,
                     in_proj_b: load_linear(
@@ -278,6 +308,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                         &format!("{attn}.in_proj_b.weight"),
                         linear.num_value_heads,
                         cfg.dim,
+                        cfg.mlp_quant,
                         device,
                     )?,
                     in_proj_z: load_linear(
@@ -285,6 +316,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                         &format!("{attn}.in_proj_z.weight"),
                         linear.value_dim(),
                         cfg.dim,
+                        cfg.mlp_quant,
                         device,
                     )?,
                     conv1d: loader.load_tensor(&format!("{attn}.conv1d.weight"), device)?,
@@ -299,6 +331,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                         &format!("{attn}.out_proj.weight"),
                         cfg.dim,
                         linear.value_dim(),
+                        cfg.mlp_quant,
                         device,
                     )?,
                 },
@@ -315,18 +348,31 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
                     cfg.rms_norm_eps,
                     device,
                 )?,
-                gate_up_proj: loader.load_fused_gate_up_with_fp8(
-                    &layer,
-                    cfg.intermediate_size,
+                gate_up_proj: load_fused_int4_or_dense(
+                    loader,
+                    &[
+                        (format!("{layer}.mlp.gate_proj"), cfg.intermediate_size),
+                        (format!("{layer}.mlp.up_proj"), cfg.intermediate_size),
+                    ],
                     cfg.dim,
-                    None,
+                    cfg.mlp_quant,
                     device,
+                    || {
+                        loader.load_fused_gate_up_with_fp8(
+                            &layer,
+                            cfg.intermediate_size,
+                            cfg.dim,
+                            None,
+                            device,
+                        )
+                    },
                 )?,
                 down_proj: load_linear(
                     loader,
                     &format!("{layer}.mlp.down_proj.weight"),
                     cfg.dim,
                     cfg.intermediate_size,
+                    cfg.mlp_quant,
                     device,
                 )?,
                 scratch: None,
@@ -342,6 +388,7 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
         device,
     )?;
     Ok(Qwen3_5Model {
+        eager_ragged: false,
         decoder: Decoder::new(embed, blocks, norm, LmHead { proj: lm_head }, dims)?,
         vision: None,
         rotary_dim: cfg.rotary_dim,
@@ -350,13 +397,44 @@ pub fn build<T: Dtype, D: OpBackend + LlmBackend>(
     })
 }
 
+fn load_fused_int4_or_dense<T: Dtype, D: OpBackend + LlmBackend>(
+    loader: &WeightLoader<'_>,
+    parts: &[(String, usize)],
+    cols: usize,
+    scheme: Option<infer_core::dtype::quant::QuantScheme>,
+    device: &D,
+    dense: impl FnOnce() -> OpResult<Linear<T, D>>,
+) -> OpResult<Linear<T, D>> {
+    if !parts
+        .iter()
+        .any(|(name, _)| loader.has_tensor(&format!("{name}.weight_packed")))
+    {
+        return dense();
+    }
+    let scheme =
+        scheme.ok_or_else(|| OpError::Shape("packed projections require INT4 metadata".into()))?;
+    let parts: Vec<_> = parts
+        .iter()
+        .map(|(name, rows)| (name.as_str(), *rows))
+        .collect();
+    loader.load_int4_parts(&parts, cols, scheme, device)
+}
+
 fn load_linear<T: Dtype, D: OpBackend + LlmBackend>(
     loader: &WeightLoader<'_>,
     name: &str,
     rows: usize,
     cols: usize,
+    scheme: Option<infer_core::dtype::quant::QuantScheme>,
     device: &D,
 ) -> OpResult<Linear<T, D>> {
+    let prefix = name.strip_suffix(".weight").unwrap_or(name);
+    if loader.has_tensor(&format!("{prefix}.weight_packed")) {
+        let scheme = scheme.ok_or_else(|| {
+            OpError::Shape(format!("{prefix}: packed weights require INT4 metadata"))
+        })?;
+        return loader.load_int4_parts(&[(prefix, rows)], cols, scheme, device);
+    }
     let weight = load_shaped(loader, name, &[rows, cols], device)?;
     Ok(Linear::new(weight, None))
 }
@@ -395,9 +473,9 @@ fn load_norm<T: Dtype, D: OpBackend + LlmBackend>(
 impl<T: Dtype, D: LlmBackend> crate::domain::model::DecoderReadout<T, D> for Qwen3_5Model<T, D> {
     fn normalize_hidden_into(
         &self,
-        hidden: &crate::domain::component::Hidden<T, D>,
+        hidden: &infer_core::component::Hidden<T, D>,
         output: &mut Tensor<T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()> {
         self.decoder.normalize_hidden_into(hidden, output, ctx)
     }
@@ -405,7 +483,7 @@ impl<T: Dtype, D: LlmBackend> crate::domain::model::DecoderReadout<T, D> for Qwe
         &self,
         normalized: &Tensor<T, D>,
         output: &mut Tensor<T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()> {
         self.decoder.project_logits_into(normalized, output, ctx)
     }

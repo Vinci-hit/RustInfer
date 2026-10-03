@@ -1,4 +1,9 @@
-use crate::state::conversation::Conversation;
+use super::icon::Icon;
+use crate::state::{
+    conversation::Conversation,
+    settings::Theme,
+    workspace::{Connection, Workspace},
+};
 use dioxus::prelude::*;
 
 #[component]
@@ -8,141 +13,90 @@ pub fn Sidebar(
     on_new_chat: EventHandler<()>,
     on_select: EventHandler<String>,
     on_delete: EventHandler<String>,
-    collapsed: Signal<bool>,
+    mobile_open: bool,
+    on_settings: EventHandler<()>,
+    on_close: EventHandler<()>,
 ) -> Element {
-    let is_collapsed = collapsed();
-
+    let mut workspace = use_context::<Workspace>();
+    let mut search = use_signal(String::new);
+    let mut deleting = use_signal(|| None::<String>);
+    let query = search().to_lowercase();
+    let mut filtered: Vec<_> = conversations
+        .read()
+        .iter()
+        .filter(|c| {
+            c.title.to_lowercase().contains(&query)
+                || c.messages
+                    .iter()
+                    .any(|m| m.content.to_lowercase().contains(&query))
+        })
+        .cloned()
+        .collect();
+    filtered.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+    let count = filtered.len();
+    let connection = (workspace.connection)();
+    let theme_icon = if workspace.settings.read().theme == Theme::Dark {
+        "sun"
+    } else {
+        "moon"
+    };
     rsx! {
-        aside {
-            class: if is_collapsed {
-                "w-0 lg:w-16 transition-all duration-300 overflow-hidden flex flex-col glass-panel rounded-2xl"
-            } else {
-                "w-72 transition-all duration-300 flex flex-col glass-panel rounded-2xl"
-            },
-
-            // Header
-            div {
-                class: "p-4 border-b border-white/5",
-
-                div {
-                    class: "flex items-center justify-between",
-
-                    if !is_collapsed {
-                        h1 {
-                            class: "text-lg font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent",
-                            "RustInfer"
-                        }
-                    }
-
-                    button {
-                        class: "p-2 rounded-lg hover:bg-white/5 transition-colors text-[var(--color-text-secondary)]",
-                        onclick: move |_| collapsed.set(!is_collapsed),
-                        // Hamburger / Close icon
-                        if is_collapsed {
-                            svg {
-                                class: "w-5 h-5",
-                                fill: "none",
-                                stroke: "currentColor",
-                                stroke_width: "2",
-                                view_box: "0 0 24 24",
-                                path { d: "M4 6h16M4 12h16M4 18h16" }
-                            }
-                        } else {
-                            svg {
-                                class: "w-5 h-5",
-                                fill: "none",
-                                stroke: "currentColor",
-                                stroke_width: "2",
-                                view_box: "0 0 24 24",
-                                path { d: "M11 19l-7-7 7-7M18 19l-7-7 7-7" }
+        aside { class: if mobile_open { "sidebar is-open" } else { "sidebar" }, aria_label: "对话导航",
+            div { class: "brand",
+                div { class: "brand-symbol", "R" }
+                div { class: "brand-copy", strong { "RustInfer" } span { "本地智能工作台" } }
+                button { class: "icon-button mobile-only", aria_label: "关闭导航", onclick: move |_| on_close.call(()), Icon { name: "x", size: 18 } }
+            }
+            button { class: "new-chat", onclick: move |_| on_new_chat.call(()), Icon { name: "plus", size: 18 } "新建对话" span { "⌘ N" } }
+            label { class: "conversation-search",
+                Icon { name: "search", size: 16 }
+                input { placeholder: "搜索对话", aria_label: "搜索对话", value: "{search}", oninput: move |e| search.set(e.value()) }
+            }
+            div { class: "sidebar-section-title", span { if query.is_empty() { "最近对话" } else { "搜索结果" } } span { "{count}" } }
+            nav { class: "conversation-list", aria_label: "历史会话",
+                if filtered.is_empty() { p { class: "sidebar-empty", "没有找到相关对话" } }
+                for conversation in filtered {
+                    {
+                        let id = conversation.id.clone();
+                        let select_id = id.clone();
+                        let delete_id = id.clone();
+                        let active = id == active_id();
+                        let generating = conversation.messages.iter().any(|m| m.is_streaming);
+                        rsx! {
+                            div { class: if active { "conversation-item active" } else { "conversation-item" }, key: "{id}",
+                                button { class: "conversation-select", aria_current: if active { "page" } else { "false" }, onclick: move |_| on_select.call(select_id.clone()),
+                                    Icon { name: "chat", size: 16 }
+                                    span { "{conversation.title}" }
+                                    if generating { span { class: "stream-dot", aria_label: "正在生成" } }
+                                }
+                                button { class: "conversation-delete", title: "删除对话", aria_label: "删除对话", disabled: generating, onclick: move |_| deleting.set(Some(delete_id.clone())), Icon { name: "trash", size: 14 } }
                             }
                         }
                     }
                 }
             }
-
-            if !is_collapsed {
-                // New Chat button
-                div {
-                    class: "p-3",
-                    button {
-                        class: "w-full flex items-center gap-2 px-4 py-2.5 rounded-xl border border-dashed border-[var(--color-border)] hover:border-[var(--color-accent)] hover:bg-white/5 transition-all text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]",
-                        onclick: move |_| on_new_chat.call(()),
-
-                        svg {
-                            class: "w-4 h-4",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            view_box: "0 0 24 24",
-                            path { d: "M12 4v16m8-8H4" }
-                        }
-                        span { class: "text-sm font-medium", "New Chat" }
-                    }
+            div { class: "sidebar-bottom",
+                div { class: "local-note", Icon { name: "shield", size: 17 } div { strong { "数据，由你掌控" } p { "对话保存在当前浏览器" } } }
+                div { class: "server-indicator",
+                    span { class: match connection { Connection::Online => "status-dot online", Connection::Connecting => "status-dot connecting", _ => "status-dot offline" } }
+                    span { match connection { Connection::Online => "推理服务已连接", Connection::Connecting => "正在连接服务", _ => "推理服务未连接" } }
+                    button { class: "icon-button", title: "重新连接", aria_label: "重新连接", onclick: move |_| { let next = *workspace.reconnect.peek() + 1; workspace.reconnect.set(next); }, Icon { name: "refresh", size: 14 } }
                 }
-
-                // Conversation list
-                div {
-                    class: "flex-1 overflow-y-auto px-3 space-y-1",
-
-                    for conv in conversations.read().iter().rev() {
-                        {
-                            let conv_id = conv.id.clone();
-                            let conv_id2 = conv.id.clone();
-                            let is_active = conv.id == active_id();
-                            let title = conv.title.clone();
-
-                            rsx! {
-                                div {
-                                    key: "{conv_id}",
-                                    class: if is_active {
-                                        "group flex items-center gap-2 px-3 py-2.5 rounded-xl bg-white/10 border border-white/10 animate-fade-in cursor-pointer"
-                                    } else {
-                                        "group flex items-center gap-2 px-3 py-2.5 rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
-                                    },
-                                    onclick: move |_| on_select.call(conv_id.clone()),
-
-                                    // Chat icon
-                                    svg {
-                                        class: "w-4 h-4 shrink-0 text-[var(--color-text-muted)]",
-                                        fill: "none",
-                                        stroke: "currentColor",
-                                        stroke_width: "2",
-                                        view_box: "0 0 24 24",
-                                        path { d: "M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" }
-                                    }
-
-                                    span {
-                                        class: "flex-1 text-sm truncate text-[var(--color-text-secondary)]",
-                                        "{title}"
-                                    }
-
-                                    // Delete button (show on hover)
-                                    button {
-                                        class: "opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-500/20 hover:text-red-400 transition-all",
-                                        onclick: move |e| {
-                                            e.stop_propagation();
-                                            on_delete.call(conv_id2.clone());
-                                        },
-                                        svg {
-                                            class: "w-3.5 h-3.5",
-                                            fill: "none",
-                                            stroke: "currentColor",
-                                            stroke_width: "2",
-                                            view_box: "0 0 24 24",
-                                            path { d: "M6 18L18 6M6 6l12 12" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                div { class: "sidebar-footer",
+                    button { class: "sidebar-settings", onclick: move |_| on_settings.call(()), Icon { name: "settings", size: 17 } "连接与设置" }
+                    button { class: "icon-button", title: "切换明暗主题", aria_label: "切换明暗主题", onclick: move |_| {
+                        let theme = workspace.settings.peek().theme.clone();
+                        workspace.settings.write().theme = if theme == Theme::Dark { Theme::Light } else { Theme::Dark };
+                    }, Icon { name: theme_icon, size: 18 } }
                 }
-
-                // Model selector at bottom
-                div {
-                    class: "p-3 border-t border-white/5",
-                    crate::components::model_selector::ModelSelector {}
+            }
+            if let Some(id) = deleting() {
+                div { class: "delete-confirm", id: "delete-conversation-dialog", role: "alertdialog",
+                    aria_modal: "true", aria_label: "确认删除对话", aria_describedby: "delete-dialog-description", tabindex: "-1",
+                    p { id: "delete-dialog-description", "删除这段对话？此操作无法撤销。" }
+                    div { button { id: "cancel-delete-conversation", class: "button-secondary", onclick: move |_| deleting.set(None), "取消" }
+                        button { class: "button-danger", onclick: move |_| { on_delete.call(id.clone()); deleting.set(None); }, "删除" }
+                    }
                 }
             }
         }

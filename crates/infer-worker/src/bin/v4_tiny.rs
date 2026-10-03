@@ -3,12 +3,12 @@ use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
+use infer_core::{
+    dtype::Dtype,
+    exec::{ExecScope, HostScope},
+    ports::backend::LlmBackend,
+};
 use infer_worker::{
-    domain::{
-        dtype::Dtype,
-        exec::{ExecScope, HostScope},
-        ports::backend::LlmBackend,
-    },
     infrastructure::{cpu::Cpu, io::SafetensorsReader},
     models::{
         deepseek_v4::{TinyConfig, TinyModel},

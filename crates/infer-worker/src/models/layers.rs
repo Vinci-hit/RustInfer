@@ -5,9 +5,9 @@
 //! decoder primitives (matmul / rmsnorm / rope / swiglu), `DiffusionOps` for
 //! conv/VAE/DiT.
 
-use crate::domain::ports::{CoreOps, DiffusionOps, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Dtype;
+use infer_core::ports::{CoreOps, DiffusionOps, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Dtype;
 
 /// Linear layer: output = input @ weight^T + optional bias
 pub struct Linear<T: Dtype, D: CoreOps> {

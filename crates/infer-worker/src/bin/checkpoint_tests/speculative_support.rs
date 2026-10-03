@@ -1,10 +1,10 @@
-use infer_worker::domain::{
+use infer_core::{
     kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
     plan::{BatchKind, BatchPlan},
     tensor::Tensor,
 };
 
-pub(super) fn indices<D: infer_worker::domain::ports::backend::LlmBackend>(
+pub(super) fn indices<D: infer_core::ports::backend::LlmBackend>(
     start: usize,
     n: usize,
     blocks: usize,
@@ -49,10 +49,7 @@ pub(super) fn indices<D: infer_worker::domain::ports::backend::LlmBackend>(
     };
     (plan, idx)
 }
-pub(super) fn pool<
-    T: infer_worker::domain::dtype::Dtype,
-    D: infer_worker::domain::ports::backend::LlmBackend,
->(
+pub(super) fn pool<T: infer_core::dtype::Dtype, D: infer_core::ports::backend::LlmBackend>(
     layers: usize,
     blocks: usize,
     kv_dim: usize,

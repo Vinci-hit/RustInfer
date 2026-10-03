@@ -2,9 +2,11 @@
 //! feature-layer selection and speculative acceptance live outside the head.
 use super::{
     cache::{CacheLayout, ModelCacheView},
+    model::ModelDims,
+};
+use infer_core::{
     dtype::Dtype,
     exec::StepCtx,
-    model::ModelDims,
     ports::{OpResult, backend::LlmBackend},
     tensor::Tensor,
 };

@@ -2,11 +2,11 @@
 //! contract every LLM the runtime drives implements.
 
 use super::cache::{CacheLayout, ModelCacheView};
-use super::component::{Hidden, LayerRange, StageKind};
-use super::dtype::Dtype as V2Dtype;
-use super::ports::OpResult;
-use super::ports::backend::LlmBackend;
-use super::tensor::Tensor;
+use infer_core::component::{Hidden, LayerRange, StageKind};
+use infer_core::dtype::Dtype as V2Dtype;
+use infer_core::ports::OpResult;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::tensor::Tensor;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ModelDims {
@@ -29,7 +29,7 @@ pub struct ModelDims {
 impl ModelDims {
     pub fn validate(&self) -> OpResult<()> {
         if self.head_num > 0 && self.head_dim > 0 && self.q_dim != self.head_num * self.head_dim {
-            return Err(crate::domain::ports::OpError::Shape(format!(
+            return Err(infer_core::ports::OpError::Shape(format!(
                 "q_dim={} does not equal head_num*head_dim={}",
                 self.q_dim,
                 self.head_num * self.head_dim
@@ -39,7 +39,7 @@ impl ModelDims {
             && self.head_dim > 0
             && self.kv_dim != self.kv_head_num * self.head_dim
         {
-            return Err(crate::domain::ports::OpError::Shape(format!(
+            return Err(infer_core::ports::OpError::Shape(format!(
                 "kv_dim={} does not equal kv_head_num*head_dim={}",
                 self.kv_dim,
                 self.kv_head_num * self.head_dim
@@ -62,6 +62,12 @@ pub enum SampleRows<'a> {
 }
 
 pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
+    /// Keep the same ragged attention arithmetic for prefill and decode, and
+    /// disable graph optimizations until they have been validated for this model.
+    fn requires_eager_ragged(&self) -> bool {
+        false
+    }
+
     /// (rotary dimensions, theta, interleaved T/H/W frequency counts).
     fn multimodal_rope(&self) -> Option<(usize, f64, [usize; 3])> {
         None
@@ -72,7 +78,7 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         _image: &infer_protocol::multimodal::ImageInput,
         _scope: &D::Scope,
     ) -> OpResult<Tensor<T, D>> {
-        Err(crate::domain::ports::OpError::unsupported(
+        Err(infer_core::ports::OpError::unsupported(
             "model",
             "image inputs",
         ))
@@ -102,7 +108,7 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         &self,
         input_ids: &Tensor<i32, D>,
         hidden: &mut Hidden<T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()>;
 
     fn decode_layers(
@@ -110,7 +116,7 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         range: LayerRange,
         hidden: &mut Hidden<T, D>,
         cache: &mut ModelCacheView<'_, T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()>;
 
     /// Optional non-mutating observation at complete decoder-block boundaries.
@@ -119,11 +125,11 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         range: LayerRange,
         hidden: &mut Hidden<T, D>,
         cache: &mut ModelCacheView<'_, T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
         observer: &mut O,
     ) -> OpResult<()> {
         if observer.is_active() {
-            return Err(crate::domain::ports::OpError::unsupported(
+            return Err(infer_core::ports::OpError::unsupported(
                 "model",
                 "decoder layer observation",
             ));
@@ -135,7 +141,7 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         &self,
         hidden: &Hidden<T, D>,
         rows: SampleRows<'_>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<Logits<T, D>>;
 
     fn forward(
@@ -144,7 +150,7 @@ pub trait DecoderModel<T: V2Dtype, D: LlmBackend> {
         hidden: &mut Hidden<T, D>,
         cache: &mut ModelCacheView<'_, T, D>,
         rows: SampleRows<'_>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<Logits<T, D>> {
         self.embed(input_ids, hidden, ctx)?;
         self.decode_layers(LayerRange::all(self.dims().num_layers), hidden, cache, ctx)?;
@@ -161,13 +167,13 @@ pub trait DecoderReadout<T: V2Dtype, D: LlmBackend>: DecoderModel<T, D> {
         &self,
         hidden: &Hidden<T, D>,
         output: &mut Tensor<T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()>;
     /// Project already normalized hidden states through the shared LM head.
     fn project_logits_into(
         &self,
         normalized: &Tensor<T, D>,
         output: &mut Tensor<T, D>,
-        ctx: &crate::domain::exec::StepCtx<'_, D>,
+        ctx: &infer_core::exec::StepCtx<'_, D>,
     ) -> OpResult<()>;
 }

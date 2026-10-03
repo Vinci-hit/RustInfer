@@ -11,14 +11,13 @@ pub type Eagle3Config = DeepSpecConfig;
 
 use crate::{
     components::eagle3::Eagle3DraftHead,
-    domain::{
-        dtype::Dtype,
-        features::FeatureSpec,
-        model::ModelDims,
-        ports::{OpBackend, OpError, OpResult, backend::LlmBackend},
-        tensor::Tensor,
-    },
+    domain::{features::FeatureSpec, model::ModelDims},
     models::loader::WeightLoader,
+};
+use infer_core::{
+    dtype::Dtype,
+    ports::{OpBackend, OpError, OpResult, backend::LlmBackend},
+    tensor::Tensor,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

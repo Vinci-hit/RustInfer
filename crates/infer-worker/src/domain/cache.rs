@@ -3,13 +3,13 @@
 
 use std::collections::HashSet;
 
-use super::component::LayerRange;
-use super::dtype::Dtype;
-use super::kv::{KvIndexTensors, KvView, PagedKvPool};
-use super::plan::{BatchKind, BatchPlan};
-use super::ports::backend::LlmBackend;
-use super::ports::{OpError, OpResult};
-use super::tensor::Tensor;
+use infer_core::component::LayerRange;
+use infer_core::dtype::Dtype;
+use infer_core::kv::{KvIndexTensors, KvView, PagedKvPool};
+use infer_core::plan::{BatchKind, BatchPlan};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 mod snapshot;
 pub use snapshot::LinearSnapshot;
@@ -239,7 +239,7 @@ impl<D: LlmBackend> LinearBatch<D> {
             && !matches!(
                 plan.kind,
                 BatchKind::Spec {
-                    mask: super::plan::MaskMode::Causal,
+                    mask: infer_core::plan::MaskMode::Causal,
                     mask_handle: None,
                 }
             )
@@ -528,7 +528,7 @@ fn validate_kv_plan<D: LlmBackend>(
         tokens = tokens
             .checked_add(q as usize)
             .ok_or_else(|| OpError::Shape("KV token count overflows".into()))?;
-        tiles += (q as usize).div_ceil(super::plan::RAGGED_Q_TILE as usize);
+        tiles += (q as usize).div_ceil(infer_core::plan::RAGGED_Q_TILE as usize);
     }
     // Full-only graph plans contain bucket placeholders; live lengths reside
     // on the device. Hybrid execution currently requires an ordinary tape.

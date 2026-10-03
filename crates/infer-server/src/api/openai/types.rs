@@ -14,6 +14,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub model: Option<String>,
     pub messages: Vec<InputChatMessage>,
+    /// GGUF chat-template controls. Omitted values retain checkpoint defaults.
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<String>,
 
     #[serde(default)]
     pub max_tokens: Option<usize>,
@@ -284,6 +287,7 @@ pub struct ModelObject {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    pub capabilities: crate::api::capabilities::ServerCapabilities,
 }
 
 #[cfg(test)]

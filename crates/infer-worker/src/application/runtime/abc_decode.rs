@@ -2,15 +2,15 @@
 //! `finalize_decode_abc` halves of the 1-deep decode pipeline (CUDA).
 
 use crate::application::execution::{ExecutionMode, ExecutionPlan, Phase, WorkspaceUse};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::ExecScope;
 use crate::domain::model::DecoderModel;
 use crate::domain::plan::StepRequest;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::pipeline_ops::{CompactExtendControlArgs, MergeCompactDecodeArgs};
-use crate::domain::ports::{CollectiveOps, CommAxis, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use infer_core::dtype::Dtype;
+use infer_core::exec::ExecScope;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::pipeline_ops::{CompactExtendControlArgs, MergeCompactDecodeArgs};
+use infer_core::ports::{CollectiveOps, CommAxis, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 use super::{
     AsyncControlBuffers, DecodeCompactOutput, DecodeRowToken, GraphDecision, Runtime,

@@ -29,13 +29,13 @@
 
 use std::path::Path;
 
-use crate::domain::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::{Dtype, Shape};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::io::SafetensorsReader;
 use crate::models::layers::{LayerNorm, Linear, RMSNorm};
 use crate::models::loader::WeightLoader;
+use infer_core::ports::{CoreOps, DiffusionOps, OpBackend, OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::{Dtype, Shape};
 
 use super::dit_block::DiTBlock;
 use super::rope_3d::{RopeEmbedder3D, fill_cap_pos_ids, fill_image_pos_ids};
@@ -308,11 +308,9 @@ impl<T: Dtype> ZImageTransformer<T, Cuda> {
         // Final layer. diffusers `LayerNorm(elementwise_affine=False)` →
         // no weight/bias on disk. We emulate with unit weight + zero bias.
         let final_norm_w_host = vec![T::write_f64(1.0); dim];
-        let final_norm_w =
-            Tensor::<T, Cuda>::from_host_slice(&final_norm_w_host, [dim], device)?;
+        let final_norm_w = Tensor::<T, Cuda>::from_host_slice(&final_norm_w_host, [dim], device)?;
         let final_norm_b_host = vec![T::write_f64(0.0); dim];
-        let final_norm_b =
-            Tensor::<T, Cuda>::from_host_slice(&final_norm_b_host, [dim], device)?;
+        let final_norm_b = Tensor::<T, Cuda>::from_host_slice(&final_norm_b_host, [dim], device)?;
         let final_norm = LayerNorm::new(final_norm_w, final_norm_b, 1e-6);
         let final_adaln = loader.load_linear::<T, Cuda>(
             &format!("all_final_layer.{}.adaLN_modulation.1.weight", patch_key),
@@ -684,7 +682,7 @@ fn load_fused_qkv_dit<T: Dtype>(
     dim: usize,
     device: &Cuda,
 ) -> OpResult<Linear<T, Cuda>> {
-    use crate::domain::types::DataType;
+    use infer_core::types::DataType;
     let names = [
         format!("{}.attention.to_q.weight", prefix),
         format!("{}.attention.to_k.weight", prefix),

@@ -1,8 +1,8 @@
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
-use crate::domain::ports::OpResult;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::OpResult;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::tensor::Tensor;
 
 /// RMSNorm weights. Held by the sublayer that consumes it — `FullAttention` (input
 /// norm), the FFN (post-attention norm), and the model (final norm) — so

@@ -4,10 +4,10 @@
 use std::rc::Rc;
 
 use super::cache::LinearDims;
-use super::dtype::Dtype;
-use super::ports::backend::LlmBackend;
-use super::ports::{OpError, OpResult};
-use super::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 
 pub struct GdnScratch<T: Dtype, D: LlmBackend> {
     pub(crate) dim: usize,

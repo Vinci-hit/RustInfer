@@ -14,6 +14,7 @@ name = "rustinfer-server"
 path = "src/bin/server.rs"
 
 [dependencies]
+infer-gguf = { version = "1.0.1", path = "../infer-gguf", features = ["text"] }
 # Core inference
 infer-protocol = { version = "1.0.1", path = "../infer-protocol" }
 

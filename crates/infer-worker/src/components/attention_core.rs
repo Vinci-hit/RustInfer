@@ -1,13 +1,13 @@
 use crate::components::linear::Linear;
 use crate::components::norm::RmsNorm;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
 use crate::domain::forward_scratch::ForwardScratch;
-use crate::domain::kv::KvView;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::kv::KvView;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 /// QKV projection, positional encoding, paged attention and output projection.
 /// Input normalization and residual ownership belong to the caller. Input and

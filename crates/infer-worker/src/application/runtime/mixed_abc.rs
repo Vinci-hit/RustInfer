@@ -3,18 +3,21 @@
 //! bootstrap mixed-graph prewarm (CUDA).
 
 use crate::application::execution::{ExecutionMode, ExecutionPlan, Phase, WorkspaceUse};
-use crate::domain::component::Hidden;
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::ExecScope;
+use crate::application::mixed_tuning::MixedGraphTuning;
 use crate::domain::model::{DecoderModel, SampleRows};
-use crate::domain::plan::{
-    BatchKind, BatchPlan, SampledToken, SeqStep, StepOutput, StepRequest, StopCriteria,
+use crate::domain::plan::{SeqStep, StepOutput, StepRequest, StopCriteria};
+use infer_core::component::Hidden;
+use infer_core::dtype::Dtype;
+use infer_core::exec::ExecScope;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::pipeline_ops::{CompactExtendControlArgs, MergeCompactMixedArgs};
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
+use infer_core::{
+    plan::{BatchKind, BatchPlan},
+    ports::SampledToken,
 };
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::pipeline_ops::{CompactExtendControlArgs, MergeCompactMixedArgs};
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
 
 use super::{
     PrefillGemmGuard, RaggedRowKind, Runtime, u32_to_i32_saturating, upload_i32_prefix,
@@ -85,6 +88,7 @@ struct MixedGraphWarmupCase {
 }
 
 fn mixed_graph_warmup_cases(
+    token_buckets: &[usize],
     capture_sizes: &[usize],
     cap_batch: usize,
     cap_num_tokens: usize,
@@ -108,7 +112,7 @@ fn mixed_graph_warmup_cases(
     prefixes.dedup();
 
     let mut out = Vec::with_capacity(limit.min(64));
-    for &token_bucket in MIXED_GRAPH_PREWARM_TOKEN_BUCKETS {
+    for &token_bucket in token_buckets {
         if token_bucket > cap_num_tokens {
             continue;
         }
@@ -140,6 +144,7 @@ fn mixed_graph_shape(
     cap_num_tokens: usize,
     tile_capacity: i32,
     capture_sizes: &[usize],
+    tuning: &MixedGraphTuning,
 ) -> Option<MixedGraphShape> {
     if !matches!(plan.kind, BatchKind::Ragged) {
         return None;
@@ -155,12 +160,17 @@ fn mixed_graph_shape(
         return None;
     }
     let actual_decode_prefix = plan.q_lens.iter().take_while(|&&q| q == 1).count();
-    let decode_prefix = floor_capture_slot(capture_sizes, actual_decode_prefix)?;
+    let decode_prefix = if tuning.exact_decode {
+        actual_decode_prefix
+    } else {
+        floor_capture_slot(capture_sizes, actual_decode_prefix)?
+    };
     let rows = ceil_capture_slot(capture_sizes, plan.batch)?;
     if decode_prefix == 0 || decode_prefix >= rows || rows > cap_batch {
         return None;
     }
-    let tokens = round_up_to_bucket(plan.num_tokens, MIXED_GRAPH_TOKEN_BUCKET)?;
+    let default_tokens = round_up_to_bucket(plan.num_tokens, MIXED_GRAPH_TOKEN_BUCKET)?;
+    let tokens = tuning.token_bucket(plan.num_tokens, default_tokens);
     let actual_tiles = usize::try_from(plan.total_q_tiles).ok()?;
     let tile_capacity = usize::try_from(tile_capacity).ok()?;
     let tiles = round_up_to_bucket(actual_tiles.max(1), MIXED_GRAPH_TILE_BUCKET)?;
@@ -243,8 +253,17 @@ where
             .max_seq_len
             .min(self.cap_num_tokens)
             .min(self.max_blocks_per_seq.saturating_mul(self.block_size));
-        let cases = mixed_graph_warmup_cases(
+        // Graph coverage does not change the default serving admission budget.
+        let tuning = &self.mixed_tuning.graph;
+        let token_buckets = tuning.prewarm_token_buckets(MIXED_GRAPH_PREWARM_TOKEN_BUCKETS);
+        let warmup_prefixes = tuning.warmup_prefixes(
             &self.capture_sizes,
+            self.cap_batch,
+            MIXED_GRAPH_PREWARM_MAX_DECODE_PREFIX,
+        );
+        let cases = mixed_graph_warmup_cases(
+            &token_buckets,
+            &warmup_prefixes,
             self.cap_batch,
             self.cap_num_tokens,
             max_prefill_len,
@@ -288,6 +307,7 @@ where
                 self.cap_num_tokens,
                 self.mixed_graph_tile_capacity(),
                 graph.capture_sizes(),
+                &self.mixed_tuning.graph,
             )
         }) else {
             return Ok(None);
@@ -382,9 +402,10 @@ where
     /// runs the REAL eager fused path, so whatever the first live step at that
     /// `num_tokens` would lazily build (GEMM shape state, FA3 scratch growth,
     /// allocator bins) is paid here instead of in the timed path — the
-    /// measured warmup-concentrated eager p99 spikes. The grid extends past
-    /// the admission budget because a step's decode rows ride on top of it
-    /// (budget bounds prefill admission, not total tokens).
+    /// measured warmup-concentrated eager p99 spikes. The grid also covers
+    /// steps beyond the default soft budget: the first atomic prefill command
+    /// may exceed that budget to guarantee progress. Admission otherwise
+    /// reserves space for decode rows within the same total-token budget.
     pub fn prewarm_mixed_eager_shapes(&mut self, eos_ids: &[i32]) -> OpResult<usize> {
         if self.has_recurrent_state() || !self.mixed_eager {
             return Ok(0);
@@ -728,7 +749,8 @@ where
         self.finalize_fused_abc(ticket, req, row_kind)
     }
 
-    /// Largest mixed-step token bucket the bootstrap prewarm covers. The
+    /// Legacy default admission budget, independent of extra graph buckets.
+    /// Explicit admission configuration overrides this value. The default
     /// fused-step packer bounds each step's prefill admission to this so live
     /// mixed steps replay a prewarmed graph (graph mode) / hit a prewarmed
     /// eager GEMM shape and keep decode-row stall per step bounded (eager
@@ -797,6 +819,7 @@ where
                 self.cap_num_tokens,
                 self.mixed_graph_tile_capacity(),
                 graph.capture_sizes(),
+                &self.mixed_tuning.graph,
             )
         }) else {
             return Ok(false);
@@ -836,7 +859,7 @@ where
         // Warm only the capturable forward/finalize kernels. Do not run merge or
         // compact-extend here, because compact-extend mutates this step's control
         // plane into the next step's control plane.
-        self.forward_finalize_argmax_all_selected(&graph_plan, &input_ids)?;
+        self.forward_mixed_graph_argmax(&graph_plan, &input_ids)?;
         self.scope.synchronize()?;
 
         // Re-seed every device input the graph reads. Warmup should be
@@ -957,12 +980,12 @@ where
             0,
             true,
         );
-        self.forward_finalize_argmax_all_selected(plan, &input_ids)?;
+        self.forward_mixed_graph_argmax(plan, &input_ids)?;
         self.run_mixed_merge_and_next_control(plan, eos_len, next_control, plan.batch)
     }
 
     fn mixed_graph_tile_capacity(&self) -> i32 {
-        let tile = crate::domain::plan::RAGGED_Q_TILE as usize;
+        let tile = infer_core::plan::RAGGED_Q_TILE as usize;
         (self.cap_batch + self.cap_num_tokens.div_ceil(tile)).max(1) as i32
     }
 
@@ -1014,7 +1037,7 @@ where
             ),
             pending: None,
         };
-        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let ctx = infer_core::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
         let logits = self.model.finalize(&hidden, SampleRows::LastPerSeq, &ctx)?;
         let logits_rows = logits.0.shape().as_slice()[0];
@@ -1040,12 +1063,30 @@ where
         D::argmax_into(&ctx, &logits.0, &mut c_view, &self.abc.argmax_ws, None)
     }
 
-    fn forward_finalize_argmax_all_selected(
+    fn forward_mixed_graph_argmax(
         &mut self,
         plan: &BatchPlan,
         input_ids: &Tensor<i32, D>,
     ) -> OpResult<()> {
         self.run_layers(plan, input_ids)?;
+        if let Some(readout_scratch) = &self.mixed_readout_hidden {
+            // Indices are updated on device for every replay. Gather BEFORE
+            // vocabulary projection, so only one row per request gets logits.
+            // Both buffers have stable addresses allocated before capture.
+            let source = self.hidden.stream.narrow(0, 0, plan.num_tokens)?;
+            let indices = self.abc.last_token_rows_dev.narrow(0, 0, plan.batch)?;
+            let mut gathered = readout_scratch.narrow(0, 0, plan.batch)?;
+            let ctx = infer_core::exec::StepCtx::new(&self.scope, plan);
+            let _guard = self.scope.enter();
+            D::embedding(&self.scope, &source, &indices, &mut gathered)?;
+            let hidden = Hidden {
+                stream: gathered,
+                pending: None,
+            };
+            let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
+            let mut output = self.abc.argmax_out_dev.narrow(0, 0, plan.batch)?;
+            return D::argmax_into(&ctx, &logits.0, &mut output, &self.abc.argmax_ws, None);
+        }
         let hidden = Hidden {
             stream: self.hidden.stream.view_raw(
                 Shape::from_slice(&[plan.num_tokens, self.dims.dim]),
@@ -1055,7 +1096,7 @@ where
             ),
             pending: None,
         };
-        let ctx = crate::domain::exec::StepCtx::new(&self.scope, plan);
+        let ctx = infer_core::exec::StepCtx::new(&self.scope, plan);
         let _guard = self.scope.enter();
         let logits = self.model.finalize(&hidden, SampleRows::All, &ctx)?;
         let mut c_view = self.abc.argmax_out_dev.view_raw(
@@ -1442,8 +1483,16 @@ mod tests {
         kinds.extend([RaggedRowKind::PrefillCont; 4]);
         kinds.push(RaggedRowKind::PrefillFinal);
 
-        let shape =
-            mixed_graph_shape(&plan, &kinds, 32, 512, 36, &[1, 2, 4, 8, 16, 24, 32]).unwrap();
+        let shape = mixed_graph_shape(
+            &plan,
+            &kinds,
+            32,
+            512,
+            36,
+            &[1, 2, 4, 8, 16, 24, 32],
+            &MixedGraphTuning::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             shape,
@@ -1454,6 +1503,33 @@ mod tests {
                 decode_prefix: 16,
             }
         );
+    }
+
+    #[test]
+    fn mixed_graph_shape_exact_prefix_keeps_decode_rows_out_of_prefill() {
+        let mut tuning = MixedGraphTuning::default();
+        tuning.exact_decode = true;
+        for prefix in 1..8 {
+            let plan = BatchPlan {
+                kind: BatchKind::Ragged,
+                num_tokens: prefix + 512,
+                batch: prefix + 1,
+                q_lens: vec![1; prefix].into_iter().chain([512]).collect(),
+                kv_lens: vec![512; prefix + 1],
+                seq_positions: vec![0; prefix + 1],
+                rope_positions: vec![0; prefix + 512],
+                max_blocks_per_seq: 4096,
+                block_size: 1,
+                total_q_tiles: prefix as i32 + 4,
+            };
+            let mut kinds = vec![RaggedRowKind::Decode; prefix];
+            kinds.push(RaggedRowKind::PrefillFinal);
+            let shape =
+                mixed_graph_shape(&plan, &kinds, 8, 4096, 40, &[1, 2, 4, 8], &tuning).unwrap();
+            assert_eq!(shape.decode_prefix, prefix);
+            assert_eq!(shape.rows, (prefix + 1).next_power_of_two());
+            assert_eq!(shape.tokens, 576);
+        }
     }
 
     #[test]
@@ -1473,8 +1549,16 @@ mod tests {
         let mut kinds = vec![RaggedRowKind::Decode; 30];
         kinds.push(RaggedRowKind::PrefillFinal);
 
-        let shape =
-            mixed_graph_shape(&plan, &kinds, 32, 512, 36, &[1, 2, 4, 8, 16, 24, 32]).unwrap();
+        let shape = mixed_graph_shape(
+            &plan,
+            &kinds,
+            32,
+            512,
+            36,
+            &[1, 2, 4, 8, 16, 24, 32],
+            &MixedGraphTuning::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             shape,
@@ -1513,8 +1597,33 @@ mod tests {
     }
 
     #[test]
+    fn mixed_graph_warmup_covers_large_prefills_with_decode_prefix() {
+        let cases = mixed_graph_warmup_cases(&[576, 2112], &[1, 2, 4, 8], 8, 4096, 4096, 112);
+        assert_eq!(cases.len(), 6);
+        for tokens in [576, 2112] {
+            for prefix in [1, 2, 4] {
+                assert!(cases.contains(&MixedGraphWarmupCase {
+                    decode_prefix: prefix,
+                    token_bucket: tokens,
+                    prefill_len: tokens - prefix,
+                }));
+            }
+        }
+        let capped = mixed_graph_warmup_cases(&[576, 2112], &[1, 2, 4, 8], 8, 1024, 1024, 112);
+        assert_eq!(capped.len(), 3);
+        assert!(capped.iter().all(|case| case.token_bucket == 576));
+    }
+
+    #[test]
     fn mixed_graph_warmup_cases_cover_common_buckets() {
-        let cases = mixed_graph_warmup_cases(&[1, 2, 4, 8, 16, 24, 32], 32, 512, 512, 10);
+        let cases = mixed_graph_warmup_cases(
+            MIXED_GRAPH_PREWARM_TOKEN_BUCKETS,
+            &[1, 2, 4, 8, 16, 24, 32],
+            32,
+            512,
+            512,
+            10,
+        );
 
         assert_eq!(
             cases,

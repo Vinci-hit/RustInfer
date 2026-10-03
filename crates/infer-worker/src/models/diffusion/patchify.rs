@@ -13,11 +13,11 @@
 //! since latent volume is tiny vs. the rest of the pipeline (1024×1024 →
 //! ~1MB BF16). When the device tensor lives on CPU we skip the round-trip.
 
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Dtype;
 use crate::infrastructure::cuda::Cuda;
 use half::bf16;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Dtype;
 
 /// `image: [C, F, H, W]` → `dst: [num_tokens, patch_flat]`,
 /// `num_tokens = (F/p_f) * (H/p) * (W/p)`,
@@ -181,7 +181,7 @@ fn upload_into<T: Dtype>(dst: &mut Tensor<T, Cuda>, host: &[T]) -> OpResult<()> 
     if bytes == 0 {
         return Ok(());
     }
-    use crate::domain::ports::MemoryPort;
+    use infer_core::ports::MemoryPort;
     let dev = dst.device().clone();
     unsafe {
         let dst_nn = std::ptr::NonNull::new_unchecked(dst.data_ptr_mut() as *mut u8);

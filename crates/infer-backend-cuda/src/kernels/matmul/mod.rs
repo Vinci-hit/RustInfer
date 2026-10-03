@@ -269,12 +269,58 @@ pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
             scheme.packing
         )));
     }
+    if A::DATA_TYPE != DataType::BF16
+        || O::DATA_TYPE != DataType::BF16
+        || W::DATA_TYPE != DataType::I32
+    {
+        return Err(OpError::Kernel(
+            "matmul_quant requires BF16 activations/output and I32 packed weights".into(),
+        ));
+    }
+    if input.shape().as_slice().len() != 2
+        || weight_packed.shape().as_slice().len() != 2
+        || output.shape().as_slice().len() != 2
+    {
+        return Err(OpError::Shape(
+            "matmul_quant requires rank-2 matrices".into(),
+        ));
+    }
+    if !input.is_contiguous() || !weight_packed.is_contiguous() || !scales.is_contiguous() {
+        return Err(OpError::Kernel(
+            "matmul_quant requires contiguous inputs, weights and scales".into(),
+        ));
+    }
     let per_word = scheme.logical_per_word(); // 8 int4 per int32 word
     let group_size = scheme.group;
     let wp_shape = weight_packed.shape().as_slice();
     let n = wp_shape[0];
     let k = wp_shape[1] * per_word;
     let m = input.shape().as_slice()[0];
+    if group_size == 0
+        || !group_size.is_multiple_of(8)
+        || k == 0
+        || n == 0
+        || !k.is_multiple_of(group_size)
+        || input.shape().as_slice()[1] != k
+        || [m, n, k, group_size].iter().any(|&d| d > i32::MAX as usize)
+        || scheme.granularity != infer_core::dtype::quant::Granularity::PerGroup
+    {
+        return Err(OpError::Shape(
+            "matmul_quant: invalid dimensions or group size".into(),
+        ));
+    }
+    let groups = k / group_size;
+    let zeros = zeros.ok_or_else(|| {
+        OpError::Shape("matmul_quant requires packed zero points (8 for symmetric INT4)".into())
+    })?;
+    if scales.shape().as_slice() != [n, groups]
+        || zeros.shape().as_slice() != [n.div_ceil(8), groups]
+        || !zeros.is_contiguous()
+    {
+        return Err(OpError::Shape(
+            "matmul_quant: invalid scales or zero points".into(),
+        ));
+    }
     let out_shape = output.shape().as_slice();
     if out_shape != [m, n] {
         return Err(OpError::Shape(format!(
@@ -290,7 +336,10 @@ pub fn matmul_quant<A: Dtype, W: Dtype, O: Dtype>(
         )));
     }
 
-    let zeros_ptr = zeros.map_or(std::ptr::null(), |z| z.data_ptr() as *const _);
+    if m == 0 {
+        return Ok(());
+    }
+    let zeros_ptr = zeros.data_ptr() as *const _;
 
     unsafe {
         if m == 1 {

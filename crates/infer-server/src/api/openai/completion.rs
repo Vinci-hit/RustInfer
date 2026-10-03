@@ -25,7 +25,7 @@ pub async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, AppError> {
     // 1. 校验
-    validate_request(&req, state.tokenizer.get_vocab_size(true))?;
+    validate_request(&req, state.tokenizer_vocab_size)?;
     shared::validate_speculative_request(
         state.config.speculative_draft_tokens(),
         req.temperature,
@@ -49,9 +49,15 @@ pub async fn completions(
     let (input_ids, prompt_tokens) = match &req.prompt {
         CompletionPrompt::Text(text) => {
             let tokenizer = state.tokenizer.clone();
+            let gguf_text = state.gguf_text.clone();
             let text = text.clone();
             let processing_admission = permit.clone();
             let ids: Vec<i32> = tokio::task::spawn_blocking(move || {
+                if let Some(codec) = gguf_text {
+                    return codec
+                        .encode(&text, true)
+                        .map_err(|e| AppError::bad_request(e.to_string()));
+                }
                 let encoding = tokenizer
                     .encode(text, true)
                     .map_err(|e| AppError::internal(anyhow::anyhow!("Tokenize error: {}", e)))?;

@@ -4,14 +4,14 @@
 //! its projections, shared scratch, ragged prefill and reordered decode slots.
 
 use half::bf16;
+use infer_core::component::Hidden;
+use infer_core::exec::{ExecScope, HostScope, StepCtx};
+use infer_core::plan::{BatchKind, BatchPlan};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::tensor::Tensor;
 use infer_worker::components::{GatedDeltaNet, GdnWeights, Linear, RmsNorm};
 use infer_worker::domain::cache::{LinearBatch, LinearDims, LinearLayerState};
-use infer_worker::domain::component::Hidden;
-use infer_worker::domain::exec::{ExecScope, HostScope, StepCtx};
 use infer_worker::domain::gdn_scratch::GdnScratch;
-use infer_worker::domain::plan::{BatchKind, BatchPlan};
-use infer_worker::domain::ports::backend::LlmBackend;
-use infer_worker::domain::tensor::Tensor;
 use infer_worker::infrastructure::cpu::Cpu;
 use infer_worker::infrastructure::cuda::{Cuda, CudaMemoryPlan, CudaScope};
 

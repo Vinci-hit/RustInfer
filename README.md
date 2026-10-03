@@ -33,8 +33,9 @@ RustInfer is organized around a few principles, applied consistently top to bott
 
 ### Hexagonal core (ports & adapters)
 
-`infer-core` owns nothing but **ports** — trait definitions for everything the
-inference path needs from hardware:
+`infer-core` owns the shared tensor, storage, and execution types, along with
+**ports** — trait definitions for the capabilities the inference path needs
+from hardware:
 
 ```
 infer-core/ports/
@@ -70,7 +71,7 @@ Infrastructure, so pure inference logic never mixes with I/O or orchestration:
 
 ```
 infer-worker/src/
-  domain/          model.rs, plan.rs, kv, forward_scratch, global_kv_alloc
+  domain/          model.rs, plan.rs, cache, forward_scratch, global_kv_alloc
                    → pure inference logic; no I/O, no transport
   application/     runtime, decode_engine, serve_loop, worker_scheduler,
                    sampler_stack, hosting  → orchestration & lifecycle
@@ -78,6 +79,11 @@ infer-worker/src/
   components/      attention, ffn, norm, embed, lm_head  → reusable NN blocks
   models/          llama3, qwen3, decoder, loader        → composition
 ```
+
+Shared types and backend ports are imported directly from `infer_core`.
+`infer_worker::domain` exposes worker-specific contracts such as `DecoderModel`,
+`StepRequest`, and KV allocation rules. Shared `BatchPlan` types belong to
+`infer_core::plan`; constructing an execution plan remains the worker's job.
 
 ### Model variation lives in the data, not in branches
 

@@ -1,44 +1,28 @@
-//! Domain layer — pure business logic, zero FFI, zero I/O.
+//! Worker-specific model contracts, execution requests, and resource rules.
 //!
-//! This module defines WHAT the system IS, not HOW it does things.
-//! All trait definitions (ports) live here. Infrastructure implements them.
+//! Shared tensors, storage, execution types, and backend ports live in
+//! `infer_core` and are imported directly from that crate. This module owns
+//! the worker's model/cache contracts, KV allocation, and step request state.
 
-pub use infer_core::component;
 pub mod cache;
-pub use infer_core::dtype;
-pub use infer_core::exec;
+pub mod draft;
+pub mod features;
 pub mod forward_scratch;
 pub mod gdn_scratch;
 pub mod global_kv_alloc;
-pub use infer_core::kv;
-pub mod draft;
-pub mod features;
 #[cfg(test)]
 mod kv_tests;
 pub mod model;
 pub mod plan;
 pub mod speculative;
 pub mod tensor_parallel;
-pub use infer_core::ports;
-pub use infer_core::storage;
-pub use infer_core::tensor;
 #[cfg(test)]
 mod tensor_tests;
-pub use infer_core::types;
 
-// ─── Re-exports ──────────────────────────────────────────────────────────────
-pub use component::{Component, Hidden, LayerRange, StageKind};
-pub use dtype::{DTypeId, DTypeSpec, Fp8E4m3, Fp8E5m2};
-pub use exec::{DeviceId, ExecScope, MaskHandle, QuantTier, Rank, TopologyShape};
+// Worker-owned domain types.
 pub use forward_scratch::ForwardScratch;
 pub use global_kv_alloc::{AllocFull, GlobalKvAllocator};
 pub use model::{DecoderModel, Logits, ModelDims, SampleRows};
-pub use ports::{
-    Allocator, CoreOps, Device, DiffusionOps, HostDevice, MemoryPort, OpBackend, OpError, OpResult,
-};
-pub use storage::Storage;
-pub use tensor::Tensor;
 pub use tensor_parallel::TensorParallelPlacement;
-pub use types::{DataType, Dims, Dtype, MAX_RANK, Shape, Strides};
 
 pub(crate) mod draft_scratch;

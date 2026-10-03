@@ -1,9 +1,9 @@
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult, SampledToken, SamplingParams};
 use crate::domain::speculative::{DraftBatch, Verification};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult, SampledToken, SamplingParams};
+use infer_core::tensor::Tensor;
 
 /// Deterministic prefix verification. Backend argmax resolves ties, exactly as
 /// in ordinary greedy sampling; CUDA transfers only the per-row token IDs.
@@ -173,9 +173,9 @@ fn verify_predictions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::exec::HostScope;
-    use crate::domain::plan::{BatchKind, BatchPlan, MaskMode};
     use crate::infrastructure::cpu::Cpu;
+    use infer_core::exec::HostScope;
+    use infer_core::plan::{BatchKind, BatchPlan, MaskMode};
 
     fn plan(q_lens: &[i32]) -> BatchPlan {
         BatchPlan {

@@ -5,14 +5,16 @@
 use super::{Qwen3_5Model, Qwen35GgufLoader, weights};
 use crate::domain::{
     cache::{LinearBatch, LinearLayerState, ModelCacheView},
-    component::{Hidden, LayerRange},
-    dtype::Dtype,
-    exec::{ExecScope, StepCtx},
     features::LayerObserver,
     forward_scratch::ForwardScratch,
     gdn_scratch::GdnScratch,
-    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
     model::{DecoderModel, SampleRows},
+};
+use infer_core::{
+    component::{Hidden, LayerRange},
+    dtype::Dtype,
+    exec::{ExecScope, StepCtx},
+    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
     plan::{BatchKind, BatchPlan},
     ports::{OpBackend, OpError, OpResult, backend::LlmBackend},
     tensor::Tensor,

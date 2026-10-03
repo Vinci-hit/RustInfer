@@ -16,9 +16,9 @@
 //! Both append a trailing `0.0` so the last Euler step integrates all the
 //! way to zero noise.
 
-use crate::domain::ports::{OpBackend, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Dtype;
+use infer_core::ports::{OpBackend, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Dtype;
 
 /// Flow Matching with Euler discrete steps.
 pub struct FlowMatchEulerScheduler {

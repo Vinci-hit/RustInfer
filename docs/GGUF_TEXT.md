@@ -5,6 +5,10 @@ from the GGUF metadata, executes the file's Jinja chat template, runs the main
 decoder, and decodes generated IDs to Unicode text. No separate tokenizer files
 or llama.cpp runtime are needed. This extends the [stateful forward runner](GGUF_FORWARD.md).
 
+For worker/server and browser chat, see [GGUF serving](GGUF_SERVING.md).
+For same-prefix logits and greedy-output checks against an independent engine,
+see [the llama.cpp comparison](GGUF_COMPARISON.md).
+
 ## Run a conversation turn
 
 From the repository root:
@@ -105,7 +109,7 @@ template/prompt-ID cases, including default/low/medium/high thinking, merged
 system/developer messages, and assistant history with reasoning.
 
 Reference results are checked in at
-`crates/infer-worker/tests/fixtures/gguf/qwen35_text_reference.json`. They were
+`crates/infer-gguf/tests/fixtures/gguf/qwen35_text_reference.json`. They were
 generated separately using Python Tokenizers 0.22.2 and Jinja2 3.1.6; Rust uses
 Tokenizers 0.23.1 and MiniJinja. The fixture records source hashes and the exact
 regex. The reference script uses the canonical Qwen35 normalization/splitting
@@ -115,12 +119,10 @@ as-is: that export contains a doubly escaped/older split pattern. Runtime
 construction depends only on GGUF metadata and the explicit Qwen35 profile.
 
 ```bash
-cargo +stable test -p infer-worker --no-default-features --lib \
-  models::qwen3_5::gguf::text
+cargo +stable test -p infer-gguf --features text --lib text
 cargo +stable test -p infer-worker --no-default-features --bin rustinfer-gguf
 RUSTINFER_GGUF_MODEL="$HOME/models/Qwen3.8-27B-GGUF-Q3_K_XL/Qwen3.8-27B-UD-Q3_K_XL.gguf" \
-  cargo +stable test -p infer-worker --no-default-features --lib \
-  models::qwen3_5::gguf::text::tests::real_tokenizer -- --ignored
+  cargo +stable test -p infer-gguf --features text --lib text::tests::real_tokenizer -- --ignored
 ```
 
 To regenerate the reference fixture from the existing inspection manifest:
@@ -129,9 +131,9 @@ To regenerate the reference fixture from the existing inspection manifest:
 .venv/bin/python scripts/gguf_text_reference.py \
   --manifest target/gguf-inspection/model.reference.json \
   --hf-tokenizer ~/models/Qwen3.8-27B-AWQ-INT4/tokenizer.json \
-  --output crates/infer-worker/tests/fixtures/gguf/qwen35_text_reference.json
+  --output crates/infer-gguf/tests/fixtures/gguf/qwen35_text_reference.json
 ```
 
-The GGUF text path remains an offline, eager, single-sequence runner. Worker/
-server integration, live text streaming, sampling beyond greedy decoding,
-tool calls, vision/mmproj and MTP execution remain separate work.
+The diagnostic CLI remains eager, single-sequence and greedy.
+[Worker/server integration](GGUF_SERVING.md) adds browser chat, streaming and
+sampling. Tool calls, GGUF vision/mmproj and GGUF MTP execution remain separate work.

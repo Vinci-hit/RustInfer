@@ -1,16 +1,16 @@
 //! Startup-owned draft control/readout buffers, complementing ForwardScratch.
 //! All views have stable storage. Host metadata is packed into one upload per
 //! round, and draft token IDs stay on device between head invocations.
-use super::dtype::Dtype;
-use super::kv::KvIndexTensors;
 use super::model::ModelDims;
-use super::plan::{BatchKind, BatchPlan, RAGGED_Q_TILE};
-use super::ports::OpResult;
-use super::ports::backend::LlmBackend;
-use super::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::kv::KvIndexTensors;
+use infer_core::plan::{BatchKind, BatchPlan, RAGGED_Q_TILE};
+use infer_core::ports::OpResult;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::tensor::Tensor;
 
 pub(crate) struct DraftWorkspace<T: Dtype, D: LlmBackend> {
-    decode_rows: Option<super::kv::PagedDecodeRows<D>>,
+    decode_rows: Option<infer_core::kv::PagedDecodeRows<D>>,
     control: Tensor<i32, D>,
     control_host: Vec<i32>,
     blocks: Tensor<i32, D>,

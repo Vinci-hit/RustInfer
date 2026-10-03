@@ -19,14 +19,13 @@ use crate::application::sampler_stack::GreedySampler;
 use crate::application::worker_scheduler::handle_fused_step;
 use crate::application::worker_state::{ActiveSeqMap, PrefillSeqMap};
 use crate::domain::TensorParallelPlacement;
-use crate::domain::exec::{ExecScope, RankPair, TopologyShape};
 use crate::domain::global_kv_alloc::GlobalKvAllocator;
 use crate::domain::model::DecoderModel;
-use crate::domain::ports::{CollectiveOps, CommAxis, OpError};
 use crate::infrastructure::cuda::{Cuda, CudaScope, NcclCommunicator, device_utils};
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
-use crate::models::loader::LoadConfig;
+use infer_core::exec::{ExecScope, RankPair, TopologyShape};
+use infer_core::ports::{CollectiveOps, CommAxis, OpError};
 
 // cudaProfiler API for precise nsys capture.
 unsafe extern "C" {
@@ -52,12 +51,11 @@ pub struct Bootstrap<'a> {
     /// Global TP group plus the contiguous rank slice owned by this process.
     pub tp_placement: TensorParallelPlacement,
     pub cuda: &'a Cuda,
-    pub load_cfg: &'a LoadConfig,
     pub max_seq_len: usize,
     pub block_size: usize,
     pub num_blocks_override: usize,
     pub server_heartbeat_ms: Option<u64>,
-    /// Resolved from config.json, not `load.model_type`.
+    /// Resolved from checkpoint metadata, not `load.model_type`.
     pub model_type: String,
     /// CUDA graph capture sizes for decode batches.
     pub capture_sizes: Vec<usize>,
@@ -99,7 +97,7 @@ impl RuntimeFollowerInit {
         &self,
         cuda: Cuda,
         communicator: Arc<NcclCommunicator>,
-    ) -> crate::domain::ports::OpResult<CudaScope> {
+    ) -> infer_core::ports::OpResult<CudaScope> {
         let topology = TopologyShape {
             tp: RankPair {
                 rank: self.rank,
@@ -123,7 +121,7 @@ impl RuntimeFollowerInit {
         self,
         model: M,
         scope: CudaScope,
-    ) -> crate::domain::ports::OpResult<Runtime<bf16, Cuda, M>>
+    ) -> infer_core::ports::OpResult<Runtime<bf16, Cuda, M>>
     where
         M: DecoderModel<bf16, Cuda>,
     {
@@ -144,8 +142,7 @@ impl RuntimeFollowerInit {
 
 /// Builds one process-local follower rank inside its long-lived Runtime thread.
 pub type RuntimeFollowerFactory<M> = Box<
-    dyn FnOnce(RuntimeFollowerInit) -> crate::domain::ports::OpResult<Runtime<bf16, Cuda, M>>
-        + Send,
+    dyn FnOnce(RuntimeFollowerInit) -> infer_core::ports::OpResult<Runtime<bf16, Cuda, M>> + Send,
 >;
 
 #[derive(Debug)]
@@ -222,7 +219,6 @@ where
     M: DecoderModel<bf16, Cuda> + 'static,
     E: crate::application::serve_execution::ServingExecution<M>,
 {
-    let _ = bs.load_cfg;
     if E::SPECULATIVE
         && (bs.load.max_batch_seqs != 1
             || bs.load.tp_size != 1
@@ -238,6 +234,7 @@ where
         ));
     }
     let max_blocks_per_seq = bs.max_seq_len.div_ceil(bs.block_size);
+    let eager_ragged = model.requires_eager_ragged();
     let model_dims = model.dims();
     let enable_prefix_caching = bs.load.enable_prefix_caching && !model.cache_layout().has_linear();
     if bs.load.enable_prefix_caching && !enable_prefix_caching {
@@ -578,7 +575,7 @@ where
     // enables real capture-on-first-hit / replay for decode-only batches whose
     // size matches a capture slot; on backends without graph support it is a
     // no-op and decode stays eager.
-    if !E::SPECULATIVE {
+    if !E::SPECULATIVE && !eager_ragged {
         if let Err(e) = runner.prime_graphs() {
             if e.is_fatal() {
                 return Err(format!("fatal graph priming failure: {e}"));
@@ -1178,7 +1175,7 @@ fn drain_control<M>(
     control: &ControlPump,
     runner: &mut Runtime<bf16, Cuda, M>,
     ctx: &mut WorkerCtx<'_>,
-) -> crate::domain::ports::OpResult<bool>
+) -> infer_core::ports::OpResult<bool>
 where
     M: DecoderModel<bf16, Cuda>,
 {
@@ -1302,7 +1299,7 @@ fn apply_drain<M>(
     ctx: &mut WorkerCtx<'_>,
     mode: DrainMode,
     req_id: RequestId,
-) -> crate::domain::ports::OpResult<()>
+) -> infer_core::ports::OpResult<()>
 where
     M: DecoderModel<bf16, Cuda>,
 {

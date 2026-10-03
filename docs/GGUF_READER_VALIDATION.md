@@ -71,4 +71,4 @@ let view = reader.read_view("output.weight")?;
 - 原有 Safetensors 读取/预取测试：3 项通过。
 - CPU Clippy：完成；保留现有 `mixed_tuning.rs` 的 3 条 dead-code 警告，无 GGUF 新警告。
 
-生成方式与命令见 [fixture README](../crates/infer-worker/tests/fixtures/gguf/README.md)。本地完整参考清单在 `target/gguf-inspection/`，不提交大模型或生成的大型清单。没有进行 GPU 推理或质量/速度评估。
+生成方式与命令见 [fixture README](../crates/infer-gguf/tests/fixtures/gguf/README.md)。本地完整参考清单在 `target/gguf-inspection/`，不提交大模型或生成的大型清单。没有进行 GPU 推理或质量/速度评估。

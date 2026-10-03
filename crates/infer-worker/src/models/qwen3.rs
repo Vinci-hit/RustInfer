@@ -1,11 +1,11 @@
 //! Qwen3 dense model. Model-specific behavior belongs in this file; the shared
 //! loader remains name-driven and model-agnostic.
 
-use crate::domain::dtype::Dtype;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpBackend, OpResult};
 use crate::models::decoder::{Decoder, build_dense_decoder};
 use crate::models::loader::{LoadConfig, WeightLoader};
+use infer_core::dtype::Dtype;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpBackend, OpResult};
 
 pub type Qwen3Model<T, D> = Decoder<T, D>;
 

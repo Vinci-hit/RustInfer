@@ -1,14 +1,15 @@
 //! `StepRequest` validation → `BatchPlan`, plus the per-step control-plane
 //! index upload into the address-stable `kv_index` tensors.
 
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::ExecScope;
 use crate::domain::model::DecoderModel;
-use crate::domain::plan::{BatchKind, BatchPlan, StepRequest};
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
-use crate::domain::types::Shape;
+use crate::domain::plan::StepRequest;
+use infer_core::dtype::Dtype;
+use infer_core::exec::ExecScope;
+use infer_core::plan::{BatchKind, BatchPlan};
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
+use infer_core::types::Shape;
 
 use super::{
     Runtime, upload_i32_full_zeropad, upload_i32_prefix, upload_i32_range,
@@ -175,14 +176,14 @@ where
         // layout; compute it arithmetically instead of building (and discarding)
         // the three `plan_ragged_tiles` Vecs here. `upload_index` builds them
         // once, when it actually uploads them.
-        let tile = crate::domain::plan::RAGGED_Q_TILE;
+        let tile = infer_core::plan::RAGGED_Q_TILE;
         let total_q_tiles: i32 = q_lens.iter().map(|&q| (q + tile - 1) / tile).sum();
         let kind = if !req.draft_tokens.is_empty() {
             BatchKind::Spec {
-                mask: crate::domain::plan::MaskMode::Causal,
+                mask: infer_core::plan::MaskMode::Causal,
                 mask_handle: None,
             }
-        } else if q_lens.iter().all(|&q| q == 1) {
+        } else if !self.model.requires_eager_ragged() && q_lens.iter().all(|&q| q == 1) {
             BatchKind::DecodeOnly
         } else {
             BatchKind::Ragged

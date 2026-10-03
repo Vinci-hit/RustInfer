@@ -1,19 +1,21 @@
 //! Independent PyTorch fixtures plus cache-reconstruction and decoding oracles.
+use infer_core::{
+    component::{Hidden, LayerRange},
+    exec::{HostScope, StepCtx},
+    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
+    plan::{BatchKind, BatchPlan},
+    tensor::Tensor,
+};
 use infer_worker::application::speculative::{
     ConditionedProposer, SpeculativeLimits, SpeculativeSession,
 };
 use infer_worker::components::eagle3::Eagle3DraftHead;
 use infer_worker::domain::{
     cache::ModelCacheView,
-    component::{Hidden, LayerRange},
     draft::ConditionedDraft,
-    exec::{HostScope, StepCtx},
     features::TargetFeatures,
     forward_scratch::ForwardScratch,
-    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
     model::{DecoderModel, SampleRows},
-    plan::{BatchKind, BatchPlan},
-    tensor::Tensor,
 };
 use infer_worker::infrastructure::{cpu::Cpu, io::safetensors::SafetensorsReader};
 use infer_worker::models::{
@@ -120,7 +122,13 @@ fn specforge() -> (Eagle3Checkpoint, Eagle3DraftHead<f32, Cpu>) {
     .unwrap();
     let target = target();
     let head = checkpoint
-        .build(&loader, target.dims(), target.embed.require_dense().unwrap(), 64, &Cpu)
+        .build(
+            &loader,
+            target.dims(),
+            target.embed.require_dense().unwrap(),
+            64,
+            &Cpu,
+        )
         .unwrap();
     (checkpoint, head)
 }
@@ -495,7 +503,7 @@ fn detects_both_formats_and_rejects_conflicting_or_unknown_layouts() {
 
 #[test]
 fn specforge_compact_vocabulary_and_shared_embedding_match_pytorch() {
-    use infer_worker::domain::ports::FusedOps;
+    use infer_core::ports::FusedOps;
     let g: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fixture("specforge/golden.json")).unwrap()).unwrap();
     let scope = HostScope::new(Cpu);
@@ -664,7 +672,13 @@ fn specforge_rejects_corrupt_maps_before_loading_a_head() {
         let reader = SafetensorsReader::open(&path).unwrap();
         let loader = WeightLoader::new(&reader);
         let checkpoint = Eagle3Checkpoint::parse(&raw, &loader).unwrap();
-        let result = checkpoint.build(&loader, model.dims(), model.embed.require_dense().unwrap(), 64, &Cpu);
+        let result = checkpoint.build(
+            &loader,
+            model.dims(),
+            model.embed.require_dense().unwrap(),
+            64,
+            &Cpu,
+        );
         assert!(result.is_err(), "corrupt {name} accepted");
     }
     std::fs::remove_file(path).unwrap();

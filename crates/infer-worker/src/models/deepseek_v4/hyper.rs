@@ -1,6 +1,6 @@
 use super::{TinyConfig, math::*};
-use crate::domain::{dtype::Dtype, ports::OpResult};
 use crate::models::loader::WeightLoader;
+use infer_core::{dtype::Dtype, ports::OpResult};
 
 pub(super) struct Hyper {
     weight: Vec<f32>,

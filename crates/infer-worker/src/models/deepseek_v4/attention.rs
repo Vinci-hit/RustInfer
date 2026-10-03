@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
 use super::{TinyConfig, math::*};
-use crate::domain::{
+use crate::models::loader::WeightLoader;
+use infer_core::{
     dtype::Dtype,
     ports::{OpResult, backend::LlmBackend},
 };
-use crate::models::loader::WeightLoader;
 
 #[derive(Default)]
 pub(super) struct CompressionState {

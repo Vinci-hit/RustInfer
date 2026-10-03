@@ -5,6 +5,7 @@
 /.claude
 /.codex
 /.codebuddy
+/.agent
 /crates/infer-frontend/node_modules
 /crates/infer-frontend/dist
 # Profiling artifacts
@@ -15,6 +16,9 @@ crates/infer-worker/.codex
 *.log
 __pycache__/
 *.py[cod]
+# CuTe DSL compiler intermediates emitted in the crate directory
+/crates/infer-backend-cuda/cutlass_launch_*.cubin
+/crates/infer-backend-cuda/cutlass_launch_*.ptx
 /docs/**
 !/docs/
 !/docs/**/

@@ -8,11 +8,12 @@ use crate::application::runtime::{DecodeCompactOutput, Runtime};
 use crate::application::worker_state::{ActiveSeqMap, DecodeRows, PrefillSeqMap};
 use crate::domain::global_kv_alloc::{GlobalKvAllocator, KvLease};
 use crate::domain::model::DecoderModel;
-use crate::domain::plan::{SampledToken, SeqStep, StepRequest, StopCriteria};
-use crate::domain::ports::{OpError, OpResult};
+use crate::domain::plan::{SeqStep, StepRequest, StopCriteria};
 use crate::infrastructure::cuda::Cuda;
 use crate::infrastructure::transport::control_pump::ControlPump;
 use crate::infrastructure::transport::data_pump::DataPump;
+use infer_core::ports::SampledToken;
+use infer_core::ports::{OpError, OpResult};
 
 /// DecodeEngine owns the worker-side decode row order.
 ///

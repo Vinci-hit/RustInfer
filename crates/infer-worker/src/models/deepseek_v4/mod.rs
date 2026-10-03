@@ -20,12 +20,12 @@ use hyper::Hyper;
 use math::*;
 use moe::Moe;
 
-use crate::domain::{
+use crate::models::loader::WeightLoader;
+use infer_core::{
     dtype::Dtype,
     exec::ExecScope,
     ports::{OpError, OpResult, backend::LlmBackend},
 };
-use crate::models::loader::WeightLoader;
 
 struct Block<T: Dtype, D: LlmBackend> {
     attention: Attention<T, D>,

@@ -1,9 +1,9 @@
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
-use crate::domain::ports::backend::LlmBackend;
-use crate::domain::ports::sampler::{SampleBatch, Sampler, SamplingParams};
-use crate::domain::ports::{OpError, OpResult};
-use crate::domain::tensor::Tensor;
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::backend::LlmBackend;
+use infer_core::ports::sampler::{SampleBatch, Sampler, SamplingParams};
+use infer_core::ports::{OpError, OpResult};
+use infer_core::tensor::Tensor;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -63,7 +63,7 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
             tokens: ids
                 .into_iter()
                 .zip(logprobs)
-                .map(|(token_id, logprob)| crate::domain::plan::SampledToken {
+                .map(|(token_id, logprob)| infer_core::ports::SampledToken {
                     token_id,
                     logprob,
                     top_logprobs: Vec::new(),
@@ -118,7 +118,7 @@ impl<T: Dtype, D: LlmBackend> Sampler<T, D> for GreedySampler {
                         ids.len()
                     ))
                 })?;
-                tokens.push(crate::domain::plan::SampledToken {
+                tokens.push(infer_core::ports::SampledToken {
                     token_id,
                     logprob: 0.0,
                     top_logprobs: Vec::new(),
@@ -170,7 +170,7 @@ fn sampling_draw(seed: Option<u64>, position: u64, row: usize) -> f64 {
     }
 }
 
-fn sampled_rows(plan: &crate::domain::plan::BatchPlan) -> Vec<usize> {
+fn sampled_rows(plan: &infer_core::plan::BatchPlan) -> Vec<usize> {
     let mut rows = Vec::with_capacity(plan.batch);
     let mut offset = 0usize;
     for &q_len in &plan.q_lens {
@@ -206,13 +206,13 @@ fn sample_filtered_row<T: Dtype>(
     row: &[T],
     params: SamplingParams,
     draw: f64,
-) -> OpResult<crate::domain::plan::SampledToken> {
+) -> OpResult<infer_core::ports::SampledToken> {
     if row.is_empty() {
         return Err(OpError::Shape("sample_filtered_row: empty vocab".into()));
     }
     if params.is_greedy() {
         let (token_id, _) = argmax_row(row)?;
-        return Ok(crate::domain::plan::SampledToken {
+        return Ok(infer_core::ports::SampledToken {
             token_id,
             logprob: log_softmax_at(row, token_id as usize) as f32,
             top_logprobs: Vec::new(),
@@ -307,7 +307,7 @@ fn sample_filtered_row<T: Dtype>(
     } else {
         Vec::new()
     };
-    Ok(crate::domain::plan::SampledToken {
+    Ok(infer_core::ports::SampledToken {
         token_id: selected,
         logprob: (selected_weight / filtered_total).ln() as f32,
         top_logprobs,

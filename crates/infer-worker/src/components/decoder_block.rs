@@ -1,10 +1,10 @@
 use crate::components::attention::Attention;
 use crate::domain::cache::LayerCacheView;
-use crate::domain::component::{Component, Hidden};
-use crate::domain::dtype::Dtype;
-use crate::domain::exec::StepCtx;
-use crate::domain::ports::OpResult;
-use crate::domain::ports::backend::LlmBackend;
+use infer_core::component::{Component, Hidden};
+use infer_core::dtype::Dtype;
+use infer_core::exec::StepCtx;
+use infer_core::ports::OpResult;
+use infer_core::ports::backend::LlmBackend;
 
 /// One transformer decoder layer: a pre-norm attention sublayer followed by a
 /// pre-norm FFN sublayer, both operating on the carried residual stream. Each

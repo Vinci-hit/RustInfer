@@ -37,7 +37,7 @@ impl<T: Dtype, D: LlmBackend, M: DecoderModel<T, D>> Runtime<T, D, M> {
                 stream: self.hidden.stream.narrow(0, 0, plan.num_tokens)?,
                 pending: None,
             };
-            let ctx = crate::domain::exec::StepCtx::new(&self.scope, &plan);
+            let ctx = infer_core::exec::StepCtx::new(&self.scope, &plan);
             let _guard = self.scope.enter();
             let logits = self
                 .model

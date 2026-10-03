@@ -1,17 +1,15 @@
 //! Official Python DFlash reference plus incremental cache and shared verifier tests.
+use infer_core::{
+    exec::{HostScope, StepCtx},
+    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
+    plan::{BatchKind, BatchPlan, MaskMode},
+    tensor::Tensor,
+};
 use infer_worker::application::speculative::{
     BlockProposer, DraftProposer, ProposerSession, SpeculativeLimits,
 };
 use infer_worker::components::dflash::DFlashDraftHead;
-use infer_worker::domain::{
-    cache::ModelCacheView,
-    draft::BlockDraft,
-    exec::{HostScope, StepCtx},
-    kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool},
-    model::DecoderModel,
-    plan::{BatchKind, BatchPlan, MaskMode},
-    tensor::Tensor,
-};
+use infer_worker::domain::{cache::ModelCacheView, draft::BlockDraft, model::DecoderModel};
 use infer_worker::infrastructure::{cpu::Cpu, io::safetensors::SafetensorsReader};
 use infer_worker::models::{
     loader::{LoadConfig, WeightLoader},

@@ -1,12 +1,12 @@
 use super::*;
+use infer_core::component::{Hidden, LayerRange};
+use infer_core::exec::StepCtx;
+use infer_core::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
+use infer_core::plan::{BatchKind, BatchPlan};
+use infer_core::tensor::Tensor;
 use infer_worker::domain::cache::ModelCacheView;
-use infer_worker::domain::component::{Hidden, LayerRange};
-use infer_worker::domain::exec::StepCtx;
 use infer_worker::domain::forward_scratch::ForwardScratch;
-use infer_worker::domain::kv::{KvIndexTensors, KvQuantTier, PagedKvLayer, PagedKvPool};
 use infer_worker::domain::model::SampleRows;
-use infer_worker::domain::plan::{BatchKind, BatchPlan};
-use infer_worker::domain::tensor::Tensor;
 use std::collections::HashMap;
 
 /// Opt-in fixed-token layer/logit diagnostic; duplicate requests exercise batch invariance.
@@ -158,8 +158,7 @@ fn qwen3_moe_checkpoint_diagnostic() {
             .finalize(&hidden, SampleRows::LastPerSeq, &ctx)
             .unwrap()
             .0;
-        let sampled =
-            <Cuda as infer_worker::domain::ports::FusedOps>::argmax(&ctx, &logits_tensor).unwrap();
+        let sampled = <Cuda as infer_core::ports::FusedOps>::argmax(&ctx, &logits_tensor).unwrap();
         if let Some(dir) = &dump_dir {
             std::fs::write(
                 Path::new(dir).join(format!("step{step}_sampled.json")),

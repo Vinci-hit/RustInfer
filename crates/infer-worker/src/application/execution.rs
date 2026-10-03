@@ -3,8 +3,8 @@
 //! Plans describe operations; BatchPlan still owns model-specific indexing.
 //! Host spans include existing waits; optional GPU spans use nonblocking events.
 //! No timer adds a device synchronization or changes buffer ownership.
-use crate::domain::ports::{OpError, OpResult};
 use infer_core::exec::{ExecScope, ScopeTimer};
+use infer_core::ports::{OpError, OpResult};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

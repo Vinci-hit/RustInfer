@@ -193,7 +193,7 @@ fn real_tokenizer_and_template_match_python_reference() {
     let t = GgufText::from_gguf(&reader).unwrap();
     drop(reader);
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../tests/fixtures/gguf/qwen35_text_reference.json"
+        "../../tests/fixtures/gguf/qwen35_text_reference.json"
     ))
     .unwrap();
     for case in fixture["encodings"].as_array().unwrap() {
