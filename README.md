@@ -9,6 +9,11 @@ compile time with no runtime penalty.
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-H200-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
+**[深入理解 RustInfer — The RustInfer Book](docs/book/00-README.md)**
+— A Chinese-language guide following an inference request through scheduling,
+KV cache management, CUDA execution, and tensor parallelism. Work in progress.
+[Browse the contents →](docs/book/01-CONTENTS.md)
+
 ---
 
 ## Performance
