@@ -135,7 +135,7 @@ fn check<T: Dtype>(roundoff: f64) {
                         assert!(
                             (got - exact).abs() <= tol,
                             "{f:?}/{:?} M={m},N={n},K={k},t={t},r={r},bias={biased}: {got} != {exact} tol={tol}",
-                            T::ID
+                            T::DATA_TYPE
                         );
                         let cpu = T::read_f64(&reference[t * n + r]);
                         if cpu.is_finite() {

@@ -9,7 +9,7 @@ use infer_core::dtype::quant::BlockQuantFormat as F;
 use infer_core::error::{OpError, OpResult};
 use infer_core::quantized::{BlockQuantView, BlockQuantWeight};
 use infer_core::tensor::Tensor;
-use infer_core::types::{DTypeId, Dtype};
+use infer_core::types::{DataType, Dtype};
 
 fn u16le(b: &[u8], p: usize) -> u16 {
     u16::from_le_bytes([b[p], b[p + 1]])
@@ -166,7 +166,7 @@ pub fn decode_row(view: BlockQuantView<'_>, row: usize, out: &mut [f32]) -> OpRe
 }
 
 fn float_dtype<T: Dtype>() -> OpResult<()> {
-    if !matches!(T::ID, DTypeId::F32 | DTypeId::F16 | DTypeId::BF16) {
+    if !matches!(T::DATA_TYPE, DataType::F32 | DataType::F16 | DataType::BF16) {
         return Err(OpError::unsupported(
             "cpu",
             "block quant activation dtype (requires f32/f16/bf16)",

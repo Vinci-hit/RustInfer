@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use infer_core::exec::{ExecScope, RankPair};
 use infer_core::ports::{CollectiveOps, CommAxis, OpError, OpResult, ReduceOp};
 use infer_core::tensor::Tensor;
-use infer_core::types::{DTypeId, Dtype};
+use infer_core::types::{DataType, Dtype};
 
 use crate::{Cuda, CudaConfig, CudaScope, device_utils, ffi, require_scope_tensor};
 
@@ -600,17 +600,16 @@ fn nccl_error_string(result: ffi::ncclResult_t) -> String {
 }
 
 fn nccl_dtype<T: Dtype>() -> OpResult<ffi::ncclDataType_t> {
-    match T::ID {
-        DTypeId::F32 => Ok(ffi::ncclDataType_t::ncclFloat32),
-        DTypeId::F16 => Ok(ffi::ncclDataType_t::ncclFloat16),
-        DTypeId::BF16 => Ok(ffi::ncclDataType_t::ncclBfloat16),
-        DTypeId::F8E4M3 => Ok(ffi::ncclDataType_t::ncclFloat8e4m3),
-        DTypeId::F8E5M2 => Ok(ffi::ncclDataType_t::ncclFloat8e5m2),
-        DTypeId::I32 => Ok(ffi::ncclDataType_t::ncclInt32),
-        DTypeId::I8 => Ok(ffi::ncclDataType_t::ncclInt8),
-        DTypeId::U8 => Ok(ffi::ncclDataType_t::ncclUint8),
-        DTypeId::U32 => Ok(ffi::ncclDataType_t::ncclUint32),
-        _ => Err(OpError::unsupported("cuda", "NCCL custom dtype")),
+    match T::DATA_TYPE {
+        DataType::F32 => Ok(ffi::ncclDataType_t::ncclFloat32),
+        DataType::F16 => Ok(ffi::ncclDataType_t::ncclFloat16),
+        DataType::BF16 => Ok(ffi::ncclDataType_t::ncclBfloat16),
+        DataType::F8E4M3 => Ok(ffi::ncclDataType_t::ncclFloat8e4m3),
+        DataType::F8E5M2 => Ok(ffi::ncclDataType_t::ncclFloat8e5m2),
+        DataType::I32 => Ok(ffi::ncclDataType_t::ncclInt32),
+        DataType::I8 => Ok(ffi::ncclDataType_t::ncclInt8),
+        DataType::U8 => Ok(ffi::ncclDataType_t::ncclUint8),
+        DataType::U32 => Ok(ffi::ncclDataType_t::ncclUint32),
     }
 }
 

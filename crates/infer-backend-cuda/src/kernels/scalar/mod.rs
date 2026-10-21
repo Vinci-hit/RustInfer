@@ -154,11 +154,11 @@ unsafe extern "C" {
 }
 
 fn float_code<T: infer_core::dtype::Dtype>() -> OpResult<i32> {
-    use infer_core::types::DTypeId;
-    match T::ID {
-        DTypeId::F32 => Ok(0),
-        DTypeId::F16 => Ok(1),
-        DTypeId::BF16 => Ok(2),
+    use infer_core::types::DataType;
+    match T::DATA_TYPE {
+        DataType::F32 => Ok(0),
+        DataType::F16 => Ok(1),
+        DataType::BF16 => Ok(2),
         _ => Err(infer_core::ports::OpError::unsupported(
             "CUDA",
             "vision scalar dtype",

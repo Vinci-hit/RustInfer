@@ -14,7 +14,7 @@ use crate::components::{
 use crate::domain::{cache::LinearDims, model::ModelDims};
 use crate::infrastructure::io::gguf::{GgmlType, GgufReader};
 use crate::models::decoder::Decoder;
-use infer_core::dtype::DTypeId;
+use infer_core::dtype::DataType;
 use infer_core::{
     dtype::Dtype,
     ports::{OpError, OpResult, backend::LlmBackend},
@@ -244,7 +244,7 @@ impl<'a> Qwen35GgufLoader<'a> {
 }
 
 fn check_dtype<T: Dtype>() -> OpResult<()> {
-    if !matches!(T::ID, DTypeId::F32 | DTypeId::F16 | DTypeId::BF16)
+    if !matches!(T::DATA_TYPE, DataType::F32 | DataType::F16 | DataType::BF16)
         || T::SIZE_BYTES != std::mem::size_of::<T>()
     {
         return Err(OpError::unsupported(

@@ -2171,6 +2171,7 @@ version = "1.0.1"
 dependencies = [
  "half",
  "libm",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 

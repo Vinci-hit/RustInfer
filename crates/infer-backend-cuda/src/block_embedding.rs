@@ -2,7 +2,7 @@
 //! this checked entry point intentionally rejects CUDA graph capture for now.
 use crate::{Cuda, CudaScope, aot::RawKernel, error::classify_sync_error, ffi};
 use infer_core::{
-    dtype::{DTypeId, Dtype, quant::BlockQuantFormat as F},
+    dtype::{DataType, Dtype, quant::BlockQuantFormat as F},
     exec::ExecScope,
     ports::{MemoryPort, OpError, OpResult},
     quantized::BlockQuantWeight,
@@ -89,10 +89,10 @@ pub(crate) fn embedding<T: Dtype>(
     crate::require_scope_tensor(scope, weight.bytes(), "block embedding weight")?;
     crate::require_scope_tensor(scope, ids, "block embedding ids")?;
     crate::require_scope_tensor(scope, output, "block embedding output")?;
-    let dtype = match T::ID {
-        DTypeId::F32 => 0,
-        DTypeId::F16 => 1,
-        DTypeId::BF16 => 2,
+    let dtype = match T::DATA_TYPE {
+        DataType::F32 => 0,
+        DataType::F16 => 1,
+        DataType::BF16 => 2,
         _ => {
             return Err(OpError::unsupported(
                 "cuda",

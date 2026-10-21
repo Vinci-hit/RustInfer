@@ -1,7 +1,6 @@
 pub mod quant;
 
-use crate::types::DataType;
-pub use crate::types::{DTypeId, DTypeSpec, Dtype, Float};
+pub use crate::types::{DataType, Dtype, Float};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
@@ -12,9 +11,9 @@ pub struct Fp8E4m3(pub u8);
 pub struct Fp8E5m2(pub u8);
 
 impl Dtype for u8 {
-    const DATA_TYPE: DataType = DataType::I8;
+    const DATA_TYPE: DataType = DataType::U8;
     const SIZE_BYTES: usize = 1;
-    const ID: DTypeId = DTypeId::U8;
+
     fn read_f64(raw: &Self) -> f64 {
         f64::from(*raw)
     }
@@ -24,9 +23,9 @@ impl Dtype for u8 {
 }
 
 impl Dtype for u32 {
-    const DATA_TYPE: DataType = DataType::I32;
+    const DATA_TYPE: DataType = DataType::U32;
     const SIZE_BYTES: usize = 4;
-    const ID: DTypeId = DTypeId::U32;
+
     fn read_f64(raw: &Self) -> f64 {
         f64::from(*raw)
     }
@@ -38,7 +37,7 @@ impl Dtype for u32 {
 impl Dtype for Fp8E4m3 {
     const DATA_TYPE: DataType = DataType::F8E4M3;
     const SIZE_BYTES: usize = 1;
-    const ID: DTypeId = DTypeId::F8E4M3;
+
     fn read_f64(raw: &Self) -> f64 {
         let bits = raw.0;
         let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
@@ -100,9 +99,9 @@ impl Dtype for Fp8E4m3 {
 }
 
 impl Dtype for Fp8E5m2 {
-    const DATA_TYPE: DataType = DataType::I8;
+    const DATA_TYPE: DataType = DataType::F8E5M2;
     const SIZE_BYTES: usize = 1;
-    const ID: DTypeId = DTypeId::F8E5M2;
+
     fn read_f64(raw: &Self) -> f64 {
         f64::from(raw.0)
     }
@@ -116,8 +115,22 @@ impl Float for Fp8E5m2 {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Dtype, Fp8E4m3};
-    use crate::types::DataType;
+    use super::{DataType, Dtype, Fp8E4m3, Fp8E5m2};
+
+    #[test]
+    fn unsigned_and_fp8_types_keep_their_identity() {
+        assert_eq!(u8::DATA_TYPE, DataType::U8);
+        assert_eq!(u32::DATA_TYPE, DataType::U32);
+        assert_eq!(Fp8E5m2::DATA_TYPE, DataType::F8E5M2);
+        assert_ne!(u8::DATA_TYPE, i8::DATA_TYPE);
+        assert_ne!(u32::DATA_TYPE, i32::DATA_TYPE);
+        assert_eq!(DataType::U8.size_in_bytes(), 1);
+        assert_eq!(DataType::U32.size_in_bytes(), 4);
+        assert_eq!(DataType::F8E5M2.size_in_bytes(), 1);
+        assert!(!DataType::U8.is_float());
+        assert!(!DataType::U32.is_float());
+        assert!(DataType::F8E5M2.is_float());
+    }
 
     #[test]
     fn fp8_e4m3_has_distinct_storage_dtype() {

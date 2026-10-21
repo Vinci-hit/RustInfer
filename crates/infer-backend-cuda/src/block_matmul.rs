@@ -1,7 +1,7 @@
 //! Asynchronous quantized matmul: GEMV for one token, tiled GEMM otherwise.
 use crate::{Cuda, CudaScope, aot::RawKernel};
 use infer_core::{
-    dtype::{DTypeId, Dtype, quant::BlockQuantFormat as F},
+    dtype::{DataType, Dtype, quant::BlockQuantFormat as F},
     exec::ExecScope,
     ports::{OpError, OpResult},
     quantized::BlockQuantWeight,
@@ -57,10 +57,10 @@ pub(crate) fn matmul<T: Dtype>(
     if let Some(b) = bias {
         crate::require_scope_tensor(scope, b, "block matmul bias")?;
     }
-    let dtype = match T::ID {
-        DTypeId::F32 => 0,
-        DTypeId::F16 => 1,
-        DTypeId::BF16 => 2,
+    let dtype = match T::DATA_TYPE {
+        DataType::F32 => 0,
+        DataType::F16 => 1,
+        DataType::BF16 => 2,
         _ => {
             return Err(OpError::unsupported(
                 "cuda",

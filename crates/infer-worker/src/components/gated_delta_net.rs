@@ -5,7 +5,7 @@ use super::norm::RmsNorm;
 use crate::domain::cache::{LinearDims, LinearLayerStateView};
 use crate::domain::gdn_scratch::GdnScratch;
 use infer_core::component::Hidden;
-use infer_core::dtype::{DTypeId, Dtype};
+use infer_core::dtype::{DataType, Dtype};
 use infer_core::exec::{ExecScope, RankPair, StepCtx};
 use infer_core::ports::backend::LlmBackend;
 use infer_core::ports::{OpError, OpResult};
@@ -49,7 +49,7 @@ impl<T: Dtype, D: LlmBackend> GatedDeltaNet<T, D> {
                 dims.key_head_dim
             )));
         }
-        if !matches!(T::ID, DTypeId::F32 | DTypeId::F16 | DTypeId::BF16) {
+        if !matches!(T::DATA_TYPE, DataType::F32 | DataType::F16 | DataType::BF16) {
             return Err(OpError::unsupported("GatedDeltaNet", "activation dtype"));
         }
         let dim = weights.input_layernorm.weight.numel();

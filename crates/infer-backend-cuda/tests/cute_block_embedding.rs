@@ -113,7 +113,7 @@ fn check<T: Dtype>(s: &CudaScope) {
                         actual,
                         expected,
                         "{f:?}/{:?}, sliced={sliced}, token {id} column {col}",
-                        T::ID
+                        T::DATA_TYPE
                     );
                 }
             }

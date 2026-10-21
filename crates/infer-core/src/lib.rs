@@ -24,6 +24,7 @@ pub mod dtype;
 pub mod env_flags;
 pub mod error;
 pub mod exec;
+pub mod compiler;
 pub mod plan;
 pub mod quantized;
 pub mod storage;

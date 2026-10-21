@@ -1,6 +1,6 @@
 use half::{bf16, f16};
 use infer_backend_cuda::{Cuda, CudaMemoryPlan, CudaScope};
-use infer_core::dtype::{DTypeId, Dtype};
+use infer_core::dtype::{DataType, Dtype};
 use infer_core::exec::ExecScope;
 use infer_core::ports::MathOps;
 use infer_core::tensor::Tensor;
@@ -53,7 +53,7 @@ fn oracle<T: Dtype>(input: &[T], weight: &[T]) -> Vec<T> {
                 let (x, w) = (T::read_f64(x), T::read_f64(w));
                 // CUDA's half kernels round the inverse RMS to the storage
                 // dtype, round x * inverse, then round the weighted result.
-                let normalized = if T::ID == DTypeId::F32 {
+                let normalized = if T::DATA_TYPE == DataType::F32 {
                     x * inverse
                 } else {
                     round::<T>(x * round::<T>(inverse))
@@ -66,10 +66,10 @@ fn oracle<T: Dtype>(input: &[T], weight: &[T]) -> Vec<T> {
 
 fn assert_close<T: Dtype>(actual: &[T], expected: &[T]) {
     assert_eq!(actual.len(), expected.len());
-    let (atol, rtol) = match T::ID {
-        DTypeId::F32 => (3e-6, 3e-6),
-        DTypeId::F16 => (2e-3, 2e-3),
-        DTypeId::BF16 => (1.6e-2, 1.6e-2),
+    let (atol, rtol) = match T::DATA_TYPE {
+        DataType::F32 => (3e-6, 3e-6),
+        DataType::F16 => (2e-3, 2e-3),
+        DataType::BF16 => (1.6e-2, 1.6e-2),
         _ => panic!("unexpected test dtype"),
     };
     for (i, (actual, expected)) in actual.iter().zip(expected).enumerate() {
@@ -78,7 +78,7 @@ fn assert_close<T: Dtype>(actual: &[T], expected: &[T]) {
         assert!(
             actual.is_finite() && (actual - expected).abs() <= tolerance,
             "{:?} element {i}: got {actual}, expected {expected}, tolerance {tolerance}",
-            T::ID
+            T::DATA_TYPE
         );
     }
 }

@@ -13,3 +13,4 @@ publish.workspace = true
 half = { version = "2.7.1", features = ["std", "num-traits"] }
 thiserror = "2.0.17"
 libm = "0.2"
+smallvec = "1.15.2"

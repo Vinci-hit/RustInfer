@@ -38,12 +38,12 @@ fn check_real<T: Dtype>(scope: &infer_backend_cuda::CudaScope, reader: &GgufRead
                 (T::read_f64(actual) - exact).abs() <= 4e-6 * norm + rounding * exact.abs() + 1e-6,
                 "{} {:?} row={r}",
                 info.name(),
-                T::ID
+                T::DATA_TYPE
             );
         }
     }
     assert_eq!(seen.len(), 13);
-    eprintln!("Real GGUF GEMM M=9: 13 formats / {:?} passed", T::ID);
+    eprintln!("Real GGUF GEMM M=9: 13 formats / {:?} passed", T::DATA_TYPE);
 }
 
 #[test]

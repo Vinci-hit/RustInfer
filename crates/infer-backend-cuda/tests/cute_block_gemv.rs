@@ -127,7 +127,7 @@ fn check<T: Dtype>(roundoff: f64) {
                         assert!(
                             (actual - exact).abs() <= tolerance,
                             "{f:?}/{:?} blocks={blocks} sliced={sliced} bias={biased} row={r}: {actual} != {exact}, tol={tolerance}",
-                            T::ID
+                            T::DATA_TYPE
                         );
                         if reference.is_finite() {
                             assert!((actual - reference).abs() <= 2.0 * tolerance);

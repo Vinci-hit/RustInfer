@@ -1714,7 +1714,9 @@ fn convert_host_bytes<'a, T: Dtype>(
     if src_dtype == T::DATA_TYPE {
         return Ok(Cow::Borrowed(src_bytes));
     }
-    if src_dtype == DataType::F8E4M3 || T::DATA_TYPE == DataType::F8E4M3 {
+    if matches!(src_dtype, DataType::F8E4M3 | DataType::F8E5M2)
+        || matches!(T::DATA_TYPE, DataType::F8E4M3 | DataType::F8E5M2)
+    {
         return Err(OpError::Kernel(format!(
             "unsupported safetensor cast from {:?} to {:?}; FP8 weights must stay raw",
             src_dtype,
@@ -1763,6 +1765,12 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
                 let b = &src[i * 4..i * 4 + 4];
                 i32::from_le_bytes(b.try_into().unwrap()) as f64
             }
+            DataType::U32 => {
+                let b = &src[i * 4..i * 4 + 4];
+                f64::from(u32::from_le_bytes(b.try_into().unwrap()))
+            }
+            DataType::U8 => f64::from(src[i]),
+            DataType::F8E5M2 => unreachable!("FP8 casts are rejected before conversion"),
             DataType::I8 => src[i] as i8 as f64,
             DataType::F8E4M3 => <Fp8E4m3 as infer_core::dtype::Dtype>::read_f64(&Fp8E4m3(src[i])),
         };
@@ -1796,6 +1804,17 @@ fn cast_bytes(src: &[u8], src_dt: DataType, dst: *mut u8, dst_dt: DataType, nume
                         4,
                     );
                 }
+                DataType::U32 => {
+                    std::ptr::copy_nonoverlapping(
+                        (val as u32).to_le_bytes().as_ptr(),
+                        dst.add(i * 4),
+                        4,
+                    );
+                }
+                DataType::U8 => {
+                    *dst.add(i) = val as u8;
+                }
+                DataType::F8E5M2 => unreachable!("FP8 casts are rejected before conversion"),
                 DataType::I8 => {
                     *dst.add(i) = val as i8 as u8;
                 }
